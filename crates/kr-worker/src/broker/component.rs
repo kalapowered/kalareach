@@ -59,6 +59,50 @@ pub struct ComponentWant {
     pub executable: String,
     /// The component, as pinned.
     pub component: BoundComponent,
+    /// Which streams the binding's installation lets its component be offered.
+    pub streams: super::binder::Streams,
+    /// Whether the binding holds the `Observation` grant, without which it is offered nothing.
+    pub observing: bool,
+    /// The generation of the instance's source: a new execution of the instance advances it.
+    pub generation: u64,
+}
+
+/// What a person is told about a binding's component beyond where it stands.
+///
+/// Each is the latest of its kind, set by the link or the pump, and a `Registered` binding's report
+/// carries them as its reason: how its component was obtained, what its view has missed, and the
+/// last time it faulted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComponentNotes {
+    /// How the registration obtained the component and how long that took.
+    pub registration: Option<String>,
+    /// What the component has missed.
+    pub loss: Option<String>,
+    /// The last time a call into it faulted.
+    pub fault: Option<String>,
+}
+
+impl ComponentNotes {
+    fn text(&self) -> Option<String> {
+        let parts: Vec<&str> = [&self.registration, &self.loss, &self.fault]
+            .into_iter()
+            .filter_map(|part| part.as_deref())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// Which of a binding's notes is being set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComponentNote {
+    /// How the registration obtained the component.
+    Registration(String),
+    /// What the component has missed.
+    Loss(String),
+    /// A fault in a call into the component.
+    Fault(String),
+    /// None of them: the binding is registered again, or gone.
+    Clear,
 }
 
 /// Reads the component a package ships from the admission and from the package's own manifest, and
@@ -123,19 +167,30 @@ fn cut(text: &str) -> (String, bool) {
 pub(super) fn report_of(
     binding: &Binding,
     reported: Option<&(ComponentState, Option<String>)>,
+    notes: Option<&ComponentNotes>,
 ) -> Option<ComponentReport> {
     let component = binding.component.as_ref()?;
+    let noted = notes.and_then(ComponentNotes::text);
     let (state, reason) = if let Some(refusal) = component.refusal.as_ref() {
-        (ComponentState::Unavailable, Some(refusal.as_str()))
+        (ComponentState::Unavailable, Some(refusal.clone()))
     } else if let Some(why) = binding.rich_disabled.as_ref() {
-        (ComponentState::Disabled, Some(why.as_str()))
+        (ComponentState::Disabled, Some(why.clone()))
     } else {
         match reported {
-            Some((state, reason)) => (*state, reason.as_deref()),
+            // A registered component has no reason of its own; what a person is told is what the
+            // worker has noted of it.
+            Some((ComponentState::Registered, reason)) => (
+                ComponentState::Registered,
+                [reason.clone(), noted]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|first, second| format!("{first}; {second}")),
+            ),
+            Some((state, reason)) => (*state, reason.clone()),
             None => (ComponentState::Pending, None),
         }
     };
-    let (reason, reason_cut) = match reason.map(cut) {
+    let (reason, reason_cut) = match reason.as_deref().map(cut) {
         Some((text, was_cut)) => (Nullable::some(text), was_cut),
         None => (Nullable::null(), false),
     };
@@ -164,7 +219,8 @@ impl Broker {
     /// whose component could not be established.
     #[must_use]
     pub fn component_wants(&self) -> Vec<ComponentWant> {
-        self.state()
+        let state = self.state();
+        state
             .bindings
             .values()
             .filter(|binding| binding.rich_disabled.is_none() && !binding.ending)
@@ -185,6 +241,14 @@ impl Broker {
                         .as_ref()
                         .map_or_else(String::new, |executable| executable.path.clone()),
                     component: component.clone(),
+                    streams: binding.streams,
+                    observing: binding
+                        .grants
+                        .holds(kr_protocol::broker::BrokerGrant::Observation),
+                    generation: state
+                        .instances
+                        .get(&binding.application_instance_id)
+                        .map_or(0, |instance| instance.source_generation.get()),
                 })
             })
             .collect()
@@ -204,6 +268,24 @@ impl Broker {
         if held.bindings.contains_key(&binding_id) {
             held.component_states
                 .insert(binding_id, (state, reason.map(str::to_owned)));
+        }
+    }
+
+    /// Records one thing a person is told about a binding's component. A binding the broker no
+    /// longer holds is ignored, as in [`Self::set_component_state`].
+    pub fn note_component(&self, binding_id: BrokerBindingId, note: ComponentNote) {
+        let mut held = self.state();
+        if !held.bindings.contains_key(&binding_id) {
+            return;
+        }
+        let notes = held.component_notes.entry(binding_id).or_default();
+        match note {
+            ComponentNote::Registration(text) => notes.registration = Some(text),
+            ComponentNote::Loss(text) => notes.loss = Some(text),
+            ComponentNote::Fault(text) => notes.fault = Some(text),
+            ComponentNote::Clear => {
+                held.component_notes.remove(&binding_id);
+            }
         }
     }
 }
@@ -233,6 +315,28 @@ impl Broker {
         binding.executable = Some(executable);
         binding.component = Some(component);
         state.component_states.remove(&binding_id);
+        state.component_notes.remove(&binding_id);
+        state.component_changes.notify_one();
+        Ok(())
+    }
+
+    /// Gives a binding made from a test's own descriptor the streams an installation's capabilities
+    /// give a binding made from admissions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::BrokerError::UnknownSubject`] when this broker holds no such binding.
+    pub fn grant_streams(
+        &self,
+        binding_id: BrokerBindingId,
+        streams: super::binder::Streams,
+    ) -> super::Result<()> {
+        let mut state = self.state();
+        state
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| super::unknown_binding(binding_id))?
+            .streams = streams;
         state.component_changes.notify_one();
         Ok(())
     }
