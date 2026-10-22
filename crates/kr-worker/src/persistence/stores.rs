@@ -323,6 +323,18 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "session_application",
+        holds: "the name of the application in the session's foreground where there is one, kept beside the summary and not in it so a release that does not know the word reads the summary",
+        durability: Durability::CrashDurable,
+        retention: Retention::SessionLifetime,
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::ArchiveService,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: true,
+    },
+    StoreDescriptor {
         name: "closure",
         holds: "the final closure record, with terminated identities and the coverage flag",
         durability: Durability::CrashDurable,

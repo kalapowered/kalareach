@@ -531,6 +531,7 @@ fn unresolved_summary(
         // The registry's rows do not hold where its environment came from.
         environment_sources: None,
         root: None,
+        application: None,
     }
 }
 
@@ -558,6 +559,7 @@ fn closed_summary(
         closure: Nullable::some(closure.clone()),
         environment_sources: None,
         root: None,
+        application: None,
     }
 }
 

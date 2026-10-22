@@ -1339,6 +1339,99 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     host.worker_ended(&updated.worker).await;
 }
 
+/// KR-REQ-13.10, KR-REQ-26.10: a session of this release whose journal names the application in
+/// its foreground is read by the release before, once the session has closed and the host has been
+/// rolled back to it: the archive of that release reads the summary row, which keeps the shape every
+/// release reads, and shows the session as it did before, with no application.
+///
+/// No worker names an application yet, so the journal is written the way a worker that did would
+/// write it, through the worker's own journal, once the session's worker has ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_session_naming_an_application_is_read_by_the_release_before_after_a_rollback() {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    let (display, session_id) = host.new_session(&updated.kr_now());
+    let worker = host.worker_process(session_id);
+    host.close(&updated.kr_now(), &display);
+    host.worker_ended(&worker).await;
+
+    let path = host.tree.environment().journal_database(session_id);
+    {
+        let mut journal = kr_worker::journal::Journal::open_existing(&path)
+            .expect("the journal of the session this release's worker ran");
+        let mut summary = journal
+            .read_session(session_id)
+            .expect("the journal reads")
+            .expect("the worker recorded what the session was");
+        assert_eq!(summary.application, None);
+        summary.application = Some("Claude Code".to_owned());
+        journal
+            .record_session(&summary)
+            .expect("the journal takes the application");
+    }
+    // The application is in a row of its own, and the summary row is the form every release reads.
+    let connection = rusqlite::Connection::open(&path).expect("opens the journal");
+    let named: i64 = connection
+        .query_row("SELECT COUNT(*) FROM session_application", [], |row| {
+            row.get(0)
+        })
+        .expect("counts");
+    assert_eq!(named, 1, "the application is recorded");
+    let stored: Vec<u8> = connection
+        .query_row("SELECT summary FROM session", [], |row| row.get(0))
+        .expect("the summary row");
+    connection.close().expect("closes the journal");
+    let row = kr_cbor::decode(&stored, &kr_cbor::Limits::DEFAULT).expect("a canonical value");
+    let kr_cbor::CanonicalValue::Map(row) = row else {
+        panic!("the summary row is a map");
+    };
+    assert!(
+        row.get("application").is_none() && row.get("root").is_none(),
+        "the summary row holds no member the release before does not know"
+    );
+
+    // This release's daemon reads it back with the application.
+    let read = host.run(&updated.kr_now(), &["--json", "status", &display]);
+    assert!(
+        read.status.success(),
+        "this release's kr status: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+
+    // And the release before's daemon reads the same journal after the rollback.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let read = host.run(&updated.kr_before(), &["--json", "status", &display]);
+    assert!(
+        read.status.success(),
+        "the release before's kr status: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
+    assert_eq!(read["session_id"], session_id.to_string(), "{read}");
+    assert_eq!(read["state"], "closed", "{read}");
+    // What only the summary row holds: the shell the session ran and where it ran it. A summary the
+    // release before could not read would be rebuilt from the closure and hold neither.
+    assert_eq!(read["shell"], "/bin/sh", "{read}");
+    assert_eq!(
+        read["cwd"],
+        host.tree.root().display().to_string(),
+        "{read}"
+    );
+    assert!(
+        read.get("application").is_none(),
+        "a session of this release shows no application to the release before: {read}"
+    );
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
 /// Enrols the host of `updated` in an organisation on the confirmation of the owner's device and
 /// applies the policy the organisation signed, which states `list` as its adapters. Returns the
 /// organisation and the file the host keeps the applied policies in.

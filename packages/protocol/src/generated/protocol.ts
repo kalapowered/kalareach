@@ -8459,6 +8459,15 @@ export interface ProcessStartIdentity2 {
  */
 export interface SessionSummary {
   /**
+   * The name of the application in the session's foreground, as a person recognises it.
+   *
+   * Absent from the wire when the worker knows no application, which is every session at a
+   * prompt and every session of a worker of a release that wrote no such member, so a summary
+   * of one is byte for byte what that release reads. A session of such a worker shows no
+   * application.
+   */
+  application?: string | null
+  /**
    * What the foreground is doing, where the host knows.
    */
   application_state: ApplicationState | null
@@ -15697,6 +15706,15 @@ export interface InputLeaseState {
  * The session.
  */
 export interface SessionSummary1 {
+  /**
+   * The name of the application in the session's foreground, as a person recognises it.
+   *
+   * Absent from the wire when the worker knows no application, which is every session at a
+   * prompt and every session of a worker of a release that wrote no such member, so a summary
+   * of one is byte for byte what that release reads. A session of such a worker shows no
+   * application.
+   */
+  application?: string | null
   /**
    * What the foreground is doing, where the host knows.
    */
@@ -28079,6 +28097,15 @@ export interface SessionCloseResult {
  */
 export interface SessionSummary2 {
   /**
+   * The name of the application in the session's foreground, as a person recognises it.
+   *
+   * Absent from the wire when the worker knows no application, which is every session at a
+   * prompt and every session of a worker of a release that wrote no such member, so a summary
+   * of one is byte for byte what that release reads. A session of such a worker shows no
+   * application.
+   */
+  application?: string | null
+  /**
    * What the foreground is doing, where the host knows.
    */
   application_state: ApplicationState | null
@@ -28238,6 +28265,15 @@ export interface SessionCreateResult {
  * What a client knows about one session.
  */
 export interface SessionSummary3 {
+  /**
+   * The name of the application in the session's foreground, as a person recognises it.
+   *
+   * Absent from the wire when the worker knows no application, which is every session at a
+   * prompt and every session of a worker of a release that wrote no such member, so a summary
+   * of one is byte for byte what that release reads. A session of such a worker shows no
+   * application.
+   */
+  application?: string | null
   /**
    * What the foreground is doing, where the host knows.
    */
@@ -28657,6 +28693,15 @@ export interface LaunchProfile1 {
  * What a client knows about one session.
  */
 export interface SessionSummary4 {
+  /**
+   * The name of the application in the session's foreground, as a person recognises it.
+   *
+   * Absent from the wire when the worker knows no application, which is every session at a
+   * prompt and every session of a worker of a release that wrote no such member, so a summary
+   * of one is byte for byte what that release reads. A session of such a worker shows no
+   * application.
+   */
+  application?: string | null
   /**
    * What the foreground is doing, where the host knows.
    */
