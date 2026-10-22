@@ -369,6 +369,9 @@ pub struct Session {
     /// keystroke, a resize or a terminal query reaches. Privacy mode stops it and clears it with
     /// the other subsystems' fences.
     description_facts: crate::description_facts::DescriptionFacts,
+    /// Where this session's terminal output is offered to the components that observe it, once a
+    /// worker has given it one.
+    observation: Option<Arc<crate::broker::observation::ObservationLane>>,
     /// The durability condition this session publishes.
     ///
     /// It is the journal's own seam when there is a journal, and a seam of this session's own,
@@ -660,6 +663,7 @@ impl Session {
             journal,
             privacy,
             description_facts,
+            observation: None,
             privacy_cleanup: if unresolved {
                 PrivacyCleanup::unresolved(
                     "this host cannot read whether privacy mode is on for this session, so it \
@@ -1154,6 +1158,13 @@ impl Session {
     #[must_use]
     pub fn description_facts(&self) -> crate::description_facts::DescriptionFacts {
         self.description_facts.clone()
+    }
+
+    /// Gives this session the lane its terminal output is offered to the observing components
+    /// through, and tells the lane whether privacy mode is on.
+    pub fn observe_with(&mut self, lane: Arc<crate::broker::observation::ObservationLane>) {
+        lane.set_private(self.privacy.is_enabled());
+        self.observation = Some(lane);
     }
 
     /// Returns the most recent command block the private hooks reported.
@@ -3755,9 +3766,16 @@ impl Session {
                     // What each subscriber is sent of the span is decided by how much of the
                     // screen its caller's authority reaches, read where that is recorded.
                     let scopes = &self.content_scopes;
+                    let bytes = Arc::new(span.bytes);
+                    // The components that observe the terminal are offered the span as the owner's
+                    // own terminal receives it. This is a push onto a bounded lane: it takes a leaf
+                    // lock for a moment and makes no call, so nothing here waits for a component.
+                    if let Some(lane) = self.observation.as_ref() {
+                        let _pushed = lane.push_terminal(&bytes, kr_ipc::now_ms().get());
+                    }
                     resynchronised.extend(self.hub.publish_direct(
                         span.cursor,
-                        &Arc::new(span.bytes),
+                        &bytes,
                         &span.behind_the_screen,
                         oldest,
                         |attachment_id| scopes.get(&attachment_id).copied().unwrap_or_default(),
@@ -4341,8 +4359,15 @@ impl Session {
         let mut receipts = crate::privacy::ReceiptMetadata::over(self.journal.as_mut(), pending);
         let mut facts =
             crate::description_facts::DescriptionFactsPrivacy::over(self.description_facts.clone());
+        let mut observation = self
+            .observation
+            .clone()
+            .map(crate::broker::observation::ObservationPrivacy::over);
         let mut subsystems: Vec<&mut dyn crate::privacy::PrivacySubsystem> =
             vec![&mut history, &mut receipts, &mut facts];
+        if let Some(observation) = observation.as_mut() {
+            subsystems.push(observation);
+        }
         for subsystem in extra.iter_mut() {
             subsystems.push(&mut **subsystem);
         }
@@ -4483,6 +4508,9 @@ impl Session {
         // Capture starts again from this moment, into a record of its own: nothing from before is
         // brought back.
         self.description_facts.release(generation);
+        if let Some(lane) = self.observation.as_ref() {
+            lane.set_private(false);
+        }
         Ok(resumed)
     }
 
