@@ -301,6 +301,19 @@ pub struct Following {
     producer: Arc<Producer>,
     /// The group and the name the previous look found, while a program held the terminal.
     previous: Option<(i32, Option<String>)>,
+    /// Whether the leader of the group the previous look found runs the command the shell
+    /// answered for. What a process runs cannot change without it starting an image again, so one
+    /// reading serves every look until the leader, the image or the command is another.
+    ran: Option<(Ran, bool)>,
+}
+
+/// What a reading of whether a leader runs a command was made of.
+#[cfg(unix)]
+#[derive(PartialEq, Eq)]
+struct Ran {
+    leader: u32,
+    image: String,
+    command: String,
 }
 
 #[cfg(unix)]
@@ -311,6 +324,7 @@ impl Following {
         Self {
             producer,
             previous: None,
+            ran: None,
         }
     }
 
@@ -322,7 +336,7 @@ impl Following {
             self.producer.observe_holder(Holder::Shell);
             return;
         };
-        let name = program_of(foreground);
+        let name = program_of(foreground, &mut self.ran);
         let settled = self
             .previous
             .as_ref()
@@ -343,49 +357,139 @@ impl Following {
 /// that holds the terminal now. The leader is the process the group is named after, or, once it
 /// has gone, the lowest-numbered member the root shell started.
 #[cfg(unix)]
-fn program_of(foreground: &crate::broker::adoption::Foreground) -> Option<String> {
+fn program_of(
+    foreground: &crate::broker::adoption::Foreground,
+    ran: &mut Option<(Ran, bool)>,
+) -> Option<String> {
     let leader = leader_of(foreground)?;
     let image = crate::questions::binding::executable_of(leader)?;
-    if let [(typed, _)] = foreground.answered.as_slice()
-        && runs(typed, &image, leader)
-        && let Some(name) = name_of(typed)
-    {
-        return Some(name);
+    if let [(typed, _)] = foreground.answered.as_slice() {
+        let reading = Ran {
+            leader,
+            image: image.clone(),
+            command: typed.clone(),
+        };
+        let runs_it = match ran {
+            Some((read, held)) if *read == reading => *held,
+            _ => {
+                let held = runs(typed, &image, leader);
+                *ran = Some((reading, held));
+                held
+            }
+        };
+        if runs_it && let Some(name) = name_of(typed) {
+            return Some(name);
+        }
     }
     name_of(&image)
 }
 
-/// How many of a program's arguments are looked at for the script an interpreter was given.
-#[cfg(unix)]
-const ARGUMENTS_LOOKED_AT: usize = 8;
-
 /// Whether the command a person typed, as the shell integration resolved it, is what `leader` is
-/// running: the image itself, or the script an interpreter was started with.
+/// running: the image itself, or the script the interpreter named on the script's first line was
+/// started with.
 ///
-/// A script is named by an argument that is its path, or, where the program was given a path
-/// relative to a directory this worker cannot see it from, by an argument with its file name.
+/// The second is shown only the way the system starts a script, and an argument that holds the
+/// script's path is not enough: `tail -f script` reads a script and runs another program. The
+/// leader's image is the interpreter the first line names (`env` and the program it looks up, for
+/// a line that names `env`), and the script is the argument after the interpreter's own, resolved
+/// where the leader works when it was given as a relative path.
 #[cfg(unix)]
 fn runs(typed: &str, image: &str, leader: u32) -> bool {
-    let canonical = |path: &str| std::fs::canonicalize(path).ok();
-    let Some(typed_file) = canonical(typed) else {
+    let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
+    let Some(script) = canonical(std::path::Path::new(typed)) else {
         return false;
     };
-    if canonical(image).is_some_and(|image| image == typed_file) {
+    let running = canonical(std::path::Path::new(image));
+    if running.as_ref() == Some(&script) {
         return true;
     }
-    crate::broker::adoption::arguments_of(leader).is_some_and(|arguments| {
-        arguments
-            .iter()
-            .skip(1)
-            .take(ARGUMENTS_LOOKED_AT)
-            .any(|argument| {
-                if std::path::Path::new(argument).is_absolute() {
-                    canonical(argument).is_some_and(|argument| argument == typed_file)
-                } else {
-                    std::path::Path::new(argument).file_name() == typed_file.file_name()
-                }
-            })
-    })
+    let Some(started_with) = first_line_of(&script) else {
+        return false;
+    };
+    let Some(arguments) = crate::broker::adoption::arguments_of(leader) else {
+        return false;
+    };
+    let words: Vec<&str> = started_with.split_whitespace().collect();
+    let Some(interpreter) = words.first() else {
+        return false;
+    };
+    let interpreter = std::path::Path::new(interpreter);
+    let script_at = if interpreter.file_name().is_some_and(|name| name == "env") {
+        // The program `env` looks up is the one that runs, started with the script alone.
+        let [_, looked_up] = words.as_slice() else {
+            return false;
+        };
+        let looked_up = std::path::Path::new(looked_up);
+        let named = looked_up.file_name();
+        if looked_up.components().count() != 1
+            || named.is_none_or(|name| name.to_string_lossy().starts_with('-'))
+            || running.as_ref().and_then(|image| image.file_name()) != named
+        {
+            return false;
+        }
+        1
+    } else {
+        if running.is_none() || canonical(interpreter) != running {
+            return false;
+        }
+        // Linux gives the interpreter the rest of the line as one argument; macOS gives it each
+        // word.
+        1 + if words.len() == 1 {
+            0
+        } else if cfg!(target_os = "linux") {
+            1
+        } else {
+            words.len() - 1
+        }
+    };
+    let Some(given) = arguments.get(script_at) else {
+        return false;
+    };
+    let given = std::path::Path::new(given);
+    let given = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        let Some(directory) = working_directory_of(leader) else {
+            return false;
+        };
+        directory.join(given)
+    };
+    canonical(&given).is_some_and(|given| given == script)
+}
+
+/// Returns the first line of a script after its `#!`, when it has one.
+#[cfg(unix)]
+fn first_line_of(script: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut head = Vec::new();
+    std::fs::File::open(script)
+        .ok()?
+        .take(512)
+        .read_to_end(&mut head)
+        .ok()?;
+    let line = head.strip_prefix(b"#!")?;
+    let line = line.split(|byte| *byte == b'\n').next()?;
+    Some(String::from_utf8_lossy(line).trim().to_owned())
+}
+
+/// Returns the directory a process works in, as the kernel names it now.
+#[cfg(target_os = "linux")]
+fn working_directory_of(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Returns the directory a process works in, as the kernel names it now.
+#[cfg(target_os = "macos")]
+fn working_directory_of(pid: u32) -> Option<std::path::PathBuf> {
+    crate::broker::commands::working_directory_path_of(u64::from(pid))
+}
+
+/// No platform record of a process's working directory is read here, so a script given by a
+/// relative path is not shown to be the one that runs.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+const fn working_directory_of(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Returns the process the foreground group is named after, or the first of the root shell's

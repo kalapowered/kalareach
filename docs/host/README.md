@@ -1614,11 +1614,14 @@ worker does not know that it is. A program that holds the terminal, with none of
 of its own, and the shell at its prompt is ready; where the foreground is not read, which is on
 Windows, the shell is taken to hold the terminal. The program's name is the file name of the command
 the shell integration answered for when it answered for exactly one and the foreground process
-group's leader is running it (the image itself, or the script an interpreter was given), and
-otherwise of the executable the leader runs, once two looks in a row have found the same group. A
-wrapper that replaces itself with another program is therefore named for the program, and a program
-run through an interpreter that was given no script to name is named by the interpreter. A session
-that has closed reports no state.
+group's leader is running it, and otherwise of the executable the leader runs, once two looks in a
+row have found the same group. The leader runs the command when it is the command's own file, or
+when the command is a script and the leader is the interpreter that the script's first line names,
+started with the script as the argument after the interpreter's own; a program that only has the
+script's path among its arguments, as `tail` has when it reads one, does not run it. A wrapper that
+replaces itself with another program is therefore named for the program, and a program run through
+an interpreter that was given no script to name is named by the interpreter. A session that has
+closed reports no state.
 
 An assertion asks the operating system not to sleep on its own. It does not stop a closed lid, a
 forced sleep or a platform policy that overrides the request, and none of those need to be stopped:
