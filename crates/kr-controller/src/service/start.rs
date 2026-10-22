@@ -61,21 +61,6 @@ pub const BOOT_FILE: &str = "boot";
 /// The longest boot record this host reads.
 const BOOT_FILE_LIMIT: u64 = 1_024;
 
-/// Which environment this daemon's measurements are taken in: a released build, which runs from a
-/// release in the install store, or any other build. A host never reports a staging environment,
-/// which is a deployment of the service and not something a host is.
-fn measured_in_environment() -> kr_protocol::metrics::Environment {
-    if kr_ipc::install::this_process()
-        .ok()
-        .and_then(kr_ipc::install::Running::store)
-        .is_some()
-    {
-        kr_protocol::metrics::Environment::Production
-    } else {
-        kr_protocol::metrics::Environment::Development
-    }
-}
-
 impl Controller {
     /// Starts the description host and the reading of every session's facts, once, at the daemon's
     /// start: the host takes the owner's settings from the configuration document, finds the
@@ -1153,7 +1138,7 @@ impl Controller {
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
             metrics: Arc::new(kr_protocol::metrics::Recorder::new(
-                measured_in_environment(),
+                kr_ipc::install::measured_environment(),
             )),
             finalising: Mutex::new(()),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),

@@ -429,6 +429,20 @@ impl WorkerService {
         &self.broker
     }
 
+    /// Returns what this worker has counted of the host's own metrics: the terminal parse faults
+    /// of its session and the failures of the adapters it brokers.
+    ///
+    /// The totals are cumulative for the life of this worker, so a second read of the same state
+    /// gives the same report.
+    #[must_use]
+    pub fn metrics(&self) -> kr_protocol::metrics::Report {
+        let faults = crate::metrics::parse_faults(
+            &self.runtime.session().terminal_diagnostics(),
+            kr_ipc::install::measured_environment(),
+        );
+        kr_protocol::metrics::Report::joined([faults, self.broker.metrics()])
+    }
+
     /// Returns what this session's application is doing, as the worker publishes it.
     #[must_use]
     pub const fn application(&self) -> &Arc<crate::application::Producer> {

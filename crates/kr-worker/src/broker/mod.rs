@@ -905,6 +905,9 @@ pub struct Broker {
     decoding: Arc<decoding::DecodeQueue>,
     /// What this worker asks the control daemon about drafts.
     drafts: Arc<crate::daemon_link::Drafts>,
+    /// How many times each bundled adapter has failed to answer, and how: the failures the host
+    /// reports about itself.
+    adapter_failures: kr_protocol::metrics::Recorder,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
     #[cfg(feature = "testing")]
     recovery_pause: Mutex<Option<RecoveryPause>>,
@@ -1048,6 +1051,9 @@ impl Broker {
             observation: Arc::new(observation::ObservationLane::new()),
             decoding: Arc::new(decoding::DecodeQueue::default()),
             drafts: Arc::new(crate::daemon_link::Drafts::new()),
+            adapter_failures: kr_protocol::metrics::Recorder::new(
+                kr_ipc::install::measured_environment(),
+            ),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
             #[cfg(feature = "testing")]

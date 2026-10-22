@@ -23,6 +23,7 @@ use kr_plugin_sdk::plugin::{PayloadRole, PluginManifest};
 use kr_protocol::admission::{AdmittedComponent, ComponentReport, ComponentState};
 use kr_protocol::ids::{BrokerBindingId, PluginId};
 use kr_protocol::limits::MAX_REPORT_DETAIL_BYTES;
+use kr_protocol::metrics::{Adapter, Outcome};
 use kr_protocol::scalars::{Digest256, Nullable};
 
 use super::decoding::NotDecoded;
@@ -368,9 +369,22 @@ impl Broker {
         reason: Option<&str>,
     ) {
         let mut held = self.state();
-        if held.bindings.contains_key(&binding_id) {
-            held.component_states
-                .insert(binding_id, (state, reason.map(str::to_owned)));
+        let Some(binding) = held.bindings.get(&binding_id) else {
+            return;
+        };
+        let package = binding.plugin_id.clone();
+        let before = held
+            .component_states
+            .insert(binding_id, (state, reason.map(str::to_owned)));
+        drop(held);
+        // The runtime says again and again that a component it cannot run is unavailable; the
+        // failure is the step into that state, not each saying of it.
+        if state == ComponentState::Unavailable
+            && before.is_none_or(|(was, _)| was != ComponentState::Unavailable)
+        {
+            if let Some(adapter) = Adapter::of_package(package.as_str()) {
+                self.adapter_failed(adapter, Outcome::Unavailable);
+            }
         }
         drop(held);
         // A request waiting for this component's registration may now be asked, or given up on.
@@ -412,6 +426,17 @@ impl Broker {
                 held.component_notes.remove(&binding_id);
             }
         }
+    }
+
+    /// Counts one failure of a bundled adapter, for the metrics this host reports about itself.
+    pub(crate) fn adapter_failed(&self, adapter: Adapter, outcome: Outcome) {
+        self.adapter_failures.adapter_failed(adapter, outcome);
+    }
+
+    /// Returns what this broker has counted of the host's own metrics.
+    #[must_use]
+    pub fn metrics(&self) -> kr_protocol::metrics::Report {
+        self.adapter_failures.report()
     }
 }
 
