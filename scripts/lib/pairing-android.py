@@ -354,10 +354,11 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
     """The paired phone is an owner device: the host's own request and a second device the host would
     add are confirmed with the phone's screen lock, and a prompt that is cancelled confirms nothing.
 
-    The phone is given a PIN, so the ceremony it offers is its screen lock, and the prompt is the
-    system's. The request is listed on the Attention tab; the first prompt is cancelled (the request is
-    still listed and the invitation behind it is refused); the same request is then confirmed, and the
-    host spends that confirmation on the invitation. A second device the host is asked to add shows a
+    The emulator has no screen lock at first, so the phone offers no ceremony. Once it is given a PIN
+    the ceremony is its screen lock, and the prompt is the system's. The request is listed on the
+    Attention tab; the first prompt is cancelled (the request is still listed and the invitation
+    behind it is refused); the same request is then confirmed, and the host spends that confirmation
+    on the invitation. A second device the host is asked to add shows a
     value, which the request on the phone shows too.
     """
     confirm = "Confirm with your screen lock"
@@ -368,16 +369,17 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         phone.tap(phone.wait(lambda each: each.startswith("Attention"), "the shell's Attention tab"))
         touch(directory, "go-confirm")
         wait_for_file(directory, "challenge.txt")
-        # The emulator has no screen lock yet, so the phone can check nothing: the request says so
-        # and offers no button. The lock is then set while the request is listed, and the button
-        # appears named for it, without the request coming or going.
-        phone.wait(
-            lambda each: each.startswith("This phone cannot check that it is you"),
-            "the words for a phone that can check nothing",
-            120,
-        )
+        # The emulator has no screen lock yet, so the phone can check nothing: the request is on the
+        # Attention tab (the tab's badge counts it), and no button named for a ceremony is offered.
+        # The row's words, that this phone cannot check that it is you, are in the screenshot and in
+        # the page's own case: the accessibility tree gives the row to `uiautomator` only once it
+        # has a button to press. The lock is then set while the request is listed, and the button
+        # appears named for it without the request coming or going.
+        phone.wait(lambda each: "1 waiting for you" in each, "the host's request counted on the Attention tab", 120)
+        time.sleep(3)
         if phone.find(lambda each: each.startswith("Confirm with")) is not None:
             phone.give_up("a phone with no screen lock offers a way to confirm")
+        phone.shot("confirm-no-lock")
         say("a phone with no screen lock cannot confirm")
         phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
         phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 120))
