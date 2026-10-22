@@ -68,6 +68,8 @@ import type {
   PairingUnavailable,
   PairingSources,
   PairingView,
+  HostRow,
+  PushHostView,
   PushView,
   IntakeView,
   RecoveryView,
@@ -926,7 +928,22 @@ export function fakeHost(
       const asked = new URLSearchParams(window.location.search).get('scan')
       return { camera: asked === 'camera' || asked === 'both', photo: asked === 'photo' || asked === 'both' }
     })(),
-    hosts: []
+    // `paired=studio` has the phone paired with one host, so the screens a pairing makes appear.
+    hosts: ((): HostRow[] => {
+      if (typeof window === 'undefined') return []
+      if (new URLSearchParams(window.location.search).get('paired') !== 'studio') return []
+      return [
+        {
+          reference: 'studio-reference',
+          in_use: true,
+          name: 'studio',
+          owner: false,
+          authority: 'answer questions',
+          grant_expires_at_ms: null,
+          in_contact: true
+        }
+      ]
+    })()
   }
   /**
    * What the address asks this host to say about the pairing records: that they could not be opened
@@ -945,7 +962,35 @@ export function fakeHost(
     }
   })()
   /** Where notifications stand: a phone has them, and nothing is on until the person asks. */
-  let push: PushView = { available: true, hosts: [] }
+  let push: PushView = ((): PushView => {
+    // What the address asks this host to say of the one paired host's notifications: `push=on`,
+    // `push=working`, `push=stopped` (the system's setting is off) or `push=unreachable`.
+    const asked =
+      typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('push')
+    const row = (state: PushHostView['state'], words: string, settings = false): PushView => ({
+      available: true,
+      hosts: [{ reference: 'studio-reference', state, words, settings }]
+    })
+    switch (asked) {
+      case 'on':
+        return row('on', '')
+      case 'working':
+        return row('working', 'Waiting for the notification service.')
+      case 'stopped':
+        return row(
+          'needs_attention',
+          'Notifications are off for this app. Turn them on in the system\u2019s settings, then come back to this screen.',
+          true
+        )
+      case 'unreachable':
+        return row(
+          'needs_attention',
+          'The notification service could not be reached. Try again in a moment.'
+        )
+      default:
+        return { available: true, hosts: [] }
+    }
+  })()
   const pushEnabled: string[] = []
   const pushLooks = { count: 0 }
   const pushListeners = new Set<(view: PushView) => void>()
