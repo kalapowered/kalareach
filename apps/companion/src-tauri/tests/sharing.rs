@@ -553,6 +553,15 @@ async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
         .await
         .expect_err("nothing is sent before an owner device answered");
     assert_eq!(code_of(&early), "OWNER_CONFIRMATION_REQUIRED", "{early}");
+    let still_waiting = scene
+        .issuer
+        .call("transfer_answered", json!({ "reference": reference }))
+        .await
+        .expect("read");
+    assert_eq!(
+        still_waiting["state"], "waiting",
+        "the early finish sent nothing, so the hand-over still waits for its answer"
+    );
     assert_eq!(
         scene.listed().await.grants.len(),
         1,

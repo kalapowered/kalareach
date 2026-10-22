@@ -291,10 +291,12 @@ async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else()
 /// not; the clock needs its own; and the three actions no method performs yet are answered for
 /// their exact description and nothing else. Enlarging persistent authority is pairing a personal
 /// owner grant, which needs both of its own.
-/// KR-REQ-02.09: the rights-enlarging owner operations named here, issuing an invitation,
-/// confirming a device, enlarging a grant, trusting a repository root and granting an executable
-/// capability, each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has confirmed
-/// exactly them; a confirmation for other rights, or for another action, does not stand in.
+/// KR-REQ-02.09, the part about the two operations this host serves: issuing an invitation and
+/// confirming a device each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has
+/// confirmed exactly them, and a confirmation for other rights or for another action does not
+/// stand in. For enlarging a grant, trusting a repository root and granting an executable
+/// capability, which no method performs yet, the owner ledger spends only a confirmation that names
+/// the action's exact digest and rights.
 /// KR-REQ-23.47, the part about the confirmation's digest: each confirmation names one action
 /// digest with its destination and rights, and one that names others does not stand in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

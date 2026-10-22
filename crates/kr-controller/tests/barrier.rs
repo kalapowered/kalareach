@@ -2637,8 +2637,9 @@ async fn an_action_inside_the_dispatch_boundary_is_named_rather_than_taken_back(
 
 /// KR-ACC-022: an action this host really admitted and never dispatched is taken back by the
 /// revocation, and its effect never happens.
-/// KR-REQ-02.08, the part that is about current state: the same through an action this host really
-/// admitted, whose dispatch marker could not be written, rather than one placed in the journal.
+/// KR-REQ-02.08, the part that is about current state: an action this host really admitted, whose
+/// dispatch marker could not be written, is rejected as revoked by a revocation that comes after,
+/// and never takes effect.
 ///
 /// The intent is left where section 9 says a fence finds one: accepted durably, with no dispatch
 /// marker. This host writes the marker in the same locked step as the acceptance, so the way to be

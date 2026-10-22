@@ -87,9 +87,8 @@ async fn kr_req_23_30_a_component_prepares_a_cancellation_and_the_worker_transmi
 /// dispatched, and so is a prompt, which the table spells no source for; nothing more is written.
 /// KR-REQ-09.06 and KR-REQ-23.46, the part about cancelling after dispatch: through a real daemon
 /// and component, the cancellation of a running turn is an action with a receipt of its own, which
-/// reads applied once the upstream acknowledged the write it made, and a plan that is not that
-/// cancellation is refused with a receipt that says it never dispatched. The route from
-/// `action.cancel` to this action is not shown here.
+/// reads applied once the upstream acknowledged the write it made, naming the thread and the turn
+/// the host read. The route from `action.cancel` to this action is not shown here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_28_a_components_cancellation_is_written_from_the_connectors_template_and_no_other_plan_is()
  {
@@ -737,9 +736,6 @@ async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_noth
 
 /// KR-REQ-23.30: a plugin runtime that ends while an action's component is being asked costs the
 /// action the code that says asking again can succeed, as one that was gone before the call does.
-/// KR-REQ-27.05, the part about killing the plugin host: the host process is killed while an action
-/// waits on its component, and the action is rejected with the code that says asking again can
-/// succeed and nothing written upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_runtime_that_ends_during_the_call_costs_its_action_a_retryable_code() {
     let Some(acting) = Acting::start().await else {

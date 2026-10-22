@@ -2884,9 +2884,10 @@ fn a_live_session_keeps_the_package_it_started_with() {
 
 /// KR-REQ-07.87, KR-REQ-07.88: a package binds into the editor it was qualified against, and says
 /// so about any other.
-/// KR-REQ-07.85, the part about the qualified PSReadLine: a PowerShell session is bound to the
-/// PSReadLine its package was qualified with, and a package whose record names another module
-/// directory, another version or another path to it is refused as not the qualified editor.
+/// KR-REQ-07.85, the part about the qualified PSReadLine: a PowerShell package is bound to the
+/// PSReadLine it was qualified with, and one whose record names another module directory or
+/// another version is refused as not the qualified editor, while the same directory reached by
+/// another path is the editor it was qualified against.
 ///
 /// The PowerShell package builds no editor. It binds into the PSReadLine the person installed, so
 /// what makes its qualification true of a running session is that editor being the one the

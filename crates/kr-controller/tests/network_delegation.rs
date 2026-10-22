@@ -325,8 +325,9 @@ async fn kr_req_10_45_a_device_cannot_delegate_past_the_limit_of_a_tree() {
 /// asked for any text of it.
 /// KR-REQ-10.40, the part about narrowing delegation: a delegation cannot outlive its parent or
 /// name more of the session than its parent does.
-/// KR-REQ-19.02: a device cannot delegate a right it does not hold: not from a grant it does not
-/// hold, not from nothing, not from a pairing grant, and not more than the grant it holds.
+/// KR-REQ-19.02: a device cannot delegate more than it holds: not from a grant it does not hold,
+/// not from nothing, not from a pairing grant, and not longer, wider or with more history or screen
+/// than the grant it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_03_a_device_delegates_nothing_wider_than_it_holds_and_revokes_only_its_own() {
     let owner = DeviceKeys::generate().expect("owner keys");

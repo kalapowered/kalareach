@@ -659,11 +659,11 @@ fn detect_under(root: &std::path::Path) -> Vec<TerminalApplication> {
     found
 }
 
-/// The Linux terminals found in the directories of `search`, which opens them through the
-/// configured desktop launcher.
+/// The Linux terminals found in the directories of `search`, offered only where a desktop launcher
+/// (`gio`, else `gtk-launch`) is installed too.
 ///
-/// A desktop terminal is opened through the configured desktop launcher. Without one there is
-/// nothing to open a window with, whatever is installed.
+/// A desktop terminal needs the desktop launcher. Without one there is nothing to open a window
+/// with, whatever is installed.
 #[cfg(all(unix, not(target_vendor = "apple")))]
 fn detect_on(search: Option<&std::ffi::OsStr>) -> Vec<TerminalApplication> {
     let Some(launcher) =
@@ -1028,11 +1028,11 @@ mod tests {
         assert!(detected(&[]).is_empty(), "nothing installed, nothing found");
     }
 
-    /// KR-REQ-07.31: a Linux host opens a desktop terminal through the configured desktop launcher,
-    /// `gio` or else `gtk-launch`: the terminals installed are found when a launcher is, each says
-    /// which launcher it is opened through, and with no launcher nothing is found, whatever is
-    /// installed. Detection runs over a search path of its own, whose directory holds the programs
-    /// a case wants found.
+    /// KR-REQ-07.31, the part about detection on Linux: a desktop terminal is offered only where a
+    /// desktop launcher is installed, `gio` or else `gtk-launch`: the terminals installed are found
+    /// when a launcher is, each names the launcher it was found with, and with no launcher nothing
+    /// is found, whatever is installed. Nothing is opened here. Detection runs over a search path of
+    /// its own, whose directory holds the programs a case wants found.
     #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn a_linux_host_finds_its_desktop_terminals_only_through_a_desktop_launcher() {

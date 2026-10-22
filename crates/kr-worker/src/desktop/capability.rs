@@ -904,10 +904,10 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("removes the test's directory");
     }
 
-    /// KR-REQ-03.26: selecting a desktop alone never reports screen capture or input injection as
-    /// available. Each is refused with a reason, whatever the platform's own facility is on this
-    /// host, while the display server is nameable and launching an application is the launcher's
-    /// own answer.
+    /// KR-REQ-03.26, the part about selecting a macOS desktop: selecting a desktop alone never
+    /// reports screen capture or input injection as available. Each is refused with a reason,
+    /// whatever the platform's own facility is on this host, while the display server is nameable and
+    /// launching an application is the launcher's own answer.
     #[test]
     fn selecting_a_desktop_never_reports_capture_or_injection_as_available() {
         let report = report(
@@ -1248,9 +1248,8 @@ mod tests {
     }
 
     /// KR-REQ-03.26, the part about the compositor: the display-server record is a different
-    /// record for X11, for Wayland and for each Wayland compositor, so a host that changed any of
-    /// them is told the evidence changed; it names no binary, and no other record names the
-    /// compositor.
+    /// record for X11, for Wayland and for each Wayland compositor; it names no binary, and no other
+    /// record names the compositor.
     #[test]
     fn the_display_server_record_names_no_binary_and_changes_with_its_compositor() {
         // A record in the form two reports are compared in: everything but the revision and the

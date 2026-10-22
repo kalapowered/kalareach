@@ -4091,9 +4091,9 @@ mod tests {
     /// way the page calls it, through the invoke path, any other path is refused with
     /// `PERMISSION_DENIED` before anything is read or written, and a path the platform handed over
     /// passes that gate once.
-    /// KR-REQ-25.25, the part about the destination of an export: a semantic JSON or asciicast
-    /// export is written only to the destination file the person chose in the save dialog, once,
-    /// and a path the page names writes nothing; no export goes anywhere else.
+    /// KR-REQ-25.25, the part about the destination of an export at the command boundary: a
+    /// semantic JSON or asciicast export is written to a destination the save dialog returned, once,
+    /// and a path the page names writes nothing.
     #[test]
     fn a_path_the_page_names_is_refused_at_the_command_boundary() {
         use tauri::Manager as _;

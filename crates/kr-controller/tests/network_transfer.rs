@@ -80,8 +80,8 @@ async fn still_waiting(
 /// under the grant that was given up is ended promptly, and a repeat of the action is answered as
 /// it was, spending nothing.
 /// KR-REQ-02.09, the part about a rights-enlarging owner operation: a transfer, which gives another
-/// device what the giving one held, is performed only on an owner device's answer to its exact
-/// plan.
+/// device what the giving one held, is performed on an owner device's answer to its exact plan,
+/// which it spends.
 /// KR-REQ-23.47, the part about the confirmation's digest: the answer is bound to this action, an
 /// answer given under another action is not spent by it, and the answer for this one is spent by
 /// the transfer.

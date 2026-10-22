@@ -1940,10 +1940,9 @@ async fn a_worker_states_the_clock_floor_it_maps_in_its_hello() {
 /// KR-REQ-09.09: authority, expiry, identity, binding and preconditions are all rechecked in the
 /// serial dispatch path, and a refusal commits a rejection rather than an effect.
 /// KR-REQ-06.02: a mutation naming any session epoch but the current one, 1, is refused as stale.
-/// KR-REQ-02.08, the part that is about current state: what a caller was admitted under is not what
-/// decides at dispatch. A controller connection a later one fenced, a lifetime that is spent, and
-/// a precondition that moved since the intent was accepted each refuse the action now, and the last
-/// leaves a `rejected` receipt.
+/// KR-REQ-02.08, the part that is about current state: the worker decides again at dispatch, from
+/// what it holds then. A lifetime that is spent and a precondition that is not met each refuse the
+/// action, and the precondition's refusal leaves a `rejected` receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_serial_path_rechecks_authority_expiry_identity_binding_and_preconditions() {
     let host = host().await;
