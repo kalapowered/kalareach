@@ -67,11 +67,8 @@ use kr_protocol::archive::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SyncConflictId;
-use kr_protocol::scalars::{
-    Bytes, Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
-};
+use kr_protocol::scalars::{Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64};
 use kr_protocol::sync::{MAX_SEALED_RECOVERY_BUNDLE_BYTES, SyncObjectKind};
-use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
 use crate::recovery::record::{Known, RecordFile, WriteRecord};
@@ -1399,65 +1396,6 @@ impl std::fmt::Debug for Migrated {
                 &self.updated_kit.service_origins.len(),
             )
             .finish_non_exhaustive()
-    }
-}
-
-/// One offline export: the encrypted bundle and the selected archives' own ciphertext.
-///
-/// Everything in it is already encrypted, so the export adds no protection of its own and claims
-/// none. It exists so an owner can keep a copy somewhere the service is not.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OfflineExport {
-    /// The encrypted recovery bundle, as the service holds it.
-    pub encrypted_bundle: Bytes,
-    /// The archive's public descriptor bytes.
-    pub descriptor: Bytes,
-    /// The encrypted archive manifest object.
-    pub encrypted_manifest: Bytes,
-    /// The selected member objects' encrypted bytes.
-    pub objects: Vec<Bytes>,
-}
-
-impl OfflineExport {
-    /// Constructs one offline export.
-    #[must_use]
-    pub fn new(
-        encrypted_bundle: Vec<u8>,
-        descriptor: Vec<u8>,
-        encrypted_manifest: Vec<u8>,
-        objects: Vec<Vec<u8>>,
-    ) -> Self {
-        Self {
-            encrypted_bundle: Bytes::new(encrypted_bundle),
-            descriptor: Bytes::new(descriptor),
-            encrypted_manifest: Bytes::new(encrypted_manifest),
-            objects: objects.into_iter().map(Bytes::new).collect(),
-        }
-    }
-
-    /// Encodes this offline export into its canonical KR-CBOR-1 bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecoveryError::Cbor`] when the export cannot be encoded.
-    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>> {
-        Ok(kr_cbor::to_canonical_vec(self)?)
-    }
-
-    /// Decodes an offline export from its canonical bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecoveryError::Cbor`] when the bytes cannot be decoded.
-    pub fn from_canonical_slice(bytes: &[u8]) -> Result<Self> {
-        let limits = kr_cbor::Limits {
-            max_message_len: bytes.len().max(kr_cbor::Limits::DEFAULT.max_message_len),
-            max_bytes_len: bytes.len().max(kr_cbor::Limits::DEFAULT.max_bytes_len),
-            max_collection_len: 65_536,
-            max_items: 1_000_000,
-            ..kr_cbor::Limits::DEFAULT
-        };
-        Ok(kr_cbor::from_canonical_slice(bytes, &limits)?)
     }
 }
 
