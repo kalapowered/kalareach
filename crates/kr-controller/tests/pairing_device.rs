@@ -98,6 +98,17 @@ fn secret_forms(text: &str, secret: &[u8; 32]) -> String {
     )
 }
 
+/// A code invitation's text and the code's secret half in the forms a log could print them in, one to
+/// a line: the code is ten characters, the first four of which name the invitation and are not secret.
+fn code_forms(text: &str, code: &str) -> String {
+    let secret = &code[5..];
+    format!(
+        "{text}\n{code}\n{}\n{secret}\n{}\n",
+        code.replace('-', ""),
+        secret.replace('-', "")
+    )
+}
+
 /// Writes `bytes` to `file` where only this user can read it, whole: the script reads a file the
 /// moment it appears, so it appears only when it is complete.
 fn write_private(file: &Path, bytes: &[u8]) {
@@ -372,6 +383,7 @@ impl Run {
         };
         let origin = RendezvousOrigin::new(format!("https://{}:{port}", self.service_peer))
             .expect("an origin the phone is asked to use");
+        let code_text = fixed.code.to_secret_text();
         let named = QrPayload::Code(CodeQrPayload {
             rendezvous_origin: origin,
             code: fixed.code,
@@ -379,6 +391,10 @@ impl Run {
         .to_text()
         .expect("a payload that is text")
         .to_string();
+        write_private(
+            &self.directory.join("secrets-code.txt"),
+            code_forms(&named, &code_text).as_bytes(),
+        );
         write_private(&self.directory.join("code.png"), &qr_picture(&named));
         self.say(
             "connections.txt",
