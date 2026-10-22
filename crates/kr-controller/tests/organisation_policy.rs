@@ -927,30 +927,69 @@ async fn a_stop_between_the_two_writes_leaves_the_earlier_policy_and_the_policy_
     fixture.host.stop().await;
 }
 
+/// The part of the answer that says the request's chain is recorded, which a request whose chain
+/// did not advance the host's, or that carried none, must not claim.
+const CHAIN_RECORDED: &str = "newer chain";
+
+/// The part of the answer that says the new policy is already in its file.
+const IN_ITS_FILE: &str = "already in its file";
+
 /// The chain a request followed is in the registry before the file of applied policies is written,
 /// and it stays in force when that file cannot be written: the key it replaced signs nothing more,
-/// while the file cannot be written, once it can, and after a restart. The policy the file could
-/// not hold is not in force, and the same policy applied again writes the file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chain_the_registry_took_stays_in_force_when_the_file_of_applied_policies_cannot_be_written()
- {
+/// while the file cannot be written, once it can, and after a restart. The policy in force is the
+/// one the host answered for before the request, which is no policy when `earlier` is `None` and
+/// that policy otherwise. A file that was there is moved aside for the failure and put back
+/// afterwards, which is what a failed write leaves: the earlier bytes. The same policy applied
+/// again writes the file.
+async fn a_failed_write_keeps_the_chain_and_the_policy_answered_for(earlier: Option<&[&str]>) {
     let mut fixture = Fixture::start().await;
     let _repository = install_the_example(&fixture).await;
     let now = fixture.now();
-    fixture.organisation.rotate(now - 1_000);
-    let policy = fixture.organisation.policy(3, 1, Some(&[CODEX]), now);
-    let chain = fixture.organisation.authority(now);
-    let old_key = fixture
-        .organisation
-        .policy(2, 1, Some(&[CODEX, EXAMPLE]), now - 2_000);
-    // A directory in the file's place: the registry takes the request, and the file is refused.
-    let in_the_way = applied::file_in(&state_dir(&fixture));
-    std::fs::create_dir(&in_the_way).expect("a directory in the file's place");
+    let file = applied::file_in(&state_dir(&fixture));
+    let aside = file.with_extension("aside");
+    let revision = if earlier.is_some() { 2 } else { 1 };
+    if let Some(list) = earlier {
+        apply(
+            &fixture,
+            fixture.organisation.policy(2, 1, Some(list), now),
+            None,
+        )
+        .await
+        .expect("the earlier policy applies under the key in force");
+        assert_eq!(applied_policies(&fixture).len(), 1);
+    }
+    // What the host answered for before the request, as `organisation.list` says it.
+    let before = fixture.listed().await;
+    assert_eq!(
+        before.enrolments[0].organisation_policy_revision,
+        earlier.map_or_else(Nullable::null, |_| Nullable::some(
+            OrganisationPolicyRevision::new(1)
+        ))
+    );
 
-    let refused = apply(&fixture, policy.clone(), Some(chain))
+    fixture.organisation.rotate(now - 1_000);
+    let policy = fixture
+        .organisation
+        .policy(3, revision, Some(&[CODEX]), now);
+    let chain = fixture.organisation.authority(now);
+    let old_key =
+        fixture
+            .organisation
+            .policy(2, revision + 1, Some(&[CODEX, EXAMPLE]), now - 2_000);
+    // A directory in the file's place: the registry takes the request, and the file is refused.
+    if earlier.is_some() {
+        std::fs::rename(&file, &aside).expect("the earlier file is put aside");
+    }
+    std::fs::create_dir(&file).expect("a directory in the file's place");
+
+    let refused = apply(&fixture, policy.clone(), Some(chain.clone()))
         .await
         .expect_err("the file of applied policies cannot be written");
     assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+    assert!(
+        refused.message.contains(CHAIN_RECORDED),
+        "a chain that advanced the host's is said to be recorded: {refused:?}"
+    );
     let listed = fixture.listed().await;
     assert_eq!(
         listed.enrolments[0].accepted_head.get(),
@@ -959,23 +998,68 @@ async fn a_chain_the_registry_took_stays_in_force_when_the_file_of_applied_polic
     );
     assert_eq!(
         listed.enrolments[0].organisation_policy_revision,
-        Nullable::null(),
-        "the policy the file could not hold is not in force"
+        before.enrolments[0].organisation_policy_revision,
+        "the policy the file could not hold is not in force, and the one answered for before is"
     );
-    assert_eq!(listed.effective_adapter_allowlist, Nullable::null());
+    assert_eq!(
+        listed.enrolments[0].adapter_allowlist,
+        before.enrolments[0].adapter_allowlist
+    );
+    assert_eq!(
+        listed.effective_adapter_allowlist, before.effective_adapter_allowlist,
+        "and so is the list it states"
+    );
 
+    // The same policy with no chain beside it, and with the chain the host holds now, cannot be
+    // written either, and neither says that a chain is recorded: none advanced.
+    for beside in [None, Some(chain)] {
+        let refused = apply(&fixture, policy.clone(), beside)
+            .await
+            .expect_err("the file of applied policies cannot be written");
+        assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+        assert!(
+            !refused.message.contains(CHAIN_RECORDED),
+            "no chain was recorded by this request: {refused:?}"
+        );
+        assert!(
+            !refused.message.contains(IN_ITS_FILE),
+            "and the file does not hold the policy: {refused:?}"
+        );
+    }
     refused_as(
         apply(&fixture, old_key.clone(), None).await,
         "earlier_revision",
     );
-    std::fs::remove_dir(&in_the_way).expect("the way is clear");
-    assert!(applied_policies(&fixture).is_empty());
+    std::fs::remove_dir(&file).expect("the way is clear");
+    if earlier.is_some() {
+        std::fs::rename(&aside, &file).expect("the earlier file is back");
+    }
+    assert_eq!(
+        applied_policies(&fixture).len(),
+        usize::from(earlier.is_some())
+    );
+
+    // Before any restart: the key the chain replaced still signs nothing.
+    refused_as(
+        apply(&fixture, old_key.clone(), None).await,
+        "earlier_revision",
+    );
+    assert_eq!(
+        fixture.listed().await.enrolments[0].organisation_policy_revision,
+        before.enrolments[0].organisation_policy_revision
+    );
 
     let fixture = restart_over(fixture, |_| {}).await;
+    let restarted = fixture.listed().await;
     assert_eq!(
-        fixture.listed().await.enrolments[0].accepted_head.get(),
+        restarted.enrolments[0].accepted_head.get(),
         3,
         "a restart keeps the chain the registry took"
+    );
+    assert_eq!(
+        restarted.enrolments[0].organisation_policy_revision,
+        before.enrolments[0].organisation_policy_revision,
+        "and the policy the file holds"
     );
     refused_as(apply(&fixture, old_key, None).await, "earlier_revision");
     assert!(is_admitted(&admission(&fixture).await));
@@ -984,6 +1068,57 @@ async fn a_chain_the_registry_took_stays_in_force_when_the_file_of_applied_polic
         .await
         .expect("the same policy again applies, the chain being held");
     assert_eq!(applied_policies(&fixture).len(), 1);
+    assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
+    fixture.host.stop().await;
+}
+
+/// No policy was applied before the request: the host goes back to none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_the_registry_took_stays_in_force_when_the_file_of_applied_policies_cannot_be_written()
+ {
+    a_failed_write_keeps_the_chain_and_the_policy_answered_for(None).await;
+}
+
+/// A policy was applied before the request: the host goes back to it, and its list is the one in
+/// force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_earlier_policy_stays_in_force_when_the_file_of_applied_policies_cannot_be_written() {
+    a_failed_write_keeps_the_chain_and_the_policy_answered_for(Some(&[CODEX, EXAMPLE])).await;
+}
+
+/// A write that renames the file into place and fails when it flushes the directory leaves the new
+/// policy in its file. The host keeps the policy it answered for in force, and the answer says
+/// that the file holds the new one, so that a restart before the same policy is accepted applies it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_whose_file_was_renamed_into_place_and_not_flushed_is_told_so() {
+    let fixture = Fixture::start().await;
+    let _repository = install_the_example(&fixture).await;
+    let now = fixture.now();
+    let policy = fixture.organisation.policy(2, 1, Some(&[CODEX]), now);
+    let refused = {
+        let _flushes = kr_flush::testing::refuse_flushes_of(state_dir(&fixture));
+        apply(&fixture, policy.clone(), None)
+            .await
+            .expect_err("the directory cannot be flushed")
+    };
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+    assert!(
+        refused.message.contains(IN_ITS_FILE),
+        "the answer says the file holds the new policy: {refused:?}"
+    );
+    assert_eq!(
+        fixture.listed().await.enrolments[0].organisation_policy_revision,
+        Nullable::null(),
+        "the policy answered for before is the one in force"
+    );
+    assert!(is_admitted(&admission(&fixture).await));
+
+    let fixture = restart_over(fixture, |_| {}).await;
+    assert_eq!(
+        fixture.listed().await.enrolments[0].organisation_policy_revision,
+        Nullable::some(OrganisationPolicyRevision::new(1)),
+        "a restart applies the policy the file holds, as the answer said it would"
+    );
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
     fixture.host.stop().await;
 }

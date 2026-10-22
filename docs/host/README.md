@@ -3161,14 +3161,21 @@ the chain the request followed recorded, and the same policy applied again, whic
 beside it any more, writes the file.
 
 A file that cannot be written once the registry took the request leaves the host the same way, with
-no restart: the request answers `STORAGE_UNAVAILABLE`, the chain it followed is in force, so the key
+no restart: the request answers `STORAGE_UNAVAILABLE`, a chain it followed is in force, so the key
 it replaced signs no policy, and the policy the host last answered for stays in force with it. The
-host decides from what it will read again after a restart, and that is the registry: a chain that
-the disk holds and memory lacks would be written back over by the next change to the host's policy.
-The host does not stop deciding while the file cannot be written, because a disk fault that the same
-request repairs would then leave it unable to decide. A write that failed only when it flushed the
-directory may have put the new file in place, and then the next start applies a policy that the
-answer said was not applied.
+answer says that a chain is recorded only when the request's chain advanced the host's. The host
+decides from what it will read again after a restart, and that is the registry: a chain that the
+disk holds and memory lacks would be written back over by the next change to the host's policy. The
+host does not stop deciding while the file cannot be written, because a disk fault that the same
+request repairs would then leave it unable to decide.
+
+A write that failed only when it flushed the directory has put the new file in place, and the
+policy the host answered for stays in force in memory. The answer says so, by reading the file back
+after the failure: a start before the same policy is accepted again applies the new policy, which
+the answer said was not applied. The host does not take the new policy into memory, because after a
+failed flush nothing can say which file a power loss leaves, and an error that meant "applied" would
+be harder to act on than one that means "not applied, and the file may hold it". The same policy
+sent again, once the disk works, writes the file and leaves nothing to the restart.
 
 An entry applies only to the enrolment it was applied for. A withdrawal writes the file again,
 without the entry of the organisation it left, or removes the file when no entry is left. A stop

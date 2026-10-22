@@ -153,6 +153,16 @@ pub fn publish(state_dir: &Path, record: &[u8]) -> Result<()> {
         .map_err(|error| ControllerError::registry(error.to_string()))
 }
 
+/// Whether the file holds exactly `record`, which is what a write that failed after the rename
+/// leaves behind.
+#[must_use]
+pub fn holds(state_dir: &Path, record: &[u8]) -> bool {
+    matches!(
+        kr_ipc::paths::read_owner_only_file(&file_in(state_dir), MAX_RECORD_LEN),
+        Ok(Some(bytes)) if bytes == record
+    )
+}
+
 /// Writes the applied policies in one write, or removes the file when there are none.
 ///
 /// # Errors

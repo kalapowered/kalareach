@@ -112,6 +112,30 @@ fn policy_refusal(refused: PolicyRefused) -> ControllerError {
     }
 }
 
+/// What an answer says when the store of applied policies could not be written after the registry
+/// took the request.
+///
+/// The policy the host answered for before the request stays in force in every case. The chain is
+/// said to be recorded only when the request's chain advanced the host's, and the file is said to
+/// hold the new policy only when it does: a write that failed after the rename leaves the new record
+/// in place, and a restart before the same policy is accepted then applies it.
+fn unwritten_policy(chain_recorded: bool, file_holds_it: bool, error: &ControllerError) -> String {
+    let chain = if chain_recorded {
+        ", and the newer chain the request carried is recorded"
+    } else {
+        ""
+    };
+    let file = if file_holds_it {
+        "; the new policy is already in its file, so a restart before the same policy is accepted \
+         applies it"
+    } else {
+        ""
+    };
+    format!(
+        "the policy this host answered for before this request stays in force{chain}{file}: {error}"
+    )
+}
+
 /// Whether this policy lets the host leave `organisation_id`.
 fn check_withdrawal(
     policy: &crate::grants::HostPolicy,
@@ -387,8 +411,9 @@ impl Controller {
     /// refused, or whose policy the store could not hold, writes nothing there, and a stop between
     /// the two writes leaves the policy the host last answered for in force, with the chain the
     /// request followed recorded. A file that cannot be written once the registry took the request
-    /// answers `STORAGE_UNAVAILABLE` and leaves the host the same way, with no stop: the chain is
-    /// in force, and the earlier policy stays in force with it.
+    /// answers `STORAGE_UNAVAILABLE` and leaves the host the same way, with no stop: a chain that
+    /// advanced is in force, and the earlier policy stays in force with it. A write that failed only
+    /// when it flushed the directory leaves the new file in place, and the answer says so.
     ///
     /// Only that the owner asked decides the admission: the organisation's own statement binds
     /// this host through the keys the owner confirmed when enrolling, and it never enlarges what
@@ -485,15 +510,20 @@ impl Controller {
                     })
                 },
                 |(_, record)| {
-                    crate::grants::applied::publish(self.paths.state_dir(), record).map_err(
-                        |error| ControllerError::Storage {
+                    let state_dir = self.paths.state_dir();
+                    crate::grants::applied::publish(state_dir, record).map_err(|error| {
+                        // What the answer says of the file and of the chain is read from where
+                        // they are, not from the error: the policy stays as it was in memory, but
+                        // a write that failed after the rename leaves the new record in place.
+                        ControllerError::Storage {
                             operation: "write down the organisation policies this host applies",
-                            detail: format!(
-                                "the policy this host answered for before this request stays in \
-                                 force, and a newer chain the request carried is recorded: {error}"
+                            detail: unwritten_policy(
+                                followed_head.get().is_some(),
+                                crate::grants::applied::holds(state_dir, record),
+                                &error,
                             ),
-                        },
-                    )
+                        }
+                    })
                 },
             )?;
             answer
