@@ -2665,6 +2665,7 @@ struct RealShell {
     bridge_task: tokio::task::JoinHandle<()>,
     /// The shell of the package this session launched, which is what its keyboard and startup file
     /// are chosen by.
+    #[cfg(unix)]
     kind: ShellKind,
     /// The shell the session qualified as, once it has: not yet while a profile is still asking.
     qualified: Option<ShellKind>,
@@ -2908,6 +2909,7 @@ impl RealShell {
             _home: home,
             runtime,
             bridge_task,
+            #[cfg(unix)]
             kind: package.kind(),
             qualified,
         }
