@@ -2095,8 +2095,8 @@ mod tests {
         );
     }
 
-    /// `kr host terminal` shows the saved terminal preference with no option, sets it with `--set`
-    /// and clears it with `--clear`, and the last two are not one request.
+    /// `kr host terminal` with no option changes nothing, `--set` names a terminal, and naming one
+    /// while clearing it is not one request.
     #[test]
     fn the_terminal_preference_is_shown_set_and_cleared() {
         let parsed = Cli::try_parse_from(["kr", "host", "terminal"]).expect("parses");
