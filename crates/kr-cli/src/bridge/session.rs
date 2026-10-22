@@ -585,7 +585,7 @@ mod tests {
         let second = std::cell::RefCell::new(Some(second));
         let mut link = linked(first).await;
         let opened = std::cell::Cell::new(0);
-        let profile = default_profile(&mut link, || {
+        let (profile, _) = destination_defaults(&mut link, || {
             opened.set(opened.get() + 1);
             let opening = second.borrow_mut().take().expect("opened once");
             async move { Ok(linked(opening).await) }
@@ -645,7 +645,7 @@ mod tests {
         let (_second, second) = answering(&[withdrawn()]);
         let second = std::cell::RefCell::new(Some(second));
         let mut link = linked(first).await;
-        let refused = default_profile(&mut link, || {
+        let refused = destination_defaults(&mut link, || {
             let opening = second.borrow_mut().take().expect("opened once");
             async move { Ok(linked(opening).await) }
         })
@@ -662,7 +662,7 @@ mod tests {
     async fn a_profile_read_that_is_answered_opens_no_second_bridge() {
         let (_first, first) = answering(&[host_info(WorkerProfile::HeadlessUser)]);
         let mut link = linked(first).await;
-        let profile = default_profile(&mut link, || async {
+        let (profile, _) = destination_defaults(&mut link, || async {
             panic!("a second bridge was opened");
             #[allow(unreachable_code)]
             Err(CliError::Other(Shown::said("unreachable")))
