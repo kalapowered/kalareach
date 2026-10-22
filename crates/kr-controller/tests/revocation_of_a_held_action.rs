@@ -17,9 +17,15 @@
 //! `barrier.rs` show. The daemon does not hold the worker here, so the test speaks to the worker as
 //! its daemon does, over connections of its own: it forwards the action and announces the revision.
 //!
+//! The worker bounds a component's preparation at five seconds from acceptance, on the runtime's
+//! own timer, and no test clock stops it: the sequence is a few exchanges, and a run too slow for
+//! it fails (the action is rejected as unavailable) and does not pass.
+//!
 //! Not claimed: Windows, where a plugin host cannot be held with a stop signal.
 
 #![cfg(unix)]
+
+use std::sync::Arc;
 
 use kr_protocol::envelope::Outcome;
 use kr_protocol::ids::ActionId;
@@ -31,10 +37,6 @@ mod plugin_world;
 use plugin_world::acting::{
     Acting, a_lease, a_paired_device, announce, signal, until_the_devices_receipt_is,
 };
-
-/// How far off the deadlines of the action and of its lease are: the case shows a revocation, so it
-/// must never reach an expiry first.
-const FAR_OFF_MS: u64 = 10 * 60 * 1000;
 
 /// A paired device's action, forwarded by the daemon and accepted by the worker, held while its
 /// component prepares it.
@@ -55,7 +57,9 @@ impl HeldDeviceAction {
     /// Holds a device's `turn.cancel` in its preparation, or nothing where the test components
     /// are not built.
     async fn begin() -> Option<Self> {
-        let acting = Acting::start().await?;
+        // The worker's deadlines are measured on a clock this suite never moves, so neither the
+        // action's accepted deadline nor its lease ends before the revocation does.
+        let acting = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await?;
         let mut proxy = acting
             .hosted
             .daemon_connection(ControllerConnectionRole::Proxy)
@@ -80,12 +84,12 @@ impl HeldDeviceAction {
                         .into_iter()
                         .collect(),
                     accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
-                        kr_ipc::clock::boot_elapsed_ms() + FAR_OFF_MS,
+                        kr_ipc::clock::boot_elapsed_ms() + 60_000,
                     ),
                     history: None,
                     screen_basis: None,
                     workflow_run_id: None,
-                    lease: Some(a_lease(&acting, 1, FAR_OFF_MS)),
+                    lease: Some(a_lease(&acting, 1, 60_000)),
                 },
             )))
             .await
