@@ -714,8 +714,8 @@ export interface FakeHostControls {
   setCameraAccess(access: CameraAccess): void
   /** How many times the page asked what the system says of the camera. */
   readonly cameraAsked: { count: number }
-  /** Whether the screen is being kept on, and how many times it was asked to be. */
-  readonly keptAwake: { on: boolean; asked: number }
+  /** Whether the screen is being kept on. */
+  readonly keptAwake: { on: boolean }
   /** The codes the page started pairing with, in order. */
   readonly startedCodes: string[]
   /** Sets the confirmations the hosts ask for, as native code would publish them. */
@@ -957,7 +957,7 @@ export function fakeHost(
   const settingsOpened = { count: 0 }
   const cameraAccessNow: { access: CameraAccess } = { access: 'prompt' }
   const cameraAsked = { count: 0 }
-  const keptAwake = { on: false, asked: 0 }
+  const keptAwake = { on: false }
   const intakeHolds = new Map<IntakeSource, Promise<void>>()
   const takeIn = (source: IntakeSource): Promise<IntakeView> => {
     intakes.push(source)
@@ -1590,9 +1590,14 @@ export function fakeHost(
         return environments(hostEnvironment, anotherHost ? 'another host · Linux' : null)
       }),
 
-    sessionList: () =>
+    sessionList: (params) =>
       reading('sessionList', () => {
         requireConnection()
+        // A host holds the operation to the parameters it names, and refuses a call that leaves one
+        // out: a screen that asks for fewer is one that no session list reaches.
+        const given = (params ?? {}) as { environment_id?: unknown; include_closed?: unknown }
+        if (!('environment_id' in given)) refuse('INVALID_ARGUMENT', 'missing field `environment_id`')
+        if (typeof given.include_closed !== 'boolean') refuse('INVALID_ARGUMENT', 'missing field `include_closed`')
         if (sessionListFailure !== null) {
           const words = sessionListFailure
           sessionListFailure = null
@@ -2162,7 +2167,6 @@ export function fakeHost(
     pairingScanPhoto: () => takeIn('photo'),
     pairingKeepAwake: (on) => {
       keptAwake.on = on
-      keptAwake.asked += 1
       return Promise.resolve()
     },
     cameraAccess: () => {
