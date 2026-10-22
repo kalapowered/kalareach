@@ -542,6 +542,13 @@ mod tests {
     }
 
     fn host_info(profile: WorkerProfile) -> Outcome {
+        host_info_naming(profile, None)
+    }
+
+    fn host_info_naming(
+        profile: WorkerProfile,
+        default_shell_mode: Option<kr_protocol::hostinfo::DefaultShellMode>,
+    ) -> Outcome {
         Outcome::Ok(
             ParamsValue::from_typed(&HostInfoResult {
                 build_id: BuildId::new("kr-controller/0.1.0").expect("a build"),
@@ -562,7 +569,7 @@ mod tests {
                 ),
                 machine: None,
                 privacy: None,
-                default_shell_mode: None,
+                default_shell_mode,
             })
             .expect("a payload"),
         )
@@ -653,6 +660,47 @@ mod tests {
         assert!(
             matches!(&refused, Err(CliError::Refused(error)) if error.code == ErrorCode::PermissionDenied),
             "{refused:?}"
+        );
+        let _ = link.close().await;
+    }
+
+    /// KR-REQ-26.13: a create in an enrolled environment that names no shell mode takes the mode the
+    /// destination says it creates sessions in. A destination of an earlier release, which names
+    /// none, is created in the product default.
+    #[tokio::test]
+    async fn a_create_that_names_no_shell_mode_takes_the_destinations_own() {
+        use kr_protocol::hostinfo::{DefaultShellMode, configuration::ValueSource};
+        let (_named, named) = answering(&[host_info_naming(
+            WorkerProfile::HeadlessUser,
+            Some(DefaultShellMode {
+                mode: ShellMode::NativeCompat,
+                source: ValueSource::HostConfiguration,
+            }),
+        )]);
+        let mut link = linked(named).await;
+        let (_, mode) = destination_defaults(&mut link, || async {
+            panic!("a second bridge was opened");
+            #[allow(unreachable_code)]
+            Err(CliError::Other(Shown::said("unreachable")))
+        })
+        .await
+        .expect("answered");
+        assert_eq!(mode, ShellMode::NativeCompat);
+        let _ = link.close().await;
+
+        let (_earlier, earlier) = answering(&[host_info(WorkerProfile::HeadlessUser)]);
+        let mut link = linked(earlier).await;
+        let (_, mode) = destination_defaults(&mut link, || async {
+            panic!("a second bridge was opened");
+            #[allow(unreachable_code)]
+            Err(CliError::Other(Shown::said("unreachable")))
+        })
+        .await
+        .expect("answered");
+        assert_eq!(
+            mode,
+            kr_protocol::hostinfo::configuration::DEFAULT_SHELL_MODE,
+            "a destination that names no default is created in the product default"
         );
         let _ = link.close().await;
     }
