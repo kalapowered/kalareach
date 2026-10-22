@@ -662,8 +662,8 @@ fn detect_under(root: &std::path::Path) -> Vec<TerminalApplication> {
 /// The Linux terminals found in the directories of `search`, offered only where a desktop launcher
 /// (`gio`, else `gtk-launch`) is installed too.
 ///
-/// A desktop terminal needs the desktop launcher. Without one there is nothing to open a window
-/// with, whatever is installed.
+/// Section 7 selects a Linux terminal through the desktop launcher, so with no launcher none is
+/// offered, whatever is installed.
 #[cfg(all(unix, not(target_vendor = "apple")))]
 fn detect_on(search: Option<&std::ffi::OsStr>) -> Vec<TerminalApplication> {
     let Some(launcher) =
@@ -1062,7 +1062,7 @@ mod tests {
         let through =
             |launcher: &str| format!("through {}", directory.path().join(launcher).display());
 
-        // Terminals with no launcher: a window could not be opened, so none is offered.
+        // Terminals with no launcher: none is offered.
         install(&[
             "gnome-terminal",
             "konsole",
