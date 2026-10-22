@@ -3180,13 +3180,14 @@ impl Rig {
     }
 
     /// Starts the worker with an application that reads nothing until the trigger is pulled, and
-    /// keeps all it reads.
+    /// keeps all it reads ([`common::KEEPS_WHAT_IT_READS`], which says why it is not `tee`).
     async fn start_late() -> Self {
         Self::from_script(|received, trigger| {
             format!(
                 "stty raw -echo; printf '\\033[?2004hkr-ready.'; cat {} >/dev/null; \
-                 exec tee {}",
+                 exec {} {}",
                 kr_worker::testing::shell_quoted(trigger),
+                common::KEEPS_WHAT_IT_READS,
                 kr_worker::testing::shell_quoted(received)
             )
         })
