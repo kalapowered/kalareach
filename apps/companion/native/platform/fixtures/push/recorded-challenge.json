@@ -1,0 +1,28 @@
+{
+  "message": {
+    "android": {
+      "priority": "high",
+      "ttl": "300s"
+    },
+    "apns": {
+      "headers": {
+        "apns-expiration": "1792702975",
+        "apns-priority": "5",
+        "apns-push-type": "background"
+      },
+      "payload": {
+        "aps": {
+          "content-available": 1
+        }
+      }
+    },
+    "data": {
+      "kr_challenge": "zr-xdK51ESgkHt3MUBhUNFOKpG0YfH7xKHBCCsZACew",
+      "kr_expires_at_ms": "1792702975465",
+      "kr_gateway_origin": "http://127.0.0.1:56940",
+      "kr_registration_id": "ccbd2d41-50b1-4a01-b458-0504827d2837",
+      "kr_token_digest": "gvc-Vzk8JZOcRilk_zF6oAFDgo-Uvfiq_kSrt3IZgBM"
+    },
+    "token": "kr-device-run-f36cf6c4-79df-4e7e-87ce-1141d534cafc"
+  }
+}
