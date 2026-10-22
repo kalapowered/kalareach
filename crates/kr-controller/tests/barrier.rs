@@ -3342,16 +3342,92 @@ async fn an_announcement_names_the_grants_a_withdrawal_reached_and_the_host_for_
     );
 }
 
+/// KR-REQ-10.45: the grants a withdrawal reached that hold the size of the session are named to a
+/// worker as well as those that hold its input lease. A grant that carries `terminal.geometry` and
+/// not `terminal.input` is the one a fence that named only typists would leave the size with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_announcement_names_a_grant_that_holds_only_the_size_of_the_session() {
+    use kr_controller::grants::GrantRecord;
+    use kr_controller::service::Audience;
+    use kr_protocol::ids::GrantId;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::CanonicalSet;
+    use kr_protocol::worker::RevisionReach;
+
+    let hosted = hosted_worker().await;
+    let sizing = a_grant_of(
+        GrantId::new(Uuid::from_bytes([0x42; 16])),
+        None,
+        &[ActionRight::SessionView, ActionRight::TerminalGeometry],
+    );
+    hosted
+        .controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: sizing.clone(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+
+    let before = hosted.controller.announcements_sent_for_tests().len();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted
+            .controller
+            .revoke_grant(sizing.grant_id, Audience::Host, None, None),
+    )
+    .await
+    .expect("the revocation completes")
+    .expect("it succeeds");
+    let announced = hosted.controller.announcements_sent_for_tests()[before..]
+        .iter()
+        .find(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+        .cloned()
+        .expect("the worker is announced to");
+    assert_eq!(
+        announced.reach,
+        RevisionReach::Within {
+            since: AuthorityRevision::new(announced.revision - 1),
+            grants: [sizing.grant_id].into_iter().collect(),
+            devices: CanonicalSet::new(),
+        },
+        "the worker is told which grant held the size"
+    );
+}
+
 /// A grant that lets its holder watch the terminal and type into it, under `parent`.
 fn a_typists_grant(
     id: kr_protocol::ids::GrantId,
     parent: Option<kr_protocol::ids::GrantId>,
 ) -> kr_protocol::grant::Grant {
+    a_grant_of(
+        id,
+        parent,
+        &[
+            kr_protocol::rights::ActionRight::SessionView,
+            kr_protocol::rights::ActionRight::TerminalInput,
+        ],
+    )
+}
+
+/// A grant that carries exactly `actions`, under `parent`.
+fn a_grant_of(
+    id: kr_protocol::ids::GrantId,
+    parent: Option<kr_protocol::ids::GrantId>,
+    actions: &[kr_protocol::rights::ActionRight],
+) -> kr_protocol::grant::Grant {
     use kr_protocol::grant::{
         EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
     };
     use kr_protocol::ids::DeviceId;
-    use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::CanonicalSet;
 
     Grant {
@@ -3362,9 +3438,7 @@ fn a_typists_grant(
         authority_revision: AuthorityRevision::new(1),
         environment_selector: EnvironmentSelector::Any,
         session_selector: SessionSelector::Any,
-        actions: [ActionRight::SessionView, ActionRight::TerminalInput]
-            .into_iter()
-            .collect(),
+        actions: actions.iter().copied().collect(),
         history: HistoryScope {
             lower_bound_ms: Nullable::some(TimestampMs::new(1)),
             include_live_screen: false,

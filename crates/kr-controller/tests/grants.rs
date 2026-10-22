@@ -1337,7 +1337,7 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input() {
         "the live ones and one that has run out: not the one revoked and fenced, or the proposal"
     );
     assert_eq!(
-        revocation.reached_with_input,
+        revocation.reached_holding_leases,
         ids(&[1, 2, 5]).into_iter().collect(),
         "and the viewer's grant is not one an input lease is held under"
     );

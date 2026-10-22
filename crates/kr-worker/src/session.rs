@@ -2699,6 +2699,51 @@ impl Session {
         only: GrantedInput<'_>,
         install: Option<kr_protocol::ids::AuthorityRevision>,
     ) {
+        self.fence_granted_input_lease(only, install);
+        // The size is the other thing a caller holds under a grant that a revision withdraws, and
+        // it goes in the same hold, before the worker acknowledges the revision.
+        if let GrantedInput::Within(reach) = only {
+            self.release_size_within(reach);
+        }
+    }
+
+    /// Takes the size from every caller made under authority `reach` names that claims it.
+    ///
+    /// A claim is withdrawn through the session's own [`Self::configure`], so the size passes to
+    /// the oldest remaining eligible claim, the terminal is resized to that claim's window, and
+    /// every view is told. The claims that do not own the size go first and the owner's last, so
+    /// that the session is resized once, to a claim the revision did not name. The caller claims
+    /// the size again when it is authorised to: a withdrawn claim does not come back by itself,
+    /// which is the difference between the size and an input lease that is acquired on the next
+    /// request.
+    ///
+    /// A resize the terminal refuses leaves the claim withdrawn and the size unowned
+    /// ([`Self::configure`]), which is what the revision asked for, so the refusal is not the
+    /// fence's.
+    fn release_size_within(&mut self, reach: &kr_protocol::worker::RevisionReach) {
+        let owner = self.attachments.geometry().owner.0;
+        let mut named: Vec<AttachmentId> = {
+            let input = self.input.lock();
+            self.attachments
+                .iter()
+                .filter(|attachment| {
+                    attachment.claim_geometry
+                        && input.granted_attachment_within(attachment.id, reach)
+                })
+                .map(|attachment| attachment.id)
+                .collect()
+        };
+        named.sort_by_key(|id| Some(*id) == owner);
+        for attachment_id in named {
+            let _ = self.configure(attachment_id, false);
+        }
+    }
+
+    fn fence_granted_input_lease(
+        &mut self,
+        only: GrantedInput<'_>,
+        install: Option<kr_protocol::ids::AuthorityRevision>,
+    ) {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
         let mut owed = Vec::new();

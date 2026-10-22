@@ -6994,8 +6994,8 @@ export interface AuthorityRevisionNotice {
            */
           devices: DeviceId[]
           /**
-           * The grants the revisions withdrew that can hold an input lease, with everything
-           * delegated from them that anyone held.
+           * The grants the revisions withdrew that can hold an input lease or the size of the
+           * session, with everything delegated from them that anyone held.
            */
           grants: GrantId[]
           /**

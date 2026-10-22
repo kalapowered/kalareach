@@ -342,9 +342,10 @@ pub struct GrantRevocation {
     /// voice grant holds no input and is never in here, so a debt written only for a voice grant
     /// whose close can still run (see [`Self::debt`]) has nothing in this list.
     pub reached: Vec<GrantId>,
-    /// The grants of [`Self::reached`] that carry `terminal.input`: the only ones an input lease
-    /// can be held under, so the only ones a worker has to be told.
-    pub reached_with_input: BTreeSet<GrantId>,
+    /// The grants of [`Self::reached`] that carry `terminal.input` or `terminal.geometry`: the only
+    /// ones an input lease or the size of a session can be held under, so the only ones a worker
+    /// has to be told.
+    pub reached_holding_leases: BTreeSet<GrantId>,
     /// The devices that held what this call revoked, which is what a revocation has to fence.
     pub devices: BTreeSet<DeviceId>,
     /// The sessions those grants covered, which is what a revocation has to close subscriptions
@@ -1191,7 +1192,7 @@ impl GrantDirectory {
                 ),
                 revoked: Vec::new(),
                 reached: Vec::new(),
-                reached_with_input: BTreeSet::new(),
+                reached_holding_leases: BTreeSet::new(),
                 devices: BTreeSet::new(),
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
@@ -1235,7 +1236,9 @@ impl GrantDirectory {
                 )?;
                 merged.revoked.extend(one.revoked);
                 merged.reached.extend(one.reached);
-                merged.reached_with_input.extend(one.reached_with_input);
+                merged
+                    .reached_holding_leases
+                    .extend(one.reached_holding_leases);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
@@ -1457,7 +1460,7 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut reached = Vec::new();
-        let mut reached_with_input = BTreeSet::new();
+        let mut reached_holding_leases = BTreeSet::new();
         let mut devices = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
@@ -1474,8 +1477,11 @@ impl GrantDirectory {
                 if record
                     .grant
                     .permits(kr_protocol::rights::ActionRight::TerminalInput)
+                    || record
+                        .grant
+                        .permits(kr_protocol::rights::ActionRight::TerminalGeometry)
                 {
-                    reached_with_input.insert(record.grant.grant_id);
+                    reached_holding_leases.insert(record.grant.grant_id);
                 }
             }
             let is_the_named_one = record.grant.grant_id == grant_id;
@@ -1541,7 +1547,7 @@ impl GrantDirectory {
             grant_id,
             revoked,
             reached,
-            reached_with_input,
+            reached_holding_leases,
             devices,
             sessions,
             covers_every_session,

@@ -34160,7 +34160,7 @@
                   "uniqueItems": true
                 },
                 "grants": {
-                  "description": "The grants the revisions withdrew that can hold an input lease, with everything\ndelegated from them that anyone held.",
+                  "description": "The grants the revisions withdrew that can hold an input lease or the size of the\nsession, with everything delegated from them that anyone held.",
                   "items": {
                     "$ref": "#/$defs/GrantId"
                   },

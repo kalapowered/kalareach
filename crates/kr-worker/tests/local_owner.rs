@@ -408,6 +408,25 @@ impl Wired {
         }
     }
 
+    /// A terminal of `dimensions` that claims the size, asking for `requested`.
+    fn terminal_claiming(
+        &self,
+        requested: &[AttachmentCapability],
+        dimensions: Dimensions,
+    ) -> SessionAttachParams {
+        SessionAttachParams {
+            claim_geometry: true,
+            dimensions: Nullable::some(dimensions),
+            ..self.terminal(requested)
+        }
+    }
+
+    /// Who owns the session's size, and at what size.
+    fn size(&self) -> (Option<AttachmentId>, Dimensions) {
+        let geometry = self.runtime.session().geometry();
+        (geometry.owner.0, geometry.dimensions)
+    }
+
     /// A subscription of one attachment to the session's output.
     fn subscription(&self, request_id: RequestId, attachment_id: AttachmentId) -> Request {
         let mut streams = CanonicalSet::new();
@@ -556,6 +575,51 @@ impl Wired {
             &self.terminal(requested),
         )
         .await
+        .expect("the attach is admitted")
+        .to_typed()
+        .expect("an attachment")
+    }
+
+    /// Forwards an attach for `actor` of a terminal of `dimensions` that claims the size.
+    async fn attach_claiming_for(
+        &self,
+        daemon: &mut Client<impl Codec>,
+        actor: &ActorEnvelope,
+        rights: &[ActionRight],
+        requested: &[AttachmentCapability],
+        dimensions: Dimensions,
+    ) -> SessionAttachResult {
+        self.forward(
+            daemon,
+            actor,
+            rights,
+            Method::SessionAttach,
+            &self.terminal_claiming(requested, dimensions),
+        )
+        .await
+        .expect("the attach is admitted")
+        .to_typed()
+        .expect("an attachment")
+    }
+
+    /// Attaches a terminal of `dimensions` that claims the size, in one of the owner's windows.
+    async fn attach_claiming_in(
+        &self,
+        window: &mut Client<impl Codec>,
+        requested: &[AttachmentCapability],
+        dimensions: Dimensions,
+    ) -> SessionAttachResult {
+        within(
+            "the attach",
+            window.mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target(),
+                &self.terminal_claiming(requested, dimensions),
+            ),
+        )
+        .await
+        .expect("the call reaches the worker")
         .expect("the attach is admitted")
         .to_typed()
         .expect("an attachment")
@@ -2455,6 +2519,132 @@ async fn a_reach_is_trusted_by_a_worker_that_has_fenced_the_revision_it_follows_
         .await;
     assert!(typing.holds_the_lease());
     typing.close();
+}
+
+/// The rights and the capabilities of a phone that may take the size of the session.
+const WATCH_AND_SIZE: &[ActionRight] = &[ActionRight::SessionView, ActionRight::TerminalGeometry];
+const OBSERVE_AND_SIZE: [AttachmentCapability; 2] = [
+    AttachmentCapability::ObserveTerminal,
+    AttachmentCapability::Geometry,
+];
+
+/// A worker that has acknowledged revision 2, a phone that owns the session's size under
+/// [`device`]'s grant, and the owner's own window, which claimed the size after it.
+struct Resizing {
+    wired: Wired,
+    authority: BoundLink,
+    phone: BoundLink,
+    window: LocalClient,
+    phones: AttachmentId,
+    windows: AttachmentId,
+}
+
+impl Resizing {
+    async fn start() -> Self {
+        let wired = wired("sleep 120").await;
+        let mut authority = wired.daemon(ControllerConnectionRole::Authority).await;
+        let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
+        wired.revise(&mut authority, 2).await;
+        let phones = wired
+            .attach_claiming_for(
+                &mut phone,
+                &device(2),
+                WATCH_AND_SIZE,
+                &OBSERVE_AND_SIZE,
+                Dimensions::new(100, 40),
+            )
+            .await
+            .attachment
+            .attachment_id;
+        let mut window = wired.window().await;
+        let windows = wired
+            .attach_claiming_in(&mut window, &OBSERVE_AND_SIZE, Dimensions::new(120, 30))
+            .await
+            .attachment
+            .attachment_id;
+        assert_eq!(
+            wired.size(),
+            (Some(phones), Dimensions::new(100, 40)),
+            "the phone claimed the size first, and a later claim displaces nobody"
+        );
+        Self {
+            wired,
+            authority,
+            phone,
+            window,
+            phones,
+            windows,
+        }
+    }
+
+    fn close(self) {
+        drop((self.authority, self.phone, self.window));
+        self.wired.close();
+    }
+}
+
+/// KR-REQ-10.45: a revision takes the size of the session from the callers its reach names, and no
+/// other caller's, before the worker acknowledges it.
+///
+/// The phone owns the size under a grant that carries no input right. A revision that names
+/// another grant leaves the size where it is. One that names the phone's grant, or its pairing,
+/// hands the size to the oldest remaining claim, the owner's own window, at the window's size, and
+/// the phone's claim is gone: it owns nothing again until it claims anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_takes_the_size_from_the_callers_it_names_and_from_no_other() {
+    let mut sized = Resizing::start().await;
+    let (stranger_grant, stranger_device) = a_stranger();
+
+    sized
+        .wired
+        .revise_within(&mut sized.authority, 3, grant_reach(2, stranger_grant))
+        .await;
+    sized
+        .wired
+        .revise_within(&mut sized.authority, 4, device_reach(3, stranger_device))
+        .await;
+    assert_eq!(
+        sized.wired.size().0,
+        Some(sized.phones),
+        "a revision that names neither the phone's grant nor the phone leaves its size"
+    );
+
+    sized
+        .wired
+        .revise_within(&mut sized.authority, 5, grant_reach(4, devices_grant()))
+        .await;
+    assert_eq!(
+        sized.wired.size(),
+        (Some(sized.windows), Dimensions::new(120, 30)),
+        "the phone's grant was named, so the size is the owner's window's"
+    );
+
+    // The owner's own window is nobody's grant: a revision of the whole host leaves it the size.
+    sized.wired.revise(&mut sized.authority, 6).await;
+    assert_eq!(sized.wired.size().0, Some(sized.windows));
+    sized.close();
+}
+
+/// KR-REQ-10.45: a revision of the whole host takes the size from every caller under a grant, as
+/// it takes every input lease of one, and the local owner's claim stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_of_the_whole_host_takes_the_size_from_every_caller_under_a_grant() {
+    let mut sized = Resizing::start().await;
+
+    sized.wired.revise(&mut sized.authority, 3).await;
+    assert_eq!(
+        sized.wired.size(),
+        (Some(sized.windows), Dimensions::new(120, 30))
+    );
+    let summaries = sized.wired.runtime.session().attachments();
+    assert!(
+        summaries
+            .iter()
+            .find(|summary| summary.attachment_id == sized.phones)
+            .is_some_and(|summary| !summary.claim_geometry),
+        "the phone's claim is gone, and it is attached still"
+    );
+    sized.close();
 }
 
 /// Holds the worker's dispatch boundary on a thread of its own until it is dropped.
