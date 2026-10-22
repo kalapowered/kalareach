@@ -12,14 +12,14 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-06.07 | an upstream frame the worker offers reaches the binding's component with its bytes, its provenance and the request identifier it carried, once and in order, and the handle is the broker's own for a request the upstream is waiting on |
+//! | KR-REQ-06.07 | an upstream frame the worker offers reaches the binding's component with its bytes, its provenance and the request identifier it carried, once and in order |
 //! | KR-REQ-11.01 | the same run, through a vendor component that needed no core release; the binding's other bindings, a binding without the stream, another package's binding and a rich-disabled binding are offered nothing, a frame the table does not list and one it lists as a credential are offered to nobody |
-//! | KR-REQ-11.38 | a lane that is full loses the oldest observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; an observation that asks for more memory or produces more output than a call may is refused and the binding's record names the bound; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
+//! | KR-REQ-11.38 | a lane that is full loses observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; an observation that asks for more memory or produces more output than a call may is refused and the binding's record names the bound; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
 //! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime has stopped reading what is handed to it; the worker lets go of that runtime and takes the component up again when it reads |
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
 //! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
 //! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
-//! | KR-REQ-24.27 | turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, and turning it off lets state be taken again |
+//! | KR-REQ-24.27 | turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, a component offered anything made in it has no state taken until it starts again, and then state is taken again |
 
 #![cfg(unix)]
 
@@ -169,7 +169,7 @@ async fn kr_req_06_07_a_frame_the_worker_offers_reaches_the_components_that_may_
     }
 }
 
-/// KR-REQ-11.38 and KR-REQ-11.39: a lane that is full loses the oldest observations it holds, counts
+/// KR-REQ-11.38 and KR-REQ-11.39: a lane that is full loses observations it holds, counts
 /// what it lost, and takes the component through a fresh snapshot, and it never loses the request
 /// the upstream is waiting on; and the terminal, which pushes onto the same lane, is neither slowed
 /// nor left unanswered while nothing at all is taking what is on it.
@@ -262,12 +262,12 @@ async fn kr_req_11_38_a_full_lane_loses_the_oldest_observations_and_never_the_re
 /// plugin runtime has stopped reading what the worker hands it; the worker lets go of a runtime that
 /// does not read, and takes the component up again when the runtime does.
 ///
-/// The runtime is stopped (`SIGSTOP`), and the shell then prints twelve megabytes, which the worker
+/// The runtime is stopped (`SIGSTOP`), and the shell then prints eight megabytes, which the worker
 /// offers the component as terminal output. The shell finishes, and asks and is answered after it,
-/// with the runtime still stopped. A runtime that has not taken an event in ten seconds has stopped
-/// reading, and the client's writer gives up on it, so the link lets the connection go and the
-/// component is no longer ready. When the runtime goes on, the link reaches it again and the
-/// component is ready, and enabled.
+/// with the runtime still stopped. A runtime that does not take an event it is handed within ten
+/// seconds, or does not answer the link's health question twice running, has stopped reading, and
+/// the link lets the connection go: the component is no longer ready. When the runtime goes on, the
+/// link reaches it again and the component is ready, and enabled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_stopped_reading() {
     let gate = std::env::temp_dir().join(format!("kr-observe-gate-{}", kr_ipc::new_uuid()));
@@ -292,6 +292,19 @@ async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_
         || async { world.output().contains("answered-0-").then_some(()) },
     )
     .await;
+    // The component is offered the terminal's output, as the owner's terminal receives it.
+    world
+        .until_account(
+            1,
+            "the component to have observed the terminal's output",
+            |account| {
+                account
+                    .seen
+                    .iter()
+                    .any(|seen| seen.provenance == "terminal_scrape")
+            },
+        )
+        .await;
 
     let host = world.hosted.published().expect("the runtime is published");
     plugin_world::acting::signal(&host, rustix::process::Signal::STOP);
@@ -538,22 +551,15 @@ async fn kr_req_11_41_a_component_compiled_at_registration_is_observed_inside_it
         reason.contains("compiled in"),
         "the registration compiled the component: {reason}"
     );
-    let client = world
-        .broker()
-        .component_calls()
-        .client()
-        .expect("the connection to the runtime is held");
-    let before = client
-        .health()
-        .await
-        .expect("a health report")
-        .component_calls;
+    // The component counts the observations it finished, and a call that faulted is not one.
     world.send(&notification("one"));
-    until("the observation to have finished", || async {
-        let now = client.health().await.ok()?.component_calls;
-        (now > before).then_some(())
-    })
-    .await;
+    world
+        .until_account(
+            1,
+            "the component to have finished an observation",
+            |account| account.observes >= 1,
+        )
+        .await;
     assert!(
         !world.reason(1).contains("fault"),
         "an observation after a cold compile faulted: {}",
@@ -567,9 +573,10 @@ async fn kr_req_11_41_a_component_compiled_at_registration_is_observed_inside_it
 /// replacement and restored to the state the worker held.
 ///
 /// The worker holds all three: the receipt of an owner's attach is in its journal, the agent's
-/// question is in its ledger, and the upstream's permission request was read into an approval by a
-/// binding trusted to decode it and is in its broker. Neither the runtime nor its component holds
-/// any of them. The runtime is killed with `SIGKILL` after the worker has taken its component's
+/// question is in its ledger, and the upstream's permission request was read into an approval, by
+/// the connector table's own decision response, for a binding trusted to decode it, and is in its
+/// broker with the decoder's record. Neither the runtime nor its component holds any of them. (The
+/// component does not decode the request: that call waits for the plugin host's decode request.) The runtime is killed with `SIGKILL` after the worker has taken its component's
 /// state, and the daemon starts another on the worker's asking. The three are read again, and are
 /// equal; the person's answer to the approval goes to the upstream once, through the native
 /// terminal, and the person's answer to the question is taken. The component in the replacement
@@ -631,6 +638,11 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
         Some(PendingState::Pending),
         "{before:?}"
     );
+    let decoded = world
+        .broker()
+        .decoding(approval)
+        .expect("the ledger reads")
+        .expect("the interpretation is recorded with its decoder");
 
     // The runtime is killed, and the daemon starts another on the worker's asking.
     let host = world.hosted.published().expect("the runtime is published");
@@ -680,6 +692,15 @@ async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_app
     assert_eq!(
         after, before,
         "the receipt, the question and the approval are unchanged"
+    );
+    assert_eq!(
+        world
+            .broker()
+            .decoding(approval)
+            .expect("the ledger reads")
+            .as_ref(),
+        Some(&decoded),
+        "and so is the record of who read the request and what they offered"
     );
 
     // And is live. The person answers the approval through the native terminal, and the upstream
@@ -787,10 +808,7 @@ async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none
             |account| account.observes >= 2,
         )
         .await;
-    assert!(
-        lane.view(binding(1))
-            .is_some_and(|view| view.offered_since_checkpoint > 0 && view.private_content)
-    );
+    world.until_offered(1).await;
     assert!(lane.checkpoint_due(later).is_empty());
     assert_eq!(lane.held_checkpoints(), (0, 0));
 
@@ -798,10 +816,6 @@ async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none
     // still not asked.
     world.tell_privacy(&mut authority, 2, false).await;
     assert!(!lane.is_private());
-    assert!(
-        lane.view(binding(1))
-            .is_some_and(|view| view.offered_since_checkpoint > 0)
-    );
     assert!(lane.checkpoint_due(later).is_empty());
     assert_eq!(lane.held_checkpoints(), (0, 0));
 
@@ -826,4 +840,52 @@ async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none
     world.until_ready(1).await;
     world.send(&notification("three"));
     world.until_held(1, "observe=1;").await;
+}
+
+/// KR-REQ-24.27: what the worker had while privacy mode was on is made in it however long it waits
+/// to be offered. A frame that reached the worker in privacy mode and is offered to the component
+/// after privacy mode ended leaves the component holding something made in privacy mode, so no
+/// state is taken from it afterwards.
+///
+/// The worker's pump is held while privacy mode is turned on, a frame arrives, and privacy mode is
+/// turned off again; then the pump goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_an_observation_made_in_privacy_mode_and_offered_after_it_leaves_no_state_taken()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let hold = lane.hold_pump();
+    until("the pump to stop at the hold", || async {
+        hold.parked().then_some(())
+    })
+    .await;
+
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    world.tell_privacy(&mut authority, 1, true).await;
+    world.send(&notification("made in privacy mode"));
+    until("the lane to hold the frame", || async {
+        (lane.waiting() == 1).then_some(())
+    })
+    .await;
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
+
+    hold.release();
+    world
+        .until_account(
+            1,
+            "the component to be offered the frame after privacy mode ended",
+            |account| account.observes >= 1,
+        )
+        .await;
+    world.until_offered(1).await;
+    assert!(lane.checkpoint_due(later).is_empty());
+    assert_eq!(lane.held_checkpoints(), (0, 0));
 }

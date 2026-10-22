@@ -7,6 +7,9 @@
 //!
 //! The body is generated: a few thousand small functions, each of which the optimiser has to
 //! compile because its result is returned.
+//!
+//! It counts the observations it finished, and returns the count as its checkpoint (`observe=<n>`),
+//! so that a case can tell an observation that finished from one that did not.
 
 #![no_std]
 #![no_main]
@@ -17,6 +20,7 @@ use alloc::borrow::ToOwned as _;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use kr_fixture_support as _;
 
@@ -37,6 +41,9 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 }
 
+/// How many observations finished.
+static OBSERVED: AtomicU64 = AtomicU64::new(0);
+
 struct Component;
 
 impl Guest for Component {
@@ -53,7 +60,9 @@ impl Guest for Component {
             node_revision: 1,
             body_json: format!("{{\"kind\":\"message\",\"text\":\"{value}\"}}"),
         })
-        .map_err(Fault::Unreadable)
+        .map_err(Fault::Unreadable)?;
+        OBSERVED.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn snapshot() -> Result<(), Fault> {
@@ -84,7 +93,7 @@ impl Guest for Component {
     }
 
     fn checkpoint() -> Result<Vec<u8>, Fault> {
-        Ok(Vec::new())
+        Ok(format!("observe={}", OBSERVED.load(Ordering::Relaxed)).into_bytes())
     }
 
     fn restore(_state: Vec<u8>) -> Result<(), Fault> {
