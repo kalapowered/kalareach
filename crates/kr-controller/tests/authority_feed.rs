@@ -133,14 +133,14 @@ impl Rig {
     }
 
     /// Waits until the daemon has asked for the wait between two passes, which it asks for the
-    /// length of the poll interval the feed states, and returns what ends it.
+    /// length of the poll interval section 10 fixes at thirty seconds, and returns what ends it.
     async fn until_a_pass_waits(&self) -> Arc<tokio::sync::Notify> {
         let (waited, release) =
             within("the carrier waits between passes", self.timer.next_wait()).await;
         assert_eq!(
             waited,
-            Duration::from_millis(kr_controller::grants::feed::FEED_POLL_INTERVAL_MS),
-            "the carrier polls at the interval section 10 fixes"
+            Duration::from_secs(30),
+            "the carrier polls every thirty seconds while online"
         );
         release
     }
@@ -510,7 +510,9 @@ async fn a_revocation_carried_out_before_a_device_connects_ends_its_connection()
     );
 }
 
-/// The poll the feed states carries out a revocation published while the device stays connected.
+/// KR-REQ-10.46: the host polls its feed every thirty seconds while online, and the poll that
+/// follows the interval carries out a revocation published while the device stays connected: the
+/// device's next request is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_published_while_a_device_is_connected_is_carried_out_at_the_next_poll() {
     let rig = Rig::start().await;
@@ -545,8 +547,9 @@ async fn a_revocation_published_while_a_device_is_connected_is_carried_out_at_th
     );
 }
 
-/// A host that stops after it carried a request out and before it acknowledged it finishes the same
-/// request the same way on its next start: one revision, and the registry advanced once.
+/// KR-REQ-10.46: a host that stops after it carried a request out and before it acknowledged it
+/// finishes the same request the same way on its next start: the acknowledgement is under the
+/// revision the host first issued, there is one revision, and the registry advanced once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_stops_between_carrying_a_request_out_and_acknowledging_it_finishes_it_once() {
     let rig = Rig::start().await;

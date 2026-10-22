@@ -3245,6 +3245,11 @@ fn a_lease_the_pinned_policy_signing_authority_did_not_sign_is_refused() {
 // The remote authority feed's host-side half
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-10.46: the host's feed takes its revisions from the host's own registry and never from a
+/// request, keeps a request's record until every enrolled host has acknowledged it, owes a
+/// synchronisation after a reconnect, states the next poll thirty seconds after the last
+/// synchronisation, shows an unreachable feed as stale without ceasing to serve work the host is
+/// authorised for, and gives back after a restart the revision it had accepted.
 #[test]
 fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowledged() {
     use kr_protocol::pairing::{RevocationRequest, RevocationTarget};
@@ -3576,6 +3581,8 @@ fn a_feed_stored_before_removals_were_kept_reads_back() {
     );
 }
 
+/// KR-REQ-10.46: a host that has accepted a revision rejects a record at that revision and one
+/// below it, and accepts the one that follows.
 #[test]
 fn a_feed_record_at_or_below_the_accepted_revision_is_refused() {
     use kr_protocol::pairing::AuthorityRevisionRecord;
@@ -3596,6 +3603,18 @@ fn a_feed_record_at_or_below_the_accepted_revision_is_refused() {
         Err(FeedRefusal::OutOfOrder {
             accepted: AuthorityRevision::new(5),
             offered: AuthorityRevision::new(4)
+        })
+    );
+    let repeated = AuthorityRevisionRecord {
+        authority_revision: AuthorityRevision::new(5),
+        previous_revision: AuthorityRevision::new(4),
+        ..replayed.clone()
+    };
+    assert_eq!(
+        feed.accept(&repeated),
+        Err(FeedRefusal::OutOfOrder {
+            accepted: AuthorityRevision::new(5),
+            offered: AuthorityRevision::new(5)
         })
     );
     let following = AuthorityRevisionRecord {
