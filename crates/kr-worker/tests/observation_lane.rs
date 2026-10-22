@@ -1,16 +1,19 @@
-//! The worker's observation lane keeps two promises that no timing of a running worker can show
-//! deterministically: what it lost comes with the entry it hands over, older than that entry, and a
-//! state asked for before a change of privacy mode is not held after it.
+//! The worker's observation lane keeps promises that no timing of a running worker can show
+//! deterministically: what it lost comes with the entry it hands over, older than that entry; a
+//! state asked for before a change of privacy mode is not held after it; and the runtime's words are
+//! withheld once privacy mode has stood on the connection that carries them.
 //!
 //! The first is what keeps a component from being offered an entry newer than a loss before the
-//! fresh snapshot the loss owes it. The second is what keeps a state taken before privacy mode was turned
-//! on from being kept through it. Both are decided at the lane's own interface, and the cases in
-//! kr-controller's `plugin_observation` show the same lane at work in a running worker.
+//! fresh snapshot the loss owes it. The second is what keeps a state taken before privacy mode was
+//! turned on from being kept through it. The third is what keeps words a component made from what
+//! it was handed in privacy mode from reaching a report, however late they are read. All are decided
+//! at the lane's own interface, and the cases in kr-controller's `plugin_observation` show the same
+//! lane at work in a running worker.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.38 | `kr_req_11_38_what_the_lane_lost_comes_with_the_entry_and_is_older_than_it` |
-//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it` |
+//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it`, `kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on` |
 
 use std::sync::Arc;
 
@@ -126,5 +129,57 @@ fn kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_af
         lane.held_checkpoints().0,
         1,
         "the earlier state stays until the fence"
+    );
+}
+
+/// KR-REQ-24.27: the runtime's words are withheld once privacy mode has been on since the link made
+/// the connection, however privacy mode stands later, and until the link makes another; a connection
+/// made while privacy mode is on is withheld from its start.
+#[test]
+fn kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on()
+ {
+    let lane = ObservationLane::new();
+    lane.began_connection();
+    assert!(!lane.words_withheld(), "no privacy mode, no withholding");
+
+    lane.set_private(true);
+    assert!(lane.words_withheld());
+    lane.set_private(false);
+    assert!(
+        lane.words_withheld(),
+        "a notice read after privacy mode ended can describe what was handed over while it stood"
+    );
+
+    lane.began_connection();
+    assert!(
+        !lane.words_withheld(),
+        "a new connection carries no old notice"
+    );
+
+    lane.set_private(true);
+    lane.began_connection();
+    assert!(
+        lane.words_withheld(),
+        "a connection made in privacy mode is withheld from its start"
+    );
+    lane.set_private(false);
+    assert!(lane.words_withheld());
+    lane.began_connection();
+    assert!(!lane.words_withheld());
+
+    // Handing a component something made in privacy mode taints the connection it goes on, however
+    // the pump and the link interleaved: the pump may have read what it needed before the link made
+    // this connection, and hands the entry over after.
+    let binding = BrokerBindingId::new(Uuid::from_bytes([9; 16]));
+    lane.expose(binding, true);
+    assert!(
+        lane.words_withheld(),
+        "private content reached a connection that was not withheld"
+    );
+    lane.began_connection();
+    lane.expose(binding, false);
+    assert!(
+        !lane.words_withheld(),
+        "a hand-over of something not made in privacy mode, with it off, withholds nothing"
     );
 }
