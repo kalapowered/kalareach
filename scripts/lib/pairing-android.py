@@ -24,6 +24,7 @@ It uses the Python standard library alone.
 """
 
 import json
+import os
 import re
 import struct
 import subprocess
@@ -599,6 +600,64 @@ def type_into_field(phone: Phone, text: str, replacing: int = 0, holding: str = 
         phone.run("shell", "input", "keyevent", "KEYCODE_MOVE_END")
         phone.run("shell", "input", "keyevent", *(["KEYCODE_DEL"] * replacing))
     phone.run("shell", "input", "text", text)
+    # What the field holds is read back, and an input method's stray character taken out: the field's
+    # text is what the application is told, and a run never depends on what it was meant to hold.
+    for _ in range(3):
+        time.sleep(0.8)
+        held = next(
+            (
+                node["label"]
+                for node in phone.screen()
+                if node["class"] == "android.widget.EditText" and node["label"].startswith(text[:4])
+            ),
+            None,
+        )
+        if held == text:
+            return
+        if held is not None and held.startswith(text):
+            phone.run("shell", "input", "keyevent", "KEYCODE_MOVE_END")
+            phone.run("shell", "input", "keyevent", *(["KEYCODE_DEL"] * (len(held) - len(text))))
+    phone.give_up(f"the field does not hold what was typed ({text})")
+
+
+def point_codes_at(phone: Phone, origin: str, host: str) -> None:
+    """Changes the service codes go through, and goes on only once the screen names `host` as it.
+
+    The keyboard covers the button, so the form is sent with the keyboard's own key: a tap at the
+    button's place would land on a key of the keyboard. A code is never sent to another service by
+    a run that is about this one, so the attempt that follows is made only once the screen says where
+    it goes.
+    """
+    start_pairing_screen(phone)
+    phone.press("Change")
+    phone.wait(lambda each: each == "Use this service", "the field for the pairing service", 30)
+    type_into_field(phone, origin, replacing=40, holding="https://")
+    phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
+    phone.wait(lambda each: each == host, f"{host} as the service codes go through", 30)
+
+
+def one_attempt(phone: Phone, shot: str) -> str:
+    """Sends one random code through the service the screen names, and says how it ended:
+    `admitted` (no host answered for it), `not_pairing` (the origin does not offer pairing), or
+    `unreachable` (the service could not be reached), or `none` when nothing came in time."""
+    type_into_field(phone, a_code_no_host_holds())
+    phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
+    end = time.monotonic() + 180
+    outcome = "none"
+    while time.monotonic() < end:
+        words = " | ".join(node["label"] for node in phone.screen() if node["label"])
+        if "No host answered for this code" in words:
+            outcome = "admitted"
+            break
+        if "does not offer pairing" in words:
+            outcome = "not_pairing"
+            break
+        if "could not be reached" in words:
+            outcome = "unreachable"
+            break
+        time.sleep(1)
+    phone.shot(shot)
+    return outcome
 
 
 def release(adb: str, serial: str, directory: Path, shots: Path, port: str, attempts: Path) -> None:
@@ -617,41 +676,44 @@ def release(adb: str, serial: str, directory: Path, shots: Path, port: str, atte
     shots.mkdir(parents=True, exist_ok=True)
     failed = False
 
-    start_pairing_screen(phone)
-    phone.wait(lambda each: each == "Pair", "the button that starts an attempt", 30)
-    type_into_field(phone, a_code_no_host_holds())
-    attempts.parent.mkdir(parents=True, exist_ok=True)
-    with attempts.open("a", encoding="utf-8") as record:
-        record.write(f"attempt at the deployed service at {time.strftime('%Y-%m-%d %H:%M:%S %Z')} local time\n")
-    say_plain(f"one attempt at the deployed service at {time.strftime('%H:%M:%S')} local time")
-    phone.press("Pair")
-    end = time.monotonic() + 180
-    outcome = ""
-    while time.monotonic() < end:
-        words = " | ".join(node["label"] for node in phone.screen() if node["label"])
-        if "No host answered for this code" in words:
-            outcome = "admitted"
-            break
-        if "could not be reached" in words or "does not offer pairing" in words:
-            outcome = "unreachable"
-            break
-        time.sleep(1)
-    phone.shot("release-deployed")
-    if outcome == "admitted":
-        print("RELEASE-TLS the application admitted the attempt at the deployed service", flush=True)
-    else:
-        failed = True
-        words = " | ".join(node["label"] for node in phone.screen() if node["label"])
-        print(f"RELEASE-TLS-FAILED the deployed service was not reached as an admitted attempt: {outcome or 'no outcome'}: {words}", flush=True)
+    deployed = os.environ.get("KR_RELEASE_NO_DEPLOYED") != "1"
+    if deployed:
+        start_pairing_screen(phone)
+        phone.wait(lambda each: each == "Pair", "the button that starts an attempt", 30)
+        attempts.parent.mkdir(parents=True, exist_ok=True)
+        with attempts.open("a", encoding="utf-8") as record:
+            record.write(f"attempt at the deployed service at {time.strftime('%Y-%m-%d %H:%M:%S %Z')} local time\n")
+        say_plain(f"one attempt at the deployed service at {time.strftime('%H:%M:%S')} local time")
+        outcome = one_attempt(phone, "release-deployed")
+        with attempts.open("a", encoding="utf-8") as record:
+            record.write(f"  outcome: {outcome}\n")
+        if outcome == "admitted":
+            print("RELEASE-TLS the application admitted the attempt at the deployed service", flush=True)
+        else:
+            failed = True
+            print(f"RELEASE-TLS-FAILED the deployed service was not reached as an admitted attempt: {outcome}", flush=True)
 
-    start_pairing_screen(phone)
-    phone.press("Change")
-    phone.wait(lambda each: each == "Use this service", "the field for the pairing service", 30)
-    type_into_field(phone, f"https://127.0.0.1:{port}", replacing=40, holding="https://")
-    phone.press("Use this service")
-    phone.wait(lambda each: "127.0.0.1" in each, "the local service as the one codes go through", 30)
+    # A public origin the system trusts, as a positive control for the verifier, when one is named:
+    # the product's own lookup with a random code, and no credential.
+    public = os.environ.get("KR_RELEASE_PUBLIC_ORIGIN", "")
+    if public:
+        host = public.removeprefix("https://")
+        point_codes_at(phone, public, host)
+        with attempts.open("a", encoding="utf-8") as record:
+            record.write(f"attempt at {public} at {time.strftime('%Y-%m-%d %H:%M:%S %Z')} local time\n")
+        say_plain(f"one attempt at {public} at {time.strftime('%H:%M:%S')} local time")
+        outcome = one_attempt(phone, "release-public")
+        record_outcome = f"RELEASE-TLS public control {public}: {outcome}"
+        print(record_outcome, flush=True)
+        with attempts.open("a", encoding="utf-8") as record:
+            record.write(f"  outcome: {outcome}\n")
+        if outcome != "not_pairing":
+            failed = True
+            print(f"RELEASE-TLS-FAILED the public origin's certificate was not accepted: {outcome}", flush=True)
+
+    point_codes_at(phone, f"https://127.0.0.1:{port}", "127.0.0.1")
     type_into_field(phone, a_code_no_host_holds())
-    phone.press("Pair")
+    phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
     phone.wait(
         lambda each: "could not be reached" in each or "does not offer pairing" in each,
         "the words for a service that could not be used",
