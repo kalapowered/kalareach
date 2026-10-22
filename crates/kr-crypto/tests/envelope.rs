@@ -7,38 +7,22 @@
 
 use std::collections::BTreeSet;
 
+use kr_crypto::CryptoError;
 use kr_crypto::envelope::{
     PairedSenders, ReplayLedger, open_delivered_envelope, open_envelope, seal_envelope,
 };
-use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair, key_id};
-use kr_crypto::sign::{self, SigningTranscript};
-use kr_crypto::{CryptoError, vectors};
+use kr_crypto::keys::{StoredEnvelopeKeyPair, key_id};
 use kr_protocol::ids::{
-    DeviceId, EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, RevocationRequestId,
-    SessionEpoch, SessionId,
+    EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId,
 };
 use kr_protocol::mailbox::{
-    EnvelopePlaintext, EnvelopeVersion, ForwardedAuthority, MailboxPayloadType, SealedEnvelope,
-    mailbox_size_bucket,
+    EnvelopePlaintext, EnvelopeVersion, MailboxPayloadType, SealedEnvelope, mailbox_size_bucket,
 };
-use kr_protocol::pairing::{KeyPurpose, REVOCATION_DOMAIN, RevocationRequest, RevocationTarget};
-use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, Signature64, TimestampMs, U64, Uuid};
+use kr_protocol::pairing::KeyPurpose;
+use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64, Uuid};
 
 const NOW_MS: u64 = 1_000;
 const EXPIRES_MS: u64 = 61_000;
-
-/// The device that issues the revocation requests in this suite.
-const OWNER_DEVICE: [u8; 16] = [6; 16];
-/// The device that issues the authority revision records in this suite.
-const HOST_DEVICE: [u8; 16] = [7; 16];
-
-fn owner_device() -> DeviceId {
-    DeviceId::new(Uuid::from_bytes(OWNER_DEVICE))
-}
-
-fn host_device() -> DeviceId {
-    DeviceId::new(Uuid::from_bytes(HOST_DEVICE))
-}
 
 fn plaintext(
     sender: &StoredEnvelopeKeyPair,
@@ -88,40 +72,18 @@ fn paired_with(sender: &StoredEnvelopeKeyPair) -> PairedSenders {
     senders
 }
 
-/// Signs a revocation request the way its issuer does, and wraps it as a forwarded object.
-fn signed_revocation(issuer: &AuthorisationKeyPair, grant_id: GrantId) -> ForwardedAuthority {
-    let mut grant_ids = CanonicalSet::new();
-    grant_ids.insert(grant_id);
-    let mut request = RevocationRequest {
-        request_id: RevocationRequestId::new(Uuid::from_bytes([5; 16])),
-        issuer_device_id: owner_device(),
-        host_device_id: host_device(),
-        target: RevocationTarget::Grants { grant_ids },
-        issued_at_ms: TimestampMs::new(NOW_MS),
-        issuer_key_id: issuer.key_id(),
-        signature: Signature64::from_bytes([0; 64]),
-    };
-    let transcript = SigningTranscript::from_canonical_bytes(
-        REVOCATION_DOMAIN,
-        request.signing_input().expect("canonical bytes"),
-    )
-    .expect("a transcript");
-    request.signature = sign::sign(issuer, &transcript).expect("a signature");
-    ForwardedAuthority::RevocationRequest(request)
-}
-
-/// An envelope carrying a forwarded authority object, referencing `grant_id`.
+/// An envelope that carries a payload of the kind that bears authority, referencing `grant_id`.
 fn authority_envelope(
     sender: &StoredEnvelopeKeyPair,
     recipient: &StoredEnvelopeKeyPair,
-    object: &ForwardedAuthority,
+    payload: &[u8],
     grant_id: Option<GrantId>,
 ) -> (EnvelopePlaintext, SealedEnvelope) {
     let mut plaintext = plaintext(
         sender,
         recipient,
         MailboxPayloadType::SignedAuthorityObject,
-        kr_cbor::to_canonical_vec(object).expect("canonical bytes"),
+        payload.to_vec(),
     );
     plaintext.grant_id = grant_id.map_or_else(Nullable::null, Nullable::some);
     let sealed = seal_envelope(sender, recipient.public(), &plaintext).expect("a sealed envelope");
@@ -317,48 +279,39 @@ fn an_envelope_version_this_build_does_not_publish_is_not_decoded() {
 // KR-REQ-20.04: authority is never taken from a mailbox
 // ---------------------------------------------------------------------------
 
-/// An authorisation-bearing payload that its issuer never signed, inside an envelope that is valid
-/// in every other way, is rejected. So is the same payload signed: the pairwise box proves that a
-/// paired device sealed the item and proves nothing about authority, and no reader of a mailbox
-/// takes authority from one. The control is the same box carrying a payload that bears none, which
-/// opens, so the refusal is the payload's kind and not a fault of the box.
+/// An authorisation-bearing payload, inside an envelope that is valid in every other way, is
+/// rejected whatever the payload holds: the pairwise box proves that a paired device sealed the
+/// item and proves nothing about authority, and no reader of a mailbox takes authority from one.
+/// The control is the same box carrying the same bytes as a kind that bears none, which opens, so
+/// the refusal is the payload's kind and not a fault of the box.
 #[test]
-fn an_unsigned_authority_payload_inside_an_otherwise_valid_envelope_is_rejected() {
+fn an_authority_payload_inside_an_otherwise_valid_envelope_is_rejected() {
     let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
     let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
-    let issuer = AuthorisationKeyPair::generate().expect("a keypair");
     let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
     let senders = paired_with(&sender);
+    let payload = b"any bytes a paired sender seals";
 
-    let signed = signed_revocation(&issuer, grant_id);
-    let ForwardedAuthority::RevocationRequest(mut request) = signed.clone() else {
-        unreachable!("the helper builds a revocation request")
-    };
-    request.signature = Signature64::from_bytes([0; 64]);
-    let unsigned = ForwardedAuthority::RevocationRequest(request);
-
-    for (what, object) in [("an unsigned", &unsigned), ("a signed", &signed)] {
-        let (_, sealed) = authority_envelope(&sender, &recipient, object, Some(grant_id));
-        assert!(
-            matches!(
-                open_envelope(&recipient, sender.public(), &sealed, NOW_MS),
-                Err(CryptoError::AuthorityNotAccepted)
-            ),
-            "{what} authority object from a paired sender is refused"
-        );
-        let mut ledger = ReplayLedger::new();
-        assert!(
-            matches!(
-                open_delivered_envelope(&recipient, &senders, &mut ledger, &sealed, NOW_MS),
-                Err(CryptoError::AuthorityNotAccepted)
-            ),
-            "{what} authority object is refused on the path a service's delivery takes"
-        );
-        assert!(
-            ledger.is_empty(),
-            "a refused item records no replay identifier"
-        );
-    }
+    let (_, sealed) = authority_envelope(&sender, &recipient, payload, Some(grant_id));
+    assert!(
+        matches!(
+            open_envelope(&recipient, sender.public(), &sealed, NOW_MS),
+            Err(CryptoError::AuthorityNotAccepted)
+        ),
+        "an authority payload from a paired sender is refused"
+    );
+    let mut ledger = ReplayLedger::new();
+    assert!(
+        matches!(
+            open_delivered_envelope(&recipient, &senders, &mut ledger, &sealed, NOW_MS),
+            Err(CryptoError::AuthorityNotAccepted)
+        ),
+        "an authority payload is refused on the path a service's delivery takes"
+    );
+    assert!(
+        ledger.is_empty(),
+        "a refused item records no replay identifier"
+    );
 
     // The control: the same bytes carried as a kind that bears no authority open, so the box, the
     // bindings and the expiry were all sound and the refusal above is the kind's.
@@ -366,7 +319,7 @@ fn an_unsigned_authority_payload_inside_an_otherwise_valid_envelope_is_rejected(
         &sender,
         &recipient,
         MailboxPayloadType::StateReference,
-        kr_cbor::to_canonical_vec(&unsigned).expect("canonical bytes"),
+        payload.to_vec(),
     );
     let sealed = seal_envelope(&sender, recipient.public(), &carried).expect("a sealed envelope");
     assert!(open_envelope(&recipient, sender.public(), &sealed, NOW_MS).is_ok());
@@ -602,56 +555,4 @@ fn a_replay_identifier_outlives_its_envelope_by_one_day_and_survives_a_restart()
             what: "the expiry of an envelope, which has passed"
         })
     ));
-}
-
-// ---------------------------------------------------------------------------
-// The committed vector
-// ---------------------------------------------------------------------------
-
-/// The committed vector of a forwarded revocation request: the signature verifies under the key
-/// the vector names, the payload is the object's canonical encoding, and the signing input is the
-/// one the object produces. The TypeScript reader checks the same bytes. Nothing opens the
-/// vector's envelope as a delivery, because no reader takes authority from a mailbox.
-#[test]
-fn the_committed_authority_vector_is_the_issuers_signature_over_the_objects_own_bytes() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/crypto/envelopes.json");
-    let document: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("the vector is readable"))
-            .expect("the vector is JSON");
-    let section = &document["authority_object"];
-
-    let issuer = vectors::host_authorisation_key().expect("the issuer key");
-    assert_eq!(
-        hex::encode(issuer.key_id().as_bytes()),
-        section["issuer"]["key_id_hex"]
-            .as_str()
-            .expect("a hex string"),
-    );
-
-    let expected: ForwardedAuthority =
-        serde_json::from_value(section["object_json"].clone()).expect("a forwarded object");
-    let ForwardedAuthority::RevocationRequest(request) = &expected else {
-        unreachable!("the vector publishes a revocation request")
-    };
-    assert_eq!(request.issuer_key_id, issuer.key_id());
-
-    let signing_input = request.signing_input().expect("canonical bytes");
-    assert_eq!(
-        hex::encode(&signing_input),
-        section["signing_input_hex"].as_str().expect("a hex string"),
-    );
-    assert_eq!(
-        hex::encode(kr_cbor::to_canonical_vec(&expected).expect("canonical bytes")),
-        section["payload_canonical_hex"]
-            .as_str()
-            .expect("a hex string"),
-    );
-    sign::verify(
-        issuer.public(),
-        &SigningTranscript::from_canonical_bytes(REVOCATION_DOMAIN, signing_input)
-            .expect("a transcript"),
-        &request.signature,
-    )
-    .expect("the issuer's signature verifies");
 }
