@@ -3137,19 +3137,20 @@ impl AutomationModule {
                 .await
             }
             // A rearm keeps no record: it names the budget generation it leaves, and the chain's
-            // own state answers a repeat. The runs it continued execute here, each on a task of
-            // its own, once the rearm has committed; a daemon that stops in between leaves them
-            // running in the journal, and its next start takes them up.
+            // own state answers a repeat. Its action identifier is still checked, inside the
+            // rearm's transaction. The runs it continued execute here, each on a task of its own,
+            // once the rearm has committed; a daemon that stops in between leaves them running in
+            // the journal, and its next start takes them up.
             Method::WorkflowRearm => {
                 let executing = Arc::clone(&service);
                 let rearmed = blocking(move || {
                     let asked: WorkflowRearmParams = typed(&params)?;
-                    Ok::<_, ProtocolError>(service.rearm(
-                        &asked,
-                        &still_admitted,
+                    let submitted = Submitted {
+                        key: &key,
+                        admission: &still_admitted,
                         caller_grant,
-                        now_ms,
-                    )?)
+                    };
+                    Ok::<_, ProtocolError>(service.rearm(&asked, &submitted, now_ms)?)
                 })
                 .await?;
                 for run in rearmed.started {

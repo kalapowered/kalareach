@@ -16,7 +16,7 @@ use kr_attention::time::BootMark;
 use kr_attention::{Attention, HostReading};
 use kr_automation::{
     AttentionSubject, AutomationError, AutomationService, CausalBudget, ManualClock,
-    MockActionRunner, TriggerDecision, WorkflowStore, create_workflow_definition,
+    MockActionRunner, Submitted, TriggerDecision, WorkflowStore, create_workflow_definition,
 };
 use kr_protocol::attention::{AttentionRule, AttentionSource};
 use kr_protocol::automation::{
@@ -27,6 +27,7 @@ use kr_protocol::automation::{
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{CausalRootId, GrantId, WorkflowId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, Uuid};
 
 mod common;
@@ -1382,8 +1383,11 @@ async fn the_repeat_of_a_rearm_is_recognised_by_a_read_that_changes_nothing() {
     let own = service
         .rearm(
             &params(test_grant_id(1), 0),
-            &common::admitted,
-            Some(test_grant_id(1)),
+            &Submitted {
+                key: &common::fresh_action(Method::WorkflowRearm),
+                admission: &common::admitted,
+                caller_grant: Some(test_grant_id(1)),
+            },
             2_000,
         )
         .expect("a device rearms its own grant's chain");
@@ -1494,8 +1498,17 @@ async fn a_rearm_whose_admission_has_lapsed_writes_nothing() {
         generation: kr_protocol::scalars::U64::new(0),
     };
 
+    let key = common::fresh_action(Method::WorkflowRearm);
     let refused = service
-        .rearm(&params, &lapsed, None, 2_000)
+        .rearm(
+            &params,
+            &Submitted {
+                key: &key,
+                admission: &lapsed,
+                caller_grant: None,
+            },
+            2_000,
+        )
         .expect_err("the admission lapsed");
     assert_eq!(code(&refused), ErrorCode::PermissionDenied, "{refused}");
     let kept = service.store().get_budget(root).unwrap().unwrap();
@@ -1503,7 +1516,15 @@ async fn a_rearm_whose_admission_has_lapsed_writes_nothing() {
 
     // The control: the same request under an admission that stands rearms the chain.
     service
-        .rearm(&params, &common::admitted, None, 2_000)
+        .rearm(
+            &params,
+            &Submitted {
+                key: &key,
+                admission: &common::admitted,
+                caller_grant: None,
+            },
+            2_000,
+        )
         .expect("the admission stands");
     assert_eq!(
         service
