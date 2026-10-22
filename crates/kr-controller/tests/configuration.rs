@@ -3608,20 +3608,16 @@ async fn a_host_says_the_shell_mode_it_creates_sessions_in_and_where_that_came_f
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let environment = host.tree().environment();
-    let info = |host: &Host| {
-        let host = host.client();
-        async move {
-            let mut local = host.await;
-            let info: HostInfoResult = typed(
-                &local
-                    .request(Method::HostInfo, &())
-                    .await
-                    .expect("the call reaches the daemon")
-                    .expect("host.info is served on the local socket"),
-            );
-            info
-        }
-    };
+    async fn info(host: &Host) -> HostInfoResult {
+        let mut local = host.client().await;
+        typed(
+            &local
+                .request(Method::HostInfo, &())
+                .await
+                .expect("the call reaches the daemon")
+                .expect("host.info is served on the local socket"),
+        )
+    }
 
     assert_eq!(
         info(&host).await.default_shell_mode,
