@@ -3463,8 +3463,8 @@ name, a unit or a permitted value cannot change on one side alone. There is no l
 text a caller chose, so no line of terminal output, prompt, key or file name can reach one.
 
 * `transport` is `direct` or `relay`: the path the connection was sending on when the host admitted
-  it, or the relay it was dialled through when no path was selected yet. The daemon never reports
-  `local`.
+  it, the first path it has where none is selected yet, and `relay` where it has none. The daemon
+  never reports `local`.
 * `attempt` is `1`, `2-3`, `4-8` or `9+`: the position, among the connections of that device the
   host admitted or refused since its last one ended, of the connection that ended the gap. An
   attempt that never reached the host is not seen and is not counted.
