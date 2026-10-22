@@ -7,8 +7,9 @@
 # left behind.
 #
 # Given an HTTPS origin it runs the legs a deployment can answer: the recovery bundle written by one
-# fresh installation and found by another that holds only the kit. The legs that need two services
-# or a deployment restored from its export are named as local only and are not run.
+# fresh installation and found by another that holds only the kit. The legs that need two services,
+# a deployment restored from its export, or a retention window moved by the web repository's local
+# driver are named as local only and are not run.
 #
 # Given a loopback origin, `http://127.0.0.1:<port>`, it runs every leg on this machine, against
 # local deployments of the web service: the first on that port, the others on ports the system
@@ -17,7 +18,10 @@
 # `infra/scripts/testing/local-restore.mjs`, starts, exports, prepares, restores and stops them. The
 # restore leg is a source deployment, an export on its schedule, the source stopped, a target
 # prepared from that export and restored on its own schedule, and a device's stores meeting each in
-# turn. On macOS, keep the tree on the internal disk: the Workers it starts read it.
+# turn. The retention leg is a deployment of its own: backup storage turned on, thirty-one generations
+# kept as thirty, the objects of the one pushed out deleted, and the driver's `sweep` and `age` steps
+# between three phases that read the storage status, so the seven days a tombstone is kept are
+# shown without waiting for them. On macOS, keep the tree on the internal disk: the Workers it starts read it.
 #
 # The recovery bundle belongs to an account, so its legs present an account token beside every
 # device's signature: one issued with backup.write for the device that writes the bundle, and one
@@ -261,6 +265,7 @@ if [ "$mode" = deployment ]; then
   fi
   printf '  %-7s %-10s %s\n' '-' services "local only: needs two services on this machine"
   printf '  %-7s %-10s %s\n' '-' restore "local only: needs a deployment restored from its export on this machine"
+  printf '  %-7s %-10s %s\n' '-' retention "local only: needs the driver to move a tombstone's window"
 else
   run="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-backup-XXXXXX")"
   state="$run/web"
@@ -317,6 +322,61 @@ else
   fi
   step stop --name first >/dev/null || stopped=0
   step stop --name second >/dev/null || stopped=0
+
+  # The retention rules: backup storage off until asked for, thirty daily snapshots kept, a deleted
+  # object a tombstone for seven days, and the sweep that removes it. The driver moves the window.
+  retention_failed=""
+  retention=""
+  if answer="$(step start --name retention)"; then
+    retention="$(member "$answer" origin)"
+  else
+    retention_failed="the retention deployment did not serve"
+  fi
+  if [ -z "$retention_failed" ] && ! step sign-in --name retention --tokens "$tokens" >/dev/null; then
+    retention_failed="the retention deployment signed no account in; see $evidence/driver.log"
+  fi
+  retention_run=(KR_DEPLOYED_ORIGIN="$retention" KR_BACKUP_RUN_DIR="$run/retention" KR_BACKUP_TOKENS="$tokens")
+  if [ -z "$retention_failed" ] && ! run_test retention thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone \
+    "$evidence/retention-1.log" "${retention_run[@]}"; then
+    retention_failed="phase 1: $(reason "$evidence/retention-1.log")"
+  fi
+  if [ -z "$retention_failed" ]; then
+    # A sweep inside the window, read from the index's own rows: the tombstones are still there.
+    if answer="$(step sweep --name retention)" && [ -n "$(member "$answer" objects)" ]; then
+      echo "$answer" >>"$evidence/retention-steps.log"
+    else
+      retention_failed="the sweep inside the window: $(member "$answer" error)"
+    fi
+  fi
+  if [ -z "$retention_failed" ] && ! run_test retention a_sweep_inside_the_window_removes_nothing \
+    "$evidence/retention-2.log" "${retention_run[@]}"; then
+    retention_failed="phase 2: $(reason "$evidence/retention-2.log")"
+  fi
+  if [ -z "$retention_failed" ]; then
+    if answer="$(step age --name retention --days 8)" && [ "$(member "$answer" aged)" != 0 ] &&
+      [ -n "$(member "$answer" aged)" ]; then
+      echo "$answer" >>"$evidence/retention-steps.log"
+    else
+      retention_failed="the window was not aged: it moved $(member "$answer" aged) tombstones"
+    fi
+  fi
+  if [ -z "$retention_failed" ]; then
+    if answer="$(step sweep --name retention)"; then
+      echo "$answer" >>"$evidence/retention-steps.log"
+    else
+      retention_failed="the sweep after the window: $(member "$answer" error)"
+    fi
+  fi
+  if [ -z "$retention_failed" ] && ! run_test retention after_the_window_the_sweep_removes_the_tombstone_and_its_charge_ends \
+    "$evidence/retention-3.log" "${retention_run[@]}"; then
+    retention_failed="phase 3: $(reason "$evidence/retention-3.log")"
+  fi
+  if [ -z "$retention_failed" ]; then
+    report ok retention "$(proved "$evidence/retention-3.log" "$retention")"
+  else
+    report FAILED retention "$retention_failed"
+  fi
+  step stop --name retention >/dev/null || stopped=0
 
   # The client across a restored deployment: a source, its export, a target restored from it.
   device="$run/device"
@@ -410,6 +470,7 @@ if [ "${#unfinished[@]}" -ne 0 ]; then
     case "$what" in
       restore) echo "  restore-1.log, restore-2.log, restore-3.log and driver.log, as far as the leg got" ;;
       services) echo "  services-1.log and services-2.log, as far as the leg got" ;;
+      retention) echo "  retention-1.log, retention-2.log, retention-3.log, retention-steps.log and driver.log, as far as the leg got" ;;
       *) echo "  $what.log" ;;
     esac
   done
