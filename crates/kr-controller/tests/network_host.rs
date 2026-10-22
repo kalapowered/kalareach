@@ -178,7 +178,7 @@ async fn read_all(
 /// as for the manager.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_management() {
-    use kr_protocol::metrics::{Adapter, MetricOutcome};
+    use kr_protocol::metrics::{Adapter, HostMetrics, MetricOutcome};
 
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
@@ -227,15 +227,19 @@ async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_ma
         ("the owner at the machine", &at_the_machine),
         ("a device that manages the host", &by_the_manager),
     ] {
-        assert_eq!(answer.metrics.adapter_failure.len(), 1, "{who}: {answer:?}");
-        let series = &answer.metrics.adapter_failure[0];
+        let Some(HostMetrics::Counted(report)) = &answer.metrics else {
+            panic!("{who} is given the report: {answer:?}");
+        };
+        assert_eq!(report.adapter_failure.len(), 1, "{who}: {answer:?}");
+        let series = &report.adapter_failure[0];
         assert_eq!(series.adapter, Adapter::Codex, "{who}");
         assert_eq!(series.outcome, MetricOutcome::Unavailable, "{who}");
         assert_eq!(series.count.get(), 1, "{who}");
     }
-    assert!(
-        by_the_viewer.metrics.is_empty(),
-        "a device that holds only session.view read the host's metrics: {by_the_viewer:?}"
+    assert_eq!(
+        by_the_viewer.metrics,
+        Some(HostMetrics::Withheld),
+        "a device that holds only session.view is not given the host's metrics"
     );
     // The metrics are all that is left out for it: the checks are the manager's own.
     let verdicts = |result: &HostDoctorResult| {

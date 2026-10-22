@@ -17407,7 +17407,23 @@ export interface HostDoctorResult {
    * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
-  metrics?: MetricsReport
+  /**
+   * What this host has measured about itself: how long its paired devices were without a
+   * connection, the faults its terminals' parsers met and the failures of its adapters.
+   *
+   * Local diagnostics, counted in memory from the start of the process that counted them and
+   * sent to no service. The owner reads them, and so does a paired device whose grant, as this
+   * host's policy and ceilings leave it, holds the right to manage the host; the answer to any
+   * other caller says they are withheld. Every host of this level sends the member, and it is
+   * missing only from the answer of a host of an earlier level. Every label of a report is one
+   * of this build's own words, so a report carries no terminal content, key, prompt or
+   * filename.
+   */
+  metrics?:
+    | {
+        counted: MetricsReport
+      }
+    | 'withheld'
 }
 /**
  * One diagnostic check.
@@ -17639,15 +17655,11 @@ export interface LaunchProbeReport {
   version: string
 }
 /**
- * What this host has measured about itself: how long its paired devices were without a
- * connection, the faults its terminals' parsers met and the failures of its adapters.
+ * What a host reports of the metrics it measures about itself.
  *
- * Local diagnostics, counted in memory from the start of the process that counted them and
- * sent to no service. The owner reads them, and so does a paired device whose grant, as this
- * host's policy and ceilings leave it, holds the right to manage the host; the answer to any
- * other device holds a report with nothing counted, which says nothing about the host. Every
- * label is one of this build's own words, so the report carries no terminal content, key,
- * prompt or filename.
+ * Closed in every member: a report is made of this build's own words, so one that was read back
+ * from elsewhere naming anything else does not parse, and there is nowhere in it for a line of
+ * output, a prompt or a filename to go.
  */
 export interface MetricsReport {
   /**
@@ -29686,7 +29698,23 @@ export interface HostDoctorResult1 {
    * read, word for word.
    */
   launch_probes: LaunchProbeReport[]
-  metrics?: MetricsReport
+  /**
+   * What this host has measured about itself: how long its paired devices were without a
+   * connection, the faults its terminals' parsers met and the failures of its adapters.
+   *
+   * Local diagnostics, counted in memory from the start of the process that counted them and
+   * sent to no service. The owner reads them, and so does a paired device whose grant, as this
+   * host's policy and ceilings leave it, holds the right to manage the host; the answer to any
+   * other caller says they are withheld. Every host of this level sends the member, and it is
+   * missing only from the answer of a host of an earlier level. Every label of a report is one
+   * of this build's own words, so a report carries no terminal content, key, prompt or
+   * filename.
+   */
+  metrics?:
+    | {
+        counted: MetricsReport
+      }
+    | 'withheld'
 }
 /**
  * One error a support bundle carries, already redacted.

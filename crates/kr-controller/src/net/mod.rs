@@ -1089,8 +1089,8 @@ async fn keep_the_record(
 ///   null, not removed: it is a required member.
 ///
 /// A third is the daemon's own. The host's diagnostics carry what the host measured about itself
-/// only to a decision that holds `host.manage`; for any other the `metrics` member is the report
-/// of a host that counted nothing, whatever decision the answer was read under.
+/// only to a decision that holds `host.manage`; for any other the `metrics` member says they are
+/// withheld, whatever decision the answer was read under.
 ///
 /// The members are read from, taken out of, or set null in the answer's map as the worker wrote
 /// it, without decoding the answer: one this build cannot decode, as one from a worker built after
@@ -1191,11 +1191,10 @@ fn shown_value(
         if manage || member(value, METRICS_MEMBER).is_none() {
             return None;
         }
-        // The report of a host that counted nothing, in the place of the counts. A reader of the
-        // answer as a type needs the member to be there, and an answer that cannot say it has
-        // none goes without the member rather than with the counts.
-        let nothing = kr_protocol::envelope::ParamsValue::from_typed(
-            &kr_protocol::metrics::MetricsReport::default(),
+        // The state of a host that gives this caller no metrics, in the place of the counts. An
+        // answer that cannot say it goes without the member rather than with the counts.
+        let withheld = kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::metrics::HostMetrics::Withheld,
         );
         let kr_cbor::CanonicalValue::Map(answer) = value.as_value() else {
             return None;
@@ -1207,10 +1206,10 @@ fn shown_value(
                 if key != METRICS_MEMBER {
                     Some((key.clone(), held.clone()))
                 } else {
-                    nothing
+                    withheld
                         .as_ref()
                         .ok()
-                        .map(|nothing| (key.clone(), nothing.as_value().clone()))
+                        .map(|withheld| (key.clone(), withheld.as_value().clone()))
                 }
             })
             .collect();

@@ -420,11 +420,14 @@ pub struct HostDoctorResult {
     /// Local diagnostics, counted in memory from the start of the process that counted them and
     /// sent to no service. The owner reads them, and so does a paired device whose grant, as this
     /// host's policy and ceilings leave it, holds the right to manage the host; the answer to any
-    /// other device holds a report with nothing counted, which says nothing about the host. Every
-    /// label is one of this build's own words, so the report carries no terminal content, key,
-    /// prompt or filename.
-    #[serde(default)]
-    pub metrics: crate::metrics::MetricsReport,
+    /// other caller says they are withheld. Every host of this level sends the member, and it is
+    /// missing only from the answer of a host of an earlier level. Every label of a report is one
+    /// of this build's own words, so a report carries no terminal content, key, prompt or
+    /// filename.
+    // The member is missing, or one of the two states: no `null` is a state of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "crate::metrics::HostMetrics")]
+    pub metrics: Option<crate::metrics::HostMetrics>,
 }
 
 impl HostDoctorResult {
@@ -443,7 +446,7 @@ impl HostDoctorResult {
             configuration,
             command_integrations: Vec::new(),
             launch_probes: Vec::new(),
-            metrics: crate::metrics::MetricsReport::default(),
+            metrics: None,
         }
     }
 
@@ -457,10 +460,10 @@ impl HostDoctorResult {
         self
     }
 
-    /// The same result, reporting `metrics`.
+    /// The same result, saying `metrics` of the host's metrics.
     #[must_use]
-    pub fn with_metrics(mut self, metrics: crate::metrics::MetricsReport) -> Self {
-        self.metrics = metrics;
+    pub fn with_metrics(mut self, metrics: crate::metrics::HostMetrics) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

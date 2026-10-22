@@ -18562,13 +18562,8 @@
           "type": "array"
         },
         "metrics": {
-          "$ref": "#/$defs/MetricsReport",
-          "default": {
-            "adapter_failure": [],
-            "reconnect_time": [],
-            "terminal_parse_fault": []
-          },
-          "description": "What this host has measured about itself: how long its paired devices were without a\nconnection, the faults its terminals' parsers met and the failures of its adapters.\n\nLocal diagnostics, counted in memory from the start of the process that counted them and\nsent to no service. The owner reads them, and so does a paired device whose grant, as this\nhost's policy and ceilings leave it, holds the right to manage the host; the answer to any\nother device holds a report with nothing counted, which says nothing about the host. Every\nlabel is one of this build's own words, so the report carries no terminal content, key,\nprompt or filename."
+          "$ref": "#/$defs/HostMetrics",
+          "description": "What this host has measured about itself: how long its paired devices were without a\nconnection, the faults its terminals' parsers met and the failures of its adapters.\n\nLocal diagnostics, counted in memory from the start of the process that counted them and\nsent to no service. The owner reads them, and so does a paired device whose grant, as this\nhost's policy and ceilings leave it, holds the right to manage the host; the answer to any\nother caller says they are withheld. Every host of this level sends the member, and it is\nmissing only from the answer of a host of an earlier level. Every label of a report is one\nof this build's own words, so a report carries no terminal content, key, prompt or\nfilename."
         }
       },
       "required": [
@@ -18671,6 +18666,29 @@
       ],
       "type": "object",
       "x-kalareach-read-only-metadata": true
+    },
+    "HostMetrics": {
+      "description": "What a host says of its metrics to the caller that asks for its diagnostics.\n\nA host counts them for its owner and for a device that manages it, and withholds them from any\nother caller. A report that counted nothing is not a host that does not say, so the two are\nstates of their own. A host of an earlier level says neither: the member that holds this is\nmissing from its answer.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host's report, which holds no series when nothing has been counted.",
+          "properties": {
+            "counted": {
+              "$ref": "#/$defs/MetricsReport"
+            }
+          },
+          "required": [
+            "counted"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "withheld",
+          "description": "The host does not give this caller its metrics.",
+          "type": "string"
+        }
+      ]
     },
     "HostPrivacyState": {
       "description": "Where a host's privacy mode stands, as every paired device may read it.\n\nThis is the generation in force and whether privacy mode is on at it: what a device needs to\nkeep what it holds for this host off a service while the host is private, and nothing the\nreport `privacy.status` makes (when it changed, what is still owed, what is kept and what had\nalready left), which only a device that manages the host reads.\n\nRead-only metadata like `EnvironmentSummary`: a member added later is explicitly optional, a\nreader whose schema predates it ignores it rather than refusing the answer, and it never\nchanges what the members here mean. An extension may extend it.",

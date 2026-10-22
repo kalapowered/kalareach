@@ -313,16 +313,28 @@ pub fn doctor(result: &HostDoctorResult) -> Document {
                 .map(launch_probe)
                 .collect::<Vec<_>>(),
         )
-        .with("metrics", metrics(&result.metrics))
+        .with("metrics", result.metrics.as_ref().map(metrics))
 }
 
-/// What the host measured about itself, in the shape the protocol answers it.
+/// What the host says of the metrics it measured about itself: its state, and the series when it
+/// counted them.
 ///
 /// Every label is one of this build's own words and every figure a number, so nothing here is a
 /// value an export has to withhold.
 #[must_use]
-pub fn metrics(report: &kr_protocol::metrics::MetricsReport) -> Document {
+pub fn metrics(metrics: &kr_protocol::metrics::HostMetrics) -> Document {
+    use kr_protocol::metrics::HostMetrics;
+
+    match metrics {
+        HostMetrics::Counted(report) => counted_metrics(report),
+        HostMetrics::Withheld => Document::new().with("state", "withheld"),
+    }
+}
+
+/// The series of a report, under the state `counted`.
+fn counted_metrics(report: &kr_protocol::metrics::MetricsReport) -> Document {
     Document::new()
+        .with("state", "counted")
         .with(
             "reconnect_time",
             report
@@ -369,12 +381,27 @@ pub fn metrics(report: &kr_protocol::metrics::MetricsReport) -> Document {
         )
 }
 
-/// What the host measured about itself, one line for each series.
+/// What the host measured about itself, one line for each series, or one line that says the host
+/// gives this caller none.
 ///
-/// A host that has counted nothing says nothing: a line that says there is nothing to say is noise
-/// in a report that runs to dozens of lines.
+/// A host that has counted nothing says nothing, and so does a host of an earlier level that says
+/// nothing of them: a line that says there is nothing to say is noise in a report that runs to
+/// dozens of lines.
 #[must_use]
-pub fn metric_lines(report: &kr_protocol::metrics::MetricsReport) -> Vec<Shown> {
+pub fn metric_lines(metrics: Option<&kr_protocol::metrics::HostMetrics>) -> Vec<Shown> {
+    use kr_protocol::metrics::HostMetrics;
+
+    match metrics {
+        Some(HostMetrics::Counted(report)) => series_lines(report),
+        Some(HostMetrics::Withheld) => vec![shown!(
+            "metric         withheld: this host gives its metrics to a device that manages it"
+        )],
+        None => Vec::new(),
+    }
+}
+
+/// One line for each series a report counted.
+fn series_lines(report: &kr_protocol::metrics::MetricsReport) -> Vec<Shown> {
     let mut lines = Vec::new();
     for series in &report.reconnect_time {
         lines.push(shown!(
@@ -955,7 +982,7 @@ pub fn doctor_lines(result: &HostDoctorResult, verbose: bool) -> Vec<Line> {
             "               ",
         ));
     }
-    for line in metric_lines(&result.metrics) {
+    for line in metric_lines(result.metrics.as_ref()) {
         lines.push(stdout_line!("{}", line));
     }
     lines.push(stdout_line!("{}", summary(result)));
@@ -995,7 +1022,7 @@ pub fn report_lines(result: &HostDoctorResult) -> Vec<Shown> {
         ));
     }
     // Made only of this build's own words and numbers, so the bundle carries them as they are.
-    lines.extend(metric_lines(&result.metrics));
+    lines.extend(metric_lines(result.metrics.as_ref()));
     lines.push(summary(result));
     lines
 }
