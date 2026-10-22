@@ -132,46 +132,47 @@ dependencies {
  * exists Gradle verifies every artefact in the graph and fails on any without an entry, which would
  * make one pinned library the whole build's problem. This checks the artefacts this build pinned,
  * and says plainly when it cannot find one.
+ *
+ * The check reads what the release build resolves for its runtime, the files it will package, and
+ * not a separate resolution of the same names: a version another dependency raises is the version
+ * checked.
  */
 val pinnedNativeLibraries = mapOf(
     "io.github.webrtc-sdk:android:150.7871.01" to
         "0a1627b1a48c2bc17d9a40d62fc47bd45166f44a311e95917f147c402de379b0",
-    "androidx.camera:camera-core:1.4.2@aar" to
+    "androidx.camera:camera-core:1.4.2" to
         "bbca13760ce1587502eb15723d0e17fa0a3495d084e609c4e4c8d3c2e1c85cf8",
     // The verifier's Kotlin half carries no native code, but it is fetched from a repository this
     // project does not run, and it decides which certificates the application trusts.
-    "org.rustls:rustls-platform-verifier:0.2.0@aar" to
+    "org.rustls:rustls-platform-verifier:0.2.0" to
         "aa021794230fbc2f0be355999e2cf67398dd563de066a2e17001ffbd0b69101b",
 )
 
 /*
- * The verifier's Kotlin half and its Rust crate are one component: the Rust side calls the Kotlin
- * side by name and layout, so the two versions must be identical. The crate's version is what
- * `Cargo.lock` holds.
+ * The verifier's Kotlin half and its Rust crate are one component, and the version of the one is
+ * the lock's for the other: the root build reads it from `Cargo.lock`, and the plugin links exactly
+ * that. A lock that names a version this build holds no digest for stops the build.
  */
-val rustlsPlatformVerifierKotlinVersion = "0.2.0"
-val rustlsPlatformVerifierCrateVersion: String by lazy {
-    val lines = rootProject.file("../../../../../Cargo.lock").readLines()
-    val named = lines.indexOfFirst { it.trim() == "name = \"rustls-platform-verifier-android\"" }
-    check(named >= 0) { "Cargo.lock names no rustls-platform-verifier-android" }
-    lines.drop(named + 1).first { it.trimStart().startsWith("version = ") }
-        .substringAfter('"').substringBefore('"')
-}
+val rustlsPlatformVerifierKotlinVersion = rootProject.extra["rustlsPlatformVerifierKotlinVersion"] as String
 
 afterEvaluate {
     val verifyNativeLibraries by tasks.registering {
         description = "Checks each native library's bytes against the digest this build pins."
         doLast {
-            if (rustlsPlatformVerifierCrateVersion != rustlsPlatformVerifierKotlinVersion) {
+            val linked = configurations.getByName("releaseRuntimeClasspath").resolvedConfiguration.resolvedArtifacts
+            val verifier = "org.rustls:rustls-platform-verifier:$rustlsPlatformVerifierKotlinVersion"
+            if (verifier !in pinnedNativeLibraries) {
                 throw GradleException(
-                    "the platform verifier's Rust crate is $rustlsPlatformVerifierCrateVersion and its " +
-                        "Kotlin half is $rustlsPlatformVerifierKotlinVersion: they must be the same version"
+                    "Cargo.lock holds the platform verifier's Kotlin half at $rustlsPlatformVerifierKotlinVersion, " +
+                        "and this build pins no digest for it"
                 )
             }
             for ((coordinates, pinned) in pinnedNativeLibraries) {
-                val detached = configurations.detachedConfiguration(dependencies.create(coordinates))
-                detached.isTransitive = false
-                val digestBytes = MessageDigest.getInstance("SHA-256").digest(detached.singleFile.readBytes())
+                val found = linked.filter { it.moduleVersion.id.toString() == coordinates }
+                if (found.size != 1) {
+                    throw GradleException("the release build links $coordinates ${found.size} times: expected once")
+                }
+                val digestBytes = MessageDigest.getInstance("SHA-256").digest(found.single().file.readBytes())
                 val digest = digestBytes.joinToString("") { b -> "%02x".format(b) }
                 if (digest != pinned) {
                     throw GradleException(

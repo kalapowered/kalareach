@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      The development build loads its page from a development server over plain HTTP. The platform
+      verifier's library merges a network security configuration of its own into every build, which
+      keeps cleartext traffic off outside the revocation-list hosts it names, and a configuration
+      takes precedence over the application's usesCleartextTraffic. The development build names its
+      own, so the development server stays in reach. The release build is unchanged.
+    -->
+    <application
+        android:networkSecurityConfig="@xml/network_security_config_development"
+        tools:replace="android:networkSecurityConfig" />
+</manifest>
