@@ -3007,12 +3007,14 @@ impl AutomationModule {
         method: Method,
         caller_grant: Option<GrantId>,
     ) -> Option<ControlFrame> {
-        if method == Method::WorkflowRearm {
-            return self.rearmed(mutation, caller_grant).await;
-        }
         let key = action_key(actor_id, mutation, method).ok()?;
         let service = Arc::clone(&self.service);
         match blocking(move || service.answered(&key)).await {
+            // A rearm has no record of its own, but an identifier the caller spent on another
+            // action is refused all the same, as it is for every action.
+            Ok(None) if method == Method::WorkflowRearm => {
+                self.rearmed(mutation, caller_grant).await
+            }
             Ok(None) => None,
             Ok(Some(answer)) => Some(frame(mutation.request_id, encode_answer(&answer))),
             Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
