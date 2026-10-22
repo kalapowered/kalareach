@@ -1,0 +1,105 @@
+{
+  "description": "An organisation's policy-signing chain and host policy as the managed service signs them across a rotation of the policy-signing key. The service signs the policy it holds again under the new key, as the next revision with the same settings, so that a host that follows the new chain applies it. The cases are the chain and the policy before the rotation, and the chain and the policy after it.",
+  "provenance": "Captured from the managed service's own signing code (kalareach-web, workers/api) in its Workers-runtime test environment: a policy was set, the chain and the policy were read, the policy-signing key was rotated, and the chain and the policy were read again. Nothing was edited. The head of each chain lasts fifteen minutes, so a test applies it with the host's wall clock set to a moment inside both heads.",
+  "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+  "authority_before_rotation": {
+    "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+    "chain": [
+      {
+        "payload": {
+          "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+          "key_revision": "1",
+          "previous_key_revision": null,
+          "public_key": "fVRaE5UfuN8MKb6FYTKZK8dYTUc--kyu817KD_mIYas",
+          "not_before_ms": "1792642898613"
+        },
+        "signature": "hj27wAl1b2h_5hM8RIcbj8t5NutmN4XO4xIB9mir404NyNDWZgUP4oLybVqtVU2sAVBFCzFVZkaR9Hp93zGjBQ"
+      }
+    ],
+    "head": {
+      "payload": {
+        "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+        "key_revision": "1",
+        "issued_at_ms": "1792642898618",
+        "expires_at_ms": "1792643798618"
+      },
+      "signature": "HrbF8vJ74MrBf1Je_q9W3aA5MZW0AOevljWZDu6GZR1dmtL2rQxfY5YH2HMT_mSkOMEsfP-YAS9BfnmcNgTWBg"
+    }
+  },
+  "policy_before_rotation": {
+    "payload": {
+      "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+      "policy_revision": "1",
+      "adapter_allowlist": [
+        "kalareach.claude-code",
+        "kalareach.codex"
+      ],
+      "minimum_client_version": "1.4.0",
+      "maximum_grant_lifetime_ms": "604800000",
+      "external_providers": "organisation_only",
+      "backup": {
+        "required": false,
+        "recovery_recipient": null
+      },
+      "audit_retention_days": "365",
+      "issued_at_ms": "1792642898613",
+      "key_revision": "1"
+    },
+    "signature": "0RNdaSr8oni_5iRIFTx8gqjsc2Y4NmQsIxr7PwVuGfk9HBUeOTL2fusrbjKubOwh9lpgrSN81Oht-TGBzWk9Ag"
+  },
+  "authority_after_rotation": {
+    "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+    "chain": [
+      {
+        "payload": {
+          "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+          "key_revision": "1",
+          "previous_key_revision": null,
+          "public_key": "fVRaE5UfuN8MKb6FYTKZK8dYTUc--kyu817KD_mIYas",
+          "not_before_ms": "1792642898613"
+        },
+        "signature": "hj27wAl1b2h_5hM8RIcbj8t5NutmN4XO4xIB9mir404NyNDWZgUP4oLybVqtVU2sAVBFCzFVZkaR9Hp93zGjBQ"
+      },
+      {
+        "payload": {
+          "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+          "key_revision": "2",
+          "previous_key_revision": "1",
+          "public_key": "mnWBE31vsxzzNZbfZtc6q_HrMSrTQrBonHwb_ek3--8",
+          "not_before_ms": "1792642898620"
+        },
+        "signature": "2tAC-E-htz0_BwyAAvB9NXQae6Lal8yF9uTWShK9MaBokeZsvDWUk7Znit16snwLtOql8qpLT1v8WH0_Bg6zCg"
+      }
+    ],
+    "head": {
+      "payload": {
+        "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+        "key_revision": "2",
+        "issued_at_ms": "1792642898626",
+        "expires_at_ms": "1792643798626"
+      },
+      "signature": "Z2-x_7j0JPvtuKv--k9YSIq1tOR_Hb60SNstN3-KYgLBQtlw3uN7D-o-k5Kv5qZig-etdrRWtsgIb38Xs4f1Cg"
+    }
+  },
+  "policy_after_rotation": {
+    "payload": {
+      "organisation_id": "3b3b3b3b-3b3b-4b3b-8b3b-3b3b3b3b3b3b",
+      "policy_revision": "2",
+      "adapter_allowlist": [
+        "kalareach.claude-code",
+        "kalareach.codex"
+      ],
+      "minimum_client_version": "1.4.0",
+      "maximum_grant_lifetime_ms": "604800000",
+      "external_providers": "organisation_only",
+      "backup": {
+        "required": false,
+        "recovery_recipient": null
+      },
+      "audit_retention_days": "365",
+      "issued_at_ms": "1792642898620",
+      "key_revision": "2"
+    },
+    "signature": "432M901upaYE69tMgT-NbUizp1AP3mdMT4Lhby109KL9d6VnzcdB-BFjtp7dSE0sz-d8QH-8V6-QE7UTxoS1CA"
+  }
+}

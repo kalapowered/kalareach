@@ -71,12 +71,30 @@ impl Fixture {
         fixture
     }
 
+    /// Starts a daemon with an owner device, enrolled in nothing, whose wall clock reads
+    /// `wall_ms` when it starts and goes on from there, for a test that applies what an
+    /// organisation signed at a time of its own.
+    pub async fn start_unenrolled_at(wall_ms: u64) -> Self {
+        let machine = i64::try_from(kr_ipc::now_ms().get()).expect("a moment");
+        let offset = i64::try_from(wall_ms).expect("a moment") - machine;
+        Self::start_unenrolled_offset(None, offset).await
+    }
+
     /// Starts a daemon with an owner device, enrolled in nothing, that reads `document` as its
     /// configuration when it is given one.
     pub async fn start_unenrolled_under(document: Option<&ConfigurationDocument>) -> Self {
+        Self::start_unenrolled_offset(document, 0).await
+    }
+
+    /// As [`Self::start_unenrolled_under`], with a wall clock moved by `offset` milliseconds from
+    /// the machine's from the start.
+    async fn start_unenrolled_offset(
+        document: Option<&ConfigurationDocument>,
+        offset: i64,
+    ) -> Self {
         let owner = DeviceKeys::generate().expect("keys");
         let continuous = ManualClock::new();
-        let moved = Arc::new(AtomicI64::new(0));
+        let moved = Arc::new(AtomicI64::new(offset));
         let clocks = clocks_over(&continuous, &moved);
         let host = match document {
             Some(document) => Host::start_with_document_clocks(&owner, document, clocks).await,
@@ -106,9 +124,14 @@ impl Fixture {
     /// The owner enrols the host in `organisation` from the chain it publishes now, on the
     /// confirmation of an owner device.
     pub async fn enrol_in(&self, organisation: &Organisation) -> OrganisationEnrolResult {
-        let params = OrganisationEnrolParams {
-            authority: organisation.authority(self.now() - 1_000),
-        };
+        self.enrol_from(organisation.authority(self.now() - 1_000))
+            .await
+    }
+
+    /// The owner enrols the host from `authority`, a chain an organisation published, on the
+    /// confirmation of an owner device.
+    pub async fn enrol_from(&self, authority: PolicyAuthority) -> OrganisationEnrolResult {
+        let params = OrganisationEnrolParams { authority };
         let mut client = self.host.client().await;
         calls::confirm_subject(
             self.host.environment_id,
