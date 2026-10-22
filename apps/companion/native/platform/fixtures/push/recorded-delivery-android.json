@@ -1,0 +1,17 @@
+{
+  "message": {
+    "android": {
+      "collapse_key": "f74cbc7e-2466-05dd-0025-fcbdc989e8e0",
+      "priority": "high",
+      "ttl": "14399s"
+    },
+    "data": {
+      "alert": "A KalaReach session is waiting for an answer.",
+      "collapse_id": "f74cbc7e-2466-05dd-0025-fcbdc989e8e0",
+      "expires_at_ms": "1792717084422",
+      "notification_id": "3324fb94-09ee-4fbe-ae1b-02505fe6553b",
+      "preview": "{\"routing\":{\"envelope_id\":\"1e29172b-8a0a-4e78-b468-772479fd57d0\",\"recipient_key_id\":\"h6ej_vBSI11Jczh00baRpztnELbtP776iadb4lz2f3s\",\"sender_key_id\":\"qVDyJezo7mGDiFsBAzOO0paiVN6jZvAPawL-704-y6o\",\"expires_at_ms\":\"1792717084422\",\"payload_type\":\"notification_preview\",\"thread_id\":null,\"size_bucket_bytes\":\"1024\"},\"nonce\":\"e5IxIVJ1q4dOE5xdCWoI1rBfviIB0-4c\",\"ciphertext\":\"7aLaZWHgCcn9BQdzC8fhUApMTSkJ1nVoDOepICfw6Z-G_JHuMx_C-4rwJy7s-CLFGMEDMotE0qeHRFZVzgo5ABGUTKCK7eBgC3pwoJpse81aiyz27MGmBU6fQ6PxJKx43enx4rIJrz8vowaLWlSTCPSQN27QLyUvNZkGTVz0LhkeWH5B9XNUAAG67QDXQT_5KZORLKtAP-puNAXH0PGKuo2GzB6VYLWTm6G5s4JPtpDQSo5jTrqKOSAjJB4Q-kqPEmPmWeB50AERS1VKiAs0dqia4LaDGyEI0m_0rFwgdaGL7dmvpIRrkk7VrZtupNhMrwEpW84p_oJzyM9aeE7vNSy4_Yq50eGFEJhRetg4jRo2r3uU751xANI4Ocg1Bbi06bXe-bvLSwyzEzdx7a6-n6kIk2Ej06JYSyPO4iibTjhUHQbIMrJM3zRa_MZ1K9qhYyWxPqqW8wtZt2pSwzC4dzDLif1traTSWWYYsYWym-Z0PlO6pI8Hm6ZFxWgARYV5LYq1wTzci_0m6hmPhRKjXveTxDMhIOUQRI2Aw_MFS319x7nRs8yUwbcBPVt6vOyCXH4MQZx_nUj4nkGM_nrt439Etusau-Ehui_7j-93HpcAqFeEtx6Fd5XjWNHXVAMiUKFIjNv730H4B5WaF9TU84RBVjq82XTGBeHtTK0-qqBNNqxXe6g61GEoJpNYOUoauF0r2u3KsVJSO_F_8aFbeq0zXJ_sduP4t23GCWMnsZV-2x5xKaa_3AKGPI-BctXb12ZpxBA3kGojvmXAdXyQ-xOthFJXiDrEJKYdoUciD4PkEf2rHR6VbjkQ_GMjiJDcaEJL5YeHsf1xroLkwewRCULQ9Y1g-2-wnA4bamMc_dpuBFXBQGahmMsnjrbNWejuMq4XyF_8a39BS3KmHl25CvPvlngS5_AOxcxiE7N5gD2SOxf2DwlcSSwjigBAN94Ih8W_gcwcqlkmvm6WJsO4G6udrWwtPvUCQOWbbKUhAitrh_s7WPPcNx8DCym6RkuLt6DiIW_jUEC9g0MZJl2qR9VayXPC5_SozhaZxQR0GmsQ_myvqteywBtTCW0r3A2ar9OspqWkjEKhIOV19QXn0tD1s2TKV6Q9PPTTzRpTlOyNvLHsbfW1Wii-6scJ1IB03KIYMyNRSDHC0mf7jcWsU9N0qNpqJJq_SgfvrlFxyNrmEeVbHuxs-5LqPxhPlHy4vocGgIIfG31e4Z4PHh40HyUSb0uv4rSlOTVIVkNucnfAOZZxeZB_rNcymj_j0Z4aLFgjCHIeplYbj0U8FUykmgkYEg4o2OGy1cRxIv0YG8rjRmcySR3gmqmkb_7meToJWsmWAmYR2oan086OnOK2QkFTnYRcC8bAti5DQSS_kB8\"}"
+    },
+    "token": "kr-device-run-f36cf6c4-79df-4e7e-87ce-1141d534cafc"
+  }
+}
