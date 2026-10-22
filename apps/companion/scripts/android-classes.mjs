@@ -31,11 +31,11 @@ import { pathToFileURL } from 'node:url'
 /**
  * The classes a packaged application must define, by these exact names.
  *
- * Both are entry points the system itself resolves by name: the first from the manifest, the
- * second from the work request the receiver enqueues. That is what makes them safe to demand of
+ * Each is an entry point the system itself resolves by name: the first from the manifest, the other
+ * two from the work requests the receiver enqueues. That is what makes them safe to demand of
  * every build. A release build may rename or remove a class that only other code reaches, so
  * naming the keystore reader or a decision class here would fail a release artefact that is
- * perfectly correct. Between them the two cover the tree: neither exists at all unless the module
+ * perfectly correct. Between them they cover the tree: none exists at all unless the module
  * compiled it.
  *
  * `--list` prints everything the artefact carries of the hand-written packages, which is what to
@@ -44,8 +44,10 @@ import { pathToFileURL } from 'node:url'
 const REQUIRED = [
   // The service the system starts when a push arrives, declared in the manifest.
   'to.kala.reach.companion.push.KalaReachMessagingService',
-  // The work the message callback hands to the platform's scheduler.
-  'to.kala.reach.companion.push.PreviewWorker'
+  // The work the message callback hands to the platform's scheduler: a notification it could not
+  // finish showing, and a registration answer it could not finish posting.
+  'to.kala.reach.companion.push.PreviewWorker',
+  'to.kala.reach.companion.push.ChallengeWorker'
 ]
 
 /** The packages whose classes are listed by `--list`. */
