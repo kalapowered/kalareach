@@ -3127,8 +3127,11 @@ never saw rotate is applied.
 
 After the organisation rotates its key, a host that has followed the new chain keeps the policy it
 holds and accepts the next one only under the new key. A policy the organisation signed under the
-old key is refused until the organisation signs it again. A host that has not followed the rotation
-needs the chain beside the policy: `kr organisation policy <policy-file> --chain <chain-file>`.
+old key is refused until the organisation signs it again, which the managed service does at the
+rotation: it signs the policy it holds again under the new key, as the next revision with the same
+settings, so the policy it serves afterwards is one that a host which followed the new chain
+applies. A host that has not followed the rotation needs the chain beside the policy:
+`kr organisation policy <policy-file> --chain <chain-file>`.
 
 The host keeps the policy's revision and its adapter allowlist in a store of its own,
 `organisation-policy.json` in the environment's state directory beside the registry, and not in

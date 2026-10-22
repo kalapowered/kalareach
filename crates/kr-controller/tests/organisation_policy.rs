@@ -494,18 +494,29 @@ async fn kr_req_18_06_a_policy_that_does_not_verify_changes_nothing() {
 }
 
 /// KR-REQ-18.06: after the organisation rotates its key, a policy under the new key applies with
-/// the chain beside it, and a policy under the old key, issued before the rotation, does not.
+/// the chain beside it, over a policy the host holds under the earlier key, and a policy under the
+/// old key, issued before the rotation, does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_06_after_a_rotation_only_the_new_key_signs_a_policy() {
     let mut fixture = Fixture::start().await;
     let _repository = install_the_example(&fixture).await;
     let now = fixture.now();
+    apply(
+        &fixture,
+        fixture
+            .organisation
+            .policy(2, 1, Some(&[CODEX, EXAMPLE]), now),
+        None,
+    )
+    .await
+    .expect("the policy under the key the host follows applies");
+    assert!(is_admitted(&admission(&fixture).await));
     fixture.organisation.rotate(now - 1_000);
     let organisation = &fixture.organisation;
 
     apply(
         &fixture,
-        organisation.policy(3, 1, Some(&[CODEX]), now),
+        organisation.policy(3, 2, Some(&[CODEX]), now),
         Some(organisation.authority(now)),
     )
     .await
@@ -516,7 +527,7 @@ async fn kr_req_18_06_after_a_rotation_only_the_new_key_signs_a_policy() {
     refused_as(
         apply(
             &fixture,
-            organisation.policy(2, 2, Some(&[CODEX, EXAMPLE]), now - 2_000),
+            organisation.policy(2, 3, Some(&[CODEX, EXAMPLE]), now - 2_000),
             None,
         )
         .await,
@@ -524,12 +535,79 @@ async fn kr_req_18_06_after_a_rotation_only_the_new_key_signs_a_policy() {
     );
     apply(
         &fixture,
-        organisation.policy(3, 2, Some(&[CODEX, EXAMPLE]), now),
+        organisation.policy(3, 3, Some(&[CODEX, EXAMPLE]), now),
         None,
     )
     .await
     .expect("the new key signs the next revision with no chain beside it");
     assert!(is_admitted(&admission(&fixture).await));
+    fixture.host.stop().await;
+}
+
+/// What the managed service signed across a rotation of its policy-signing key, captured from its
+/// own signing code: the chain and the policy before the rotation, and after it.
+#[derive(serde::Deserialize)]
+struct RotatedPolicy {
+    authority_before_rotation: PolicyAuthority,
+    policy_before_rotation: OrganisationPolicy,
+    authority_after_rotation: PolicyAuthority,
+    policy_after_rotation: OrganisationPolicy,
+}
+
+/// KR-REQ-18.06: the policy the managed service signs again when its organisation rotates the
+/// policy-signing key applies to a host that holds the policy before. The records are the
+/// service's own, not built here: the host enrols from the chain before the rotation, applies the
+/// policy signed before it, follows the chain after it with the policy the service signed again
+/// beside it, and holds the same list under the next revision; the policy before is then refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_06_the_policy_the_managed_service_signs_again_at_a_rotation_applies_to_a_host_that_holds_the_one_before()
+ {
+    let rotated: RotatedPolicy = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/accounts/rotated-policy.json"),
+        )
+        .expect("the captured records"),
+    )
+    .expect("records the host reads");
+    // The host's clock reads a moment inside the life of both heads.
+    let fixture = Fixture::start_unenrolled_at(
+        rotated
+            .authority_after_rotation
+            .head
+            .payload
+            .issued_at_ms
+            .get()
+            + 500,
+    )
+    .await;
+    fixture
+        .enrol_from(rotated.authority_before_rotation.clone())
+        .await;
+
+    let before = apply(&fixture, rotated.policy_before_rotation.clone(), None)
+        .await
+        .expect("the policy signed before the rotation applies under the key the host followed");
+    assert_eq!(before.organisation_policy_revision.get(), 1);
+    assert_eq!(fixture.listed().await.enrolments[0].accepted_head.get(), 1);
+
+    let after = apply(
+        &fixture,
+        rotated.policy_after_rotation.clone(),
+        Some(rotated.authority_after_rotation.clone()),
+    )
+    .await
+    .expect("the policy signed again under the new key applies with the new chain beside it");
+    assert_eq!(after.organisation_policy_revision.get(), 2);
+    assert_eq!(
+        after.adapter_allowlist, before.adapter_allowlist,
+        "the settings are the ones before"
+    );
+    assert_eq!(fixture.listed().await.enrolments[0].accepted_head.get(), 2);
+    refused_as(
+        apply(&fixture, rotated.policy_before_rotation.clone(), None).await,
+        "earlier_revision",
+    );
     fixture.host.stop().await;
 }
 
