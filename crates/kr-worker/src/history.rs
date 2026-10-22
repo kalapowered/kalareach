@@ -24,6 +24,7 @@ use kr_protocol::recovery::{
 };
 use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64};
 
+use crate::output_times::TimeIndex;
 use crate::persistence::retention::{Eviction, OutputRetention, Pressure, RetentionLimit};
 
 use crate::error::{Result, WorkerError};
@@ -219,6 +220,13 @@ pub struct OutputHistory {
     /// which bound took it, which is what section 20 asks eviction to leave explicit: a person
     /// looking at a gap can tell their own session's size from a busy host.
     evictions: VecDeque<Eviction>,
+    /// When the output was produced, where this history keeps that.
+    ///
+    /// Nothing is recorded while the history is not retaining, and nothing is noted for a range the
+    /// history does not hold.
+    times: Option<TimeIndex>,
+    /// Whether the wall clock could be proved at the last append, which the rows record.
+    clock_proven: bool,
 }
 
 impl OutputHistory {
@@ -238,7 +246,43 @@ impl OutputHistory {
             left_behind: None,
             resident_marks: VecDeque::new(),
             evictions: VecDeque::new(),
+            times: None,
+            clock_proven: false,
         }
+    }
+
+    /// Keeps the time each part of the output was produced at in the index file at `path`.
+    ///
+    /// The file is made when there is output to record. It lies beside the spool and not in it
+    /// ([`kr_ipc::paths::output_times_beside`]), so a release that reads the spool by its own rules
+    /// never meets it.
+    #[must_use]
+    pub fn with_time_index(mut self, path: impl Into<PathBuf>) -> Self {
+        self.times = Some(TimeIndex::new(path));
+        self
+    }
+
+    /// Says whether the wall clock can be proved as of now, which the next output's time records.
+    pub fn set_clock_proven(&mut self, proven: bool) {
+        self.clock_proven = proven;
+    }
+
+    /// Returns the handle to the time index, when this history keeps one.
+    ///
+    /// A pass of maintenance holds it beyond the session's lock to write it: the write is a call to
+    /// the disk, and the output path waits for the lock.
+    #[must_use]
+    pub fn time_index(&self) -> Option<TimeIndex> {
+        self.times.clone()
+    }
+
+    /// Writes the time index, with nothing else held.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the index could not be written; its intervals are kept for the next write.
+    pub fn flush_times(&self) -> std::result::Result<(), String> {
+        self.times.as_ref().map_or(Ok(()), TimeIndex::flush)
     }
 
     /// Opens an existing spool, without creating or repairing anything.
@@ -375,6 +419,9 @@ impl OutputHistory {
             self.try_resume();
         }
         let now = kr_ipc::now_ms();
+        if let Some(times) = self.times.as_ref() {
+            times.note(start, bytes.len() as u64, now.get(), self.clock_proven);
+        }
         let mut owed = None;
         if let Some(spool) = self.spool.as_mut() {
             owed = spool.take_plain_append(start, bytes, now.get());
@@ -664,6 +711,13 @@ impl OutputHistory {
     /// This is logical cleanup. The files are unlinked and the window is dropped; nothing here
     /// claims the bytes are unrecoverable from the device they were on.
     pub fn discard_retained(&mut self) -> Discarded {
+        let mut discarded = self.discard_window_and_spool();
+        self.discard_times(&mut discarded);
+        discarded
+    }
+
+    /// Removes the resident window and the spool's segments, and says what went and what could not.
+    fn discard_window_and_spool(&mut self) -> Discarded {
         // A write that is owed is made before anything is taken away, so that what the index
         // counts is in the file when a removal that fails leaves it where it was.
         self.wait_for_owed_write();
@@ -714,6 +768,19 @@ impl OutputHistory {
             spool.clear_suspension();
         }
         discarded
+    }
+
+    /// Removes the time index with the output it describes, and says so when it cannot.
+    fn discard_times(&mut self, discarded: &mut Discarded) {
+        let Some(times) = self.times.as_ref() else {
+            return;
+        };
+        if let Err(why) = times.discard() {
+            discarded.left_behind = Some(match discarded.left_behind.take() {
+                Some(earlier) => format!("{earlier}; {why}"),
+                None => why,
+            });
+        }
     }
 
     /// Returns whether this session recorded where its output got to and cannot read it back.
@@ -826,7 +893,29 @@ impl OutputHistory {
         }
         // A spool that stopped taking output is asked each pass whether it can take it again.
         self.try_resume();
+        // The rows of output that is no longer retained go with it, at the next write of the index.
+        if let Some(times) = self.times.as_ref() {
+            times.forget_before(self.oldest_retained_cursor());
+        }
         taken
+    }
+
+    /// Applies section 20's retention with the host's figure measured from the environment's
+    /// spools, which is what a live session's maintenance pass does.
+    ///
+    /// The figure is a reading of `spools`, the directory that holds every session's spool, and
+    /// not an authority: [`retained_bytes_under`] sizes each file by asking the file, and a file it
+    /// cannot read counts as nothing, which evicts less and not more. The control daemon applies
+    /// the same cap to the sessions that have closed, from the same reading.
+    pub fn apply_retention_to_host(
+        &mut self,
+        spools: &Path,
+        retention: OutputRetention,
+        now_ms: TimestampMs,
+        age_permitted: bool,
+    ) -> Vec<Eviction> {
+        let host_bytes = retained_bytes_under(spools);
+        self.apply_retention(retention, host_bytes, now_ms, age_permitted)
     }
 
     /// Removes every byte this host can prove was produced before `expires_before`.
@@ -1032,6 +1121,49 @@ impl OutputHistory {
         let take = wanted.min(usize::try_from(self.resident_start - start).unwrap_or(usize::MAX));
         spool.read_at(start, take, self.resident_start)
     }
+}
+
+/// Returns how many bytes of retained output live under one directory of spools.
+///
+/// One level of session directories, each holding fixed-size segments, so the walk is bounded by
+/// the number of sessions and the segments each keeps rather than by how much output they have
+/// produced. A directory or a file this host cannot read counts as nothing, which under-reports
+/// the host figure and therefore evicts less rather than more. Output still in a session's
+/// resident window has not reached a spool and is not counted.
+///
+/// What is counted is the output: the segment files, which are what `Spool` holds against its own
+/// cap. The file that records where a spool's output got to is a few bytes about the output, and
+/// counting it would hold a host that has given up every byte of a session over its cap by the
+/// size of the record.
+///
+/// Each segment is sized by asking the file itself. A directory entry's size is what the file
+/// system last wrote into the directory, which Windows does not bring up to date while a handle to
+/// the file is open, so a segment still being written would read shorter than it is, and the host
+/// would hold more than its cap.
+#[must_use]
+pub fn retained_bytes_under(root: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|extension| extension == "out") {
+                total += std::fs::metadata(&path).map_or(0, |data| data.len());
+            }
+        }
+    }
+    total
 }
 
 /// What a history holds at one cursor.
@@ -2740,6 +2872,121 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// A spool directory and the time index that goes beside it, as an environment lays them out.
+    fn spool_with_times(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let state = std::env::temp_dir().join(format!("kr-times-{name}-{}", kr_ipc::new_uuid()));
+        let session = kr_ipc::new_uuid();
+        let spool = state.join("spool").join(format!("{session}.log"));
+        let times = kr_ipc::paths::output_times_beside(&spool).expect("an index beside the spool");
+        (spool, times)
+    }
+
+    #[test]
+    fn output_is_timed_when_it_is_written_and_the_times_are_read_back_by_a_reader_of_the_spool() {
+        let (spool, times) = spool_with_times("timed");
+        let before = kr_ipc::now_ms().get();
+        {
+            let mut history =
+                OutputHistory::with_spool(4, &spool, SpoolLayout::new(8, 1024 * 1024))
+                    .expect("a spool")
+                    .with_time_index(&times);
+            history.set_clock_proven(true);
+            history.append(&[b'a'; 12]);
+            history.append(&[b'b'; 12]);
+            history.flush_times().expect("writes the times");
+        }
+        let after = kr_ipc::now_ms().get();
+        // The session is gone. What reads its output reads its times from the file.
+        let read = crate::output_times::read(&times, 0, 24, 16).expect("the times");
+        assert!(read.complete);
+        let first = read.marks.first().expect("a time for the output");
+        assert_eq!((first.from, first.to), (0, 24), "one burst is one interval");
+        assert!(first.proven);
+        assert!(
+            (before..=after).contains(&first.at_ms),
+            "{} is not in {before}..={after}",
+            first.at_ms
+        );
+        std::fs::remove_dir_all(
+            spool
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("a root"),
+        )
+        .ok();
+    }
+
+    #[test]
+    fn output_that_is_evicted_takes_its_times_with_it() {
+        let (spool, times) = spool_with_times("evicted");
+        let mut history = OutputHistory::with_spool(4, &spool, SpoolLayout::new(8, 16))
+            .expect("a spool")
+            .with_time_index(&times);
+        for _ in 0..8 {
+            history.append(&[b'z'; 8]);
+        }
+        let oldest = history.oldest_retained_cursor();
+        assert!(oldest > 0, "the oldest segments were dropped");
+        history.apply_retention(
+            OutputRetention::DEFAULT,
+            history.retained_bytes(),
+            kr_ipc::now_ms(),
+            true,
+        );
+        history.flush_times().expect("writes the times");
+        let read = crate::output_times::read(&times, 0, history.next_cursor(), 16).expect("times");
+        assert!(
+            read.marks.iter().all(|mark| mark.to > oldest),
+            "no row is wholly before the oldest retained cursor {oldest}: {:?}",
+            read.marks
+        );
+        std::fs::remove_dir_all(
+            spool
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("a root"),
+        )
+        .ok();
+    }
+
+    #[test]
+    fn privacy_mode_removes_the_times_with_the_output_and_nothing_is_recorded_while_it_is_on() {
+        let (spool, times) = spool_with_times("privacy");
+        let mut history = OutputHistory::with_spool(4, &spool, SpoolLayout::new(8, 1024 * 1024))
+            .expect("a spool")
+            .with_time_index(&times);
+        history.append(&[b'a'; 8]);
+        history.flush_times().expect("writes the times");
+        assert!(times.exists());
+        history.stop_retaining();
+        let discarded = history.discard_retained();
+        assert_eq!(discarded.left_behind, None);
+        assert!(!times.exists(), "the file went with the output");
+        history.append(&[b'b'; 8]);
+        history.flush_times().expect("nothing to write");
+        assert!(
+            !times.exists(),
+            "nothing is recorded while retention is off"
+        );
+        history.resume_retaining();
+        history.append(&[b'c'; 8]);
+        history.flush_times().expect("writes the times");
+        let read = crate::output_times::read(&times, 0, 64, 16).expect("times");
+        let spans: Vec<_> = read.marks.iter().map(|mark| (mark.from, mark.to)).collect();
+        assert_eq!(
+            spans,
+            vec![(16, 24)],
+            "only the output kept after retention resumed"
+        );
+        std::fs::remove_dir_all(
+            spool
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("a root"),
+        )
+        .ok();
+    }
+
     #[test]
     fn the_spool_drops_its_oldest_segments_and_reports_the_gap() {
         let directory = std::env::temp_dir().join(format!("kr-spool-{}", kr_ipc::new_uuid()));
@@ -3171,5 +3418,45 @@ mod tests {
         assert!(history.evictions().is_empty());
         assert!(!history.page(0, 64).expect("a page").gap.is_present());
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn the_host_measure_sizes_a_segment_that_is_open_for_append_by_the_bytes_written_to_it() {
+        use std::io::Write as _;
+
+        // A segment held open and written through the handle it was opened with: a directory
+        // entry's size is not brought up to date on Windows while such a handle exists, and the
+        // measure asks the file.
+        let root = spool_directory("measure");
+        let session = root.join("one.log");
+        std::fs::create_dir_all(&session).expect("a spool directory");
+        let mut open = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(session.join("0.out"))
+            .expect("a segment");
+        open.write_all(&[b'x'; 100]).expect("writes");
+        let mut sibling = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(session.join("100.out"))
+            .expect("another segment");
+        sibling.write_all(&[b'y'; 28]).expect("writes");
+        assert_eq!(retained_bytes_under(&root), 128);
+        drop((open, sibling));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_host_measure_counts_the_segments_and_nothing_beside_them() {
+        let root = spool_directory("measure-beside");
+        let session = root.join("one.log");
+        std::fs::create_dir_all(&session).expect("a spool directory");
+        std::fs::write(session.join("0.out"), [b'x'; 64]).expect("a segment");
+        std::fs::write(session.join(BOUNDARY_FILE), [b'b'; 16]).expect("the boundary");
+        std::fs::write(session.join("stray"), [b's'; 32]).expect("a file beside them");
+        std::fs::write(root.join("loose.out"), [b'l'; 8]).expect("a file outside a session");
+        assert_eq!(retained_bytes_under(&root), 64);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

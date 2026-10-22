@@ -261,6 +261,7 @@ impl EnvironmentPaths {
             &self.state_dir,
             &self.journals_dir(),
             &self.spool_dir(),
+            &self.output_times_dir(),
             &self.jobs_dir(),
             &self.secrets_dir(),
             &self.workers_dir(),
@@ -405,6 +406,37 @@ impl EnvironmentPaths {
     #[must_use]
     pub fn session_spool(&self, session_id: SessionId) -> PathBuf {
         self.spool_dir().join(format!("{session_id}.log"))
+    }
+
+    /// Returns the directory holding the time indexes of retained output.
+    ///
+    /// It lies beside the spool and not inside it, so nothing that lists or measures a spool meets
+    /// an index, and an earlier release that reads the spool by its own rules never sees one.
+    #[must_use]
+    pub fn output_times_dir(&self) -> PathBuf {
+        self.state_dir.join("output-times")
+    }
+
+    /// Returns the index of when one session's retained output was produced.
+    #[must_use]
+    pub fn session_output_times(&self, session_id: SessionId) -> PathBuf {
+        self.output_times_dir().join(format!("{session_id}.sqlite"))
+    }
+
+    /// Returns the directory holding the locks that keep two recoveries of one session apart.
+    ///
+    /// It is in the runtime directory: a lock describes this boot and no other, and the operating
+    /// system releases it with the process that holds it.
+    #[must_use]
+    pub fn recoveries_dir(&self) -> PathBuf {
+        self.runtime_dir.join("recoveries")
+    }
+
+    /// Returns the lock held while one session's stores are recovered, migrated or collected by a
+    /// process that is not the session's worker.
+    #[must_use]
+    pub fn recovery_lock(&self, session_id: SessionId) -> PathBuf {
+        self.recoveries_dir().join(format!("{session_id}.lock"))
     }
 
     /// Returns the directory holding generated per-session job definitions.
@@ -2566,6 +2598,29 @@ fn read_environment_id(path: &Path) -> Result<Option<EnvironmentId>> {
 
 /// The largest recorded environment identity this host will read.
 const MAX_ENVIRONMENT_ID_LEN: u64 = 128;
+
+/// Returns where the time index of the output in `spool_directory` is, when the directory is where
+/// [`EnvironmentPaths::session_spool`] puts one: `<state>/spool/<session>.log` has its index at
+/// `<state>/output-times/<session>.sqlite`.
+///
+/// A spool anywhere else belongs to no environment, and its output has no index.
+#[must_use]
+pub fn output_times_beside(spool_directory: &Path) -> Option<PathBuf> {
+    let session = spool_directory
+        .file_name()?
+        .to_str()?
+        .strip_suffix(".log")?;
+    let spool = spool_directory.parent()?;
+    if spool.file_name()? != "spool" {
+        return None;
+    }
+    Some(
+        spool
+            .parent()?
+            .join("output-times")
+            .join(format!("{session}.sqlite")),
+    )
+}
 
 /// Opens the lock file at `path`, creating it owner-only when it is not there, without following a
 /// link and without waiting for a writer, and checks that the handle it opened is a regular file.

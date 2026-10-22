@@ -396,6 +396,21 @@
     },
     {
       "entry": {
+        "store": "output-times",
+        "scope": "environment",
+        "path": "output-times/*.sqlite",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "times_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "036d87deb88a4bc4ada6b5063713f6febb818b3fa6bbdcf22fe294ada29acbe6",
+      "kept": []
+    },
+    {
+      "entry": {
         "store": "policy-mirror",
         "scope": "environment",
         "path": "policy-mirror.cbor",

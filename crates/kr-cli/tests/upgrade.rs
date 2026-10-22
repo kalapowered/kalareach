@@ -2693,6 +2693,24 @@ async fn a_worker_of_the_release_before_registers_again_with_the_runtime_of_this
     host.end_the_plugin_host().await;
 }
 
+/// The retained output an export document carries, joined.
+fn exported_output(document: &Value) -> Vec<u8> {
+    use base64::Engine as _;
+
+    let mut output = Vec::new();
+    for chunk in document["output"]["chunks"]
+        .as_array()
+        .expect("the retained output is a list of pieces")
+    {
+        output.extend(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(chunk["base64url"].as_str().expect("base64 text"))
+                .expect("the piece decodes"),
+        );
+    }
+    output
+}
+
 /// KR-REQ-26.06, KR-REQ-20.23, KR-ACC-029, KR-ACC-035: what the worker of the release before wrote
 /// to the session's terminal is kept by the daemon of this release when the session closes, and `kr
 /// export` of this release reads it back through the daemon.
@@ -2741,18 +2759,7 @@ async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_d
         updated.session_id.to_string(),
         "{document}"
     );
-    let mut output = Vec::new();
-    for chunk in document["output"]["chunks"]
-        .as_array()
-        .expect("the retained output is a list of pieces")
-    {
-        use base64::Engine as _;
-        output.extend(
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(chunk["base64url"].as_str().expect("base64 text"))
-                .expect("the piece decodes"),
-        );
-    }
+    let output = exported_output(&document);
     assert!(
         String::from_utf8_lossy(&output).contains("KEPT-42-OUTPUT"),
         "the export holds what the session showed: {}",
@@ -2900,6 +2907,88 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
     assert_eq!(
         read["cwd"], recorded.cwd,
         "the directory the journal recorded is shown, not a summary rebuilt from the closure: {read}"
+    );
+
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-25.25: a session of this release keeps when its output was
+/// produced in a store of its own beside the spool, which the release before does not name. A
+/// rollback leaves that store where it is, and the release before reads the session's output from
+/// its spool by its own rules: the bytes and the file its `kr export` writes are all there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_the_record_of_when_output_was_produced_and_the_release_before_exports_the_output()
+ {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+
+    let (display, session_now) = host.new_session(&updated.kr_now());
+    let worker_now = host.worker_process(session_now);
+    let typing = terminal_for(host, &updated.kr_now(), &["attach", &display]);
+    typing.ready().await;
+    // The shell computes the marker, so the line as typed does not hold it.
+    typing.type_line("echo KEPT-$((6*7))-OUTPUT");
+    typing.expect("KEPT-42-OUTPUT").await;
+    drop(typing);
+    host.close(&updated.kr_now(), &display);
+    host.worker_ended(&worker_now).await;
+    let times = host.tree.environment().session_output_times(session_now);
+    assert!(
+        times.is_file(),
+        "the session's worker kept when its output was produced in {}",
+        times.display()
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    assert!(times.is_file(), "the rollback leaves the store alone");
+
+    let file = host.scratch("export-after-rollback").join("session.json");
+    let started = Instant::now();
+    loop {
+        let output = host.run(
+            &updated.kr_before(),
+            &[
+                "export",
+                &session_now.to_string(),
+                "--output",
+                &file.display().to_string(),
+            ],
+        );
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the release before did not export the closed session in {:?}: {}",
+            started.elapsed(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let document: Value = serde_json::from_slice(&std::fs::read(&file).expect("the exported file"))
+        .expect("the export is one JSON document");
+    assert_eq!(
+        document["session"]["session_id"],
+        session_now.to_string(),
+        "{document}"
+    );
+    let output = exported_output(&document);
+    assert!(
+        String::from_utf8_lossy(&output).contains("KEPT-42-OUTPUT"),
+        "the release before exports what the session showed: {}",
+        String::from_utf8_lossy(&output).escape_debug()
     );
 
     host.close(&updated.kr_before(), &updated.display);
