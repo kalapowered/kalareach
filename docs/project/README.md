@@ -1005,11 +1005,17 @@ and a worker still running after that counts until the daemon restarts.
 * A closure the host wrote over a death it could not confirm. It stops counting under the same
   rule as a claimed worker. One the journal kept after its process ended is not looked at again
   until the daemon restarts, and is not registered again then.
-* A closure that records a process the session left running. It counts until the daemon restarts,
-  and after a restart nothing follows that process.
+* A closure that lists anything but an unconfirmed worker: a process the session left running, a
+  process that left for a control daemon's scope, or a reason the host could not account for the
+  session's processes. It counts until the daemon restarts, whoever wrote the closure. A restart
+  forgets it, and nothing follows that process.
 
-A closure that accounts for its worker releases the session even where its account of the
-session's own processes is incomplete.
+A closure that lists nothing releases the session even where its ownership coverage is
+incomplete. The closure the host writes over a crashed worker lists a reason on macOS, and on
+Linux unless the worker ran in a service of its own and the cleanup read that service's control
+group empty: a process that began after the worker's last record, or that left the session
+unseen, is not found there. A crashed session on those hosts therefore counts until the daemon
+restarts, and a hold on a tree of its repository is refused until then.
 
 What a reservation does not see: a session in a tree this host does not record (a linked worktree
 the user added by hand), a shell that changes into a tree after it started elsewhere, a parent

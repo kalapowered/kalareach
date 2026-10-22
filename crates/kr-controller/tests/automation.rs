@@ -447,13 +447,21 @@ impl Apart {
 
 /// [`working_host`] whose daemon runs apart.
 async fn working_host_apart() -> (Host, Apart) {
+    working_host_apart_started_by(kr_controller::supervision::detect).await
+}
+
+/// [`working_host_apart`] whose daemon starts its workers through the supervisor `supervisor`
+/// makes, which the host the test runs on would otherwise choose.
+async fn working_host_apart_started_by(
+    supervisor: fn() -> Box<dyn WorkerSupervisor>,
+) -> (Host, Apart) {
     let temp = teardown::Tree::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let worker = temp.root().join("kr-worker");
     kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
     let supervisor = Box::new(Patient {
-        inner: temp.supervisor(kr_controller::supervision::detect()),
+        inner: temp.supervisor(supervisor()),
     });
     let (ready_sender, ready) = std::sync::mpsc::channel();
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
@@ -7128,6 +7136,128 @@ async fn a_restarted_daemon_serves_though_a_live_sessions_directory_never_answer
         "the session started outside every tree never counted against this one"
     );
     close_session(&mut control, &host, &other).await;
+    host.clients.abort();
+}
+
+/// The closure the registry holds for a session, once one is recorded.
+fn recorded_closure(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> Option<kr_protocol::session::ClosureRecord> {
+    use rusqlite::OptionalExtension as _;
+
+    let registry = rusqlite::Connection::open_with_flags(
+        environment.registry_database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("the registry opens while the daemon runs");
+    let record: Vec<u8> = registry
+        .query_row(
+            "SELECT record FROM tombstones WHERE session_id = ?1",
+            [session_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("the closures read")?;
+    Some(
+        kr_cbor::from_canonical_slice(&record, &kr_cbor::Limits::DEFAULT)
+            .expect("the closure reads back"),
+    )
+}
+
+/// KR-REQ-14.32: a session whose worker crashed counts as a writer until the daemon restarts,
+/// where the host cannot account for every process the session ran. The worker here runs in no
+/// service of its own, so the closure the daemon writes over its death lists a reason it could
+/// not account for the session's processes and no process: that is the closure a crash leaves on
+/// macOS and on a Linux host with no control group of the worker's own. The registration stays,
+/// so a hold on a tree of its repository is refused, because the host cannot say that nothing
+/// the session started is left writing. The restart forgets it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_session_counts_as_a_writer_until_the_daemon_restarts() {
+    let (host, apart) = working_host_apart_started_by(|| {
+        Box::new(kr_controller::supervision::DetachedSupervisor::new())
+    })
+    .await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let created = session_in(&mut control, &host, &host.work().join("source")).await;
+    let session_id = created.session.session_id;
+    drop(control);
+
+    // The worker ends without a word. The daemon closes the session when it is asked to reconcile
+    // it, which does nothing while the kernel still shows the worker running, so it is asked until
+    // the closure is recorded.
+    let environment = host._temp.environment();
+    let worker: i64 = rusqlite::Connection::open(environment.registry_database())
+        .expect("the registry opens while the daemon runs")
+        .query_row("SELECT launcher_pid FROM reservations", [], |row| {
+            row.get(0)
+        })
+        .expect("the one session's worker was recorded");
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(worker).expect("a process"))
+            .expect("a process number"),
+        rustix::process::Signal::KILL,
+    )
+    .expect("the worker this test started is ended");
+    let asked = std::time::Instant::now();
+    let closure = loop {
+        let _ = host.controller.reconcile(session_id).await;
+        if let Some(closure) = recorded_closure(&environment, session_id) {
+            break closure;
+        }
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(60),
+            "waited 60 s for the crashed session's closure"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+    assert!(
+        !closure.surviving.is_empty()
+            && closure
+                .surviving
+                .iter()
+                .all(|resource| resource.kind == "unestablished"),
+        "a worker in no service of its own leaves a closure that lists only what it could not account for: {closure:?}"
+    );
+
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert_eq!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .expect_err("the crashed session may have left something writing"),
+        kr_project::holds::Refusal::SessionsBound(1)
+    );
+    host.clients.abort();
+
+    let host = restarted(host, apart).await;
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .is_ok(),
+        "and not after the daemon restarts, which forgets it"
+    );
     host.clients.abort();
 }
 
