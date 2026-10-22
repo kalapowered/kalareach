@@ -2272,7 +2272,7 @@ async fn kr_req_12_12_an_operation_larger_than_the_connection_carries_is_refused
             served.owner.dispatch().expect("it carries operations"),
         )
         .expect("the transport is bound");
-    let mut upstream = tokio::io::BufReader::new(served.upstream);
+    let upstream = tokio::io::BufReader::new(served.upstream);
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
@@ -2296,14 +2296,11 @@ async fn kr_req_12_12_an_operation_larger_than_the_connection_carries_is_refused
         refused.to_string().contains("this operation is"),
         "refused by the admission and not by the writer after a marker: {refused}"
     );
-    let mut line = String::new();
-    let read = tokio::time::timeout(
-        std::time::Duration::from_millis(150),
-        upstream.read_line(&mut line),
-    )
-    .await;
-    assert!(read.is_err(), "the upstream was sent {line:?}");
-    served.drained.abort();
+    // What the upstream was sent is read once the writers have finished and its end is reached, so
+    // a write that was only late would be in it.
+    drop(served.upstream_reads);
+    let sent = everything_sent_upstream(served.owner, served.drained, upstream).await;
+    assert!(sent.is_empty(), "the upstream was sent {sent:?}");
 }
 
 /// A broker with nothing registered yet, for a launch that will register the instance itself.

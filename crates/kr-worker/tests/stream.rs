@@ -390,15 +390,19 @@ impl World {
     }
 
     /// Asserts nothing was written to the server.
-    async fn nothing_written(&mut self) {
+    ///
+    /// The owner counts a frame from the moment it takes it until its bytes are in the stream. At
+    /// a count of zero every frame it took is therefore in the stream, where a read finds it at
+    /// once, so the stream is read then and not after a wait: a writer that is slow to run cannot
+    /// make a frame look absent, and no delay decides the case. The read is outside the runtime's
+    /// budget, which would otherwise answer it as not ready while the bytes are there.
+    fn nothing_written(&mut self) {
+        use futures_util::FutureExt as _;
         assert_eq!(self.owner.queued_to_upstream(), 0, "nothing is queued");
         let mut byte = [0_u8; 1];
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            self.upstream.read_exact(&mut byte),
-        )
-        .await;
-        assert!(read.is_err(), "the server was sent a byte: {byte:?}");
+        let read =
+            tokio::task::coop::unconstrained(self.upstream.read_exact(&mut byte)).now_or_never();
+        assert!(read.is_none(), "the server was sent a byte: {byte:?}");
     }
 }
 
@@ -521,7 +525,7 @@ async fn kr_req_12_12_an_operation_the_table_does_not_spell_or_cannot_fill_write
         ),
         "{queued:?}"
     );
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A prompt that names a draft would leave the draft's content out.
     let mut named = world.prompt("unused");
@@ -538,7 +542,7 @@ async fn kr_req_12_12_an_operation_the_table_does_not_spell_or_cannot_fill_write
         drafted.to_string().contains("draft"),
         "the refusal says why: {drafted}"
     );
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A steer of a turn that is not the one running, and a cancellation with none running.
     let steer = kr_protocol::agent::AgentSteerParams {
@@ -551,7 +555,7 @@ async fn kr_req_12_12_an_operation_the_table_does_not_spell_or_cannot_fill_write
         .agent_steer(&caller, &steer, NOW)
         .await
         .expect_err("no turn is running");
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A prompt over a running turn is not a queued one.
     world
@@ -569,7 +573,7 @@ async fn kr_req_12_12_an_operation_the_table_does_not_spell_or_cannot_fill_write
         ),
         "{over:?}"
     );
-    world.nothing_written().await;
+    world.nothing_written();
 }
 
 /// The declaration of the action the Codex-shaped package registers for cancelling a turn.
@@ -624,7 +628,7 @@ async fn kr_req_11_28_a_declared_cancellation_is_written_from_the_template_under
         ),
         "{none:?}"
     );
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A turn runs. The admission carries a plan, and taking it writes the template.
     world
@@ -646,7 +650,7 @@ async fn kr_req_11_28_a_declared_cancellation_is_written_from_the_template_under
         ),
         "{named_one:?}"
     );
-    world.nothing_written().await;
+    world.nothing_written();
     let admitted = world
         .broker
         .admit_host_cancel(&caller, binding_id, &invoke(&world), NOW)
@@ -763,7 +767,7 @@ async fn kr_req_23_30_a_components_cancellation_is_carried_and_what_it_may_not_p
         ),
         "{not_the_hosts:?}"
     );
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A plan that prepares another operation than the action's declaration says.
     let admitted = world
@@ -792,7 +796,7 @@ async fn kr_req_23_30_a_components_cancellation_is_carried_and_what_it_may_not_p
         "{wrong:?}"
     );
     world.broker.abandon(&admitted);
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A plan over arguments the token does not cover.
     let admitted = world
@@ -821,7 +825,7 @@ async fn kr_req_23_30_a_components_cancellation_is_carried_and_what_it_may_not_p
         "{other:?}"
     );
     world.broker.abandon(&admitted);
-    world.nothing_written().await;
+    world.nothing_written();
 
     // The plan the declaration allows is written as the cancellation template.
     let admitted = world
@@ -888,7 +892,7 @@ async fn kr_req_23_30_a_components_cancellation_is_carried_and_what_it_may_not_p
         "{unsourced:?}"
     );
     world.broker.abandon(&admitted);
-    world.nothing_written().await;
+    world.nothing_written();
 }
 
 /// KR-REQ-12.06: a terminal behind the gateway selects a conversation, and the instance's binding
@@ -2180,7 +2184,7 @@ async fn kr_req_12_06_a_mutation_and_an_action_admitted_before_a_selection_are_s
         panic!("a permit admitted before a selection is stopped");
     };
     assert!(stopped.proven_unsent(), "{stopped:?}");
-    world.nothing_written().await;
+    world.nothing_written();
 }
 
 /// KR-REQ-12.06 and KR-REQ-11.28: the same for the declared cancellation, whose token the
@@ -2220,7 +2224,7 @@ async fn kr_req_11_28_a_declared_cancellation_admitted_before_a_leave_is_stopped
         panic!("a permit admitted before a leave is stopped");
     };
     assert!(stopped.proven_unsent(), "{stopped:?}");
-    world.nothing_written().await;
+    world.nothing_written();
 }
 
 /// KR-REQ-12.06 and KR-REQ-12.04: a success reply kept for the requests before it is not applied
@@ -2335,7 +2339,7 @@ async fn kr_req_12_04_a_mutation_admitted_before_a_turn_began_or_ended_is_stoppe
         panic!("a prompt over a turn that began is stopped at its take");
     };
     assert!(stopped.proven_unsent(), "{stopped:?}");
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A steer admitted for the running turn, and the turn ended before it was taken.
     let steer = kr_protocol::agent::AgentSteerParams {
@@ -2354,7 +2358,7 @@ async fn kr_req_12_04_a_mutation_admitted_before_a_turn_began_or_ended_is_stoppe
         panic!("a steer of a turn that ended is stopped at its take");
     };
     assert!(stopped.proven_unsent(), "{stopped:?}");
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A cancellation admitted for one turn, and another began in its place.
     world
@@ -2375,7 +2379,7 @@ async fn kr_req_12_04_a_mutation_admitted_before_a_turn_began_or_ended_is_stoppe
         panic!("a cancellation of a turn that was replaced is stopped at its take");
     };
     assert!(stopped.proven_unsent(), "{stopped:?}");
-    world.nothing_written().await;
+    world.nothing_written();
 
     // The turn is the one it was admitted for: the take goes through and the frame is written.
     let admitted = world
@@ -2432,7 +2436,7 @@ async fn kr_req_11_33_an_answer_admitted_before_its_authority_was_withdrawn_is_s
         PendingState::Pending,
         "the claim was given back"
     );
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A narrower installation takes the grant away.
     let mut world = World::new(1 << 20);
@@ -2462,7 +2466,7 @@ async fn kr_req_11_33_an_answer_admitted_before_its_authority_was_withdrawn_is_s
         world.broker.pending(id).expect("held").state,
         PendingState::Pending
     );
-    world.nothing_written().await;
+    world.nothing_written();
 
     // A component fault disables the binding's rich capabilities after the admission, and the
     // answer that was admitted goes.
