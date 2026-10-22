@@ -14,7 +14,7 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 mod support;
 
 use support::kr;
+use support::terminal::{self, Answering, Collected, Keys};
 
 /// A session this test hosts, with its descriptor published where `kr` will find it.
 struct Hosted {
@@ -199,25 +200,19 @@ fn terminal_fd(pty: &portable_pty::PtyPair) -> std::os::fd::BorrowedFd<'_> {
 /// happens somewhere else and the test only ever looks at what has arrived.
 #[derive(Clone)]
 struct TerminalOutput {
-    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    seen: Collected,
 }
 
 impl TerminalOutput {
-    fn collect(mut reader: Box<dyn Read + Send>) -> Self {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let collected = Arc::clone(&seen);
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                if let Ok(mut seen) = collected.lock() {
-                    seen.extend_from_slice(&buffer[..read]);
-                }
-            }
-        });
-        Self { seen }
+    fn collect(reader: Box<dyn Read + Send>) -> Self {
+        Self {
+            seen: terminal::collect(reader),
+        }
+    }
+
+    /// Types `reply` the moment `question` has arrived in what the terminal is sent.
+    fn reply_to(&self, question: &'static [u8], reply: &[u8], keys: &Keys) -> Answering {
+        terminal::reply_to(&self.seen, 0, question, 1, reply, keys)
     }
 
     /// Waits for the marker to appear, or for the deadline to pass.
@@ -233,24 +228,16 @@ impl TerminalOutput {
     }
 
     fn contains(&self, marker: &[u8]) -> bool {
-        self.seen
-            .lock()
-            .is_ok_and(|seen| seen.windows(marker.len()).any(|window| window == marker))
+        contains(&self.snapshot(), marker)
     }
 
     /// Everything the terminal has been sent so far.
     fn snapshot(&self) -> Vec<u8> {
-        self.seen
-            .lock()
-            .map(|seen| seen.clone())
-            .unwrap_or_default()
+        terminal::bytes(&self.seen)
     }
 
     fn text(&self) -> String {
-        self.seen
-            .lock()
-            .map(|seen| String::from_utf8_lossy(&seen).into_owned())
-            .unwrap_or_default()
+        String::from_utf8_lossy(&self.snapshot()).into_owned()
     }
 }
 
@@ -347,11 +334,18 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
         ))
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let mut writer = pty.master.take_writer().expect("a writer");
+    let keys = terminal::keys(pty.master.take_writer().expect("a writer"));
 
-    // The terminal answers every question, and the person types through the middle of it.
+    // The terminal answers every question, and the person types through the middle of it. The
+    // answer is typed the moment the question that ends the exchange has arrived: the exchange has
+    // one second in all, and the questions asked are read from what was sent by then.
+    let answering = output.reply_to(
+        b"\x1b[c",
+        b"\x1b[?5u\x1b]10;rgb:ff/ff/ff\x1b\\typed-during\x1b[>4;2m\x1b[?62;22c",
+        &keys,
+    );
     assert!(
-        output.wait_for(b"\x1b[c", Duration::from_secs(30)),
+        answering.typed_within(Duration::from_secs(30)),
         "the command asked the terminal what it is: {}",
         output.text().escape_debug()
     );
@@ -392,10 +386,6 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
             "and before the terminator, which is what proves nothing else is coming"
         );
     }
-    writer
-        .write_all(b"\x1b[?5u\x1b]10;rgb:ff/ff/ff\x1b\\typed-during\x1b[>4;2m\x1b[?62;22c")
-        .expect("answers");
-    writer.flush().expect("flushes");
 
     // What the application received. The answers are not in it, and the typing is.
     let deadline = Instant::now() + Duration::from_secs(20);
