@@ -89,7 +89,11 @@ prefix_url="file://$served"
 export HOMEBREW_NO_AUTO_UPDATE=1
 export HOMEBREW_NO_ANALYTICS=1
 export HOMEBREW_NO_ENV_HINTS=1
-export HOMEBREW_NO_INSTALL_FROM_API=1
+# A cask is installed from the tap alone. A formula is installed with Homebrew's own API in place of
+# a checkout of its core repository, which a runner's Homebrew directory does not let this user make.
+if [ "$kind" = cask ]; then
+  export HOMEBREW_NO_INSTALL_FROM_API=1
+fi
 export HOMEBREW_NO_ASK=1
 export HOMEBREW_NO_INSTALL_CLEANUP=1
 # An upgrade looks for what depends on the package, which would make Homebrew clone its whole core
