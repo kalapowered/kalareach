@@ -256,8 +256,8 @@ for (const size of SIZES) {
       await photograph(page, `sharing-revoked-${size.name}`)
     })
 
-    // KR-REQ-18.14: an attempt whose answer was lost is on the page as unfinished, in words, with
-    // the one thing that can be done about it.
+    // An attempt whose answer was lost is on the page as unfinished, in words, with the one thing
+    // that can be done about it.
     test('lists an unfinished invitation with what can be done about it', async ({ page }) => {
       await openSharing(page)
       await page.evaluate(() => {
@@ -274,8 +274,8 @@ for (const size of SIZES) {
       await photograph(page, `sharing-unfinished-${size.name}`)
     })
 
-    // KR-REQ-18.14: an attempt the person hid is not lost from sight: the one line that says so has
-    // the control that shows it again, focus goes to it and back, and nothing is pushed sideways.
+    // An attempt the person hid is not lost from sight: the one line that says so has the control
+    // that shows it again, focus goes to it and back, and nothing is pushed sideways.
     test('hides an unfinished attempt and shows it again, with focus following', async ({ page }) => {
       await openSharing(page)
       await page.evaluate(() => {

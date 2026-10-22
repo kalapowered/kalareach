@@ -211,6 +211,8 @@ describe('the live view', () => {
     )
   })
 
+  // KR-REQ-18.12: a screen the preview had to cut cannot be shared: Invite stays off while the cut
+  // screen is shown, and is possible again once a refresh reads a screen that fits.
   it('cannot issue an invitation whose screen the preview cut', async () => {
     const { controls, person } = await openSharing()
     controls.sharing.setScreen(['x'.repeat(10)], true)

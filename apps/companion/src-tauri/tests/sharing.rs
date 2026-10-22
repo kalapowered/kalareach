@@ -127,8 +127,8 @@ async fn the_typed_result_reaches_the_page_and_a_share_is_accepted_and_taken_bac
     scene.stop().await;
 }
 
-/// KR-REQ-23.49: the host's answer to an invitation is lost, and the application, which kept the
-/// request before it sent it, asks the host again with the same request on a connection opened for
+/// The host's answer to an invitation is lost, and the application, which kept the request before
+/// it sent it, asks the host again with the same request on a connection opened for
 /// it. The host answers from the record it kept, so the invitation exists once, and the page reads
 /// the host's own result from the attempt. The record stays until the page removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1682,8 +1682,9 @@ async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_is
     adopted.stop().await;
 }
 
-/// A share taken back by the person at the host leaves the device's main connection as it was. What the device is told it holds is read on that connection under its pairing and never
-/// under the share, so the host has nothing of the share to withdraw the connection with: the same
+/// A share taken back by the person at the host leaves the device's main connection as it was.
+/// What the device is told it holds is read on that connection under its pairing and never under
+/// the share, so the host has nothing of the share to withdraw the connection with: the same
 /// connection reads the list again, without the share, and no connection was taken up in between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_share_taken_back_ends_nothing_on_the_main_connection() {
