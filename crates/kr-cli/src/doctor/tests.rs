@@ -958,6 +958,48 @@ fn the_commands_edit_validates_before_it_writes_and_refuses_a_document_it_must_n
     assert!(format!("{refused}").contains("version 99"), "{refused}");
 }
 
+/// KR-REQ-20.17: a change shown against one document is written only over that document. The
+/// document that moved after the person was shown the change is another, and nothing is written.
+#[test]
+fn a_change_shown_for_confirmation_is_not_written_over_a_document_that_moved_since() {
+    use kr_protocol::desktop::SleepInhibitionSetting;
+    use kr_protocol::hostinfo::configuration::{Change, DeviceConfiguration};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    apply_as_a_command(
+        &environment,
+        &Change::SleepInhibition(SleepInhibitionSetting::MainsOnly),
+    )
+    .expect("the owner's choice");
+    let shown_against = configuration::load(&environment);
+    let mut backed_up = ConfigurationDocument::empty();
+    backed_up.preferences.sleep_inhibition =
+        kr_protocol::scalars::Nullable::some(SleepInhibitionSetting::BatteryToo);
+    let change = Change::DeviceConfiguration(Box::new(DeviceConfiguration::of(&backed_up)));
+
+    // Another edit lands between the plan and the write.
+    apply_as_a_command(&environment, &Change::SessionLimit(Some(3))).expect("another edit");
+    let moved = configuration::load(&environment);
+    let writers = crate::barrier::hold_for_configuration(&environment).expect("the writers' lock");
+    let permit = crate::barrier::permit(&writers, &configuration::WRITTEN).expect("a permit");
+    let refused = configuration::apply_over(&environment, &change, &permit, Some(&shown_against))
+        .expect_err("the document is not the one that was shown");
+    assert!(
+        format!("{refused}").contains("changed after it was shown"),
+        "{refused}"
+    );
+    assert_eq!(
+        configuration::load(&environment).revision(),
+        moved.revision()
+    );
+
+    // Over the document that was shown it writes, as the control.
+    let written = configuration::apply_over(&environment, &change, &permit, Some(&moved))
+        .expect("written over the document shown");
+    assert_eq!(written, moved.revision() + 1);
+}
+
 /// The entry names of a `ustar` archive, in order.
 fn entry_names(bytes: &[u8]) -> Vec<String> {
     let mut names = Vec::new();

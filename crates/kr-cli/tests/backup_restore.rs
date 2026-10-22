@@ -1492,11 +1492,15 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
 async fn a_configuration_from_a_newer_release_is_not_applied_and_nothing_is_written() {
     let world = World::new();
     let rig = Rig::start(SignIn::Usable).await;
+    let mut newer: serde_json::Value =
+        serde_json::from_slice(&backed_up_configuration()).expect("a document is JSON");
+    newer["level"] = serde_json::json!(kr_protocol::hostinfo::configuration::LEVEL + 1);
+    newer["a_section_of_a_newer_release"] = serde_json::json!({});
     let held: Vec<(String, Vec<u8>)> = vec![
         (session_name(0x01), plaintext("session one: ", 300)),
         (
             "host/configuration.json".to_owned(),
-            br#"{"version":1,"level":99,"revision":9,"a_section_of_a_newer_release":{}}"#.to_vec(),
+            serde_json::to_vec(&newer).expect("a document"),
         ),
     ];
     let sealed = seal(&world, 1, &borrowed(&held));
