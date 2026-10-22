@@ -2747,8 +2747,7 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
     daemon.stop().await;
 }
 
-/// KR-REQ-07.66, KR-REQ-24.25, KR-GOAL-19: a crash is cleaned up before the session's identity is
-/// released.
+/// KR-REQ-07.66, KR-REQ-24.25: a crash is cleaned up before the session's identity is released.
 ///
 /// The worker is killed without a chance to say anything (`SIGKILL`, or `taskkill /F` on Windows,
 /// where core-ci's windows job runs this case), and the closure the daemon writes names the crash,
@@ -2758,7 +2757,7 @@ async fn a_crashed_workers_tree_is_stopped_before_its_closure_is_recorded() {
     a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Plain, false).await;
 }
 
-/// KR-GOAL-19: the same when it is the start of a daemon that finds the worker dead.
+/// The same when it is the start of a daemon that finds the worker dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crashed_workers_tree_is_stopped_by_the_daemon_that_starts_after_it() {
     a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Plain, true).await;
