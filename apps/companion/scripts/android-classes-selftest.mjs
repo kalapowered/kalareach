@@ -23,7 +23,8 @@ import { definedStrings, missingFrom, packagesOf, requestFrom } from './android-
 
 const PRESENT = [
   'to.kala.reach.companion.push.KalaReachMessagingService',
-  'to.kala.reach.companion.push.PreviewWorker'
+  'to.kala.reach.companion.push.PreviewWorker',
+  'to.kala.reach.companion.push.ChallengeWorker'
 ]
 
 /**
@@ -76,7 +77,7 @@ const code = dex({ defined: PRESENT })
 const filler = { name: 'AndroidManifest.xml', bytes: Buffer.from('not a manifest', 'utf8') }
 
 expect(
-  'an APK whose application dex carries both classes is whole',
+  'an APK whose application dex carries every class is whole',
   'whole.apk',
   zip([filler, { name: 'classes.dex', bytes: code }]),
   'nothing'
@@ -104,7 +105,10 @@ expect(
   'reference-only.apk',
   zip([
     filler,
-    { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]], referenced: [PRESENT[1]] }) }
+    {
+      name: 'classes.dex',
+      bytes: dex({ defined: [PRESENT[0], PRESENT[2]], referenced: [PRESENT[1]] })
+    }
   ]),
   PRESENT[1]
 )
@@ -141,7 +145,7 @@ expect(
 expect(
   'an application missing the worker is named, not passed',
   'partial.apk',
-  zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[2]] }) }]),
   PRESENT[1]
 )
 expect(
