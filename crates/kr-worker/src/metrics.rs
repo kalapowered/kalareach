@@ -7,7 +7,7 @@
 //! everything it has counted. Totals are read, never recomputed from a stream, so reading them
 //! twice gives the same answer.
 
-use kr_protocol::metrics::{Environment, Fault, ParseFault, Report};
+use kr_protocol::metrics::{Environment, Fault, MetricsReport, ParseFault};
 use kr_protocol::scalars::U64;
 use kr_term::diag::DiagnosticKind;
 
@@ -52,7 +52,7 @@ pub const fn fault_of(kind: DiagnosticKind) -> Option<Fault> {
 /// Totals are cumulative, so the report is built whole from them and a second call over the same
 /// totals is the same report.
 #[must_use]
-pub fn parse_faults(totals: &[(DiagnosticKind, u64)], environment: Environment) -> Report {
+pub fn parse_faults(totals: &[(DiagnosticKind, u64)], environment: Environment) -> MetricsReport {
     let mut by_class: std::collections::BTreeMap<Fault, u64> = std::collections::BTreeMap::new();
     for (kind, count) in totals {
         if let Some(fault) = fault_of(*kind) {
@@ -60,7 +60,7 @@ pub fn parse_faults(totals: &[(DiagnosticKind, u64)], environment: Environment) 
             *held = held.saturating_add(*count);
         }
     }
-    Report {
+    MetricsReport {
         terminal_parse_fault: by_class
             .into_iter()
             .filter(|(_, count)| *count > 0)
@@ -70,6 +70,6 @@ pub fn parse_faults(totals: &[(DiagnosticKind, u64)], environment: Environment) 
                 count: U64::new(count),
             })
             .collect(),
-        ..Report::default()
+        ..MetricsReport::default()
     }
 }

@@ -115,7 +115,7 @@ closed_label! {
 
 closed_label! {
     /// Which attempt ended a reconnection, as a range rather than a number.
-    Attempt, "attempt", Bucket, {
+    ReconnectAttempt, "attempt", Bucket, {
         /// The first.
         One => "1",
         /// The second or third.
@@ -127,7 +127,7 @@ closed_label! {
     }
 }
 
-impl Attempt {
+impl ReconnectAttempt {
     /// The range the `ordinal`th attempt falls in. Attempts count from one: a zero is the first.
     #[must_use]
     pub const fn of(ordinal: u64) -> Self {
@@ -270,7 +270,7 @@ pub const HOST_METRICS: &[Declaration] = &[
         kind: Kind::Duration,
         labels: &[
             Transport::KEY,
-            Attempt::KEY,
+            ReconnectAttempt::KEY,
             MetricOutcome::KEY,
             Environment::KEY,
         ],
@@ -303,7 +303,11 @@ fn values_of(key: &str) -> Option<(Shape, Vec<&'static str>)> {
     }
     match key {
         Transport::KEY => all(Transport::SHAPE, Transport::ALL, Transport::as_str),
-        Attempt::KEY => all(Attempt::SHAPE, Attempt::ALL, Attempt::as_str),
+        ReconnectAttempt::KEY => all(
+            ReconnectAttempt::SHAPE,
+            ReconnectAttempt::ALL,
+            ReconnectAttempt::as_str,
+        ),
         MetricOutcome::KEY => all(
             MetricOutcome::SHAPE,
             MetricOutcome::ALL,
@@ -367,7 +371,7 @@ pub struct ReconnectTime {
     pub transport: Transport,
     /// Which attempt, among the connections the host saw from the device since its last one ended,
     /// is the one reported.
-    pub attempt: Attempt,
+    pub attempt: ReconnectAttempt,
     /// How that attempt ended.
     pub outcome: MetricOutcome,
     /// Which environment measured it.
@@ -413,7 +417,7 @@ pub struct AdapterFailure {
 /// output, a prompt or a filename to go.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Report {
+pub struct MetricsReport {
     /// Every reconnect.time series, in a fixed order.
     #[serde(default)]
     pub reconnect_time: Vec<ReconnectTime>,
@@ -425,7 +429,7 @@ pub struct Report {
     pub adapter_failure: Vec<AdapterFailure>,
 }
 
-impl Report {
+impl MetricsReport {
     /// How many events the report counts, across every series.
     #[must_use]
     pub fn events(&self) -> u64 {
@@ -509,7 +513,7 @@ impl Report {
 /// What a series counts under: its metric and every label it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
-    Reconnect(Transport, Attempt, MetricOutcome),
+    Reconnect(Transport, ReconnectAttempt, MetricOutcome),
     ParseFault(Fault),
     AdapterFailure(Adapter, MetricOutcome),
 }
@@ -559,7 +563,7 @@ impl Recorder {
     pub fn reconnected(
         &self,
         transport: Transport,
-        attempt: Attempt,
+        attempt: ReconnectAttempt,
         outcome: MetricOutcome,
         took: Duration,
     ) {
@@ -581,13 +585,13 @@ impl Recorder {
 
     /// Returns what has been counted, in a fixed order.
     #[must_use]
-    pub fn report(&self) -> Report {
+    pub fn report(&self) -> MetricsReport {
         let environment = self.environment;
         let series = self
             .series
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut report = Report::default();
+        let mut report = MetricsReport::default();
         for (key, totals) in series.iter() {
             match *key {
                 Key::Reconnect(transport, attempt, outcome) => {
