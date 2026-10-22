@@ -30,9 +30,12 @@ asked.
 | `files` | Every file but the manifest, with its length, SHA-256 digest and whether it is a program | The tree |
 
 A reader reads past a member it does not know, and the signature covers the manifest whole, so a
-member a later release adds is checked by the host that reads past it. Every member above is
-required: a manifest that leaves one out is not read, so a tool that forgets what a release owes
-its readers cannot sign one.
+member a later release adds is checked by the host that reads past it. A reader also takes a
+manifest that lacks what a later release added, since `kr host rollback` and the helpers' pins read
+the manifest of an earlier release: `agents`, `dependencies` and the members of a shell entry beyond
+its `shell`, `identity` and `patch_revisions` may be absent. The rest is required. `kr-release`
+writes every member and refuses to sign a `release.json` that is not what the tree makes, so a tool
+that forgets what a release owes its readers cannot sign one.
 
 ## Shell packages
 
@@ -40,6 +43,9 @@ its readers cannot sign one.
 identity record the build wrote, and `shells/<shell>/current` names the identity. For each package
 the manifest states:
 
+- `patch_revisions`: the revision of each patch, in the order they are applied. The release before
+  package managers requires this member and reads a shell package by it, so every entry keeps it. It
+  repeats the revisions of `patches` and is refused when it does not.
 - `upstream`: the shell's version, the upstream revision the patches apply to, the archive and its
   SHA-256 digest, from `shells/<shell>/manifest.json`.
 - `patches`: each reader patch in the order it is applied, with its own revision, the upstream

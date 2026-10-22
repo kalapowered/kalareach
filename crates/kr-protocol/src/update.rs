@@ -360,10 +360,15 @@ pub struct ReleaseManifest {
     /// The qualified shell packages under `shells/`.
     pub shells: Vec<ReleaseShell>,
     /// The executable builds of the supported agents this release is qualified against, each as
-    /// the signed plugin index at the pinned commit names it. Empty while the index names none.
+    /// the signed plugin index at the pinned commit names it. Empty while the index names none, and
+    /// absent from the manifest of a release built before it was stated.
+    #[serde(default)]
     pub agents: Vec<ReleaseAgent>,
     /// The cryptographic libraries the release is built with, and the lock they were resolved in.
-    pub dependencies: ReleaseDependencies,
+    /// Absent from the manifest of a release built before they were stated, which a rollback
+    /// still reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<ReleaseDependencies>,
     /// Every store the release's programs read, with the versions of each they read. A host
     /// switches to a release only when every store it keeps is at a version this says the release
     /// reads. Never empty.
@@ -514,21 +519,35 @@ const FLOOR_FORM: &str = "a floor's version is `<major>.<minor>`";
 /// applied to it, the bridge sources added to it, the module trees it loads and how a host starts
 /// it among the person's own startup files. The package's directory under `shells/<shell>/` holds
 /// the built files, each of them listed among the release's files.
+///
+/// An entry keeps `patch_revisions` beside `patches`. The release before package managers reads an
+/// entry by its shell, its identity and that member alone, and requires all three, so a manifest
+/// without it would be refused by every host still on that release. A release built before an entry
+/// said more has only those three, and is read as such: the members that say more are absent from
+/// it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseShell {
     /// Which shell: `zsh`, `bash`, `fish` or `powershell`.
     pub shell: String,
     /// The package's identity, which names its directory under `shells/<shell>/`.
     pub identity: String,
+    /// The revision of each reader patch built into it, in the order they are applied: those of
+    /// `patches`, where the entry states them.
+    pub patch_revisions: Vec<String>,
     /// The upstream release the package is built from.
-    pub upstream: ShellUpstream,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<ShellUpstream>,
     /// The reader patches built into it, in the order they are applied.
+    #[serde(default)]
     pub patches: Vec<ReleasePatch>,
     /// The sources of the bridge the package adds to the shell.
+    #[serde(default)]
     pub sources: Vec<ReleaseSource>,
     /// The module trees it loads.
+    #[serde(default)]
     pub modules: Vec<ReleaseModule>,
     /// How a host starts it, and where its marked entry sits among the person's own startup files.
+    #[serde(default)]
     pub profile_order: Vec<ProfileLaunch>,
 }
 
@@ -1087,12 +1106,27 @@ impl ReleaseManifest {
 
     /// Checks what a host must know before it installs anything a manifest lists: that no two of
     /// its files are one file, on a system that compares names without regard to case as well, and
-    /// that none is inside another.
+    /// that none is inside another, and that a shell package which states its patches lists their
+    /// revisions in `patch_revisions` as well.
     ///
     /// # Errors
     ///
-    /// Returns [`ManifestError::Overlapping`] naming the first such pair.
+    /// Returns [`ManifestError::Overlapping`] naming the first such pair, and
+    /// [`ManifestError::Malformed`] naming a shell package whose two statements of its patches
+    /// disagree.
     pub fn check(&self) -> Result<(), ManifestError> {
+        for shell in &self.shells {
+            let stated = shell.patches.iter().map(|patch| patch.revision.as_str());
+            if shell.upstream.is_some()
+                && !shell.patch_revisions.iter().map(String::as_str).eq(stated)
+            {
+                return Err(ManifestError::Malformed(format!(
+                    "the {} package lists other revisions in `patch_revisions` than its `patches` \
+                     carry",
+                    shell.shell
+                )));
+            }
+        }
         let mut seen: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
         for file in &self.files {
             let folded = file.path.as_str().to_ascii_lowercase();
@@ -1499,11 +1533,11 @@ mod tests {
             retained_levels: vec![CompatibilityLevel::of(PackageVersion::new(0, 48, 0))],
             shells: Vec::new(),
             agents: Vec::new(),
-            dependencies: ReleaseDependencies {
+            dependencies: Some(ReleaseDependencies {
                 lock_sha256: Digest256::from_bytes([9; 32]),
                 pinned: Vec::new(),
                 vectors: Vec::new(),
-            },
+            }),
             stores: vec![store("registry", 7, 1)],
             files,
         }
@@ -1815,12 +1849,13 @@ mod tests {
         ReleaseShell {
             shell: "zsh".to_owned(),
             identity: "0b26110c784907c9".to_owned(),
-            upstream: ShellUpstream {
+            patch_revisions: vec!["1".to_owned(), "1".to_owned()],
+            upstream: Some(ShellUpstream {
                 version: "5.9".to_owned(),
                 revision: "zsh-5.9".to_owned(),
                 archive: "zsh-5.9.tar.xz".to_owned(),
                 sha256: Digest256::from_bytes([1; 32]),
-            },
+            }),
             patches: vec![
                 ReleasePatch {
                     name: "zle-reader-mailbox".to_owned(),
@@ -1915,7 +1950,22 @@ mod tests {
             .expect("an earlier build's manifest is read");
         assert_eq!(read.shells.len(), 1);
         assert_eq!(read.shells[0].identity, "0b26110c784907c9");
-        assert!(read.agents.is_empty());
+        assert_eq!(read.shells[0].patch_revisions, ["1", "1"]);
+        assert!(read.shells[0].upstream.is_none() && read.shells[0].patches.is_empty());
+        assert!(read.agents.is_empty() && read.dependencies.is_none());
+    }
+
+    /// A package that states its patches and lists other revisions of them for the release before
+    /// this one is not one manifest: the two readings would disagree about what the release is.
+    #[test]
+    fn a_shell_package_lists_the_revisions_of_the_patches_it_states() {
+        let mut written = manifest(vec![file("bin/kr")]);
+        written.shells = vec![zsh_package()];
+        assert!(written.check().is_ok(), "the control agrees");
+        written.shells[0].patch_revisions = vec!["1".to_owned(), "2".to_owned()];
+        assert!(matches!(written.check(), Err(ManifestError::Malformed(_))));
+        written.shells[0].patch_revisions = vec!["1".to_owned()];
+        assert!(written.check().is_err());
     }
 
     /// A release retains the levels it names and no others.

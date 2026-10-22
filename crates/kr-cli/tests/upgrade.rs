@@ -450,6 +450,14 @@ fn build_previous(commit: &str) -> PathBuf {
 /// The extra levels this build retains besides its own are named in the manifest of a release
 /// assembled here, as a real release names them.
 impl Assembled {
+    /// This release as a build before this one wrote it, which the release before this one is: its
+    /// manifest has no `agents` and no `dependencies`, and each shell package it lists states its
+    /// identity and the revisions of its patches, which is all that build had to say of one.
+    fn as_an_earlier_build_wrote_it(mut self) -> Self {
+        self.earlier = true;
+        self
+    }
+
     /// This release as one that names every level this build speaks at, as its manifest does.
     fn retaining_what_this_build_does(mut self) -> Self {
         self.manifest.retained_levels = kr_protocol::retained::levels();

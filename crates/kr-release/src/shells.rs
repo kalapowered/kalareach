@@ -344,12 +344,13 @@ fn package(tree: &Path, checkout: &Path, shell: &str) -> Result<ReleaseShell> {
     Ok(ReleaseShell {
         shell: shell.to_owned(),
         identity,
-        upstream: ShellUpstream {
+        patch_revisions: patches.iter().map(|patch| patch.revision.clone()).collect(),
+        upstream: Some(ShellUpstream {
             version: text(&upstream["version"])?,
             revision: base_revision,
             archive: text(&upstream["archive"])?,
             sha256: scalar(digest_from_hex(&pinned_sha)?),
-        },
+        }),
         patches,
         sources,
         modules,

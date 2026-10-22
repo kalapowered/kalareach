@@ -457,12 +457,13 @@ fn shells_a_release_lists() -> Vec<ReleaseShell> {
         let (arguments, location) = startup;
         ReleaseShell {
             shell: shell.to_owned(),
-            upstream: ShellUpstream {
+            patch_revisions: patches.iter().map(|_| "1".to_owned()).collect(),
+            upstream: Some(ShellUpstream {
                 version: version.to_owned(),
                 revision: format!("{shell}-{version}"),
                 archive: archive.to_owned(),
                 sha256: Digest256::from_bytes(kr_cbor::sha256(archive.as_bytes())),
-            },
+            }),
             patches: patches
                 .iter()
                 .map(|name| ReleasePatch {
@@ -632,11 +633,11 @@ impl Assembled {
                 retained_levels: vec![retained],
                 shells: shells_a_release_lists(),
                 agents: Vec::new(),
-                dependencies: kr_protocol::update::ReleaseDependencies {
+                dependencies: Some(kr_protocol::update::ReleaseDependencies {
                     lock_sha256: Digest256::from_bytes([0; 32]),
                     pinned: Vec::new(),
                     vectors: Vec::new(),
-                },
+                }),
                 stores: release_stores(),
                 files,
             },
@@ -656,14 +657,6 @@ impl Assembled {
             CompatibilityLevel::of(PACKAGE_VERSION),
             the_root(),
         )
-    }
-
-    /// This release as a build before this one wrote it, which the release before this one is: its
-    /// manifest has no `agents` and no `dependencies`, and each shell package it lists states its
-    /// identity and the revisions of its patches, which is all that build had to say of one.
-    fn as_an_earlier_build_wrote_it(mut self) -> Self {
-        self.earlier = true;
-        self
     }
 
     /// The members the manifest is signed over: what this build serialises, or with `earlier` what

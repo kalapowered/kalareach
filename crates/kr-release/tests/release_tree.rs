@@ -238,11 +238,23 @@ fn the_manifest_of_a_tree_names_the_pins_and_the_identity_the_build_recorded() {
             recorded.trim(),
             "the identity the build recorded"
         );
-        assert_eq!(listed.upstream.version, pins["upstream"]["version"]);
-        assert_eq!(listed.upstream.revision, pins["upstream"]["revision"]);
-        assert_eq!(listed.upstream.archive, pins["upstream"]["archive"]);
+        let upstream = listed
+            .upstream
+            .as_ref()
+            .expect("the package states its upstream");
+        assert_eq!(upstream.version, pins["upstream"]["version"]);
+        assert_eq!(upstream.revision, pins["upstream"]["revision"]);
+        assert_eq!(upstream.archive, pins["upstream"]["archive"]);
         let pinned = pins["patches"].as_array().expect("patches");
         assert_eq!(listed.patches.len(), pinned.len());
+        // The release before package managers reads the package by these alone.
+        assert_eq!(
+            listed.patch_revisions,
+            pinned
+                .iter()
+                .map(|pin| pin["revision"].as_str().expect("a revision").to_owned())
+                .collect::<Vec<_>>()
+        );
         for (patch, pin) in listed.patches.iter().zip(pinned) {
             assert_eq!(patch.name, pin["name"]);
             assert_eq!(patch.revision, pin["revision"]);

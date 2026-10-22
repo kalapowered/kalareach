@@ -103,7 +103,7 @@ pub fn assemble(inputs: &Inputs) -> Result<ReleaseManifest> {
         retained_levels: retained::levels(),
         shells: shells::packages(&inputs.tree, &inputs.checkout, &inputs.target)?,
         agents: agents::agents(&inputs.checkout, &inputs.target)?,
-        dependencies: pins::dependencies(&inputs.checkout)?,
+        dependencies: Some(pins::dependencies(&inputs.checkout)?),
         stores: stores(&inputs.checkout)?,
         files,
     };
