@@ -12,7 +12,7 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
-//! | KR-REQ-03.27 | the program holding the terminal is the session's application, named as a person knows it, with no state of its own while it runs, and the shell at its prompt is not an application; a program that is another until it execs takes the name it has after the exec; the executable the shell integration answered for the line names it when it answered for one |
+//! | KR-REQ-03.27 | the program holding the terminal is the session's application, named as a person knows it, with no state of its own while it runs, and the shell at its prompt is not an application; a program that is another until it execs takes the name it has after the exec; the command the shell integration answered for the line names it when it answered for one and the leader is running it |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
@@ -154,32 +154,42 @@ impl Setup {
 
     /// The same, the stand-in writing to `running` once it runs.
     fn start_telling(&self, running: Option<&Path>) -> Started {
-        self.start_with(running, None)
-    }
-
-    /// The same, the stand-in given `script` as an argument, as an interpreter is given the script
-    /// it runs (the test harness reads it as one more name of a test to run, and runs none).
-    fn start_running_script(&self, script: &Path) -> Started {
-        self.start_with(None, Some(script))
-    }
-
-    fn start_with(&self, running: Option<&Path>, script: Option<&Path>) -> Started {
         let mut command = Command::new(&self.program);
         command
             .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
-            .args(script)
             .env(STAND_IN, "60")
-            .current_dir(self.host.root())
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .current_dir(self.host.root());
         if let Some(running) = running {
             command.env(STAND_IN_RUNNING, running);
         }
-        let child = command.spawn().expect("the stand-in starts");
+        self.spawn_in_a_group(command)
+    }
+
+    /// Starts `script`, an executable file, as this process's own child in a process group of its
+    /// own, as a shell starts a script typed as a command: the system runs it under the interpreter
+    /// on its first line, with the script's path as the interpreter's argument.
+    fn start_script(&self, script: &Path) -> Started {
+        self.spawn_in_a_group(Command::new(script))
+    }
+
+    /// Starts `interpreter` given `script` by the relative path it is typed as in the host's
+    /// directory, as a shell starts a script typed as `./name`.
+    fn start_interpreter(&self, interpreter: &str, script: &str) -> Started {
+        let mut command = Command::new(interpreter);
+        command.arg(script).current_dir(self.host.root());
+        self.spawn_in_a_group(command)
+    }
+
+    fn spawn_in_a_group(&self, mut command: Command) -> Started {
+        let child = command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the program starts");
         let process = kr_ipc::identity::process_start_identity(child.id())
-            .expect("the stand-in is identified");
+            .expect("the program is identified");
         Started { child, process }
     }
 
@@ -1230,33 +1240,76 @@ async fn kr_req_03_27_a_wrapper_that_execs_the_program_names_the_program_after_t
     typing.close().await;
 }
 
+/// Writes an executable script at `path`.
+fn script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::write(path, body).expect("the script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("the script can run");
+}
+
 /// KR-REQ-03.27: when the shell's integration answered for exactly one command of the line and
-/// the foreground program is running it, as an interpreter runs a script it was given, that command
-/// names the application and not the interpreter; and a command the leader has replaced names
-/// nothing, so a wrapper that execs another program is not still called by its own name. A program
-/// is not named until two looks have found the same group.
+/// the foreground program is running it, as the interpreter a script names runs the script it is
+/// given, that command names the application and not the interpreter. Only that shows it: a
+/// program that merely reads the script, or that has replaced the command, is named for its own
+/// image. A program is not named until two looks have found the same group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_program_that_runs_it() {
     use kr_worker::application::Following;
 
     let setup = Setup::new();
-    let script = setup.host.root().join("assistant");
-    std::fs::write(&script, b"#!/bin/sh\n").expect("the script");
-    let answered = vec![(script.display().to_string(), None)];
-
-    // The interpreter is given the script, so the script is what runs.
-    let started = setup.start_running_script(&script);
+    let assistant = setup.host.root().join("assistant");
+    script(&assistant, "#!/bin/sh\nsleep 60\ntrue\n");
+    let answered = vec![(assistant.display().to_string(), None)];
     let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
     let mut following = Following::new(Arc::clone(&producer));
+
+    // The system starts the script under the interpreter its first line names, with the script's
+    // path as the interpreter's argument, so the script is what runs. One look is not a program:
+    // it is published when the look after it finds the same.
+    let started = setup.start_script(&assistant);
     let foreground = Setup::foreground(&started, answered.clone());
-    let image_name = look_until_named(&mut following, &producer, &foreground);
+    following.look(Some(&foreground));
     assert_eq!(
-        image_name, "assistant",
-        "the script the program was given names it, not the image that runs it"
+        producer.application().name,
+        None,
+        "a program is not named on the first look that finds it"
+    );
+    let named = look_until_named(&mut following, &producer, &foreground);
+    assert_eq!(
+        named, "assistant",
+        "the script the interpreter was given names it, not the interpreter"
     );
     following.look(None);
     assert_eq!(producer.application().name, None);
+    started.end();
+
+    // The same script given to its interpreter as a path relative to the directory it works in,
+    // as `./assistant` is typed: the leader's own directory is where that path leads.
+    let started = setup.start_interpreter("/bin/sh", "assistant");
+    let foreground = Setup::foreground(&started, answered.clone());
+    let named = look_until_named(&mut following, &producer, &foreground);
+    assert_eq!(
+        named, "assistant",
+        "a script given by a relative path is the one that runs"
+    );
+    following.look(None);
+    started.end();
+
+    // A program that has the script among its arguments and is another program: `tail` reads the
+    // script and runs nothing of it.
+    let watcher = setup.host.root().join("watcher");
+    script(&watcher, "#!/bin/sh\nexec tail -f \"$0\"\n");
+    let started = setup.start_script(&watcher);
+    let foreground = Setup::foreground(&started, vec![(watcher.display().to_string(), None)]);
+    let named = look_until_named(&mut following, &producer, &foreground);
+    assert_eq!(
+        named, "tail",
+        "a program that is given the script's path to read is not the script"
+    );
+    following.look(None);
     started.end();
 
     // The same command, answered for a line whose program has since replaced it: nothing the
