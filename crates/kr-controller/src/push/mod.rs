@@ -150,6 +150,25 @@ fn forget_at_start(
 /// own is not one a host delivers through.
 pub const OFFICIAL_GATEWAY_ORIGIN: &str = kr_client::services::account::ACCOUNT_ORIGIN;
 
+/// The gateway this daemon delivers through, read once when it starts.
+///
+/// [`OFFICIAL_GATEWAY_ORIGIN`] in every shipped build. A suite that stands the managed service up
+/// on this machine gives the daemon that service's origin for the length of one start, as it does
+/// for the account service (`testing::with_account_origin`), so a credential issued by a gateway
+/// under test is one the host accepts and every request the host makes under it goes there.
+#[cfg(not(any(test, feature = "testing")))]
+#[must_use]
+pub fn gateway_origin_for_start() -> String {
+    OFFICIAL_GATEWAY_ORIGIN.to_owned()
+}
+
+/// The gateway this daemon delivers through, or the one a suite stood the managed service at.
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+pub fn gateway_origin_for_start() -> String {
+    crate::testing::account_origin().unwrap_or_else(|| OFFICIAL_GATEWAY_ORIGIN.to_owned())
+}
+
 /// What asking the gateway about a credential a device handed over came to, when it did not
 /// confirm it.
 ///
@@ -192,8 +211,9 @@ pub fn check_offered_credential(
     credential: &PushDeliveryCredential,
     device_authorisation: &kr_protocol::scalars::AuthorisationKey,
     now_ms: u64,
+    gateway_origin: &str,
 ) -> Result<()> {
-    if credential.gateway_origin.as_str() != OFFICIAL_GATEWAY_ORIGIN {
+    if credential.gateway_origin.as_str() != gateway_origin {
         return Err(ControllerError::InvalidArgument(
             "this host delivers notifications through the KalaReach push gateway only, and the \
              credential names another"
