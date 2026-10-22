@@ -115,10 +115,6 @@ fn a_service_is_started_by_the_environments_task_and_not_by_this_process() {
             "a child of a task whose job lets it leave is in no job"
         );
     }
-    let recorded = kr_ipc::starter::recorded_session(&host.environment())
-        .expect("the record")
-        .expect("a session is recorded");
-    assert_eq!(recorded.session, session);
 }
 
 /// A start is carried out when the daemon answers its starter late.

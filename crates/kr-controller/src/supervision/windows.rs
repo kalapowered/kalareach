@@ -1830,20 +1830,6 @@ mod launching {
                     return not_started(format!("this daemon's login session: {error}"));
                 }
             };
-            let recorded = kr_ipc::identity::boot_identity()
-                .map_err(|error| error.to_string())
-                .and_then(|boot| {
-                    starter::record_session(
-                        &self.environment,
-                        &starter::RecordedSession { session, boot },
-                    )
-                    .map_err(|error| error.to_string())
-                });
-            if let Err(detail) = recorded {
-                return not_started(format!(
-                    "the environment's login session could not be recorded: {detail}"
-                ));
-            }
             let listener = match self
                 .environment
                 .starter_endpoint()
