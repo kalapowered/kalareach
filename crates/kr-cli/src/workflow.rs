@@ -57,7 +57,7 @@ async fn rearm(
         "Rearming chain {} from budget generation {}. {}",
         closed_word(&root),
         generation,
-        repeat_with(generation)
+        repeat_with(root, grant, generation)
     ));
     let rearmed: WorkflowRearmResult = match daemon
         .mutate(
@@ -75,7 +75,7 @@ async fn rearm(
         Err(error) => {
             if !matches!(&error, CliError::Refused(refusal) if refusal.code != ErrorCode::OutcomeUnknown)
             {
-                report::say(&repeat_with(generation));
+                report::say(&repeat_with(root, grant, generation));
             }
             return Err(error);
         }
@@ -92,11 +92,14 @@ async fn rearm(
     Ok(())
 }
 
-/// What a person does when the reply to a rearm may not have reached them.
-fn repeat_with(generation: u64) -> Shown {
+/// What a person does when the reply to a rearm may not have reached them: the command that
+/// names the generation, which a chain already on the generation after it answers without giving a
+/// second budget.
+fn repeat_with(root: CausalRootId, grant: GrantId, generation: u64) -> Shown {
     shown!(
-        "If the reply does not arrive, run the command again with --generation {}: a chain already \
-         on the generation after it is told so and is given no second budget.",
+        "If the reply does not arrive, run: kr workflow rearm {} --grant {} --generation {}",
+        closed_word(&root),
+        closed_word(&grant),
         generation
     )
 }
