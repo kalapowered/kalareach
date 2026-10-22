@@ -30,8 +30,8 @@ use crate::recovery::{RecoveryError, Result};
 /// Every read is held to it, and a read that is held raises it to what that read holds, so what one
 /// read showed holds every read after it, whether or not a write was made on that read. A service
 /// that answers a later read with an older authentic bundle, or one that records a lower checkpoint
-/// of any archive than a read before it did, is not recorded into, because writing on it would put
-/// back what a newer bundle replaced: a lowered checkpoint, or a writer another device had added.
+/// of any archive than a read before it did, is not recorded into, because writing on it would lower
+/// a checkpoint that a newer bundle raised, or drop a writer that another device added.
 #[derive(Clone)]
 pub(crate) struct Strongest {
     revision: u64,
@@ -61,7 +61,7 @@ impl Strongest {
     pub(crate) fn hold(&mut self, bundle: &RecoveryBundle) -> Result<()> {
         if bundle.revision.get() < self.revision {
             return Err(RecoveryError::BundleWentBackToAnOlderRevision {
-                first: self.revision,
+                newest: self.revision,
             });
         }
         for known in &self.checkpoints {
