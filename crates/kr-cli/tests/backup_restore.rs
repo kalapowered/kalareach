@@ -1628,6 +1628,21 @@ fn backed_up_configuration() -> Vec<u8> {
     document.revision = 9;
     document.preferences.sleep_inhibition = Nullable::some(SleepInhibitionSetting::BatteryToo);
     document.descriptions.enabled = Nullable::some(true);
+    // What can carry a secret or run code: a variable a session is given and a package's command
+    // integration, in the base preferences and in a profile. A restore keeps the host's own.
+    document.preferences.environment_additions = Nullable::some(
+        [("BASH_ENV".to_owned(), "/tmp/restored-env".to_owned())]
+            .into_iter()
+            .collect(),
+    );
+    document.profiles.insert(
+        "tools".to_owned(),
+        kr_protocol::hostinfo::configuration::PreferenceSet {
+            command_integrations: Nullable::some(vec!["restored/tool".to_owned()]),
+            sleep_inhibition: Nullable::some(SleepInhibitionSetting::Off),
+            ..kr_protocol::hostinfo::configuration::PreferenceSet::default()
+        },
+    );
     // What no restore may move: a restriction, the service this host selects, how its daemon starts.
     document.ceilings.session_limit = Nullable::some(1);
     document.storage.origin = Nullable::some("https://elsewhere.example".to_owned());
@@ -1711,6 +1726,18 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
     assert!(preview.status.success(), "{}", text(&preview.stderr));
     let plan: Value = serde_json::from_slice(&preview.stdout).expect("a document");
     assert_eq!(plan["applies_configuration"], true);
+    // What stays the host's own is named by set and never by variable or value.
+    assert_eq!(
+        plan["configuration_left_out"]["preferences"], true,
+        "{plan}"
+    );
+    assert_eq!(
+        plan["configuration_left_out"]["profiles"],
+        serde_json::json!(["tools"]),
+        "{plan}"
+    );
+    assert!(!plan.to_string().contains("BASH_ENV"));
+    assert!(!plan.to_string().contains("restored/tool"));
     let changes: Vec<&str> = plan["configuration_changes"]
         .as_array()
         .expect("the changes")
@@ -1805,6 +1832,80 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
         "the preference came back"
     );
     assert_eq!(after.descriptions.enabled, Nullable::some(true));
+    // The profile came back with its own settings and without what runs code or carries a secret.
+    assert_eq!(
+        after.profiles["tools"].sleep_inhibition,
+        Nullable::some(SleepInhibitionSetting::Off)
+    );
+    assert_eq!(
+        after.profiles["tools"].command_integrations,
+        Nullable::null()
+    );
+    assert_eq!(
+        after.preferences.environment_additions, before.preferences.environment_additions,
+        "a variable is not restored"
+    );
+    assert_eq!(
+        after.preferences.command_integrations, before.preferences.command_integrations,
+        "a command integration is not restored"
+    );
+    let report: Value = serde_json::from_slice(&applied.stdout).expect("a document");
+    assert_eq!(
+        report["configuration_left_out"]["profiles"],
+        serde_json::json!(["tools"]),
+        "{report}"
+    );
+    // The same restore in words names the set, so that the person can add what was left out again.
+    let words_into = folder(&rig, "restored-in-words");
+    let words_into_arg = words_into.display().to_string();
+    let words_preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &words_into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--apply-configuration",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(
+        words_preview.status.success(),
+        "{}",
+        text(&words_preview.stderr)
+    );
+    let in_words = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &words_into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &digest_of(&words_preview),
+                "--apply-configuration",
+            ],
+            None,
+        )
+        .await;
+    assert!(in_words.status.success(), "{}", text(&in_words.stderr));
+    let said = text(&in_words.stdout);
+    assert!(
+        said.contains("Not applied: the variables and command integrations of the profile tools."),
+        "{said}"
+    );
+    assert!(said.contains("of the base preferences"), "{said}");
+    assert!(
+        !said.contains("BASH_ENV") && !said.contains("restored/tool"),
+        "{said}"
+    );
     assert_eq!(
         after.ceilings, before.ceilings,
         "a restriction is not restored"
