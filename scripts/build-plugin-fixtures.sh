@@ -42,6 +42,7 @@ fi
 # and its panic handler would collide with theirs. Separate invocations keep each group's features
 # to itself.
 sandboxed=(
+    hostile-decoder
     infinite-loop
     memory-hog
     oversized-output

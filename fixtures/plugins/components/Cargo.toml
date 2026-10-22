@@ -8,6 +8,7 @@
 resolver = "3"
 members = [
     "ambient-import",
+    "hostile-decoder",
     "infinite-loop",
     "memory-hog",
     "oversized-output",

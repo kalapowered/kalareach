@@ -484,6 +484,157 @@ pub enum RequestBody {
     },
     /// Asks what the host is doing.
     Health,
+    /// Asks a binding's component to interpret one native request.
+    ///
+    /// The answer is a proposal. The worker compares every part of it with the request it holds
+    /// before anything becomes an approval.
+    Decode(Box<DecodeCall>),
+    /// Asks a binding's component to encode a validated decision as the bytes of a response.
+    ///
+    /// The answer is bytes and nothing has been sent: the host has no way to send them.
+    Encode(Box<EncodeCall>),
+    /// Replaces the facts a binding's component reads about its bound execution.
+    ///
+    /// Answered on acceptance. A revision replaces an earlier one no call has yet seen, and the
+    /// binding's next call is the first to see it.
+    ReviseFacts {
+        /// The binding.
+        binding_id: kr_protocol::scalars::Uuid,
+        /// The facts, whole.
+        facts: WireFacts,
+    },
+    /// Replaces the attachments a binding's component reads the current draft as holding.
+    ///
+    /// Answered and applied as [`Self::ReviseFacts`] is.
+    ReviseAttachments {
+        /// The binding.
+        binding_id: kr_protocol::scalars::Uuid,
+        /// The attachments, whole.
+        attachments: Vec<WireAttachment>,
+    },
+    /// Tells the host whether privacy mode stands for the worker this connection serves.
+    ///
+    /// While it does, the host writes no document of this connection and sends the presentation of
+    /// a decoded request empty. Answered once that holds.
+    Privacy {
+        /// Whether privacy mode stands.
+        private: bool,
+    },
+}
+
+/// Everything a `decode-request` call carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodeCall {
+    /// The binding.
+    pub binding_id: kr_protocol::scalars::Uuid,
+    /// The native request, as the broker retained it.
+    pub event: WireSourceEvent,
+    /// The caller's own deadline.
+    pub deadline_ms: u64,
+}
+
+/// Everything an `encode-response` call carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncodeCall {
+    /// The binding.
+    pub binding_id: kr_protocol::scalars::Uuid,
+    /// The broker's own record of the pending request.
+    pub request: WireRequestSnapshot,
+    /// The decision the broker validated, one of the request's offered decisions.
+    pub decision: String,
+    /// The request's source event, where the broker still holds it.
+    pub event: Option<WireSourceEvent>,
+    /// The caller's own deadline.
+    pub deadline_ms: u64,
+}
+
+/// The broker's own record of one pending native request, as it travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireRequestSnapshot {
+    /// The identifier the upstream gave the request.
+    pub request_id: String,
+    /// The source event the request arrived as.
+    pub handle: kr_protocol::ids::SourceEventHandle,
+    /// The method the request named.
+    pub method: String,
+    /// How the method is classified.
+    pub class: WireMethodClass,
+    /// When the broker received the request, in milliseconds since the Unix epoch.
+    pub received_at_ms: u64,
+    /// When the upstream stops waiting for an answer, where it says.
+    pub deadline_at_ms: Option<u64>,
+    /// The decisions the upstream offers, as stable identifiers.
+    pub offered_decisions: Vec<String>,
+    /// The binding revision the request was recorded at.
+    pub binding_revision: u64,
+}
+
+/// How a native method is classified, as it travels.
+///
+/// The protocol's own closed set rather than another crate's, so that a change to that type is not
+/// a change to a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMethodClass {
+    /// The method reads.
+    Observation,
+    /// The method changes something.
+    Mutation,
+    /// The method carries a credential or a configuration.
+    Credential,
+    /// The method is not one the connector supports.
+    Unsupported,
+}
+
+/// A native request a component decoded, as it travels.
+///
+/// All of the contract's record. The worker uses the identifier, the summary and the decisions and
+/// believes none of them as they stand.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDecoded {
+    /// The identifier the component says the request has.
+    pub request_id: String,
+    /// How the component says its method is classified.
+    pub class: WireMethodClass,
+    /// A one-line summary of what answering yes would do.
+    pub summary: String,
+    /// The decisions the component says the upstream offers, as stable identifiers.
+    pub decisions: Vec<String>,
+    /// The document nodes that present the request, as canonical JSON.
+    ///
+    /// Empty while privacy mode stands on the connection.
+    pub presentation: Vec<String>,
+}
+
+/// A response a component encoded, as it travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireEncoded {
+    /// The identifier of the request the component says it answers.
+    pub request_id: String,
+    /// The bytes. Nothing has sent them.
+    #[serde(with = "serde_bytes_vec")]
+    pub bytes: Vec<u8>,
+}
+
+/// One completed attachment of the current draft, as it travels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireAttachment {
+    /// The attachment's identifier.
+    pub attachment_id: String,
+    /// Its name.
+    pub name: String,
+    /// Its media type.
+    pub media_type: String,
+    /// Its size in bytes.
+    pub size_bytes: u64,
+    /// When its transfer completed, in milliseconds since the Unix epoch.
+    pub completed_at_ms: u64,
 }
 
 /// Everything a `prepare-action` call carries.
@@ -507,12 +658,16 @@ impl RequestBody {
         match self {
             Self::RegisterBinding(registration) => Some(registration.binding_id),
             Self::PrepareAction(call) => Some(call.binding_id),
+            Self::Decode(call) => Some(call.binding_id),
+            Self::Encode(call) => Some(call.binding_id),
             Self::Event { binding_id, .. }
             | Self::Snapshot { binding_id, .. }
             | Self::Checkpoint { binding_id, .. }
             | Self::Restore { binding_id, .. }
+            | Self::ReviseFacts { binding_id, .. }
+            | Self::ReviseAttachments { binding_id, .. }
             | Self::Unbind { binding_id } => Some(*binding_id),
-            Self::Hello { .. } | Self::Verify { .. } | Self::Health => None,
+            Self::Hello { .. } | Self::Verify { .. } | Self::Health | Self::Privacy { .. } => None,
         }
     }
 
@@ -530,6 +685,11 @@ impl RequestBody {
             Self::Restore { .. } => "restore",
             Self::Unbind { .. } => "unbind",
             Self::Health => "health",
+            Self::Decode(_) => "decode",
+            Self::Encode(_) => "encode",
+            Self::ReviseFacts { .. } => "revise_facts",
+            Self::ReviseAttachments { .. } => "revise_attachments",
+            Self::Privacy { .. } => "privacy",
         }
     }
 }
@@ -603,6 +763,16 @@ pub enum ResponseBody {
         /// Whether there was one to remove.
         existed: bool,
     },
+    /// A revision of a binding's facts or attachments was accepted.
+    Revised,
+    /// Privacy mode is as the worker said, for the rest of this connection until it says otherwise.
+    ///
+    /// Every document frame of the connection is before this answer in the stream, or is never
+    /// written.
+    PrivacySet {
+        /// Whether privacy mode stands.
+        private: bool,
+    },
     /// What the host is doing.
     Health(Box<HostHealth>),
     /// The request was refused.
@@ -626,6 +796,10 @@ pub enum CallValue {
     Plan(Box<WirePlan>),
     /// A component's own resumable state.
     State(#[serde(with = "serde_bytes_vec")] Vec<u8>),
+    /// A native request a component decoded.
+    Decoded(Box<WireDecoded>),
+    /// A response a component encoded.
+    Encoded(Box<WireEncoded>),
 }
 
 /// What the host reports about itself.

@@ -70,6 +70,9 @@ pub enum Offered {
     Dropped,
     /// What must arrive will not fit, even with every document gone. The connection is over.
     Overflowed,
+    /// It was a document and documents are withheld ([`NoticeSink::withhold_documents`]). Nothing
+    /// was queued and nothing is owed for it until they are no longer withheld.
+    Withheld,
     /// The reader is gone.
     Closed,
 }
@@ -128,6 +131,11 @@ struct Queued {
     gone: std::collections::HashSet<(Uuid, u64)>,
     /// The order those were recorded in, so the oldest is the first to go if there are too many.
     gone_order: VecDeque<(Uuid, u64)>,
+    /// Whether documents are withheld: none is queued or delivered until this is lifted.
+    withhold: bool,
+    /// The bindings a document was withheld for, and how many documents each lost, waiting to be
+    /// reported as losses when documents are no longer withheld.
+    withheld: HashMap<Uuid, u64>,
     closed: bool,
     /// Set when what must arrive would not fit. The connection is over.
     overflowed: bool,
@@ -199,7 +207,32 @@ impl NoticeSink {
             queue
                 .gone_order
                 .retain(|(held, _document)| *held != binding_id);
+            queue.withheld.remove(&binding_id);
         }
+    }
+
+    /// Withholds documents, or stops withholding them.
+    ///
+    /// While they are withheld a document is not queued, and the documents already queued are
+    /// removed: the queue stops holding what will not be sent. A document that is withheld is not
+    /// one the queue lost for want of room, so nothing is owed for it while they are withheld. A
+    /// piece of a document that is withheld and is not its last is remembered as a dropped one is,
+    /// so that the rest of that document is dropped when it arrives after documents are no longer
+    /// withheld, and a reader is never given the end of a document it did not receive the start of.
+    /// When documents are no longer withheld, one loss of documents for each binding that had one
+    /// withheld is reported as a gap, which is how the reader learns to expect a fresh document and
+    /// how the component is asked to draw one.
+    pub fn withhold_documents(&self, withhold: bool) {
+        if let Ok(mut queue) = self.shared.queue.lock() {
+            queue.set_withhold(withhold);
+        }
+        self.shared.wake.notify_one();
+    }
+
+    /// Returns true while documents are withheld.
+    #[must_use]
+    pub fn documents_withheld(&self) -> bool {
+        self.shared.queue.lock().is_ok_and(|queue| queue.withhold)
     }
 
     /// Closes the queue, so a reader waiting on it stops waiting.
@@ -274,6 +307,38 @@ impl NoticeStream {
         self.shared.queue.lock().is_ok_and(|queue| queue.closed)
     }
 
+    /// Returns true while documents are withheld.
+    #[must_use]
+    pub fn documents_withheld(&self) -> bool {
+        self.shared.queue.lock().is_ok_and(|queue| queue.withhold)
+    }
+
+    /// Says whether a notice this reader took is one to leave unwritten, and if it is a document
+    /// withheld, records it as withheld as the queue records one it never held.
+    ///
+    /// For the task that writes notices, which asks it holding the connection's writer: documents
+    /// are withheld or not at the moment the writer is taken, and a document taken off the queue
+    /// before documents were withheld is not written after.
+    pub fn skips_withheld(&self, notice: &Notice) -> bool {
+        let Ok(mut queue) = self.shared.queue.lock() else {
+            return false;
+        };
+        if !queue.withhold {
+            return false;
+        }
+        let Notice::Document {
+            binding_id,
+            document,
+            last,
+            ..
+        } = notice
+        else {
+            return false;
+        };
+        queue.withhold_piece(*binding_id, *document, *last);
+        true
+    }
+
     /// Returns true when the queue closed because what had to arrive would not fit.
     #[must_use]
     pub fn overflowed(&self) -> bool {
@@ -291,6 +356,7 @@ impl Drop for NoticeStream {
             queue.lost_order.clear();
             queue.gone.clear();
             queue.gone_order.clear();
+            queue.withheld.clear();
             queue.held = 0;
         }
     }
@@ -316,6 +382,19 @@ impl Queued {
                     documents,
                 },
             );
+        }
+
+        // Documents are withheld: this one is neither queued nor owed.
+        if self.withhold
+            && let Notice::Document {
+                binding_id,
+                document,
+                last,
+                ..
+            } = &notice
+        {
+            self.withhold_piece(*binding_id, *document, *last);
+            return Offered::Withheld;
         }
 
         // A piece of a document this queue has already dropped. Queueing it would leave a reader
@@ -472,6 +551,65 @@ impl Queued {
         self.lost.insert(binding_id, loss);
         self.lost_order.push_back(binding_id);
         self.dropped = self.dropped.saturating_add(loss.documents);
+    }
+
+    /// Records that one piece of a document was withheld.
+    ///
+    /// The document is remembered as dropped until its last piece is seen, and the binding is
+    /// remembered as owed a loss of documents for when they are no longer withheld.
+    fn withhold_piece(&mut self, binding_id: Uuid, document: u64, last: bool) {
+        self.gave_up_on(binding_id, document, last);
+        let lost = self.withheld.entry(binding_id).or_insert(0);
+        if last {
+            *lost = lost.saturating_add(1);
+        }
+    }
+
+    /// Starts or ends withholding documents.
+    fn set_withhold(&mut self, withhold: bool) {
+        if self.withhold == withhold {
+            return;
+        }
+        self.withhold = withhold;
+        if withhold {
+            self.purge_documents();
+            return;
+        }
+        // Each binding that had a document withheld has lost at least one, whatever pieces of it
+        // this queue saw: the reader may hold the start of one.
+        let owed: Vec<(Uuid, u64)> = self.withheld.drain().collect();
+        for (binding_id, documents) in owed {
+            let _ = self.absorb(
+                binding_id,
+                Loss {
+                    documents: documents.max(1),
+                    ..Loss::default()
+                },
+            );
+        }
+    }
+
+    /// Removes every document that is waiting, and remembers each as withheld.
+    fn purge_documents(&mut self) {
+        let mut freed = 0;
+        let mut pieces: Vec<(Uuid, u64, bool)> = Vec::new();
+        self.waiting.retain(|notice| match notice {
+            Notice::Document {
+                binding_id,
+                document,
+                last,
+                ..
+            } => {
+                freed += notice_bytes(notice);
+                pieces.push((*binding_id, *document, *last));
+                false
+            }
+            _ => true,
+        });
+        self.held = self.held.saturating_sub(freed);
+        for (binding_id, document, last) in pieces {
+            self.withhold_piece(binding_id, document, last);
+        }
     }
 
     /// Drops the oldest document, whole, and says whether it dropped anything.
@@ -970,5 +1108,82 @@ mod tests {
                 .expect("the reader was not left waiting")
                 .is_none()
         );
+    }
+
+    fn piece(binding_id: Uuid, document: u64, last: bool) -> Notice {
+        Notice::Document {
+            binding_id,
+            call: "snapshot".to_owned(),
+            document,
+            last,
+            nodes: vec![WireNode {
+                node_id: "n0".to_owned(),
+                node_revision: 1,
+                body_json: "x".repeat(32),
+            }],
+        }
+    }
+
+    #[test]
+    fn documents_that_are_withheld_are_not_held_and_the_reader_is_told_when_they_are_not_withheld_any_more()
+     {
+        let (sink, mut stream) = channel();
+        // Two documents waiting, one of them whole and one with a piece still to come.
+        sink.send(piece(binding(1), 1, false));
+        sink.send(piece(binding(2), 1, true));
+        assert_ne!(stream.held_bytes(), 0);
+
+        sink.withhold_documents(true);
+        assert!(sink.documents_withheld());
+        assert_eq!(
+            stream.held_bytes(),
+            0,
+            "the queue went on holding what it will not send"
+        );
+        // What arrives while documents are withheld is neither queued nor lost for want of room,
+        // and a fault is still told.
+        assert_eq!(sink.send(piece(binding(1), 1, true)), Offered::Withheld);
+        assert_eq!(sink.send(piece(binding(1), 2, true)), Offered::Withheld);
+        assert_eq!(sink.send(piece(binding(1), 3, false)), Offered::Withheld);
+        assert_eq!(
+            sink.send(Notice::Fault {
+                binding_id: binding(1),
+                call: "decode-request".to_owned(),
+                detail: "trapped".to_owned(),
+                faults_in_window: 1,
+            }),
+            Offered::Kept
+        );
+        assert!(matches!(stream.try_recv(), Some(Notice::Fault { .. })));
+        assert!(stream.try_recv().is_none());
+        assert_eq!(stream.dropped_documents(), 0);
+
+        // Documents are not withheld any more: each binding that had one withheld is told, once,
+        // that documents were lost, and a fresh one is queued.
+        sink.withhold_documents(false);
+        let mut told = Vec::new();
+        while let Some(notice) = stream.try_recv() {
+            let Notice::Gap {
+                binding_id,
+                documents,
+                ..
+            } = notice
+            else {
+                panic!("{notice:?} was queued for documents that were withheld");
+            };
+            told.push((binding_id, documents));
+        }
+        told.sort();
+        assert_eq!(told, [(binding(1), 2), (binding(2), 1)]);
+
+        // The last piece of the document that was part withheld arrives now. A reader that was
+        // given no start of it is not given its end.
+        assert_eq!(sink.send(piece(binding(1), 3, true)), Offered::Dropped);
+        assert!(stream.try_recv().is_none());
+        assert_eq!(sink.send(piece(binding(1), 4, true)), Offered::Kept);
+        assert!(matches!(
+            stream.try_recv(),
+            Some(Notice::Document { document: 4, .. })
+        ));
     }
 }

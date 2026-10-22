@@ -38,6 +38,8 @@
 
 pub mod client;
 pub mod error;
+#[cfg(feature = "testing")]
+pub mod hold;
 pub mod launcher;
 pub mod notices;
 pub mod protocol;
