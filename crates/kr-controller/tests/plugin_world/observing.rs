@@ -548,10 +548,7 @@ impl Observing {
         let session = self.hosted._runtime.session();
         let mut seen = Vec::new();
         let mut cursor = 0_u64;
-        loop {
-            let Ok(page) = session.history_page(cursor, 1024 * 1024) else {
-                break;
-            };
+        while let Ok(page) = session.history_page(cursor, 1024 * 1024) {
             if page.bytes.as_slice().is_empty() {
                 break;
             }
@@ -611,12 +608,31 @@ impl Observing {
     }
 
     /// Waits until the reason a binding's report gives contains `part`, and returns it.
+    ///
+    /// # Panics
+    ///
+    /// Panics, saying where the binding stands, when the report never says it.
     pub async fn until_reason(&self, number: u8, part: &str) -> String {
-        until(&format!("the report to say {part:?}"), || async {
-            let reason = self.reason(number);
-            reason.contains(part).then_some(reason)
+        let said = tokio::time::timeout(PATIENCE, async {
+            loop {
+                let reason = self.reason(number);
+                if reason.contains(part) {
+                    return reason;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         })
-        .await
+        .await;
+        match said {
+            Ok(reason) => reason,
+            Err(_) => panic!(
+                "waited {PATIENCE:?} for the report to say {part:?}; it says {:?}, the binding is \
+                 {:?}; {}",
+                self.reason(number),
+                self.broker().rich_disabled(binding(number)),
+                self.diagnostics(number)
+            ),
+        }
     }
 
     /// Waits until the lane holds a state for a binding that says `part`, and returns it.
