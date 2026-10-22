@@ -35,6 +35,7 @@ tauri-build = { workspace = true, features = [] }
 [dependencies]
 # Draws the kit as a QR code to print.
 qrcodegen.workspace = true
+# Clears the buffers that hold the kit's QR code once it is written.
 # The one secure store, the Android TLS verifier's start and the browser-backed sign-in session.
 companion-platform.workspace = true
 kr-cbor.workspace = true
@@ -96,8 +97,11 @@ testing = ["kr-client/testing"]
 exacl.workspace = true
 
 [dev-dependencies]
-# Reads the QR code the kit is saved as, which a test holds to the kit's own text: an encoder that
-# misrendered would otherwise be decoded by its own code.
+# Reads the QR code the kit is saved as, which a test holds to the kit's own text: the whole SVG is
+# rendered as a viewer renders it (`resvg`) and its pixels decoded by `rqrr`, so an encoder or a
+# wrapper that misrendered, or drew white on white, would fail where its own reading of its own
+# output would not.
+resvg.workspace = true
 rqrr.workspace = true
 # This crate's own tests, with the seams above compiled in.
 companion-tauri = { path = ".", features = ["testing"] }
