@@ -479,13 +479,14 @@ rules are these.
   and `privacy` without entering a component. The other requests that name a binding run in a task of
   their own and take a place from the connection's sixteen. A connection holds sixty-four bindings,
   and a request past either bound is refused and not queued.
-- A call's own deadline is from 1 to 30,000 ms. A `decode` or an `encode` event is at most the
-  largest document node a frame carries, has the provenance `native_protocol` and carries the
-  identifier the upstream gave: an event that is a scrape or names no request is refused before any
-  component runs. An `encode` names a decision among the request's offered decisions (at most 16, of
-  at most 256 bytes), and its event, where it has one, is the source of the request being answered,
-  with the same handle and identifier. A request, a method, an identifier or a decision is at most
-  256 bytes.
+- The own deadline of a `decode` or an `encode` is from 1 to 30,000 ms. The event of either is at
+  most the largest document node a frame carries, has the provenance `native_protocol` and carries
+  the identifier the upstream gave: an event that is a scrape or names no request is refused before
+  any component runs. An `encode` names a decision among the request's offered decisions (at most
+  16, of at most 256 bytes), and its event, where it has one, is the source of the request being
+  answered, with the same handle and identifier. A request's method is at most 256 bytes, and its
+  identifier at most 1,538 bytes in the form the broker records it in, which is the upstream's own
+  JSON value with the quotes of a string.
 - Facts have strings of at most 1 KiB, at most 64 held rights and the plugin identifier the binding
   was registered with, and the facts of a registration are held to the same bounds. A draft's
   attachments are at most 64, with an identifier and a media type of at most 256 bytes and a name of
@@ -661,8 +662,8 @@ stands; after that one task of the link sends the changes, in the order they wer
 
 While the host holds that privacy mode stands on a connection, it writes no document notice on it,
 and it sends the nodes that present a decoded request empty. A document is a component's drawing of
-what it was handed, and in privacy mode nothing that was made of the session's content crosses the
-boundary of the host's process or waits in its queue for a reader that may not come. The host
+what it was handed, and in privacy mode no document crosses the boundary of the host's process or
+waits in its queue for a reader that may not come. The host
 answers a `privacy` request holding the connection's writer: it sets the flag, drops the documents
 its queue holds and writes the answer, and its notice writer checks the flag holding the same writer
 before it writes a document. So every document frame of a connection is before the answer in the

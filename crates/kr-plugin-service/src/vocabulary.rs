@@ -255,11 +255,11 @@ pub struct AttachmentFact {
     pub completed_at_ms: u64,
 }
 
-/// The longest a call's own deadline may be, in milliseconds.
+/// The longest a decode's or an encode's own deadline may be, in milliseconds.
 ///
-/// Every call carries the caller's deadline and holds one of the connection's places for as long as
-/// it runs. The longest a worker asks for is a few seconds; this is what keeps a request that names
-/// no end from holding a place for ever.
+/// Each holds one of the connection's places for as long as it runs. The longest a worker asks for
+/// is a few seconds; this is what keeps a request that names no end from holding a place for
+/// ever.
 pub const MAX_CALL_DEADLINE_MS: u64 = 30_000;
 
 /// The longest a text a worker gives a component about its binding may be, in bytes: an identifier,
@@ -278,8 +278,12 @@ pub const MAX_ATTACHMENT_ID_BYTES: usize = 256;
 /// The longest an attachment's name may be, in bytes.
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 1024;
 
-/// The longest a native request's method, identifier or one decision's identifier may be, in bytes.
+/// The longest a native request's method or one decision's identifier may be, in bytes.
 pub const MAX_REQUEST_TEXT_BYTES: usize = 256;
+
+/// The longest a native request's identifier may be, in bytes of the form the broker records it
+/// in: the upstream's own JSON value, quotes included for a string.
+pub const MAX_REQUEST_ID_BYTES: usize = kr_protocol::ids::MAX_UPSTREAM_REQUEST_ID_LEN;
 
 /// How many decisions a request may offer.
 pub const MAX_OFFERED_DECISIONS: usize = kr_protocol::broker::MAX_OFFERED_DECISIONS;
@@ -357,7 +361,7 @@ pub fn check_attachments(attachments: &[WireAttachment]) -> Result<(), String> {
 ///
 /// Returns the first bound the record breaks.
 pub fn check_snapshot(request: &WireRequestSnapshot) -> Result<(), String> {
-    if request.request_id.len() > MAX_REQUEST_TEXT_BYTES
+    if request.request_id.len() > MAX_REQUEST_ID_BYTES
         || request.method.len() > MAX_REQUEST_TEXT_BYTES
     {
         return Err("a request's identifier or method is over its bound".to_owned());

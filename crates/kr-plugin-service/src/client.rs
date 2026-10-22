@@ -782,26 +782,26 @@ impl PluginClient {
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal or [`ServiceError::Unavailable`].
+    /// Returns the host's refusal or [`ServiceError::Unavailable`], and a refusal at once for a
+    /// request no frame could carry.
     pub async fn revise_facts(
         &self,
         binding_id: BindingId,
         facts: &BindingFacts,
     ) -> ServiceResult<()> {
-        let body = self
-            .request(RequestBody::ReviseFacts {
-                binding_id: binding_id.get(),
-                facts: wire_facts(facts),
-            })
-            .await?;
-        revised(body)
+        let request = RequestBody::ReviseFacts {
+            binding_id: binding_id.get(),
+            facts: wire_facts(facts),
+        };
+        check_fits(&request)?;
+        revised(self.request(request).await?)
     }
 
     /// Replaces the attachments a binding's component reads the current draft as holding.
     ///
     /// # Errors
     ///
-    /// As [`Self::revise_facts`], and a refusal at once for a request no frame could carry.
+    /// As [`Self::revise_facts`].
     pub async fn revise_attachments(
         &self,
         binding_id: BindingId,

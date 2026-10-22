@@ -1385,6 +1385,21 @@ async fn kr_req_11_21_an_encode_returns_bytes_for_an_offered_decision_and_what_i
     assert_eq!(encoded.request_id, "7");
     assert_eq!(encoded.bytes, br#"{"id":"7","result":"allow"}"#);
 
+    // An identifier the upstream gave as a string of 255 characters is 257 bytes in the form the
+    // broker records it in, quotes included, and is a request like any other.
+    let long = format!("\"{}\"", "a".repeat(255));
+    let called = client
+        .encode(
+            binding_id,
+            pending_request(&long, "session/request_permission"),
+            "allow",
+            None,
+            deadline,
+        )
+        .await
+        .expect("a long identifier is encoded");
+    assert_eq!(called.encoded.expect("bytes").request_id, long);
+
     // A decision the request does not offer, an event that is not the request's, and an event of
     // another request: refused by the host, so the component is not asked.
     for (name, request, decision, event) in [
@@ -1428,8 +1443,8 @@ async fn kr_req_11_21_an_encode_returns_bytes_for_an_offered_decision_and_what_i
     );
     let account = account_of(&client, binding_id).await;
     assert!(
-        account.contains("encode=2;"),
-        "the component ran {account}: once for the answer and once for the one the host refused after"
+        account.contains("encode=3;"),
+        "the component ran {account}: for the two answers and for the one the host refused after"
     );
 }
 
@@ -1759,6 +1774,16 @@ async fn a_revision_or_a_call_beyond_its_bounds_is_refused_and_the_binding_goes_
         .decode(binding_id, &huge, core::time::Duration::from_millis(500))
         .await
         .expect_err("a request larger than a frame is refused");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { detail } if detail.contains("frame")),
+        "{refused}"
+    );
+    let mut huge_facts = components::facts("hostile-decoder");
+    huge_facts.thread_id = Some("t".repeat(1_100_000));
+    let refused = client
+        .revise_facts(binding_id, &huge_facts)
+        .await
+        .expect_err("facts larger than a frame are refused");
     assert!(
         matches!(&refused, ServiceError::Protocol { detail } if detail.contains("frame")),
         "{refused}"
