@@ -181,17 +181,20 @@ impl WorkerSupervisor for Supervisor {
 
 /// The platform's supervisor for a service, and what must live as long as it does.
 ///
-/// Unix: the daemon's own choice. Windows: the environment's scheduled task, whose starter creates
-/// the process outside this test's job, as it does for every suite that hosts a daemon.
+/// The daemon's own choice. On Windows that is the environment's scheduled task, whose starter
+/// creates the process outside this test's job, as it does for every suite that hosts a daemon;
+/// where nobody is signed in the same type runs over the task a host with no session registers.
 pub fn platform_supervisor(
     environment: &EnvironmentPaths,
 ) -> (Box<dyn WorkerSupervisor>, Option<Box<dyn std::any::Any>>) {
     #[cfg(windows)]
     {
-        let (task, supervisor) =
-            kr_controller::supervision::windows::testing::supervisor(environment)
-                .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
-        (Box::new(supervisor), Some(Box::new(task)))
+        use kr_controller::supervision::windows::testing::{TestTask, built_binary};
+
+        let task = built_binary("kr-controller")
+            .and_then(|starter| TestTask::register(environment, &starter))
+            .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
+        (task.product_supervisor(environment), Some(Box::new(task)))
     }
     #[cfg(not(windows))]
     {

@@ -12,7 +12,8 @@
 //! adopt a program into a binding; the claims that depend on the platform are these:
 //!
 //! * the platform starts the host, and the host is not in this process's group, so what ends this
-//!   process's group does not reach it (on Windows, a process outside this test's job);
+//!   process's group does not reach it (on Windows, a process outside every job the daemon runs in,
+//!   which is shown by the jobs closing on a daemon and its host running on);
 //! * the endpoint a worker reaches the host on, a socket or a named pipe, is the one the daemon
 //!   published, and the host answers a challenge on it;
 //! * a component compiles and runs in the host on this platform;
@@ -150,4 +151,132 @@ fn group_of(pid: u64) -> u32 {
         .trim()
         .parse()
         .expect("a process group")
+}
+
+/// The variable that makes the helper below do what it is for: it is set by the test that starts
+/// the helper and by nothing else, so a run of every ignored test leaves the helper alone.
+#[cfg(windows)]
+const NESTED_HELPER: &str = "KR_PLUGIN_HOST_NESTED_HELPER";
+
+/// Hosts a daemon and its worker, which is this process, and has the daemon start the plugin host,
+/// inside the jobs its parent built, until those jobs end it.
+///
+/// It says when the host is published, and where the tree and the task are, so that its parent can
+/// clean up what a process that its jobs end cannot.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "a helper process of the test below, which starts it itself"]
+async fn a_daemon_and_its_plugin_host_for_its_parent() {
+    if std::env::var_os(NESTED_HELPER).is_none() {
+        return;
+    }
+    let mut word = String::new();
+    std::io::stdin()
+        .read_line(&mut word)
+        .expect("the parent's word that the jobs are in place");
+    let hosted = hosted().await;
+    let _runtime = hosted.runtime().await;
+    let host = hosted.published().expect("the host is published");
+    println!(
+        "plugin host ready pid={} task={} root={}",
+        host.pid.get(),
+        kr_controller::supervision::windows::task_name(hosted.environment_id),
+        hosted.tree.root().display()
+    );
+    std::future::pending::<()>().await;
+}
+
+/// KR-REQ-05.06: the plugin runtime is a service of its own that the daemon starts when a worker
+/// asks, outside the controller's kill tree. The daemon runs in the nesting a breakaway cannot see
+/// through: an outer job that ends its members when it closes and does not let them leave, over an
+/// inner one that lets them. The host the platform starts for it was never in either, so when the
+/// jobs close and take the daemon and its worker with them the host runs on.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_host_outlives_the_jobs_its_daemon_ran_in() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::windows::io::AsHandle as _;
+
+    use kr_ipc::starter::{BREAKAWAY_OK, Job, KILL_ON_JOB_CLOSE};
+
+    let mut daemon = std::process::Command::new(std::env::current_exe().expect("this test"))
+        .args([
+            "a_daemon_and_its_plugin_host_for_its_parent",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(NESTED_HELPER, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("the daemon's process starts");
+    let outer = Job::create(KILL_ON_JOB_CLOSE).expect("the outer job");
+    outer
+        .assign(daemon.as_handle())
+        .expect("the daemon is in the outer job");
+    let inner = Job::create(BREAKAWAY_OK).expect("the inner job");
+    inner
+        .assign(daemon.as_handle())
+        .expect("the daemon is in the inner job, beneath the outer");
+    writeln!(daemon.stdin.take().expect("its input"), "go").expect("the word is given");
+    // Its output is read to the end on a thread of its own, so the helper never writes into a
+    // closed pipe; the line that says the host is published is passed on.
+    let output = daemon.stdout.take().expect("its output");
+    let (ready, is_ready) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if let Some(said) = line.strip_prefix("plugin host ready ") {
+                let _ = ready.send(said.to_owned());
+            }
+        }
+    });
+    let said = tokio::task::spawn_blocking(move || is_ready.recv_timeout(PATIENCE * 2))
+        .await
+        .expect("the wait")
+        .expect("the daemon in the nested jobs started the plugin host");
+    let field = |name: &str| {
+        said.split(' ')
+            .take_while(|part| !part.starts_with("root="))
+            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("the helper said {name}: {said}"))
+            .to_owned()
+    };
+    let host = kr_ipc::identity::process_start_identity(field("pid").parse().expect("a pid"))
+        .expect("the plugin host's identity");
+    assert_eq!(
+        kr_ipc::identity::process_state(&host),
+        ProcessState::Running,
+        "the plugin host is running while its daemon's jobs are open"
+    );
+
+    // The jobs close. The outer one ends every process in it, the daemon and its worker among them.
+    drop(inner);
+    drop(outer);
+    tokio::task::spawn_blocking(move || daemon.wait())
+        .await
+        .expect("the wait")
+        .expect("the jobs ended the daemon, and its process is collected");
+    let _ = reader.join();
+    let survived = kr_ipc::identity::process_state(&host);
+    // What a process the jobs could not end leaves is the test's to remove, whatever was found.
+    kill(&host);
+    let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("the system"))
+        .join("System32")
+        .join("schtasks.exe");
+    let _ = std::process::Command::new(system)
+        .args(["/Delete", "/TN", &field("task"), "/F"])
+        .output();
+    if let Some((_, root)) = said.split_once("root=") {
+        let _ = std::fs::remove_dir_all(root);
+    }
+    assert_eq!(
+        survived,
+        ProcessState::Running,
+        "the plugin host outlived every job its daemon ran in"
+    );
 }

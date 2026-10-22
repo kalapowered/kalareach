@@ -225,7 +225,7 @@ impl Host {
     fn platform_supervisor(&self) -> Box<dyn WorkerSupervisor> {
         #[cfg(windows)]
         if let Some(task) = &self.task {
-            return Box::new(task.supervisor(&self.paths()));
+            return task.product_supervisor(&self.paths());
         }
         if self.platform_service {
             return kr_controller::supervision::detect();
@@ -1335,14 +1335,36 @@ async fn a_worker_the_detached_start_launches_leads_a_session_of_its_own() {
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
 /// shell. The daemon asks its supervisor to start the worker and nothing else: no plugin runtime
 /// or other separately supervised service, lazily or otherwise. And nothing the worker itself
-/// starts beside the shell stays running.
-#[cfg(unix)]
+/// starts beside the shell stays running, which on Windows leaves the pseudo-console's host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
+    #[cfg(unix)]
+    nothing_the_worker_started_beside_the_shell_runs(&created).await;
+    #[cfg(windows)]
+    only_the_pseudo_console_runs_beside_the_shell(&host, &created);
+    // Everything the daemon asked the platform to run for this environment, over the whole of it.
+    let launched = host.launches();
+    assert_eq!(
+        launched,
+        [Requested::Worker(host.worker.clone())],
+        "the daemon started the worker and nothing else"
+    );
+    assert!(
+        kr_plugin_service::launcher::read_descriptor(&host.paths())
+            .expect("reads the plugin host's descriptor")
+            .is_none(),
+        "no plugin runtime was published for a session that asked for none"
+    );
+    close(&mut client, &host, created.session.session_id).await;
+}
+
+/// Over a few seconds of idling, no process the worker started beside the root shell stays.
+#[cfg(unix)]
+async fn nothing_the_worker_started_beside_the_shell_runs(created: &SessionCreateResult) {
     let root = u32::try_from(
         created
             .session
@@ -1384,14 +1406,54 @@ async fn an_idle_session_runs_nothing_beside_its_shell() {
         beside_the_shell.is_empty(),
         "nothing the worker started beside its shell is still running: {beside_the_shell:?}"
     );
-    // Everything the daemon asked the platform to run for this environment, over the whole of it.
-    let launched = host.launches();
-    assert_eq!(
-        launched,
-        [Requested::Worker(host.worker.clone())],
-        "the daemon started the worker and nothing else"
+}
+
+/// What the worker has started, on Windows: its root shell, and the host of the pseudo-console the
+/// shell runs in, and nothing else. A backend server is run only on a Unix host.
+#[cfg(windows)]
+fn only_the_pseudo_console_runs_beside_the_shell(host: &Host, created: &SessionCreateResult) {
+    let root = u32::try_from(
+        created
+            .session
+            .root_process
+            .as_ref()
+            .expect("the session names its root shell")
+            .pid
+            .get(),
+    )
+    .expect("a process identifier");
+    let worker = worker_of(host, created.session.session_id);
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Get-CimInstance Win32_Process -Filter 'ParentProcessId={}' | \
+                 ForEach-Object {{ '{{0}} {{1}}' -f $_.ProcessId, $_.Name }}",
+                worker.pid.get()
+            ),
+        ])
+        .output()
+        .expect("lists the worker's children");
+    assert!(
+        output.status.success(),
+        "the list of the worker's children was read"
     );
-    close(&mut client, &host, created.session.session_id).await;
+    let beside: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, name) = line.trim().split_once(' ')?;
+            let console = ["conhost.exe", "openconsole.exe"]
+                .iter()
+                .any(|host| name.eq_ignore_ascii_case(host));
+            (pid.parse::<u32>().ok()? != root && !console).then(|| line.trim().to_owned())
+        })
+        .collect();
+    assert!(
+        beside.is_empty(),
+        "the worker started nothing beside its shell and its console: {beside:?}"
+    );
 }
 
 /// Every process on this machine, with its parent.
@@ -1853,12 +1915,8 @@ fn nested_daemon_supervisor(
     environment: &kr_ipc::paths::EnvironmentPaths,
     starter: &Path,
 ) -> Box<dyn WorkerSupervisor> {
-    use kr_controller::supervision::windows::TaskSupervisor;
-    use kr_controller::supervision::windows::testing::definition;
-
-    let expected = definition(environment, starter).expect("the task's definition");
-    let through_the_task = TaskSupervisor::for_definition(environment.clone(), expected);
-    Box::new(through_the_task)
+    kr_controller::supervision::windows::testing::supervisor_for(environment, starter)
+        .expect("the supervisor the daemon here starts through")
 }
 
 /// Hosts a control daemon for its parent's host tree, inside the jobs its parent built, until
@@ -2057,6 +2115,173 @@ async fn removing_the_environments_task_leaves_its_running_worker_running() {
     let closed = close(&mut client, &host, session_id).await;
     assert_eq!(closed.session_id, session_id, "and closes as usual");
     drop(client);
+    daemon.stop().await;
+}
+
+/// What `whoami` says of a process: its account, the integrity level it runs at, and whether it
+/// holds the Administrators group in force.
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct Standing {
+    account: String,
+    integrity: String,
+    administrators: Option<bool>,
+}
+
+#[cfg(windows)]
+impl Standing {
+    /// Reads the output of `whoami /user /fo csv /nh` and of `whoami /groups /fo csv /nh`.
+    fn read(user: &str, groups: &str) -> Self {
+        fn fields(line: &str) -> Vec<&str> {
+            line.trim().trim_matches('"').split("\",\"").collect()
+        }
+        let account = user
+            .lines()
+            .find_map(|line| fields(line).get(1).map(|sid| (*sid).to_owned()))
+            .expect("whoami names the account's identifier");
+        let mut integrity = None;
+        let mut administrators = None;
+        for line in groups.lines() {
+            let fields = fields(line);
+            let (Some(sid), Some(attributes)) = (fields.get(2), fields.get(3)) else {
+                continue;
+            };
+            if sid.starts_with("S-1-16-") {
+                integrity = Some((*sid).to_owned());
+            }
+            if *sid == "S-1-5-32-544" {
+                administrators = Some(!attributes.contains("deny only"));
+            }
+        }
+        Self {
+            account,
+            integrity: integrity.expect("whoami names the integrity level"),
+            administrators,
+        }
+    }
+
+    /// What this process, which is the daemon's, runs as.
+    fn of_this_process() -> Self {
+        let whoami = |argument: &str| {
+            let output = std::process::Command::new("whoami.exe")
+                .args([argument, "/fo", "csv", "/nh"])
+                .output()
+                .expect("whoami runs");
+            assert!(output.status.success(), "whoami {argument} answered");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        Self::read(&whoami("/user"), &whoami("/groups"))
+    }
+}
+
+/// KR-REQ-06.12: the session root shell is not a superuser shell: the process a session launches
+/// as its root shell runs as the account of the host that started it, at the integrity level that
+/// account's token has, with no privilege raised by the host. On Windows the worker is created by
+/// the environment's task, whose principal runs with the least privilege, and the shell it starts
+/// is compared with the daemon's own process.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_root_shell_runs_as_the_hosts_own_account_and_level() {
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    // The shell says who it is as it starts: its startup file runs before its first prompt, in the
+    // directory the session was given. `whoami`'s switches are not paths, so the shell is told
+    // not to turn them into ones.
+    let startup = host.temp.root().join("kr-who.sh");
+    std::fs::write(
+        &startup,
+        "MSYS_NO_PATHCONV=1 whoami /user /fo csv /nh > kr-user\n\
+         MSYS_NO_PATHCONV=1 whoami /groups /fo csv /nh > kr-groups\n\
+         : > kr-who-done\n",
+    )
+    .expect("writes the shell's startup file");
+    let created = create_with(
+        &mut client,
+        &host,
+        &[("ENV", startup.to_str().expect("a path"))],
+    )
+    .await;
+    let root = host.temp.root().to_path_buf();
+    until("the shell to say who it is", || {
+        root.join("kr-who-done").exists().then_some(())
+    })
+    .await;
+    let read = |name: &str| {
+        std::fs::read_to_string(root.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    let shell = Standing::read(&read("kr-user"), &read("kr-groups"));
+    let daemons = Standing::of_this_process();
+    assert_eq!(
+        shell, daemons,
+        "the root shell runs as the daemon's account, at the daemon's integrity level, with the \
+         Administrators group in force exactly when the daemon has it"
+    );
+    close(&mut client, &host, created.session.session_id).await;
+    daemon.stop().await;
+}
+
+/// What the daemon's `host.doctor` says.
+#[cfg(windows)]
+async fn doctor_of(client: &mut LocalClient) -> kr_protocol::hostinfo::HostDoctorResult {
+    client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the doctor answers")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// `kr doctor` says whether this daemon can start workers: where the environment's task is the one
+/// this installation registers it says so, and where the task is gone it says that nothing can be
+/// started and what to run.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doctor_says_whether_the_environments_task_can_start_workers() {
+    use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
+
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let supervisor_check = |doctor: HostDoctorResult| {
+        let check = doctor
+            .checks
+            .into_iter()
+            .find(|check| check.id() == "supervisor")
+            .expect("the doctor has a check of what starts workers");
+        (
+            check.status,
+            check.detail().to_owned(),
+            check.remedy().map(str::to_owned),
+        )
+    };
+    let (status, _, _) = supervisor_check(doctor_of(&mut client).await);
+    assert_eq!(
+        status,
+        DoctorStatus::Ok,
+        "the task is there to start workers"
+    );
+    assert!(
+        kr_controller::supervision::windows::remove(
+            host.task
+                .as_ref()
+                .expect("the environment's task")
+                .definition()
+        )
+        .expect("removed"),
+        "the task was there to remove"
+    );
+    let (status, detail, remedy) = supervisor_check(doctor_of(&mut client).await);
+    assert_eq!(
+        status,
+        DoctorStatus::Failed,
+        "nothing can be started without the task"
+    );
+    assert!(
+        remedy.is_some_and(|remedy| remedy.contains("kr host startup --set standalone")),
+        "the remedy names the setup step: {detail}"
+    );
     daemon.stop().await;
 }
 
