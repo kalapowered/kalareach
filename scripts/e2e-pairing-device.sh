@@ -478,6 +478,8 @@ run_android() {
     search_log "$adb" -s "$serial" logcat -d -b all
     "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -2000 >"$artefacts/logcat.log"
+    # What the application's native half printed to its standard streams.
+    "$adb" -s "$serial" logcat -d -s RustStdoutStderr 2>/dev/null >"$artefacts/application.log"
     judge "$out" || status=2
     [ "$status" = 0 ] || return 2
 }
