@@ -4324,6 +4324,7 @@ dependencies = [
 name = "kr-backup-integration"
 version = "0.1.0"
 dependencies = [
+ "kr-cbor",
  "kr-client",
  "kr-crypto",
  "kr-protocol",
