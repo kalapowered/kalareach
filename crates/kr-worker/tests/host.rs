@@ -62,6 +62,10 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
     fn describe(&self) -> &'static str {
         "this host's supervisor, with the worker told where this test's packages are"
     }
+
+    fn readiness(&self) -> kr_controller::supervision::Readiness {
+        self.inner.readiness()
+    }
 }
 
 /// One request the daemon made of its supervisor.
@@ -151,6 +155,10 @@ impl WorkerSupervisor for RecordingSupervisor {
 
     fn describe(&self) -> &'static str {
         "this host's supervisor, with every request remembered"
+    }
+
+    fn readiness(&self) -> kr_controller::supervision::Readiness {
+        self.inner.readiness()
     }
 }
 

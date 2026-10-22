@@ -44,7 +44,9 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor};
+use kr_controller::supervision::{
+    LaunchOutcome, Readiness, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
+};
 use kr_ipc::identity::{ProcessState, process_state};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_ipc::testing::TempHost;
@@ -281,6 +283,10 @@ impl WorkerSupervisor for Closable {
 
     fn describe(&self) -> &'static str {
         self.inner.describe()
+    }
+
+    fn readiness(&self) -> Readiness {
+        self.inner.readiness()
     }
 }
 
