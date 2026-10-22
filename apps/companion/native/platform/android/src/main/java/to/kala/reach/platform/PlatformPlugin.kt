@@ -226,6 +226,7 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         is ScanOutcome.Text -> JSObject().put("outcome", "text").put("text", outcome.text)
         ScanOutcome.Cancelled -> JSObject().put("outcome", "cancelled")
         ScanOutcome.CameraDenied -> JSObject().put("outcome", "camera_denied")
+        ScanOutcome.Failed -> JSObject().put("outcome", "failed")
     }
 
     // The voice call is the application's own, in a module this library cannot see: the application

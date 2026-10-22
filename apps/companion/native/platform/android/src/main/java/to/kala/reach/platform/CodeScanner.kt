@@ -48,6 +48,9 @@ sealed class ScanOutcome {
 
     /** The camera is not allowed to this application. */
     object CameraDenied : ScanOutcome()
+
+    /** The camera could not be started, or failed while it ran. */
+    object Failed : ScanOutcome()
 }
 
 /**
@@ -77,6 +80,7 @@ class CodeScanner(
     private var finished = false
     private var found = false
     private var lastRead = 0L
+    private var packed = ByteArray(0)
 
     private val pausing = LifecycleEventObserver { _, event ->
         if (event == Lifecycle.Event.ON_PAUSE) finish(ScanOutcome.Cancelled)
@@ -97,7 +101,9 @@ class CodeScanner(
                 try {
                     bind(future.get())
                 } catch (failure: Exception) {
-                    finish(ScanOutcome.CameraDenied)
+                    // The camera is allowed by now, so a camera that cannot be bound is a camera
+                    // that cannot be used, which Settings cannot put right.
+                    finish(ScanOutcome.Failed)
                 }
             },
             ContextCompat.getMainExecutor(activity),
@@ -123,7 +129,19 @@ class CodeScanner(
             .build()
         frames.setAnalyzer(analysis) { frame -> analyse(frame) }
         cameraProvider.unbindAll()
-        camera = cameraProvider.bindToLifecycle(activity, CameraSelector.DEFAULT_BACK_CAMERA, view, frames)
+        // The back camera, and a device that has only the front one reads with that.
+        val selector = if (cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
+            CameraSelector.DEFAULT_BACK_CAMERA
+        } else {
+            CameraSelector.DEFAULT_FRONT_CAMERA
+        }
+        val bound = cameraProvider.bindToLifecycle(activity, selector, view, frames)
+        camera = bound
+        // A camera another application takes, or one a policy turns off, closes with an error: the
+        // scan ends and says the camera could not be used, rather than showing a black screen.
+        bound.cameraInfo.cameraState.observe(activity) { state ->
+            if (state.error != null) finish(ScanOutcome.Failed)
+        }
     }
 
     private fun analyse(frame: ImageProxy) {
@@ -136,8 +154,9 @@ class CodeScanner(
             val height = frame.height
             val rows = plane.rowStride
             val source = plane.buffer
-            // The plane's rows may be padded; the decoder takes them packed.
-            val packed = ByteArray(width * height)
+            // The plane's rows may be padded; the decoder takes them packed, in a buffer this scan
+            // reuses from one frame to the next.
+            if (packed.size != width * height) packed = ByteArray(width * height)
             for (row in 0 until height) {
                 source.position(row * rows)
                 source.get(packed, row * width, width)
@@ -163,6 +182,7 @@ class CodeScanner(
         if (finished) return
         finished = true
         activity.lifecycle.removeObserver(pausing)
+        camera?.cameraInfo?.cameraState?.removeObservers(activity)
         camera?.cameraControl?.enableTorch(false)
         provider?.unbindAll()
         analysis.shutdown()
@@ -190,21 +210,28 @@ class CodeScanner(
             hint,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL),
         )
-        // The hint sits above the square, which is centred and 70% of the shorter side.
-        root.viewTreeObserver.addOnGlobalLayoutListener {
-            val side = minOf(root.width, root.height) * OUTLINE_SHARE
-            hint.translationY = (root.height - side) / 2f - hint.height - px(24)
-        }
-
         val cancel = button("Cancel").apply { setOnClickListener { finish(ScanOutcome.Cancelled) } }
-        root.addView(cancel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, px(48), Gravity.TOP or Gravity.START))
+        root.addView(
+            cancel,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START),
+        )
 
         // The torch control appears once the camera is bound and says it has a torch.
         val torch = button("Torch").apply {
             visibility = View.GONE
             contentDescription = "Torch, off"
         }
-        root.addView(torch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, px(48), Gravity.TOP or Gravity.END))
+        root.addView(
+            torch,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END),
+        )
+        // The hint sits above the square, which is centred and 70% of the shorter side, and below
+        // the controls: at a large text size it runs over the preview rather than under Cancel.
+        root.viewTreeObserver.addOnGlobalLayoutListener {
+            val side = minOf(root.width, root.height) * OUTLINE_SHARE
+            val lowest = maxOf(cancel.bottom, if (torch.visibility == View.VISIBLE) torch.bottom else 0) + px(8)
+            hint.translationY = maxOf(lowest.toFloat(), (root.height - side) / 2f - hint.height - px(24))
+        }
         var torchOn = false
         torch.setOnClickListener {
             torchOn = !torchOn
