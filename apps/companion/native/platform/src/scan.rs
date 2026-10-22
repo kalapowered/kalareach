@@ -241,6 +241,41 @@ async fn ask<R: Runtime>(_app: &AppHandle<R>, _method: &str) -> Result<Scan, Pla
     Err(PlatformError::new("this device reads no QR code"))
 }
 
+/// Has `listener` called each time the application goes to the background, which is when what a
+/// phone read and has not used must be let go of.
+///
+/// This is not the application's ceasing to be active: iOS also takes the application out of the
+/// active state for the Control Center, the Notification Center and the system's own questions,
+/// none of which takes it from the front, and a person who turns on Wi-Fi in the middle of pairing
+/// has not left. The platform's half says when the application is in the background and nothing less.
+///
+/// The listener runs on the system's thread for the notification, so it starts any work of its own
+/// on another. Only iOS needs this; Android's own signal (`onPause`) reaches the window's events.
+///
+/// # Errors
+///
+/// Returns an error when the native half cannot be asked to listen.
+#[cfg(target_os = "ios")]
+pub fn on_background<R: Runtime>(
+    app: &AppHandle<R>,
+    listener: impl Fn() + Send + Sync + 'static,
+) -> Result<(), PlatformError> {
+    use tauri::Manager as _;
+
+    #[derive(serde::Serialize)]
+    struct Watch {
+        events: tauri::ipc::Channel<serde_json::Value>,
+    }
+
+    let events = tauri::ipc::Channel::<serde_json::Value>::new(move |_| {
+        listener();
+        Ok(())
+    });
+    let platform = app.state::<crate::Platform<R>>();
+    let _: serde_json::Value = platform.call_blocking("watchBackground", Watch { events })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

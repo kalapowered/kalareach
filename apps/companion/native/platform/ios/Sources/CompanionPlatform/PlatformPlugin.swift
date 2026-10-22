@@ -78,6 +78,7 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   private var waiting: Invoke?
   private let attempts = SessionAttempts()
   private let protection = ProtectedData()
+  private let background = BackgroundWatch()
 
   /// The window is made on the main thread once the application object exists, which is when
   /// what the system says about protected data can first be read.
@@ -133,6 +134,12 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   /// Has the system's news that protected data became readable sent on a channel, each time.
   @objc public func watchProtectedData(_ invoke: Invoke) throws {
     protection.watch(try invoke.parseArgs(WatchArguments.self).events)
+    invoke.resolve(["done": true])
+  }
+
+  /// Has the application's going to the background sent on a channel, each time.
+  @objc public func watchBackground(_ invoke: Invoke) throws {
+    background.watch(try invoke.parseArgs(WatchArguments.self).events)
     invoke.resolve(["done": true])
   }
 
