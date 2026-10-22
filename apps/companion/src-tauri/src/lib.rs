@@ -45,6 +45,7 @@ pub mod pairing;
 /// The checks a debug build runs for the voice call's bridge on a phone.
 #[cfg(debug_assertions)]
 pub mod probe;
+pub mod push;
 pub mod questions;
 pub mod recovery;
 pub mod remote;
@@ -157,6 +158,12 @@ pub fn run() {
             }
             #[cfg(all(debug_assertions, mobile))]
             device_probe::start(app.handle());
+            // A device run of notifications leaves its own request, which names a gateway and a
+            // token in place of the managed service's and the platform's.
+            #[cfg(all(debug_assertions, mobile))]
+            if let Some(request) = probe::notifications::take(app.handle()) {
+                probe::notifications::start(app.handle(), request);
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -545,6 +552,8 @@ fn start_with_records(app: &tauri::AppHandle) {
     hosts::resume(app);
     open_recovery(app);
     open_mailbox(app);
+    #[cfg(mobile)]
+    open_push(app);
 }
 
 fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
@@ -828,6 +837,53 @@ pub fn start_recovery<R: tauri::Runtime>(
         state.sync_service()?,
     )?;
     state.recovery_opened(Arc::new(recovery));
+    Ok(())
+}
+
+/// Opens this phone's notifications, with their record under `data`, over the pairing records.
+#[cfg(mobile)]
+fn open_push(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let Ok(data) = app.path().app_data_dir() else {
+        return;
+    };
+    if let Err(error) = start_push(app, &data) {
+        tracing::warn!(%error, "this phone's notifications could not be opened");
+    }
+}
+
+/// Opens this phone's notifications over the record kept under `data`: the platform plugin is the
+/// native half, the paired connection is the way to a host, and the page is told on
+/// [`push::PUSH_EVENT`] whenever where they stand changes.
+///
+/// # Errors
+///
+/// Returns a local failure when the pairing records are not open.
+pub fn start_push<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    data: &std::path::Path,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use tauri::{Emitter as _, Manager as _};
+
+    let state = app.state::<AppState>();
+    let device = state.device()?;
+    let emitter = app.clone();
+    let desk = push::PushDesk::open(
+        data,
+        Arc::clone(&device),
+        Arc::new(push::PluginNative(app.clone())),
+        Arc::new(push::ConnectionRegistrar(device)),
+        push::Wiring::product(),
+        move || {
+            if let Some(desk) = emitter.state::<AppState>().push() {
+                let _ = emitter.emit(push::PUSH_EVENT, desk.view());
+            }
+        },
+    )?;
+    state.push_opened(desk);
     Ok(())
 }
 

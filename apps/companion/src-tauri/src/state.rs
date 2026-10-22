@@ -46,6 +46,7 @@ pub struct AppState {
     intake: OnceLock<Arc<dyn IntakePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
     recovery: OnceLock<Arc<Recovery>>,
+    push: OnceLock<Arc<crate::push::PushDesk>>,
     mailbox: OnceLock<Arc<crate::mailbox::MailboxDesk>>,
     settings: OnceLock<Arc<crate::settings::Settings>>,
     drafts: Arc<crate::drafts::DraftDesk>,
@@ -88,6 +89,7 @@ impl AppState {
             intake: OnceLock::new(),
             sync_service: OnceLock::new(),
             recovery: OnceLock::new(),
+            push: OnceLock::new(),
             mailbox: OnceLock::new(),
             settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
@@ -557,6 +559,17 @@ impl AppState {
     /// Records this computer's reader of its own mailbox, once it has been opened.
     pub fn mailbox_opened(&self, desk: Arc<crate::mailbox::MailboxDesk>) {
         let _ = self.mailbox.set(desk);
+    }
+
+    /// Records this phone's notifications, once they have been opened.
+    pub fn push_opened(&self, desk: Arc<crate::push::PushDesk>) {
+        let _ = self.push.set(desk);
+    }
+
+    /// This phone's notifications, when it has any: a computer has none.
+    #[must_use]
+    pub fn push(&self) -> Option<Arc<crate::push::PushDesk>> {
+        self.push.get().cloned()
     }
 
     /// Records this computer's recovery seed and bundle, once they have been opened.
