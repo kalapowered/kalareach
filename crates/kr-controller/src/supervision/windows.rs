@@ -2187,11 +2187,170 @@ pub mod testing {
         pub fn supervisor(&self, environment: &EnvironmentPaths) -> TaskSupervisor {
             TaskSupervisor::for_definition(environment.clone(), self.definition.clone())
         }
+
+        /// The supervisor a daemon a test hosts starts through: the one the shipping daemon
+        /// chooses where a user is signed in, and the same type over this task where nobody is.
+        ///
+        /// A host nobody is signed in to has no session for the setup step's task to run in, so
+        /// its task logs on without one, and the shipping daemon's choice would refuse it.
+        #[must_use]
+        pub fn product_supervisor(
+            &self,
+            environment: &EnvironmentPaths,
+        ) -> Box<dyn crate::supervision::WorkerSupervisor> {
+            if self.definition.logon == LogonType::InteractiveToken {
+                crate::supervision::detect()
+            } else {
+                Box::new(self.supervisor(environment))
+            }
+        }
     }
 
-    impl Drop for TestTask {
+    /// The supervisor a daemon a test hosts starts through, for an environment whose task
+    /// registered `starter`, by the rule of [`TestTask::product_supervisor`].
+    ///
+    /// For a process that hosts a daemon on behalf of a test and does not own the task, which is
+    /// the test's.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong when the account or the session could not be read.
+    pub fn supervisor_for(
+        environment: &EnvironmentPaths,
+        starter: &Path,
+    ) -> Result<Box<dyn crate::supervision::WorkerSupervisor>, String> {
+        let expected = definition(environment, starter)?;
+        Ok(if expected.logon == LogonType::InteractiveToken {
+            crate::supervision::detect()
+        } else {
+            Box::new(TaskSupervisor::for_definition(
+                environment.clone(),
+                expected,
+            ))
+        })
+    }
+
+    /// A process of this user that runs in a login session other than this process's, started by
+    /// the Task Scheduler and ended when this is dropped.
+    ///
+    /// Where this process is in a session where the user is signed in, the process runs in session
+    /// 0 through a task that logs on without a session; where it is in session 0, it runs in the
+    /// session where the user is signed in. Either way a recorded worker whose process is this one
+    /// is a worker in another login session than the daemon's.
+    #[derive(Debug)]
+    pub struct ProcessInAnotherSession {
+        /// The process, by its start identity.
+        pub identity: kr_protocol::identity::ProcessStartIdentity,
+        /// The login session it runs in.
+        pub session: u32,
+        /// Last: the task goes once the process has been ended.
+        _task: OneShotTask,
+    }
+
+    /// A task this module registered for a test, removed when it is dropped.
+    #[derive(Debug)]
+    struct OneShotTask(TaskDefinition);
+
+    impl Drop for OneShotTask {
         fn drop(&mut self) {
-            let _ = remove(&self.definition);
+            let _ = remove(&self.0);
+        }
+    }
+
+    impl ProcessInAnotherSession {
+        /// Starts it, writing the number it finds under `directory`.
+        ///
+        /// # Errors
+        ///
+        /// Returns what went wrong when the task could not be registered or run, or the process
+        /// did not come.
+        pub fn start(directory: &Path) -> Result<Self, String> {
+            let here = kr_ipc::starter::current_session().map_err(|error| error.to_string())?;
+            let logon = if here == 0 {
+                LogonType::InteractiveToken
+            } else {
+                LogonType::S4U
+            };
+            let user = kr_ipc::starter::current_user_sid().map_err(|error| error.to_string())?;
+            let named = kr_ipc::new_uuid().to_string();
+            let written = directory.join("process-in-another-session");
+            let powershell = PathBuf::from(
+                std::env::var_os("SystemRoot").ok_or("the system directory is not named")?,
+            )
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+            let definition = TaskDefinition {
+                name: format!("KalaReach-{}", &named[..8]),
+                user,
+                environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                logon,
+                starter: powershell,
+                arguments: format!(
+                    "-NoProfile -NonInteractive -Command \"[Environment]::ProcessId | \
+                     Set-Content -LiteralPath '{}'; Start-Sleep -Seconds 600\"",
+                    written.display()
+                ),
+                working_directory: directory.to_path_buf(),
+            };
+            register(&definition).map_err(|error| error.to_string())?;
+            let task = OneShotTask(definition);
+            super::run(&task.0).map_err(|failure| failure.detail())?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&written)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "the task {} did not start its process within two minutes",
+                        task.0.name
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            let identity =
+                kr_ipc::identity::process_start_identity(pid).map_err(|error| error.to_string())?;
+            let mut started = Self {
+                identity,
+                session: here,
+                _task: task,
+            };
+            // Dropped, which ends the process, when it is not what was asked for.
+            let session = kr_ipc::starter::process_facts(pid)
+                .map_err(|error| error.to_string())?
+                .session;
+            if session == here {
+                return Err(format!(
+                    "the process runs in this process's session, {here}"
+                ));
+            }
+            started.session = session;
+            Ok(started)
+        }
+
+        /// Ends the process, once, if it is still the one that started.
+        pub fn end(&self) {
+            if kr_ipc::identity::process_state(&self.identity)
+                == kr_ipc::identity::ProcessState::Running
+            {
+                let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_default())
+                    .join("System32")
+                    .join("taskkill.exe");
+                let _ = std::process::Command::new(system)
+                    .args(["/PID", &self.identity.pid.get().to_string(), "/F"])
+                    .output();
+            }
+        }
+    }
+
+    impl Drop for ProcessInAnotherSession {
+        fn drop(&mut self) {
+            self.end();
         }
     }
 

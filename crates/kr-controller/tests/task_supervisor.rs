@@ -17,7 +17,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_controller::supervision::windows::testing::{TestTask, built_binary, definition};
+use kr_controller::supervision::windows::testing::{
+    ProcessInAnotherSession, TestTask, built_binary, definition,
+};
 use kr_controller::supervision::windows::{TaskSupervisor, run};
 use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerSupervisor};
 use kr_ipc::starter::{Reached, StartClaim, connect, current_session, in_any_job};
@@ -256,4 +258,211 @@ fn a_starter_with_only_a_lapsed_claim_takes_it_and_starts_nothing() {
         .expect("a runtime")
         .block_on(kr_ipc::endpoint::Connection::connect(&endpoint));
     assert!(reached.is_err(), "no daemon was started for a lapsed claim");
+}
+
+/// What a daemon that starts again on an environment is given, with a supervisor that starts
+/// nothing: the guard under test decides before anything is started.
+#[derive(Debug)]
+struct NoWorkers;
+
+impl WorkerSupervisor for NoWorkers {
+    fn start(&self, _launch: &kr_controller::supervision::WorkerLaunch) -> LaunchOutcome {
+        LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that starts nothing"
+    }
+}
+
+/// Starts a daemon on `host`'s environment, and gives back why it did not start.
+async fn start_daemon(host: &TempHost) -> Result<(), String> {
+    use kr_controller::service::{Controller, ControllerSetup};
+    use kr_crypto::store::{StoreSelection, open_store_in};
+    use kr_ipc::verify::ControllerIdentity;
+
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let secrets = environment.secrets_dir();
+    let worker = host.root().join("kr-worker.exe");
+    std::fs::write(&worker, b"").expect("a stand-in for the worker program");
+    let started = Controller::start(ControllerSetup {
+        paths: environment,
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(NoWorkers),
+        worker_program: worker,
+        build_id: kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier"),
+        release: "0".to_owned(),
+        shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
+    })
+    .await;
+    match started {
+        Ok(controller) => {
+            drop(controller);
+            Ok(())
+        }
+        Err(refused) => Err(refused.to_string()),
+    }
+}
+
+/// What a daemon that ran before this one left in the environment's registry.
+#[derive(Clone, Copy, Debug)]
+enum Left {
+    /// A worker of a live session.
+    Worker,
+    /// A launch handed to the platform, with the process it reported, and no claim.
+    Spawned,
+    /// A launch handed to the platform whose process was never reported.
+    SpawnedWithNoProcess,
+    /// A launch whose worker claimed its reservation, and has not reported a shell.
+    Claimed,
+    /// A launch that was fenced, which may still be running.
+    Fenced,
+}
+
+/// Writes into the environment's registry what an earlier daemon would have left, with `process` as
+/// the process it started (where there is one).
+fn leave(host: &TempHost, left: Left, process: &kr_protocol::identity::ProcessStartIdentity) {
+    use kr_controller::registry::{LaunchPhase, Registry, WorkerRecord};
+    use kr_protocol::scalars::{AuthorisationKey, Digest256, TimestampMs};
+
+    let mut registry = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("opens the registry");
+    let reservation = registry
+        .reserve(
+            &kr_protocol::ids::ActorId::new("local:501").expect("a principal"),
+            kr_ipc::new_uuid(),
+            Digest256::from_bytes([1; 32]),
+            &[0xa0],
+            TimestampMs::new(1),
+        )
+        .expect("reserves")
+        .reservation;
+    let id = reservation.reservation_id;
+    match left {
+        Left::Worker => registry
+            .adopt_worker(
+                &WorkerRecord {
+                    session_id: reservation.session_id,
+                    display_number: reservation.display_number,
+                    public_key: AuthorisationKey::from_bytes([9; 32]),
+                    process_identity: process.clone(),
+                    endpoint: "kr-no-such-endpoint".to_owned(),
+                    profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                    state: kr_protocol::session::SessionState::Live,
+                    acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+                },
+                None,
+            )
+            .expect("records the worker"),
+        Left::SpawnedWithNoProcess => registry
+            .set_phase(id, LaunchPhase::Spawned)
+            .expect("spawned"),
+        Left::Spawned | Left::Claimed | Left::Fenced => {
+            registry
+                .set_phase(id, LaunchPhase::Spawned)
+                .expect("spawned");
+            registry
+                .record_launch(id, process)
+                .expect("the launcher's process");
+            if !matches!(left, Left::Spawned) {
+                registry
+                    .claim_rendezvous(id, AuthorisationKey::from_bytes([9; 32]))
+                    .expect("claims");
+            }
+            if matches!(left, Left::Fenced) {
+                registry.set_phase(id, LaunchPhase::Fenced).expect("fences");
+            }
+        }
+    }
+}
+
+/// KR-REQ-07.58: an environment's work stays in one login session. A daemon that starts in a
+/// session other than the one where what an earlier daemon left is still running takes none of it
+/// over: signing out ends a session's processes, so what keeps running there would be left behind
+/// by the wrong sign-out. It refuses, naming the session, for a worker, for a launch that was
+/// handed over or claimed and for one that was fenced, and it starts for what has ended, for what
+/// runs in its own session and for a launch that reported no process, which no claim can follow.
+/// No record of the session is needed: what is running says where.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
+    let scratch = TempHost::create();
+    let elsewhere = ProcessInAnotherSession::start(scratch.root())
+        .expect("a process of this user in another login session");
+    for left in [Left::Worker, Left::Spawned, Left::Claimed, Left::Fenced] {
+        let host = TempHost::create();
+        leave(&host, left, &elsewhere.identity);
+        let refused = start_daemon(&host).await.expect_err(&format!(
+            "a daemon took over {left:?} work in another session"
+        ));
+        assert!(
+            refused.contains("login session") && refused.contains(&elsewhere.session.to_string()),
+            "the refusal names the session the work is in: {refused}"
+        );
+    }
+
+    // What runs in this daemon's own session is its to take over.
+    let here = std::process::Command::new(system("PING.EXE"))
+        .args(["-n", "600", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("a process in this session");
+    let mut here = EndedOnDrop(here);
+    let identity = kr_ipc::identity::process_start_identity(here.0.id()).expect("its identity");
+    let host = TempHost::create();
+    leave(&host, Left::Worker, &identity);
+    start_daemon(&host)
+        .await
+        .expect("a worker in this daemon's own session is taken over");
+
+    // A launch that reported no process cannot be followed by a claim, so it is not work.
+    let host = TempHost::create();
+    leave(&host, Left::SpawnedWithNoProcess, &identity);
+    start_daemon(&host)
+        .await
+        .expect("a launch with no process is not work in another session");
+
+    // What has ended is not work: after a sign-out nothing of it runs.
+    let host = TempHost::create();
+    leave(&host, Left::Worker, &elsewhere.identity);
+    elsewhere.end();
+    until_ended(&elsewhere.identity);
+    start_daemon(&host)
+        .await
+        .expect("a worker that has ended in another session is not work");
+    let _ = here.0.kill();
+}
+
+/// Ends the process it holds when it is dropped.
+struct EndedOnDrop(std::process::Child);
+
+impl Drop for EndedOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Waits until the kernel says the recorded process is gone.
+fn until_ended(identity: &kr_protocol::identity::ProcessStartIdentity) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while kr_ipc::identity::process_state(identity) == kr_ipc::identity::ProcessState::Running {
+        assert!(Instant::now() < deadline, "the process did not end");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
