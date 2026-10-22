@@ -1590,11 +1590,20 @@ pub mod configuration {
     /// document belongs is refused rather than followed and a named pipe with the right name
     /// cannot hold this host's startup open.
     ///
+    /// `owner` asks the platform whether the opened file is this user's and reachable by no one
+    /// else: the owner and mode on Unix, the owner and access-control list on Windows. It lives
+    /// with the operating-system code, which this crate has none of, and it runs on the handle this
+    /// function opened, after a link has been refused and before anything is read.
+    ///
     /// # Errors
     ///
     /// Returns the reason when the file exists but is not one this host wrote, or is larger than
     /// `limit`.
-    pub fn read_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>, Sentence> {
+    pub fn read_file(
+        path: &std::path::Path,
+        limit: u64,
+        owner: impl FnOnce(&std::fs::File) -> Result<(), FileRefusal>,
+    ) -> Result<Option<Vec<u8>>, Sentence> {
         use std::io::Read as _;
 
         #[cfg(unix)]
@@ -1650,53 +1659,34 @@ pub mod configuration {
                     .withheld(super::export::ContentClass::Message, &error.to_string()));
             }
         };
-        #[cfg(unix)]
+        #[cfg(windows)]
         {
-            use std::os::unix::fs::MetadataExt as _;
+            use std::os::windows::fs::MetadataExt as _;
+
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
             let metadata = file.metadata().map_err(|error| {
                 Sentence::new().withheld(super::export::ContentClass::Message, &error.to_string())
             })?;
-            if metadata.uid() != rustix::process::getuid().as_raw() {
-                return Err(Sentence::new().stated("configuration file is not owned by this user"));
-            }
-            if metadata.mode() & 0o077 != 0 {
-                return Err(Sentence::new()
-                    .stated("configuration file has permissions wider than owner-only"));
-            }
-            if !metadata.is_file() {
-                return Err(Sentence::new().stated("configuration file must be a regular file"));
-            }
-            if metadata.len() > limit {
-                return Err(Sentence::new()
-                    .stated("this file is larger than the ")
-                    .number(limit)
-                    .stated(" byte bound"));
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(
+                    Sentence::new().stated("configuration file must not be a link or a junction")
+                );
             }
         }
-        #[cfg(not(unix))]
-        {
-            let metadata = file.metadata().map_err(|error| {
-                Sentence::new().withheld(super::export::ContentClass::Message, &error.to_string())
-            })?;
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt as _;
-
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(Sentence::new()
-                        .stated("configuration file must not be a link or a junction"));
-                }
-            }
-            if !metadata.is_file() {
-                return Err(Sentence::new().stated("configuration file must be a regular file"));
-            }
-            if metadata.len() > limit {
-                return Err(Sentence::new()
-                    .stated("this file is larger than the ")
-                    .number(limit)
-                    .stated(" byte bound"));
-            }
+        // Whose file it is and who else can reach it, asked of the handle that was opened and not of
+        // the name, and before any of it is read.
+        owner(&file).map_err(FileRefusal::into_sentence)?;
+        let metadata = file.metadata().map_err(|error| {
+            Sentence::new().withheld(super::export::ContentClass::Message, &error.to_string())
+        })?;
+        if !metadata.is_file() {
+            return Err(Sentence::new().stated("configuration file must be a regular file"));
+        }
+        if metadata.len() > limit {
+            return Err(Sentence::new()
+                .stated("this file is larger than the ")
+                .number(limit)
+                .stated(" byte bound"));
         }
         let mut bytes = Vec::new();
         (&file)
@@ -1712,6 +1702,43 @@ pub mod configuration {
                 .stated(" byte bound"));
         }
         Ok(Some(bytes))
+    }
+
+    /// Why an opened configuration file is not one this host reads: the platform's answer to whose
+    /// file it is and who else can reach it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum FileRefusal {
+        /// Another user owns it.
+        NotOwned,
+        /// Its mode lets another user reach it.
+        WiderThanOwnerOnly,
+        /// Its access-control list names an account this host does not trust, or its owner is
+        /// another account. The text names accounts.
+        AccessList(String),
+        /// The platform could not say who owns the file or what its list grants.
+        Unreadable(String),
+    }
+
+    impl FileRefusal {
+        /// The sentence a person reads. What the platform said about accounts and errors is
+        /// withheld from an export by its class.
+        fn into_sentence(self) -> Sentence {
+            use super::export::ContentClass;
+
+            match self {
+                Self::NotOwned => {
+                    Sentence::new().stated("configuration file is not owned by this user")
+                }
+                Self::WiderThanOwnerOnly => Sentence::new()
+                    .stated("configuration file has permissions wider than owner-only"),
+                Self::AccessList(detail) => Sentence::new()
+                    .stated("configuration file is refused by its access-control list: ")
+                    .withheld(ContentClass::Name, &detail),
+                Self::Unreadable(detail) => Sentence::new()
+                    .stated("configuration file's owner and access cannot be read: ")
+                    .withheld(ContentClass::Message, &detail),
+            }
+        }
     }
 
     /// The version this build writes.

@@ -2384,6 +2384,74 @@ pub fn current_uid() -> u32 {
     0
 }
 
+/// Asks the platform whether an opened configuration file is this user's and reachable by no one
+/// else, which is what makes it this host's configuration and not a file somebody left there.
+///
+/// It is asked of the handle the file was read through. On Unix that is the owner and the mode:
+/// the file belongs to this user and grants nothing to the group or to others. On Windows there are
+/// no mode bits, so it is the file's own access-control list, read from the handle: the file
+/// belongs to an account this process could have created it as, and the list grants no account
+/// that the machine does not already trust. The list need not be protected, as a descriptor's need
+/// not: a file inherits the owner entry of the directory it was made in, and demanding protection
+/// would refuse a file that is owner-only exactly because it inherited that entry.
+///
+/// # Errors
+///
+/// Returns why the file is not one to read.
+#[cfg(unix)]
+pub fn check_configuration_file(
+    file: &std::fs::File,
+) -> std::result::Result<(), kr_protocol::hostinfo::configuration::FileRefusal> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use kr_protocol::hostinfo::configuration::FileRefusal;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileRefusal::Unreadable(error.to_string()))?;
+    if metadata.uid() != current_uid() {
+        return Err(FileRefusal::NotOwned);
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(FileRefusal::WiderThanOwnerOnly);
+    }
+    Ok(())
+}
+
+/// Asks the platform whether an opened configuration file is this user's and reachable by no one
+/// else; see the Unix form.
+///
+/// # Errors
+///
+/// Returns why the file is not one to read.
+#[cfg(windows)]
+pub fn check_configuration_file(
+    file: &std::fs::File,
+) -> std::result::Result<(), kr_protocol::hostinfo::configuration::FileRefusal> {
+    use std::os::windows::io::AsHandle as _;
+
+    use kr_protocol::hostinfo::configuration::FileRefusal;
+
+    match check_access_list(file.as_handle(), "the configuration file", false) {
+        Ok(()) => Ok(()),
+        Err(AccessListRefusal::Policy(detail)) => Err(FileRefusal::AccessList(detail)),
+        Err(AccessListRefusal::Unreadable(detail)) => Err(FileRefusal::Unreadable(detail)),
+    }
+}
+
+/// Asks the platform whether an opened configuration file is this user's; a platform with neither
+/// modes nor access lists has nothing to ask.
+///
+/// # Errors
+///
+/// Never.
+#[cfg(not(any(unix, windows)))]
+pub fn check_configuration_file(
+    _file: &std::fs::File,
+) -> std::result::Result<(), kr_protocol::hostinfo::configuration::FileRefusal> {
+    Ok(())
+}
+
 /// What the system records of the user this process runs as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasswdEntry {
@@ -4496,6 +4564,34 @@ mod tests {
             failed.is_err_and(|error| error.kind() == std::io::ErrorKind::Other),
             "a failure that is not a refusal is the answer"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// On Windows the question is asked of the file's access-control list: a configuration file
+    /// that the Everyone group may write is refused with the list's reason, and a file only its
+    /// owner may reach is read. `WD` is the Everyone group and `OW` the owner.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_file_another_account_may_write_is_refused_on_windows() {
+        use kr_protocol::hostinfo::configuration::FileRefusal;
+
+        let root = temporary_root("configuration-list");
+        let wide = root.join("wide.json");
+        create_file_with_descriptor(&wide, "D:P(A;;GA;;;OW)(A;;GA;;;WD)")
+            .expect("a file everyone may write");
+        let file = std::fs::File::open(&wide).expect("opened");
+        assert!(
+            matches!(
+                check_configuration_file(&file),
+                Err(FileRefusal::AccessList(ref detail)) if detail.contains("grants access to")
+            ),
+            "{:?}",
+            check_configuration_file(&file)
+        );
+        let narrow = root.join("narrow.json");
+        create_file_with_descriptor(&narrow, "D:P(A;;GA;;;OW)").expect("an owner-only file");
+        let file = std::fs::File::open(&narrow).expect("opened");
+        assert_eq!(check_configuration_file(&file), Ok(()), "the control");
         std::fs::remove_dir_all(&root).ok();
     }
 }
