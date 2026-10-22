@@ -1272,6 +1272,16 @@ async fn an_export_that_is_not_what_it_claims_is_refused_by_name() {
         Err(RestoreError::Member(_))
     ));
 
+    // An object the service serves other than the signed manifest names is not copied into a file.
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a plan");
+    source.corrupt(prepared.plan().members[0].object_id);
+    assert!(matches!(
+        prepared.export().await,
+        Err(RestoreError::Member(_))
+    ));
+
     // An archive too large to be one file is said so, and nothing is read.
     let large = world.seal_declared(
         4,
