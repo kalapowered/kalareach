@@ -100,14 +100,20 @@ export function NewSession({
   // What the person chose in this opening of the sheet; none until they choose, so the host's own
   // answer decides what the sheet starts on.
   const [chosen, setChosen] = useState<ShellMode | null>(null)
-  const [wasOpen, setWasOpen] = useState(open)
-  if (open !== wasOpen) {
-    // A sheet that opens again starts on the host's answer, not on the last opening's choice.
-    setWasOpen(open)
-    if (open) setChosen(null)
-  }
   const [host, setHost] = useState<HostInfoResult | null>(null)
   const [unread, setUnread] = useState<string | null>(null)
+  const [wasOpen, setWasOpen] = useState(open)
+  if (open !== wasOpen) {
+    // A sheet that opens again starts on this opening's own answer from the host: not on the last
+    // opening's choice, and not on what the host said then, which a host that cannot be read now
+    // would otherwise leave standing as if it were current.
+    setWasOpen(open)
+    if (open) {
+      setChosen(null)
+      setHost(null)
+      setUnread(null)
+    }
+  }
   const [creating, setCreating] = useState(false)
   const [refusal, setRefusal] = useState<Refusal | null>(null)
   const field = useId()
