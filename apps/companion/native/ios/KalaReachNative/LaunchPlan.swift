@@ -2,12 +2,14 @@
 //  What the application does about push when it starts.
 //
 //  The decision is made from facts and nothing else, so the rules can be held by tests rather than
-//  by whoever last read the launch code. Three of them matter. A build with no Firebase
+//  by whoever last read the launch code. Four of them matter. A build with no Firebase
 //  configuration, or one Firebase would end the application over, does not start Firebase, because
 //  starting it with nothing to start from stops the process. A launch never asks the person for a permission: the product asks in its own context,
 //  where the person can see why, and registering for remote notifications needs no permission at
-//  all. And the two modes that look at or clean out the device's keychain run before anything else
-//  has had a chance to write to it.
+//  all. The two modes that look at or clean out the device's keychain run before anything else
+//  has had a chance to write to it. And whatever Firebase does, the application's delegate is given
+//  the methods a push reaches it by and the notification centre a delegate that hears a tap, because
+//  a registration challenge and a tap on a notification do not depend on Firebase being started.
 //
 
 import Foundation
@@ -22,8 +24,11 @@ enum LaunchAction: Equatable {
     case skipFirebase(String)
     /// Reads the configuration and starts Firebase.
     case configureFirebase
-    /// Gives the application's delegate the two methods the system calls with an APNs token.
-    case addTokenMethods
+    /// Gives the application's delegate the three methods the system calls about push: with an APNs
+    /// token, with its refusal, and when a push woke the application.
+    case addDelegateMethods
+    /// Makes the notification centre's delegate the one that hears a tap on a notification.
+    case hearNotificationTaps
     /// Asks the system for an APNs token, which shows the person nothing.
     case registerForRemoteNotifications
     /// Lets Firebase generate a registration token on its own, or not, as the permission stands.
@@ -49,12 +54,13 @@ enum LaunchPlan {
         case .usable:
             plan = [
                 .configureFirebase,
-                .addTokenMethods,
+                .addDelegateMethods,
+                .hearNotificationTaps,
                 .registerForRemoteNotifications,
                 .setAutoInit(permission == .granted),
             ]
         case .unusable(let reason):
-            plan = [.skipFirebase(reason)]
+            plan = [.skipFirebase(reason), .addDelegateMethods, .hearNotificationTaps]
         }
         if let mode = debugMode {
             plan.append(.runDebugMode(mode))
