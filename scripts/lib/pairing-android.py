@@ -262,9 +262,71 @@ def any_card(each: str) -> bool:
     return each.startswith("Invitation from a host")
 
 
+def overlap(one: list[int], other: list[int]) -> bool:
+    """Whether two boxes (left, top, right, bottom) share any area."""
+    return one[0] < other[2] and other[0] < one[2] and one[1] < other[3] and other[1] < one[3]
+
+
+def scanner_fits_the_largest_text(phone: Phone, port: str) -> None:
+    """At the largest text size the scanner's hint and controls lie inside the screen, and the hint
+    does not run under Cancel.
+
+    The scanner's window is secure, so a screenshot shows none of it, but `uiautomator` still names
+    what the window holds and where. The application is started again with the larger text, and with
+    the normal size again afterwards, because a change of size while the application is open
+    recreates it.
+    """
+    hint_words = "Point the camera at the code on your host"
+
+    def start() -> None:
+        phone.run("shell", "am", "force-stop", APP)
+        phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+        phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
+        phone.press("Hosts")
+        phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
+
+    phone.run("shell", "settings", "put", "system", "font_scale", "2.0")
+    try:
+        start()
+        look(port, AWAY)
+        phone.press("Scan code")
+        end = time.monotonic() + 60
+        while time.monotonic() < end:
+            nodes = phone.screen()
+            asking = [node for node in nodes if node["label"] in ("While using the app", "Only this time", "Allow")]
+            if asking:
+                phone.tap(asking[0])
+                continue
+            if any(node["label"] == hint_words for node in nodes):
+                break
+            time.sleep(0.3)
+        else:
+            phone.give_up("the scanner did not open at the largest text size")
+        width = max(node["box"][2] for node in nodes)
+        height = max(node["box"][3] for node in nodes)
+        found = {node["label"]: node["box"] for node in nodes if node["label"] in (hint_words, "Cancel")}
+        for name, box in found.items():
+            if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
+                phone.give_up(f"{name} runs past the screen at the largest text size")
+        if overlap(found["Cancel"], found[hint_words]):
+            phone.give_up("the hint runs under Cancel at the largest text size")
+        phone.press("Cancel")
+        phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the scanner closed")
+    finally:
+        phone.run("shell", "settings", "put", "system", "font_scale", "1.0")
+    say("the scanner fits the largest text size")
+
+
 def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
     phone = Phone(adb, serial, shots)
     shots.mkdir(parents=True, exist_ok=True)
+    phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+    phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
+    phone.press("Hosts")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
+    scanner_fits_the_largest_text(phone, port)
+    # The application was started again with the normal size, so the screen is looked for again.
+    phone.run("shell", "am", "force-stop", APP)
     phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
     phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
     phone.press("Hosts")

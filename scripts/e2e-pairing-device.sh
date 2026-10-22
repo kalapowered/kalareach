@@ -60,6 +60,10 @@ feeder_pid=""
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
+# Whether the phone's logs were searched for an invitation's text and secret, and whether any held one.
+logs_searched=0
+logs_found=0
+
 # What the iOS run makes or changes outside this script's own directories: a simulator of its own,
 # whose photo library takes the pictures, and two files of the build that are put back as they were.
 simulator_made=""
@@ -172,12 +176,32 @@ if [ "$platform" = android ]; then
     platform_checks=(
         "the scanner is kept out of screenshots"
         "the scanner closes on Cancel"
+        "the scanner fits the largest text size"
     )
 fi
 
 # What the host wrote in one of its files, on one line, or nothing when it wrote none.
 host_file() { # <name>
     [ -f "$harness/$1" ] && tr -d '\n' <"$harness/$1"
+}
+
+# Searches one of the phone's logs for every form of an invitation's text and secret that the host
+# recorded: the log is read whole, and a match in it fails the run.
+search_log() { # <command that prints the log...>
+    cat "$harness"/secrets-*.txt >"$harness/secrets.all" 2>/dev/null
+    [ -s "$harness/secrets.all" ] || return 0
+    # The control: the same search finds a line that holds one, so a search that finds nothing is
+    # one that looked.
+    head -n 1 "$harness/secrets.all" >"$harness/log-control.txt"
+    if ! grep -q -i -F -f "$harness/secrets.all" "$harness/log-control.txt"; then
+        logs_found=2
+        return 0
+    fi
+    "$@" >"$harness/log-searched.txt" 2>/dev/null
+    logs_searched=$((logs_searched + 1))
+    if grep -q -i -F -f "$harness/secrets.all" "$harness/log-searched.txt"; then
+        logs_found=1
+    fi
 }
 
 # Decides the run from the lines the driver reported and the files the host wrote.
@@ -199,10 +223,23 @@ judge() { # <driver output>
         say "check=the host locked no candidate on a changed secret ok=0 detail=${result:-no record}"
         bad=1
     fi
+    result="$(host_file control-refused.txt)"
+    if [ "$result" = "refused=1" ]; then
+        say "check=the host refused the changed secret it was sent ok=1"
+    else
+        say "check=the host refused the changed secret it was sent ok=0 detail=${result:-no record}"
+        bad=1
+    fi
     if [ -s "$harness/host-value.txt" ] && [ -s "$harness/paired.txt" ]; then
         say "check=the host showed its value and approved the phone ok=1 detail=value $(host_file host-value.txt) invitation $(host_file direct-length.txt) characters"
     else
         say "check=the host showed its value and approved the phone ok=0 detail=no record"
+        bad=1
+    fi
+    if [ "$logs_searched" -ge 1 ] && [ "$logs_found" = 0 ]; then
+        say "check=no log holds an invitation's text or secret ok=1 detail=$logs_searched log read whole"
+    else
+        say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found"
         bad=1
     fi
     result="$(host_file connections.txt)"
@@ -290,6 +327,7 @@ run_ios() {
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
+    search_log xcrun simctl spawn "$udid" log show --last 40m --style compact
     judge "$out" || status=2
     [ "$status" = 0 ] || return 2
 }
@@ -383,6 +421,7 @@ run_android() {
     python3 "$here/scripts/lib/pairing-android.py" drive "$adb" "$serial" "$harness" "$shots" "$grpc_port" >"$out" 2>&1 || status=$?
     sed 's/^/    /' "$out" | tee -a "$log"
     # The crash buffer, and the main buffer without the compositor's and the screen reader's polling.
+    search_log "$adb" -s "$serial" logcat -d -b all
     "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -2000 >"$artefacts/logcat.log"
     judge "$out" || status=2
