@@ -204,14 +204,18 @@ impl Submit for kr_automation::AutomationService {
         leaves: u64,
         now_ms: u64,
     ) -> kr_automation::Result<kr_automation::Rearmed> {
+        let key = fresh_action(kr_protocol::method::Method::WorkflowRearm);
         self.rearm(
             &kr_protocol::automation::WorkflowRearmParams {
                 causal_root_id: root,
                 grant_reference: grant,
                 generation: kr_protocol::scalars::U64::new(leaves),
             },
-            &admitted,
-            None,
+            &kr_automation::Submitted {
+                key: &key,
+                admission: &admitted,
+                caller_grant: None,
+            },
             now_ms,
         )
     }

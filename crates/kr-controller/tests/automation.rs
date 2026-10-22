@@ -4550,6 +4550,125 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
     host.clients.abort();
 }
 
+/// KR-REQ-25.17, KR-REQ-19.04: a rearm whose action identifier another connection spends on a
+/// different action while the rearm is on its way into its transaction is refused, and the chain
+/// keeps the budget it ran out of.
+///
+/// The rearm has looked for an answer under its identifier and found none, and is held there. A
+/// second connection then spends the identifier on a pause and gets its answer. The rearm goes on:
+/// the identifier is looked at again in the transaction that would move the budget, and finds the
+/// pause. The control is a rearm under an identifier of its own, which gives the chain its budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rearm_whose_identifier_another_connection_spends_first_gives_the_chain_no_budget() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(4), &COMMAND_RIGHTS);
+    host.issue(grant_id(45), &[ActionRight::AutomationManage]);
+    // A workflow for the pause to act on, and a chain that ran out, in the daemon's own journal.
+    let paused = definition(
+        workflow_id(4),
+        grant_id(4),
+        "paused by the connection that spends the identifier",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    install(&mut control, &host, &paused).await;
+    let journal = host.controller.automation().journal();
+    let chain = kr_automation::create_workflow_definition(
+        workflow_id(46),
+        1,
+        "a chain that ran out",
+        grant_id(4),
+        Vec::new(),
+        Vec::new(),
+    );
+    let now = kr_ipc::now_ms().get();
+    journal
+        .save_definition(&chain, now)
+        .expect("the revision is installed");
+    let context = kr_automation::CausalContext::new_root();
+    let root = context.root_id;
+    let mut budget = journal
+        .commit_trigger_and_run(
+            kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x47; 16])),
+            &chain,
+            "evt-root",
+            &context,
+            now,
+        )
+        .expect("the root run is admitted");
+    budget.exhaust();
+    journal.save_budget(&budget).expect("the budget is saved");
+
+    let target = ActionTarget::environment(host.environment_id);
+    let spent = ActionId::new(kr_ipc::new_uuid());
+    let mut rearming_client = client(&host).await;
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let rearm = tokio::spawn({
+        let target = target.clone();
+        async move {
+            rearming_client
+                .mutate(
+                    Method::WorkflowRearm,
+                    spent,
+                    target,
+                    &rearming(root, grant_id(45), 0),
+                )
+                .await
+        }
+    });
+    arrived
+        .await
+        .expect("the rearm has looked for an answer under its identifier");
+    control
+        .mutate(
+            Method::WorkflowPause,
+            spent,
+            target.clone(),
+            &WorkflowPauseParams {
+                workflow_id: paused.workflow_id,
+                revision: paused.revision,
+                reason: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the pause is answered");
+    go.send(()).expect("the rearm is let go");
+
+    let refused = failure(
+        rearm
+            .await
+            .expect("the rearm's task ends")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::IdConflict, "{refused:?}");
+    let kept = budget_of(&mut control, root).await.expect("the budget");
+    assert!(
+        kept.exhausted && kept.generation.get() == 0,
+        "the refused rearm gave the chain no budget: {kept:?}"
+    );
+
+    let rearmed: WorkflowRearmResult = typed(
+        &control
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &rearming(root, grant_id(45), 0),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("a rearm under an identifier of its own succeeds"),
+    );
+    assert_eq!(rearmed.generation.get(), 1);
+    host.clients.abort();
+}
+
 /// KR-ACC-032 and KR-REQ-24.10 across a real restart of the daemon's process, not a reopened
 /// service. Two workflows, each a single node and neither cyclic on its own, trigger one another:
 /// a capture's success triggers a materialisation of a version, and a materialisation's success
