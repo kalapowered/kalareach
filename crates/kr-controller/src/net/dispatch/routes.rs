@@ -411,7 +411,10 @@ impl RemoteConnection {
                     .await
             }
             DeviceRead::Attention => {
-                let caller = crate::attention::Caller::device(&decided.acting.grant);
+                let caller = crate::attention::Caller::device(
+                    &decided.acting.grant,
+                    self.started_at_ms(&decided.acting),
+                );
                 let reach = self.controller.attention_reach();
                 self.controller
                     .attention()
@@ -470,11 +473,14 @@ impl RemoteConnection {
                             crate::error::ControllerError::InvalidArgument(error.to_string())
                         })?;
                     let summary = self.controller.session_summary(params.session_id).await?;
-                    let reach = crate::describe::HistoryReach::of_grant(
-                        decided.acting.grant.history.lower_bound_ms.0,
+                    let reaches_the_session = crate::describe::history_reaches_the_session(
+                        &decided.acting.grant.history,
+                        Some(self.started_at_ms(&decided.acting)),
                         Some(summary.created_at_ms),
                     );
-                    self.controller.session_describe(summary, reach).await
+                    self.controller
+                        .session_describe(summary, reaches_the_session)
+                        .await
                 };
                 match described.await {
                     // What a model wrote is answered only while the privacy state it was read
@@ -1020,7 +1026,10 @@ impl RemoteConnection {
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
                 let method = entry.method;
-                let caller = crate::attention::Caller::device(&decided.acting.grant);
+                let caller = crate::attention::Caller::device(
+                    &decided.acting.grant,
+                    self.started_at_ms(&decided.acting),
+                );
                 let carried = crate::authority::AdmittedMutation {
                     connection_id: self.connection_id(),
                     admitted_revision: validated,

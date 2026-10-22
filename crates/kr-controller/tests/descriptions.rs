@@ -2426,13 +2426,17 @@ async fn a_summary_asked_for_is_written_by_the_model_and_served_beside_the_chang
     environment.stop().await;
 }
 
-/// KR-REQ-18.02: a summary is written from every change in an interval, so it is served only to a
-/// grant whose history reaches back to the first of them, and asked for by none that does not.
-/// The owner's is written and a grant that starts at the first change is served the same
-/// summary; one that starts after it, and one with no history, are served none and ask for
-/// nothing.
+/// KR-REQ-18.02 and KR-REQ-10.49: a summary is generated text, written from every change in an
+/// interval and from the session text those changes name, so it is served to the owner and to no
+/// paired device, whatever its grant's history, and asked for by none.
+///
+/// The owner's is written. A grant that starts at the first change, one that starts after it and
+/// one with no lower bound that started after it are each served the changes their history
+/// reaches and none of the summary, although it is written and `summarise` is asked for: the
+/// moment a change was observed does not date the text it names, so a summary cannot be shown to
+/// stay inside a grant that begins after any of its sources.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_summary_is_served_to_a_grant_that_reaches_the_first_change_and_to_none_that_does_not() {
+async fn a_summary_is_served_to_the_owner_and_to_no_paired_device() {
     use kr_controller::attention::Caller;
     use kr_protocol::envelope::ParamsValue;
     use kr_protocol::method::MethodVersion;
@@ -2485,23 +2489,26 @@ async fn a_summary_is_served_to_a_grant_that_reaches_the_first_change_and_to_non
         grant
     };
 
-    // A grant that starts after the first change is served the changes and none of the summary,
-    // and so is one that retains no history; neither asks for one.
-    for grant in [voice_grant(at + 1), no_history.clone()] {
-        let served = read_as(Caller::device(&grant)).await;
-        assert_eq!(served.changes.len(), 4);
+    // A device is served the changes its history reaches and none of a summary, and asks for none.
+    // The changes are the turn and its change set of each of the two records.
+    for (grant, started, changes) in [
+        (voice_grant(at + 1), at, 2),
+        (no_history.clone(), at + 1, 2),
+        (voice_grant(at), at, 4),
+    ] {
+        let served = read_as(Caller::device(&grant, started)).await;
+        assert_eq!(served.changes.len(), changes);
         assert!(served.summary.0.is_none());
     }
     environment.until_host_has_taken_what_was_posted().await;
     assert_eq!(
         environment.figures().jobs.summary_asks,
         0,
-        "a grant that does not reach the changes starts no job"
+        "a device starts no job"
     );
 
-    // The owner's is written, and a grant that starts at the first change is served it: the same
-    // summary, with the same provenance. The grants that do not reach it are still served none.
-    let written = environment
+    // The owner's is written, and no device is served it, whatever its grant reaches.
+    environment
         .changed_until("the summary", session_id, |changed| {
             changed.summary.0.is_some()
         })
@@ -2509,10 +2516,18 @@ async fn a_summary_is_served_to_a_grant_that_reaches_the_first_change_and_to_non
         .summary
         .0
         .expect("a summary");
-    let reaching = read_as(Caller::device(&voice_grant(at))).await;
-    assert_eq!(reaching.summary.0.as_ref(), Some(&written));
-    for grant in [voice_grant(at + 1), no_history] {
-        assert!(read_as(Caller::device(&grant)).await.summary.0.is_none());
+    for (grant, started) in [
+        (voice_grant(at), at),
+        (voice_grant(at + 1), at),
+        (no_history, at + 1),
+    ] {
+        assert!(
+            read_as(Caller::device(&grant, started))
+                .await
+                .summary
+                .0
+                .is_none()
+        );
     }
     environment.stop().await;
 }

@@ -83,31 +83,40 @@ mod link;
 #[cfg(feature = "testing")]
 pub use host::Figures;
 
-/// How far back a caller's authority reaches into one session's history.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryReach {
-    /// All of it: the local owner, or a grant that reaches back to the session's start.
-    WholeSession,
-    /// Less than all of it, or no history at all.
-    Partial,
-}
+/// Whether a caller whose grant has `history`, and started at `grant_started_at_ms` when it is
+/// known, may be shown what a model wrote of the whole of a session that started at
+/// `session_started_at_ms`.
+///
+/// Decided by the one history filter, as a summary derived from the interval that is the session's
+/// start: a grant that reaches back to the start is served, and one that begins after it is not,
+/// since what the model wrote cannot be recomputed from the part of the session the grant reaches.
+/// A grant with no lower bound reaches from its own start, and from none when the start is not
+/// known. A session whose start is not known cannot be shown to lie inside the grant.
+#[must_use]
+pub fn history_reaches_the_session(
+    history: &kr_protocol::grant::HistoryScope,
+    grant_started_at_ms: Option<u64>,
+    session_started_at_ms: Option<TimestampMs>,
+) -> bool {
+    use kr_worker::history_filter::{
+        DerivedDecision, HistoryFilter, Provenance, SourceInterval, Surface, ViewerScope,
+    };
 
-impl HistoryReach {
-    /// Returns a paired device's reach under its grant.
-    ///
-    /// The whole session only when the grant's history lower bound is at or before a known session
-    /// start. A grant with no lower bound retains no history, and a session whose start is not known
-    /// cannot be shown to lie inside the grant, so neither reaches the whole session.
-    #[must_use]
-    pub fn of_grant(
-        lower_bound_ms: Option<TimestampMs>,
-        session_started_at_ms: Option<TimestampMs>,
-    ) -> Self {
-        match (lower_bound_ms, session_started_at_ms) {
-            (Some(bound), Some(started)) if bound.get() <= started.get() => Self::WholeSession,
-            _ => Self::Partial,
-        }
-    }
+    let Some(started) = session_started_at_ms else {
+        return false;
+    };
+    let history = grant_started_at_ms.map_or_else(
+        || history.clone(),
+        |grant_started| history.clone().from_start(grant_started),
+    );
+    let filter = HistoryFilter::new(ViewerScope::from_history(&history, true));
+    matches!(
+        filter.admit_derived(
+            Surface::Summary,
+            &Provenance::over(SourceInterval::new(started.get(), started.get())),
+        ),
+        DerivedDecision::Serve { .. }
+    )
 }
 
 /// What a model on this host wrote of a session.
@@ -558,7 +567,8 @@ impl DescribeModule {
     /// enabled.
     ///
     /// `facts` are the host's own metadata for the session, which the deterministic title is built
-    /// from; `reach` is how far the caller's authority reaches into the session's history; and
+    /// from; `reaches_the_session` says whether the caller's history reaches the whole session
+    /// ([`history_reaches_the_session`]), which is what lets it be shown what a model wrote; and
     /// `privacy` is the environment's published state. It is read once the store is held and held
     /// until the answer is decided, so a change of privacy mode waits for this read: the answer is
     /// decided wholly before the change is published, or after it.
@@ -571,7 +581,7 @@ impl DescribeModule {
         &self,
         session_id: SessionId,
         facts: &SessionFacts,
-        reach: HistoryReach,
+        reaches_the_session: bool,
         privacy: &PrivacyState,
     ) -> Result<Described> {
         let (shown, decided) = {
@@ -583,7 +593,7 @@ impl DescribeModule {
             self.pauses.before_decision.wait();
             let decided = reading.published();
             (
-                self.shown(&store, session_id, facts, reach, decided)?,
+                self.shown(&store, session_id, facts, reaches_the_session, decided)?,
                 decided,
             )
         };
@@ -762,7 +772,7 @@ impl DescribeModule {
         store: &DescriptionStore,
         session_id: SessionId,
         facts: &SessionFacts,
-        reach: HistoryReach,
+        reaches_the_session: bool,
         privacy: Published,
     ) -> Result<Shown> {
         if let Some(pin) = store
@@ -777,7 +787,7 @@ impl DescribeModule {
         }
         // While private nothing generated is read at all, and a caller whose history does not
         // reach the whole session is not shown a summary of it.
-        let generated = if !privacy.private && reach == HistoryReach::WholeSession {
+        let generated = if !privacy.private && reaches_the_session {
             store
                 .generated(&session_id)
                 .map_err(ControllerError::registry)?
@@ -826,23 +836,17 @@ impl DescribeModule {
         let store = self.store();
         let reading = privacy.reading();
         let published = reading.published();
-        let named = self.shown(&store, session_id, facts, HistoryReach::Partial, published)?;
+        let named = self.shown(&store, session_id, facts, false, published)?;
         let pinned = (named.source == LabelSource::Pinned).then(|| named.title.as_str().to_owned());
         let generated = if pinned.is_some() {
             None
         } else {
-            self.shown(
-                &store,
-                session_id,
-                facts,
-                HistoryReach::WholeSession,
-                published,
-            )?
-            .generated
-            .map(|record| GeneratedText {
-                title: record.title.as_str().to_owned(),
-                activity: record.activity.as_str().to_owned(),
-            })
+            self.shown(&store, session_id, facts, true, published)?
+                .generated
+                .map(|record| GeneratedText {
+                    title: record.title.as_str().to_owned(),
+                    activity: record.activity.as_str().to_owned(),
+                })
         };
         let seen = if published.private {
             None
@@ -1104,7 +1108,8 @@ impl crate::service::Controller {
     }
 
     /// Answers `session.describe` for one session, from its summary, to a caller whose history
-    /// reaches `reach` into it, under the environment's privacy state as it stands now.
+    /// reaches the whole of it when `reaches_the_session` ([`history_reaches_the_session`]), under
+    /// the environment's privacy state as it stands now.
     ///
     /// What a model wrote is released only while the privacy state it was read under holds: an
     /// answer that is held while privacy mode is enabled is written without it
@@ -1117,13 +1122,18 @@ impl crate::service::Controller {
     pub(crate) async fn session_describe(
         &self,
         summary: kr_protocol::session::SessionSummary,
-        reach: HistoryReach,
+        reaches_the_session: bool,
     ) -> Result<crate::attention::Read> {
         let descriptions = std::sync::Arc::clone(&self.descriptions);
         let privacy = self.privacy.state();
         let read_under = privacy.clone();
         let described = tokio::task::spawn_blocking(move || {
-            descriptions.describe(summary.session_id, &facts_of(&summary), reach, &privacy)
+            descriptions.describe(
+                summary.session_id,
+                &facts_of(&summary),
+                reaches_the_session,
+                &privacy,
+            )
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
@@ -1576,7 +1586,7 @@ pub(crate) mod tests {
         drop(module);
         let module = DescribeModule::open(root.path()).expect("the store opens again");
         let described = module
-            .describe(session(1), &facts(), HistoryReach::Partial, &off())
+            .describe(session(1), &facts(), false, &off())
             .expect("a read")
             .answer;
         assert_eq!(described.title, "KalaReach pairing");
@@ -1618,7 +1628,7 @@ pub(crate) mod tests {
             Recorded::NamePinned
         );
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
+            .describe(session(1), &facts(), true, &off())
             .expect("a read")
             .answer;
         assert_eq!(described.title, "Release prep");
@@ -1639,7 +1649,7 @@ pub(crate) mod tests {
         assert_eq!(cleared.source, Shown::Metadata);
         assert_eq!(cleared.title, "kalareach (main)");
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
+            .describe(session(1), &facts(), true, &off())
             .expect("a read")
             .answer;
         assert_eq!(described.source, Shown::Generated);
@@ -1659,19 +1669,14 @@ pub(crate) mod tests {
             )
             .expect("a description");
         let open = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
+            .describe(session(1), &facts(), true, &off())
             .expect("a read")
             .answer;
         assert_eq!(open.source, Shown::Generated);
         assert!(open.provenance.0.is_some());
 
         let described = module
-            .describe(
-                session(1),
-                &facts(),
-                HistoryReach::WholeSession,
-                &private(1),
-            )
+            .describe(session(1), &facts(), true, &private(1))
             .expect("a read")
             .answer;
         assert_eq!(described.source, Shown::Metadata);
@@ -1695,12 +1700,7 @@ pub(crate) mod tests {
             )
             .expect("a description under the private generation");
         let described = module
-            .describe(
-                session(1),
-                &facts(),
-                HistoryReach::WholeSession,
-                &private(1),
-            )
+            .describe(session(1), &facts(), true, &private(1))
             .expect("a read")
             .answer;
         assert_eq!(described.source, Shown::Metadata);
@@ -1717,12 +1717,7 @@ pub(crate) mod tests {
             )
             .expect("a name is pinned while private");
         let described = module
-            .describe(
-                session(1),
-                &facts(),
-                HistoryReach::WholeSession,
-                &private(1),
-            )
+            .describe(session(1), &facts(), true, &private(1))
             .expect("a read")
             .answer;
         assert_eq!(described.source, Shown::Pinned);
@@ -1734,27 +1729,40 @@ pub(crate) mod tests {
     #[test]
     fn generated_text_reaches_only_a_caller_whose_history_covers_the_whole_session() {
         let started = Some(TimestampMs::new(10_000));
-        assert_eq!(
-            HistoryReach::of_grant(Some(TimestampMs::new(9_000)), started),
-            HistoryReach::WholeSession
-        );
-        assert_eq!(
-            HistoryReach::of_grant(Some(TimestampMs::new(10_000)), started),
-            HistoryReach::WholeSession
-        );
-        assert_eq!(
-            HistoryReach::of_grant(Some(TimestampMs::new(10_001)), started),
-            HistoryReach::Partial,
+        let history = |lower_bound_ms: Option<u64>| kr_protocol::grant::HistoryScope {
+            lower_bound_ms: kr_protocol::scalars::Nullable(lower_bound_ms.map(TimestampMs::new)),
+            include_live_screen: false,
+            named_questions: kr_protocol::scalars::CanonicalSet::new(),
+            named_approvals: kr_protocol::scalars::CanonicalSet::new(),
+        };
+        assert!(history_reaches_the_session(
+            &history(Some(9_000)),
+            None,
+            started
+        ));
+        assert!(history_reaches_the_session(
+            &history(Some(10_000)),
+            None,
+            started
+        ));
+        assert!(
+            !history_reaches_the_session(&history(Some(10_001)), None, started),
             "a grant that begins after the session did sees only part of it"
         );
-        assert_eq!(
-            HistoryReach::of_grant(None, started),
-            HistoryReach::Partial,
-            "a grant with no lower bound retains no history"
+        assert!(
+            history_reaches_the_session(&history(None), Some(9_000), started),
+            "a grant with no lower bound reaches from its own start"
         );
-        assert_eq!(
-            HistoryReach::of_grant(Some(TimestampMs::new(9_000)), None),
-            HistoryReach::Partial,
+        assert!(
+            !history_reaches_the_session(&history(None), Some(10_001), started),
+            "and a grant that started after the session began sees only part of it"
+        );
+        assert!(
+            !history_reaches_the_session(&history(None), None, started),
+            "a grant with no lower bound and no start reaches no history"
+        );
+        assert!(
+            !history_reaches_the_session(&history(Some(9_000)), None, None),
             "a session whose start is not known is not shown to lie inside the grant"
         );
 
@@ -1773,20 +1781,20 @@ pub(crate) mod tests {
             })
         };
         let partial = module
-            .describe(session(1), &facts(), HistoryReach::Partial, &at(2))
+            .describe(session(1), &facts(), false, &at(2))
             .expect("a read")
             .answer;
         assert_eq!(partial.source, Shown::Metadata);
         assert!(partial.activity_text.0.is_none());
         let whole = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, &at(2))
+            .describe(session(1), &facts(), true, &at(2))
             .expect("a read")
             .answer;
         assert_eq!(whole.source, Shown::Generated);
         assert_eq!(whole.title, "Pairing check");
         assert_eq!(whole.freshness, DescriptionFreshness::Stale);
         let later = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, &at(3))
+            .describe(session(1), &facts(), true, &at(3))
             .expect("a read")
             .answer;
         assert_eq!(
@@ -1825,7 +1833,7 @@ pub(crate) mod tests {
             Err(ControllerError::InvalidArgument(_))
         ));
         let described = module
-            .describe(session(1), &facts(), HistoryReach::WholeSession, &off())
+            .describe(session(1), &facts(), true, &off())
             .expect("a read")
             .answer;
         assert_eq!(described.title, "Release prep");

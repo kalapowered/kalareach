@@ -534,6 +534,28 @@ impl HistoryFilter {
         }
     }
 
+    /// Returns the earliest moment of production this viewer reaches on one surface, when it
+    /// reaches any.
+    ///
+    /// Nothing produced before it is admitted by [`Self::admit_at`], and everything produced at or
+    /// after it is. A reader that has to hold a bound as a number, to compare it with moments it
+    /// reads elsewhere, takes it from here and not from the scope, so that the filter stays the one
+    /// place the rule is written.
+    #[must_use]
+    pub fn first_moment(&self, surface: Surface) -> Option<u64> {
+        if !self.scope.session_view {
+            return None;
+        }
+        if self.scope.unrestricted {
+            return Some(0);
+        }
+        // The visible screen is what is being shared, whenever it was printed.
+        if self.scope.include_live_screen && surface.is_the_visible_screen() {
+            return Some(0);
+        }
+        self.scope.lower_bound_ms
+    }
+
     /// Filters a run of content for one surface.
     ///
     /// The items keep their order and their identity: what comes back is what the caller put in,

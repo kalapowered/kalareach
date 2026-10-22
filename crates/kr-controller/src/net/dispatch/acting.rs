@@ -98,6 +98,20 @@ impl RemoteConnection {
         Acting::pairing(&self.device.grant)
     }
 
+    /// The moment the grant `acting` is decided under started: when the pairing was committed, or
+    /// when the invitation was redeemed. A share that cannot be read as redeemed has no start, and
+    /// its history reaches nothing.
+    pub(super) fn started_at_ms(&self, acting: &Acting) -> u64 {
+        match acting.held {
+            Held::Pairing => self.device.paired_at_ms.get(),
+            Held::Share => self
+                .share_record(acting.grant.grant_id)
+                .ok()
+                .and_then(|record| record.activated_at_ms)
+                .unwrap_or(u64::MAX),
+        }
+    }
+
     /// The grant this device acts under for `session_id`, when it names `named` or none.
     ///
     /// # Errors

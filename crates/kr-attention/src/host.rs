@@ -914,22 +914,30 @@ impl Attention {
     /// caller be served it, [`ChangedPage::texts`] names the record each such change's text is
     /// read from.
     ///
+    /// A change the host recorded before the moment the viewer's history reaches back to is not in
+    /// the view, nor is its place: the viewer has no history of it. The cursors still cover it, so
+    /// the next view starts where this one ended.
+    ///
     /// # Errors
     ///
     /// As [`Attention::engine`].
     pub fn changed(
         &self,
         actor: &ActorId,
+        viewer: &Viewer<'_>,
         session_id: SessionId,
         max_changes: u64,
         oldest_output_cursor: u64,
         content: Content,
     ) -> Result<ChangedPage> {
         self.live()?;
-        let changed =
+        let mut changed =
             self.state
                 .visits
                 .changed_since(actor, session_id, max_changes, oldest_output_cursor);
+        changed
+            .changes
+            .retain(|(change, _)| viewer.reaches(Some(change.at_ms)));
         let texts = if content == Content::Whole {
             changed
                 .changes

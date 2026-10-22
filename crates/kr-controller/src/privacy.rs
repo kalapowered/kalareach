@@ -3568,7 +3568,7 @@ mod tests {
             directory: Some("kalareach".to_owned()),
             ..kr_describe::metadata::SessionFacts::default()
         };
-        let whole = crate::describe::HistoryReach::WholeSession;
+        let whole = true;
         host.descriptions
             .rename(
                 session(2),
@@ -4352,7 +4352,7 @@ mod tests {
             directory: Some("kalareach".to_owned()),
             ..kr_describe::metadata::SessionFacts::default()
         };
-        let whole = crate::describe::HistoryReach::WholeSession;
+        let whole = true;
         let state = host.privacy.state();
         let (arrived, release) = host.descriptions.pauses.before_decision.arm();
         std::thread::scope(|scope| {
@@ -4433,7 +4433,7 @@ mod tests {
             directory: Some("kalareach".to_owned()),
             ..kr_describe::metadata::SessionFacts::default()
         };
-        let whole = crate::describe::HistoryReach::WholeSession;
+        let whole = true;
         let state = host.privacy.state();
         // The read holds the store and has not looked at the state yet.
         let (arrived, release) = host.descriptions.pauses.before_reading.arm();

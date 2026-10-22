@@ -7,7 +7,9 @@ use kr_attention::engine::Outcome;
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, Fingerprint, SourceEvent};
 use kr_attention::key::DERIVED_MARKER;
 use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
-use kr_attention::{Attention, Claimant, Content, HostReading, Liveness, Origin, Subject, Viewer};
+use kr_attention::{
+    Attention, Claimant, Content, DeviceScope, HostReading, Liveness, Origin, Subject, Viewer,
+};
 use kr_protocol::attention::{
     AttentionAcknowledgeResult, AttentionAutomationSubject, AttentionGap, AttentionItem,
     AttentionItemRevision, AttentionKey, AttentionLevel, AttentionReadParams, AttentionReadResult,
@@ -401,6 +403,7 @@ impl AsOwner for Attention {
     ) -> kr_attention::Result<Seen> {
         let page = self.changed(
             actor,
+            &Viewer::Owner,
             session(1),
             max_changes,
             oldest_output_cursor,
@@ -1417,6 +1420,7 @@ fn a_caller_the_host_cannot_narrow_is_served_the_record_without_the_session_s_te
     let changed = attention
         .changed(
             &actor("device:phone"),
+            &Viewer::Owner,
             session(1),
             100,
             0,
@@ -1437,7 +1441,14 @@ fn a_caller_the_host_cannot_narrow_is_served_the_record_without_the_session_s_te
         "and not a paraphrase of it either"
     );
     let whole_changes = attention
-        .changed(&actor("local:501"), session(1), 100, 0, Content::Whole)
+        .changed(
+            &actor("local:501"),
+            &Viewer::Owner,
+            session(1),
+            100,
+            0,
+            Content::Whole,
+        )
         .expect("the store is this owner's");
     assert_eq!(
         whole_changes.texts.len(),
@@ -1657,6 +1668,80 @@ fn a_turn_s_change_set_carries_its_own_version() {
 }
 
 // ----- Changed since the last visit --------------------------------------------------------
+
+/// KR-REQ-10.49: the changed-since-last-visit view of a viewer whose history starts after some of
+/// the changes does not hold them. The owner is shown all of them, and the cursors of the view are
+/// the same, so a viewer that acknowledges what it was shown has seen up to the same place.
+#[test]
+fn a_viewer_is_shown_the_changes_its_history_reaches_and_no_earlier_ones() {
+    let mut attention = engine();
+    for (sequence, version) in [(1_u64, 1_u64), (2, 2), (3, 3)] {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 * sequence, version),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let device = |history_from_ms: u64| {
+        Viewer::Device(DeviceScope {
+            grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([1; 16])),
+            session_view: true,
+            automation_manage: false,
+            host_manage: false,
+            admits_session: &admits_one,
+            history_from_ms,
+        })
+    };
+    let phone = actor("device:phone");
+    let all = attention
+        .changed_as(&phone, 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert_eq!(
+        all.changes.len(),
+        6,
+        "a turn and its change set, three times"
+    );
+
+    let later = attention
+        .changed(
+            &phone,
+            &device(2_000),
+            session(1),
+            100,
+            0,
+            Content::Narrowed,
+        )
+        .expect("the store is this owner's");
+    assert_eq!(later.result.changes.len(), 4);
+    assert!(
+        later
+            .result
+            .changes
+            .iter()
+            .all(|change| change.at_ms.get() >= 2_000),
+        "{:?}",
+        later.result.changes
+    );
+    assert_eq!(later.result.from_cursor.get(), all.from_cursor);
+    assert_eq!(later.result.to_cursor.get(), all.to_cursor);
+
+    let none = attention
+        .changed(
+            &phone,
+            &device(u64::MAX),
+            session(1),
+            100,
+            0,
+            Content::Narrowed,
+        )
+        .expect("the store is this owner's");
+    assert!(
+        none.result.changes.is_empty(),
+        "a history that reaches nothing"
+    );
+}
 
 #[test]
 fn changed_since_a_visit_compares_the_acknowledged_cursor_with_the_current_events() {
