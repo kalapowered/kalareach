@@ -1180,6 +1180,10 @@ export type RevocationPolicy = 'warn_only' | 'disable_at_next_admission' | 'disa
  */
 export type SleepInhibitionSetting = 'off' | 'mains_only' | 'battery_too'
 /**
+ * How the root shell is integrated.
+ */
+export type ShellMode = 'managed' | 'native_compat'
+/**
  * One way of starting this environment's control daemon.
  */
 export type ControllerStartup = 'standalone' | 'service'
@@ -12270,6 +12274,7 @@ export interface ConfigurationDocument {
    * looks like when it is enforced rather than promised.
    */
   secrets?: SecretReference[]
+  shell?: ShellSelection
   startup?: StartupSelection
   storage?: StorageSelection
   /**
@@ -12647,6 +12652,23 @@ export interface SecretReference {
    * The secure store it lives in.
    */
   store: string
+}
+/**
+ * The shell mode a session is created in when its request names none.
+ *
+ * A section of level 6: written when its `mode` member is not null, and ignored, with a
+ * count, by a release that reads level 5. A release that does not know it creates a
+ * session in the mode its own command names, so a host rolled back to one applies this
+ * choice to nothing until it is brought forward again. Read when a session is created,
+ * so a change applies to the sessions made afterwards. No profile, request or
+ * environment variable can set it here: a request names a mode itself, and no profile
+ * carries one.
+ */
+export interface ShellSelection {
+  /**
+   * The mode. Null or absent leaves the choice to the product default.
+   */
+  mode?: ShellMode | null
 }
 /**
  * How this environment's control daemon is started when a command finds none running.
@@ -17582,6 +17604,12 @@ export interface HostInfoResult {
    */
   build_id: string
   /**
+   * The shell mode this host creates a session in when the request names none, and the rung of
+   * section 26's order it came from: the per-user host configuration, or the product default.
+   * Absent from a host of an earlier release, whose commands named a mode themselves.
+   */
+  default_shell_mode?: DefaultShellMode | null
+  /**
    * How long a worker's execution context lasts.
    *
    * The profile is recorded on every worker. It decides what a logout means: a desktop-bound worker
@@ -17634,6 +17662,22 @@ export interface BootIdentity7 {
    * The opaque value. Compared for equality, never interpreted.
    */
   value: string
+}
+/**
+ * The shell mode a host creates a session in when the request names none.
+ *
+ * Read-only metadata, like the answer that carries it. The request rung is the caller's own, so
+ * the source is the host configuration or the product default.
+ */
+export interface DefaultShellMode {
+  /**
+   * How the root shell is integrated.
+   */
+  mode: 'managed' | 'native_compat'
+  /**
+   * The rung it came from.
+   */
+  source: 'request' | 'profile' | 'host_configuration' | 'default'
 }
 /**
  * What this host's sleep inhibition is doing, whether it is active or not.

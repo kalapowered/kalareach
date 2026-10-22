@@ -9442,6 +9442,10 @@
           },
           "type": "array"
         },
+        "shell": {
+          "$ref": "#/$defs/ShellSelection",
+          "description": "The shell mode a session is created in when its request names none.\n\nA section of level 6: written when its `mode` member is not null, and ignored, with a\ncount, by a release that reads level 5. A release that does not know it creates a\nsession in the mode its own command names, so a host rolled back to one applies this\nchoice to nothing until it is brought forward again. Read when a session is created,\nso a change applies to the sessions made afterwards. No profile, request or\nenvironment variable can set it here: a request names a mode itself, and no profile\ncarries one."
+        },
         "startup": {
           "$ref": "#/$defs/StartupSelection",
           "default": {
@@ -11375,6 +11379,25 @@
         "granted_at"
       ],
       "type": "object"
+    },
+    "DefaultShellMode": {
+      "description": "The shell mode a host creates a session in when the request names none.\n\nRead-only metadata, like the answer that carries it. The request rung is the caller's own, so\nthe source is the host configuration or the product default.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ShellMode",
+          "description": "The mode."
+        },
+        "source": {
+          "$ref": "#/$defs/ValueSource",
+          "description": "The rung it came from."
+        }
+      },
+      "required": [
+        "mode",
+        "source"
+      ],
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
     },
     "DeliveryDestinationConfigureParams": {
       "additionalProperties": false,
@@ -18413,6 +18436,17 @@
         "build_id": {
           "$ref": "#/$defs/BuildId",
           "description": "The controller build."
+        },
+        "default_shell_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultShellMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The shell mode this host creates a session in when the request names none, and the rung of\nsection 26's order it came from: the per-user host configuration, or the product default.\nAbsent from a host of an earlier release, whose commands named a mode themselves."
         },
         "default_worker_profile": {
           "$ref": "#/$defs/WorkerProfile",
@@ -36956,6 +36990,25 @@
           "type": "string"
         }
       ]
+    },
+    "ShellSelection": {
+      "additionalProperties": false,
+      "description": "The shell mode this host creates a session in when its request names none.\n\nSection 7 makes the managed shell the default and a stock shell an explicit choice, never an\nautomatic fallback. Section 26 orders an ordinary preference as the request, the selected\nprofile, the per-user host configuration and the product default; this is the host\nconfiguration's rung, and no profile carries a shell mode, so that rung is empty until one\ndoes.\n\nThe section arrived with level 6. A release that reads level 5 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not edit\nthe document.",
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShellMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The mode. Null or absent leaves the choice to the product default."
+        }
+      },
+      "type": "object"
     },
     "ShellStartup": {
       "description": "Whether a root shell reads the user's login startup as well as its interactive startup.\n\nSection 7 states the platform defaults: macOS runs normal login startup, including any path\nchanges it makes, and Linux does not unless a profile asks for it. That is a property of the\nsession being created rather than of the shell package, so it travels with the create request.",

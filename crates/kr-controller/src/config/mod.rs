@@ -661,6 +661,7 @@ pub fn effective(
     let ceilings = resolver.ceilings();
     let power = resolver.sleep_inhibition(None);
     let profile = resolver.worker_profile(None, platform_profile);
+    let shell_mode = resolver.shell_mode(None);
     let integrations = resolver.command_integrations();
     let additions = resolver.environment_additions();
     let runtime = resolver.runtime_directory();
@@ -672,6 +673,7 @@ pub fn effective(
     let mut values: Vec<EffectiveValue> = vec![
         effective_value(&power, &Declared::term(power.value.as_str())),
         effective_value(&profile, &Declared::term(profile.value.as_str())),
+        effective_value(&shell_mode, &Declared::term(shell_mode.value.as_str())),
         // The packages are names the owner wrote down, so an export carries their class and
         // length rather than which agents this host runs.
         effective_value(

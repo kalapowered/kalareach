@@ -238,6 +238,7 @@ variables an older build read joins nothing because of them.
 | `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.origin` | the relay lease service this host asks for a lease for each paired device, billed to the account the host is signed in as; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `automation.test_suites` | the test suites a workflow's `run_tests` node can name: for each name, the `command` a POSIX shell runs in a private copy of the version under test, and the `outputs` it writes besides the source. This is a section of level 5, so a release that reads only level 4 ignores it, and its host runs no suite | at most 64 suites; a name of letters, digits, `.`, `_` and `-` that starts with a letter or a digit, at most 256 bytes; a command of 1 to 16384 bytes with no control character, line break included (chain commands with `&&` or `;`); at most 16 output paths of at most 1024 bytes each, relative, of names with no `.` or `..` and no backslash, none repeated and none inside another; a name this host does not carry as input (a colon, one of `< > " | ? *`, a trailing dot or space, a Windows device name with or without an extension, over 255 bytes) is accepted here and refused when the suite is dispatched |
+| `shell.mode` | the shell mode a session is created in when its request names none: `managed` or `native_compat`. A section of level 6, so a release that reads only level 5 ignores it and its commands create a session in the mode they name themselves. It takes effect for the sessions created afterwards, and `kr host shell-mode` writes it | `managed` or `native_compat`; absent leaves the choice to the product default, `managed`. No profile carries a shell mode, so that rung of the order below is empty for it |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -839,7 +840,13 @@ For an ordinary preference, highest first:
 4. the product default.
 
 Every ordinary preference resolves through one function, so the order cannot drift between call
-sites. A profile a request names and this host does not have contributes nothing and the value
+sites. The shell mode a session is created in resolves through it with the second rung empty: no
+profile carries a shell mode, so a request (`kr new --shell-mode`, or the choice in the companion's
+new-session form) outranks the host's `shell.mode`, which outranks the product default, `managed`.
+The host resolves the last two and says the answer, and the rung it came from, in `host.info`
+(`default_shell_mode`), so every client that creates a session without naming a mode uses the host's
+own answer and none carries a default of its own. A host of an earlier release names none, and the
+product default stands for it. A profile a request names and this host does not have contributes nothing and the value
 falls through to the document.
 
 The creator's shell environment is what the session's own processes run with, and nothing this host decides is taken from it. The daemon holds it in memory from the reservation until the worker claims it. Because it is never written anywhere, environmental variables containing security credentials are never written to the registry, to a WAL, or to any log. Only the variables below participate in configuration, and they are read from the host's own environment.
