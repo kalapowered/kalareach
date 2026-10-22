@@ -1,0 +1,26 @@
+{
+  "message": {
+    "apns": {
+      "headers": {
+        "apns-collapse-id": "3ac2da77-5665-777f-99bc-f913f2a97cde",
+        "apns-expiration": "1792724027",
+        "apns-priority": "5",
+        "apns-push-type": "alert"
+      },
+      "payload": {
+        "aps": {
+          "alert": {
+            "body": "A KalaReach session is waiting for an answer."
+          },
+          "mutable-content": 1
+        }
+      }
+    },
+    "data": {
+      "expires_at_ms": "1792724027689",
+      "notification_id": "cb521255-8d8a-48e8-a25f-ff936e7f5935",
+      "preview": "{\"routing\":{\"envelope_id\":\"da71c5cd-5973-4aa0-aa75-611d47f8a736\",\"recipient_key_id\":\"hifPZgcbP18SvrvQ9Nr_19PvjiyaXpa49BabLJqNqZg\",\"sender_key_id\":\"kknreR9bFja7TRk_B2IQXcX8kf78QZSSe-Dx7COHdG4\",\"expires_at_ms\":\"1792724027689\",\"payload_type\":\"notification_preview\",\"thread_id\":null,\"size_bucket_bytes\":\"1024\"},\"nonce\":\"VbdwjgMEDhjKVHvvClEE-iOw6v348dC5\",\"ciphertext\":\"L0Sq_U9VbvkUgCLk4_SmXMZ6CVNNwq_lZ3rkoVfgMdSPfUokthLbT9dm5_YgSvppNKqUgYcTY3SKoTmMUvjBhXjCljLorV68TWh_zOC2WEkHUmx_5RYAXjAIM52wQPCXaxj1gGhz4l6JdnELMIuz_LM5Fsf4nurl1lE0vQpEvOjWvsgVoIdG8jlf_8j10n6qsfINvmuymeLApYaGkCuT3qwvPVB0BuIUW0lMrPjZFlPkFtNdOeR165eVWo2Xa771TVktILvY3GDBnmPt9gWcE47g9im1lNG7AUxXLxO0Z9xstpFn-9tBHCGHVPVT1ssMobHs-QQzl9XZOQiUTkgfJjIICCZPWVZT1Wp5uGSypPKal0pUpGSB7CF5qypMKJX4_-oY59Z6dJa-aAALKQwM8JcZRtkjdefNTuKeyAULq759-k-SRBokPHQjAtguEHAYYYjv25cGEmMGQL8ECKrNnlA5K7QPXydr73eIkqaFw8Hn4Mr5DmPWPrNY2HUQsCJI7M69SBmjB-vvI_Ynsc2CeXkZhBlBwkouvnk2RAeqr25-3jegXy0FfJI27__40pP6JuOW84KF6yB-HGXQ8hmc1MF1KFcfmA3mUqMI7sm4suVdYTfFROBnyqoL5AQjShwnB1qFSWtNHjAwakXG8KM0DPqEF095PcT7tREY3aCVsNRhLFfXoRMJt0aUsCa3klFsSsxi_0QJwYIfBOqJEjHcBbXVLuj9HhJJLEzXMQW61Q8cUZ4wFy1hE9QdRdRbZo7FuwD-BG36rHU0N2ESJxvLRNt7vhHhBjs__Mb5ma3xGG2hdHDaLZXrOXgSeaOrupAJnjDlqDojbBzRcGXprx0LQWLDpWibw2HPkAh4N6nu4WWfcVrYjbzsdJWQ53FT5wgE-54pBuZCRFGjuazAasv0xFmNmMu7txVyEsjlm3YkUqPaMTWM0OpSnDdw54hmK3w8XsrXXGFKkdf8yDmWBcOnhD5UBJdc9OOO0i0oI29_LSOZ-42KSCe5XR30DwHfDmtItmszkniEqKZj0L41gc3pWY_2bYgyvwsksYblBOfbyJzZvwe5cTqaYUznpCMf2XyQeeKDYPy0E2H_MS9KZsEWcZjglZvJFfhLBv_B8vTPwnxo7kbLCshXiW4QoOEefPM5fuIgxYZmRH76HioxysZeO_MkX4UyL0nTjY1-LVX4YKXBiKZuf56sIxscHSX1VI8g_eWFzInRGwYgGap1COjr1KYFCnzQx-BHkUqmrhJPe3MCeLdwt5mkAzWMbQKu0wPHVUyLaxx-nB_DLgit-q_0-SgBGWl0Q_kd8CJOjV6TXY2fx-1wlEXrJ_bHBvjlMyco7WGHMNHFJqw7uDMu1lCi8gaMRIAMa407KOnnzrHur-A\"}"
+    },
+    "token": "kr-device-run-ff0557f8-19ce-4b4e-ad5b-e3a6152df560"
+  }
+}
