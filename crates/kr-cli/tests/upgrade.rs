@@ -269,6 +269,21 @@ fn inside_the_level() -> Option<&'static Previous> {
         .as_ref()
 }
 
+/// As [`inside_the_level`], for the case `case`, which says it did not run when the commit's
+/// history holds no release at its level: a case that returns with no assertion would otherwise
+/// report that it passed.
+fn inside_the_level_for(case: &str) -> Option<&'static Previous> {
+    let found = inside_the_level();
+    if found.is_none() {
+        println!(
+            "{case}: not run, because no kept release of level {} is in the history of this \
+             commit; the cases that update from, and roll back to, the release before still run",
+            CompatibilityLevel::of(PACKAGE_VERSION)
+        );
+    }
+    found
+}
+
 impl Previous {
     /// The release at `commit`, built in a tree of its own under the cache and copied, with its
     /// programs in a directory of their own: two releases a run builds do not share one.
@@ -2033,7 +2048,9 @@ async fn inside_the_level_an_update_leaves_the_worker_running_and_serves_a_devic
     use kr_protocol::scalars::CanonicalSet;
     use kr_protocol::session::Dimensions;
 
-    let Some(before) = inside_the_level() else {
+    let Some(before) = inside_the_level_for(
+        "inside_the_level_an_update_leaves_the_worker_running_and_serves_a_device_and_kr_attach",
+    ) else {
         return;
     };
     let updated = Updated::prepare_on(
@@ -2138,7 +2155,9 @@ async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_s
     use kr_protocol::scalars::CanonicalSet;
     use kr_protocol::session::Dimensions;
 
-    let Some(before) = inside_the_level() else {
+    let Some(before) = inside_the_level_for(
+        "inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_serves_a_device",
+    ) else {
         return;
     };
     let updated = Updated::prepare_on(
