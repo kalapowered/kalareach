@@ -3073,8 +3073,9 @@ its local owner is signed for, and the sessions whose workers cannot be told wha
 It reports the adapters the enrolled organisations' policies allow together and the adapters the
 catalogue admits under now. They are the same once the host has put the first list in force. They
 differ while a change waits for a synchronisation that holds the catalogue, or for the admission
-revision to be written, and the second is then the earlier list. The second is what the catalogue holds when the answer is made: it does not show
-that every session's worker has finished the round that follows a change.
+revision to be written, and the second is then the earlier list. The second is what the catalogue
+holds when the answer is made: it does not show that every session's worker has finished the round
+that follows a change.
 
 ### Applying a policy
 
