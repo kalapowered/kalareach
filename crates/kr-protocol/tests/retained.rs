@@ -1,11 +1,12 @@
 //! What a release keeps of the release before it, tried on the surfaces of two real releases.
 //!
 //! The product keeps one retained level. The difference these tests work from is a real one: the
-//! surface of the 0.73.0 release (`tests/retained/0.73`, cut from its tag) and of the retained
-//! level, a later release, differ by one variant of the attention source, which a record of
-//! the attention text request carries. The retained level is what they compare with, and not this
-//! build, because this build's surface moves with every change to a frame and these cases are
-//! about how differences are found and covered, not about what this build differs by. The other
+//! surface of the 0.73.0 release (`tests/retained/0.73`, cut from its tag) and of the 0.75.0
+//! release (`tests/retained/0.75`, the surface the level of that release was cut with), a later
+//! release, differ by one variant of the attention source, which a record of the attention text
+//! request carries. Two real surfaces are what they compare, and not this build's, because the
+//! retained level and this build move with every cut and every change to a frame, and these cases
+//! are about how differences are found and covered, not about what this build differs by. The other
 //! differences are made by editing that real surface: a required member dropped, a variant
 //! removed, a definition renamed, something frozen changed.
 
@@ -25,14 +26,16 @@ use kr_protocol::update::CompatibilityLevel;
 use serde_json::Value;
 
 const SURFACE_073: &str = include_str!("retained/0.73/surface.schema.json");
+const SURFACE_075: &str = include_str!("retained/0.75/surface.schema.json");
 
 fn old_surface() -> Surface {
     Surface::parse(SURFACE_073).expect("the 0.73 surface")
 }
 
-/// The surface of the retained level, a later release than 0.73.0.
+/// The surface of the 0.75.0 release, a later release than 0.73.0.
 fn newer_surface() -> &'static Surface {
-    kr_protocol::retained::RETAINED[0].surface()
+    static SURFACE: std::sync::OnceLock<Surface> = std::sync::OnceLock::new();
+    SURFACE.get_or_init(|| Surface::parse(SURFACE_075).expect("the 0.75 surface"))
 }
 
 fn limits() -> Limits {
@@ -382,7 +385,7 @@ fn a_worker_is_at_this_level_at_a_retained_one_or_at_none() {
             .expect("a patch apart")
             .is_this()
     );
-    let previous = Level::of(Some(&stated(75, 0))).expect("the retained level");
+    let previous = Level::of(Some(&stated(76, 0))).expect("the retained level");
     assert!(!previous.is_this());
     assert_eq!(
         previous.level(),
@@ -660,7 +663,7 @@ fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
 }
 
 /// KR-REQ-26.06, KR-ACC-035: the exchange a control daemon had with a real worker of the release
-/// before (`retained/0.75/frames.json`: the payload of every frame either way, as they went over
+/// before (`retained/0.76/frames.json`: the payload of every frame either way, as they went over
 /// the wire in the upgrade suite) reads under the level that release stated, and reads the same
 /// under this build's own level while the two do not differ. What the daemon wrote reads back as
 /// the bytes it wrote.
@@ -669,18 +672,18 @@ fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
 /// upgrade the_frames_ -- --nocapture`, which prints it.
 #[test]
 fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_its_level() {
-    let record: Vec<Value> = serde_json::from_str(include_str!("../retained/0.75/frames.json"))
+    let record: Vec<Value> = serde_json::from_str(include_str!("../retained/0.76/frames.json"))
         .expect("the record is a list");
     assert!(
         !record.is_empty(),
         "the retained level records no exchange with a worker of its release"
     );
-    // The record is of the 0.75 release, and is read under that level whatever else is retained.
-    let wanted = CompatibilityLevel::of(PackageVersion::new(0, 75, 0));
+    // The record is of the 0.76 release, and is read under that level whatever else is retained.
+    let wanted = CompatibilityLevel::of(PackageVersion::new(0, 76, 0));
     let retained = kr_protocol::retained::RETAINED
         .iter()
         .find(|retained| retained.level == wanted)
-        .expect("the 0.75 level is retained");
+        .expect("the 0.76 level is retained");
     let level = Level::retained(retained);
     // While this build's surface is the one the level kept, a frame reads the same under both.
     let alike = differences(retained.surface(), current()).is_empty();

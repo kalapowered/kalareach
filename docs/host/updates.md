@@ -145,8 +145,8 @@ the store's own `kr`, which runs the release that is current.
 
 The store names the package manager in its `installer` file. The file only records who admitted
 the releases; `current` says which one runs. It is not part of the store's record, so a release
-before this one, which a rollback may bring back, reads the record as it always has. It does not
-know the file, so a host rolled back to it treats the install as its own: nothing then reads the
+from before the file, which a rollback may bring back, reads the record as it always has. It does
+not know the file, so a host rolled back to it treats the install as its own: nothing then reads the
 file, and the package manager's next release is admitted again by the first command of its `kr`, by
 the same rules. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
 and a mistake in the arguments read nothing of the host and admit nothing, and neither does a `kr`
