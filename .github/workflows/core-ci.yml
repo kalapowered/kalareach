@@ -618,15 +618,15 @@ jobs:
       #     `launch_probe`, `command_backends`, `windows` (a real pseudo-console, a real PowerShell
       #     and a real job object), `question_bindings`, `questions_answer`, `authority`,
       #     `persistence`, `snapshot`, `terminal`, `session`, `local_owner`, `input_lease`, `fence`,
-      #     `desktop` and `performance`, and `host` twice: under cargo through the environment's
-      #     scheduled task, and from the built executable as the shipping daemon starts a worker;
+      #     `desktop`, `performance` and `host`, whose daemons start each worker as the shipping
+      #     daemon does, through the environment's scheduled task;
       #   - the local endpoint, descriptors and process identity the host rests on: `kr-ipc`'s
       #     `windows`, `stop` and `peer_gone` suites and its library, and all of `kr-flush`, the
       #     directory flush of every local store;
       #   - the control daemon over the environment's scheduled task and the starter it runs:
-      #     `supervision::windows`, the breakaway decision in `supervision::tests`, the
-      #     `task_supervisor` suite, the `plugin_runtime_service` suite over the plugin test
-      #     components built for it, and `kr-cli`'s `startup_windows`;
+      #     `supervision::windows`, the `task_supervisor` suite (with a daemon refused in a login
+      #     session other than the one its work runs in), the `plugin_runtime_service` suite over
+      #     the plugin test components built for it, and `kr-cli`'s `startup_windows`;
       #   - the daemon's other Windows suites: the library filters `catalogue::integrations`,
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
@@ -660,12 +660,11 @@ jobs:
       # The persistence suite runs with PowerShell 7 as each session's root shell rather than the
       # `/bin/sh` this platform has not got. The host tests that start a real worker run under
       # `cargo test`, whose own job kills its members on close and forbids breakaway: their daemon
-      # starts each worker through the environment's scheduled task, whose starter creates it, so the
-      # worker is never in that job. They run a second time from the built test executable, outside
-      # cargo, the way the shipping daemon still starts a worker. Three of those tests are held back
-      # on this platform: two need the worker's rendezvous to complete here, which it does not yet,
-      # and one uses a POSIX shell binary this platform has not got. Each gives its reason in its
-      # ignore attribute in `crates/kr-worker/tests/host.rs`.
+      # starts each worker through the environment's scheduled task, as the shipping daemon does,
+      # whose starter creates it, so the worker is never in that job. Three of those tests are held
+      # back on this platform: two need the worker's rendezvous to complete here, which it does not
+      # yet, and one uses a POSIX shell binary this platform has not got. Each gives its reason in
+      # its ignore attribute in `crates/kr-worker/tests/host.rs`.
       #
       # What this runner cannot do at all is qualify a console interactively. The pseudo-console
       # tests open a console of their own and drive it, which works here; what needs a real machine
@@ -1047,13 +1046,6 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --lib singleton
 
-      # A Windows worker must be independent of the daemon's kill-on-close job, so the start asks to
-      # break away from that job only when the daemon's own job would kill it on close. This checks
-      # that decision for the four job contexts the product can be started in.
-      - name: Decide a worker's breakaway from the daemon's job
-        if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: cargo test --locked -p kr-controller --lib supervision::tests::a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job
-
       # The environment's scheduled task: the definition the setup step registers, read back as the
       # Task Scheduler exports it, whose it is, and registering, repairing, removing and running a
       # real one. This runner's account is signed in to the console, so the task logs on as the
@@ -1274,35 +1266,14 @@ jobs:
         run: cargo test --locked -p kr-controller --test descriptions
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
-      # each daemon starts its workers through the environment's scheduled task, so a worker is never
-      # in that job, and one started by a daemon inside nested jobs outlives them. The shipping
-      # daemon's own start, which asks to break away, is refused here with its named failure.
+      # each daemon starts its workers through the environment's scheduled task, as the shipping
+      # daemon does, so a worker is never in that job, and one started by a daemon inside nested
+      # jobs outlives them. The same suite shows the root shell running as the daemon's own account
+      # and level, an idle session starting nothing beside its shell, and the doctor saying whether
+      # the task can start workers.
       - name: The real-worker host tests under cargo, through the environment's task
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test host
-
-      # The real-worker host tests again, run from the built executable directly rather than through
-      # cargo, so they are not inside cargo's kill-on-close job, and with each worker started the
-      # way the shipping daemon still starts one: as the daemon's own detached process. This
-      # runner's own job does not kill on close, so no breakaway is asked for. The three tests held
-      # back on this platform are ignored here too.
-      - name: The real-worker host tests, from the built executable, as the shipping daemon starts a worker
-        if: ${{ !cancelled() && matrix.part == 'second' }}
-        env:
-          KR_HOST_TEST_SUPERVISOR: detached
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # Build without running, and take the executable Cargo says it built rather than the newest
-          # file in the cache, so a failed build cannot fall through to a stale executable.
-          $json = cargo test --locked -p kr-worker --test host --no-run --message-format=json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $exe = $json |
-            ForEach-Object { $_ | ConvertFrom-Json } |
-            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'host' -and $_.executable } |
-            Select-Object -Last 1 -ExpandProperty executable
-          if (-not $exe) { Write-Error 'cargo reported no host test executable'; exit 1 }
-          & $exe --test-threads=1 --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # The other Windows target the product ships on. Nothing is executed for it here; this is
       # the compile the release baseline asks for.

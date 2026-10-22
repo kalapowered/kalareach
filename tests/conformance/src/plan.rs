@@ -707,7 +707,6 @@ fn windows() -> Vec<Step> {
         step.filter = Some(only(filter));
         step
     };
-    let breakaway = "supervision::tests::a_worker_breaks_away_from_a_kill_on_close_or_a_breakaway_permitting_job";
     let credential = "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again";
     vec![
         // The pairing tests run `kr` against a control daemon they find built beside them, and a
@@ -1133,18 +1132,6 @@ fn windows() -> Vec<Step> {
                 "singleton",
             ],
             "singleton",
-        ),
-        qualified_only(
-            "a worker's breakaway from the daemon's job",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "kr-controller",
-                "--lib",
-                breakaway,
-            ],
-            breakaway,
         ),
         qualified_only(
             "the environment's scheduled task, registered, read back and run",
