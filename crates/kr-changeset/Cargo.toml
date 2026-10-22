@@ -41,6 +41,12 @@ tempfile.workspace = true
 # through the copy's own descriptor.
 rustix = { workspace = true, features = ["fs", "process"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# FSEvents, through the crate every Rust tool that watches files on macOS uses, rather than calls
+# into CoreServices written here: the workspace forbids unsafe code outside the few modules that
+# need it. It reports the names written beside a declared output while a test's command runs.
+notify = { workspace = true, features = ["macos_fsevent"] }
+
 [target.'cfg(windows)'.dependencies]
 # Removing an open object rather than a name: the staged file this host verified is reopened for
 # deletion and marked through its own handle, so no name can redirect the removal.

@@ -2,6 +2,7 @@
 
 pub mod answer;
 pub mod apply;
+pub mod binding;
 pub mod capture;
 pub mod error;
 pub mod grant;

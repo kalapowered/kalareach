@@ -37,6 +37,7 @@ use kr_automation::{
     Dispatch, Host, Submitted, WorkflowStore,
 };
 use kr_changeset::ChangeSetService;
+use kr_changeset::binding;
 use kr_changeset::materialise::{self, Outputs, RunReport};
 use kr_changeset::service::CaptureOrder;
 use kr_protocol::actor::ActorIngress;
@@ -1748,6 +1749,15 @@ async fn run_tests(
             };
         }
     };
+    // The copy is recorded before the command starts, and settled against that record when the
+    // result is recorded: a command that wrote in the copy and put what it wrote back leaves a
+    // copy that reads as the version, and only the record shows it.
+    let binding = {
+        let (changesets, outputs) = (Arc::clone(&context.changesets), outputs.clone());
+        Arc::new(
+            blocking(move || binding::bind_run(&changesets, materialisation_id, &outputs)).await,
+        )
+    };
     let driven = drive_command(
         context,
         held,
@@ -1770,6 +1780,7 @@ async fn run_tests(
                     version,
                     materialisation_id,
                     outputs,
+                    binding,
                     session_id: *session_id,
                     began_at_ms: *began_at_ms,
                 },
@@ -1794,6 +1805,9 @@ struct TestRun<'a> {
     version: kr_protocol::changeset::VersionRef,
     materialisation_id: kr_protocol::ids::MaterialisationId,
     outputs: Outputs,
+    /// The record of the copy taken before the command started, which the result is settled
+    /// against.
+    binding: Arc<binding::RunBinding>,
     session_id: kr_protocol::ids::SessionId,
     began_at_ms: kr_protocol::scalars::TimestampMs,
 }
@@ -1804,9 +1818,11 @@ struct TestRun<'a> {
 /// a signal ended it. A suite that never started, or that was stopped, has no result to record, and
 /// the answer this function returns is how the session closed. Of the suites that ran, the
 /// session's own exit status and the copy as it is read back now decide the node. A suite that
-/// exits zero against a copy that still holds exactly the version has passed that version; one that
-/// exits zero against a copy that was changed, or that cannot be read back, has passed nothing this
-/// host can name, and the node is left unknown. A non-zero status or a signal fails the node
+/// exits zero against a copy that still holds exactly the version, and in which nothing outside
+/// the suite's declared outputs was written while it ran, has passed that version; one that exits
+/// zero against a copy that was changed, that had something written in it and put back, or that
+/// cannot be read back or bound to the run, has passed nothing this host can name, and the node
+/// is left unknown. A non-zero status or a signal fails the node
 /// whatever the copy holds, once what was observed is recorded; when that cannot be recorded the
 /// node is left unknown. A node the engine has already settled as cancelled stays cancelled, and
 /// the answer is discarded.
@@ -1857,16 +1873,18 @@ async fn observe_tests(
     };
     let recorded = {
         let changesets = Arc::clone(&context.changesets);
-        let (id, outputs, version, suite) = (
+        let (id, outputs, binding, version, suite) = (
             run.materialisation_id,
             run.outputs.clone(),
+            Arc::clone(&run.binding),
             run.version,
             run.suite.to_owned(),
         );
         let session_id = run.session_id;
         blocking(
             move || -> kr_changeset::Result<kr_protocol::changeset::MaterialisationResult> {
-                let result = materialise::record_result_with(&changesets, id, &report, &outputs)?;
+                let result =
+                    materialise::record_result(&changesets, id, &report, &outputs, &binding)?;
                 changesets.record_evidence(
                     version.change_set_id,
                     version.version,
