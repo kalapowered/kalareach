@@ -398,6 +398,8 @@ fn the_descriptions_settings_are_reported_with_their_source_and_apply_at_once() 
     assert_eq!(on_battery.value(), "false");
     assert_eq!(on_battery.source, ValueSource::Default);
     assert_eq!(on_battery.effect, ValueEffect::Immediately);
+    let settings = open(&environment).description_settings();
+    assert!(settings.enabled && !settings.on_battery);
 
     // The owner turns descriptions off and leaves the other setting alone.
     let (applied, _) = edit_and_owed(
@@ -420,6 +422,11 @@ fn the_descriptions_settings_are_reported_with_their_source_and_apply_at_once() 
         on_battery.source,
         ValueSource::Default,
         "the setting the edit did not name is still the default"
+    );
+    let settings = open(&environment).description_settings();
+    assert!(
+        !settings.enabled,
+        "and what the daemon acts on is what the report says"
     );
 
     // Choosing the default value is still a choice: the row names the document.
@@ -460,6 +467,11 @@ fn an_unusable_document_reports_descriptions_off_and_the_daemon_acts_on_that() {
         assert_eq!(row.source, ValueSource::Default, "{key}");
         assert_eq!(row.effect, ValueEffect::Immediately, "{key}");
     }
+    let settings = open(&environment).description_settings();
+    assert!(
+        !settings.enabled && !settings.on_battery,
+        "the daemon fails closed: on is wider than anything the owner could have chosen"
+    );
 }
 
 /// KR-REQ-01.23: the configuration's diagnostics report the document, the order and the ceilings.

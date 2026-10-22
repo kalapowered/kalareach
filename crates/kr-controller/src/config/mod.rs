@@ -705,6 +705,12 @@ pub fn effective(
         resolver.loaded().document.as_ref(),
         &resolver.document().display().to_string(),
     ));
+    // The owner's two settings for descriptions, read by the daemon through the same resolver, and
+    // applied as soon as they are written.
+    values.extend(configuration::descriptions_rows(
+        &resolver.description_settings(),
+        &resolver.document().display().to_string(),
+    ));
     // The ownership the owner wrote down for each package's agent. Nothing acts on it, and the
     // row says so.
     values.push(configuration::agents_row(

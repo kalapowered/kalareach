@@ -173,22 +173,13 @@ impl Controller {
     /// is on, or off for battery, unless the document chooses otherwise.
     ///
     /// A document this host cannot use turns them off: on is the product default and wider than
-    /// anything the owner could have chosen, and the owner's choice is in that document.
+    /// anything the owner could have chosen, and the owner's choice is in that document. The
+    /// effective-value report reads the same resolver, so it says what the daemon does.
     pub(crate) fn description_settings(&self) -> kr_describe::resource::ResourceSettings {
-        let resolver = self.configuration();
-        let loaded = resolver.loaded();
-        let section = loaded
-            .document
-            .as_ref()
-            .map(|document| &document.descriptions);
+        let settings = self.configuration().description_settings();
         kr_describe::resource::ResourceSettings {
-            enabled: !loaded.fails_closed()
-                && section
-                    .and_then(|section| section.enabled())
-                    .unwrap_or(true),
-            on_battery: section
-                .and_then(|section| section.on_battery())
-                .unwrap_or(false),
+            enabled: settings.enabled,
+            on_battery: settings.on_battery,
             ..kr_describe::resource::ResourceSettings::default()
         }
     }
