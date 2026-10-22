@@ -969,8 +969,8 @@ pub(super) fn is_owners_own_socket(actor_id: &ActorId) -> bool {
     actor_id.as_str().starts_with(LOCAL_PRINCIPAL_PREFIX)
 }
 
-/// Encodes one host-and-environment read for whoever asked: the one function that decides what a
-/// paired device reads of this host.
+/// Encodes one host-and-environment read for whoever asked: the one function that decides the form
+/// a paired device reads of this host.
 ///
 /// The owner at their own machine, on its owner-only socket, is answered with the display form:
 /// the account the environments belong to, the directories this host resolved, what the platform
@@ -981,7 +981,9 @@ pub(super) fn is_owners_own_socket(actor_id: &ActorId) -> bool {
 /// from this build's own words. The four answers are `host.info`, `environment.list`,
 /// `environment.capabilities` and `host.doctor`; each has its one reduction beside its type, and
 /// the protocol's tests walk every field of all four, so a field added to one is classed before it
-/// can be sent.
+/// can be sent. The one thing a device reads by the right its grant holds, the host's metrics in
+/// `host.doctor`, is left out where the answer is written, under the decision it is written under
+/// (`crate::net::answer_shown`), because no decision is known here.
 fn host_read<T>(answer: T, owner: bool) -> Result<ParamsValue>
 where
     T: kr_protocol::hostinfo::export::ForExport + serde::Serialize,
