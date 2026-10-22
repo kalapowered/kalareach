@@ -76,6 +76,11 @@ tough.workspace = true
 # The recovery kit is read into a buffer that clears itself, and never through a copy that does not.
 zeroize.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The probe tests give the command's process the timer slack the system gives one at background
+# priority.
+rustix = { workspace = true, features = ["thread"] }
+
 [dev-dependencies]
 # The update tests make channel roots and sign release manifests with keys of their own.
 aws-lc-rs.workspace = true

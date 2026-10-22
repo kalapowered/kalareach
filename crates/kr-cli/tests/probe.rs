@@ -481,6 +481,112 @@ async fn a_terminal_that_never_finishes_the_exchange_fails_the_attempt() {
     let _ = shell.wait();
 }
 
+/// A writer that waits before it writes, as the far end of a network does: a terminal reached over
+/// a connection answers a moment after it is asked, never in the microseconds the command takes to
+/// reach its first wait for the answer.
+#[cfg(target_os = "linux")]
+struct Late<W> {
+    inner: W,
+    by: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl<W: std::io::Write> std::io::Write for Late<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.by);
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Runs `start` with this thread's timer slack at `slack` and on one processor, which the process it
+/// starts is given and keeps, and puts the thread's own back afterwards.
+///
+/// The system wakes the timers of a process it runs at background priority late, by as much as a
+/// slack of this size: a sleep of a millisecond takes a second and a half. It does so when nothing
+/// else wakes a timer on the processor in the meantime, and a process alone on its processor has
+/// nothing else, so the process is given the last processor it may use.
+#[cfg(target_os = "linux")]
+fn started_with_timers_woken_late<T>(slack: Duration, start: impl FnOnce() -> T) -> T {
+    let slack_before = rustix::thread::current_timer_slack().expect("reads the timer slack");
+    let processors = rustix::thread::sched_getaffinity(None).expect("reads the processors");
+    let last = (0..rustix::thread::CpuSet::MAX_CPU)
+        .rev()
+        .find(|processor| processors.is_set(*processor))
+        .expect("a processor this thread may use");
+    let mut alone = rustix::thread::CpuSet::new();
+    alone.set(last);
+    let raised = u64::try_from(slack.as_nanos()).expect("a slack that fits");
+    rustix::thread::set_current_timer_slack(std::num::NonZeroU64::new(raised))
+        .expect("raises the timer slack");
+    rustix::thread::sched_setaffinity(None, &alone).expect("keeps the thread on one processor");
+    let started = start();
+    rustix::thread::sched_setaffinity(None, &processors).expect("gives the processors back");
+    rustix::thread::set_current_timer_slack(std::num::NonZeroU64::new(slack_before))
+        .expect("puts the timer slack back");
+    started
+}
+
+/// KR-REQ-08.14: the exchange with the terminal ends when the terminal answers, and not when a
+/// timer wakes. The command runs with its timers woken a second and a half late, as the system wakes
+/// a process at background priority, and the terminal answers a moment after it is asked: an
+/// exchange that waited by sleeping between looks would be asleep until its second was gone, and
+/// fails the attempt with an answer that was there in a tenth of it. Linux only, because only
+/// there can a test give a process the slack the system gives a background one.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_exchange_ends_when_the_terminal_answers_in_a_process_whose_timers_wake_late() {
+    let hosted = hosted(ECHOES_ITS_INPUT).await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = hosted.display.get().to_string();
+    let mut shell = started_with_timers_woken_late(Duration::from_millis(1500), || {
+        pty.slave
+            .spawn_command(shell_running(
+                &hosted,
+                &format!(
+                    "{} attach {display}; printf 'attach-finished-%s\n' \"$?\"",
+                    kr().display()
+                ),
+            ))
+            .expect("starts the shell")
+    });
+    // Collected, and answered, by threads that were made with this thread's own slack.
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keys = terminal::keys(Box::new(Late {
+        inner: pty.master.take_writer().expect("a writer"),
+        by: Duration::from_millis(100),
+    }));
+    let answering = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keys);
+    assert!(
+        answering.typed_within(Duration::from_secs(30)),
+        "the command asked the terminal what it is: {}",
+        output.text().escape_debug()
+    );
+    // The attachment began, which it does only once the exchange has ended with the answer.
+    assert!(
+        output.wait_for(b"kr-ready.", Duration::from_secs(30)),
+        "the exchange ended with the answer and the session's screen reached the terminal: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"attach-finished-"),
+        "and the command did not fail the attempt: {}",
+        output.text().escape_debug()
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
 /// KR-REQ-08.43: `--no-probe` asks the terminal nothing at all.
 /// KR-REQ-08.14: with no probe chosen, no question is sent at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
