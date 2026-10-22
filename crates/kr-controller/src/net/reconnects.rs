@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_protocol::ids::DeviceId;
-use kr_protocol::metrics::{Attempt, MetricOutcome, Recorder, Transport};
+use kr_protocol::metrics::{MetricOutcome, ReconnectAttempt, Recorder, Transport};
 use kr_transport::clock::ContinuousInstant;
 
 /// What the host has seen of one device's connections.
@@ -66,7 +66,7 @@ impl Reconnects {
             if let Some(ended_at) = presence.ended_at {
                 self.recorder.reconnected(
                     transport,
-                    Attempt::of(presence.seen),
+                    ReconnectAttempt::of(presence.seen),
                     outcome,
                     now.saturating_duration_since(ended_at),
                 );
@@ -102,7 +102,8 @@ mod tests {
 
     use kr_protocol::ids::DeviceId;
     use kr_protocol::metrics::{
-        Attempt, Environment, MetricOutcome, ReconnectTime, Recorder, Report, Transport,
+        Environment, MetricOutcome, MetricsReport, ReconnectAttempt, ReconnectTime, Recorder,
+        Transport,
     };
     use kr_protocol::scalars::{U64, Uuid};
     use kr_transport::clock::{ContinuousClock as _, ManualClock};
@@ -124,7 +125,7 @@ mod tests {
 
     fn series(
         transport: Transport,
-        attempt: Attempt,
+        attempt: ReconnectAttempt,
         outcome: MetricOutcome,
         count: u64,
         total_ms: u64,
@@ -159,7 +160,7 @@ mod tests {
             recorder.report().reconnect_time,
             [series(
                 Transport::Direct,
-                Attempt::One,
+                ReconnectAttempt::One,
                 MetricOutcome::Ok,
                 1,
                 4_500,
@@ -190,7 +191,7 @@ mod tests {
             recorder.report().reconnect_time,
             [series(
                 Transport::Relay,
-                Attempt::One,
+                ReconnectAttempt::One,
                 MetricOutcome::Ok,
                 1,
                 7_000,
@@ -224,7 +225,7 @@ mod tests {
             [
                 series(
                     Transport::Relay,
-                    Attempt::One,
+                    ReconnectAttempt::One,
                     MetricOutcome::Refused,
                     1,
                     2_000,
@@ -232,7 +233,7 @@ mod tests {
                 ),
                 series(
                     Transport::Relay,
-                    Attempt::TwoToThree,
+                    ReconnectAttempt::TwoToThree,
                     MetricOutcome::Refused,
                     2,
                     10_000,
@@ -240,7 +241,7 @@ mod tests {
                 ),
                 series(
                     Transport::Relay,
-                    Attempt::FourToEight,
+                    ReconnectAttempt::FourToEight,
                     MetricOutcome::Ok,
                     1,
                     8_000,
@@ -267,7 +268,7 @@ mod tests {
         );
         clock.advance(Duration::from_secs(5));
         reconnects.arrived(device(1), clock.now(), Transport::Relay, MetricOutcome::Ok);
-        assert_eq!(recorder.report(), Report::default());
+        assert_eq!(recorder.report(), MetricsReport::default());
 
         reconnects.arrived(device(2), clock.now(), Transport::Relay, MetricOutcome::Ok);
         reconnects.departed(device(1), clock.now());
@@ -280,7 +281,7 @@ mod tests {
             recorder.report().reconnect_time,
             [series(
                 Transport::Relay,
-                Attempt::One,
+                ReconnectAttempt::One,
                 MetricOutcome::Ok,
                 2,
                 7_000,

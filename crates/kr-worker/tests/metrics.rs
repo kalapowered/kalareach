@@ -24,7 +24,7 @@ use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, BuildId, ControllerGeneration, PluginId, PublisherId,
     SessionEpoch, SessionId,
 };
-use kr_protocol::metrics::{Adapter, Environment, Fault, MetricOutcome, Report};
+use kr_protocol::metrics::{Adapter, Environment, Fault, MetricOutcome, MetricsReport};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
 use kr_term::diag::DiagnosticKind;
@@ -127,7 +127,7 @@ impl World {
     }
 
     /// Waits until the worker's report counts every class in `classes`, and returns it.
-    async fn report_counting(&self, classes: &[Fault]) -> Report {
+    async fn report_counting(&self, classes: &[Fault]) -> MetricsReport {
         let deadline = tokio::time::Instant::now() + LIVENESS;
         loop {
             let report = self.service.metrics();
@@ -156,7 +156,7 @@ impl Drop for World {
 }
 
 /// What a report counts of the parse faults, as class and count.
-fn faults(report: &Report) -> Vec<(Fault, u64)> {
+fn faults(report: &MetricsReport) -> Vec<(Fault, u64)> {
     report
         .terminal_parse_fault
         .iter()
