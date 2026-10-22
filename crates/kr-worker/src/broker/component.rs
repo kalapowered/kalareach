@@ -53,8 +53,8 @@ pub struct ComponentWant {
     pub version: String,
     /// The exact package hash the binding holds.
     pub package_digest: Digest256,
-    /// The admission revision the binding was decided at.
-    pub revision: u64,
+    /// The generation of the package's repository the admissions carried when the binding was made.
+    pub repository_generation: kr_protocol::ids::RepositoryGeneration,
     /// The program the binding recognises.
     pub executable: String,
     /// The component, as pinned.
@@ -179,7 +179,7 @@ impl Broker {
                     plugin_id: binding.plugin_id.clone(),
                     version: release.version.clone(),
                     package_digest: binding.package_digest,
-                    revision: binding.frame.map_or(0, |frame| frame.revision.get()),
+                    repository_generation: binding.repository_generation?,
                     executable: binding
                         .executable
                         .as_ref()
@@ -210,9 +210,9 @@ impl Broker {
 
 #[cfg(feature = "testing")]
 impl Broker {
-    /// Gives a binding made from a test's own descriptor the release, the program and the component
-    /// that a binding made from admissions has, so that the plugin runtime is wanted for it and the
-    /// link registers it.
+    /// Gives a binding made from a test's own descriptor the release, the repository generation,
+    /// the program and the component that a binding made from admissions has, so that the plugin
+    /// runtime is wanted for it and the link registers it.
     ///
     /// # Errors
     ///
@@ -221,6 +221,7 @@ impl Broker {
         &self,
         binding_id: BrokerBindingId,
         release: kr_protocol::admission::LiveRelease,
+        repository_generation: kr_protocol::ids::RepositoryGeneration,
         executable: crate::broker::ledger::BoundExecutable,
         component: BoundComponent,
     ) -> super::Result<()> {
@@ -230,6 +231,7 @@ impl Broker {
             .get_mut(&binding_id)
             .ok_or_else(|| super::unknown_binding(binding_id))?;
         binding.release = Some(release);
+        binding.repository_generation = Some(repository_generation);
         binding.executable = Some(executable);
         binding.component = Some(component);
         state.component_states.remove(&binding_id);

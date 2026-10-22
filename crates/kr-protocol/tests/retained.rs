@@ -662,6 +662,101 @@ fn a_kept_answer_reads_under_the_retained_level_as_it_reads_under_this_one() {
     }
 }
 
+/// A snapshot of admissions that carries one package, as the daemon sends it to a worker.
+fn admissions_with_a_package() -> ControlFrame {
+    use kr_protocol::admission::{
+        AdmittedPackage, PluginAdmissions, ReleaseOrigin, RevocationPolicy,
+    };
+    use kr_protocol::ids::{
+        ControllerGeneration, EnvironmentId, PluginId, PublisherId, RepositoryGeneration,
+    };
+    use kr_protocol::scalars::{Digest256, Uuid};
+
+    ControlFrame::PluginAdmissions(Box::new(PluginAdmissions {
+        environment_id: EnvironmentId::new(Uuid::from_bytes([1; 16])),
+        frame: kr_protocol::admission::FrameId {
+            generation: ControllerGeneration::new(2),
+            revision: U64::new(5),
+            round: U64::new(1),
+        },
+        part: 1,
+        parts: 1,
+        policy: RevocationPolicy::WarnOnly,
+        packages: vec![AdmittedPackage {
+            plugin_id: PluginId::new("example.agent".to_owned()).expect("a plugin"),
+            publisher_id: PublisherId::new("example").expect("a publisher"),
+            version: "1.2.0".to_owned(),
+            package_digest: Digest256::from_bytes([3; 32]),
+            origin: ReleaseOrigin {
+                repository_id: "official".to_owned(),
+                enrolment_key: "0123456789abcdef0123456789abcdef".to_owned(),
+            },
+            repository_generation: RepositoryGeneration::new(0),
+            package_dir: "/state/repositories/package".to_owned(),
+            grants: vec!["terminal.stream".to_owned()],
+            bridge: Nullable::null(),
+            builds: Vec::new(),
+            component: Nullable::null(),
+        }],
+        releases: Vec::new(),
+    }))
+}
+
+/// Writes the golden pair of the package a snapshot of admissions carries: the frame as this build
+/// writes it and as the retained level has it. Run with `--ignored` when the package's record
+/// changes, then read the diff.
+#[test]
+#[ignore = "writes the golden pair of the retained level"]
+fn record_the_golden_pair_of_an_admitted_package() {
+    let frame = admissions_with_a_package();
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("retained/0.76/golden");
+    std::fs::write(
+        directory.join("admitted-package.current.cbor"),
+        Level::this().encode(&frame, &limits()).expect("written"),
+    )
+    .expect("writes the pair");
+    std::fs::write(
+        directory.join("admitted-package.retained.cbor"),
+        Level::retained(&kr_protocol::retained::RETAINED[0])
+            .encode(&frame, &limits())
+            .expect("written for the level"),
+    )
+    .expect("writes the pair");
+}
+
+/// KR-REQ-06.06, KR-REQ-26.06: the generation of a package's repository, which the daemon sends a
+/// worker of this build with each admitted package, is left out of the frame a worker of the
+/// retained level is sent, which refuses a member it does not know, and a frame of that level reads
+/// as one admitted under no generation. The golden pairs of every entry of the level come out both
+/// ways.
+#[test]
+fn the_generation_of_an_admitted_package_is_left_out_for_the_retained_level_and_read_back_as_none()
+{
+    let level = Level::retained(&kr_protocol::retained::RETAINED[0]);
+    assert_eq!(level.golden_problems(&limits()), Vec::<String>::new());
+
+    let mut frame = admissions_with_a_package();
+    let ControlFrame::PluginAdmissions(admissions) = &mut frame else {
+        unreachable!("the helper builds admissions");
+    };
+    admissions.packages[0].repository_generation = kr_protocol::ids::RepositoryGeneration::new(7);
+    let written = level
+        .encode(&frame, &limits())
+        .expect("written for the level");
+    assert!(
+        !String::from_utf8_lossy(&written).contains("repository_generation"),
+        "the retained level is not sent a member it does not know"
+    );
+    // The same package the level reads is the one admitted under no generation.
+    let read = level
+        .decode(&written, &limits())
+        .expect("read from the level");
+    assert_eq!(read, admissions_with_a_package());
+    // And a worker of this level is sent the generation.
+    let ours = Level::this().encode(&frame, &limits()).expect("written");
+    assert!(String::from_utf8_lossy(&ours).contains("repository_generation"));
+}
+
 /// KR-REQ-26.06, KR-ACC-035: the exchange a control daemon had with a real worker of the release
 /// before (`retained/0.76/frames.json`: the payload of every frame either way, as they went over
 /// the wire in the upgrade suite) reads under the level that release stated, and reads the same

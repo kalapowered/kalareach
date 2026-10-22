@@ -1158,6 +1158,10 @@
           "$ref": "#/$defs/PublisherId",
           "description": "Its publisher."
         },
+        "repository_generation": {
+          "$ref": "#/$defs/RepositoryGeneration",
+          "description": "The generation of its repository that this snapshot was made under: the one the enrolment\nit came through was on, or zero when that enrolment had none. A binding made from this\npackage holds it as the generation its package was resolved against, which is not the\nadmission revision the binding was decided at."
+        },
         "version": {
           "description": "The installed release.",
           "type": "string"
@@ -1169,6 +1173,7 @@
         "version",
         "package_digest",
         "origin",
+        "repository_generation",
         "package_dir",
         "grants",
         "bridge",
