@@ -1160,6 +1160,12 @@ impl AutomationService {
     /// exact repeat, which carries the freshness window the request was first admitted under, is
     /// answered from that state before the window is asked about ([`Self::rearmed`]).
     ///
+    /// The action identifier is checked again inside the transaction, as every other action's is:
+    /// a different action on another connection may have spent it since the host first looked.
+    /// Such an identifier is refused, and the chain keeps the budget it ran out of. A rearm does
+    /// not record its own identifier, so a different action may spend it afterwards, and the exact
+    /// repeat of the rearm is then refused as a reused identifier.
+    ///
     /// The runs that start now are in [`Rearmed::started`], for the host to execute; one that
     /// waits for a slot starts when one frees.
     ///
@@ -1170,17 +1176,21 @@ impl AutomationService {
     /// store's refusal for a grant it does not hold as live; [`AutomationError::InvalidArgument`]
     /// for a chain this journal holds no budget for (or that a device may not reach) and for one
     /// whose budget has not run out; [`AutomationError::GenerationMismatch`] for a chain on
-    /// another generation; a lapsed admission; and a storage error.
+    /// another generation; [`AutomationError::ActionIdentifierReused`] for an identifier spent on
+    /// another action; a lapsed admission; and a storage error.
     pub fn rearm(
         &self,
         params: &WorkflowRearmParams,
-        admission: &(dyn Fn() -> Result<()> + Send + Sync),
-        caller_grant: Option<GrantId>,
+        submitted: &Submitted<'_>,
         now_ms: u64,
     ) -> Result<Rearmed> {
+        let caller_grant = submitted.caller_grant;
         self.may_rearm(params, caller_grant, now_ms)?;
         let root = params.causal_root_id;
-        self.store.guarded(admission, |journal| {
+        self.store.guarded(submitted.admission, |journal| {
+            // A rearm leaves no record of its own, so a record under this identifier is another
+            // action's, and reading it refuses the identifier.
+            journal.action_record(submitted.key)?;
             // A chain belongs to the grant its root run acts under, and a device reaches only
             // its own grant's. Another grant's chain is answered as a root nothing is known for.
             if let Some(held) = caller_grant
