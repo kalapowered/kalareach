@@ -64,7 +64,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{SecretStore, StoreSelection};
 use kr_pairing::host::HostIdentity;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
-use kr_protocol::metrics::{Outcome, Transport};
+use kr_protocol::metrics::{MetricOutcome, Transport};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
 use kr_transport::clock::ContinuousInstant;
@@ -566,7 +566,7 @@ impl NetworkHost {
         let transport = transport_of(&session.connection);
         let refused = || {
             self.reconnects
-                .arrived(device_id, arrived_at, transport, Outcome::Refused)
+                .arrived(device_id, arrived_at, transport, MetricOutcome::Refused)
         };
         let device = match self.admit(&session).await {
             Ok(device) => device,
@@ -626,7 +626,7 @@ impl NetworkHost {
         // Served from here on, so the gap before this connection is over, and it is the guard
         // that says when this one has ended: a destructor runs however the handler is dropped.
         self.reconnects
-            .arrived(device_id, arrived_at, transport, Outcome::Ok);
+            .arrived(device_id, arrived_at, transport, MetricOutcome::Ok);
         let mut guard = ConnectionGuard {
             host: Arc::clone(&self),
             controller: Arc::clone(&controller),
