@@ -451,7 +451,7 @@ impl Controller {
     ///
     /// Returns a refusal when a device is asked about no grant, which is no answer a device is
     /// given, and a storage error when the grant cannot be read.
-    fn barrier_for(
+    pub(super) fn barrier_for(
         &self,
         audience: Audience,
         named: Option<kr_protocol::ids::GrantId>,

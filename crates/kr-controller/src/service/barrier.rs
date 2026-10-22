@@ -24,18 +24,24 @@ use super::workers::WORKER_EXCHANGE;
 /// next announcement continues from where this one stopped.
 const MAX_EVIDENCE_PAGES: usize = 64;
 
-/// How many times an announcement asks one worker again for a page of evidence that it refused
-/// because its dispatch boundary was held, in all the pages it collects from that worker.
+/// How many times an announcement asks again for a page of evidence that a worker refused because
+/// its dispatch boundary was held, in all the pages it collects from all the workers.
 ///
 /// A worker takes the boundary without waiting and refuses an announcement while a mutation, a
 /// generation another link presents or a maintenance pass is inside it, which is a matter of
 /// moments. The pause before the first of these is [`PAGE_RETRY_PAUSE`] and it doubles up to
 /// [`PAGE_RETRY_LONGEST_PAUSE`], so the retries together wait about five seconds at most, which is
-/// one worker exchange. A worker still busy after that leaves the rest of its names to the next
-/// announcement, and the report says how many are outstanding. The bound is each worker's own, and
-/// the pages are asked for once every worker has been asked for its acknowledgement, so a busy
-/// worker holds up the pages of the workers after it and never their acknowledgements.
+/// one worker exchange. The bound is the announcement's and not each worker's, so a host with many
+/// busy workers does not wait for each of them in turn. A worker still busy after the bound leaves
+/// the rest of its names to the daemon's own collection ([`evidence_pass`]), and the report says
+/// how many are outstanding. The pages are asked for once every worker has been asked for its
+/// acknowledgement, so a busy worker holds up the pages of the workers after it and never their
+/// acknowledgements.
 const MAX_PAGE_RETRIES: u32 = 10;
+
+/// How often the daemon looks for names a worker still owes, apart from the announcements that
+/// ask for them.
+const EVIDENCE_PASS_INTERVAL: std::time::Duration = DEBT_PASS_INTERVAL;
 
 /// The pause before the first retry of a refused page.
 const PAGE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
@@ -47,8 +53,35 @@ const PAGE_RETRY_LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_
 struct EvidenceBudget {
     /// How many more page exchanges it may make.
     pages: usize,
-    /// How many more times it may ask again for a page the worker refused for now.
-    retries: u32,
+}
+
+/// How many more times an announcement may ask again for a page a worker refused for now, and how
+/// long it pauses before it does, across every worker it collects from.
+#[derive(Debug)]
+struct Retries {
+    left: u32,
+    pause: std::time::Duration,
+}
+
+impl Retries {
+    /// What a whole announcement may spend.
+    fn for_an_announcement() -> Self {
+        Self {
+            left: MAX_PAGE_RETRIES,
+            pause: PAGE_RETRY_PAUSE,
+        }
+    }
+
+    /// Waits before the next retry and says whether there is one, taking it from what is left.
+    async fn wait(&mut self) -> bool {
+        if self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        tokio::time::sleep(self.pause).await;
+        self.pause = (self.pause * 2).min(PAGE_RETRY_LONGEST_PAUSE);
+        true
+    }
 }
 
 /// How far one restrictive change reaches when the barrier that retires it fences connections.
@@ -312,6 +345,27 @@ async fn debt_pass(
     }
 }
 
+/// The evidence pass: at each of `passes` it asks the workers that still owe names for them.
+///
+/// An announcement asks a busy worker for its pages only for so long ([`MAX_PAGE_RETRIES`]) and
+/// reports what it did not get. Nothing else would ask again, since the debt the revocation owed
+/// is settled once its barrier holds, so the names would wait for some other announcement. They
+/// are asked for here, on a task of their own: a pass that waits for a worker must not hold up the
+/// debt pass, whose barrier is what lets the host admit work again. They land in the report of the
+/// revision they belong to, which is what an answer to a repeat of that revocation reads.
+async fn evidence_pass(daemon: std::sync::Weak<Controller>, mut passes: PassSchedule) {
+    loop {
+        passes.next().await;
+        let held = while_held(&daemon, async |controller: &Controller| {
+            controller.collect_names_owed().await;
+        })
+        .await;
+        if held.is_none() {
+            return;
+        }
+    }
+}
+
 /// Waits for the telling under way to end, and for ever while there is none.
 async fn until_told(telling: &mut Option<tokio::task::JoinHandle<()>>) {
     match telling {
@@ -510,8 +564,11 @@ impl Controller {
             }
             self.reconcile(*session_id).await?;
         }
+        // One bound on the asking again for the whole announcement, so many busy workers do not
+        // cost the time of each.
+        let mut retries = Retries::for_an_announcement();
         for (session_id, binding) in acknowledged {
-            self.collect_owed_evidence(session_id, binding, revision)
+            self.collect_owed_evidence_within(session_id, binding, revision, &mut retries)
                 .await;
         }
         // The report is taken inside one section of the registry, which is also where a closure is
@@ -536,6 +593,31 @@ impl Controller {
             registry.settle_fence(revision)?;
         }
         Ok(report)
+    }
+
+    /// The barrier of one revision as the daemon holds it now, without asking a worker anything.
+    ///
+    /// The workers it covers are those recorded and not closed, as the end of an announcement
+    /// takes them, so what it names of each is what the daemon has collected since the revision
+    /// was announced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(super) async fn barrier_as_it_stands(
+        &self,
+        revision: AuthorityRevision,
+    ) -> Result<RevocationBarrier> {
+        let round = self.leases.begin_round();
+        round.at(revision);
+        let registry = self.registry.lock().await;
+        let mut covered = Vec::new();
+        for worker in registry.workers()? {
+            if registry.closure(worker.session_id)?.is_none() {
+                covered.push(worker.session_id);
+            }
+        }
+        Ok(round.report(revision, covered))
     }
 
     /// Establishes a worker's control path, unless its session has closed.
@@ -587,8 +669,26 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
     ) {
+        self.collect_owed_evidence_within(
+            session_id,
+            binding,
+            revision,
+            &mut Retries::for_an_announcement(),
+        )
+        .await;
+    }
+
+    /// As [`Self::collect_owed_evidence`], asking again for a refused page out of `retries`, which
+    /// a caller that collects from several workers shares among them.
+    async fn collect_owed_evidence_within(
+        &self,
+        session_id: SessionId,
+        binding: kr_transport::lease::WorkerBinding,
+        revision: AuthorityRevision,
+        retries: &mut Retries,
+    ) {
         let mut budget = self.evidence_budget();
-        self.collect_fence_evidence(session_id, binding, revision, &mut budget, false)
+        self.collect_fence_evidence(session_id, binding, revision, &mut budget, retries, false)
             .await;
         // The revisions announced to the worker that a result it holds a report for reads and the
         // worker has said nothing about, because the announcement was refused or lost. Its fence
@@ -599,14 +699,14 @@ impl Controller {
             if budget.pages == 0 {
                 return;
             }
-            self.collect_fence_evidence(session_id, binding, earlier, &mut budget, true)
+            self.collect_fence_evidence(session_id, binding, earlier, &mut budget, retries, true)
                 .await;
         }
         for older in self.leases.evidence_outstanding(session_id, revision) {
             if budget.pages == 0 {
                 return;
             }
-            self.collect_fence_evidence(session_id, binding, older, &mut budget, false)
+            self.collect_fence_evidence(session_id, binding, older, &mut budget, retries, false)
                 .await;
         }
     }
@@ -620,10 +720,7 @@ impl Controller {
         );
         #[cfg(not(feature = "testing"))]
         let pages = MAX_EVIDENCE_PAGES;
-        EvidenceBudget {
-            pages,
-            retries: MAX_PAGE_RETRIES,
-        }
+        EvidenceBudget { pages }
     }
 
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
@@ -695,9 +792,9 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
         budget: &mut EvidenceBudget,
+        retries: &mut Retries,
         mut unasked: bool,
     ) {
-        let mut pause = PAGE_RETRY_PAUSE;
         while budget.pages > 0 {
             budget.pages -= 1;
             let from = if unasked {
@@ -752,12 +849,9 @@ impl Controller {
                 // The attempt was not a page: it does not count against the pages, and the
                 // retries have their own bound.
                 budget.pages += 1;
-                if budget.retries == 0 {
+                if !retries.wait().await {
                     return;
                 }
-                budget.retries -= 1;
-                tokio::time::sleep(pause).await;
-                pause = (pause * 2).min(PAGE_RETRY_LONGEST_PAUSE);
                 continue;
             };
             if !self
@@ -1303,13 +1397,47 @@ impl Controller {
     }
 
     /// Starts the debt pass ([`debt_pass`]), which raises a barrier for every debt left to it at
-    /// each of `passes`, and at once whenever a change leaves it one.
+    /// each of `passes`, and at once whenever a change leaves it one, and the evidence pass
+    /// ([`evidence_pass`]) beside it.
     pub(super) fn start_debt_pass(self: &Arc<Self>, passes: PassSchedule) {
         tokio::spawn(debt_pass(
             Arc::downgrade(self),
             Arc::clone(&self.debt_pass),
             passes,
         ));
+        tokio::spawn(evidence_pass(
+            Arc::downgrade(self),
+            PassSchedule::every(EVIDENCE_PASS_INTERVAL),
+        ));
+    }
+
+    /// Asks every worker that still owes names of a revocation for them, out of one bound on the
+    /// asking again ([`evidence_pass`]).
+    async fn collect_names_owed(&self) {
+        let owing = self.leases.owing_names();
+        if owing.is_empty() {
+            return;
+        }
+        // Held as an announcement holds its round, so a worker that ends while this runs keeps
+        // the names it had given until this is over.
+        let round = self.leases.begin_round();
+        let revision = {
+            let registry = self.registry.lock().await;
+            let Ok(revision) = registry.authority_revision() else {
+                return;
+            };
+            round.at(revision);
+            revision
+        };
+        let mut retries = Retries::for_an_announcement();
+        for session_id in owing {
+            // A worker whose session has closed is bound no more, and owes nothing it can give.
+            let Ok(Some(binding)) = self.binding_or_bind(session_id).await else {
+                continue;
+            };
+            self.collect_owed_evidence_within(session_id, binding, revision, &mut retries)
+                .await;
+        }
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.

@@ -908,6 +908,26 @@ impl AuthorityBarrier {
         Some(report.named())
     }
 
+    /// Returns the workers that still owe names of some revocation and are not ended, in session
+    /// order: the ones whose pages the daemon goes on asking for apart from any announcement.
+    ///
+    /// An ended worker cannot supply them, and what it named is in its report whatever happens.
+    #[must_use]
+    pub fn owing_names(&self) -> Vec<SessionId> {
+        let roster = self.ordered();
+        let fences = self.lock();
+        let mut owing: Vec<SessionId> = fences
+            .iter()
+            .filter(|(session_id, held)| {
+                !roster.retired.contains_key(session_id)
+                    && held.reports.iter().any(|report| report.remaining > 0)
+            })
+            .map(|(session_id, _)| *session_id)
+            .collect();
+        owing.sort_unstable();
+        owing
+    }
+
     /// Returns the older revocations this worker still owes names for, oldest first.
     ///
     /// A page whose exchange failed before a newer revision arrived is still owed: section 9 asks

@@ -2295,6 +2295,12 @@ impl Journal {
     /// [`kr_protocol::action::MAX_NAMED_FENCED_ACTIONS`] names, and `remaining` says how many are
     /// still to come: nought there is what says the evidence is complete.
     ///
+    /// The actions whose dispatch had already won the serial race come before the intents the
+    /// fence took back, whichever the fence named first. They are the names section 9 requires,
+    /// and a caller that stops collecting early has them. The order is the same on every page of
+    /// one revision, which is what keeps `from` a count of names the caller holds: a pass names
+    /// under its own revision, and a page is served only after a pass has finished.
+    ///
     /// A revocation whose names this journal no longer holds is the one case where nought
     /// remaining does not mean complete, and `omitted` is what says so: it carries how many names
     /// went without reaching the daemon, so a page of nothing is not read as a fence that named
@@ -2326,7 +2332,7 @@ impl Journal {
             .prepare(
                 "SELECT kind, actor_id, action_id, method, state FROM fence_evidence
                  WHERE revision = ?1
-                 ORDER BY position
+                 ORDER BY (kind = 'rejected'), position
                  LIMIT ?2 OFFSET ?3",
             )
             .map_err(|error| faulted(&self.health, error))?;
