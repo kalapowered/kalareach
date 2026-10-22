@@ -225,8 +225,8 @@ const WORKER_IDLE_BYTES: usize = 2 * 1024 * 1024;
 const READY: &str = "kr-ready";
 
 /// Opens a session whose root shell waits for input, starts the runtime that serves it, and returns
-/// once the runtime has read what the shell first printed: its reading path has run and what it
-/// allocates for itself is counted.
+/// once the runtime has read what the shell first printed, has written it to the spool, and its
+/// supervision has taken a first look: what each allocates for itself is counted.
 async fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtime::SessionRuntime> {
     let session_id =
         kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
@@ -277,5 +277,21 @@ async fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtim
     tokio::task::spawn_blocking(move || writing.wait_for_the_spool_write())
         .await
         .expect("the spool write is waited for");
+    // The supervision has taken a look at the session's processes, and has finished it: it is
+    // asked for one, it is held while it is reading, and let go.
+    let (reading, resume) = runtime.pause_in_next_observation();
+    runtime.observe_now();
+    tokio::time::timeout(std::time::Duration::from_secs(60), reading)
+        .await
+        .expect("the supervision reached its reading")
+        .expect("the supervision is reading");
+    resume.send(()).expect("the supervision is let go");
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while runtime.supervision_is_looking() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the supervision finished its look");
     runtime
 }
