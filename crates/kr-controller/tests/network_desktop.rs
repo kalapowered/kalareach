@@ -10,8 +10,9 @@
 //! host-and-environment group are the three machine group steps and the presentation of the
 //! device's own organisation lease. KR-REQ-23.25, in part, for `environment.capabilities`.
 //!
-//! No worker is started here, so no session has work outstanding and nothing here observes an
-//! assertion actually held. Every one of these is a read the daemon answers itself.
+//! Most of these start no worker, so no session has work outstanding and they observe no assertion
+//! held; they are reads the daemon answers itself. The last starts a daemon that has adopted a
+//! worker, and shows what the worker's agent waits for reaching a device as the host's own demand.
 
 mod net_support;
 
@@ -27,6 +28,7 @@ use kr_protocol::ids::EnvironmentId;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use net_support::Host;
+use net_support::worker::{Adopted, Upstream};
 
 /// A grant that sees a session and nothing more. Capability evidence is not authority, so this is
 /// the narrowest grant a device can hold and still reach the host's own reads.
@@ -425,4 +427,160 @@ async fn the_inhibition_a_device_reads_is_the_one_the_owner_chose_and_says_why()
 
     session.close();
     host.stop().await;
+}
+
+/// What a device reads of the host's sleep demand, until it counts `pending` requests.
+///
+/// Each read is the host evaluating its own demand, which asks every worker what it has
+/// outstanding, so the wait ends on the count the daemon reached from what the worker said and on
+/// nothing else.
+async fn demand_reaches(session: &kr_client::session::Session, pending: u64) -> HostInfoResult {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let info: HostInfoResult = session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("host.info is served to the device");
+        if info.power.pending_requests.get() == pending {
+            return info;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the host counts {} pending requests, and never {pending}",
+            info.power.pending_requests.get()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// The process the platform's own listing is asked about, from the sentence the host gives for the
+/// assertion it holds.
+fn holder_process(holder: &str) -> &str {
+    holder
+        .split("process ")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .expect("the holder names the process the assertion is held for")
+}
+
+/// Whether the operating system's own listing of sleep assertions names `process`, where the
+/// platform has one this suite can ask.
+fn the_platform_lists(process: &str) -> Option<bool> {
+    let (program, arguments, wanted) = if cfg!(target_os = "macos") {
+        (
+            "/usr/bin/pmset",
+            vec!["-g", "assertions"],
+            format!("(pid {process})"),
+        )
+    } else if cfg!(target_os = "linux") {
+        (
+            "systemd-inhibit",
+            vec!["--list", "--no-legend"],
+            process.to_owned(),
+        )
+    } else {
+        return None;
+    };
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).contains(&wanted))
+}
+
+/// KR-REQ-03.27: what the agent in a session waits for is the host's own sleep demand, read by a
+/// device over the network.
+///
+/// The owner chose to be kept awake on any power source. A question an agent has put to the person
+/// is a pending request the moment the worker says so, and so is an approval a connector's table
+/// answers; each ends with the person's answer. The count is the daemon's, reached from what the
+/// worker reported, and holds on every platform. Whether the machine is kept awake then is the
+/// platform's: where it confirms the assertion, its own listing names the process the host says
+/// it holds it for and stops naming it when the demand ends, and where it does not, the host says
+/// which facility did not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_reads() {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.preferences.sleep_inhibition =
+        kr_protocol::scalars::Nullable::some(SleepInhibitionSetting::BatteryToo);
+    let adopted = Adopted::start_with_document(1, &document).await;
+    let (_device, session) =
+        net_support::paired_device(&adopted.host, &adopted.owner, VIEWER).await;
+    let worker = &adopted.workers[0];
+
+    let idle = demand_reaches(&session, 0).await;
+    assert_eq!(idle.power.setting, SleepInhibitionSetting::BatteryToo);
+    assert!(
+        !idle.power.active,
+        "nothing is outstanding, so nothing is held"
+    );
+
+    // A question the agent put to the person.
+    let question = worker.ask("publish");
+    let waiting = demand_reaches(&session, 1).await;
+    let power = &waiting.power;
+    assert_eq!(
+        power.active,
+        power.holder.is_present(),
+        "an assertion is held exactly when the host names its holder"
+    );
+    if power.active {
+        assert_eq!(
+            power.reason.as_ref().copied(),
+            Some(kr_protocol::desktop::InhibitionReason::PendingRequests),
+            "the reason is the request that is waiting"
+        );
+        let process = holder_process(power.holder.0.as_deref().expect("a holder"));
+        if let Some(listed) = the_platform_lists(process) {
+            assert!(listed, "the platform's own listing names process {process}");
+        }
+    } else {
+        assert!(
+            power
+                .withheld_reason
+                .0
+                .as_deref()
+                .is_some_and(|reason| reason.contains("facility") || reason.contains("assertion")),
+            "a host that cannot hold the assertion says which facility did not: {power:?}"
+        );
+    }
+
+    worker
+        .service
+        .questions()
+        .cancel(
+            &kr_protocol::question::QuestionCancelParams {
+                session_id: worker.session_id,
+                question_id: question.question_id,
+                expected_revision: question.revision,
+            },
+            kr_worker::questions::Now {
+                utc_ms: kr_ipc::now_ms(),
+                boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+            },
+        )
+        .expect("the person withdraws the question");
+    let released = demand_reaches(&session, 0).await;
+    assert!(!released.power.active, "the assertion ends with the demand");
+    if let Some(holder) = power.holder.0.as_deref() {
+        let process = holder_process(holder);
+        if let Some(listed) = the_platform_lists(process) {
+            assert!(
+                !listed,
+                "and the platform's listing stops naming process {process}"
+            );
+        }
+    }
+
+    // An approval the connector's table answers.
+    let upstream = std::sync::Arc::new(Upstream::default());
+    let instance = worker.register_agent(std::sync::Arc::clone(&upstream));
+    let _approval = worker.offer_approval(instance, upstream);
+    demand_reaches(&session, 1).await;
+
+    session.close();
+    adopted.stop().await;
 }
