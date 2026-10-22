@@ -13,6 +13,8 @@ use kr_protocol::ids::EnvironmentId;
 
 use crate::paths::{EnvironmentPaths, HostPaths};
 
+#[cfg(target_os = "linux")]
+pub mod hung_mount;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod volumes;
 

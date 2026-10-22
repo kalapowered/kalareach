@@ -15,6 +15,8 @@ use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+use kr_ipc::testing::hung_mount::HungMount;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::Uuid;
 use kr_transfer::{AuthorisedDirectory, Escape, ObjectPolicy, RelativeName};
@@ -2603,92 +2605,6 @@ fn removal_mount() {
 #[cfg(target_os = "linux")]
 const HUNG_REMOVAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A filesystem in user space that is mounted and never served: every request made of it, a look
-/// at its root included, waits for an answer that does not come.
-///
-/// It is what a network mount whose server has gone is to a caller. The server end is held here,
-/// and letting it go aborts the connection, which ends every call waiting on the mount.
-#[cfg(target_os = "linux")]
-struct HungMount {
-    server: Option<std::os::fd::OwnedFd>,
-    at: std::path::PathBuf,
-}
-
-#[cfg(target_os = "linux")]
-impl HungMount {
-    /// Mounts it at `at`, an empty directory this account owns, through the setuid helper a
-    /// user-space filesystem is mounted with by an unprivileged account.
-    ///
-    /// The helper opens the control device, mounts it, and passes the descriptor back over the
-    /// socket it is told of, which is how a server is given its end.
-    ///
-    /// # Errors
-    ///
-    /// Returns what this host lacks when it cannot place the mount.
-    fn attach(at: &Path) -> Result<Self, String> {
-        use std::io::IoSliceMut;
-        use std::mem::MaybeUninit;
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::net::UnixStream;
-
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
-
-        if !Path::new("/dev/fuse").exists() {
-            return Err("this host has no /dev/fuse".to_owned());
-        }
-        let (ours, theirs) = UnixStream::pair().map_err(|error| error.to_string())?;
-        // Held open across the helper's start, which a descriptor is not by default.
-        rustix::io::fcntl_setfd(&theirs, rustix::io::FdFlags::empty())
-            .map_err(|error| error.to_string())?;
-        let helper = std::process::Command::new("fusermount3")
-            .args(["-o", "rw,nosuid,nodev,fsname=kr-hung", "--"])
-            .arg(at)
-            .env("_FUSE_COMMFD", theirs.as_raw_fd().to_string())
-            .output()
-            .map_err(|error| format!("fusermount3 could not be run: {error}"))?;
-        drop(theirs);
-        if !helper.status.success() {
-            return Err(format!(
-                "fusermount3 would not place the mount: {}",
-                String::from_utf8_lossy(&helper.stderr).trim()
-            ));
-        }
-        let mut data = [0_u8; 1];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-        let mut control = RecvAncillaryBuffer::new(&mut space);
-        // Marked to close on exec as it arrives, so that no process another case starts while the
-        // mount is there keeps the server's end open and the connection alive.
-        recvmsg(
-            &ours,
-            &mut [IoSliceMut::new(&mut data)],
-            &mut control,
-            RecvFlags::CMSG_CLOEXEC,
-        )
-        .map_err(|error| format!("the descriptor did not arrive: {error}"))?;
-        let server = control.drain().find_map(|message| match message {
-            RecvAncillaryMessage::ScmRights(mut descriptors) => descriptors.next(),
-            _ => None,
-        });
-        Ok(Self {
-            server: Some(server.ok_or("fusermount3 passed no descriptor")?),
-            at: at.to_owned(),
-        })
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for HungMount {
-    fn drop(&mut self) {
-        // The connection is aborted first, so that nothing is left waiting on the mount while it
-        // comes off.
-        drop(self.server.take());
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-u", "-z"])
-            .arg(&self.at)
-            .status();
-    }
-}
-
 /// KR-REQ-14.05: a recursive removal does not wait on a mount that never answers. It stops at the
 /// mount as at any other, and names it, without a single request reaching the mounted filesystem:
 /// a look at the root of a mount whose server has gone does not return.
@@ -2704,16 +2620,8 @@ fn a_removal_does_not_wait_on_a_mount_that_never_answers() {
     let mount_point = root.path().join("tree/branch/mount");
     std::fs::create_dir_all(&mount_point).expect("the tree");
     std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
-    let hung = match HungMount::attach(&mount_point) {
-        Ok(hung) => hung,
-        Err(why) => {
-            assert!(
-                std::env::var_os("KR_REQUIRE_FUSE").is_none(),
-                "this host cannot place the mount this check needs: {why}"
-            );
-            eprintln!("skipped: {why}");
-            return;
-        }
+    let Some(hung) = HungMount::attach_where_possible(&mount_point) else {
+        return;
     };
     let authority =
         AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
@@ -2778,16 +2686,8 @@ fn a_removal_does_not_wait_on_a_mount_put_on_a_directory_it_has_emptied() {
         let root = kr_ipc::testing::PrivateTempDir::create();
         std::fs::create_dir_all(root.path().join("tree/branch/inner")).expect("the tree");
         std::fs::create_dir(root.path().join("probe")).expect("a place to try a mount");
-        match HungMount::attach(&root.path().join("probe")) {
-            Ok(probe) => drop(probe),
-            Err(why) => {
-                assert!(
-                    std::env::var_os("KR_REQUIRE_FUSE").is_none(),
-                    "this host cannot place the mount this check needs: {why}"
-                );
-                eprintln!("skipped: {why}");
-                return;
-            }
+        if HungMount::attach_where_possible(&root.path().join("probe")).is_none() {
+            return;
         }
         let authority = AuthorisedDirectory::open_root(environment(), root.path())
             .expect("the authority opens");
