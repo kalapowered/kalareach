@@ -1372,6 +1372,8 @@ impl Ceremony for ChangingCeremony {
 /// that it cannot check and where to confirm instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_with_no_ceremony_still_lists_what_its_host_asks() {
+    use serde_json::json;
+
     let host_owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&host_owner).await;
     let environment = host.environment_id;
@@ -1391,13 +1393,32 @@ async fn a_phone_with_no_ceremony_still_lists_what_its_host_asks() {
         Arc::new(StubIntake::default()),
     );
     support::record_owned(&as_owner.device(), &host, "the test host");
-    let _ = calls::request(environment, &mut client, an_invitation())
+    let challenge = calls::request(environment, &mut client, an_invitation())
         .await
-        .expect("the local owner asks");
+        .expect("the local owner asks")
+        .request;
     let request = as_owner
         .listed(|request| request["checkable"] == true)
         .await;
     assert_eq!(request["checkable"], true);
+    // The phone can check nothing, so a review asks no one and signs nothing: the host's request
+    // stays unanswered.
+    assert_eq!(
+        as_owner.call(
+            "owner_confirmation_review",
+            json!({ "request": { "reference": request["reference"] } })
+        ),
+        Ok(json!("no_ceremony"))
+    );
+    assert!(
+        host.network()
+            .pairing()
+            .rows()
+            .acceptance(challenge.confirmation_id)
+            .expect("readable")
+            .is_none(),
+        "a phone that can check nothing answered the host's request"
+    );
 }
 
 /// KR-REQ-10.52: a ceremony the phone starts to offer after the application started reaches the page
