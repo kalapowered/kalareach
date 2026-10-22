@@ -660,7 +660,7 @@ pub(crate) fn group_of(process: &ProcessStartIdentity) -> Option<i32> {
 /// Returns the argument vector a process was started with, as the kernel keeps it:
 /// `/proc/<pid>/cmdline`, one argument after each NUL-terminated one.
 #[cfg(target_os = "linux")]
-fn arguments_of(pid: u32) -> Option<Vec<String>> {
+pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
     if bytes.is_empty() {
@@ -677,7 +677,7 @@ fn arguments_of(pid: u32) -> Option<Vec<String>> {
 /// Returns the argument vector a process was started with, as the kernel keeps it: macOS's
 /// `KERN_PROCARGS2`, read through `sysinfo`.
 #[cfg(not(target_os = "linux"))]
-fn arguments_of(pid: u32) -> Option<Vec<String>> {
+pub(crate) fn arguments_of(pid: u32) -> Option<Vec<String>> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
     let mut system = sysinfo::System::new();
