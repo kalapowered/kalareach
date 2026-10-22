@@ -255,7 +255,6 @@ struct Inner {
     ordinary: VecDeque<Entry>,
     authoritative: VecDeque<Entry>,
     held: u64,
-    in_flight: u64,
     in_flight_entries: u64,
     next_seq: u64,
     pending_loss: LaneLoss,
@@ -373,13 +372,13 @@ impl ObservationLane {
     /// Returns true when some binding takes upstream frames.
     #[must_use]
     pub fn wants_native(&self) -> bool {
-        self.native_wanted.load(Ordering::Acquire) && !self.is_private()
+        self.native_wanted.load(Ordering::Acquire)
     }
 
     /// Returns true when some binding takes terminal output.
     #[must_use]
     pub fn wants_terminal(&self) -> bool {
-        self.terminal_wanted.load(Ordering::Acquire) && !self.is_private()
+        self.terminal_wanted.load(Ordering::Acquire)
     }
 
     /// Pushes one span of terminal output. Never waits, and copies nothing.
@@ -466,7 +465,6 @@ impl ObservationLane {
         } else {
             inner.ordinary.pop_front()
         }?;
-        inner.in_flight = inner.in_flight.saturating_add(entry.cost);
         inner.in_flight_entries = inner.in_flight_entries.saturating_add(1);
         Some(entry)
     }
@@ -475,7 +473,6 @@ impl ObservationLane {
     pub fn finish(&self, entry: &Entry) {
         let mut inner = self.inner();
         inner.held = inner.held.saturating_sub(entry.cost);
-        inner.in_flight = inner.in_flight.saturating_sub(entry.cost);
         inner.in_flight_entries = inner.in_flight_entries.saturating_sub(1);
     }
 
@@ -779,8 +776,9 @@ impl ObservationLane {
 
     // -- privacy mode -------------------------------------------------------------------------
 
-    /// Says whether privacy mode is on. While it is, nothing is pushed or held, and what the lane
-    /// and the link hold of content is dropped when it is turned on ([`Self::fence`]).
+    /// Says whether privacy mode is on. Observation for live use goes on under it; what does not is
+    /// anything derived from it that would outlive it: while it is on no checkpoint is taken or
+    /// held, and the ones held are dropped when it is turned on ([`Self::fence`]).
     pub fn set_private(&self, private: bool) {
         self.private.store(private, Ordering::Release);
     }
@@ -791,23 +789,17 @@ impl ObservationLane {
         self.private.load(Ordering::Acquire)
     }
 
-    /// Drops everything the lane holds of content: the entries waiting and every held checkpoint.
-    /// Returns the entries dropped and the checkpoint bytes and records removed.
+    /// Drops every checkpoint held, which is everything this lane holds that is derived from what a
+    /// component was offered: the entries waiting are live observation, bounded in time by the
+    /// pump and in size by the lane. Returns the checkpoints dropped and their bytes.
     pub fn fence(&self) -> Fenced {
         let mut inner = self.inner();
-        let entries = inner.ordinary.len() + inner.authoritative.len();
-        let kept_in_flight = inner.in_flight;
-        inner.ordinary.clear();
-        inner.authoritative.clear();
-        inner.held = kept_in_flight;
-        inner.pending_loss = LaneLoss::default();
         let records = inner.checkpoints.len();
         let bytes = inner.checkpoint_bytes;
         inner.checkpoints.clear();
         inner.checkpoint_order.clear();
         inner.checkpoint_bytes = 0;
         Fenced {
-            entries: entries as u64,
             checkpoints: records as u64,
             checkpoint_bytes: bytes,
         }
@@ -859,28 +851,21 @@ impl ObservationLane {
 
 /// The observation lane's part in privacy mode.
 ///
-/// Observation for live use goes on under privacy mode, and nothing derived from it outlives it:
-/// turning privacy mode on stops the lane taking anything, drops what it is holding and drops the
-/// state held for each binding, so a component restored after that starts again from the live
-/// point; while it is on, no state is taken or held (`ObservationLane::hold` refuses).
+/// Observation for live use goes on under privacy mode, and nothing derived from it outlives it.
+/// Turning privacy mode on stops any more of a component's state being taken and drops the state
+/// held for each binding, so a component restored after that starts again from the live point; while
+/// it is on, a component is never asked for its state ([`ObservationLane::checkpoint_due`]) and
+/// nothing is held ([`ObservationLane::hold`]).
 #[derive(Clone, Debug)]
 pub struct ObservationPrivacy {
     lane: Arc<ObservationLane>,
-    removed: Fenced,
 }
 
 impl ObservationPrivacy {
     /// Builds the subsystem over a session's lane.
     #[must_use]
     pub const fn over(lane: Arc<ObservationLane>) -> Self {
-        Self {
-            lane,
-            removed: Fenced {
-                entries: 0,
-                checkpoints: 0,
-                checkpoint_bytes: 0,
-            },
-        }
+        Self { lane }
     }
 }
 
@@ -894,11 +879,9 @@ impl crate::privacy::PrivacySubsystem for ObservationPrivacy {
         _generation: crate::privacy::PrivacyGeneration,
     ) -> Result<crate::privacy::Fenced, crate::privacy::Unavailable> {
         self.lane.set_private(true);
-        let dropped = self.lane.fence();
-        self.removed = dropped;
         Ok(crate::privacy::Fenced {
             queues: 1,
-            items: dropped.entries,
+            items: 0,
         })
     }
 
@@ -913,26 +896,23 @@ impl crate::privacy::PrivacySubsystem for ObservationPrivacy {
         &mut self,
         _generation: crate::privacy::PrivacyGeneration,
     ) -> Result<crate::privacy::Removed, crate::privacy::Unavailable> {
-        // The fence removed them; removing again at the same generation changes nothing.
-        let again = self.lane.fence();
+        let dropped = self.lane.fence();
         Ok(crate::privacy::Removed {
-            bytes: self.removed.checkpoint_bytes.max(again.checkpoint_bytes),
-            records: self.removed.checkpoints.max(again.checkpoints),
+            bytes: dropped.checkpoint_bytes,
+            records: dropped.checkpoints,
         })
     }
 
     fn outstanding(&self) -> Result<u64, crate::privacy::Unavailable> {
-        // An entry the pump is offering when privacy mode is turned on is already out of the
-        // lane; the cleanup is finished when the pump is done with it.
-        Ok(self.lane.in_flight())
+        // A checkpoint being taken when privacy mode is turned on is refused when it comes back:
+        // nothing is held while it is on. So there is nothing in flight to wait for.
+        Ok(0)
     }
 }
 
 /// What turning privacy mode on dropped from the lane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fenced {
-    /// Entries that were waiting.
-    pub entries: u64,
     /// Checkpoints that were held.
     pub checkpoints: u64,
     /// The bytes those checkpoints held.
