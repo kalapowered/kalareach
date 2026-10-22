@@ -63,6 +63,7 @@ pub mod channels;
 pub mod commands;
 pub mod component;
 pub mod connectors;
+pub mod decoding;
 pub mod duplex;
 pub mod endpoint;
 pub mod error;
