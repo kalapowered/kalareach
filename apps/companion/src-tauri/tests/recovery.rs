@@ -225,6 +225,9 @@ impl Computer {
                 companion_tauri::commands::recovery_turn_on,
                 companion_tauri::commands::recovery_settle,
                 companion_tauri::commands::recovery_save_kit,
+                companion_tauri::commands::recovery_save_kit_qr,
+                companion_tauri::commands::recovery_archives,
+                companion_tauri::commands::recovery_export_offline,
                 companion_tauri::commands::recovery_cover_host,
             ])
             .build(mock_context(noop_assets()))
@@ -1019,6 +1022,180 @@ async fn a_write_whose_answer_was_lost_blocks_the_next_until_it_is_settled() {
         .expect_err("no answer from the host");
     assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
     assert_eq!(silent.setups_sent().len(), 1, "the host was asked once");
+}
+
+/// The QR code a saved kit draws, read back by a decoder that shares nothing with the encoder: the
+/// squares the file draws are put on a bitmap and the bitmap is scanned.
+fn scanned(svg: &str) -> (rqrr::MetaData, String) {
+    let size: usize = svg
+        .split("viewBox=\"0 0 ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|number| number.parse().ok())
+        .expect("a view box");
+    let path = svg
+        .split("<path d=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a path");
+    let mut dark = vec![false; size * size];
+    for square in path.split(' ') {
+        let (x, y) = square
+            .strip_prefix('M')
+            .and_then(|rest| rest.strip_suffix("h1v1h-1z"))
+            .and_then(|at| at.split_once(','))
+            .expect("a unit square");
+        dark[y.parse::<usize>().expect("a row") * size + x.parse::<usize>().expect("a column")] =
+            true;
+    }
+    let scale = 8;
+    let mut image =
+        rqrr::PreparedImage::prepare_from_greyscale(size * scale, size * scale, |x, y| {
+            if dark[(y / scale) * size + x / scale] {
+                0
+            } else {
+                255
+            }
+        });
+    let grids = image.detect_grids();
+    assert_eq!(grids.len(), 1, "one code is drawn");
+    grids[0].decode().expect("the code decodes")
+}
+
+/// KR-REQ-20.18: the kit saves as a QR code that scans back to the kit's own text, at the error
+/// correction a printed copy needs, in a file only its owner reads; and nothing is drawn while
+/// recovery is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kit_saved_as_a_qr_code_scans_back_to_the_kit_and_is_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    let out = tempfile::tempdir().expect("a directory");
+    let path = out.path().join("kit.svg");
+    page.dialog_returns(&path);
+    let refused = page
+        .call(
+            "recovery_save_kit_qr",
+            json!({ "path": path.to_string_lossy() }),
+        )
+        .expect_err("no kit while recovery is off");
+    assert_eq!(refused["code"], "PERMISSION_DENIED");
+    assert!(!path.exists());
+
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let (_, kit) = page.kit(out.path());
+    page.dialog_returns(&path);
+    page.call(
+        "recovery_save_kit_qr",
+        json!({ "path": path.to_string_lossy() }),
+    )
+    .expect("the QR code is saved");
+    let svg = std::fs::read_to_string(&path).expect("the file");
+    let (meta, text) = scanned(&svg);
+    assert_eq!(meta.ecc_level, 3, "error correction level Q");
+    assert_eq!(
+        text,
+        kr_client::recovery::render_kit(&kit)
+            .expect("the kit's text")
+            .to_string(),
+        "a scanner reads the document a person could have typed"
+    );
+    let mode = std::fs::metadata(&path)
+        .expect("the file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the code is private to its owner");
+    // The page was told where, and nothing the code holds.
+    assert!(!page.told().contains(&kit.bundle_locator));
+}
+
+/// KR-REQ-20.18: the bundle exports alone as a file of ciphertext, in the owner-only mode, that is
+/// the bundle as the service holds it; the archives the bundle names are listed; and a request for
+/// an archive the bundle does not name, or while recovery is off, writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bundle_exports_alone_as_a_private_file_of_ciphertext() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    let out = tempfile::tempdir().expect("a directory");
+    let path = out.path().join("bundle.krexport");
+    page.dialog_returns(&path);
+    let refused = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": path.to_string_lossy(), "archive": null }),
+        )
+        .expect_err("recovery is off");
+    assert_eq!(refused["code"], "PERMISSION_DENIED");
+    assert!(!path.exists());
+
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let (_, kit) = page.kit(out.path());
+    assert_eq!(
+        page.call("recovery_archives", json!({}))
+            .expect("the archives"),
+        json!([]),
+        "a bundle that names no archive lists none"
+    );
+    page.dialog_returns(&path);
+    let saved = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": path.to_string_lossy(), "archive": null }),
+        )
+        .expect("the bundle is exported");
+    assert_eq!(saved["archive_id"], Value::Null);
+    let bytes = std::fs::read(&path).expect("the file");
+    assert_eq!(saved["bytes"], bytes.len());
+    let export =
+        kr_client::recovery::OfflineExport::from_canonical_slice(&bytes).expect("an export");
+    assert_eq!(
+        Some(export.encrypted_bundle.as_slice().to_vec()),
+        computer.served.web().bundle(&kit.bundle_locator),
+        "the bundle as the service holds it"
+    );
+    assert!(export.archive.0.is_none());
+    let seed = RecoverySeed::from_kit(&kit).expect("the seed");
+    let kit_text = kr_client::recovery::render_kit(&kit)
+        .expect("the kit's text")
+        .to_string();
+    let seed_line = kit_text
+        .lines()
+        .find_map(|line| line.strip_prefix("seed: "))
+        .expect("a seed line");
+    assert!(
+        !bytes
+            .windows(seed_line.len())
+            .any(|window| window == seed_line.as_bytes()),
+        "the export holds no kit text"
+    );
+    drop(seed);
+    let mode = std::fs::metadata(&path)
+        .expect("the file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the export is private to its owner");
+
+    // An archive the bundle does not name writes nothing.
+    let other = out.path().join("other.krexport");
+    page.dialog_returns(&other);
+    let unlisted = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": other.to_string_lossy(), "archive": "00000000-0000-4000-8000-000000000099" }),
+        )
+        .expect_err("not listed");
+    assert_eq!(unlisted["code"], "PERMISSION_DENIED");
+    assert!(!other.exists());
+    let malformed = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": other.to_string_lossy(), "archive": "not an identifier" }),
+        )
+        .expect_err("not an identifier");
+    assert_eq!(malformed["code"], "INVALID_ARGUMENT");
 }
 
 /// The first write of all can be lost too. Whether it landed or not, settling it leaves recovery

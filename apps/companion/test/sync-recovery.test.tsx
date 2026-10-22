@@ -257,6 +257,71 @@ describe('recovery', () => {
     })
   })
 
+  it('draws the kit as a QR code and makes offline copies of the bundle and an archive, each where the dialog put it', async () => {
+    const { person, controls, sheet, port } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+      controls.recovery.setArchives([
+        {
+          archive_id: '0a1b2c3d-0000-4000-8000-000000000001',
+          generation: 4,
+          published_at_ms: Date.UTC(2026, 9, 12),
+          withheld: null
+        },
+        {
+          archive_id: '0a1b2c3d-0000-4000-8000-000000000002',
+          generation: null,
+          published_at_ms: null,
+          withheld: 'nothing'
+        }
+      ])
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    const chosen: string[] = []
+    port.chooseExportPath = (name) => {
+      chosen.push(name)
+      return Promise.resolve(`/tmp/${name}`)
+    }
+
+    await person.click(within(recovery).getByTestId('recovery-save-qr'))
+    await waitFor(() => {
+      expect(controls.recovery.qrSaved).toEqual(['/tmp/kalareach-recovery-kit.svg'])
+    })
+
+    await person.click(within(recovery).getByTestId('recovery-export-offline'))
+    const copies = await within(recovery).findByTestId('recovery-copies')
+    expect(within(recovery).getByTestId('recovery-export-help')).toBeInTheDocument()
+    expect(copies).toHaveTextContent('generation 4')
+    expect(copies).toHaveTextContent('2026-10-12')
+    expect(copies).toHaveTextContent('no generation')
+    // An archive the service holds nothing of is not offered for copying.
+    expect(
+      within(recovery).getByTestId('recovery-copy-0a1b2c3d-0000-4000-8000-000000000002')
+    ).toBeDisabled()
+
+    await person.click(within(recovery).getByTestId('recovery-copy-0a1b2c3d-0000-4000-8000-000000000001'))
+    await waitFor(() => {
+      expect(controls.recovery.exportsMade).toEqual([
+        {
+          path: '/tmp/kalareach-archive-0a1b2c3d.krexport',
+          archive: '0a1b2c3d-0000-4000-8000-000000000001'
+        }
+      ])
+    })
+    await person.click(within(recovery).getByTestId('recovery-copy-bundle'))
+    await waitFor(() => {
+      expect(controls.recovery.exportsMade).toHaveLength(2)
+    })
+    expect(controls.recovery.exportsMade[1]).toEqual({
+      path: '/tmp/kalareach-recovery-bundle.krexport',
+      archive: null
+    })
+    expect(chosen).toContain('kalareach-recovery-bundle.krexport')
+    await person.click(within(recovery).getByTestId('recovery-copies-close'))
+    expect(within(recovery).queryByTestId('recovery-copies')).toBeNull()
+  })
+
   it('says that a bundle stays where it was made when another sync service is chosen', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
