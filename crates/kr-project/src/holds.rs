@@ -182,8 +182,8 @@ impl std::fmt::Display for Refusal {
                  writes where it runs",
             ),
             Self::TreeUnreadable => formatter.write_str(
-                "a tree this host records for its repository cannot be looked at, so what lies \
-                 above it cannot be held",
+                "a tree this host records for its repository cannot be looked at, so a removal \
+                 of a directory above it cannot be turned away",
             ),
             Self::Lapsed => formatter
                 .write_str("the hold ran out before every tree of its repository was covered"),
@@ -539,9 +539,9 @@ impl Drop for Hold {
 /// The nearest existing directory at or above `path` after links are resolved: a name that does
 /// not exist yet, or a file, stands for the directory it would be in. `None` when nothing of it
 /// can be opened, and when a directory on the way cannot be looked at for any other reason: a
-/// mount whose server has stopped or answers with an error, a directory this account may not
-/// search. That is not a missing name, and the directory above it says nothing of where the path
-/// leads.
+/// mount whose server has stopped or answers with any error but a missing name, a directory this
+/// account may not search. That is not a missing name, and the directory above it says nothing of
+/// where the path leads.
 fn identity_chain(
     environment_id: kr_protocol::ids::EnvironmentId,
     path: &Path,
