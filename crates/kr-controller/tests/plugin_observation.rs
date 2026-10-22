@@ -794,8 +794,13 @@ async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none
     world.send(&notification("one"));
     world.until_held(1, "observe=1;").await;
     assert_eq!(lane.held_checkpoints().0, 1);
+    // Another frame, offered after the state was taken and before the component has been quiet long
+    // enough to be asked for it again.
+    world.send(&notification("one more"));
+    world.until_offered(1).await;
 
-    // Privacy mode on: what is held is dropped.
+    // Privacy mode on: what is held is dropped, and the state the component is owed is not asked
+    // for.
     let mut authority = world
         .hosted
         .daemon_connection(ControllerConnectionRole::Authority)
@@ -807,6 +812,7 @@ async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none
         (0, 0),
         "the state held was dropped"
     );
+    assert!(lane.checkpoint_due(later).is_empty());
 
     // Observation for live use goes on. The component is owed a checkpoint it is not asked for.
     world.send(&notification("two"));
