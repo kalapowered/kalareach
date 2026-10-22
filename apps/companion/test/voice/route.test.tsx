@@ -88,7 +88,7 @@ describe('before a call exists', () => {
     ).toBeInTheDocument()
 
     const scope = screen.getByRole('region', { name: 'What will be sent' })
-    expect(within(scope).getByText('the contents of files')).toBeInTheDocument()
+    expect(within(scope).getByText('environment variables')).toBeInTheDocument()
     expect(within(scope).getByText(/at most 8,000 tokens/)).toBeInTheDocument()
 
     // Asking created nothing. Reading what a call would be must not start one, reserve anything

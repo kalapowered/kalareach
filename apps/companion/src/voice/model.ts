@@ -210,14 +210,10 @@ export interface ProviderChoice {
 /** How a content class reads to a person. */
 function classSummary(kind: string): string {
   switch (kind) {
-    case 'file_contents':
-      return 'the contents of files'
     case 'environment_variables':
       return 'environment variables'
     case 'terminal_scrollback':
       return 'raw terminal scrollback'
-    case 'attachment_bytes':
-      return 'the bytes of an attachment'
     default:
       return kind.replace(/_/g, ' ')
   }

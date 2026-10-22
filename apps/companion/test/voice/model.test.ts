@@ -72,8 +72,8 @@ function preparation(over: Partial<VoicePrepareResult> = {}): VoicePrepareResult
       statements: ['Summarise what a session is doing.', 'Move between sessions.'],
       unlocked_screen_actions: []
     },
-    excluded: ['attachment_bytes', 'environment_variables', 'file_contents', 'terminal_scrollback'],
-    selected: ['file_contents'],
+    excluded: ['environment_variables', 'terminal_scrollback'],
+    selected: ['environment_variables'],
     token_cap: 8000,
     message_count: 20,
     broker_origin: 'https://reach.kala.to',
@@ -141,7 +141,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     previousRate: null,
     context: [{ kind: 'the session', summary: 'its description and the last 20 messages' }],
     withheld: [
-      { kind: 'file_contents', summary: 'the contents of files', reason: 'not selected' }
+      { kind: 'terminal_scrollback', summary: 'raw terminal scrollback', reason: 'not selected' }
     ],
     tokenCap: 8000,
     messageCount: 20,
@@ -226,8 +226,8 @@ describe('the provider choice', () => {
   // KR-REQ-15.19: what is excluded is listed beside what is carried.
   it('lists what is not being sent beside what is, and never both', () => {
     const made = choiceFromPreparation(preparation())
-    expect(made.context.map((item) => item.kind)).toContain('file_contents')
-    expect(made.withheld.map((item) => item.kind)).not.toContain('file_contents')
+    expect(made.context.map((item) => item.kind)).toContain('environment_variables')
+    expect(made.withheld.map((item) => item.kind)).not.toContain('environment_variables')
     expect(made.withheld.map((item) => item.kind)).toContain('terminal_scrollback')
     for (const item of made.withheld) expect(item.reason).toBe('not selected')
   })

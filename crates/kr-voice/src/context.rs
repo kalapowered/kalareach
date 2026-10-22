@@ -583,8 +583,8 @@ mod tests {
                 .map(|index| ContextItem::new(format!("message {index}"), 2_000 + index))
                 .collect(),
             selected: vec![SelectedItem {
-                class: VoiceContextClass::FileContents,
-                item: ContextItem::new("the file the person chose", 2_200),
+                class: VoiceContextClass::EnvironmentVariables,
+                item: ContextItem::new("the variable the person chose", 2_200),
             }],
             resources: vec!["session:1".to_owned()],
             withheld: Vec::new(),
@@ -633,13 +633,15 @@ mod tests {
         let chosen = select_context(
             &gathered(),
             &grant(Some(1_000)),
-            &[VoiceContextClass::FileContents].into_iter().collect(),
+            &[VoiceContextClass::EnvironmentVariables]
+                .into_iter()
+                .collect(),
             &SecretPatterns::default(),
         );
         assert_eq!(chosen.selection.selected.len(), 1);
         assert_eq!(
             chosen.selection.selected[0].class,
-            VoiceContextClass::FileContents
+            VoiceContextClass::EnvironmentVariables
         );
     }
 
