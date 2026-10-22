@@ -166,6 +166,9 @@ pub struct Device {
     held: Mutex<Option<Held>>,
     /// The intake under way: a newer one, a stop and an attempt's start void it.
     intake: Mutex<Intaking>,
+    /// The number of the intake under way, told whenever it changes, so a wait that holds what an
+    /// intake read can end the moment that intake is void.
+    intake_number: watch::Sender<u64>,
     sources: Mutex<Sources>,
     running: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     progress: watch::Sender<AttemptState>,
@@ -353,6 +356,7 @@ impl Device {
             origin: Mutex::new(origin),
             held: Mutex::new(None),
             intake: Mutex::new(Intaking::default()),
+            intake_number: watch::channel(0).0,
             sources: Mutex::new(Sources::default()),
             running: Mutex::new(None),
             progress: watch::channel(AttemptState::Idle).0,
@@ -615,6 +619,7 @@ impl Device {
         intaking.number += 1;
         intaking.read = false;
         let intake = Intake(intaking.number);
+        self.intake_number.send_replace(intaking.number);
         let let_go = lock(&self.held).take().is_some();
         drop(intaking);
         if let_go {
@@ -640,7 +645,24 @@ impl Device {
 
     /// Voids the intake under way, when there is one.
     pub fn void_intakes(&self) {
-        lock(&self.intake).number += 1;
+        let mut intaking = lock(&self.intake);
+        intaking.number += 1;
+        self.intake_number.send_replace(intaking.number);
+    }
+
+    /// Answers once `intake` is no longer the one under way: a newer intake, a stop, an attempt's
+    /// start or the application's leaving the front voided it. A wait that holds what the intake
+    /// read ends on this, and lets go of it, instead of keeping it until a person answers.
+    pub async fn voided(&self, intake: Intake) {
+        let mut changes = self.intake_number.subscribe();
+        loop {
+            if !self.owns(intake) {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// The application stopped being in front. What was read and is not used yet is let go of: the
@@ -654,6 +676,7 @@ impl Device {
         if intaking.read {
             intaking.number += 1;
             intaking.read = false;
+            self.intake_number.send_replace(intaking.number);
         }
         let let_go = lock(&self.held).take().is_some();
         drop(intaking);

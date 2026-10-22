@@ -218,9 +218,18 @@ pub async fn take_in(
         && code.names_another_origin
     {
         let configured = device.view().origin;
-        let accepted = platform
-            .use_another_service(&code.origin, &configured.origin)
-            .await;
+        // What the code says is let go of the moment the intake is void (the application left the
+        // front, a newer intake began), not when a person finally answers an alert nobody sees.
+        let accepted = tokio::select! {
+            accepted = platform.use_another_service(&code.origin, &configured.origin) => accepted,
+            () = device.voided(intake) => {
+                drop(invitation);
+                return IntakeView {
+                    cleared,
+                    ..IntakeView::cancelled()
+                };
+            }
+        };
         // An answer to the alert after a newer intake, a stop or an attempt came first is no
         // answer to anything the person is looking at now.
         if !device.owns(intake) {
