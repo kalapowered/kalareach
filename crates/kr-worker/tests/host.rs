@@ -2069,7 +2069,10 @@ impl Standing {
     /// Reads the output of `whoami /user /fo csv /nh` and of `whoami /groups /fo csv /nh`.
     fn read(user: &str, groups: &str) -> Self {
         fn fields(line: &str) -> Vec<&str> {
-            line.trim().trim_matches('"').split("\",\"").collect()
+            let line = line.trim();
+            let line = line.strip_prefix('"').unwrap_or(line);
+            let line = line.strip_suffix('"').unwrap_or(line);
+            line.split("\",\"").collect()
         }
         let account = user
             .lines()
