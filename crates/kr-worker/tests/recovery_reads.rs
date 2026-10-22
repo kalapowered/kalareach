@@ -539,7 +539,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
         actor: device(),
         grant_rights: [ActionRight::SessionView].into_iter().collect(),
         accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
-        history: None,
+        history: (method == Method::SessionAttach).then(common::a_scope_with_the_live_screen),
         screen_basis: None,
         workflow_run_id: None,
         lease: Some(lease),

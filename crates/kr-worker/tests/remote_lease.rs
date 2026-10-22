@@ -286,6 +286,17 @@ fn for_a_device(
     )
 }
 
+/// The history scope of a grant that includes the live screen, which the daemon sends beside an
+/// attach it decided under such a grant.
+fn a_scope_with_the_live_screen() -> kr_protocol::grant::HistoryScope {
+    kr_protocol::grant::HistoryScope {
+        lower_bound_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(1)),
+        include_live_screen: true,
+        named_questions: CanonicalSet::new(),
+        named_approvals: CanonicalSet::new(),
+    }
+}
+
 fn forwarded(
     mutation: &MutationRequest,
     ingress: ActorIngress,
@@ -327,7 +338,9 @@ fn forwarded(
             CanonicalSet::new()
         },
         accepted_deadline_boot_ms: U64::new(boot_now_ms() + TWO_MINUTES_MS),
-        history: None,
+        // The daemon sends the scope of the grant an attach was decided under.
+        history: (device && mutation.method == Method::SessionAttach.into())
+            .then(a_scope_with_the_live_screen),
         screen_basis: None,
         workflow_run_id: None,
         lease,
