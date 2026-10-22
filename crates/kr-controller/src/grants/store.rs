@@ -408,6 +408,9 @@ pub struct GrantDirectory {
     /// The highest sequence the mirror holds, and the lock its writes are made under, so the two
     /// of them that race leave the newer one.
     mirrored: std::sync::Mutex<u64>,
+    /// Whether the last write of the copy failed, so that a lasting failure is reported once and
+    /// not at every write.
+    mirror_failing: std::sync::atomic::AtomicBool,
     /// Where this host's own tests stop a delegation, a redemption or a transfer once it has
     /// anchored its grant and before it takes the store's transaction. Compiled away in every
     /// shipped build.
@@ -553,6 +556,7 @@ impl GrantDirectory {
             host_clock: std::sync::OnceLock::new(),
             mirror: None,
             mirrored: std::sync::Mutex::new(0),
+            mirror_failing: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             before_effect: crate::attention::Pause::default(),
         })
@@ -2483,11 +2487,23 @@ impl GrantDirectory {
             return;
         }
         match super::mirror::write(file, sequence, policy) {
-            Ok(()) => *kept = sequence,
-            Err(error) => eprintln!(
-                "kr-controller: could not copy this host's policy, so a registry put back to \
-                 an earlier state would not be noticed until the next write: {error}"
-            ),
+            Ok(()) => {
+                *kept = sequence;
+                self.mirror_failing
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(error) => {
+                if !self
+                    .mirror_failing
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "kr-controller: could not copy this host's policy, so a registry put \
+                         back to an earlier state would not be noticed until a write of the \
+                         copy lands: {error}"
+                    );
+                }
+            }
         }
     }
 

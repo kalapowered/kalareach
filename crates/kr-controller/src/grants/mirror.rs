@@ -2,7 +2,7 @@
 //!
 //! The policy is written to the registry's `host_authority` table, with a sequence beside it that
 //! every write raises ([`super::store::GrantDirectory::store_policy`]). After each write the host
-//! keeps the same policy and the same sequence in `policy-mirror.json`. At a start the host reads
+//! keeps the same policy and the same sequence in `policy-mirror.cbor`. At a start the host reads
 //! both, and a registry whose sequence is below the mirror's was put back to an earlier state:
 //! the mirror is the policy then, and the older row, with the enrolments an owner left, the
 //! exclusive management that was ended, the offline bound that was changed and the leases it
@@ -17,8 +17,12 @@
 //! it and forward again meets a row that is newer than its sequence says: the row is kept, as it
 //! is whenever the sequences are equal.
 //!
-//! The limit: a registry and a mirror put back together are one earlier state, and nothing in
-//! this host can tell it from the host's own.
+//! The limits. A registry and a mirror put back together are one earlier state, and nothing in
+//! this host can tell it from the host's own. A mirror that cannot be read protects nothing: a
+//! registry put back to an earlier state while the mirror is damaged keeps the older row, and the
+//! next write replaces the mirror with a copy of it. A registry put back to an earlier state that
+//! an earlier release then writes keeps the sequence it had, so the mirror still stands above it
+//! when this build starts again, and the mirror's policy replaces what that release wrote.
 
 use std::path::{Path, PathBuf};
 
@@ -49,7 +53,7 @@ struct Record {
 /// Where the file is, beside the registry's database.
 #[must_use]
 pub fn file_beside(registry_database: &Path) -> PathBuf {
-    registry_database.with_file_name("policy-mirror.json")
+    registry_database.with_file_name("policy-mirror.cbor")
 }
 
 /// Reads the mirror, none when the file is not there.
@@ -85,7 +89,8 @@ pub fn read(file: &Path) -> Result<Option<(u64, StoredPolicy)>> {
 /// # Errors
 ///
 /// Returns an error when the policy cannot be encoded or the file cannot be written. What was
-/// there is then as it was.
+/// there is then as it was, except when the file was replaced and the directory then could not be
+/// flushed: the new file is there, and the error says the write is not known to be durable.
 pub fn write(file: &Path, sequence: u64, policy: &StoredPolicy) -> Result<()> {
     let bytes = kr_cbor::to_canonical_vec(&Record {
         version: RECORD_VERSION,
