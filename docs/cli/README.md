@@ -1478,24 +1478,33 @@ document is the host's whole result with the failure's code and status beside it
 
 Workflows that trigger one another share one causal budget. When it runs out, the chain is paused,
 no further descendant starts, and one attention item says so. Only an explicit, authorised re-arm
-gives the chain a new budget, and `kr workflow rearm` is that request. It is a client of the one
-method `workflow.rearm`, and the daemon decides every refusal.
+gives the chain a new budget, and `kr workflow rearm` is that request. It reads the chain's
+budget with `workflow.read` and sends `workflow.rearm`. The daemon decides whether the re-arm is
+allowed, and the command itself refuses a root the daemon holds no budget for.
 
 The chain is named by its causal root. The attention item for an exhausted chain names it as
 `automation.causal_budget.` followed by the root's identifier, and the identifier is the argument.
-`--grant` names the grant the re-arm is made under, which the host must hold as live, for this
-environment, with the right to manage automation. The command reads the budget generation the chain
+`--grant` names the grant the re-arm is made under, by the identifier `kr share list` shows or
+`grant.list` returns: a grant the host must hold as live, for this environment, with the right to
+manage automation. A paired device that runs the command names the grant it holds. The command reads the budget generation the chain
 is on, shown as `generation` beside the chain's budget in `workflow.read`, and asks to leave it. With
 `--generation <n>` it asks to leave the generation you name instead, which is what makes a repeat of
-the command safe: a chain already past that generation is told where it is and is given no second
-budget, whether or not it has run out again since. A chain whose budget has not run out, a
-generation the chain is not on, a grant without the right, and a root the host holds no budget for
-are each refused, with the exit code of a refusal by the daemon.
+the command safe: a chain already on the generation after it is told where it is and is given no
+second budget, whether or not it has run out again since. A chain whose budget has not run out, a
+generation the chain is neither on nor just past, a grant without the right, and a root the host
+holds no budget for are each refused, with the exit code of a refusal by the daemon.
 
-The command prints `Rearmed chain <root>: its budget is on generation <n>.` With `--json` it prints
-`{ "ok": true, "causal_root_id": "...", "generation": "1" }`, the generation as text, as the protocol
-encodes a 64-bit number. The runs the re-arm continues start in the daemon once the re-arm has
-committed, and `workflow.read` shows them.
+Before it sends the request, the command prints on standard error the generation it asks to leave,
+and how to repeat the request: `kr workflow rearm <causal-root> --grant <grant> --generation <n>`
+with that number. A reply that does not arrive leaves no other way to know it, and a repeat that
+names it is answered and gives no second budget. A run of the command without `--generation` can
+give a chain that has since run out again a second budget, because it reads the generation anew.
+When a failure is not the daemon's refusal, the command prints that line again.
+
+On success the command prints `Rearmed chain <root>: its budget is on generation <n>.` With `--json`
+it prints `{ "ok": true, "causal_root_id": "...", "generation": "1" }`, the generation as text, as
+the protocol encodes a 64-bit number. The runs the re-arm continues start in the daemon once the
+re-arm has committed, and `workflow.read` shows them.
 
 ## `kr device`
 
