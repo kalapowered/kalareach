@@ -11,7 +11,9 @@ mod net_support;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::method::Method;
-use kr_protocol::metrics::{Environment, MetricOutcome, ReconnectAttempt};
+use kr_protocol::metrics::{
+    Environment, HostMetrics, MetricOutcome, MetricsReport, ReconnectAttempt,
+};
 use kr_protocol::rights::ActionRight;
 use net_support::{Device, Host, connect, pair_with, proposal};
 
@@ -22,15 +24,20 @@ const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
 /// host to have counted its connection as ended.
 const CYCLES: usize = 40;
 
-async fn doctor(host: &Host) -> HostDoctorResult {
+/// What the host says it counted, to its owner at the machine.
+async fn counted(host: &Host) -> MetricsReport {
     let mut client = host.client().await;
-    client
+    let result: HostDoctorResult = client
         .request(Method::HostDoctor, &())
         .await
         .expect("the call reaches the daemon")
         .expect("host.doctor is served on the local socket")
         .to_typed()
-        .expect("a result of the declared shape")
+        .expect("a result of the declared shape");
+    match result.metrics {
+        Some(HostMetrics::Counted(report)) => report,
+        other => panic!("the owner at the machine is given the report: {other:?}"),
+    }
 }
 
 /// KR-REQ-26.43: a device that connects, goes and comes back is one reconnection in what the host
@@ -50,7 +57,7 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
 
     let mut session = connect(&host, &device, &record).await;
     assert!(
-        doctor(&host).await.metrics.reconnect_time.is_empty(),
+        counted(&host).await.reconnect_time.is_empty(),
         "a device's first connection since the host started has no gap before it"
     );
 
@@ -63,11 +70,11 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
             .read::<_, kr_protocol::hostinfo::HostInfoResult>(Method::HostInfo, &())
             .await
             .expect("the host answers the device that came back");
-        if !doctor(&host).await.metrics.reconnect_time.is_empty() {
+        if !counted(&host).await.reconnect_time.is_empty() {
             break;
         }
     }
-    let report = doctor(&host).await.metrics;
+    let report = counted(&host).await;
     assert!(
         !report.reconnect_time.is_empty(),
         "the host counted none of the {CYCLES} times the device came back"

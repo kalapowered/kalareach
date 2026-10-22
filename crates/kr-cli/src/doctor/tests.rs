@@ -518,7 +518,9 @@ fn measured() -> HostDoctorResult {
     );
     recorder.parse_faulted(Fault::InvalidEncoding, 3);
     recorder.adapter_failed(Adapter::GeminiCli, MetricOutcome::Timeout);
-    result().with_metrics(recorder.report())
+    result().with_metrics(kr_protocol::metrics::HostMetrics::Counted(
+        recorder.report(),
+    ))
 }
 
 /// Section 26: what a host measures about itself is in the document `--json` prints and in the
@@ -554,7 +556,10 @@ fn what_the_host_measured_about_itself_is_reported_in_both_forms() {
     ] {
         assert!(text.contains(shown), "{shown} is missing: {text}");
     }
-    let empty = doctor(&result()).json();
+    let counted_nothing = result().with_metrics(kr_protocol::metrics::HostMetrics::Counted(
+        kr_protocol::metrics::MetricsReport::default(),
+    ));
+    let empty = doctor(&counted_nothing).json();
     assert_eq!(empty["metrics"]["reconnect_time"], serde_json::json!([]));
     assert!(
         !crate::doctor::doctor_lines(&result(), false)
@@ -645,7 +650,7 @@ fn a_support_bundle_carries_the_measurements_as_this_builds_own_words() {
         assert!(said.contains(shown), "{shown} is missing: {said}");
     }
     let mut planted = serde_json::to_value(measured()).expect("a result serialises");
-    planted["metrics"]["terminal_parse_fault"][0]["fault"] = serde_json::json!(PLANTED);
+    planted["metrics"]["counted"]["terminal_parse_fault"][0]["fault"] = serde_json::json!(PLANTED);
     assert!(
         serde_json::from_value::<HostDoctorResult>(planted).is_err(),
         "a label that is not one of this build's words does not parse, so it cannot reach a bundle"

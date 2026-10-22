@@ -5,9 +5,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterFailure, Environment, Fault, HOST_METRICS, MetricOutcome, MetricsReport,
-    ParseFault, ReconnectAttempt, ReconnectTime, Recorder, Shape, Transport, VECTOR_FILE_NAME,
-    vector,
+    Adapter, AdapterFailure, Environment, Fault, HOST_METRICS, HostMetrics, MetricOutcome,
+    MetricsReport, ParseFault, ReconnectAttempt, ReconnectTime, Recorder, Shape, Transport,
+    VECTOR_FILE_NAME, vector,
 };
 use crate::envelope::ParamsValue;
 use crate::hostinfo::{EffectiveConfiguration, HostDoctorResult};
@@ -317,9 +317,17 @@ fn diagnostics_with(metrics: Option<Value>) -> ParamsValue {
 /// what it sends: the answer decodes, and says it carries no metrics.
 #[test]
 fn an_older_hosts_diagnostics_without_metrics_decode() {
-    diagnostics_with(None)
+    let decoded = diagnostics_with(None)
         .to_typed::<HostDoctorResult>()
         .expect("an answer from a host that reports no metrics decodes");
+    assert_eq!(decoded.metrics, None);
+    assert!(
+        serde_json::to_value(&decoded)
+            .expect("serialises")
+            .get("metrics")
+            .is_none(),
+        "and it is sent again as it came, with no such member"
+    );
 }
 
 /// A host says its metrics are counted, with a report that may hold nothing, or withheld from the
@@ -330,11 +338,23 @@ fn a_hosts_metrics_are_counted_or_withheld_and_nothing_else_decodes() {
     let nothing = json!({
         "counted": {"reconnect_time": [], "terminal_parse_fault": [], "adapter_failure": []}
     });
-    for state in [nothing, json!("withheld")] {
-        diagnostics_with(Some(state.clone()))
-            .to_typed::<HostDoctorResult>()
-            .unwrap_or_else(|error| panic!("{state} decodes: {error}"));
-    }
+    let states: Vec<_> = [nothing, json!("withheld")]
+        .into_iter()
+        .map(|state| {
+            diagnostics_with(Some(state.clone()))
+                .to_typed::<HostDoctorResult>()
+                .unwrap_or_else(|error| panic!("{state} decodes: {error}"))
+                .metrics
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            Some(HostMetrics::Counted(MetricsReport::default())),
+            Some(HostMetrics::Withheld)
+        ],
+        "a report that counted nothing is not a host that withholds its metrics"
+    );
     for refused in [
         Value::Null,
         json!({"withheld": null}),

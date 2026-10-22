@@ -798,7 +798,9 @@ impl Controller {
         Ok(HostDoctorResult::new(checks, effective)
             .with_command_integrations(integrations)
             .with_launch_probes(launch_probes)
-            .with_metrics(self.metrics.report()))
+            .with_metrics(kr_protocol::metrics::HostMetrics::Counted(
+                self.metrics.report(),
+            )))
     }
 
     /// The doctor's checks of what this host serves a paired device in repository operations:
