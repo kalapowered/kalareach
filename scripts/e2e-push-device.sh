@@ -337,7 +337,8 @@ say("the person answered from there, and the worker's ledger holds the answer as
     report.get("question_answered_from_the_notification") is True and report.get("answer_is_the_paired_devices") is True)
 late_seen = report.get("late_observe_step") or ""
 say("a second question answered at the host while the person had chosen an answer to it: the phone no longer offers it to send, and says nothing is waiting or that the question is no longer waiting (09.21)",
-    report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen and "Send answer" not in late_seen,
+    report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen and "Send answer" not in late_seen
+    and ("PUSH-CHOSEN" in (report.get("late_step") or "") or "chosen" in (report.get("late_step") or "")),
     late_seen[:300].replace("\n", " "))
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
 
@@ -629,7 +630,7 @@ want_ios() { # foreground|background
 }
 
 pump_ios() { # <udid>
-    local udid="$1" n=1 file kind before after waited place=foreground
+    local udid="$1" n=1 file kind before after waited place=foreground deliveries=0
     while [ ! -e "$harness/finish" ]; do
         file="$harness/inject-$n.json"
         if [ ! -s "$file" ]; then
@@ -682,16 +683,34 @@ pump_ios() { # <udid>
             # A delivery is shown by the system while the application is in the background: the
             # person's acts bring it to the front, so it is asked to go every time.
             want_ios background
+            deliveries=$((deliveries + 1))
             python3 "$here/scripts/lib/push-inject.py" banner "$file" >"$harness/banner-expect-$n.txt"
             xcrun simctl push "$udid" "$app_id" "$harness/payload-$n.json" >"$harness/push-$n.out" 2>&1
             : >"$harness/banner-wanted-$n"
-            : >"$harness/no-tap-$n"
+            # The person taps the banner of the first two questions, which the host's acts on the
+            # phone start from; the banners after those are only read.
+            if [ "$deliveries" -le 2 ]; then
+                echo "$n" >>"$harness/tap-order"
+                : >"$harness/tap-$n"
+            else
+                : >"$harness/no-tap-$n"
+            fi
             until [ -s "$harness/banner-$n.txt" ]; do
                 sleep 1
                 waited=$((waited + 1))
                 [ "$waited" -lt 90 ] || break
             done
             cp "$harness/banner-$n.txt" "$artefacts/banner-$n.txt" 2>/dev/null
+            if [ -e "$harness/tap-$n" ]; then
+                # The tap brought the application to the front, where the person's acts are.
+                until [ -s "$harness/tapped-$n" ]; do
+                    sleep 1
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 150 ] || break
+                done
+                cp "$harness/tapped-$n" "$artefacts/tapped-$n.txt" 2>/dev/null
+                want_ios foreground && place=foreground
+            fi
             say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> banner: $(head -c 200 "$harness/banner-$n.txt" 2>/dev/null)"
             if [ -s "$harness/banner-$n.txt" ] && ! grep -q 'kr-marker-4f1c9a' "$harness/banner-$n.txt" \
                 && grep -q -F -f "$harness/banner-expect-$n.txt" "$harness/banner-$n.txt"; then
@@ -719,6 +738,20 @@ act_ios() { # <verb>
     cat "$harness/acted-$k"
 }
 
+# What the screen showed after the person tapped the banner of the <k>th question: the test that
+# drives the phone writes it when it has tapped the banner.
+tapped_ios() { # <k>
+    local k="$1" n waited=0
+    while :; do
+        n="$(sed -n "${k}p" "$harness/tap-order" 2>/dev/null)"
+        [ -n "$n" ] && [ -s "$harness/tapped-$n" ] && break
+        sleep 1
+        waited=$((waited + 1))
+        [ "$waited" -lt 150 ] || { echo "no banner $k was tapped"; return 1; }
+    done
+    cat "$harness/tapped-$n"
+}
+
 # Does what the host asks of the phone besides what messages do, on the simulator: the person taps
 # the notification, chooses an answer and sends it; the gateway issues the authorisation again and
 # the application ends; and the application registers again with a new token.
@@ -727,14 +760,12 @@ steps_ios() { # <udid>
     while [ ! -e "$harness/finish" ]; do
         if [ -e "$harness/step-tap.json" ] && [ ! -e "$harness/started-tap" ]; then
             : >"$harness/started-tap"
-            python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)" >"$harness/act-expect"
-            out="$(act_ios tap; act_ios choose; act_ios send)"
+            out="$(tapped_ios 1; act_ios choose; act_ios send)"
             printf 'PUSH-TAPPED %s\n' "$out" >"$harness/done-tap.tmp" && mv "$harness/done-tap.tmp" "$harness/done-tap"
         fi
         if [ -e "$harness/step-late.json" ] && [ ! -e "$harness/started-late" ]; then
             : >"$harness/started-late"
-            python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)" >"$harness/act-expect"
-            out="$(act_ios tap; act_ios choose)"
+            out="$(tapped_ios 2; act_ios choose)"
             printf '%s\n' "$out" >"$harness/done-late.tmp" && mv "$harness/done-late.tmp" "$harness/done-late"
         fi
         if [ -e "$harness/step-late-observe.json" ] && [ ! -e "$harness/started-late-observe" ]; then
@@ -891,7 +922,7 @@ run_ios() {
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|KR-" "$out" | sed 's/^/    /' | tee -a "$log"
     [ "$(cat "$harness/test-status" 2>/dev/null)" = 0 ] || { say "check=the driving test passed ok=0"; test_status=2; }
     cp "$harness/ios.log" "$artefacts/application.log" 2>/dev/null
-    search_ios_log "$udid"
+    search_ios_log "$udid" || test_status=2
     local status=$test_status line
     while IFS= read -r line; do
         say "$line"
@@ -900,18 +931,36 @@ run_ios() {
     [ "$status" = 0 ] || return 2
 }
 
-# No part of the run reaches a Google host: the simulator's log of the application, read whole, names
-# none.
+# What the simulator's log says of the run. No part of it reaches a Google host: the application's
+# log, read whole, names none. And the notification service extension ran for a delivery.
 search_ios_log() { # <udid>
+    local bad=0
     xcrun simctl spawn "$1" log show --last 40m --style compact --predicate 'process == "KalaReach"' \
         >"$artefacts/application-log-whole.txt" 2>/dev/null
     if [ ! -s "$artefacts/application-log-whole.txt" ]; then
         say "check=no Google host is named in the application's log ok=0 detail=the log could not be read"
+        bad=2
     elif grep -q -i -E 'googleapis|firebaseinstallations|firebase\.google' "$artefacts/application-log-whole.txt"; then
         say "check=no Google host is named in the application's log ok=0"
+        bad=2
     else
         say "check=no Google host is named in the application's log ok=1"
     fi
+    # The notification service extension is its own process: a debug build says that it ran, and
+    # why it showed what it showed, and nothing of the notification. The simulator's own way of
+    # delivering a push has not run it on the system versions this was tried on (the extension is
+    # installed and registered, and the system never starts it), so its running is a check when it
+    # did and a note when it did not, and a device is what shows it. What the system says of the
+    # extension is kept for whoever reads the run.
+    xcrun simctl spawn "$1" log show --last 40m --style compact \
+        --predicate 'process == "KalaReachNotificationService"' \
+        >"$artefacts/extension-log.txt" 2>/dev/null
+    if grep -v 'log run noninteractively' "$artefacts/extension-log.txt" | grep -q 'KalaReachExtension: ran'; then
+        say "check=the notification service extension ran for a delivery (16.02) ok=1 detail=$(grep -o 'KalaReachExtension: ran, .*' "$artefacts/extension-log.txt" | sort -u | head -3 | tr '\n' ';')"
+    else
+        say "note=the simulator did not start the notification service extension for a delivery: only a device shows that it runs (16.02)"
+    fi
+    return $bad
 }
 
 case "$platform" in
