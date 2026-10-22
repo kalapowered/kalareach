@@ -190,6 +190,7 @@ fn read_only_metadata_is_reachable_only_from_read_results() {
     assert_eq!(
         marked,
         [
+            "DefaultShellMode",
             "EnvironmentListResult",
             "EnvironmentSummary",
             "HostInfoResult",
