@@ -39139,13 +39139,8 @@
       "type": "object"
     },
     "VoiceContextClass": {
-      "description": "A class of content the default context excludes.",
+      "description": "A class of content the default context excludes and a person may select.\n\nFile contents and attachment bytes are excluded from every call and cannot be selected: nothing\non a host reads them for a call, so they are not classes.",
       "oneOf": [
-        {
-          "const": "file_contents",
-          "description": "The contents of files.",
-          "type": "string"
-        },
         {
           "const": "environment_variables",
           "description": "Environment variables.",
@@ -39154,11 +39149,6 @@
         {
           "const": "terminal_scrollback",
           "description": "Raw terminal scrollback.",
-          "type": "string"
-        },
-        {
-          "const": "attachment_bytes",
-          "description": "The bytes of an attachment.",
           "type": "string"
         }
       ]
@@ -39179,7 +39169,7 @@
           "description": "The delegation this context belongs to, or null for context that belongs to the call."
         },
         "selected": {
-          "description": "Content classes the person has selected on top of the default.\n\nSection 15 ¶12 excludes file contents, environment variables, raw terminal scrollback and\nattachment bytes unless the user selects them, so selecting one is a field rather than a\nsetting somewhere else.",
+          "description": "Content classes the person has selected on top of the default.\n\nSection 15 ¶12 excludes environment variables and raw terminal scrollback unless the user\nselects them, so selecting one is a field rather than a setting somewhere else. File\ncontents and attachment bytes are excluded and not offered.",
           "items": {
             "$ref": "#/$defs/VoiceContextClass"
           },
@@ -39845,7 +39835,7 @@
           "description": "A digest of what a call started now would be bound to: the sessions it would reach, what\nit would be permitted to do, and the provider that would carry it.\n\nA start names it. When what a start would be bound to is no longer what this digest\ndescribes, because a grant changed or another provider was attached, the start is refused\nas [`VoiceStartOutcome::PreparationChanged`] before anything is created, so a call never\nreaches further than what the person was shown."
         },
         "selected": {
-          "description": "Classes from the request that would actually be carried.\n\nA selection the grant does not reach is absent here rather than refused, because this read\nexists to show a person what a call would be before they make one.",
+          "description": "Classes from the request that would actually be carried.",
           "items": {
             "$ref": "#/$defs/VoiceContextClass"
           },

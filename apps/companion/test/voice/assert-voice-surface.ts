@@ -610,7 +610,7 @@ const DISCLOSURE = [
   "This service's own channel to the provider still receives transcripts",
   'is not a confirmation'
 ] as const
-const SCOPE = ['the session', 'at most 8,000 tokens', 'the contents of files', 'raw terminal scrollback'] as const
+const SCOPE = ['the session', 'at most 8,000 tokens', 'environment variables', 'raw terminal scrollback'] as const
 const UNHEARD = 'Nothing spoken while the microphone was not carrying your voice can authorise an action'
 
 async function assertProviderChoice(page: Page, base: string, target: Target): Promise<void> {

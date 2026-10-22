@@ -2498,10 +2498,12 @@ export type NetworkHint = string
  */
 export type SyncRevisionId = string
 /**
- * A class of content the default context excludes.
+ * A class of content the default context excludes and a person may select.
+ *
+ * File contents and attachment bytes are excluded from every call and cannot be selected: nothing
+ * on a host reads them for a call, so they are not classes.
  */
-export type VoiceContextClass =
-  'file_contents' | 'environment_variables' | 'terminal_scrollback' | 'attachment_bytes'
+export type VoiceContextClass = 'environment_variables' | 'terminal_scrollback'
 /**
  * One thing a voice session may ask the host to do.
  *
@@ -30438,9 +30440,9 @@ export interface VoiceContextParams {
   /**
    * Content classes the person has selected on top of the default.
    *
-   * Section 15 ¶12 excludes file contents, environment variables, raw terminal scrollback and
-   * attachment bytes unless the user selects them, so selecting one is a field rather than a
-   * setting somewhere else.
+   * Section 15 ¶12 excludes environment variables and raw terminal scrollback unless the user
+   * selects them, so selecting one is a field rather than a setting somewhere else. File
+   * contents and attachment bytes are excluded and not offered.
    */
   selected: VoiceContextClass[]
   /**
@@ -30559,9 +30561,12 @@ export interface VoiceContextSelection {
  */
 export interface VoiceSelectedContent {
   /**
-   * A class of content the default context excludes.
+   * A class of content the default context excludes and a person may select.
+   *
+   * File contents and attachment bytes are excluded from every call and cannot be selected: nothing
+   * on a host reads them for a call, so they are not classes.
    */
-  class: 'file_contents' | 'environment_variables' | 'terminal_scrollback' | 'attachment_bytes'
+  class: 'environment_variables' | 'terminal_scrollback'
   /**
    * The text it contributed, already filtered, capped and stripped.
    */
@@ -31074,9 +31079,6 @@ export interface VoicePrepareResult {
   prepared: string
   /**
    * Classes from the request that would actually be carried.
-   *
-   * A selection the grant does not reach is absent here rather than refused, because this read
-   * exists to show a person what a call would be before they make one.
    */
   selected: VoiceContextClass[]
   /**
