@@ -9,6 +9,8 @@ use super::{
     ParseFault, ReconnectAttempt, ReconnectTime, Recorder, Shape, Transport, VECTOR_FILE_NAME,
     vector,
 };
+use crate::envelope::ParamsValue;
+use crate::hostinfo::{EffectiveConfiguration, HostDoctorResult};
 use crate::scalars::U64;
 
 /// The committed vector is the one the declaration writes, so the service's suite and this one
@@ -293,4 +295,60 @@ fn reports_from_several_places_join_into_one() {
     assert_eq!(joined.reconnect_time[0].total_ms.get(), 1_000);
     assert_eq!(joined.reconnect_time[0].longest_ms.get(), 900);
     assert_eq!(joined.events(), 8);
+}
+
+/// A host's diagnostics as the wire carries them, with the `metrics` member as `metrics` says, or
+/// with no such member at all.
+fn diagnostics_with(metrics: Option<Value>) -> ParamsValue {
+    let mut document = serde_json::to_value(HostDoctorResult::new(
+        Vec::new(),
+        EffectiveConfiguration::unread(),
+    ))
+    .expect("the result serialises");
+    let members = document.as_object_mut().expect("a map");
+    members.remove("metrics");
+    if let Some(metrics) = metrics {
+        members.insert("metrics".to_owned(), metrics);
+    }
+    ParamsValue::from_typed(&document).expect("encodes")
+}
+
+/// A host of the level before this one sends no `metrics` member, and a client at this level reads
+/// what it sends: the answer decodes, and says it carries no metrics.
+#[test]
+fn an_older_hosts_diagnostics_without_metrics_decode() {
+    diagnostics_with(None)
+        .to_typed::<HostDoctorResult>()
+        .expect("an answer from a host that reports no metrics decodes");
+}
+
+/// A host says its metrics are counted, with a report that may hold nothing, or withheld from the
+/// caller, and nothing else: the two states are the only ones that decode, in the one form each
+/// serialises back to. A report that counts nothing is not the withheld state.
+#[test]
+fn a_hosts_metrics_are_counted_or_withheld_and_nothing_else_decodes() {
+    let nothing = json!({
+        "counted": {"reconnect_time": [], "terminal_parse_fault": [], "adapter_failure": []}
+    });
+    for state in [nothing, json!("withheld")] {
+        diagnostics_with(Some(state.clone()))
+            .to_typed::<HostDoctorResult>()
+            .unwrap_or_else(|error| panic!("{state} decodes: {error}"));
+    }
+    for refused in [
+        Value::Null,
+        json!({"withheld": null}),
+        json!("counted"),
+        json!({"counted": null}),
+        json!({"counted": {"reconnect_time": []}}),
+        json!({"withheld": {}}),
+        json!({"unreported": null}),
+    ] {
+        assert!(
+            diagnostics_with(Some(refused.clone()))
+                .to_typed::<HostDoctorResult>()
+                .is_err(),
+            "{refused} is no state of a host's metrics"
+        );
+    }
 }
