@@ -494,8 +494,8 @@ pub enum RestoreError {
     NotInPlan,
     /// The archive holds more ciphertext than one export file does.
     #[error(
-        "the archive holds {bytes} bytes, more than the {limit} an export file holds; restore it \
-         from the service instead"
+        "the archive holds {bytes} bytes, more than the {limit} an export file holds, so it has no \
+         offline copy and restores from the service only"
     )]
     TooLargeToExport {
         /// What the archive holds.
