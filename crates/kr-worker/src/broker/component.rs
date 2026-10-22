@@ -53,8 +53,8 @@ pub struct ComponentWant {
     pub version: String,
     /// The exact package hash the binding holds.
     pub package_digest: Digest256,
-    /// The admission revision the binding was decided at.
-    pub revision: u64,
+    /// The generation of the package's repository the admissions carried when the binding was made.
+    pub repository_generation: kr_protocol::ids::RepositoryGeneration,
     /// The program the binding recognises.
     pub executable: String,
     /// The component, as pinned.
@@ -179,7 +179,7 @@ impl Broker {
                     plugin_id: binding.plugin_id.clone(),
                     version: release.version.clone(),
                     package_digest: binding.package_digest,
-                    revision: binding.frame.map_or(0, |frame| frame.revision.get()),
+                    repository_generation: binding.repository_generation?,
                     executable: binding
                         .executable
                         .as_ref()
