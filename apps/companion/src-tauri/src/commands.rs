@@ -175,6 +175,12 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // The host a phone's commands go to.
     ("hosts_use", None),
     ("hosts_forget", None),
+    // Notifications: where each paired host's stand, turning them on for one, looking again, and the
+    // screen a tap on a notification opened.
+    ("push_view", None),
+    ("push_enable", None),
+    ("push_refresh", None),
+    ("notification_route", None),
     // Voice. The start names its method for the table, and this process refuses it before sending.
     ("voice_prepare", Some(Method::VoicePrepare)),
     ("voice_start", Some(Method::VoiceStart)),
@@ -311,6 +317,16 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // The host's own account of which environment it is, read once the connection to a paired
     // host is up: the connection carries none on its handshake.
     ("hosts_use", &[Method::HostInfo, Method::SessionOpen]),
+    // A phone hands its host the credential its installation was issued, and says it holds the
+    // key the host seals previews to. The page names a host and nothing else.
+    (
+        "push_enable",
+        &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
+    ),
+    (
+        "push_refresh",
+        &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
+    ),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
     // Settings sync keeps drafts in step host by host and shares the settings' key between the
     // person's devices. Before a draft leaves it asks the connected host whether the host holds the
@@ -601,6 +617,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         revocation_revoke,
         hosts_use,
         hosts_forget,
+        push_view,
+        push_enable,
+        push_refresh,
+        notification_route,
         voice_prepare,
         voice_start,
         voice_stop,
@@ -2447,6 +2467,55 @@ pub async fn hosts_use<R: tauri::Runtime>(
     crate::hosts::use_host(&app, host).await
 }
 
+/// Where each paired host's notifications stand.
+///
+/// A computer has none, and says so: the view is empty and not available.
+#[tauri::command]
+pub fn push_view(state: State<'_, AppState>) -> Result<crate::push::PushView> {
+    Ok(state
+        .push()
+        .map_or_else(unavailable_push_view, |desk| desk.view()))
+}
+
+/// Turns notifications on for the host the page named, and starts the steps that make this phone a
+/// place the host can send them to.
+///
+/// The page names the host by the reference the pairing screen listed it under. Native code asks
+/// the system, asks the notification service, waits for its own receiver to answer the challenge,
+/// and gives the host the credential; the page is told where it stands on `kr://push`.
+#[tauri::command]
+pub fn push_enable(state: State<'_, AppState>, reference: String) -> Result<crate::push::PushView> {
+    state
+        .push()
+        .ok_or_else(|| CommandError::unsupported("notifications are a phone's"))?
+        .enable(&reference)
+}
+
+/// Looks again at where notifications stand, and mends what a change since the last look needs.
+#[tauri::command]
+pub async fn push_refresh(state: State<'_, AppState>) -> Result<crate::push::PushView> {
+    let Some(desk) = state.push() else {
+        return Ok(unavailable_push_view());
+    };
+    Ok(desk.refresh().await)
+}
+
+/// The screen a tap on a notification opened the application on, once.
+#[tauri::command]
+pub async fn notification_route(state: State<'_, AppState>) -> Result<Option<String>> {
+    let Some(desk) = state.push() else {
+        return Ok(None);
+    };
+    Ok(desk.route().await)
+}
+
+fn unavailable_push_view() -> crate::push::PushView {
+    crate::push::PushView {
+        available: false,
+        hosts: Vec::new(),
+    }
+}
+
 /// Forgets a host this computer is paired with, named by the reference the pairing screen listed it
 /// under, and says where that leaves the connection.
 ///
@@ -2462,7 +2531,13 @@ pub fn hosts_forget<R: tauri::Runtime>(
         .device()?
         .host_by_reference(&reference)
         .ok_or_else(crate::hosts::unknown_host)?;
-    crate::hosts::forget_host(&app, &host)
+    let forgotten = crate::hosts::forget_host(&app, &host)?;
+    // What is kept of a host's notifications goes with the host. The host's own destination stays
+    // until its owner removes this device: only the host revokes an authorisation it holds.
+    if let Some(desk) = state.push() {
+        desk.forgotten(host.host_device_id);
+    }
+    Ok(forgotten)
 }
 
 /// The confirmations this computer's hosts ask for, as descriptions, and the ceremony this
@@ -3434,6 +3509,10 @@ mod tests {
     /// table is not left out of the one tour that proves the route of the commands that reach a
     /// session: adding one fails this test until it is classified.
     const HOST_OR_LOCAL_COMMANDS: &[&str] = &[
+        "push_view",
+        "push_enable",
+        "push_refresh",
+        "notification_route",
         "host_info",
         "environment_list",
         "environment_capabilities",
@@ -3653,6 +3732,13 @@ mod tests {
                 // The host a phone's commands go to: it pairs, then it chooses, and it may forget.
                 "hosts_use",
                 "hosts_forget",
+                // Notifications: where each paired host's stand, turning them on for one, looking
+                // again, and the screen a tap opened. Native code asks the gateway, waits for its
+                // own receiver, and hands the host the credential; the page names a host.
+                "push_view",
+                "push_enable",
+                "push_refresh",
+                "notification_route",
                 // Setup's own two. Neither performs a protocol operation: one reads this
                 // application's identity and one opens a settings pane by name.
                 "setup_identity",
@@ -3792,6 +3878,8 @@ mod tests {
             Method::GrantTransfer,
             Method::DeviceRevoke,
             Method::BackupEnable,
+            Method::DevicePushRegister,
+            Method::DevicePreviewKeyUpdate,
         ] {
             assert!(!page.contains(&method), "{method} is a page method");
         }
