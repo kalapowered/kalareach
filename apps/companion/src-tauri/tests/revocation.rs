@@ -5,16 +5,9 @@
 //! recorded as an owner of the host. The daemon reads and answers the feed itself, so what the
 //! screen is shown of an acknowledgement is what a real host wrote.
 //!
-//! KR-REQ-10.46: a remote owner publishes a signed revocation request to the host's durable feed
-//! and the device list shows the host's last acknowledgement:
-//! `a_revocation_is_called_done_only_once_the_hosts_acknowledgement_is_read`,
-//! `a_host_that_reads_another_service_never_acknowledges_and_the_screen_never_calls_it_done`,
-//! `a_host_that_does_not_answer_is_revoked_on_through_its_feed_from_the_list_last_seen` and
-//! `a_host_the_feed_removed_is_not_reached_by_feed_and_nothing_is_published`.
-//! KR-REQ-10.01: the page never performs `device.revoke`; the host on this computer takes it from
-//! native code over its own connection:
-//! `the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is_the_acknowledgement`.
-//! `a_revocation_the_person_does_not_confirm_sends_nothing` holds the ceremony in front of both.
+//! A case that shows the clause of a requirement row carries that row's key in a comment of its
+//! own. The device list's standing for a request published to a host's feed, and the host on this
+//! computer taking a revocation from native code, are the two things most cases here are about.
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -740,6 +733,11 @@ fn phone_state(view: &Value, route: &str) -> String {
         .to_owned()
 }
 
+/// KR-REQ-10.46: a revocation of a device on a host that is read through its feed is a request
+/// published to that feed, and the screen does not call it done until the host's acknowledgement
+/// is read. It says how often the host reads its feed (every thirty seconds), shows
+/// the host's last acknowledgement with its revision once it is read, and sends nothing a second
+/// time for a device that is revoked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_is_called_done_only_once_the_hosts_acknowledgement_is_read() {
     let rig = Rig::start().await;
@@ -818,6 +816,9 @@ async fn a_revocation_is_called_done_only_once_the_hosts_acknowledgement_is_read
     assert_eq!(repeat["code"], "PERMISSION_DENIED", "{repeat}");
 }
 
+/// KR-REQ-10.46: a request that no host acknowledged stays sent and outstanding, and is never
+/// called done: a host that reads another service than the one the request was published at
+/// finds nothing, and asking again publishes nothing and asks nobody.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_reads_another_service_never_acknowledges_and_the_screen_never_calls_it_done() {
     let rig = Rig::start().await;
@@ -904,6 +905,9 @@ async fn a_revocation_the_person_does_not_confirm_sends_nothing() {
     assert_eq!(rig.publications(), 0);
 }
 
+/// KR-REQ-10.01: the page names a host and a device only by the references native code gave it. A
+/// reference the screen was not given, and this computer's own device, are refused by the command
+/// before anything is published or asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reference_the_screen_was_not_given_names_nothing_and_this_computer_is_not_revoked_by_itself()
  {
@@ -1036,10 +1040,10 @@ async fn mailbox_after_a_look(rig: &Rig) -> Value {
     rig.view().await["mailbox"].clone()
 }
 
-/// KR-REQ-20.04, KR-REQ-20.05, KR-REQ-10.46: the host that carries out a revocation announces what
-/// became of it to the computer that published it, and this computer takes the announcement from
-/// its own mailbox: it opens against the host it is paired with, is written down, and is counted
-/// once. Nothing wakes this computer's look but the look itself, which a screen makes.
+/// KR-REQ-20.04, KR-REQ-20.05: the host that carries out a revocation announces what became of it
+/// to the computer that published it, and this computer takes the announcement from its own
+/// mailbox: it opens against the host it is paired with, is written down, and is counted once.
+/// Nothing wakes this computer's look but the look itself, which a screen makes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_20_05_the_hosts_announcement_of_its_acknowledgement_is_taken_from_this_computers_mailbox()
  {
@@ -1069,9 +1073,8 @@ async fn kr_req_20_05_the_hosts_announcement_of_its_acknowledgement_is_taken_fro
     assert_eq!(rig.identifiers_on_record().len(), 1, "it is on record");
 }
 
-/// KR-REQ-20.05: the host announces only to a device whose pairing is in force. An owner whose
-/// request revokes its own device is acknowledged, and the host places nothing in its mailbox, as
-/// that device is no longer one the host pairs with.
+/// An owner whose request revokes its own device is carried out by the host, and the host places
+/// nothing in the mailbox of that device, as it is no longer one the host pairs with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_that_revoked_its_own_device_is_acknowledged_without_an_announcement() {
     use kr_protocol::ids::RevocationRequestId;
@@ -1501,6 +1504,9 @@ async fn a_computer_that_owns_no_host_to_read_a_feed_of_asks_the_mailbox_nothing
     assert_eq!(view["mailbox"]["last_read_ms"], Value::Null);
 }
 
+/// KR-REQ-10.46: a host that does not answer is revoked on through its durable feed: the screen
+/// shows the list it last saw with its time, and the request is published and stands as sent, not
+/// done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_does_not_answer_is_revoked_on_through_its_feed_from_the_list_last_seen() {
     let rig = Rig::start().await;
@@ -1624,6 +1630,9 @@ async fn a_feed_that_cannot_be_read_is_said_and_nothing_is_sent() {
     );
 }
 
+/// KR-REQ-10.46: a request that was sent keeps its standing while its feed cannot be read: the
+/// screen shows that it is an earlier read (when it was read), forgets nothing, and leaves another
+/// device of the host as it was, and the standing is read afresh once the feed answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_that_was_sent_keeps_its_standing_while_its_feed_cannot_be_read() {
     let rig = Rig::start().await;
