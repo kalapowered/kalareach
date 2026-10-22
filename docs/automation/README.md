@@ -59,8 +59,9 @@ acts on, and a request whose revision does not match the document it carries is 
 carries the caller's action identifier, and the workflow journal records what it came to in the
 same transaction as its effect. `workflow.rearm` is the one mutation that keeps no such record: the
 generation it names is its own key, and the chain's state is what answers a repeat of it (see
-"Re-arming" below). Its action identifier is still held to the rule every action's is: one spent on
-a different action is refused, inside the transaction that would move the budget.
+"Re-arming" below). Its action identifier is still checked against the records of the other actions, inside
+the transaction that would move the budget: one that an install, enable, pause or run spent is
+refused.
 
 * **One transaction.** The journal first looks for the record an earlier submission of the same
   action left. If there is one, it is the answer and nothing is written. Otherwise the journal asks
@@ -410,9 +411,13 @@ the unit it derives them for. Nothing a caller sends names any of them.
   first connection. A request of its own that names a generation the chain is neither on nor just
   past is refused as a conflict. None of them gives a budget. Nothing is stored for the request, so
   the journal's stored form is the one it had before the method existed. For the same reason the
-  identifier a re-arm was sent under is not remembered: a different action may spend it afterwards,
-  and the re-arm's exact repeat is then refused as a reused identifier and not answered. The same
-  re-arm under a new identifier is a repeat all the same, and the generation it names answers it.
+  journal does not remember the identifier a re-arm was sent under. At the local socket, where no
+  other record holds it, a different action that keeps a record may spend it afterwards, and the
+  re-arm's exact repeat is then refused as a reused identifier and not answered; two re-arms under
+  one identifier are each decided on their own. A paired device's identifiers are also claimed when
+  the request arrives, so there a different action under the same identifier is refused whichever
+  comes first. The same re-arm under a new identifier is a repeat all the same, and the generation
+  it names answers it.
 * **What a re-arm does not do.** It continues the descendants the budget refused when the chain
   tried to admit them, which is how a chain that reached its depth or run ceiling goes on. A run
   stopped at a node, because the chain's action, session or spend allowance ran out when the node
