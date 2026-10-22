@@ -1357,10 +1357,6 @@ pub struct InstallArguments {
     /// The store to install into. Without it, this user's own.
     #[arg(long)]
     pub store: Option<PathBuf>,
-    /// The package manager that put the release where it is, when the first run of its `kr` is
-    /// the one installing it.
-    #[arg(long, hide = true)]
-    pub installer: Option<String>,
 }
 
 /// `kr host update`.

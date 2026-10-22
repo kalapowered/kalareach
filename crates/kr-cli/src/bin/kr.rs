@@ -1101,7 +1101,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 let installed = kr_cli::update::install(
                     install.release.as_deref(),
                     install.store.as_deref(),
-                    install.installer.as_deref(),
+                    None,
                 )
                 .await?;
                 if cli.json {
