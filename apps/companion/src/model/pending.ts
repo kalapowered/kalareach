@@ -1,30 +1,10 @@
 /**
  * The shapes this application reads from methods whose wire types are not published.
  *
- * The launch surface and what a privacy generation left behind have no published parameter and
- * result type, so the desktop port refuses both and the interface for each is built against the
- * shape the specification describes. Every field below has a sentence in the specification behind
+ * The launch surface has no published parameter and result type, so the desktop port refuses it and
+ * the interface is built against the shape the specification describes. Every field below has a sentence in the specification behind
  * it. Nothing here invents a concept the product does not have.
  */
-
-/** One artefact a privacy generation left behind. */
-export interface RetainedArtefact {
-  readonly object_id: string
-  readonly kind: 'archive' | 'notification' | 'viewer_copy'
-  readonly description: string
-  readonly location: string
-  readonly byte_len: number
-  readonly created_at_ms: number
-  /** True when this copy is held by someone else and deletion cannot reach it. */
-  readonly held_by_other_party: boolean
-}
-
-/** What `storage.status` answers with, for the privacy screen. */
-export interface RetainedArtefacts {
-  readonly privacy_mode: boolean
-  readonly privacy_generation: string
-  readonly artefacts: readonly RetainedArtefact[]
-}
 
 /** One installed launch profile, or a command the person named. */
 export interface LaunchProfile {

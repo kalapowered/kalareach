@@ -237,9 +237,6 @@ export const PREVIEW_PARAMS = object({ session_id: uuid, selection: ROLE_SELECTI
 
 export const ENVIRONMENT_PARAMS = object({ environment_id: uuid })
 
-/** A retained artefact's deletion names the artefact and nothing else. */
-export const STORAGE_OBJECT_DELETE_PARAMS = object({ object_id: opaque })
-
 export const HISTORY_PAGE_PARAMS = object({ session_id: uuid, from_cursor: u64, max_bytes: u64 })
 
 export const QUESTION_READ_PARAMS = object({

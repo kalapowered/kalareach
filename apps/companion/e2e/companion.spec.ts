@@ -3403,14 +3403,15 @@ test.describe('a control that commits on a completed action', () => {
   })
 })
 
-test.describe('retained artefacts', () => {
-  test('each is deleted on its own, and a copy elsewhere is not offered', async ({ page }) => {
+test.describe('what has left the host', () => {
+  test('each copy is listed with whether the host can ask for its removal', async ({ page }) => {
     await open(page)
     await page.getByRole('button', { name: 'Change sets' }).click()
     const retained = page.getByTestId('retained-artefacts')
     await expect(retained).toBeVisible()
-    await expect(retained.getByTestId('delete-obj-3')).toBeDisabled()
-    await expect(retained.getByTestId('held-elsewhere')).toBeVisible()
+    await expect(retained.getByTestId('removal')).toHaveCount(3)
+    await expect(retained.getByRole('button')).toHaveCount(0)
+    await expect(retained.getByTestId('unlisted')).toBeVisible()
     await page.screenshot({ path: shot('privacy-24.29'), fullPage: true })
   })
 })

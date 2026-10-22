@@ -1252,30 +1252,28 @@ describe('change sets', () => {
   })
 })
 
-describe('retained artefacts', () => {
-  it('shows what a privacy generation left behind, each with its own deletion', async () => {
+describe('what has left the host', () => {
+  it('shows each copy the host reports, and what the host could not list', async () => {
     start({ view: 'changesets' })
     const retained = await screen.findByTestId('retained-artefacts')
-    expect(within(retained).getByText(/Encrypted history archive/)).toBeInTheDocument()
-    expect(within(retained).getByTestId('delete-obj-1')).toBeEnabled()
+    expect(within(retained).getByText('backup archive')).toBeInTheDocument()
+    expect(within(retained).getByText('notification')).toBeInTheDocument()
+    expect(within(retained).getByText("possible copy held by a viewer's device")).toBeInTheDocument()
+    expect(within(retained).getByTestId('unlisted')).toHaveTextContent(
+      'descriptions: the description store could not be read'
+    )
     expect(within(retained).getByText(/logical cleanup rather than a secure erase/)).toBeInTheDocument()
   })
 
-  it('does not offer to delete a copy someone else holds', async () => {
+  it('offers no action on a copy the host has no way to ask for the removal of', async () => {
     start({ view: 'changesets' })
     const retained = await screen.findByTestId('retained-artefacts')
-    expect(within(retained).getByTestId('delete-obj-3')).toBeDisabled()
-    expect(within(retained).getByTestId('held-elsewhere')).toBeInTheDocument()
-  })
-
-  it('deletes one artefact without touching the others', async () => {
-    start({ view: 'changesets' })
-    const retained = await screen.findByTestId('retained-artefacts')
-    await userEvent.click(within(retained).getByTestId('delete-obj-1'))
-    await waitFor(() => {
-      expect(screen.queryByTestId('delete-obj-1')).toBeNull()
-    })
-    expect(screen.getByTestId('delete-obj-2')).toBeInTheDocument()
+    const removal = within(retained).getAllByTestId('removal')
+    expect(removal).toHaveLength(3)
+    for (const line of removal) {
+      expect(line).toHaveTextContent('This host has no way to ask for its removal.')
+    }
+    expect(within(retained).queryByRole('button')).toBeNull()
   })
 })
 

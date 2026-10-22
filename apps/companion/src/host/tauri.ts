@@ -318,8 +318,7 @@ export function tauriPort(): HostPort {
 
     changesetRead: (params) => read('changeset_read', params),
 
-    storageStatus: () => noAgreedShape('what this host retains'),
-    storageObjectDelete: () => noAgreedShape('deleting a retained artefact'),
+    privacyStatus: () => read('privacy_status', {}),
 
     // Each view has a channel of its own, which native code publishes that view's states on and
     // nothing else: no protocol event and no other view's state ever reaches its listener.
