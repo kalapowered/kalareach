@@ -664,6 +664,7 @@ impl claim::Claimed for kr_protocol::changeset::TestedSource {}
 impl claim::Claimed for kr_protocol::changeset::TreeSummary {}
 impl claim::Claimed for kr_protocol::changeset::VersionRef {}
 impl claim::Claimed for kr_protocol::project::ContentClass {}
+impl claim::Claimed for kr_protocol::ids::CausalRootId {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetId {}
 impl claim::Claimed for kr_protocol::ids::ChangeSetVersion {}
 impl claim::Claimed for kr_protocol::ids::EnvironmentId {}
@@ -1375,6 +1376,7 @@ mod tests {
         assert_closed::<kr_protocol::changeset::TreeSummary>();
         assert_closed::<kr_protocol::changeset::VersionRef>();
         assert_closed::<kr_protocol::project::ContentClass>();
+        assert_closed::<kr_protocol::ids::CausalRootId>();
         assert_closed::<kr_protocol::ids::ChangeSetId>();
         assert_closed::<kr_protocol::ids::ChangeSetVersion>();
         assert_closed::<kr_protocol::ids::EnvironmentId>();

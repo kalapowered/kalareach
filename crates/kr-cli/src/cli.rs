@@ -92,6 +92,9 @@ pub enum Command {
     /// Review changes, or apply or revert a change set explicitly at a destination you name.
     #[command(subcommand)]
     Diff(DiffCommand),
+    /// Give a causal chain of this environment's workflows a new budget after its budget ran out.
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
     /// Inspect the devices paired with this host, or revoke one.
     #[command(subcommand)]
     Device(DeviceCommand),
@@ -458,6 +461,37 @@ pub struct ChangesetMaterializeArguments {
     /// The label the copy is shown with. Its purpose when absent.
     #[arg(long)]
     pub label: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr workflow` operation.
+#[derive(Subcommand)]
+pub enum WorkflowCommand {
+    /// Give a causal chain whose budget ran out a new one, and continue it.
+    ///
+    /// Only this, made under a grant this host holds with the right to manage automation, gives a
+    /// chain a new budget; a late or replayed event never does. The chain is named by its causal
+    /// root, which the attention item for the exhausted chain shows after
+    /// `automation.causal_budget.`.
+    Rearm(WorkflowRearmArguments),
+}
+
+/// `kr workflow rearm`.
+#[derive(Args)]
+pub struct WorkflowRearmArguments {
+    /// The chain, by its causal root identifier.
+    pub causal_root: String,
+    /// The grant the rearm is made under, by identifier: a grant this host holds as live, for this
+    /// environment, with the right to manage automation.
+    #[arg(long)]
+    pub grant: String,
+    /// The budget generation the rearm leaves. Without it, the generation the chain is on when the
+    /// command reads it. Naming it makes a repeat of the command safe: a chain already past that
+    /// generation is told so and given no second budget.
+    #[arg(long)]
+    pub generation: Option<u64>,
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,
