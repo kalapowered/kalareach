@@ -55,9 +55,10 @@ fn large_notification() -> serde_json::Value {
 ///
 /// Four bindings share the instance. The first is granted the connector's own frames and is the
 /// positive case; the second runs another package, the third holds the grant and no stream, and the
-/// fourth is rich-disabled before anything is offered. The upstream sends a run of notifications and
-/// requests, a frame the table lists as a credential and one it does not list at all; the last
-/// notification is a marker, so that "nothing arrived" is decided by a frame that did.
+/// fourth is rich-disabled after it is ready and before anything is offered. The upstream sends a
+/// run of notifications and requests, a frame the table lists as a credential and one it does not
+/// list at all; the last notification is a marker, so that "nothing arrived" is decided by a frame
+/// that did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_06_07_a_frame_the_worker_offers_reaches_the_components_that_may_be_offered_it() {
     let Some(world) = Observing::start(Options::with(vec![
@@ -70,13 +71,14 @@ async fn kr_req_06_07_a_frame_the_worker_offers_reaches_the_components_that_may_
     else {
         return;
     };
-    world.broker().disable_rich(
-        plugin_world::observing::binding(4),
-        "disabled before the run",
-    );
-    for number in [1, 2, 3] {
+    for number in [1, 2, 3, 4] {
         world.until_ready(number).await;
     }
+    // The fourth binding is registered and ready, and then loses its rich capabilities: the runtime
+    // has not unbound it yet, and it is offered nothing from here on.
+    world
+        .broker()
+        .disable_rich(binding(4), "disabled before the run");
     // Of the four bindings only the first may be offered the connector's frames: the second runs
     // another package, the third holds the grant and no stream, and the fourth is rich-disabled.
     assert_eq!(
