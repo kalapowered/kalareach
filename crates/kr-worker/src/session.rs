@@ -4536,25 +4536,36 @@ impl Session {
     /// nothing, which under-reports and therefore evicts less rather than more, and a session
     /// whose spool is configured somewhere else reads that other directory's contents instead.
     pub fn collect_output(&mut self) -> Vec<crate::persistence::retention::Eviction> {
-        let host_bytes = self
-            .config
-            .spool_directory
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map_or_else(
-                || self.history.retained_bytes(),
-                crate::history::retained_bytes_under,
-            );
+        self.collect_output_under(crate::persistence::retention::OutputRetention::DEFAULT)
+    }
+
+    /// Applies output retention under `retention`, which is section 20's own figures for the
+    /// host's pass and other ones for a test.
+    pub fn collect_output_under(
+        &mut self,
+        retention: crate::persistence::retention::OutputRetention,
+    ) -> Vec<crate::persistence::retention::Eviction> {
         // Section 9 stops expiry-based collection while the wall clock cannot be proved, and
         // removing output because it is seven days old is exactly that. The caps are applied
         // either way: they are about bytes rather than about time.
         let age_permitted = self.time.may_collect_expired();
-        self.history.apply_retention(
-            crate::persistence::retention::OutputRetention::DEFAULT,
-            host_bytes,
-            kr_ipc::now_ms(),
-            age_permitted,
-        )
+        let now = kr_ipc::now_ms();
+        match self
+            .config
+            .spool_directory
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            Some(spools) => {
+                self.history
+                    .apply_retention_to_host(spools, retention, now, age_permitted)
+            }
+            None => {
+                let held = self.history.retained_bytes();
+                self.history
+                    .apply_retention(retention, held, now, age_permitted)
+            }
+        }
     }
 
     /// Writes down what the time contract has to survive a restart, when it has changed.

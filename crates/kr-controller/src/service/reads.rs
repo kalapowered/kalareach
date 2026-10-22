@@ -304,13 +304,29 @@ impl Controller {
                 .find(|row| row.session_id == session_id);
             (row, registry.closure(session_id)?)
         };
+        Ok(self.worker_may_remain(session_id, row.as_ref(), closure.as_ref()))
+    }
+
+    /// Whether anything this host holds says the worker of a session may still be there, given the
+    /// registry's worker row and closure for it.
+    ///
+    /// The registry's row names a process the kernel has not said ended; the closure lists a worker
+    /// it never saw end; or the published descriptor names one. Each of the three is evidence, and
+    /// a closure erases the first two, so the answer is only as good as all three being asked. A
+    /// collection asks it with the session's recovery lock held.
+    pub(crate) fn worker_may_remain(
+        &self,
+        session_id: SessionId,
+        row: Option<&crate::registry::WorkerRecord>,
+        closure: Option<&ClosureRecord>,
+    ) -> bool {
         if let Some(row) = row
             && !matches!(
                 kr_ipc::identity::process_state(&row.process_identity),
                 kr_ipc::identity::ProcessState::Ended
             )
         {
-            return Ok(true);
+            return true;
         }
         if let Some(closure) = closure
             && closure
@@ -318,9 +334,9 @@ impl Controller {
                 .iter()
                 .any(|resource| resource.kind == UNACCOUNTED_WORKER)
         {
-            return Ok(true);
+            return true;
         }
-        Ok(self.archive().a_worker_may_still_own(session_id))
+        self.archive().a_worker_may_still_own(session_id)
     }
 
     /// Reads what one session left behind, with the registry's own record beside it.

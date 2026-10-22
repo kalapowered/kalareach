@@ -169,6 +169,9 @@ pub struct Archive {
     pub oldest_retained_cursor: u64,
     /// The cursor after the last byte of retained output.
     pub next_cursor: u64,
+    /// How many bytes of output the archive holds, which is not the distance between the cursors:
+    /// output that aged out is a gap and holds nothing.
+    pub output_bytes: u64,
     /// Resources this session still refers to.
     pub retained: Vec<RetainedResource>,
     /// What this archive could not account for. Empty means complete.
@@ -185,33 +188,52 @@ impl Archive {
     /// Returns true when this session's own retention still covers what was submitted to it.
     ///
     /// Section 14 gives a submitted attachment its session's retention rather than the seven-day
-    /// unused-attachment window, so the question is whether this host still holds a record of the
-    /// session at all. Three answers are *yes* and they are all the same kind of answer:
+    /// unused-attachment window. A session's retention is what the archive still holds of it: its
+    /// receipts for thirty days and its output for seven. So the answer is *yes* while any of these
+    /// holds:
     ///
-    /// * a summary or a closure survived, which is a session this host remembers;
-    /// * a receipt survived, which is the same thing said by a different store;
-    /// * retained output survived, which is a session whose history is still being kept;
-    /// * this host could not read something, including a spool it cannot tell an empty one from;
-    /// * something could not be read, because declining to delete is the answer that cannot lose
-    ///   a file and an unreadable record is not evidence that retention has ended.
+    /// * a receipt or a byte of output is held;
+    /// * something could not be read, because declining to delete is the answer that cannot lose a
+    ///   file and an unreadable record is not evidence that retention has ended;
+    /// * the session has a summary and no closure, which is a session still starting or one whose
+    ///   end was never recorded;
+    /// * the session closed less than thirty days ago, or the clock cannot say it did not.
     ///
-    /// Only an archive that found nothing at all and could read everything it looked at answers
-    /// no. The one thing that must never happen here is a *false* answer produced by not looking,
-    /// because the sweep reads no as expiry and removes the payload.
+    /// `proven_now` is the host's reading of the wall clock when it can prove it, and none when it
+    /// cannot. The age of a closure is a decision the wall clock makes, and an unproved clock is
+    /// how a rollback deletes what had not expired, so without a proved reading the answer is yes.
+    ///
+    /// A lost range does not keep a file: age and the caps leave one behind by design, and a
+    /// session whose every byte and receipt aged out would otherwise keep its files for ever. Only
+    /// an archive that found nothing at all, and could read everything it looked at, answers no
+    /// without a closure. The one thing that must never happen here is a *false* answer produced by
+    /// not looking, because the sweep reads no as expiry and removes the payload.
     #[must_use]
-    pub fn retains_submissions(&self) -> bool {
-        self.summary.is_some()
-            || self.closure.is_some()
-            || self.receipts > 0
-            || self.next_cursor > 0
-            || self.incompleteness.iter().any(|reason| {
-                matches!(
-                    reason,
-                    Incompleteness::JournalUnreadable { .. } | Incompleteness::HistoryLost { .. }
-                )
-            })
+    pub fn retains_submissions(&self, proven_now: Option<TimestampMs>) -> bool {
+        if self.receipts > 0
+            || self.output_bytes > 0
+            || self
+                .incompleteness
+                .iter()
+                .any(|reason| matches!(reason, Incompleteness::JournalUnreadable { .. }))
+        {
+            return true;
+        }
+        match &self.closure {
+            Some(closure) => proven_now.is_none_or(|now| {
+                now.get()
+                    < closure
+                        .closed_at_ms
+                        .get()
+                        .saturating_add(RECEIPT_RETENTION_MS)
+            }),
+            None => self.summary.is_some(),
+        }
     }
 }
+
+/// How long a closed session's receipts are kept, which is how long a file submitted to it is.
+pub const RECEIPT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// What recovering a crashed session's journal resolved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -240,6 +262,9 @@ pub struct Collected {
     pub output_retained: Option<u64>,
     /// Why output past its retention is still there, when some is.
     pub output_left_behind: Option<String>,
+    /// Why the rows of the time index for output that went are still there, when they are. The
+    /// index describes output and is not output: this does not hold the output's own collection.
+    pub times_left_behind: Option<String>,
     /// What the recovery rules settled before any receipt was collected.
     pub recovered: Recovered,
     /// Receipts past their retention that went.
@@ -252,19 +277,65 @@ pub struct Collected {
 
 /// Exclusive recovery ownership of one session's stores.
 ///
-/// It exists only after the endpoint is fenced and the worker's death is validated, which is the
-/// order section 24 fixes: a journal taken over while its worker was still writing would be two
-/// writers on one store.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// It exists only after the session's recovery lock is held, the endpoint is fenced and the
+/// worker's death is validated, which is the order section 24 fixes: a journal taken over while its
+/// worker was still writing would be two writers on one store. The lock is a file in the runtime
+/// directory held for as long as this value is, so two recoveries, collections or migrations of one
+/// session are kept apart, in one process and between processes, and the operating system gives it
+/// back with the process that held it.
+///
+/// There is exactly one at a time for a session, so it is not [`Clone`]. Every operation that
+/// writes a session's stores while no worker owns them takes it.
+#[derive(Debug)]
 pub struct RecoveryOwnership {
     /// The session whose stores this owns.
     pub session_id: SessionId,
-    /// The identity the kernel confirmed had ended.
-    pub ended: ProcessStartIdentity,
+    /// The identity the kernel confirmed had ended, where ownership rests on a death validated
+    /// here, and none where it rests on a closure that was recorded for a worker that is gone.
+    pub ended: Option<ProcessStartIdentity>,
     /// Whether the worker's published endpoint was removed.
     pub endpoint_fenced: bool,
     /// When ownership was taken.
     pub taken_at_ms: TimestampMs,
+    _lock: RecoveryLock,
+}
+
+/// The lock of one session's recovery, held until it is dropped.
+#[derive(Debug)]
+struct RecoveryLock {
+    file: std::fs::File,
+}
+
+impl Drop for RecoveryLock {
+    fn drop(&mut self) {
+        // A descriptor copied into a child process keeps the lock alive after this one closes, so
+        // it is let go of here and not left to the close.
+        let _ = kr_flush::lock::release(&self.file);
+    }
+}
+
+impl RecoveryLock {
+    /// Takes the lock of `session_id`'s recovery if no one holds it, and does not wait.
+    fn take(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        session_id: SessionId,
+    ) -> std::result::Result<Self, OwnershipRefusal> {
+        let unavailable = |detail: String| OwnershipRefusal::LockUnavailable {
+            session: session_id.to_string(),
+            detail,
+        };
+        kr_ipc::paths::create_private_tree(paths.runtime_root(), &paths.recoveries_dir())
+            .map_err(|error| unavailable(error.to_string()))?;
+        let file = kr_ipc::paths::open_lock_file(&paths.recovery_lock(session_id))
+            .map_err(|error| unavailable(error.to_string()))?;
+        match kr_flush::lock::try_exclusive(&file) {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(OwnershipRefusal::Held {
+                session: session_id.to_string(),
+            }),
+            Err(std::fs::TryLockError::Error(error)) => Err(unavailable(error.to_string())),
+        }
+    }
 }
 
 /// Why recovery ownership could not be taken.
@@ -289,6 +360,57 @@ pub enum OwnershipRefusal {
         /// What the platform said.
         detail: String,
     },
+    /// Another recovery, collection or migration of the session holds its stores.
+    #[error("session {session} is being recovered by another, so its stores are not this one's")]
+    Held {
+        /// The session.
+        session: String,
+    },
+    /// The worker is gone and its published endpoint is not: it could not be removed.
+    #[error(
+        "the endpoint a worker of session {session} published could not be removed, so its \
+         stores are not taken: {detail}"
+    )]
+    Unfenced {
+        /// The session.
+        session: String,
+        /// What the file system said.
+        detail: String,
+    },
+    /// The lock that keeps recoveries apart could not be made or taken.
+    #[error("the recovery lock of session {session} could not be taken: {detail}")]
+    LockUnavailable {
+        /// The session.
+        session: String,
+        /// What the file system said.
+        detail: String,
+    },
+    /// Something says a worker may still own the session's stores.
+    #[error(
+        "session {session} has a worker this host has not seen end, so a worker may still own \
+         its stores and nothing of them is collected"
+    )]
+    WorkerMayRemain {
+        /// The session.
+        session: String,
+    },
+}
+
+/// Why the stores of a closed session could not be owned for a collection.
+#[derive(Debug, thiserror::Error)]
+pub enum ClosedRefusal {
+    /// The session is held, or a worker may remain.
+    #[error("{0}")]
+    Ownership(#[from] OwnershipRefusal),
+    /// The evidence that no worker remains could not be read.
+    #[error("{0}")]
+    Evidence(#[from] ControllerError),
+}
+
+impl From<OwnershipRefusal> for ControllerError {
+    fn from(refusal: OwnershipRefusal) -> Self {
+        Self::InvalidArgument(refusal.to_string())
+    }
 }
 
 /// The environment's archive service.
@@ -312,62 +434,103 @@ impl ArchiveService {
 
     /// Takes exclusive recovery ownership of one session's stores.
     ///
-    /// Death is validated first, and the endpoint is fenced only once it has been. Section 24
-    /// puts the fence before the journal is opened, which is what this keeps: nothing reaches the
-    /// stores until the endpoint is gone. What it must not do is fence first and ask afterwards,
-    /// because the answer can be *no*: a worker that is alive would then have had its published
-    /// endpoint deleted by the daemon that was only enquiring, and every client of a working
-    /// session would find nothing where its socket had been.
+    /// The session's recovery lock comes first, so that what follows is decided by the one party
+    /// that holds it. Death is validated next, and the endpoint is fenced only once it has been.
+    /// Section 24 puts the fence before the journal is opened, which is what this keeps: nothing
+    /// reaches the stores until the endpoint is gone. What it must not do is fence first and ask
+    /// afterwards, because the answer can be *no*: a worker that is alive would then have had its
+    /// published endpoint deleted by the daemon that was only enquiring, and every client of a
+    /// working session would find nothing where its socket had been.
     ///
     /// Validation is the kernel's own answer, and both halves of it: the identifier and the start
     /// value, because the kernel reuses identifiers and an unrelated program can hold the number
     /// within milliseconds. Only a confirmed ending is death. A query the platform declines is
     /// not death, and leaves the session alone.
     ///
+    /// The fence is part of the ownership and not a courtesy: an endpoint or a descriptor that is
+    /// there and cannot be removed refuses it, because a stale socket left beside a recovered
+    /// journal is the state this exists to rule out. One that is already gone is fenced.
+    ///
     /// It never creates a worker, and there is no argument by which it could: what it takes is a
     /// directory and a database that already exist.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] carrying an [`OwnershipRefusal`] when the
-    /// worker is alive or its death could not be validated. Nothing has been fenced in either
-    /// case.
+    /// Returns the [`OwnershipRefusal`]: another holds the session, the worker is alive or its
+    /// death could not be validated, or the fence could not be made. Nothing has been fenced when
+    /// the worker is alive or its death is unvalidated.
     pub fn take_ownership(
         &self,
         session_id: SessionId,
         display_number: kr_protocol::session::DisplayNumber,
         identity: &ProcessStartIdentity,
-    ) -> Result<RecoveryOwnership> {
+    ) -> std::result::Result<RecoveryOwnership, OwnershipRefusal> {
+        let lock = RecoveryLock::take(&self.paths, session_id)?;
         let mut last = String::new();
         for _ in 0..DEATH_VALIDATION_ATTEMPTS {
             match kr_ipc::identity::process_state(identity) {
                 kr_ipc::identity::ProcessState::Ended => {
-                    let fenced = self.fence_endpoint(session_id, display_number);
+                    let fenced =
+                        self.fence_endpoint(session_id, display_number)
+                            .map_err(|detail| OwnershipRefusal::Unfenced {
+                                session: session_id.to_string(),
+                                detail,
+                            })?;
                     return Ok(RecoveryOwnership {
                         session_id,
-                        ended: identity.clone(),
+                        ended: Some(identity.clone()),
                         endpoint_fenced: fenced,
                         taken_at_ms: kr_ipc::now_ms(),
+                        _lock: lock,
                     });
                 }
                 kr_ipc::identity::ProcessState::Running => {
-                    return Err(ControllerError::InvalidArgument(
-                        OwnershipRefusal::WorkerAlive {
-                            session: session_id.to_string(),
-                        }
-                        .to_string(),
-                    ));
+                    return Err(OwnershipRefusal::WorkerAlive {
+                        session: session_id.to_string(),
+                    });
                 }
                 kr_ipc::identity::ProcessState::Unknown { detail } => last = detail,
             }
         }
-        Err(ControllerError::InvalidArgument(
-            OwnershipRefusal::DeathUnvalidated {
+        Err(OwnershipRefusal::DeathUnvalidated {
+            session: session_id.to_string(),
+            detail: last,
+        })
+    }
+
+    /// Takes exclusive ownership of the stores of a session that has already closed, for the
+    /// collection of what it retains.
+    ///
+    /// There is no process to validate here: the caller's `a_worker_may_remain` is every piece of
+    /// evidence the host holds that one is gone, asked **with the lock held**, so that no other
+    /// recovery can change the answer between the question and the use. A closure the registry
+    /// recorded, a worker row, the closure's own list of a worker it never saw end and the
+    /// published descriptor are the evidence, and the caller reads all of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnershipRefusal::Held`] when another holds the session,
+    /// [`OwnershipRefusal::WorkerMayRemain`] when `a_worker_may_remain` says a worker may, and
+    /// whatever it fails with otherwise.
+    pub fn own_closed(
+        &self,
+        session_id: SessionId,
+        a_worker_may_remain: impl FnOnce() -> Result<bool>,
+    ) -> std::result::Result<RecoveryOwnership, ClosedRefusal> {
+        let lock = RecoveryLock::take(&self.paths, session_id)?;
+        if a_worker_may_remain()? {
+            return Err(OwnershipRefusal::WorkerMayRemain {
                 session: session_id.to_string(),
-                detail: last,
             }
-            .to_string(),
-        ))
+            .into());
+        }
+        Ok(RecoveryOwnership {
+            session_id,
+            ended: None,
+            endpoint_fenced: false,
+            taken_at_ms: kr_ipc::now_ms(),
+            _lock: lock,
+        })
     }
 
     /// Returns whether a worker this host has not seen end may still own this session.
@@ -421,6 +584,18 @@ impl ArchiveService {
     /// is left alone and reported by the reader, because restoring one in part is worse than
     /// saying it cannot be read.
     pub fn bring_forward(&self, session_id: SessionId) {
+        self.bring_forward_with(session_id, None);
+    }
+
+    /// Brings a store forward as [`Self::bring_forward`] does, for the recovery that owns it.
+    ///
+    /// A migration is a write, so it is made under the session's recovery lock. The recovery that
+    /// holds that lock is the one that calls this, and it needs no second hold on it.
+    pub fn bring_forward_owned(&self, ownership: &RecoveryOwnership) {
+        self.bring_forward_with(ownership.session_id, Some(ownership));
+    }
+
+    fn bring_forward_with(&self, session_id: SessionId, owned: Option<&RecoveryOwnership>) {
         // A migration is a write, so it asks the question recovery ownership asks, and asks it
         // here rather than trusting a caller: a session whose published descriptor names a process
         // the kernel has not said ended may still own this store, and a closure written over an
@@ -441,6 +616,16 @@ impl ArchiveService {
         {
             return;
         }
+        // The lock is taken only when there is something to write, and not waited for: a store
+        // another recovery holds is left to it, and the reader reports it until it is done.
+        let _held = if owned.is_some() {
+            None
+        } else {
+            match RecoveryLock::take(&self.paths, session_id) {
+                Ok(lock) => Some(lock),
+                Err(_) => return,
+            }
+        };
         // `Journal::open` migrates and then holds the current schema. Dropping it immediately is
         // what keeps this a migration rather than a second reader.
         drop(Journal::open(&path));
@@ -453,18 +638,35 @@ impl ArchiveService {
     /// and stop a restarted daemon rebuilding its directory from a descriptor for a session that
     /// has ended. It runs only after death is validated, because the endpoint it removes belongs
     /// to a session that may still be serving.
+    ///
+    /// A file that is not there is fenced. A file that is there and cannot be removed is not, and
+    /// is returned as the reason.
     fn fence_endpoint(
         &self,
         session_id: SessionId,
         display_number: kr_protocol::session::DisplayNumber,
-    ) -> bool {
-        let mut fenced = std::fs::remove_file(self.paths.descriptor_file(session_id)).is_ok();
-        if let Ok(endpoint) = self.paths.worker_endpoint(display_number)
-            && std::fs::remove_file(endpoint.as_path()).is_ok()
-        {
-            fenced = true;
+    ) -> std::result::Result<bool, String> {
+        let remove = |path: &std::path::Path| -> std::result::Result<bool, String> {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(format!("{}: {error}", path.display())),
+            }
+        };
+        let mut fenced = remove(&self.paths.descriptor_file(session_id))?;
+        if let Ok(endpoint) = self.paths.worker_endpoint(display_number) {
+            // On Windows the endpoint is the name of a pipe, which has no file to remove and goes
+            // with the process that made it.
+            #[cfg(unix)]
+            {
+                fenced |= remove(endpoint.as_path())?;
+            }
+            #[cfg(not(unix))]
+            {
+                fenced |= std::fs::remove_file(endpoint.as_path()).is_ok();
+            }
         }
-        fenced
+        Ok(fenced)
     }
 
     /// Recovers a crashed session's journal, under ownership, without creating one.
@@ -530,10 +732,10 @@ impl ArchiveService {
         // published descriptor is asked as well, because a worker that is still serving is the
         // one thing that must never have its stores collected under it.
         if self.a_worker_may_still_own(session_id) {
-            return Err(ControllerError::InvalidArgument(format!(
-                "session {session_id} has a published worker this host has not seen end, so a \
-                 worker may still own its stores and nothing of them is collected"
-            )));
+            return Err(OwnershipRefusal::WorkerMayRemain {
+                session: session_id.to_string(),
+            }
+            .into());
         }
         let mut collected = Collected {
             age_permitted,
@@ -611,7 +813,7 @@ impl ArchiveService {
             &directory,
             kr_worker::history::SpoolLayout::DEFAULT,
         ) {
-            Ok(history) => history,
+            Ok(history) => history.with_time_index(self.paths.session_output_times(session_id)),
             Err(error) => {
                 into.output_left_behind = Some(error.to_string());
                 return;
@@ -629,6 +831,79 @@ impl ArchiveService {
         into.output_bytes = taken.iter().map(|eviction| eviction.bytes).sum();
         into.output_retained = Some(history.retained_bytes());
         into.output_left_behind = history.left_behind().map(str::to_owned);
+        into.times_left_behind = history.flush_times().err();
+    }
+
+    /// Gives up output of a closed session so that the host-wide cap holds, and returns how many
+    /// bytes went.
+    ///
+    /// `excess` is how far over the cap the host is. The session gives up what it can of it, oldest
+    /// output first, and no more than it holds; the caller goes on to the next session with what is
+    /// left. Only the caps are applied: age is [`Self::collect`]'s, and it needs a clock the host
+    /// can prove, which a cap does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a worker may still own the session, and nothing is taken then.
+    pub fn collect_over_host_cap(
+        &self,
+        ownership: &RecoveryOwnership,
+        retention: kr_worker::persistence::retention::OutputRetention,
+        excess: u64,
+        now_ms: TimestampMs,
+    ) -> Result<u64> {
+        let session_id = ownership.session_id;
+        if self.a_worker_may_still_own(session_id) {
+            return Err(OwnershipRefusal::WorkerMayRemain {
+                session: session_id.to_string(),
+            }
+            .into());
+        }
+        let directory = self.paths.session_spool(session_id);
+        if !directory.try_exists().unwrap_or(false) {
+            return Ok(0);
+        }
+        let mut history = kr_worker::history::OutputHistory::read_spool(
+            &directory,
+            kr_worker::history::SpoolLayout::DEFAULT,
+        )
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?
+        .with_time_index(self.paths.session_output_times(session_id));
+        // The host figure this session reports is the cap and the excess, so the most it gives up
+        // is the excess, bounded by what it holds.
+        let taken = history.apply_retention(
+            retention,
+            retention.host_cap_bytes.saturating_add(excess),
+            now_ms,
+            false,
+        );
+        let _ = history.flush_times();
+        Ok(taken.iter().map(|eviction| eviction.bytes).sum())
+    }
+
+    /// Reads when a closed session's output was produced, between two cursors.
+    ///
+    /// The index is read from the file the session's worker left. A session whose worker has not
+    /// gone is the caller's to refuse, as it is for a page of its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the index could not be read, which a caller states and does not hide: output
+    /// with no recorded time is declared as that.
+    pub fn history_times(
+        &self,
+        session_id: SessionId,
+        from_cursor: u64,
+        to_cursor: u64,
+        limit: usize,
+    ) -> std::result::Result<kr_worker::output_times::Times, kr_worker::output_times::Unavailable>
+    {
+        kr_worker::output_times::read(
+            &self.paths.session_output_times(session_id),
+            from_cursor,
+            to_cursor,
+            limit,
+        )
     }
 
     /// Reads what one session left behind.
@@ -671,6 +946,7 @@ impl ArchiveService {
             receipts: 0,
             oldest_retained_cursor: 0,
             next_cursor: 0,
+            output_bytes: 0,
             retained: Vec::new(),
             incompleteness: Vec::new(),
         };
@@ -867,8 +1143,15 @@ impl ArchiveService {
     /// # Errors
     ///
     /// Returns an error only when a path this host owns cannot be built.
-    pub fn retains_submissions(&self, session_id: SessionId) -> Result<bool> {
-        Ok(self.archive(session_id)?.retains_submissions())
+    pub fn retains_submissions(
+        &self,
+        session_id: SessionId,
+        recorded: Option<ClosureRecord>,
+        proven_now: Option<TimestampMs>,
+    ) -> Result<bool> {
+        Ok(self
+            .archive_beside(session_id, recorded)?
+            .retains_submissions(proven_now))
     }
 
     /// Returns every session this host still holds a journal or a spool for.
@@ -957,6 +1240,7 @@ impl ArchiveService {
         };
         archive.oldest_retained_cursor = history.oldest_retained_cursor();
         archive.next_cursor = history.next_cursor();
+        archive.output_bytes = history.retained_bytes();
         if history.boundary_unreadable() {
             // This session recorded where its output got to and this host cannot read it back, so
             // the range it is missing is not a range this host can name.
@@ -1058,7 +1342,7 @@ impl crate::service::Controller {
             if candidates.contains(&session_id) {
                 continue;
             }
-            if archive.retains_submissions(session_id)? {
+            if archive.retains_submissions(session_id, None, None)? {
                 retention.insert(session_id);
             }
         }
@@ -1136,11 +1420,12 @@ mod tests {
             receipts: 0,
             oldest_retained_cursor: 0,
             next_cursor: 0,
+            output_bytes: 0,
             retained: Vec::new(),
             incompleteness: Vec::new(),
         };
         assert!(archive.is_complete());
-        assert!(!archive.retains_submissions());
+        assert!(!archive.retains_submissions(None));
     }
 
     #[test]
@@ -1152,6 +1437,7 @@ mod tests {
             receipts: 0,
             oldest_retained_cursor: 0,
             next_cursor: 0,
+            output_bytes: 0,
             retained: Vec::new(),
             incompleteness: vec![Incompleteness::JournalUnreadable {
                 detail: "the store said so".to_owned(),
@@ -1159,7 +1445,7 @@ mod tests {
         };
         assert!(!archive.is_complete());
         assert!(
-            archive.retains_submissions(),
+            archive.retains_submissions(None),
             "declining to delete is the answer that cannot lose a file"
         );
     }

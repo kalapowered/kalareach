@@ -765,6 +765,8 @@ pub struct Controller {
     /// and writing its closure happen once: the second to arrive waits and finds the closure.
     crash_flights:
         std::sync::Mutex<std::collections::HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    /// What the daemon collects of the sessions that have closed, and the task that does it.
+    collection: crate::collection::Collection,
     /// This daemon's side of an update of the host: its gate to new sessions, the creates under
     /// way, and whether it has been told to stop.
     handover: host::Handover,
@@ -1034,6 +1036,11 @@ impl Controller {
     #[must_use]
     pub const fn attention(&self) -> &Arc<crate::attention::AttentionModule> {
         &self.attention
+    }
+
+    /// Returns what the daemon collects of the sessions that have closed.
+    pub(crate) const fn collection(&self) -> &crate::collection::Collection {
+        &self.collection
     }
 
     /// Returns the registry, for a module that needs to read the environment's own records.

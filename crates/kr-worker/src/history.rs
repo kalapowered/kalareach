@@ -900,6 +900,24 @@ impl OutputHistory {
         taken
     }
 
+    /// Applies section 20's retention with the host's figure measured from the environment's
+    /// spools, which is what a live session's maintenance pass does.
+    ///
+    /// The figure is a reading of `spools`, the directory that holds every session's spool, and
+    /// not an authority: [`retained_bytes_under`] sizes each file by asking the file, and a file it
+    /// cannot read counts as nothing, which evicts less and not more. The control daemon applies
+    /// the same cap to the sessions that have closed, from the same reading.
+    pub fn apply_retention_to_host(
+        &mut self,
+        spools: &Path,
+        retention: OutputRetention,
+        now_ms: TimestampMs,
+        age_permitted: bool,
+    ) -> Vec<Eviction> {
+        let host_bytes = retained_bytes_under(spools);
+        self.apply_retention(retention, host_bytes, now_ms, age_permitted)
+    }
+
     /// Removes every byte this host can prove was produced before `expires_before`.
     ///
     /// Both layers, because the resident window is what a session serves when its spool has
