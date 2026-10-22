@@ -54,6 +54,7 @@ use kr_protocol::ids::{
     SessionId,
 };
 use kr_protocol::method::Method;
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult, ReceiptState};
 use kr_protocol::recovery::{
     AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSnapshotResult,
 };
@@ -1964,8 +1965,13 @@ fn kr_req_12_08_a_device_steers_cancels_and_prompts_through_what_the_released_pa
     ctx.close(&host);
 }
 
-/// A prompt a device sends while the server dies under it is an outcome nobody can establish, and
-/// the caller is told so: the host's own OUTCOME_UNKNOWN, and the prompt is not sent again.
+/// KR-GOAL-19: a prompt a device sends while the server dies under it is an outcome nobody can
+/// establish, and the caller is told so.
+///
+/// The prompt reached the upstream before the upstream went: the server noted its request, and then
+/// ended. The device is told `OUTCOME_UNKNOWN`, which is neither a refusal it could retry nor a
+/// success; the host's receipt for the action says `unknown`; and the person's terminal route
+/// carries on, since the shell is back at its prompt and runs what is typed there.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[test]
@@ -2003,14 +2009,48 @@ fn a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
     // The host says it cannot establish whether the action happened: the client's own account of
     // an unknown outcome, which carries the action and the host's OUTCOME_UNKNOWN.
     let kr_e2e_m1b::device::RequestError::Client(kr_client::ClientError::OutcomeUnknown {
+        action_id,
         error,
-        ..
     }) = &refused
     else {
         panic!("the outcome is unknown, and the host says so: {refused}");
     };
     assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{refused}");
-    // The same prompt is not sent again: the server received one request of the second turn at most.
-    assert!(requests_of(&ctx, "turn/start").len() <= 2);
+    // The prompt was dispatched: the upstream received the second turn's request before it ended.
+    assert_eq!(
+        requests_of(&ctx, "turn/start").len(),
+        2,
+        "the terminal's turn and the device's prompt each reached the server: {:?}",
+        received_lines(&ctx)
+    );
+    // What the host keeps of the action says what the caller was told: it cannot be established.
+    let read: ActionReadResult = ctx
+        .runtime
+        .block_on(remote.read(
+            Method::ActionRead,
+            &ActionReadParams {
+                action_id: *action_id,
+                session_id: Some(session),
+            },
+        ))
+        .unwrap_or_else(|why| panic!("action.read: {why}"));
+    assert_eq!(
+        read.receipt.state,
+        ReceiptState::Unknown,
+        "the receipt of a prompt whose server died under it"
+    );
+    // The terminal route is unharmed: the terminal ended with its server, and the shell it was
+    // started from reads and runs what is typed next.
+    let _ = ctx.instances_until(&remote, session, "the terminal's end", |read| {
+        read.agent_instances
+            .instances
+            .iter()
+            .all(|instance| instance.ended_at.0.is_some())
+    });
+    person.types("printf 'kala%s-after\\n' reach");
+    let _ = person.sees(
+        "kalareach-after",
+        "the shell runs what is typed after the server died",
+    );
     ctx.close(&host);
 }
