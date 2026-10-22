@@ -1512,6 +1512,94 @@ mod platform {
     }
 }
 
+/// Refuses to start a daemon in a login session other than the one that work an earlier daemon of
+/// this environment left is still running in.
+///
+/// Windows ends a login session's processes when the user signs out of it, so an environment's
+/// work has to stay in one session: a worker in another would be ended by the wrong sign-out, or
+/// outlive the one that ends the rest. A daemon that took over work in another session would then
+/// start its own workers in this one, and the environment would be in two. So what an earlier
+/// daemon left is read before anything is recovered, adopted or accepted, and a daemon whose
+/// session is not the one it runs in refuses to start, naming the session and the way out.
+///
+/// What counts as work is what recovery would act on: a worker of a live session, and a launch
+/// that was handed over and reported a process, was claimed, or was fenced, since a fenced launch
+/// is unresolved and may still be running. A launch that reported no process is not work: a worker
+/// starts a shell only after its claim, which recovery fences before anything is served. Each
+/// process is read by the kernel, so nothing a record says is believed: a process that has ended
+/// is not work, which is how a sign-out, and then a daemon in the next session, is told apart from
+/// work left behind; a process whose session cannot be read is refused as well, since it is not
+/// shown to be in this one. The caller does not call this for a boot the environment did not run
+/// in, where a reboot ended every process.
+///
+/// # Errors
+///
+/// Returns the refusal, or the registry's failure to be read.
+#[cfg(windows)]
+pub(crate) fn refuse_work_in_another_session(
+    registry: &crate::registry::Registry,
+    here: u32,
+) -> crate::error::Result<()> {
+    use kr_ipc::identity::{ProcessState, process_state};
+
+    use crate::registry::LaunchPhase;
+
+    let mut left: Vec<kr_protocol::identity::ProcessStartIdentity> = registry
+        .workers()?
+        .into_iter()
+        .map(|worker| worker.process_identity)
+        .collect();
+    for phase in [
+        LaunchPhase::Spawned,
+        LaunchPhase::Claimed,
+        LaunchPhase::Fenced,
+    ] {
+        left.extend(
+            registry
+                .reservations_in(phase)?
+                .into_iter()
+                .filter_map(|reservation| reservation.launcher_identity),
+        );
+    }
+    left.sort_by_key(|identity| identity.pid.get());
+    left.dedup_by_key(|identity| identity.pid.get());
+    let mut elsewhere = Vec::new();
+    let mut unread = Vec::new();
+    for identity in &left {
+        let pid = u32::try_from(identity.pid.get()).unwrap_or(u32::MAX);
+        match process_state(identity) {
+            ProcessState::Ended => {}
+            ProcessState::Running => match kr_ipc::starter::process_facts(pid) {
+                Ok(facts) if facts.session == here => {}
+                Ok(facts) => elsewhere.push(format!("{pid} in session {}", facts.session)),
+                Err(_) => unread.push(pid.to_string()),
+            },
+            ProcessState::Unknown { .. } => unread.push(pid.to_string()),
+        }
+    }
+    if elsewhere.is_empty() && unread.is_empty() {
+        return Ok(());
+    }
+    let mut said = format!(
+        "this environment's work is still running outside this daemon's login session, {here}, and \
+         a daemon here takes none of it over"
+    );
+    if !elsewhere.is_empty() {
+        said.push_str(&format!(" (processes {})", elsewhere.join(", ")));
+    }
+    if !unread.is_empty() {
+        said.push_str(&format!(
+            "; the login session of the processes {} could not be read",
+            unread.join(", ")
+        ));
+    }
+    said.push_str(
+        ". Sign in to that session and end the work there, or end those processes, or restart the \
+         machine",
+    );
+    Err(crate::error::ControllerError::supervision(said))
+}
+
 #[cfg(windows)]
 pub use self::launching::{StarterExit, TaskSupervisor, run_starter};
 
