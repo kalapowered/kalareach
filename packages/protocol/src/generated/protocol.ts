@@ -2841,6 +2841,8 @@ export interface KalaReachProtocol {
   hello_reply?: HelloReply
   history_page_params?: HistoryPageParams
   history_page_result?: HistoryPageResult
+  history_times_params?: HistoryTimesParams
+  history_times_result?: HistoryTimesResult
   host_clock_establish_params?: HostClockEstablishParams
   host_clock_establish_result?: HostClockEstablishResult
   host_doctor_result?: HostDoctorResult
@@ -3006,6 +3008,7 @@ export interface KalaReachProtocol {
   organisation_policy_apply_result?: OrganisationPolicyApplyResult
   organisation_withdraw_params?: OrganisationWithdrawParams
   output_event?: OutputEvent
+  output_time?: OutputTime
   owner_confirmation_complete_params?: OwnerConfirmationCompleteParams
   owner_confirmation_complete_result?: OwnerConfirmationCompleteResult
   owner_confirmation_pending_params?: OwnerConfirmationPendingParams
@@ -17340,6 +17343,71 @@ export interface HistoryPageResult {
   oldest_retained_cursor: string
 }
 /**
+ * Parameters of `history.times`.
+ */
+export interface HistoryTimesParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  to_cursor: string
+}
+/**
+ * The result of `history.times`.
+ */
+export interface HistoryTimesResult {
+  /**
+   * Whether the range holds nothing more at or after `next_cursor`.
+   */
+  complete: boolean
+  /**
+   * The intervals that overlap the range, in order, at most [`MAX_HISTORY_TIMES`].
+   */
+  intervals: OutputTime[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  next_cursor: string
+  /**
+   * Why the host has no record of when this session's output was produced, when it has none.
+   * The intervals are then empty, and a reader says that the output carries no time rather than
+   * giving it one.
+   */
+  unavailable: string | null
+}
+/**
+ * One interval of retained output, and when its first byte was written.
+ *
+ * Every byte of the interval was written at or after `at_ms`, so it is a lower bound on when each
+ * of them was produced. Output in no interval has no recorded time.
+ */
+export interface OutputTime {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * Whether the worker could prove its wall clock when it took the reading. A reader that
+   * decides what a person may be shown by time uses only intervals for which this is true.
+   */
+  proven: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  to_cursor: string
+}
+/**
  * The parameters of `host.clock.establish`.
  *
  * There are none: what the owner confirmed is the digest of [`CLOCK_PURPOSE`], and the effect is
@@ -18927,6 +18995,7 @@ export interface MethodEntry {
     | 'events.snapshot'
     | 'agent.instances'
     | 'history.page'
+    | 'history.times'
     | 'action.read'
     | 'grant.create'
     | 'grant.revoke'
@@ -27892,6 +27961,7 @@ export interface ServiceRequestPayload {
     | 'events.snapshot'
     | 'agent.instances'
     | 'history.page'
+    | 'history.times'
     | 'action.read'
     | 'grant.create'
     | 'grant.revoke'

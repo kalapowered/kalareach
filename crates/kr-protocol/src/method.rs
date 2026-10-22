@@ -1506,6 +1506,16 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "Page retained history. A history request never creates a worker.";
 
+    HistoryTimes = "history.times", StateRecovery,
+    effect: Read, ingress: [LocalIpc], rights: [req(SessionView)],
+    selectors: [Session],
+    history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Read when a closed session's retained output was produced: the intervals of its cursors \
+          and the wall-clock reading at which each began, and whether the host could prove its \
+          clock then. Output in no interval has no recorded time. A history request never \
+          creates a worker.";
+
     ActionRead = "action.read", StateRecovery,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow],
     rights: [basis(ResourceOwner), basis(PresentViewAuthority)],
@@ -2088,6 +2098,7 @@ mod tests {
         ("events.subscribe", &[ActionRight::SessionView]),
         ("events.snapshot", &[ActionRight::SessionView]),
         ("history.page", &[ActionRight::SessionView]),
+        ("history.times", &[ActionRight::SessionView]),
         ("agent.snapshot", &[ActionRight::SessionView]),
         ("agent.approval.inspect", &[ActionRight::SessionView]),
     ];

@@ -206,7 +206,7 @@ use crate::receipt::{
 use crate::recovery::{
     AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSnapshotResult,
     EventsSubscribeParams, EventsSubscribeResult, HistoryPageParams, HistoryPageResult,
-    OutputEvent, ResyncRequired,
+    HistoryTimesParams, HistoryTimesResult, OutputEvent, OutputTime, ResyncRequired,
 };
 use crate::relay::{
     RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
@@ -485,6 +485,9 @@ pub fn protocol_schema() -> Value {
         "hello_reply" => HelloReply,
         "history_page_params" => HistoryPageParams,
         "history_page_result" => HistoryPageResult,
+        "history_times_params" => HistoryTimesParams,
+        "history_times_result" => HistoryTimesResult,
+        "output_time" => OutputTime,
         "host_doctor_result" => HostDoctorResult,
         "host_info_result" => HostInfoResult,
         "host_selection" => HostSelection,
