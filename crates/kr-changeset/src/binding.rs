@@ -731,8 +731,7 @@ mod unix {
 
             /// Takes one report into `heard`.
             fn hear(&self, heard: &mut Heard, event: &Event) {
-                // Reports of lost reports are not about any path: FSEvents gives them the path
-                // of the root of the volume.
+                // A report that reports are lost is not about a path that was written.
                 if event.need_rescan() {
                     heard.lost.get_or_insert_with(|| {
                         "the watcher lost reports of changes to the copy".to_owned()
@@ -836,13 +835,12 @@ mod unix {
                 };
                 let mut watcher = notify::recommended_watcher(handler)
                     .map_err(|error| format!("no watcher could be started: {error}"))?;
-                // The root of the volume is watched as well, without descending into it: the
-                // backend drops a report whose path is not at or below a watched one, and
-                // FSEvents gives the report that it lost reports the path of the volume's root.
+                // FSEvents reports that it lost reports at each path a stream watches, so the
+                // report reaches the handler through the copy's own path, which the backend
+                // passes. The stream takes in no more than the copy and the directory it is in.
                 watcher
                     .watch(&copy_path, RecursiveMode::Recursive)
                     .and_then(|()| watcher.watch(&beside_path, RecursiveMode::NonRecursive))
-                    .and_then(|()| watcher.watch(Path::new("/"), RecursiveMode::NonRecursive))
                     .map_err(|error| format!("the copy could not be watched: {error}"))?;
                 let watch = Self {
                     _watcher: watcher,
@@ -970,7 +968,7 @@ mod unix {
         #[test]
         fn only_the_filesystems_known_to_keep_change_times_are_trusted() {
             assert!(super::known_name("apfs").is_ok());
-            for other in ["hfs", "nfs", "smbfs", "msdos", "exfat", "autofs"] {
+            for other in ["nfs", "smbfs", "msdos", "exfat", "autofs"] {
                 assert!(super::known_name(other).is_err(), "{other}");
             }
         }

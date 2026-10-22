@@ -606,6 +606,7 @@ impl Outputs {
     }
 
     /// The declared paths, relative and normalised.
+    #[cfg(unix)]
     pub(crate) const fn declared(&self) -> &std::collections::BTreeSet<String> {
         &self.declared
     }
