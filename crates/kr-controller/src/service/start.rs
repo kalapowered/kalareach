@@ -1146,6 +1146,7 @@ impl Controller {
             demand_scan: Mutex::new(DemandScan::default()),
             finalising: Mutex::new(()),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
+            collection: crate::collection::Collection::default(),
             handover: super::host::Handover::default(),
             machine,
             lock,
@@ -1378,6 +1379,10 @@ impl Controller {
             );
         }
         crate::transfer::serve(&controller)?;
+        // What closed sessions retain is collected from here on, beginning at once: a daemon that
+        // starts over sessions that closed days ago finds their output and receipts past their
+        // bounds.
+        crate::collection::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
         // somebody happened to run a command.
@@ -1637,6 +1642,9 @@ impl Controller {
             )
             .ok()
         });
+        // Whether a session of the earlier boot was left as it was, so that the record of that boot
+        // stays and the next start closes it.
+        let mut left = false;
         if recorded.is_some_and(|recorded| recorded != self.boot_identity) {
             let rows = {
                 let registry = self.registry.lock().await;
@@ -1656,27 +1664,43 @@ impl Controller {
                 // and a session whose closure names a worker this host never saw end is refused
                 // every archive read rather than served an incomplete one.
                 let archive = self.archive();
-                let validated = if let Ok(ownership) = archive.take_ownership(
+                let ownership = archive.take_ownership(
                     row.session_id,
                     row.display_number,
                     &row.process_identity,
+                );
+                // Another recovery of this session is under way, or the stores cannot be taken
+                // safely yet (the worker's endpoint cannot be removed, or the lock cannot be
+                // made). The session keeps its worker row, and the record of the earlier boot
+                // stays where it is below, so the next start closes it as the host's restart: a
+                // closure written here over a death that was not validated would be written over
+                // its stores, and it would refuse every read of the session for good.
+                if matches!(
+                    ownership,
+                    Err(crate::archive::OwnershipRefusal::Held { .. }
+                        | crate::archive::OwnershipRefusal::Unfenced { .. }
+                        | crate::archive::OwnershipRefusal::LockUnavailable { .. })
                 ) {
-                    let _ = archive.recover_journal(&ownership);
-                    true
-                } else {
-                    false
-                };
+                    left = true;
+                    continue;
+                }
+                if let Ok(ownership) = &ownership {
+                    let _ = archive.recover_journal(ownership);
+                }
                 self.record_final(
                     row.session_id,
                     ClosureReason::HostShutdown,
                     &row.process_identity,
                     &crate::archive::Fenced::nothing(row.session_id),
-                    validated,
+                    ownership.is_ok(),
                 )
                 .await?;
+                // Held to here, so that nothing else recovers or collects the session while its
+                // closure is written.
+                drop(ownership);
             }
         }
-        if bytes.as_deref() != Some(current.as_slice()) {
+        if !left && bytes.as_deref() != Some(current.as_slice()) {
             kr_ipc::paths::write_owner_only_file(&path, &current)?;
         }
         Ok(())
