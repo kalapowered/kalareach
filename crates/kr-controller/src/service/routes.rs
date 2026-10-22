@@ -141,6 +141,8 @@ impl Controller {
                 .map_err(|error| error.to_protocol_error())?;
         }
         let admission: crate::automation::Admission = Arc::new(self.admission_in_service(carried));
+        #[cfg(feature = "testing")]
+        self.after_the_automation_admission.wait().await;
         self.automation
             .write(actor_id, mutation, method, admission, caller_grant)
             .await
