@@ -148,7 +148,7 @@ use crate::machine::{
     MachineChange, MachineExpected, MachineGroup, MachineJoinParams, MachineMergeParams,
     MachineSplitParams, MachineStepResult,
 };
-use crate::mailbox::{EnvelopePlaintext, ForwardedAuthority, SealedEnvelope};
+use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
 use crate::method::REGISTRY;
 use crate::organisation::{
     ExclusiveManagementEvent, MembershipPresentParams, MembershipPresentResult,
@@ -439,7 +439,6 @@ pub fn protocol_schema() -> Value {
         "events_snapshot_result" => EventsSnapshotResult,
         "events_subscribe_params" => EventsSubscribeParams,
         "events_subscribe_result" => EventsSubscribeResult,
-        "forwarded_authority" => ForwardedAuthority,
         "forwarded_mutation" => ForwardedMutation,
         "forwarded_request" => ForwardedRequest,
         "generation_accepted" => GenerationAccepted,

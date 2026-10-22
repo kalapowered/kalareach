@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::ids::{EnvelopeId, EnvironmentId, GrantId, MailboxThreadId, SessionEpoch, SessionId};
-use crate::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use crate::scalars::{
     Bytes, Digest256, KeyId, Nonce192, Nullable, StoredEnvelopeKey, TimestampMs, U64,
 };
@@ -59,11 +58,17 @@ pub enum MailboxPayloadType {
     /// A reference and not the state: what it names is read under current authority from the host
     /// that holds it. It is the repeated kind, so it is the one coalescing is mostly about.
     StateReference,
-    /// A signed authority object: a revocation request or a host authority revision record.
+    /// A payload that bears authority.
     ///
-    /// The payload is the signed object's canonical bytes. No reader of a mailbox takes authority
-    /// from one: a host and a device take theirs from their own records and the authority feed, so
-    /// an item of this kind is refused whoever sealed it.
+    /// No reader of a mailbox takes authority from one: a host and a device take theirs from their
+    /// own records and the authority feed, so an item of this kind is refused whoever sealed it.
+    /// Nothing produces one.
+    ///
+    /// The variant stays while the release before reads the delivery store at a version that
+    /// keeps it: removing it changes what `SealedEnvelope` reaches, which moves the delivery
+    /// store's version, and that store is read through at version 11 and written at 10. It goes,
+    /// with [`Self::bears_authority`], in the release that writes version 11, once the release
+    /// that read it ahead is the one retained.
     SignedAuthorityObject,
     /// An encrypted notification preview.
     NotificationPreview,
@@ -97,10 +102,9 @@ impl MailboxPayloadType {
 
     /// Returns true when a payload of this type bears authority.
     ///
-    /// Section 20 requires an authorisation-bearing payload to be signed before encryption, so
-    /// pairwise message authentication never substitutes for an issuer's grant signature. No
-    /// reader of a mailbox here accepts one, so a reader refuses an item of such a type after the
-    /// box, the bindings and the expiry have passed.
+    /// No reader of a mailbox here accepts one, so a reader refuses an item of such a type after
+    /// the box, the bindings and the expiry have passed. It goes with
+    /// [`Self::SignedAuthorityObject`], whose removal condition is stated there.
     #[must_use]
     pub const fn bears_authority(self) -> bool {
         match self {
@@ -112,24 +116,6 @@ impl MailboxPayloadType {
             | Self::SyncChange => false,
         }
     }
-}
-
-/// What the payload of a `signed_authority_object` envelope decodes as.
-///
-/// Section 20 signs an authorisation-bearing payload **before** encryption, so pairwise message
-/// authentication can never substitute for an issuer's grant signature. The set is closed, and it
-/// is closed on one property: every member carries its issuer's key identifier and a signature
-/// over a domain-separated transcript of its own fields.
-///
-/// Nothing here is authority by arriving. A reader of a mailbox refuses an item of this kind, and
-/// the objects take effect only through the authority feed and the host's own records.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ForwardedAuthority {
-    /// A remote owner's signed revocation request.
-    RevocationRequest(RevocationRequest),
-    /// One ordered authority revision a host issued.
-    AuthorityRevision(AuthorityRevisionRecord),
 }
 
 /// The authenticated plaintext of one mailbox envelope.

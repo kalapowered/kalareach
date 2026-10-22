@@ -17312,37 +17312,6 @@
       ],
       "type": "object"
     },
-    "ForwardedAuthority": {
-      "description": "What the payload of a `signed_authority_object` envelope decodes as.\n\nSection 20 signs an authorisation-bearing payload **before** encryption, so pairwise message\nauthentication can never substitute for an issuer's grant signature. The set is closed, and it\nis closed on one property: every member carries its issuer's key identifier and a signature\nover a domain-separated transcript of its own fields.\n\nNothing here is authority by arriving. A reader of a mailbox refuses an item of this kind, and\nthe objects take effect only through the authority feed and the host's own records.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "description": "A remote owner's signed revocation request.",
-          "properties": {
-            "revocation_request": {
-              "$ref": "#/$defs/RevocationRequest"
-            }
-          },
-          "required": [
-            "revocation_request"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "One ordered authority revision a host issued.",
-          "properties": {
-            "authority_revision": {
-              "$ref": "#/$defs/AuthorityRevisionRecord"
-            }
-          },
-          "required": [
-            "authority_revision"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "ForwardedLease": {
       "additionalProperties": false,
       "description": "The remote dispatch lease the control daemon holds for a worker, as it travels beside a mutation\nit forwards for a paired device.\n\nRemote dispatch needs a live authority lease from the current controller generation and\nrevision, valid for at most five seconds, and the worker is where the dispatch is. The daemon\ntakes the lease at the moment it forwards, so what arrives is a renewal made for this\ndispatch; the worker holds it to what it has itself acknowledged and installed, and to its own\nclock, in the serial path immediately before the dispatch marker.",
@@ -21466,7 +21435,7 @@
         },
         {
           "const": "signed_authority_object",
-          "description": "A signed authority object: a revocation request or a host authority revision record.\n\nThe payload is the signed object's canonical bytes. No reader of a mailbox takes authority\nfrom one: a host and a device take theirs from their own records and the authority feed, so\nan item of this kind is refused whoever sealed it.",
+          "description": "A payload that bears authority.\n\nNo reader of a mailbox takes authority from one: a host and a device take theirs from their\nown records and the authority feed, so an item of this kind is refused whoever sealed it.\nNothing produces one.\n\nThe variant stays while the release before reads the delivery store at a version that\nkeeps it: removing it changes what `SealedEnvelope` reaches, which moves the delivery\nstore's version, and that store is read through at version 11 and written at 10. It goes,\nwith [`Self::bears_authority`], in the release that writes version 11, once the release\nthat read it ahead is the one retained.",
           "type": "string"
         },
         {
@@ -43134,9 +43103,6 @@
     },
     "fenced_action": {
       "$ref": "#/$defs/FencedAction"
-    },
-    "forwarded_authority": {
-      "$ref": "#/$defs/ForwardedAuthority"
     },
     "forwarded_mutation": {
       "$ref": "#/$defs/ForwardedMutation"
