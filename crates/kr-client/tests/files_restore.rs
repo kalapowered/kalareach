@@ -1290,6 +1290,112 @@ async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_i
     );
 }
 
+/// The checkpoint of an archive the restore is not about, at the generation given.
+fn another_archive_at(generation: u64) -> ArchiveCheckpoint {
+    ArchiveCheckpoint {
+        archive_id: ArchiveId::new(id(0x42)),
+        backup_generation: BackupGeneration::new(generation),
+        encrypted_manifest_hash: Digest256::from_bytes(
+            [u8::try_from(generation).expect("few"); 32],
+        ),
+        verified_at_ms: TimestampMs::new(4_000),
+    }
+}
+
+/// A restore that read revision 5 of the bundle, which records another archive at generation 5,
+/// after which another device wrote revision 6, which records that archive at generation 9. It
+/// returns the restore, the service, the bytes of revision 5 as the service first served them, and
+/// a writer whose first write meets whatever the test puts in `meanwhile`.
+async fn a_restore_that_revision_6_overtook(
+    world: &World,
+) -> (
+    kr_client::recovery::PreparedRestore,
+    Arc<Scripted>,
+    Vec<u8>,
+    Bundle,
+) {
+    let sealed = world.seal(4, &honest_members());
+    let first = world.bundle(&Shape {
+        revision: Some(5),
+        more_checkpoints: vec![another_archive_at(5)],
+        ..Shape::default()
+    });
+    let source = Arc::new(Scripted::serving(world, first).publishing(&sealed));
+    let prepared = restore(world, &source, None).await.expect("a restore");
+    let revision_5 = source.sealed_bundle();
+    source.replace_bundle(world.bundle(&Shape {
+        revision: Some(6),
+        more_checkpoints: vec![another_archive_at(9)],
+        ..Shape::default()
+    }));
+    let writer = Bundle::over(&source);
+    (prepared, source, revision_5, writer)
+}
+
+/// KR-REQ-24.16: what any read of the bundle showed holds every read after it. A write that meets
+/// a conflict reads again, and a service that answers with revision 5 again, at a later place,
+/// after an attempt read revision 6, is not written on: the write would put back the older bundle
+/// and drop what revision 6 held.
+#[tokio::test]
+async fn a_retry_does_not_write_on_a_bundle_older_than_one_an_attempt_read() {
+    let world = World::new();
+    let (prepared, source, revision_5, writer) = a_restore_that_revision_6_overtook(&world).await;
+    *writer.meanwhile.lock().expect("meanwhile") = Some(revision_5.clone());
+    let refused = prepared
+        .record_checkpoint(&writer, TimestampMs::new(9_000))
+        .await
+        .expect_err("revision 5 is older than the revision 6 an attempt read");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::BundleWentBackToAnOlderRevision { first: 6 })
+    ));
+    assert_eq!(
+        *writer.writes.lock().expect("writes"),
+        1,
+        "only the write that conflicted met the service"
+    );
+    assert_eq!(
+        source.sealed_bundle(),
+        revision_5,
+        "nothing was written over what the service holds"
+    );
+}
+
+/// KR-REQ-24.16: a checkpoint an attempt read is held on its own, whatever the revision: a retry
+/// that finds a newer revision than any attempt read, with another archive's checkpoint lower than
+/// one an attempt read, is not written on either.
+#[tokio::test]
+async fn a_retry_does_not_seal_a_checkpoint_below_one_an_attempt_read() {
+    let world = World::new();
+    let (prepared, source, _, writer) = a_restore_that_revision_6_overtook(&world).await;
+    let revision_7 = world.bundle(&Shape {
+        revision: Some(7),
+        more_checkpoints: vec![another_archive_at(5)],
+        ..Shape::default()
+    });
+    *writer.meanwhile.lock().expect("meanwhile") = Some(revision_7.clone());
+    let refused = prepared
+        .record_checkpoint(&writer, TimestampMs::new(9_000))
+        .await
+        .expect_err("the other archive's checkpoint went back");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::CheckpointWentBack { known: 9 })
+    ));
+    assert_eq!(
+        *writer.writes.lock().expect("writes"),
+        1,
+        "only the write that conflicted met the service"
+    );
+    assert_eq!(
+        source.sealed_bundle(),
+        revision_7,
+        "nothing was written over what the service holds"
+    );
+}
+
 /// An export read back as a source, in bytes, as a file would hold it.
 fn reread(export: &OfflineExport) -> Arc<ExportSource> {
     let bytes = export.to_canonical_bytes().expect("canonical bytes");
