@@ -713,12 +713,13 @@ mod tests {
         let mut answered = pending.clone();
         answered.state = PendingState::Answered;
 
-        let cases: [(
-            &str,
-            &BTreeMap<String, String>,
-            Option<&PendingRegistration>,
+        type Case<'a> = (
+            &'a str,
+            &'a BTreeMap<String, String>,
+            Option<&'a PendingRegistration>,
             u64,
-        ); 9] = [
+        );
+        let cases: [Case<'_>; 9] = [
             ("registration", &other_registration, Some(&pending), now),
             ("expired", &lapsed, Some(&pending), now),
             ("token", &other_token, Some(&pending), now),
