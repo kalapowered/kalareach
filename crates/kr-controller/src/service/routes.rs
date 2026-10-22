@@ -182,8 +182,7 @@ impl Controller {
             let described = async {
                 let params: kr_protocol::describe::SessionDescribeParams = parse(&request.params)?;
                 let summary = self.session_summary(params.session_id).await?;
-                self.session_describe(summary, crate::describe::HistoryReach::WholeSession)
-                    .await
+                self.session_describe(summary, true).await
             };
             return crate::attention::Released::of(
                 request.request_id,

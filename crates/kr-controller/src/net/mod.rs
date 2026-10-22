@@ -1156,8 +1156,7 @@ fn shown_value(
                         .and_then(kr_cbor::CanonicalValue::as_integer)
                         .and_then(kr_cbor::Integer::as_u64)
                         .map(kr_protocol::scalars::TimestampMs::new);
-                    crate::describe::HistoryReach::of_grant(history.lower_bound_ms.0, started)
-                        == crate::describe::HistoryReach::WholeSession
+                    crate::describe::history_reaches_the_session(history, None, started)
                 });
             if shows || member(value, DESCRIPTION_MEMBER).is_none() {
                 return None;

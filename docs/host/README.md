@@ -2844,7 +2844,10 @@ What the grant decides, for every request:
   drawn less: the screen's text and how that is drawn, because that is what the share's issuer was
   previewed. It is sent no title, no title stack and no link target, in its restoration, in a
   rendering of the grid, in an update or in the stream that follows. A device under its pairing
-  grant is drawn the live screen with them.
+  grant is drawn the live screen with them. The worker decides that from the history scope the
+  daemon sends with the attach, and from nothing else: an attach by a grant whose history does not
+  include the live screen, and an attach that comes with no scope, are refused before the
+  attachment is made. The local owner holds no grant and needs none.
 
 What a subscription carries is a read that goes on after it was answered, so the same decision is
 taken again, as a subscription to the attached session, before each batch the host writes to it,
@@ -5401,7 +5404,9 @@ moment in time to an item's text, which is why it refuses a retained history pag
 outright. An attention item is not a history page, so it is narrowed rather than refused: a caller
 that did not arrive over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
-model summary either.
+model summary either. The changed-since-last-visit view holds only the changes the host recorded
+at or after the moment the caller's history reaches back to; the cursors still cover the others,
+so the next view starts where this one ended.
 
 An item's key carries none of that text either. A key has to be derived rather than allocated, so
 that rebuilding the inbox from the retained events lands on the items it had before, and it travels
@@ -6170,7 +6175,21 @@ so a summary generated now from an hour-old conversation is an hour-old conversa
 carries the interval and the resources it was built from; the filter answers with the interval to
 rebuild from when that interval crosses the viewer's scope, and with nothing when the whole of it
 does. Whether a viewer may read a particular *resource* is a separate question the caller answers:
-the filter decides when, and a file's or an attachment's own grant decides what.
+the filter decides when, and a file's or an attachment's own grant decides what. The bytes of a
+file or an attachment are checked against the right to read files, which the grant carries or
+does not, and not against the particular file: a caller that has to hold a file to one resource
+checks the resource itself before it asks.
+
+Two readers hold a bound as a number, and take it from the filter (`first_moment`): the attention
+inbox and the changed-since-last-visit view of a paired device. A grant with no history cursor
+reaches from its own start there, as it does for a notice. A paired device is served no generated
+summary of what changed, whatever its grant reaches, and the host starts none for it: the moments
+the log keeps are when the host observed a change, which does not date the session text the change
+names, so a summary cannot be shown to stay inside a grant that begins after any of its sources.
+What a model wrote of a session is shown to a device whose history reaches the session's start,
+decided as a summary derived from the interval that is that moment, and a session whose start is
+not known is shown none of it. A retained history page and an export are not served to a paired
+device at all.
 
 A live-only invitation reaches the currently visible screen and nothing else. Snapshot installation
 goes through the filtered projection rather than the worker's unrestricted state, so the buffer that

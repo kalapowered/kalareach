@@ -871,6 +871,61 @@ fn a_grant_without_session_view_reaches_no_surface() {
     );
 }
 
+/// KR-REQ-10.49: the earliest moment a viewer reaches on a surface is the earliest the one filter
+/// admits, for every kind of scope and every surface, so a reader that holds the bound as a number
+/// decides as the filter does.
+#[test]
+fn the_first_moment_a_viewer_reaches_is_the_first_the_filter_admits() {
+    let viewing = [ActionRight::SessionView];
+    let filters = [
+        HistoryFilter::new(ViewerScope::owner()),
+        HistoryFilter::new(ViewerScope::from_grant(&grant(
+            scope(Some(CUTOFF_MS), false, &[], &[]),
+            &viewing,
+        ))),
+        HistoryFilter::new(ViewerScope::from_grant(&grant(
+            scope(Some(CUTOFF_MS), true, &[], &[]),
+            &viewing,
+        ))),
+        HistoryFilter::new(ViewerScope::from_grant(&grant(
+            scope(Some(0), false, &[], &[]),
+            &viewing,
+        ))),
+        HistoryFilter::new(ViewerScope::from_grant(&grant(
+            scope(None, false, &[], &[]),
+            &viewing,
+        ))),
+        HistoryFilter::new(ViewerScope::from_grant(&grant(
+            scope(None, true, &[], &[]),
+            &viewing,
+        ))),
+        HistoryFilter::new(ViewerScope::from_grant(&grant(
+            scope(Some(CUTOFF_MS), true, &[], &[]),
+            &[ActionRight::FilesRead],
+        ))),
+    ];
+    for filter in &filters {
+        for surface in Surface::ALL {
+            match filter.first_moment(surface) {
+                Some(first) => {
+                    assert_eq!(filter.admit_at(surface, first), Ok(()), "{surface}");
+                    if let Some(before) = first.checked_sub(1) {
+                        assert!(
+                            filter.admit_at(surface, before).is_err(),
+                            "{surface} admits a moment before its first, {first}"
+                        );
+                    }
+                    assert_eq!(filter.admit_at(surface, u64::MAX), Ok(()), "{surface}");
+                }
+                None => assert!(
+                    filter.admit_at(surface, u64::MAX).is_err(),
+                    "{surface} reaches no moment and admits one"
+                ),
+            }
+        }
+    }
+}
+
 /// The named sets are exactly the grant's, and a scope is built from nothing else.
 #[test]
 fn a_scope_comes_from_the_grant_and_never_from_a_label() {

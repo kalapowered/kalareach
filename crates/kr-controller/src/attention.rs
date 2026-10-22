@@ -88,6 +88,7 @@ use kr_protocol::ids::{ActorId, ApprovalRequestId, GrantId, RequestId, SessionId
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::question::QuestionEventKind;
 use kr_protocol::scalars::{Nullable, SecretBytes32, TimestampMs, U64};
+use kr_worker::history_filter::{HistoryFilter, Surface, ViewerScope};
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
@@ -180,40 +181,31 @@ pub enum Caller {
         host_manage: bool,
         /// The sessions the grant's selector admits.
         sessions: kr_protocol::grant::SessionSelector,
-        /// How far back the grant's history reaches: the moment it starts at, when it has one. A
-        /// grant with no lower bound retains no history.
-        history_lower_bound_ms: Option<TimestampMs>,
+        /// What the grant's history reaches, decided by the one filter every delivery path asks.
+        history: HistoryFilter,
     },
 }
 
 impl Caller {
-    /// Builds the caller a paired device's grant describes.
+    /// Builds the caller a paired device's grant describes, for a grant that started at
+    /// `started_at_ms`: the moment the pairing was committed, or the invitation redeemed.
+    ///
+    /// A grant with no history cursor reaches from its start and nothing earlier, as it does for a
+    /// notice. The caller is built as one who may view sessions, so that the filter decides when
+    /// the grant's history reaches and not whether the grant may see an item: that is the store's
+    /// to decide from the rights and selectors beside it.
     #[must_use]
-    pub fn device(grant: &kr_protocol::grant::Grant) -> Self {
+    pub fn device(grant: &kr_protocol::grant::Grant, started_at_ms: u64) -> Self {
         Self::Device {
             grant_id: grant.grant_id,
             session_view: grant.permits(kr_protocol::rights::ActionRight::SessionView),
             automation_manage: grant.permits(kr_protocol::rights::ActionRight::AutomationManage),
             host_manage: grant.permits(kr_protocol::rights::ActionRight::HostManage),
             sessions: grant.session_selector.clone(),
-            history_lower_bound_ms: grant.history.lower_bound_ms.0,
-        }
-    }
-
-    /// Whether this caller's authority reaches back to a moment in a session's history: the
-    /// owner's always does, and a paired device's does when its grant's history starts at or before
-    /// it. A grant with no lower bound retains no history and reaches none.
-    ///
-    /// A summary is written from every change in an interval and says things about all of them, so
-    /// it is served only to a caller that reaches back to the earliest of them.
-    #[must_use]
-    pub fn reaches_back_to(&self, at_ms: u64) -> bool {
-        match self {
-            Self::Owner => true,
-            Self::Device {
-                history_lower_bound_ms,
-                ..
-            } => history_lower_bound_ms.is_some_and(|bound| bound.get() <= at_ms),
+            history: HistoryFilter::new(ViewerScope::from_history(
+                &grant.history.clone().from_start(started_at_ms),
+                true,
+            )),
         }
     }
 
@@ -239,7 +231,7 @@ impl Caller {
                 automation_manage,
                 host_manage,
                 sessions,
-                history_lower_bound_ms,
+                history,
             } => {
                 let admits = |session_id: SessionId| sessions.admits(session_id);
                 with(&Viewer::Device(DeviceScope {
@@ -249,7 +241,9 @@ impl Caller {
                     host_manage: *host_manage,
                     admits_session: &admits,
                     // A grant whose history reaches back to no moment reaches no dated item.
-                    history_from_ms: history_lower_bound_ms.map_or(u64::MAX, TimestampMs::get),
+                    history_from_ms: history
+                        .first_moment(Surface::ChangedSinceLastVisit)
+                        .unwrap_or(u64::MAX),
                 }))
             }
         }
@@ -1356,14 +1350,17 @@ impl AttentionModule {
                 // page was read at, whatever is recorded while the text is read.
                 let (page, source) = {
                     let store = self.store()?;
-                    let page = store
-                        .changed(
-                            actor,
-                            params.session_id,
-                            params.max_changes.get(),
-                            floor,
-                            caller.content(),
-                        )
+                    let page = caller
+                        .view(|viewer| {
+                            store.changed(
+                                actor,
+                                viewer,
+                                params.session_id,
+                                params.max_changes.get(),
+                                floor,
+                                caller.content(),
+                            )
+                        })
                         .map_err(refusal)?;
                     let source = if params.summarise {
                         Some(
@@ -1411,11 +1408,10 @@ impl AttentionModule {
     /// wanted, the request for it.
     ///
     /// The answer does not wait for a model. It is the summary the description host has already
-    /// written, held under the profile it selected and the privacy generation in force, to a
-    /// caller whose grant reaches back to the earliest change in it, and nothing when there is none,
-    /// when no model runs here and when privacy mode is on. A request for one that is wanted is
-    /// made only for a caller whose grant reaches back to the earliest change in the interval now, so
-    /// a grant that does not reach it starts nothing the answer to it could not show.
+    /// written, held under the profile it selected and the privacy generation in force, to the
+    /// owner, and nothing when there is none, when no model runs here, when privacy mode is on and
+    /// for every paired device. A request for one that is wanted is made only for the owner, so a
+    /// caller that is served none starts nothing.
     async fn summary(
         &self,
         reach: &dyn Reach,
@@ -1429,10 +1425,15 @@ impl AttentionModule {
         ) else {
             return None;
         };
-        let (earliest, _) = moments(&source.changes)?;
-        if !caller.reaches_back_to(earliest) {
+        // A summary is generated text, written from every change in an interval and from the
+        // session text those changes name. The moments the log holds are when the host observed
+        // each change, which is not when the text it names was produced, so nothing here can say
+        // that a summary stays inside what a grant's history reaches. A paired device is served
+        // none until the source of a summary carries the moments its text was produced.
+        if !matches!(caller, Caller::Owner) {
             return None;
         }
+        moments(&source.changes)?;
         let (first_cursor, head) = (source.from_cursor, source.head);
         let reading = {
             let descriptions = Arc::clone(&descriptions);
@@ -1452,22 +1453,19 @@ impl AttentionModule {
             self.ask_for_summary(reach, &descriptions, session_id, source)
                 .await;
         }
-        reading
-            .served
-            .filter(|record| caller.reaches_back_to(record.from_ms))
-            .map(|record| {
-                (
-                    ChangeSummary {
-                        text: record.text.as_str().to_owned(),
-                        from_cursor: U64::new(record.cursor.from),
-                        to_cursor: U64::new(record.cursor.to),
-                        from_ms: TimestampMs::new(record.from_ms),
-                        to_ms: TimestampMs::new(record.to_ms),
-                        model: format!("{}@{}", record.profile_id, record.profile_revision.get()),
-                    },
-                    Generated::read_under(privacy, reading.decided),
-                )
-            })
+        reading.served.map(|record| {
+            (
+                ChangeSummary {
+                    text: record.text.as_str().to_owned(),
+                    from_cursor: U64::new(record.cursor.from),
+                    to_cursor: U64::new(record.cursor.to),
+                    from_ms: TimestampMs::new(record.from_ms),
+                    to_ms: TimestampMs::new(record.to_ms),
+                    model: format!("{}@{}", record.profile_id, record.profile_revision.get()),
+                },
+                Generated::read_under(privacy, reading.decided),
+            )
+        })
     }
 
     /// Asks the description host for a summary of the changes in a frozen interval.
@@ -4119,27 +4117,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// KR-REQ-18.02: a summary is written from every change in an interval, so it is served only to
-    /// a caller whose authority reaches back to the earliest of them: the owner's always does, a
-    /// paired device's when its grant's history starts at or before it, and a grant with no lower
-    /// bound retains no history and reaches none.
-    #[test]
-    fn a_summary_is_for_a_caller_whose_history_reaches_the_earliest_change() {
-        let device = |history_lower_bound_ms: Option<u64>| Caller::Device {
-            grant_id: GrantId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
-            session_view: true,
-            automation_manage: false,
-            host_manage: false,
-            sessions: kr_protocol::grant::SessionSelector::Any,
-            history_lower_bound_ms: history_lower_bound_ms.map(TimestampMs::new),
-        };
-        assert!(Caller::Owner.reaches_back_to(0));
-        assert!(device(Some(1_000)).reaches_back_to(1_000), "at the moment");
-        assert!(device(Some(900)).reaches_back_to(1_000), "before it");
-        assert!(!device(Some(1_001)).reaches_back_to(1_000), "after it");
-        assert!(!device(None).reaches_back_to(1_000), "no history at all");
-    }
-
     /// A reach that connects to nothing and answers a closure as the test says.
     struct Stub {
         unaccounted: bool,
@@ -4406,27 +4383,36 @@ pub(crate) mod tests {
             automation_manage: false,
             host_manage: false,
             sessions: kr_protocol::grant::SessionSelector::Any,
-            history_lower_bound_ms: Some(TimestampMs::new(bound)),
+            history: HistoryFilter::new(ViewerScope::from_history(
+                &kr_protocol::grant::HistoryScope {
+                    lower_bound_ms: Nullable::some(TimestampMs::new(bound)),
+                    include_live_screen: false,
+                    named_questions: kr_protocol::scalars::CanonicalSet::new(),
+                    named_approvals: kr_protocol::scalars::CanonicalSet::new(),
+                },
+                true,
+            )),
         }
     }
 
-    /// KR-REQ-18.02: a summary is asked for only by a caller whose history reaches back to the
-    /// earliest of the changes it is written from, and the log holds them in the order they were
-    /// recorded, not the order they happened in. A grant that starts after the earliest asks for
-    /// nothing, though it starts before the first the log holds; one that starts at the earliest
-    /// asks for the interval with the moments of its earliest and latest change.
+    /// KR-REQ-18.02 and KR-REQ-10.49: a summary is generated text, so it is served to a paired device
+    /// whatever its grant's history, and asked for by none. A grant that starts before the earliest
+    /// change is not served one either, since the moments the log holds are when the host observed
+    /// the changes and not when the text they name was produced; the owner's is asked for the
+    /// interval, with the moments of its earliest and latest change.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_grant_that_starts_after_the_earliest_change_asks_for_no_summary() {
+    async fn a_paired_device_is_served_no_summary_and_asks_for_none() {
         let mut world = Summarised::start();
         world.record_commands(&[2_000, 1_000, 1_500], false);
         let reader = ActorId::new("test:device").expect("an actor");
 
-        let late = world.changed_for(&reader, &device_from(1_500)).await;
-        assert_eq!(late.changes.len(), 3);
-        assert!(late.summary.0.is_none());
+        for bound in [1_500, 1_000, 0] {
+            let device = world.changed_for(&reader, &device_from(bound)).await;
+            assert!(device.summary.0.is_none(), "a grant from {bound}");
+        }
         assert_eq!(world.asked(), Vec::new(), "nothing is asked for");
 
-        world.changed_for(&reader, &device_from(1_000)).await;
+        world.changed_for(&reader, &Caller::Owner).await;
         let asked = world.asked();
         assert_eq!(asked.len(), 1, "{asked:?}");
         assert_eq!(
