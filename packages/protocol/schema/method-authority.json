@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 185,
+  "method_count": 186,
   "methods": [
     {
       "capability": "none",
