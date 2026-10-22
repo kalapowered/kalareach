@@ -814,7 +814,8 @@ async fn kr_req_24_06_a_daemon_restart_keeps_the_receipt_the_approval_and_the_qu
 /// The plugin holds none of the receipt or the question either. What is not claimed here: a
 /// plugin that reconnects and answers on a restored connection, and a plugin-runtime service that
 /// restarts with an approval pending. The first has no production path, since no entry reopens a
-/// closed connection; the second does not end a gateway connection and has no case yet.
+/// closed connection; the second does not end a gateway connection, and kr-controller's
+/// `plugin_observation` suite shows it against a real plugin host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_24_06_the_receipt_and_the_question_survive_a_connections_end_and_its_approval_settles()
  {
