@@ -2150,7 +2150,15 @@ mod tests {
                 "a history cursor",
                 scope(
                     &[ActionRight::AutomationManage],
-                    ViewerScope::forwarded(500),
+                    ViewerScope::from_history(
+                        &HistoryScope {
+                            lower_bound_ms: Nullable::some(TimestampMs::new(500)),
+                            include_live_screen: true,
+                            named_questions: CanonicalSet::new(),
+                            named_approvals: CanonicalSet::new(),
+                        },
+                        true,
+                    ),
                     500,
                 ),
             ),

@@ -525,6 +525,20 @@ mod tests {
     use kr_protocol::scalars::Uuid;
     use kr_worker::history_filter::ViewerScope;
 
+    /// The scope of a viewer whose history reaches back to `from_ms`, sees the session and is
+    /// drawn the live screen.
+    fn reaching(from_ms: u64) -> ViewerScope {
+        ViewerScope::from_history(
+            &kr_protocol::grant::HistoryScope {
+                lower_bound_ms: kr_protocol::scalars::Nullable::some(TimestampMs::new(from_ms)),
+                include_live_screen: true,
+                named_questions: kr_protocol::scalars::CanonicalSet::new(),
+                named_approvals: kr_protocol::scalars::CanonicalSet::new(),
+            },
+            true,
+        )
+    }
+
     fn session(byte: u8) -> SessionId {
         SessionId::new(Uuid::from_bytes([byte; 16]))
     }
@@ -623,7 +637,7 @@ mod tests {
 
     #[test]
     fn content_before_a_grants_history_bound_does_not_reach_a_recipient() {
-        let filter = HistoryFilter::new(ViewerScope::forwarded(5_000));
+        let filter = HistoryFilter::new(reaching(5_000));
         let message = compose(
             DestinationKind::Discord,
             PushAlert::WorkComplete,
@@ -668,7 +682,7 @@ mod tests {
         };
         let viewers = [
             ("owner", ViewerScope::owner()),
-            ("a history cursor", ViewerScope::forwarded(5_000)),
+            ("a history cursor", reaching(5_000)),
             (
                 "no retained history",
                 ViewerScope::from_history(&no_history, true),
@@ -739,7 +753,7 @@ mod tests {
             named_approvals: CanonicalSet::new(),
         };
         let viewers = [
-            ("a history cursor", ViewerScope::forwarded(5_000)),
+            ("a history cursor", reaching(5_000)),
             (
                 "no retained history",
                 ViewerScope::from_history(&no_history, true),
