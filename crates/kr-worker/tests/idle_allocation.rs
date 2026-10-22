@@ -271,5 +271,11 @@ async fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtim
     })
     .await
     .expect("the runtime read what the shell first printed");
+    // The history shows the output before the write of it to the spool has been made, and that
+    // write allocates too.
+    let writing = Arc::clone(&runtime);
+    tokio::task::spawn_blocking(move || writing.wait_for_the_spool_write())
+        .await
+        .expect("the spool write is waited for");
     runtime
 }
