@@ -42,6 +42,9 @@ testing = []
 # the epoch, never because the machine was slow.
 kr-plugin-runtime = { path = ".", features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
+# The hold on the client's writer of offered events, which a test uses to stand between an event
+# being taken off the queue and its being written.
+kr-plugin-service = { workspace = true, features = ["testing"] }
 # The bundled generation is seeded into a catalogue with no network, under a kernel denial of it.
 kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

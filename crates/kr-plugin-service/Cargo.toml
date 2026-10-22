@@ -21,6 +21,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
+[features]
+# The hold a test uses to stop the task that writes offered events between taking an event off the
+# queue and writing it. It compiles to nothing without this feature, and no shipped build enables it.
+testing = []
+
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
 

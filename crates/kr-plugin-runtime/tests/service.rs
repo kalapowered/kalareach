@@ -881,6 +881,126 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
     assert!(asked.elapsed() < core::time::Duration::from_millis(500));
 }
 
+// KR-REQ-11.38: an event the client was handed is counted until it has been written. A caller that
+// asks for a snapshot once the count is zero, which is what the worker's pump does, so has it
+// written after every event it handed over. The host here only reads and records, because what
+// the case is about is the order the client writes in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_38_an_event_handed_over_is_counted_until_it_is_written_and_a_snapshot_asked_for_then_follows_it()
+ {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
+    let endpoint = host_endpoint(&environment).expect("an endpoint");
+    let descriptor = HostDescriptor {
+        protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+        environment_id: temp.environment_id(),
+        reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+        endpoint: endpoint.as_text(),
+        boot_identity: identity.boot_identity().clone(),
+        process_start_identity: identity.process_start_identity().clone(),
+        host_public_key: *identity.public_key(),
+    };
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a listener");
+
+    // What the host reads after the handshake, in the order it reads it. A snapshot is answered, so
+    // that the client's call comes back.
+    let read = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let serving = tokio::spawn({
+        let descriptor = descriptor.clone();
+        let read = Arc::clone(&read);
+        async move {
+            let (connection, _peer) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            while let Ok(request) = reader
+                .read_message_without_schema::<kr_plugin_service::protocol::Request>()
+                .await
+            {
+                let body = match request.body {
+                    RequestBody::Hello { .. } => ResponseBody::Hello {
+                        protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                        descriptor: Box::new(descriptor.clone()),
+                    },
+                    RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
+                        identity
+                            .answer(&nonce, &descriptor.endpoint)
+                            .expect("an answer"),
+                    )),
+                    RequestBody::Event { .. } => {
+                        read.lock().expect("the record").push("event");
+                        continue;
+                    }
+                    RequestBody::Snapshot { .. } => {
+                        read.lock().expect("the record").push("snapshot");
+                        ResponseBody::Called {
+                            value: None,
+                            fault: None,
+                            document: None,
+                        }
+                    }
+                    other => panic!("the client asked for {other:?}"),
+                };
+                writer
+                    .write_message(&Frame::Response {
+                        reply_to: request.request_id,
+                        body,
+                    })
+                    .await
+                    .expect("the answer is written");
+            }
+        }
+    });
+
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("connects");
+    let client = PluginClient::over(connection, descriptor)
+        .await
+        .expect("the handshake and the challenge");
+    let binding_id = new_binding_id();
+
+    // The writer is held with an event in hand: taken off the queue, not yet written.
+    let hold = client.hold_offered_writes();
+    let handed = client.offer(binding_id, &components::scrape("se-1", "first"));
+    assert_eq!(handed, kr_plugin_service::client::Handoff::Accepted);
+    let watchdog = std::time::Instant::now();
+    while !hold.parked() {
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(60),
+            "the writer never took the event off the queue"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_ne!(
+        client.offered_bytes(),
+        0,
+        "an event that has not been written is not counted, so a count of zero does not mean the \
+         events handed over are written"
+    );
+
+    // Written: the count falls to zero, and a snapshot asked for then is written after the event.
+    hold.release();
+    while client.offered_bytes() != 0 {
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(60),
+            "the event was never written"
+        );
+        tokio::task::yield_now().await;
+    }
+    client
+        .snapshot(binding_id, core::time::Duration::from_secs(5))
+        .await
+        .expect("the snapshot is answered");
+    assert_eq!(
+        *read.lock().expect("the record"),
+        ["event", "snapshot"],
+        "the host read the snapshot before the event it was handed first"
+    );
+    drop(client);
+    serving.await.expect("the host finished");
+}
+
 fn admission_name(admission: &Admission) -> &'static str {
     match admission {
         Admission::Queued => "queued",

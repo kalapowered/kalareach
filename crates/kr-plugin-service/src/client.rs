@@ -285,6 +285,8 @@ pub struct PluginClient {
     sink: NoticeSink,
     offered: tokio::sync::mpsc::Sender<Request>,
     offered_bytes: Arc<AtomicU64>,
+    #[cfg(feature = "testing")]
+    offer_hold: Arc<OfferHold>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -349,11 +351,15 @@ impl PluginClient {
         // on by whoever offered the event.
         let (offered, waiting_events) = tokio::sync::mpsc::channel::<Request>(MAX_OFFERED_EVENTS);
         let offered_bytes = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "testing")]
+        let offer_hold = Arc::new(OfferHold::default());
         let offer_task = tokio::spawn(write_offered(
             waiting_events,
             Arc::clone(&writer),
             Arc::clone(&offered_bytes),
             Arc::clone(&pending),
+            #[cfg(feature = "testing")]
+            Arc::clone(&offer_hold),
         ));
         // What closing this connection has to stop, recorded before anything can close it.
         pending.serves(Transport {
@@ -371,6 +377,8 @@ impl PluginClient {
             sink: sink_for_client,
             offered,
             offered_bytes,
+            #[cfg(feature = "testing")]
+            offer_hold,
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -468,8 +476,8 @@ impl PluginClient {
             };
         }
         // Reserved before the event is published, and in one step, because the writer releases the
-        // reservation when it consumes the event: a charge made afterwards could be made after its
-        // own release, and the allowance would drift until it admitted nothing.
+        // reservation when it has written the event: a charge made afterwards could be made after
+        // its own release, and the allowance would drift until it admitted nothing.
         let Ok(held) =
             self.offered_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -512,10 +520,24 @@ impl PluginClient {
         }
     }
 
-    /// Returns how many bytes of offered events are waiting to be written.
+    /// Returns how many bytes of offered events have been handed over and not yet written.
+    ///
+    /// An event counts until its write has finished, the one being written included, so zero says
+    /// that every event handed over has been written, or that the connection is over and refuses
+    /// every request. A request made on this connection after the count was read as zero is
+    /// written after those events. That is the order the host receives them in; whether the
+    /// component has observed them by then is not something the count says.
     #[must_use]
     pub fn offered_bytes(&self) -> u64 {
         self.offered_bytes.load(Ordering::Acquire)
+    }
+
+    /// Holds the task that writes offered events, between taking an event off the queue and writing
+    /// it, until the returned hold is released. For the tests of a crate that drives this client.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_offered_writes(&self) -> OfferHoldHandle {
+        self.offer_hold.set()
     }
 
     /// Offers one source event and waits for the queue's answer.
@@ -921,14 +943,21 @@ async fn write_offered(
     writer: Writer,
     held: Arc<AtomicU64>,
     pending: Arc<Pending>,
+    #[cfg(feature = "testing")] hold: Arc<OfferHold>,
 ) {
     while let Some(request) = offered.recv().await {
         let cost = offered_bytes_of(&request);
-        // Released before the write rather than after it: this task can be stopped at any await,
-        // and a charge released only on the far side of one would survive the queue it was for.
-        // What the charge bounds is how much is waiting to be written, and this one is no longer
-        // waiting.
-        release(&held, cost);
+        #[cfg(feature = "testing")]
+        hold.pause().await;
+        // The charge is kept until the write has finished, so that the count is zero only when
+        // every event handed over has been written or the connection is over: a caller that waits
+        // for it and then makes a request on this connection has the request written after those
+        // events, since both take the writer, or refused. A charge released before the write would
+        // leave the last event uncounted while it is still to be written, and one released after a
+        // failure but before the close would leave a connection that still takes requests with an
+        // unwritten event uncounted. This task can be stopped at any await below, which leaves the
+        // charge in place; closing the connection sets the count to zero, so nothing survives the
+        // queue it was for.
         // Bounded, the wait for the writer included: a host that stopped reading would otherwise
         // hold this task and the lock every request on this connection needs.
         let written = tokio::time::timeout(OFFER_WRITE_DEADLINE, async {
@@ -961,8 +990,10 @@ async fn write_offered(
         if !matches!(written, Ok(Ok(()))) {
             // A frame that failed or was never taken leaves the writer with a part-written frame,
             // and nothing after it could be delivered. The connection is over, and everything
-            // waiting on it is told rather than left to time out one by one. What is still queued
-            // is released and reported by the queue emptying.
+            // waiting on it is told rather than left to time out one by one. Closing sets the
+            // count to zero and refuses every request, so the count is never zero while an event
+            // is unwritten on a connection that still takes requests. What is still queued is
+            // released and reported by the queue emptying.
             pending.close();
             offered.close();
             while let Some(abandoned) = offered.recv().await {
@@ -970,6 +1001,88 @@ async fn write_offered(
             }
             return;
         }
+        release(&held, cost);
+    }
+}
+
+/// The pause the writer of offered events takes, for the tests of a crate that drives this client.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct OfferHold {
+    state: Mutex<Option<Arc<OfferHoldState>>>,
+    wake: tokio::sync::Notify,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct OfferHoldState {
+    parked: AtomicBool,
+    released: AtomicBool,
+}
+
+#[cfg(feature = "testing")]
+impl OfferHold {
+    fn set(self: &Arc<Self>) -> OfferHoldHandle {
+        let state = Arc::new(OfferHoldState::default());
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
+        OfferHoldHandle {
+            state,
+            hold: Arc::clone(self),
+        }
+    }
+
+    /// Waits while a test holds the writer, and records that the writer has reached the hold.
+    async fn pause(&self) {
+        loop {
+            let held = {
+                let mut slot = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match slot.as_ref() {
+                    None => return,
+                    Some(state) if state.released.load(Ordering::Acquire) => {
+                        *slot = None;
+                        return;
+                    }
+                    Some(state) => {
+                        state.parked.store(true, Ordering::Release);
+                        Arc::clone(state)
+                    }
+                }
+            };
+            if held.released.load(Ordering::Acquire) {
+                continue;
+            }
+            self.wake.notified().await;
+        }
+    }
+}
+
+/// A hold on the writer of offered events. While it is held the writer stops with an event in hand,
+/// taken off the queue and not yet written, and writes nothing.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct OfferHoldHandle {
+    state: Arc<OfferHoldState>,
+    hold: Arc<OfferHold>,
+}
+
+#[cfg(feature = "testing")]
+impl OfferHoldHandle {
+    /// Returns true once the writer has an event in hand and has stopped at the hold.
+    #[must_use]
+    pub fn parked(&self) -> bool {
+        self.state.parked.load(Ordering::Acquire)
+    }
+
+    /// Lets the writer go on.
+    pub fn release(&self) {
+        self.state.released.store(true, Ordering::Release);
+        self.hold.wake.notify_one();
     }
 }
 
