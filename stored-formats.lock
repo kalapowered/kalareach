@@ -165,7 +165,7 @@
       "kept": [
         "ConfigurationDocument"
       ],
-      "level": 5,
+      "level": 6,
       "near_miss": 2,
       "members": [
         {
@@ -187,6 +187,11 @@
           "member": "automation",
           "level": 5,
           "digest": "aeec99e9503ad243bbc0acab8163afd55c573b43d4070f99a12bf0217052516b"
+        },
+        {
+          "member": "shell",
+          "level": 6,
+          "digest": "c183319175f5ebf888a7f75cc8592757cc98f6ff7c4589039a92c160bdaf60cf"
         }
       ]
     },
