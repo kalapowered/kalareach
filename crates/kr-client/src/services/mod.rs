@@ -6,7 +6,7 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and twelve modules hold the managed
+//! The traits and one null implementation live here, and thirteen modules hold the managed
 //! implementations this crate carries. [`account`] is the account sign-in: the request a system
 //! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
 //! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
@@ -16,7 +16,9 @@
 //! holds that call's media keeps to the service for as long as the call runs. [`authority`] is the
 //! durable authority feed, where a remote owner publishes a signed revocation request and the host
 //! that owns the feed acknowledges what it applied. [`mailbox`] is the encrypted mailbox, where a
-//! device leaves a sealed item for a peer that is not connected and the peer reads its own. [`sync`]
+//! device leaves a sealed item for a peer that is not connected and the peer reads its own. [`push`] is the push gateway, where an installation registers
+//! the token its provider gave it, answers the challenge sent to that token and authorises one
+//! paired host, and where every signed push request, a host's renewals included, is built. [`sync`]
 //! is settings sync, the
 //! compare-and-exchange service settings, a client's position and drafts are kept on. [`storage`] is
 //! managed storage, where an account's backup ciphertext is uploaded part by part and read back,
@@ -56,6 +58,8 @@
 //! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
 //! | [`voice_control::ControlNews`], [`voice_control::ControlEnd`], [`voice_control::Closure`], [`voice_control::Accepted`] | What the service and the provider said to a call: a reason, an identifier, a note, a delegation | Which kind it is and its numbers |
 //! | [`signed::SignedService`] | The key that signs a managed-service call | The gateway, the signer kind |
+//! | [`push::InstallationSigner`] | An installation's authorisation key | The public key |
+//! | [`push::Registration`], [`push::Issued`] | A binding, a challenge's identifiers, a delivery credential | Which state it is, or that a credential was issued |
 //! | [`authority::FeedAnnouncement`] | A sealed announcement for a mailbox | What the item is, and its declared size |
 //! | [`authority::AuthorityFeedRecord`] | A revocation request signed by a remote owner | The position, the request identity, whether it is finished |
 //! | [`authority::AuthorityFeedState`] | Those records | How many came back, the cursor, the summary |
@@ -73,7 +77,7 @@
 //! A type that holds one of these only through one of these, as [`relay::RelayLeaseAnswer`] holds a
 //! grant, is safe to derive, because the rendering it composes is the redacted one.
 //!
-//! Twelve tests are that rule's proof:
+//! Thirteen tests are that rule's proof:
 //! `a_rendering_of_a_request_a_grant_or_a_token_carries_none_of_them` in [`account`],
 //! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` and
 //! `a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature` in [`relay`],
@@ -86,6 +90,8 @@
 //! `a_rendering_of_a_request_an_item_or_a_page_carries_neither_a_claim_nor_a_sealed_item` in
 //! [`mailbox`],
 //! `a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed` in [`sync`],
+//! `a_rendering_of_a_signer_a_registration_a_credential_or_a_request_carries_none_of_it` in
+//! [`push`],
 //! `a_rendering_of_a_part_or_a_range_carries_its_length_and_never_its_ciphertext` in [`storage`],
 //! `a_rendering_of_a_fetched_generation_carries_neither_its_publication_nor_its_signature` in
 //! [`backup`], and `a_rendering_of_content_carries_its_length_and_never_its_bytes` in [`signed`].
@@ -116,6 +122,7 @@ pub mod backup;
 pub mod http;
 pub mod json;
 pub mod mailbox;
+pub mod push;
 pub mod relay;
 pub mod signed;
 pub mod storage;
