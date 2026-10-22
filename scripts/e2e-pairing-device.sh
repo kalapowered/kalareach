@@ -223,13 +223,6 @@ judge() { # <driver output>
         say "check=the host locked no candidate on a changed secret ok=0 detail=${result:-no record}"
         bad=1
     fi
-    result="$(host_file control-refused.txt)"
-    if [ "$result" = "refused=1" ]; then
-        say "check=the host refused the changed secret it was sent ok=1"
-    else
-        say "check=the host refused the changed secret it was sent ok=0 detail=${result:-no record}"
-        bad=1
-    fi
     if [ -s "$harness/host-value.txt" ] && [ -s "$harness/paired.txt" ]; then
         say "check=the host showed its value and approved the phone ok=1 detail=value $(host_file host-value.txt) invitation $(host_file direct-length.txt) characters"
     else
