@@ -258,8 +258,7 @@ async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_unde
     assert_eq!(
         settled.terminal_parse_fault.len(),
         4,
-        "a movement the grid reduced to its edge is not a parse fault, and is not counted as one: \
-         {totals:?}"
+        "the four classes are all that is reported: {totals:?}"
     );
     assert_eq!(
         world.service.metrics(),

@@ -816,9 +816,10 @@ impl Outstanding {
 
     /// Records that this host is waiting for one identifier to be answered.
     ///
-    /// What comes back forgets the identifier when it is dropped, however it is dropped: a caller
-    /// that gave up, an outer deadline, a connection that ended. Nothing about this connection
-    /// grows because a reply never came.
+    /// What comes back forgets the identifier when it is dropped, however it is dropped: the end
+    /// of the operation's own wait, an outer deadline, a connection that ended. A caller that gave
+    /// up does not drop it, because the operation waits on a task of its own ([`detached`]).
+    /// Nothing about this connection grows because a reply never came.
     fn expect(self: &Arc<Self>, id: &UpstreamRequestId) -> Waiting {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.held().insert(id.clone(), sender);
@@ -3759,8 +3760,11 @@ mod tests {
 
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
         // The count is made by the operation's own task, which the paused clock has now run on to
-        // the adapter's deadline.
-        for _ in 0..16 {
+        // the adapter's deadline: wait for it to have made it.
+        for _ in 0..1000 {
+            if !failures_counted(&broker).is_empty() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
         assert_eq!(
