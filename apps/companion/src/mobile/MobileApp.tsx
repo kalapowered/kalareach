@@ -126,6 +126,19 @@ export function MobileApp({
   useRebind(connection?.connected === true, lifecycle)
   useKeyboardInset()
 
+  // A tap on a notification opened the application. What needs the person is on the attention
+  // screen, so that is where it opens: the system says it once, at the start or on coming to the
+  // front, and native code gives it to the page once.
+  useEffect(() => {
+    let watching = true
+    port.notificationRoute().then((route) => {
+      if (watching && route === 'attention') setPlace({ tab: 'attention' })
+    }).catch(() => undefined)
+    return () => {
+      watching = false
+    }
+  }, [port, lifecycle.resumed])
+
   useEffect(() => {
     document.documentElement.dataset.surface = resolved
     return () => {
@@ -338,6 +351,7 @@ export function MobileApp({
             surface={resolved}
             connected={connection?.connected ?? null}
             environmentId={connection?.environmentId ?? null}
+            resumed={lifecycle.resumed}
           />
         ) : null}
         {place.tab === 'account' ? <Account surface={resolved} channel={build.channel} /> : null}
