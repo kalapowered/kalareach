@@ -635,7 +635,11 @@ component state, and it holds none that was asked for before privacy mode was tu
 Turning it on drops the state held. A component that was handed anything the worker had while
 privacy mode was on, including something that waited in the lane and was handed over after it ended,
 or whose hand-over was not answered, is marked before the hand-over and is not asked for its state
-again until it starts again, since what it holds may be what it was handed.
+again until it starts again, since what it holds may be what it was handed. An observation, the
+arguments of an action and a request to decode all mark it. A mark made once a registration has begun
+stays when the component becomes ready, whichever of them made it; a mark made before the
+registration began goes, because a component registered afresh holds nothing its predecessor was
+handed.
 
 The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
 report once privacy mode has been on at any time since the worker made the connection to the runtime
