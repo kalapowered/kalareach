@@ -1162,9 +1162,11 @@ impl AutomationService {
     ///
     /// The action identifier is checked again inside the transaction, as every other action's is:
     /// a different action on another connection may have spent it since the host first looked.
-    /// Such an identifier is refused, and the chain keeps the budget it ran out of. A rearm does
-    /// not record its own identifier, so a different action may spend it afterwards, and the exact
-    /// repeat of the rearm is then refused as a reused identifier.
+    /// An identifier that another action recorded is refused, and the chain keeps the budget it
+    /// ran out of. A rearm does not record its own identifier, so the journal does not stop a
+    /// different action from spending it afterwards, and the exact repeat of the rearm is then
+    /// refused as a reused identifier; two rearms under one identifier are each decided on their
+    /// own.
     ///
     /// The runs that start now are in [`Rearmed::started`], for the host to execute; one that
     /// waits for a slot starts when one frees.
