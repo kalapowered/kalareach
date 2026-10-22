@@ -1723,7 +1723,7 @@ async fn new_in_enrolled(
     enrolment: kr_protocol::identity::EnvironmentEnrolment,
     arguments: kr_cli::cli::NewArguments,
     presentation: Presentation,
-    shell_mode: ShellMode,
+    shell_mode: Option<ShellMode>,
     json: bool,
 ) -> Result<Completion> {
     // A terminal application opens where the session runs, and an enrolled environment has no
