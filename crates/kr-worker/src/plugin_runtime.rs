@@ -36,8 +36,8 @@
 //! has been offered events and has been quiet for two seconds (or its last attempt is a minute old,
 //! or it has never been asked), holds it in memory under the source generation the component was
 //! registered in, and restores it when the binding is registered again after the runtime was lost.
-//! Held checkpoints are never persisted, and privacy mode drops them. Every thirty seconds it asks the runtime what it is doing; a runtime
-//! that does not answer twice running is treated as lost.
+//! Held checkpoints are never persisted, and privacy mode drops them. Every thirty seconds it asks
+//! the runtime what it is doing; a runtime that does not answer twice running is treated as lost.
 //!
 //! # When the runtime is lost
 //!
@@ -142,7 +142,9 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         lane,
         health_due: None,
         health_failures: 0,
+        notices_epoch: 0,
     };
+    link.notices_epoch = link.lane.privacy_epoch();
     loop {
         let Some(wants) = broker.upgrade().map(|broker| broker.component_wants()) else {
             return;
@@ -181,6 +183,9 @@ struct Link {
     health_due: Option<tokio::time::Instant>,
     /// How many times in a row the runtime did not answer.
     health_failures: u32,
+    /// The number privacy mode's changes had reached when the link last read a notice from the
+    /// runtime. A notice read after a change may be about something that happened before it.
+    notices_epoch: u64,
 }
 
 /// One binding's refusal by the runtime.
@@ -628,12 +633,27 @@ impl Link {
                 notice = notice => Event::Notice(notice),
             }
         };
+        // Whether what a notice says may have happened in privacy mode: it is on, or it changed since
+        // the last notice was read, which may have been after this one was written.
+        let epoch = self.lane.privacy_epoch();
+        let may_be_private = self.lane.is_private() || epoch != self.notices_epoch;
+        if matches!(event, Event::Notice(Some(_))) {
+            self.notices_epoch = epoch;
+        }
         match event {
             Event::Changed | Event::Timer => {}
             Event::Notice(None) => self.lose(broker, "the plugin runtime ended its connection"),
             Event::Notice(Some(Notice::Disabled { binding_id, reason })) => {
                 // The runtime has stopped running this component for good. The broker holds that
                 // for the binding's life; the next pass sees it no longer wanted and unbinds it.
+                // Its reason carries the last fault's words, which are withheld as a fault's are.
+                let reason = if may_be_private {
+                    "the plugin runtime disabled the component after repeated faults; its words \
+                     are withheld for privacy mode"
+                        .to_owned()
+                } else {
+                    reason
+                };
                 if let Some(broker) = broker.upgrade() {
                     broker.disable_rich(BrokerBindingId::new(binding_id), reason);
                 }
@@ -651,9 +671,8 @@ impl Link {
                         BrokerBindingId::new(binding_id),
                         ComponentNote::Fault(FaultNote {
                             call: call.to_string(),
-                            detail,
+                            detail: (!may_be_private).then_some(detail),
                             faults_in_window,
-                            in_privacy: self.lane.is_private(),
                         }),
                     );
                 }
@@ -702,10 +721,18 @@ impl Link {
             return Ok(());
         };
         let binding = want.binding_id;
+        // The generation the source has reached now, not the one the registration began under: it
+        // may have moved while the registration was under way.
+        let generation = broker
+            .upgrade()
+            .and_then(|broker| broker.component_generation(binding))
+            .unwrap_or(want.generation);
         let held = self
             .lane
-            .take_held(binding, want.package_digest, want.generation);
+            .take_held(binding, want.package_digest, generation);
         if let Some(held) = held {
+            // The component is given state that belongs to this generation.
+            self.registered.insert(binding, generation);
             let restored = client
                 .restore(service_id(binding), held.state, CALL_WAIT)
                 .await;
@@ -767,11 +794,15 @@ impl Link {
         }
         // One binding's state at a time; the next is taken on the next pass.
         let now = tokio::time::Instant::now();
-        if let Some(binding) = self.lane.checkpoint_due(now).into_iter().next() {
+        let epoch = self.lane.privacy_epoch();
+        let due = self.lane.checkpoint_due(now).into_iter().next();
+        // Privacy mode may have come on between the choice and the call, and then nothing is asked.
+        if let Some(binding) =
+            due.filter(|_| !self.lane.is_private() && self.lane.privacy_epoch() == epoch)
+        {
             self.lane.checkpoint_attempted(binding, now);
             let want = wants.iter().find(|want| want.binding_id == binding);
             let generation = self.registered.get(&binding).copied();
-            let epoch = self.lane.privacy_epoch();
             match client.checkpoint(service_id(binding), CALL_WAIT).await {
                 Ok(called) => {
                     if let (Some(state), Some(want), Some(generation)) =

@@ -87,29 +87,28 @@ pub struct ComponentNotes {
 pub struct FaultNote {
     /// Which call faulted.
     pub call: String,
-    /// The runtime's words, which the component chose in part.
-    pub detail: String,
+    /// The runtime's words, which the component chose in part. None where the fault came to the
+    /// worker in or after privacy mode: those words are never kept.
+    pub detail: Option<String>,
     /// How many faults the binding has had in the last minute.
     pub faults_in_window: u32,
-    /// Whether privacy mode was on when it happened.
-    pub in_privacy: bool,
 }
 
 impl FaultNote {
     fn text(&self, private: bool) -> String {
-        if self.in_privacy || private {
+        let detail = self.detail.as_deref().filter(|_| !private);
+        match detail {
             // What a component says in a fault can be made of what it was offered, so while privacy
-            // mode is on, and for a fault that happened in it, only the metadata is told.
-            format!(
+            // mode is on, and for a fault that may have happened in it, only the metadata is told.
+            None => format!(
                 "last fault, in {} ({} in the last minute); the runtime's words are withheld for \
                  privacy mode",
                 self.call, self.faults_in_window
-            )
-        } else {
-            format!(
+            ),
+            Some(detail) => format!(
                 "last fault, in {}: {} ({} in the last minute)",
-                self.call, self.detail, self.faults_in_window
-            )
+                self.call, detail, self.faults_in_window
+            ),
         }
     }
 }
@@ -307,6 +306,18 @@ impl Broker {
             held.component_states
                 .insert(binding_id, (state, reason.map(str::to_owned)));
         }
+    }
+
+    /// Returns the source generation the binding's instance has reached now, where the broker holds
+    /// the binding.
+    #[must_use]
+    pub fn component_generation(&self, binding_id: BrokerBindingId) -> Option<u64> {
+        let state = self.state();
+        let binding = state.bindings.get(&binding_id)?;
+        state
+            .instances
+            .get(&binding.application_instance_id)
+            .map(|instance| instance.source_generation.get())
     }
 
     /// Records one thing a person is told about a binding's component. A binding the broker no
