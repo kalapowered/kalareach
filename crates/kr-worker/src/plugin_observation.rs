@@ -30,7 +30,17 @@
 //!
 //! Between the two sources there is no order, and none is claimed. Within a source the order is the
 //! order produced, and a snapshot is asked for after a loss and before any later entry is handed to
-//! the binding, once the client's queue of events has emptied.
+//! the binding.
+//!
+//! What a snapshot is ordered after is what the client has written. The pump asks for it once the
+//! client holds no event that has been handed over and not written, and the client keeps an event
+//! in its count until its write is over, so the snapshot request is written after every event the
+//! pump handed over before it (or, on a connection that has ended, refused), and the runtime reads
+//! them in that order. The runtime queues an event
+//! when it reads it, takes the queue in batches of sixteen and answers a snapshot request between
+//! batches, so the component may not have observed the older events when it is asked for the
+//! snapshot. That is not claimed: the snapshot is the component's view of what it held when it ran,
+//! and each observation after it draws the view again.
 //!
 //! Every call the pump makes is made on the connection it was handed, and what the call came to is
 //! recorded only while that connection is still the runtime's: an answer from a connection the link
@@ -176,9 +186,9 @@ async fn snapshots(broker: &Broker, lane: &ObservationLane) {
             return;
         };
         // A snapshot is asked for after what the client already holds has been written, so that the
-        // component is not asked to rebuild its view before it has read what is older than the loss.
-        // A client that has not written it all is asked again after a wait that grows, and the
-        // binding is passed over until then.
+        // request reaches the runtime after the events handed over before it. A client that has not
+        // written them all is asked again after a wait that grows, and the binding is passed over
+        // until then.
         if !written(&client).await {
             if current(broker, &client) {
                 lane.snapshot_failed(binding, Instant::now());
@@ -207,8 +217,10 @@ async fn snapshots(broker: &Broker, lane: &ObservationLane) {
     }
 }
 
-/// Waits, for a bounded time, until the client has written what it already holds, and says whether
-/// it has.
+/// Waits, for a bounded time, until the client has written every event handed over to it, and says
+/// whether it has. The client counts an event until its write is over, and nothing but this task
+/// hands it events, so a snapshot requested after this answers true is written after them all, or
+/// refused where the connection has ended.
 async fn written(client: &PluginClient) -> bool {
     let until = Instant::now() + HAND_OFF_BARRIER;
     while client.offered_bytes() > 0 {

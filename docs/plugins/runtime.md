@@ -533,18 +533,23 @@ and a full hand-off refuses the span at once. A runtime that does not answer is 
 seconds, then for twice as long after each failure up to two minutes, and each entry passed over is
 counted. The two sources have no order between them, and each keeps the order it was pushed in.
 
-Whatever a ready component does not get is a numbered loss: an entry the lane pushed out or
-refused, one the pump passed over, one the host's queue refused. What was pushed before a binding
-became ready, or while the worker had no connection to the runtime, predates the binding's view and
-is not a loss. The pump offers a binding nothing while it owes the binding a snapshot, so a
-component is asked for
-a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a second,
-until the client's queue of events is empty; if it is not, the binding is passed over and asked
-again after a wait that grows. The lane gives the pump what it lost together with the entry it
-hands over, and what it lost is older than that entry, so the pump applies the loss, takes the
-snapshot and then offers the entry. A loss that arrives while a snapshot runs has a number of its
-own and asks for another. A snapshot the component answers or declines discharges its number. One that does not
-reach the component is asked for again after a wait that doubles from one second to thirty.
+Whatever a ready component does not get is a numbered loss: an entry the lane pushed out or refused,
+one the pump passed over, one the host's queue refused. What was pushed before a binding became
+ready, or while the worker had no connection to the runtime, predates the binding's view and is not
+a loss. The pump offers a binding nothing while it owes the binding a snapshot, so a component is
+asked for a fresh snapshot before anything later is handed to it. The snapshot waits, for up to a
+second, until the client has written every event it was handed, an event being counted until its
+write is over; if it has not, the binding is passed over and asked again after a wait that grows.
+The snapshot request is then written after those events, and the runtime reads them in that order.
+Whether the component has observed them when it answers is not claimed: the runtime queues an event
+when it reads it, takes the queue in batches of sixteen and may answer a snapshot request between
+two batches, so the snapshot is the view of what the component held when it ran, and each
+observation after it draws the view again. The lane gives the pump what it lost together with the
+entry it hands over, and what it lost is older than that entry, so the pump applies the loss, takes
+the snapshot and then offers the entry. A loss that arrives while a snapshot runs has a number of
+its own and asks for another. A snapshot the component answers or declines discharges its number.
+One that does not reach the component is asked for again after a wait that doubles from one second
+to thirty.
 
 The link keeps three more things. When a component has been offered something since its state was
 last asked for and has then been left alone for two seconds, or its last request is a minute old or
