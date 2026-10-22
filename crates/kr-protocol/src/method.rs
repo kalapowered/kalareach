@@ -525,6 +525,17 @@ methods! {
           call whose answer was lost is made again with the same bytes and is answered from what \
           the first left.";
 
+    BackupBundleWrite = "backup.bundle.write", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("request identity"),
+    doc: "Move the recovery bundle on by one compare-and-swap at its locator, for a restore that \
+          has verified a generation and records it. The call names the place the bundle was read \
+          at and carries the sealed bundle; it replaces a bundle that is still there and makes \
+          none. The host relays ciphertext with its own account and sees no seed or content. It \
+          sends nothing while privacy mode is on or while the service has asked to be left \
+          alone, and keeps no record of the write.";
+
     HostUpdateHandover = "host.update.handover", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -2073,6 +2084,7 @@ mod tests {
         // Setting this host's backups up and reading where they stand, at the host itself.
         ("backup.status", &[ActionRight::HostManage]),
         ("backup.enable", &[ActionRight::HostManage]),
+        ("backup.bundle.write", &[ActionRight::HostManage]),
         // Session descriptions: reading what is offered, and the two changes an owner makes.
         ("description.setup", &[ActionRight::HostManage]),
         ("description.configure", &[ActionRight::HostManage]),
