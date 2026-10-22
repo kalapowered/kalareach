@@ -262,8 +262,13 @@ impl World {
                 .unwrap_or_else(|| vec![collection(ORIGIN, "collection-1", archive())]),
             trusted_writers: writers.into_iter().collect(),
             trusted_producers: producers.into_iter().collect(),
-            checkpoints: shape.checkpoint.iter().cloned().collect(),
-            revision: U64::new(3),
+            checkpoints: shape
+                .checkpoint
+                .iter()
+                .chain(shape.more_checkpoints.iter())
+                .cloned()
+                .collect(),
+            revision: U64::new(shape.revision.unwrap_or(3)),
             written_at_ms: TimestampMs::new(2_000),
         };
         let key = self
@@ -288,6 +293,10 @@ struct Shape {
     no_producer: bool,
     collections: Option<Vec<CollectionLocator>>,
     checkpoint: Option<ArchiveCheckpoint>,
+    /// The checkpoints of other archives the bundle records.
+    more_checkpoints: Vec<ArchiveCheckpoint>,
+    /// The bundle's revision, when it is not the usual one.
+    revision: Option<u64>,
     sealed_for_origin: Option<&'static str>,
     sealed_at_locator: Option<String>,
 }
@@ -1184,6 +1193,72 @@ async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_i
         bundle_held(&world, &source).checkpoints.is_empty(),
         "nothing was written over the bundle the service now holds"
     );
+
+    // The bundle also records another archive, at generation 9, and this restore of the first at
+    // generation 8 reads it. A later read that finds an older authentic bundle in which that other
+    // archive stands at 5 is not written on either: the write would lower a checkpoint of an
+    // archive the restore was not about.
+    let other = ArchiveCheckpoint {
+        archive_id: ArchiveId::new(id(0x42)),
+        backup_generation: BackupGeneration::new(9),
+        encrypted_manifest_hash: Digest256::from_bytes([9; 32]),
+        verified_at_ms: TimestampMs::new(4_000),
+    };
+    let lower = ArchiveCheckpoint {
+        backup_generation: BackupGeneration::new(5),
+        encrypted_manifest_hash: Digest256::from_bytes([5; 32]),
+        ..other.clone()
+    };
+    let current = world.seal(8, &members);
+    let source = Arc::new(
+        Scripted::serving(
+            &world,
+            world.bundle(&Shape {
+                checkpoint: Some(checkpoint_of(&sealed)),
+                more_checkpoints: vec![other.clone()],
+                ..Shape::default()
+            }),
+        )
+        .publishing(&current),
+    );
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    source.replace_bundle(world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&sealed)),
+        more_checkpoints: vec![lower],
+        ..Shape::default()
+    }));
+    let refused = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect_err("another archive's checkpoint went back");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::CheckpointWentBack { known: 9 })
+    ));
+    assert_eq!(*bundle.writes.lock().expect("writes"), 0);
+
+    // A bundle of an older revision than the one the restore read is not written on, whatever it
+    // records.
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    source.replace_bundle(world.bundle(&Shape {
+        revision: Some(2),
+        ..Shape::default()
+    }));
+    let refused = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect_err("an older revision");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::BundleWentBackToAnOlderRevision { first: 3 })
+    ));
+    assert_eq!(*bundle.writes.lock().expect("writes"), 0);
 
     // Another restore recorded this very generation with another encrypted manifest.
     let source =

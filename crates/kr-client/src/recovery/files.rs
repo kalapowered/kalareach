@@ -63,7 +63,7 @@ use serde::Serialize;
 
 use crate::error::ClientError;
 use crate::recovery::bundle::read_bundle;
-use crate::recovery::checkpoint::hold_to_known_checkpoint;
+use crate::recovery::checkpoint::hold_to_the_first_read;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
     RetrievalPolicy, ServiceAccess, TrustedMaterial, advance_checkpoint,
@@ -965,9 +965,10 @@ pub struct PreparedRestore {
     context: RecoveryContext,
     /// Where the first read found the bundle, which every later read is held to.
     first_place: SyncPosition,
-    /// The checkpoint the first read found for this archive, which every later read is held to:
-    /// the strongest this restore has seen authenticated.
-    known_checkpoint: Option<ArchiveCheckpoint>,
+    /// Every checkpoint the first read found, for every archive, which every later read is held
+    /// to with the revision the first read found: the strongest this restore has seen
+    /// authenticated.
+    known_checkpoints: Vec<ArchiveCheckpoint>,
     /// The bundle as the service sealed it there, for an export.
     sealed_bundle: Vec<u8>,
     /// The publication this restore verified, for an export.
@@ -1057,9 +1058,12 @@ impl PreparedRestore {
             let read = read_bundle(&reader, &self.context, Some(seen), &self.seed)
                 .await
                 .map_err(from_recovery)?;
-            if let Some(known) = &self.known_checkpoint {
-                hold_to_known_checkpoint(&read.bundle, known).map_err(from_recovery)?;
-            }
+            hold_to_the_first_read(
+                &read.bundle,
+                self.plan.bundle_revision,
+                &self.known_checkpoints,
+            )
+            .map_err(from_recovery)?;
             let Some(mut advanced) =
                 advance_checkpoint(&read.bundle, &verified).map_err(from_recovery)?
             else {
@@ -1373,7 +1377,7 @@ impl FilesRestore {
             seed,
             context,
             first_place,
-            known_checkpoint: checkpoint,
+            known_checkpoints: material.checkpoints.clone(),
             sealed_bundle,
             publication,
             encrypted_manifest,
