@@ -3872,7 +3872,11 @@ pub mod configuration {
     /// voice, storage, authority, mailbox, relay), the commands its workflows run, the references
     /// to its secrets and how its control daemon is started stay as the host has them: a restore
     /// from a copy made earlier does not lift a restriction, point the host at another service or
-    /// install a command, and the start choice also writes what the service manager holds.
+    /// install a command, and the start choice also writes what the service manager holds. So do
+    /// the two things in a set of preferences that carry a secret or run code: the variables a
+    /// session is given (a `PATH` or a `BASH_ENV`, or a token) and the packages whose command
+    /// integration applies. Each set, the base preferences and every profile, keeps the host's
+    /// own of them; [`Self::left_out`] names where the backup held some that were not put back.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct DeviceConfiguration {
         /// The preferences that apply when no profile is selected.
@@ -3900,6 +3904,30 @@ pub mod configuration {
             }
         }
 
+        /// Where this configuration holds variables or command integrations that putting it back
+        /// does not apply, because the host keeps its own: the base preferences, and each profile
+        /// by name. Nothing is named that the backup does not hold, or that the host already has
+        /// the same; no variable and no value is named.
+        #[must_use]
+        pub fn left_out(&self, host: &ConfigurationDocument) -> LeftOut {
+            let held_apart = |ours: &PreferenceSet, theirs: Option<&PreferenceSet>| {
+                let host = theirs.cloned().unwrap_or_default();
+                (ours.command_integrations.0.is_some()
+                    && ours.command_integrations != host.command_integrations)
+                    || (ours.environment_additions.0.is_some()
+                        && ours.environment_additions != host.environment_additions)
+            };
+            LeftOut {
+                preferences: held_apart(&self.preferences, Some(&host.preferences)),
+                profiles: self
+                    .profiles
+                    .iter()
+                    .filter(|(name, set)| held_apart(set, host.profiles.get(*name)))
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            }
+        }
+
         /// The parts of the configuration in which `self` differs from `other`, each in this
         /// program's own words and none in the document's: a profile's name and a variable's name
         /// are the owner's text and are not repeated.
@@ -3924,6 +3952,42 @@ pub mod configuration {
             }
             parts
         }
+    }
+
+    /// Where a configuration put back leaves out the variables or command integrations it holds.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LeftOut {
+        /// Whether the base preferences, the ones that apply when no profile is selected, held
+        /// some.
+        pub preferences: bool,
+        /// The profiles that held some, by name, in order.
+        pub profiles: Vec<String>,
+    }
+
+    impl LeftOut {
+        /// Whether nothing was left out.
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            !self.preferences && self.profiles.is_empty()
+        }
+
+        /// How many sets of preferences held some.
+        #[must_use]
+        pub fn sets(&self) -> u64 {
+            u64::from(self.preferences) + self.profiles.len() as u64
+        }
+    }
+
+    /// `set` as a configuration put back keeps it: its variables and its command integrations are
+    /// the host's own set's, or none where the host has no such set.
+    fn keeping_the_hosts_commands(
+        mut set: PreferenceSet,
+        host: Option<&PreferenceSet>,
+    ) -> PreferenceSet {
+        let host = host.cloned().unwrap_or_default();
+        set.command_integrations = host.command_integrations;
+        set.environment_additions = host.environment_additions;
+        set
     }
 
     /// The preferences in which two sets differ.
@@ -3983,7 +4047,8 @@ pub mod configuration {
         ///
         /// Every section of [`DeviceConfiguration`] becomes what it names, and nothing else in the
         /// document moves: the ceilings, the services it selects, the commands its workflows run,
-        /// the secret references and the start choice are the host's own.
+        /// the secret references and the start choice are the host's own, and so are the
+        /// variables and command integrations of every set of preferences.
         DeviceConfiguration(Box<DeviceConfiguration>),
     }
 
@@ -4236,8 +4301,16 @@ pub mod configuration {
                     descriptions,
                     agents,
                 } = device.as_ref().clone();
-                document.preferences = preferences;
-                document.profiles = profiles;
+                let hosts = std::mem::take(&mut document.profiles);
+                let kept = keeping_the_hosts_commands(preferences, Some(&document.preferences));
+                document.preferences = kept;
+                document.profiles = profiles
+                    .into_iter()
+                    .map(|(name, set)| {
+                        let kept = keeping_the_hosts_commands(set, hosts.get(&name));
+                        (name, kept)
+                    })
+                    .collect();
                 document.default_profile = default_profile;
                 document.descriptions = descriptions;
                 document.agents = agents;
@@ -9936,8 +10009,52 @@ mod tests {
         let loaded = configuration::load(Some(configuration::contents(&host).as_bytes()));
         assert_eq!(loaded.status.state, DocumentState::Loaded);
 
+        // The host has a profile of its own with a variable, and a command integration in its base
+        // preferences.
+        host.profiles.insert(
+            "kept".to_owned(),
+            configuration::PreferenceSet {
+                environment_additions: Nullable::some(
+                    [("EDITOR".to_owned(), "vi".to_owned())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..configuration::PreferenceSet::default()
+            },
+        );
+        host.preferences.command_integrations = Nullable::some(vec!["acme/tool".to_owned()]);
+        let loaded = configuration::load(Some(configuration::contents(&host).as_bytes()));
+        assert_eq!(loaded.status.state, DocumentState::Loaded);
+
         let mut backed_up = ConfigurationDocument::empty();
         backed_up.preferences.sleep_inhibition = Nullable::some(SleepInhibitionSetting::BatteryToo);
+        // What the backup holds that can carry a secret or run code: a variable and an integration
+        // in the base preferences, in a profile the host has, in one it has not, and in one that
+        // holds none.
+        backed_up.preferences.environment_additions = Nullable::some(
+            [("BASH_ENV".to_owned(), "/tmp/x".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        backed_up.preferences.command_integrations = Nullable::some(vec!["evil/tool".to_owned()]);
+        backed_up.profiles.insert(
+            "kept".to_owned(),
+            configuration::PreferenceSet {
+                environment_additions: Nullable::some(
+                    [("PATH".to_owned(), "/tmp/bin".to_owned())]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..configuration::PreferenceSet::default()
+            },
+        );
+        backed_up.profiles.insert(
+            "added".to_owned(),
+            configuration::PreferenceSet {
+                command_integrations: Nullable::some(vec!["evil/tool".to_owned()]),
+                ..configuration::PreferenceSet::default()
+            },
+        );
         backed_up.profiles.insert(
             "review".to_owned(),
             crate::hostinfo::configuration::PreferenceSet::default(),
@@ -9955,8 +10072,38 @@ mod tests {
         let edited = configuration::edit(&loaded, &change).expect("a validated edit");
         assert_eq!(edited.revision, 7);
         let document = &edited.document;
-        assert_eq!(document.preferences, backed_up.preferences);
-        assert_eq!(document.profiles, backed_up.profiles);
+        assert_eq!(
+            document.preferences.sleep_inhibition,
+            backed_up.preferences.sleep_inhibition
+        );
+        // A variable and a command integration are the host's own, in every set of preferences:
+        // the base's keeps the host's integration and has no variable, the profile the host has
+        // keeps its variable, and a profile it has not comes without either.
+        assert_eq!(
+            document.preferences.command_integrations,
+            host.preferences.command_integrations
+        );
+        assert_eq!(document.preferences.environment_additions, Nullable::null());
+        assert_eq!(
+            document.profiles["kept"].environment_additions,
+            host.profiles["kept"].environment_additions
+        );
+        assert_eq!(
+            document.profiles["added"],
+            configuration::PreferenceSet::default()
+        );
+        assert_eq!(document.profiles["review"], backed_up.profiles["review"]);
+        // The importer says where it left some out, by profile and never by variable or value.
+        let left = DeviceConfiguration::of(&backed_up).left_out(&host);
+        assert_eq!(
+            left,
+            configuration::LeftOut {
+                preferences: true,
+                profiles: vec!["added".to_owned(), "kept".to_owned()],
+            }
+        );
+        assert!(!left.is_empty());
+        assert!(DeviceConfiguration::of(&host).left_out(&host).is_empty());
         assert_eq!(document.default_profile, backed_up.default_profile);
         assert_eq!(document.descriptions, backed_up.descriptions);
         assert_eq!(document.ceilings, host.ceilings, "a restriction stays");
@@ -9965,6 +10112,10 @@ mod tests {
         assert_eq!(document.automation, host.automation, "the commands stay");
         let reread = configuration::load(Some(edited.contents.as_bytes()));
         assert_eq!(reread.document.as_ref(), Some(document));
+        assert!(
+            !edited.contents.contains("BASH_ENV") && !edited.contents.contains("evil/tool"),
+            "nothing the backup held that runs code reaches the document"
+        );
 
         // A default profile that names no profile is the document's own refusal, and nothing moves.
         let mut dangling = backed_up.clone();
