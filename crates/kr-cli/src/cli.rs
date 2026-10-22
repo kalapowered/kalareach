@@ -2095,7 +2095,8 @@ mod tests {
         );
     }
 
-    /// KR-REQ-07.31: the saved preference is the middle step of the selection order.
+    /// `kr host terminal` shows the saved terminal preference with no option, sets it with `--set`
+    /// and clears it with `--clear`, and the last two are not one request.
     #[test]
     fn the_terminal_preference_is_shown_set_and_cleared() {
         let parsed = Cli::try_parse_from(["kr", "host", "terminal"]).expect("parses");
