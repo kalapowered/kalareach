@@ -463,6 +463,8 @@ impl Run {
         .expect("the answer is spent on the invitation it confirmed");
         assert!(matches!(invited.entry, InviteEntry::Direct { .. }));
         let spent = self.answered(id).await.expect("the record is still there");
+        // A host offers one invitation at a time: this one has served its purpose.
+        let _ = calls::cancel(self.environment, client, invited.invitation_id, false).await;
         self.say(
             "confirm-result.txt",
             &format!("answered {record}\nafter {spent}\n"),
