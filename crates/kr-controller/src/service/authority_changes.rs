@@ -156,8 +156,12 @@ impl Controller {
     /// A revocation answers when its barrier has held, and the names a busy worker had not given
     /// by then are collected afterwards ([`Self::collect_names_owed`]). The answer is kept as it
     /// was given, so a retry of the same action reads the barrier of its revision as it stands
-    /// now, and takes from it what a worker has named since. It takes nothing else: a worker the
-    /// daemon no longer holds a report of, as after a restart, keeps the answer it was given.
+    /// now, and takes from it what a worker has named since. It takes a worker's live entry only
+    /// when that entry carries at least the names the kept answer gave: the daemon holds a report
+    /// of a revision only for a while, and after a restart or a number of later revisions the live
+    /// entry says nothing of it, which is not a worker with no names. So a worker the daemon no
+    /// longer holds a report of keeps the answer it was given, and so does a repeat whose live
+    /// barrier cannot be read.
     async fn revocation_read_again(
         &self,
         actor_id: &ActorId,
@@ -186,36 +190,62 @@ impl Controller {
                     ),
                     _ => None,
                 };
-                let audience = Audience::of(actor_id);
-                encode(&self.with_the_names_since(audience, named, given).await?)
+                let Some(barrier) = self
+                    .with_the_names_since(Audience::of(actor_id), named, &given)
+                    .await
+                else {
+                    return Ok(answer);
+                };
+                let mut refreshed = kr_protocol::sharing::RevocationResult::bounded(
+                    given.authority_revision,
+                    given.revoked_grants.iter().copied(),
+                    barrier,
+                );
+                refreshed.revoked_grants_total = given.revoked_grants_total;
+                encode(&refreshed)
             }
             Some(Method::GrantTransfer) => {
-                let Ok(mut given) = answer.to_typed::<kr_protocol::sharing::GrantTransferResult>()
+                let Ok(given) = answer.to_typed::<kr_protocol::sharing::GrantTransferResult>()
                 else {
                     return Ok(answer);
                 };
                 if !owes(&given.revoked) {
                     return Ok(answer);
                 }
-                given.revoked = self
-                    .with_the_names_since(Audience::Host, None, given.revoked)
-                    .await?;
-                encode(&given)
+                let Some(barrier) = self
+                    .with_the_names_since(Audience::Host, None, &given.revoked)
+                    .await
+                else {
+                    return Ok(answer);
+                };
+                // Cut around the replacement grant it travels beside, as it was first answered.
+                let mut refreshed = kr_protocol::sharing::GrantTransferResult::bounded(
+                    given.replacement.clone(),
+                    given.revoked.authority_revision,
+                    given.revoked.revoked_grants.iter().copied(),
+                    barrier,
+                );
+                refreshed.revoked.revoked_grants_total = given.revoked.revoked_grants_total;
+                encode(&refreshed)
             }
             _ => Ok(answer),
         }
     }
 
-    /// `given`, with the barrier of its revision as the daemon holds it now for each worker that
-    /// had names to give and has given more.
+    /// The barrier of `given`, with the entry of each worker that had names to give replaced by the
+    /// daemon's own entry for it now, when that carries at least what `given` held of it and has
+    /// fewer names still to come. `None` when the barrier as it stands cannot be read.
     async fn with_the_names_since(
         &self,
         audience: Audience,
         named: Option<kr_protocol::ids::GrantId>,
-        given: kr_protocol::sharing::RevocationResult,
-    ) -> Result<kr_protocol::sharing::RevocationResult> {
-        let live = self.barrier_as_it_stands(given.authority_revision).await?;
-        let live = self.barrier_for(audience, named, live)?;
+        given: &kr_protocol::sharing::RevocationResult,
+    ) -> Option<kr_protocol::action::RevocationBarrier> {
+        let live = self
+            .barrier_as_it_stands(given.authority_revision)
+            .await
+            .ok()?;
+        let live = self.barrier_for(audience, named, live).ok()?;
         let mut barrier = given.barrier.clone();
         for worker in &mut barrier.workers {
             if worker.names_pending.get() == 0 {
@@ -225,17 +255,13 @@ impl Controller {
                 now.session_id == worker.session_id
                     && now.state.holds()
                     && now.names_pending.get() < worker.names_pending.get()
+                    && now.rejected_actions_total.get() >= worker.rejected_actions_total.get()
+                    && now.possibly_executed_total.get() >= worker.possibly_executed_total.get()
             }) {
                 *worker = now.clone();
             }
         }
-        let mut answer = kr_protocol::sharing::RevocationResult::bounded(
-            given.authority_revision,
-            given.revoked_grants.iter().copied(),
-            barrier,
-        );
-        answer.revoked_grants_total = given.revoked_grants_total;
-        Ok(answer)
+        Some(barrier)
     }
 
     /// The answer a record is owed, when nothing has to run first: every state but an unfinished
