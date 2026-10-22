@@ -364,6 +364,15 @@ fn now_ms() -> u64 {
     .expect("a time in range")
 }
 
+/// How a call to the host fails.
+#[derive(Clone, Copy)]
+enum HostFailure {
+    /// The host refuses it in its own words, before it does anything.
+    Refuses,
+    /// The host carried it out and its reply could not be read.
+    Unreadable,
+}
+
 /// What the service holds at a locator, read when the host is sent a setup.
 type HeldBundle = Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
@@ -378,6 +387,8 @@ struct Host {
     keys: BackupHostKeys,
     /// What the host answers to the setup, or nothing when the answer is lost.
     answer: Mutex<Option<BackupEnableResult>>,
+    /// How the call fails instead of being answered, when it does.
+    failure: Mutex<Option<HostFailure>>,
     /// The setups it was sent, and whether the service held exactly their bundle at that moment.
     enabled: Mutex<Vec<(BackupEnableParams, bool)>>,
     statuses: Mutex<usize>,
@@ -417,6 +428,7 @@ impl Host {
             }),
             keys,
             answer: Mutex::new(None),
+            failure: Mutex::new(None),
             enabled: Mutex::new(Vec::new()),
             statuses: Mutex::new(0),
             held: Box::new(move |locator| web.bundle(locator)),
@@ -462,7 +474,24 @@ impl HostBackups for Host {
             there.as_deref() == Some(params.sealed_bundle.as_slice()),
         ));
         let answer = self.answer.lock().expect("answer").clone();
+        let failure = *self.failure.lock().expect("failure");
         Box::pin(async move {
+            match failure {
+                Some(HostFailure::Refuses) => {
+                    return Err(kr_client::ClientError::Host(
+                        kr_protocol::error::ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this connection may not set backups up".to_owned(),
+                        ),
+                    ));
+                }
+                Some(HostFailure::Unreadable) => {
+                    return Err(kr_client::ClientError::Cbor(kr_client::Shown::said(
+                        "the host's reply could not be read",
+                    )));
+                }
+                None => {}
+            }
             match answer {
                 Some(BackupEnableResult::Enabled { .. }) => Ok(BackupEnableResult::Enabled {
                     archive_id: params.archive_id,
@@ -481,12 +510,12 @@ impl HostBackups for Host {
     }
 }
 
-/// How many writes of the bundle reached the service, whether or not it acted on them.
 /// A recovery recipient's public key that is not this computer's.
 fn another_recipient() -> kr_protocol::scalars::StoredEnvelopeKey {
     *StoredEnvelopeKeyPair::generate().expect("a key").public()
 }
 
+/// How many writes of the bundle reached the service, whether or not it acted on them.
 fn writes_sent(computer: &Computer) -> usize {
     computer
         .served
@@ -1005,6 +1034,69 @@ async fn a_host_that_cannot_be_covered_as_it_stands_is_left_alone_and_nothing_is
             .len(),
         archives_named,
         "no archive the host declined to make is named"
+    );
+
+    // A host that refuses the call in its own words recorded nothing either, and the error is the
+    // host's, not an outcome that is unknown.
+    let host = Host::new(&computer, computer.served.origin());
+    *host.failure.lock().expect("failure") = Some(HostFailure::Refuses);
+    let refused = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("the host refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    assert_eq!(
+        read_with_only_the_kit(&computer.served, &kit)
+            .await
+            .collections
+            .len(),
+        archives_named,
+        "no archive the host refused to make is named"
+    );
+
+    // A reply that could not be read may follow a setup that was carried out: the archive stays
+    // named, and the error says the outcome is not known, so that a repeat finds the setup.
+    let host = Host::new(&computer, computer.served.origin());
+    *host.failure.lock().expect("failure") = Some(HostFailure::Unreadable);
+    let unknown = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("the reply was unreadable");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        read_with_only_the_kit(&computer.served, &kit)
+            .await
+            .collections
+            .len(),
+        archives_named + 1,
+        "the archive the host may have made stays named"
+    );
+
+    // A failure before the host is asked leaves the bundle as it was: the service fails the read of
+    // the bundle that follows the write which named the archive.
+    let before_asking = read_with_only_the_kit(&computer.served, &kit)
+        .await
+        .collections
+        .len();
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    computer.served.web().fail(SYNC_PATH, 3, Moment::Before);
+    let stopped = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("the sealed bytes could not be read");
+    drop(stopped);
+    assert!(host.setups_sent().is_empty(), "the host was not asked");
+    assert_eq!(
+        read_with_only_the_kit(&computer.served, &kit)
+            .await
+            .collections
+            .len(),
+        before_asking,
+        "no archive the host never heard of is named"
     );
 }
 
