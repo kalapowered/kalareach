@@ -14,7 +14,6 @@
 
 #![cfg(unix)]
 
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -23,6 +22,7 @@ use kr_protocol::identity::ProcessStartIdentity;
 use kr_worker::ownership::{OwnedProcesses, OwnershipBoundary, force_stop, request_stop};
 
 /// How long a test waits for something that should happen promptly, before it calls it a failure.
+/// It only ends a case that is hung: what is waited for costs what it costs.
 const LIVENESS: Duration = Duration::from_secs(60);
 
 /// A process the test started, ended whatever the test did.
@@ -50,6 +50,9 @@ fn identity_of(child: &Child) -> ProcessStartIdentity {
     kr_ipc::identity::process_start_identity(child.id()).expect("the child's identity")
 }
 
+/// Waits until `condition` holds, for state the system gives no wakeup for: another process's
+/// end, and what the owned-process record reads of the process table. What a case's own child says
+/// is waited for where it is said ([`Server::next_line`]), not here.
 fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
     let started = Instant::now();
     while !condition() {
@@ -71,12 +74,17 @@ fn pid_of(identity: &ProcessStartIdentity) -> u32 {
 /// `nohup`, and a server or a command that ignored one would make "it was never sent" and "it was
 /// sent and ignored" the same.
 fn start(program: &str, arguments: &[&str]) -> Child {
+    start_with_error(program, arguments, Stdio::null())
+}
+
+/// As [`start`], with the process's standard error where `error` says.
+fn start_with_error(program: &str, arguments: &[&str], error: Stdio) -> Child {
     Command::new("/usr/bin/perl")
         .args(["-e", "$SIG{HUP} = q(DEFAULT); exec @ARGV", program])
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(error)
         .spawn()
         .expect("starts the process")
 }
@@ -87,46 +95,86 @@ struct Server {
     identity: ProcessStartIdentity,
     command: Escaped,
     command_identity: ProcessStartIdentity,
+    /// What the server's command says on its standard error, a line at a time as it says it.
+    said: std::sync::mpsc::Receiver<String>,
 }
 
 impl Server {
     /// Starts a server, which runs until it is ended, and a command it starts with `script`, in a
-    /// session of its own, whose process number the server writes in `directory/name`.
-    fn start(directory: &Path, name: &str, script: &str) -> Self {
-        let written = directory.join(name);
+    /// session of its own. The command says its process number once it has set that session up,
+    /// and anything `script` writes to its standard error after.
+    fn start(script: &str) -> Self {
         let command = format!(
-            "perl -MPOSIX -e '$SIG{{HUP}} = q(DEFAULT); POSIX::setsid(); exec @ARGV' \
-             /bin/sh -c {script} & \
-             echo $! > {file}.part && mv {file}.part {file}; \
+            "perl -MPOSIX -e '$SIG{{HUP}} = q(DEFAULT); POSIX::setsid(); print STDERR qq($$\\n); \
+             exec @ARGV' /bin/sh -c {script} & \
              while :; do sleep 0.2; done",
             script = kr_worker::testing::shell_word(script),
-            file = kr_worker::testing::shell_quoted(&written)
         );
-        let process = Reaped(start("/bin/sh", &["-c", &command]));
+        let mut process = Reaped(start_with_error(
+            "/bin/sh",
+            &["-c", &command],
+            Stdio::piped(),
+        ));
         let identity = identity_of(&process.0);
-        eventually("the server never started its command", || written.exists());
-        let command_pid: u32 = std::fs::read_to_string(&written)
-            .expect("the command's number")
-            .trim()
-            .parse()
-            .expect("a number");
+        let log = process
+            .0
+            .stderr
+            .take()
+            .expect("the server's standard error");
+        let (tell, said) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(log).lines().map_while(Result::ok) {
+                if tell.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        // Its number is the one line that is a number: anything else the server's shell or the
+        // program that starts the command says on the way is not it.
+        let command_pid: u32 = loop {
+            let line = said_within(
+                &said,
+                "the server's command never said it had left the server's group",
+            );
+            if let Ok(number) = line.trim().parse() {
+                break number;
+            }
+        };
         let command_identity =
             kr_ipc::identity::process_start_identity(command_pid).expect("the command's identity");
-        // The command has been started, and not yet necessarily left: it leaves when it has set up
-        // its session, a moment after the server wrote its number down.
+        // The command set its session up before it said its number.
         let server_group = process_lineage(process.0.id())
             .expect("the server's lineage")
             .group;
-        eventually("the command never left the server's group", || {
-            process_lineage(command_pid).is_ok_and(|lineage| lineage.group != server_group)
-        });
+        assert_ne!(
+            process_lineage(command_pid)
+                .expect("the command's lineage")
+                .group,
+            server_group,
+            "the command has left the server's group"
+        );
         Self {
             process,
             identity,
             command: Escaped(Some(command_identity.clone())),
             command_identity,
+            said,
         }
     }
+
+    /// The next line the server's command says on its standard error, waited for where it is said.
+    fn next_line(&self, what: &str) -> String {
+        said_within(&self.said, what)
+    }
+}
+
+/// The next line a process says, which ends the case as hung when none comes within the bound or
+/// when the process's output has ended.
+fn said_within(said: &std::sync::mpsc::Receiver<String>, what: &str) -> String {
+    said.recv_timeout(LIVENESS).unwrap_or_else(|_| {
+        panic!("{what}: nothing was said within {LIVENESS:?}, or the output ended")
+    })
 }
 
 /// A record established for a session whose root shell is `shell`, over a group number no process
@@ -165,9 +213,8 @@ fn observe_until_below(
 #[test]
 fn kr_req_07_60_a_servers_commands_are_recorded_below_it_and_the_session_s_stop_leaves_the_server()
 {
-    let directory = kr_ipc::testing::TempHost::create();
     let shell = a_shell();
-    let mut server = Server::start(directory.root(), "command", "exec sleep 600");
+    let mut server = Server::start("exec sleep 600");
     let mut owned = record_for(&shell);
     let plain = owned.record();
     owned.add_backend(server.identity.clone());
@@ -232,16 +279,14 @@ fn kr_req_07_60_a_servers_commands_are_recorded_below_it_and_the_session_s_stop_
 fn kr_req_07_60_a_command_whose_server_has_gone_is_still_read_and_stopped() {
     let directory = kr_ipc::testing::TempHost::create();
     let go = directory.root().join("go");
-    let grandchild = directory.root().join("grandchild");
     // The command waits for the test to say the server is gone, and only then starts a process of
-    // its own, so that process is one the walk can only find from the command.
+    // its own and says its number, so that process is one the walk can only find from the command.
     let script = format!(
-        "while [ ! -e {go} ]; do sleep 0.05; done; sleep 600 & echo $! > {grandchild}.part; mv {grandchild}.part {grandchild}; wait",
+        "while [ ! -e {go} ]; do sleep 0.05; done; sleep 600 & echo $! >&2; wait",
         go = kr_worker::testing::shell_quoted(&go),
-        grandchild = kr_worker::testing::shell_quoted(&grandchild)
     );
     let shell = a_shell();
-    let mut server = Server::start(directory.root(), "command", &script);
+    let mut server = Server::start(&script);
     let mut owned = record_for(&shell);
     owned.add_backend(server.identity.clone());
     observe_until_below(&mut owned, &server.identity, &server.command_identity);
@@ -253,14 +298,12 @@ fn kr_req_07_60_a_command_whose_server_has_gone_is_still_read_and_stopped() {
     let _ = server.process.0.wait();
     assert!(ended(&server.identity));
     std::fs::write(&go, b"").expect("lets the command go on");
-    eventually("the command never started its process", || {
-        grandchild.exists()
-    });
-    let grandchild_pid: u32 = std::fs::read_to_string(&grandchild)
-        .expect("the process's number")
-        .trim()
-        .parse()
-        .expect("a number");
+    let grandchild_pid: u32 = loop {
+        let line = server.next_line("the command never started its process");
+        if let Ok(number) = line.trim().parse() {
+            break number;
+        }
+    };
     let grandchild_identity =
         kr_ipc::identity::process_start_identity(grandchild_pid).expect("its identity");
     let grandchild_guard = Escaped(Some(grandchild_identity.clone()));
@@ -301,10 +344,9 @@ fn kr_req_07_60_a_command_whose_server_has_gone_is_still_read_and_stopped() {
 /// hold two, and stopping the commands of the one must not name the other or its commands.
 #[test]
 fn kr_req_07_60_what_is_recorded_below_a_server_is_below_that_server_only() {
-    let directory = kr_ipc::testing::TempHost::create();
     let shell = a_shell();
-    let first = Server::start(directory.root(), "first", "exec sleep 600");
-    let second = Server::start(directory.root(), "second", "exec sleep 600");
+    let first = Server::start("exec sleep 600");
+    let second = Server::start("exec sleep 600");
     let mut owned = record_for(&shell);
     owned.add_backend(first.identity.clone());
     owned.add_backend(second.identity.clone());
