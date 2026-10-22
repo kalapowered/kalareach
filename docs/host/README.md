@@ -3402,9 +3402,9 @@ Two contracts `docs/transport/README.md` names, and where they are kept:
 A host counts three things about its own work: how long a paired device was without a connection,
 the faults a session's terminal parser met, and the failures of the adapters a session runs. They
 are local diagnostics. The totals are kept in memory and start again from zero when the process
-that counted them does, and no service receives them from this host. `kr doctor` prints them and a
-support bundle carries them: counts under labels from the closed lists below, which name no person,
-session, path or program a person ran.
+that counted them does, and no service receives them from this host. `kr doctor` prints what the
+daemon holds and a support bundle carries it: counts under labels from the closed lists below,
+which name no person, session, path or program a person ran.
 
 A paired device reads them only when its grant, as this host's policy and ceilings leave it,
 holds the right to manage the host, as an owner's device does. The metrics are about the host, and
@@ -3445,13 +3445,14 @@ text a caller chose, so no line of terminal output, prompt, key or file name can
   nested too deep) or `unknown_control` (a sequence the terminal profile has no class for, or that
   the canonical grid does not implement). The other diagnostics of a session's terminal, such as a
   cursor movement past the edge that the grid reduced to the edge, a query the host answered or a
-  clipboard write it refused, are well-formed and are not parse faults.
+  clipboard write it refused, are not counted as parse faults.
 * `adapter` is one of the agent connectors the product bundles. A package that is not one of them
   is counted under no name. `outcome` is `unavailable` when the adapter's connection could not take
   a frame the host sent, or when the plugin runtime could not run its component, counted once for
-  each outage however often the runtime is asked again, and once more when the runtime stops
-  running the component for good; it is `timeout` when the adapter took a request and did not answer
-  it in time, counted at the adapter's deadline whether or not the caller is still waiting.
+  each outage however often the runtime is asked again, and when the runtime stops running the
+  component for good in an outage that was not counted yet; it is `timeout` when the adapter took a
+  request and did not answer it in time, counted at the adapter's deadline whether or not the
+  caller is still waiting.
 * `environment` is `production` for a build that runs from a release in the install store and
   `development` for any other. A host never reports `staging`, which is a deployment of the
   service.
