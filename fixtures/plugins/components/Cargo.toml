@@ -12,6 +12,7 @@ members = [
     "memory-hog",
     "oversized-output",
     "preparing",
+    "recording",
     "slow-compile",
     "slow-observe",
     "support",
