@@ -552,6 +552,7 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
         Method::EnvironmentRefresh,
         Method::HostUpdateHandover,
         Method::BackupEnable,
+        Method::BackupBundleWrite,
         Method::AccountSignIn,
         Method::AccountSignOut,
     ];
@@ -1232,6 +1233,7 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
         Method::EnvironmentRefresh,
         Method::HostUpdateHandover,
         Method::BackupEnable,
+        Method::BackupBundleWrite,
         Method::AccountSignIn,
         Method::AccountSignOut,
     ];

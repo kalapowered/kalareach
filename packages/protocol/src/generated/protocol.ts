@@ -391,6 +391,28 @@ export type BackupBundle =
  */
 export type Uuid = string
 /**
+ * What `backup.bundle.write` answers.
+ */
+export type BackupBundleWriteResult =
+  | {
+      place: BackupBundlePlace2
+      state: 'written'
+    }
+  | {
+      /**
+       * Where the bundle stood when the refusal was answered, when the service said.
+       */
+      current: BackupBundlePlace | null
+      state: 'conflict'
+    }
+  | {
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      retry_after_seconds: string
+      state: 'wait'
+    }
+/**
  * How the last call to `backup.enable` ended, when it did not set backups up.
  */
 export type BackupEnableCause =
@@ -2671,6 +2693,9 @@ export interface KalaReachProtocol {
   authority_revision_notice?: AuthorityRevisionNotice
   authority_revision_record?: AuthorityRevisionRecord
   backup_bundle?: BackupBundle
+  backup_bundle_place?: BackupBundlePlace
+  backup_bundle_write_params?: BackupBundleWriteParams
+  backup_bundle_write_result?: BackupBundleWriteResult
   backup_enable_cause?: BackupEnableCause
   backup_enable_params?: BackupEnableParams
   backup_enable_result?: BackupEnableResult
@@ -7041,6 +7066,82 @@ export interface AuthorityRevisionRecord {
    * The Ed25519 signature over `CBOR(["kr-authority/1", record without this field])`.
    */
   signature: string
+}
+/**
+ * A place in the bundle's order at the service: where a read found it, or where a write left it.
+ */
+export interface BackupBundlePlace {
+  /**
+   * The history the place is in: the recovery the answer named, or null for a service never put
+   * back.
+   */
+  recovery: Uuid | null
+  /**
+   * The name the service gave this write.
+   */
+  revision: Uuid | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  write_sequence: string
+}
+/**
+ * Parameters of `backup.bundle.write`: one write of the sealed bundle at its locator.
+ */
+export interface BackupBundleWriteParams {
+  expected: BackupBundlePlace1
+  /**
+   * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+   */
+  locator: string
+  /**
+   * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+   */
+  request_id: string
+  /**
+   * The sealed bundle, at most as large as any sealed bundle may be.
+   */
+  sealed_bundle: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  signed_at_ms: string
+}
+/**
+ * The place the bundle was read at. The write replaces the bundle only if it is still there.
+ */
+export interface BackupBundlePlace1 {
+  /**
+   * The history the place is in: the recovery the answer named, or null for a service never put
+   * back.
+   */
+  recovery: Uuid | null
+  /**
+   * The name the service gave this write.
+   */
+  revision: Uuid | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  write_sequence: string
+}
+/**
+ * Where the write left the bundle.
+ */
+export interface BackupBundlePlace2 {
+  /**
+   * The history the place is in: the recovery the answer named, or null for a service never put
+   * back.
+   */
+  recovery: Uuid | null
+  /**
+   * The name the service gave this write.
+   */
+  revision: Uuid | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  write_sequence: string
 }
 /**
  * Parameters of `backup.enable`: everything the daemon needs to set backups up, and nothing of the
@@ -18799,6 +18900,7 @@ export interface MethodEntry {
     | 'backup.read'
     | 'backup.status'
     | 'backup.enable'
+    | 'backup.bundle.write'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
@@ -27752,6 +27854,7 @@ export interface ServiceRequestPayload {
     | 'backup.read'
     | 'backup.status'
     | 'backup.enable'
+    | 'backup.bundle.write'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
