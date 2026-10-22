@@ -594,6 +594,11 @@ fn cancel_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
 /// turn is carried out by the host from the connector's own template. The host issues the token
 /// for the invocation and spends it against its own plan, so the admission has the checks a
 /// component's plan passes, and with no turn running nothing is admitted and nothing is written.
+/// KR-REQ-09.06 and KR-REQ-23.46, the part about cancelling after dispatch: the cancellation of a
+/// running turn is an action of its own, admitted by the host under a token it issues for it and
+/// spent once, written to the upstream as a separate operation naming the thread and the turn, and
+/// settled with a result that names the turn it cancelled. The route from `action.cancel` to this
+/// action is not shown here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_28_a_declared_cancellation_is_written_from_the_template_under_its_own_token() {
     let mut world = World::new(1 << 20);
