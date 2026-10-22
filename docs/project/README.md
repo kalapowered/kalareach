@@ -947,11 +947,12 @@ This host's own reservation is the project service's. It is granted for an isola
 host made (a Git worktree or an independent clone) that is ready, whose recorded working tree
 and Git directory are the ones the capture opened, and never for the user's own checkout, which
 the user's own tools write. It is granted only when no writer of this host is at work in the
-repository and no live session this host started is in a tree it records for it. The reservation
-is first granted over the working tree and its Git directory, and the other trees the host records
-for the repository are read and added once it stands, so a worktree being made at that moment
-either turns the reservation away as a writer at work or is counted. A tree adopted after the
-grant is not covered. The reservation never waits: a workspace it cannot hold at that moment is
+repository, no live session this host started is in a tree it records for it, and the host can
+look at every tree it records for the repository. The reservation is first granted over the
+working tree and its Git directory, and the other trees the host records for the repository are
+read and added once it stands, so a worktree being made at that moment either turns the
+reservation away as a writer at work or is counted. A tree adopted after the grant is not
+covered. The reservation never waits: a workspace it cannot hold at that moment is
 captured as the per-file class, or the capture is refused when it required the quiesced one, and
 the refusal says which of these applies. A reservation ends at its bound, five minutes, whatever
 its holder does.
@@ -975,19 +976,28 @@ While a reservation stands the host's own writers of that repository are turned 
 * a session that would start in one of those trees: the daemon asks before the shell is started.
 
 A writer whose directory the host cannot open is taken to write anywhere. It is turned away by
-every reservation, and it keeps every reservation from being granted while it is at work.
+every reservation, and it keeps every reservation from being granted while it is at work. A
+directory the host cannot look at counts as one it cannot open: one whose look fails with any
+error but a missing name or a file in the path, such as a mount whose server has stopped or a
+directory the host may not search.
 
 A session is a writer for as long as it lives. It is found by the directory it was asked to start
 in: the nearest existing directory at or above that path, after links, together with every
 directory above it, matched at the moment a reservation is asked for against every tree this host
 records, a project's own checkout included whether or not a workspace was ever selected on it, so
 a terminal opened before the host knew its repository still counts. A session with no directory
-starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
-request the daemon could not read after a restart, counts against every reservation. A daemon
-that starts opens the directories of the sessions it finds alive together and waits five seconds
-at most for all of them before it goes on to serve. A session whose directory is still silent
-after that, such as one on a network mount whose server has gone, counts against every
-reservation as well, until it closes or a later start places it.
+starts at the root and counts nowhere; one whose directory is not an absolute path, whose
+request the daemon could not read after a restart, or whose directory the host cannot look at,
+counts against every reservation. Only a name that does not exist, or a file where a directory
+was named, stands for the directory it would be in. Any other error ends the look and is not
+replaced by the directory above: a mount whose server has stopped fails every look at once, and
+so does a directory the host may not search. A `session.create` in such a directory is turned
+away while any reservation stands, and a session started there counts against every reservation
+until it closes or a later start places it. A daemon that starts opens
+the directories of the sessions it finds alive together and waits five seconds at most for all
+of them before it goes on to serve. A session whose directory is still silent after that, such
+as one on a network mount that does not answer, counts against every reservation as well, until
+it closes or a later start places it.
 
 A session counts until its closure is recorded. Three cases end differently. In the first two the
 host waits for the kernel to say that the worker's process has ended; it asks for sixty seconds,

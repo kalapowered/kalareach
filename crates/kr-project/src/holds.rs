@@ -29,6 +29,7 @@
 //! ends at its bound whatever its holder does, and a hold that ended never holds again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -154,6 +155,9 @@ pub enum Refusal {
     WriterAtWork(&'static str),
     /// This many live sessions started in a tree of the repository.
     SessionsBound(usize),
+    /// A tree this host records for the repository cannot be looked at, so the directories above
+    /// it, which a removal of the directory holding it meets, cannot be named.
+    TreeUnreadable,
     /// The hold ran out before every tree of the repository was covered.
     Lapsed,
 }
@@ -176,6 +180,10 @@ impl std::fmt::Display for Refusal {
             Self::SessionsBound(1) => formatter.write_str(
                 "a live session started in a tree of its repository, and a session's shell \
                  writes where it runs",
+            ),
+            Self::TreeUnreadable => formatter.write_str(
+                "a tree this host records for its repository cannot be looked at, so what lies \
+                 above it cannot be held",
             ),
             Self::Lapsed => formatter
                 .write_str("the hold ran out before every tree of its repository was covered"),
@@ -530,7 +538,10 @@ impl Drop for Hold {
 ///
 /// The nearest existing directory at or above `path` after links are resolved: a name that does
 /// not exist yet, or a file, stands for the directory it would be in. `None` when nothing of it
-/// can be opened.
+/// can be opened, and when a directory on the way cannot be looked at for any other reason: a
+/// mount whose server has stopped or answers with an error, a directory this account may not
+/// search. That is not a missing name, and the directory above it says nothing of where the path
+/// leads.
 fn identity_chain(
     environment_id: kr_protocol::ids::EnvironmentId,
     path: &Path,
@@ -543,17 +554,20 @@ fn identity_chain(
     let real = loop {
         match std::fs::canonicalize(&candidate) {
             Ok(real) => break real,
-            Err(_) => {
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
                 if !candidate.pop() {
                     return None;
                 }
             }
+            Err(_) => return None,
         }
     };
-    let real = if real.is_dir() {
-        real
-    } else {
-        real.parent()?.to_path_buf()
+    let real = match std::fs::metadata(&real) {
+        Ok(found) if found.is_dir() => real,
+        Ok(_) => real.parent()?.to_path_buf(),
+        Err(_) => return None,
     };
     let mut here = AuthorisedDirectory::open_root(environment_id, &real).ok()?;
     let mut chain = vec![here.identity()];
@@ -616,10 +630,12 @@ struct KnownTree {
 }
 
 /// The identities of the directories above the working tree a record names at `path`, nearest
-/// first, or none when it cannot be opened.
-fn parents_of(environment_id: kr_protocol::ids::EnvironmentId, path: &str) -> Vec<ObjectIdentity> {
-    identity_chain(environment_id, Path::new(path))
-        .map_or_else(Vec::new, |chain| chain.into_iter().skip(1).collect())
+/// first, or `None` when the tree cannot be looked at.
+fn parents_of(
+    environment_id: kr_protocol::ids::EnvironmentId,
+    path: &str,
+) -> Option<Vec<ObjectIdentity>> {
+    identity_chain(environment_id, Path::new(path)).map(|chain| chain.into_iter().skip(1).collect())
 }
 
 impl ProjectService {
@@ -637,7 +653,8 @@ impl ProjectService {
     }
 
     /// Where a session that is asked to start in `directory` starts. No directory is the
-    /// worker's own default, the root; one that is not absolute, or cannot be opened, is unknown.
+    /// worker's own default, the root; one that is not absolute, or that cannot be looked at, is
+    /// unknown.
     ///
     /// This opens the directory and every directory above it, so it waits for as long as a
     /// mount on the way takes to answer.
@@ -778,8 +795,8 @@ impl ProjectService {
     ///
     /// Granted only for an isolated, ready workspace whose recorded tree and Git directory are the
     /// ones the capture opened, at the place the host recorded, and only when no writer of this
-    /// host is at work and no live session started in a tree this host records for the
-    /// repository.
+    /// host is at work, no live session started in a tree this host records for the
+    /// repository, and every tree it records for the repository can be looked at.
     ///
     /// The hold is granted over the tree and the Git directory first, and the other trees this host
     /// records for the repository are read afterwards and added to it. The writers that publish a
@@ -825,7 +842,10 @@ impl ProjectService {
         for known in self.known_trees()? {
             if known.repository == Some(git_dir) {
                 more.extend(known.tree);
-                more_ancestors.extend(parents_of(self.environment_id, &known.display_path));
+                let Some(parents) = parents_of(self.environment_id, &known.display_path) else {
+                    return Ok(Err(Refusal::TreeUnreadable));
+                };
+                more_ancestors.extend(parents);
             }
         }
         Ok(hold.widen(more, more_ancestors).map(|()| hold))
