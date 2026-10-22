@@ -57,15 +57,15 @@ use kr_protocol::archive::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
-use kr_protocol::scalars::{Digest256, KeyId, StoredEnvelopeKey, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, Digest256, KeyId, StoredEnvelopeKey, TimestampMs, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
 use crate::error::ClientError;
 use crate::recovery::bundle::read_bundle;
 use crate::recovery::{
-    FreshRestore, RecoveryError, RetrievalPolicy, ServiceAccess, TrustedMaterial,
-    advance_checkpoint,
+    ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
+    RetrievalPolicy, ServiceAccess, TrustedMaterial, advance_checkpoint,
 };
 use crate::services::{
     ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition,
@@ -234,8 +234,9 @@ struct BundleReader {
     /// Whether the source answered that no bundle is held, so the caller can say that apart from a
     /// bundle that failed to authenticate.
     answered_absent: AtomicBool,
-    /// Where the first read found the bundle, which a later read is held to.
-    first_place: std::sync::Mutex<Option<SyncPosition>>,
+    /// Where the first read found the bundle, which a later read is held to, and the bytes it was
+    /// sealed as there.
+    first: std::sync::Mutex<Option<(SyncPosition, Vec<u8>)>>,
 }
 
 impl fmt::Debug for BundleReader {
@@ -306,12 +307,15 @@ impl SyncBackupService for BundleReader {
             let fetched = self.source.bundle(locator).await?;
             match &fetched {
                 SyncFetched::Absent { .. } => self.answered_absent.store(true, Ordering::Relaxed),
-                SyncFetched::Held { position, .. } => {
+                SyncFetched::Held {
+                    position,
+                    ciphertext,
+                } => {
                     let mut first = self
-                        .first_place
+                        .first
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    first.get_or_insert(*position);
+                    first.get_or_insert_with(|| (*position, ciphertext.clone()));
                 }
             }
             Ok(fetched)
@@ -472,6 +476,17 @@ pub enum RestoreError {
     /// A member was asked for that the plan does not restore.
     #[error("that member is not one this restore's plan writes")]
     NotInPlan,
+    /// The archive holds more ciphertext than one export file does.
+    #[error(
+        "the archive holds {bytes} bytes, more than the {limit} an export file holds; restore it \
+         from the service instead"
+    )]
+    TooLargeToExport {
+        /// What the archive holds.
+        bytes: u64,
+        /// The most an export holds.
+        limit: u64,
+    },
     /// The recovery bundle changed under every attempt to record the checkpoint in it.
     #[error("the recovery bundle kept changing while the verified generation was being recorded")]
     BundleKeptMoving,
@@ -921,6 +936,12 @@ pub struct PreparedRestore {
     context: RecoveryContext,
     /// Where the first read found the bundle, which every later read is held to.
     first_place: SyncPosition,
+    /// The bundle as the service sealed it there, for an export.
+    sealed_bundle: Vec<u8>,
+    /// The publication this restore verified, for an export.
+    publication: BackupGenerationPublication,
+    /// The encrypted manifest it named, for an export.
+    encrypted_manifest: Vec<u8>,
 }
 
 /// What recording the checkpoint did.
@@ -992,7 +1013,7 @@ impl PreparedRestore {
         let reader = BundleReader {
             source: Arc::clone(&self.source),
             answered_absent: AtomicBool::new(false),
-            first_place: std::sync::Mutex::new(None),
+            first: std::sync::Mutex::new(None),
         };
         let key = self
             .seed
@@ -1159,61 +1180,15 @@ impl FilesRestore {
         archive: Option<ArchiveId>,
         accept_older: Option<BackupGeneration>,
     ) -> Result<PreparedRestore, RestoreError> {
-        // 1. The kit's checksum, before anything is derived or asked.
-        let seed = RecoverySeed::from_kit(&kit)
-            .map_err(|_| RestoreError::Recovery(Box::new(RecoveryError::MistypedKit)))?;
-        let service = source.service().await?;
-        if let SourceSignIn::Unusable(cause) = service.sign_in {
-            return Err(RestoreError::NotSignedIn {
-                cause,
-                why: Shown::said(cause.why()),
-            });
-        }
-        let origin =
-            kit_origin_for(&kit, &service.origin).ok_or(RestoreError::OriginNotConfigured)?;
-        // The locator is an identifier in its canonical spelling, and the service refuses
-        // anything else, so a kit that carries another is wrong before it is used.
-        if !is_an_identifier(&kit.bundle_locator) {
-            return Err(RestoreError::Recovery(Box::new(
-                RecoveryError::MalformedKit {
-                    what: "a bundle locator that is not an identifier",
-                },
-            )));
-        }
-
-        // 2. The bundle, through a reader that cannot write.
-        let context = kit
-            .context(&origin)
-            .map_err(|_| RestoreError::OriginNotConfigured)?;
-        let reader = Arc::new(BundleReader {
-            source: Arc::clone(&source),
-            answered_absent: AtomicBool::new(false),
-            first_place: std::sync::Mutex::new(None),
-        });
-        let mut fresh = FreshRestore::new(kit, RetrievalPolicy::Account);
-        fresh
-            .obtained_access(ServiceAccess::new(
-                RetrievalPolicy::Account,
-                origin.clone(),
-                Arc::clone(&reader) as Arc<dyn SyncBackupService>,
-            ))
-            .map_err(|error| RestoreError::Recovery(Box::new(error)))?;
-        let material = match fresh.open_bundle(&origin).await {
-            Ok(material) => material,
-            Err(RecoveryError::Service(error)) => {
-                return Err(if reader.answered_absent.load(Ordering::Relaxed) {
-                    RestoreError::BundleAbsent
-                } else {
-                    RestoreError::Read(error)
-                });
-            }
-            Err(other) => return Err(RestoreError::Recovery(Box::new(other))),
-        };
-        let first_place = reader
-            .first_place
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ok_or(RestoreError::BundleAbsent)?;
+        let Opened {
+            seed,
+            service,
+            origin,
+            context,
+            material,
+            first_place,
+            sealed_bundle,
+        } = open_bundle(kit, Arc::clone(&source)).await?;
 
         // 3. One archive.
         let archive_id = choose_archive(&material, &origin, archive, source.as_ref()).await?;
@@ -1354,8 +1329,185 @@ impl FilesRestore {
             seed,
             context,
             first_place,
+            sealed_bundle,
+            publication,
+            encrypted_manifest,
         })
     }
+
+    /// The archives the bundle names at the service the source reached, each with the newest
+    /// generation the service holds of it, verified as a restore verifies one. Nothing is
+    /// written, and no object is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason the bundle cannot be opened; see [`RestoreError`].
+    pub async fn archives(
+        kit: RecoveryKit,
+        source: Arc<dyn RestoreSource>,
+    ) -> Result<Vec<Candidate>, RestoreError> {
+        let opened = open_bundle(kit, Arc::clone(&source)).await?;
+        let named = archives_at(&opened.material, &opened.origin);
+        candidates(&opened.material, &named, source.as_ref()).await
+    }
+
+    /// An export of the bundle alone, as the service holds it, after it has authenticated under
+    /// the kit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason the bundle cannot be opened; see [`RestoreError`].
+    pub async fn export_bundle(
+        kit: RecoveryKit,
+        source: Arc<dyn RestoreSource>,
+    ) -> Result<OfflineExport, RestoreError> {
+        let opened = open_bundle(kit, source).await?;
+        Ok(OfflineExport::new(
+            opened.origin,
+            opened.sealed_bundle,
+            None,
+        ))
+    }
+}
+
+impl PreparedRestore {
+    /// The bundle and this archive's newest generation as ciphertext, each object checked against
+    /// the hash the signed manifest gives it. Nothing decrypted is read or kept; the members the
+    /// restore would refuse are copied too, because an export is a copy of what the service holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError::TooLargeToExport`] for an archive over [`MAX_EXPORT_BYTES`],
+    /// [`RestoreError::Member`] for an object whose bytes are not the ones the manifest names, and
+    /// the read's own failure.
+    pub async fn export(&self) -> Result<OfflineExport, RestoreError> {
+        let objects = self.open.objects();
+        let total = objects
+            .iter()
+            .map(|entry| entry.object.encrypted_len.get())
+            .fold(self.encrypted_manifest.len() as u64, u64::saturating_add);
+        if total > MAX_EXPORT_BYTES {
+            return Err(RestoreError::TooLargeToExport {
+                bytes: total,
+                limit: MAX_EXPORT_BYTES,
+            });
+        }
+        let mut exported = Vec::with_capacity(objects.len());
+        for entry in objects {
+            let bytes = read_whole(
+                self.source.as_ref(),
+                self.plan.archive_id,
+                entry.object.object_id,
+                entry.object.encrypted_len.get(),
+            )
+            .await?;
+            if kr_cbor::sha256(&bytes) != *entry.object.encrypted_object_hash.as_bytes() {
+                return Err(RestoreError::Member(Shown::said(
+                    "an object's bytes are not the ones the signed manifest names",
+                )));
+            }
+            exported.push(ExportedObject {
+                object_id: entry.object.object_id,
+                bytes: Bytes::new(bytes),
+            });
+        }
+        Ok(OfflineExport::new(
+            self.plan.origin.clone(),
+            self.sealed_bundle.clone(),
+            Some(ExportedArchive {
+                archive_id: self.plan.archive_id,
+                publication: self.publication.clone(),
+                encrypted_manifest: Bytes::new(self.encrypted_manifest.clone()),
+                objects: exported,
+            }),
+        ))
+    }
+}
+
+/// What opening the bundle with a kit gives a restore.
+struct Opened {
+    seed: RecoverySeed,
+    service: SourceService,
+    /// The kit's own spelling of the origin the source reached.
+    origin: String,
+    context: RecoveryContext,
+    material: TrustedMaterial,
+    /// Where the first read found the bundle.
+    first_place: SyncPosition,
+    /// The bytes the bundle was sealed as there.
+    sealed_bundle: Vec<u8>,
+}
+
+/// Checks the kit's checksum, finds the origin the source reached among the kit's, and reads the
+/// bundle through a reader that cannot write and authenticates it.
+async fn open_bundle(
+    kit: RecoveryKit,
+    source: Arc<dyn RestoreSource>,
+) -> Result<Opened, RestoreError> {
+    // 1. The kit's checksum, before anything is derived or asked.
+    let seed = RecoverySeed::from_kit(&kit)
+        .map_err(|_| RestoreError::Recovery(Box::new(RecoveryError::MistypedKit)))?;
+    let service = source.service().await?;
+    if let SourceSignIn::Unusable(cause) = service.sign_in {
+        return Err(RestoreError::NotSignedIn {
+            cause,
+            why: Shown::said(cause.why()),
+        });
+    }
+    let origin = kit_origin_for(&kit, &service.origin).ok_or(RestoreError::OriginNotConfigured)?;
+    // The locator is an identifier in its canonical spelling, and the service refuses
+    // anything else, so a kit that carries another is wrong before it is used.
+    if !is_an_identifier(&kit.bundle_locator) {
+        return Err(RestoreError::Recovery(Box::new(
+            RecoveryError::MalformedKit {
+                what: "a bundle locator that is not an identifier",
+            },
+        )));
+    }
+
+    // 2. The bundle, through a reader that cannot write.
+    let context = kit
+        .context(&origin)
+        .map_err(|_| RestoreError::OriginNotConfigured)?;
+    let reader = Arc::new(BundleReader {
+        source,
+        answered_absent: AtomicBool::new(false),
+        first: std::sync::Mutex::new(None),
+    });
+    let mut fresh = FreshRestore::new(kit, RetrievalPolicy::Account);
+    fresh
+        .obtained_access(ServiceAccess::new(
+            RetrievalPolicy::Account,
+            origin.clone(),
+            Arc::clone(&reader) as Arc<dyn SyncBackupService>,
+        ))
+        .map_err(|error| RestoreError::Recovery(Box::new(error)))?;
+    let material = match fresh.open_bundle(&origin).await {
+        Ok(material) => material,
+        Err(RecoveryError::Service(error)) => {
+            return Err(if reader.answered_absent.load(Ordering::Relaxed) {
+                RestoreError::BundleAbsent
+            } else {
+                RestoreError::Read(error)
+            });
+        }
+        Err(other) => return Err(RestoreError::Recovery(Box::new(other))),
+    };
+    let (first_place, sealed_bundle) = reader
+        .first
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or(RestoreError::BundleAbsent)?;
+    Ok(Opened {
+        seed,
+        service,
+        origin,
+        context,
+        material,
+        first_place,
+        sealed_bundle,
+    })
 }
 
 /// Whether `text` is an identifier in its canonical lowercase spelling.
@@ -1380,14 +1532,8 @@ pub(super) fn kit_origin_for(kit: &RecoveryKit, configured: &str) -> Option<Stri
         .cloned()
 }
 
-/// The archive to restore, from the entries of the authenticated bundle that name the configured
-/// origin.
-async fn choose_archive(
-    material: &TrustedMaterial,
-    origin: &str,
-    asked: Option<ArchiveId>,
-    source: &dyn RestoreSource,
-) -> Result<ArchiveId, RestoreError> {
+/// The archives the authenticated bundle names at `origin`, each once.
+fn archives_at(material: &TrustedMaterial, origin: &str) -> Vec<ArchiveId> {
     let mut archives: Vec<ArchiveId> = Vec::new();
     for CollectionLocator {
         service_origin,
@@ -1399,6 +1545,58 @@ async fn choose_archive(
             archives.push(*archive_id);
         }
     }
+    archives
+}
+
+/// Each of `archives` with the newest generation the source holds of it, verified as a restore
+/// verifies one.
+async fn candidates(
+    material: &TrustedMaterial,
+    archives: &[ArchiveId],
+    source: &dyn RestoreSource,
+) -> Result<Vec<Candidate>, RestoreError> {
+    let mut candidates = Vec::with_capacity(archives.len());
+    for archive_id in archives {
+        let checkpoint = material.checkpoint(*archive_id);
+        let newest = match source.generation(*archive_id, checkpoint).await? {
+            None => CandidateState::Nothing,
+            Some(publication) => {
+                let expectation = checkpoint.map_or(
+                    GenerationExpectation::Unverified,
+                    GenerationExpectation::Checkpoint,
+                );
+                match verify_publication(
+                    &publication,
+                    *archive_id,
+                    &material.trusted_writers,
+                    expectation,
+                ) {
+                    Ok(_) => CandidateState::Newest(CandidateGeneration {
+                        generation: publication.payload.descriptor.backup_generation,
+                        published_at_ms: publication.payload.published_at_ms,
+                        writer: publication.payload.writer_key_id,
+                    }),
+                    Err(refusal) => CandidateState::Refused(refusal),
+                }
+            }
+        };
+        candidates.push(Candidate {
+            archive_id: *archive_id,
+            newest,
+        });
+    }
+    Ok(candidates)
+}
+
+/// The archive to restore, from the entries of the authenticated bundle that name the configured
+/// origin.
+async fn choose_archive(
+    material: &TrustedMaterial,
+    origin: &str,
+    asked: Option<ArchiveId>,
+    source: &dyn RestoreSource,
+) -> Result<ArchiveId, RestoreError> {
+    let archives = archives_at(material, origin);
     if let Some(asked) = asked {
         return if archives.contains(&asked) {
             Ok(asked)
@@ -1410,36 +1608,7 @@ async fn choose_archive(
         [] => Err(RestoreError::NoArchive),
         [only] => Ok(*only),
         several => {
-            let mut candidates = Vec::with_capacity(several.len());
-            for archive_id in several {
-                let checkpoint = material.checkpoint(*archive_id);
-                let newest = match source.generation(*archive_id, checkpoint).await? {
-                    None => CandidateState::Nothing,
-                    Some(publication) => {
-                        let expectation = checkpoint.map_or(
-                            GenerationExpectation::Unverified,
-                            GenerationExpectation::Checkpoint,
-                        );
-                        match verify_publication(
-                            &publication,
-                            *archive_id,
-                            &material.trusted_writers,
-                            expectation,
-                        ) {
-                            Ok(_) => CandidateState::Newest(CandidateGeneration {
-                                generation: publication.payload.descriptor.backup_generation,
-                                published_at_ms: publication.payload.published_at_ms,
-                                writer: publication.payload.writer_key_id,
-                            }),
-                            Err(refusal) => CandidateState::Refused(refusal),
-                        }
-                    }
-                };
-                candidates.push(Candidate {
-                    archive_id: *archive_id,
-                    newest,
-                });
-            }
+            let candidates = candidates(material, several, source).await?;
             Err(RestoreError::SeveralArchives {
                 count: candidates.len(),
                 candidates,
