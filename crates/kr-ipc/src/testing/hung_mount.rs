@@ -1,10 +1,15 @@
-//! A filesystem that never answers, for the tests of every service that opens a directory.
+//! A filesystem that never answers, or whose server has stopped, for the tests of every service
+//! that opens a directory.
 //!
 //! A network mount whose server has gone makes every call that reaches it wait: a look at its
 //! root included. [`HungMount`] is that for a caller: a filesystem in user space that is mounted
 //! and never served. A test places it on a directory it owns, shows that the code under test
 //! does not wait on it, and lets it go, which aborts the connection and so ends every call still
 //! waiting on the mount.
+//!
+//! A mount whose server has stopped is the other way a network mount fails: nothing waits, and
+//! every call that reaches it, a look at its root included, fails at once with an error that is
+//! not a missing name. [`HungMount::stop_server`] makes the mount that.
 //!
 //! A host without `/dev/fuse` or the setuid helper a distribution installs for it cannot place
 //! the mount. [`HungMount::attach_where_possible`] leaves the case out and says why, unless
@@ -22,7 +27,8 @@ use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg}
 /// at its root included, waits for an answer that does not come.
 ///
 /// It is what a network mount whose server has gone is to a caller. The server end is held here,
-/// and letting it go aborts the connection, which ends every call waiting on the mount.
+/// and letting it go aborts the connection, which ends every call waiting on the mount. The
+/// mount itself stays in place until this value is dropped.
 #[derive(Debug)]
 pub struct HungMount {
     server: Option<OwnedFd>,
@@ -102,6 +108,13 @@ impl HungMount {
                 None
             }
         }
+    }
+
+    /// Stops the server and leaves the mount where it is: every call that reaches the mount fails
+    /// at once with `ENOTCONN`, a look at its root included, as it does on a network mount whose
+    /// server has stopped. A call already waiting on the mount ends with an error too.
+    pub fn stop_server(&mut self) {
+        drop(self.server.take());
     }
 }
 
