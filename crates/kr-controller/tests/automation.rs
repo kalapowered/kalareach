@@ -2567,6 +2567,73 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     assert_eq!(live.code, ErrorCode::InvalidArgument, "{live:?}");
     assert!(live.message.contains("has not run out"), "{live:?}");
     served.insert(Method::WorkflowRearm);
+    // Once its budget has run out, as a breached ceiling leaves it, the device rearms the chain,
+    // and the exact request, sent again on another connection of the device because the reply was
+    // lost, is answered from the chain with the window the first connection was issued, and gives
+    // the chain nothing more.
+    let journal = host.controller().automation().journal();
+    let mut budget = journal
+        .get_budget(run.causal_root_id)
+        .expect("the budget reads")
+        .expect("the chain's budget");
+    budget.exhaust();
+    journal.save_budget(&budget).expect("the budget is saved");
+    let original = session
+        .compose(
+            Method::WorkflowRearm,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            None,
+            &ParamsValue::empty(),
+            &rearming(run.causal_root_id, own_grant, 0),
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+        .expect("the rearm is composed");
+    let rearmed: WorkflowRearmResult = typed(
+        session
+            .send(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .result()
+            .expect("a device rearms the chain of its own grant"),
+    );
+    assert_eq!(rearmed.generation.get(), 1);
+    let elsewhere = net_support::connect(&host, &device, &record).await;
+    let repeated: WorkflowRearmResult = typed(
+        elsewhere
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .result()
+            .expect("the repeat is answered from the chain"),
+    );
+    assert_eq!(repeated, rearmed);
+    let mut budget = journal
+        .get_budget(run.causal_root_id)
+        .expect("the budget reads")
+        .expect("the chain's budget");
+    assert_eq!(budget.generation, 1, "the repeat gave no second budget");
+    budget.exhaust();
+    journal.save_budget(&budget).expect("the budget is saved");
+    let again: WorkflowRearmResult = typed(
+        elsewhere
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .result()
+            .expect("the repeat is answered whatever state the chain is in now"),
+    );
+    assert_eq!(again, rearmed);
+    assert_eq!(
+        journal
+            .get_budget(run.causal_root_id)
+            .expect("the budget reads")
+            .expect("the chain's budget")
+            .generation,
+        1,
+        "and still gave nothing"
+    );
     device_mutation(
         &session,
         host.environment_id,
@@ -4107,11 +4174,13 @@ fn rearming(
 }
 
 /// Sets the trigger dispatcher's position in the journal back to the start, as a stream replayed
-/// from its first event would find it, and then decides every event again.
+/// from its first event would find it, and waits until the events have been decided again.
 ///
 /// The events are still in the journal because a consumer of the test's own, which never reads,
-/// keeps the stream from being pruned.
-fn replay_the_stream(host: &Host) -> kr_automation::AdmittedTriggers {
+/// keeps the stream from being pruned. The daemon's own dispatcher is reading the same position,
+/// so either it or this call decides the events; the case is over when the position has reached
+/// the last event the dispatcher reads, and nothing the decisions this call took starts a run.
+async fn replay_the_stream(host: &Host) {
     let journal = host
         ._temp
         .environment()
@@ -4121,6 +4190,16 @@ fn replay_the_stream(host: &Host) -> kr_automation::AdmittedTriggers {
     connection
         .busy_timeout(std::time::Duration::from_secs(30))
         .expect("waits for the daemon's writes");
+    let last: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(e.outbox_id), 0) FROM outbox_events e
+             JOIN event_subscriptions s ON s.event_type = e.event_type
+             WHERE s.consumer = ?1",
+            rusqlite::params![kr_automation::TRIGGER_CONSUMER],
+            |row| row.get(0),
+        )
+        .expect("the last event the dispatcher reads");
+    assert!(last > 0, "the stream holds events to replay");
     let rewound = connection
         .execute(
             "UPDATE event_consumers SET position = 0 WHERE consumer = ?1",
@@ -4128,17 +4207,39 @@ fn replay_the_stream(host: &Host) -> kr_automation::AdmittedTriggers {
         )
         .expect("the position is set back");
     assert_eq!(rewound, 1, "the dispatcher is a registered consumer");
-    drop(connection);
     let replayed = host
         .controller
         .automation()
         .service()
         .admit_triggers(kr_ipc::now_ms().get());
+    assert!(replayed.started.is_empty(), "{:?}", replayed.decisions);
+    assert!(replayed.stopped.is_none(), "{:?}", replayed.stopped);
     assert!(
-        !replayed.decisions.is_empty(),
-        "the stream was replayed, so its events were decided again"
+        replayed
+            .decisions
+            .iter()
+            .all(|decision| decision.outcome.is_err()),
+        "{:?}",
+        replayed.decisions
     );
-    replayed
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let position: i64 = connection
+            .query_row(
+                "SELECT position FROM event_consumers WHERE consumer = ?1",
+                rusqlite::params![kr_automation::TRIGGER_CONSUMER],
+                |row| row.get(0),
+            )
+            .expect("the dispatcher's position");
+        if position >= last {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "within two minutes the events were decided again; the position stood at {position} of {last}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// KR-REQ-25.17: an exhausted chain stays paused with `CAUSAL_LIMIT` whatever replayed or late
@@ -4253,17 +4354,7 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
 
     // Replayed events cannot rearm it: every event of the stream is decided again, and the chain
     // starts nothing and keeps the budget it ran out of.
-    let replayed = replay_the_stream(&host);
-    assert!(replayed.started.is_empty(), "{:?}", replayed.decisions);
-    assert!(replayed.stopped.is_none(), "{:?}", replayed.stopped);
-    assert!(
-        replayed
-            .decisions
-            .iter()
-            .all(|decision| decision.outcome.is_err()),
-        "{:?}",
-        replayed.decisions
-    );
+    replay_the_stream(&host).await;
     let (kept, runs) = read_chain(&mut control, root).await;
     let kept = kept.expect("the chain's budget");
     assert_eq!(runs.len() as u64, limit, "no run was added");
@@ -4407,7 +4498,7 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
             .mutate(
                 Method::WorkflowRearm,
                 ActionId::new(kr_ipc::new_uuid()),
-                target,
+                target.clone(),
                 &rearming(root, grant_id(45), 1),
             )
             .await
@@ -4429,7 +4520,28 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
             .await
             .expect("the call reaches the daemon"),
     );
-    assert_eq!(stale.code, ErrorCode::DraftConflict, "{stale:?}");
+    assert_eq!(
+        stale.code,
+        ErrorCode::PermissionDenied,
+        "its window belongs to the first connection, and nothing answers it now: {stale:?}"
+    );
+    // A request of its own that leaves the generation the first rearm left is a conflict.
+    let conflicting = failure(
+        elsewhere
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &request,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(
+        conflicting.code,
+        ErrorCode::DraftConflict,
+        "{conflicting:?}"
+    );
     let kept = budget_of(&mut control, root).await.expect("the budget");
     assert!(
         kept.exhausted && kept.generation.get() == 2,
@@ -4438,16 +4550,7 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
 
     // The events of the generations before the last rearm, replayed, spend nothing of the new
     // budget.
-    let replayed = replay_the_stream(&host);
-    assert!(replayed.started.is_empty(), "{:?}", replayed.decisions);
-    assert!(
-        replayed
-            .decisions
-            .iter()
-            .all(|decision| decision.outcome.is_err()),
-        "{:?}",
-        replayed.decisions
-    );
+    replay_the_stream(&host).await;
     let (kept, runs) = read_chain(&mut control, root).await;
     let kept = kept.expect("the chain's budget");
     assert_eq!(runs.len() as u64, 3 * limit, "no run was added");
