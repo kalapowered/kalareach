@@ -488,6 +488,11 @@ export interface FakeHostControls {
    * host refuses one it cannot qualify: with the reason, and never a stock shell in its place.
    */
   withoutQualifiedShell(): void
+  /**
+   * Changes the shell mode this host says it creates a session in when the request names none, and
+   * the rung of its order that said so: the host's configuration, or the product default.
+   */
+  withDefaultShell(mode: SessionCreateParams['shell_mode'], source: 'host_configuration' | 'default'): void
   /** Every session creation the interface asked for, as it asked. */
   readonly sessionCreates: readonly SessionCreateParams[]
   /**
@@ -1010,6 +1015,10 @@ export function fakeHost(
   const created: SessionSummaryOf[] = []
   const sessionCreates: SessionCreateParams[] = []
   let qualifiedShell = true
+  let defaultShell: NonNullable<HostInfoResult['default_shell_mode']> = {
+    mode: 'managed',
+    source: 'default'
+  }
   const listed = (): SessionSummaryOf[] => [...sessions().sessions, ...created]
   const exportedArchives: Parameters<HostPort['exportSemanticJson']>[0][] = []
   const exportedCasts: Parameters<HostPort['exportAsciicast']>[0][] = []
@@ -1579,7 +1588,7 @@ export function fakeHost(
     hostInfo: () =>
       reading('hostInfo', () => {
         requireConnection()
-        return hostInfo()
+        return { ...hostInfo(), default_shell_mode: defaultShell }
       }),
     environmentList: () =>
       reading('environmentList', () => {
@@ -2978,6 +2987,9 @@ export function fakeHost(
     },
     withoutQualifiedShell() {
       qualifiedShell = false
+    },
+    withDefaultShell(mode, source) {
+      defaultShell = { mode, source }
     },
     usedHosts,
     forgottenHosts,
