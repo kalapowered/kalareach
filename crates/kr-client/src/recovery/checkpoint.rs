@@ -43,7 +43,7 @@ impl Strongest {
     pub(crate) fn first_read(revision: u64, checkpoints: &[ArchiveCheckpoint]) -> Self {
         Self {
             revision,
-            checkpoints: highest_of_each_archive(checkpoints),
+            checkpoints: checkpoints.to_vec(),
         }
     }
 
@@ -86,32 +86,14 @@ impl Strongest {
                 }
             }
         }
-        // Every checkpoint read before is in `bundle` at that generation or a newer one, so what
-        // `bundle` holds is at least as strong, and replaces it.
+        // For every checkpoint read before, `bundle` holds its archive at that generation or a
+        // newer one, so `bundle` is at least as strong and replaces the floor. It keeps every entry
+        // `bundle` holds, not one per archive, so that two manifests recorded for one generation
+        // both stay known, and a later read that agrees with only one of them is refused.
         self.revision = bundle.revision.get();
-        self.checkpoints = highest_of_each_archive(bundle.checkpoints.iter());
+        self.checkpoints = bundle.checkpoints.iter().cloned().collect();
         Ok(())
     }
-}
-
-/// The checkpoint held for each archive that has one, at its highest generation.
-fn highest_of_each_archive<'a>(
-    held: impl IntoIterator<Item = &'a ArchiveCheckpoint>,
-) -> Vec<ArchiveCheckpoint> {
-    let mut highest: Vec<ArchiveCheckpoint> = Vec::new();
-    for held in held {
-        match highest
-            .iter_mut()
-            .find(|known| known.archive_id == held.archive_id)
-        {
-            Some(known) if known.backup_generation < held.backup_generation => {
-                *known = held.clone();
-            }
-            Some(_) => {}
-            None => highest.push(held.clone()),
-        }
-    }
-    highest
 }
 
 /// The bundle that records `verified`, or nothing when the bundle already records it or a newer
