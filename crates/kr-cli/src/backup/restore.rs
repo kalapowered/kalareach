@@ -54,7 +54,7 @@ use kr_protocol::scalars::TimestampMs;
 use super::directory::{Destination, Held};
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
-use crate::output::{Asked as Arrived, Document, Request};
+use crate::output::{Document, Request};
 
 /// What the person asked of this restore.
 #[derive(Clone, PartialEq, Eq)]
@@ -381,8 +381,8 @@ impl Planned {
                         "  not applied: the variables a session is given and the packages whose \
                          command integration applies, in {} of the backup's sets of preferences. \
                          They can hold secrets and run code, so this host keeps its own. The \
-                         restore names the sets when it is done; their values are in \
-                         configuration.json in the folder.",
+                         restore names the sets when it is done, and a preview does too; what was \
+                         left out is in configuration.json in the folder.",
                         applying.left_out.sets()
                     ));
                 }
@@ -453,12 +453,12 @@ impl Planned {
                                 .left_out
                                 .profiles
                                 .iter()
-                                .map(|name| Arrived::text(Request::Restore, name))
+                                .map(|name| crate::output::Asked::text(Request::Restore, name))
                                 .collect::<Vec<_>>(),
                         ),
                     Asked::No | Asked::NothingToApply => Document::new()
                         .with("preferences", false)
-                        .with("profiles", Vec::<Arrived>::new()),
+                        .with("profiles", Vec::<crate::output::Asked>::new()),
                 },
             )
             .with("digest", crate::shown::hex_digest(&self.digest))
