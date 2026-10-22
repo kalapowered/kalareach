@@ -168,6 +168,13 @@ impl Controller {
             session_limit: U64::new(limit),
             default_worker_profile,
             power,
+            default_shell_mode: Some({
+                let resolved = self.configuration().shell_mode(None);
+                kr_protocol::hostinfo::DefaultShellMode {
+                    mode: resolved.value,
+                    source: resolved.source,
+                }
+            }),
             machine: self.machine_report(),
             // Read last, after every wait above, so the answer is as new as this function can make
             // it. A copy that never waits: the lock itself is held across a delivery exchange

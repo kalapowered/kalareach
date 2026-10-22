@@ -326,12 +326,12 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.overrides.len(), 2);
     assert_eq!(
         report.values.len(),
-        6 + configuration::SELECTIONS.len() + 2 + 1 + 2,
-        "four preferences, two locations, every selection read at the next start, the two \
+        7 + configuration::SELECTIONS.len() + 2 + 1 + 2,
+        "five preferences, two locations, every selection read at the next start, the two \
          settings for descriptions, the agents the document names an ownership for and the two \
          rows of the automation section"
     );
-    for (row, selection) in report.values[6..].iter().zip(configuration::SELECTIONS) {
+    for (row, selection) in report.values[7..].iter().zip(configuration::SELECTIONS) {
         assert_eq!(row.key, selection.key);
         assert_eq!(row.effect, ValueEffect::NextStart);
         assert_eq!(
@@ -478,6 +478,69 @@ fn an_unusable_document_reports_descriptions_off_and_the_daemon_acts_on_that() {
         !settings.enabled && !settings.on_battery,
         "the daemon fails closed: on is wider than anything the owner could have chosen"
     );
+}
+
+/// KR-REQ-26.13: the shell mode a session is created in resolves in section 26's order, with no
+/// profile rung while no profile carries one: the request, then the per-user host configuration,
+/// then the product default, which is the managed shell. The report names the mode in force with
+/// the rung it came from, for sessions created afterwards.
+#[test]
+fn the_shell_mode_in_force_is_the_requests_then_the_hosts_choice_then_the_managed_shell() {
+    use kr_protocol::session::ShellMode;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let row = |report: &EffectiveConfiguration| {
+        report
+            .values
+            .iter()
+            .find(|value| value.key == "shell.mode")
+            .expect("the report has a shell.mode row")
+            .clone()
+    };
+
+    // Nothing chosen: the product default, and a request still outranks it.
+    let resolver = open(&environment);
+    let in_force = resolver.shell_mode(None);
+    assert_eq!(in_force.value, ShellMode::Managed);
+    assert_eq!(in_force.source, ValueSource::Default);
+    let asked = resolver.shell_mode(Some(ShellMode::NativeCompat));
+    assert_eq!(asked.value, ShellMode::NativeCompat);
+    assert_eq!(asked.source, ValueSource::Request);
+    let report = row(&reported(&environment));
+    assert_eq!(report.value(), "managed");
+    assert_eq!(report.source, ValueSource::Default);
+    assert_eq!(report.effect, ValueEffect::NewSessionsOnly);
+
+    // The owner chooses a stock shell for the sessions that name no mode.
+    let (applied, _) = edit_and_owed(
+        &environment,
+        &Change::ShellMode(Some(ShellMode::NativeCompat)),
+    )
+    .expect("the owner's choice");
+    assert_eq!(applied.effect, ValueEffect::NewSessionsOnly);
+    drop(applied);
+    let resolver = open(&environment);
+    let in_force = resolver.shell_mode(None);
+    assert_eq!(in_force.value, ShellMode::NativeCompat);
+    assert_eq!(in_force.source, ValueSource::HostConfiguration);
+    assert_eq!(
+        in_force.origin.as_deref(),
+        Some(
+            kr_worker::config::document_path(&environment)
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "and it says which document"
+    );
+    let report = row(&reported(&environment));
+    assert_eq!(report.value(), "native_compat");
+    assert_eq!(report.source, ValueSource::HostConfiguration);
+    // A request for the managed shell outranks the host's choice, as the other way round.
+    let asked = resolver.shell_mode(Some(ShellMode::Managed));
+    assert_eq!(asked.value, ShellMode::Managed);
+    assert_eq!(asked.source, ValueSource::Request);
 }
 
 /// KR-REQ-01.23: the configuration's diagnostics report the document, the order and the ceilings.

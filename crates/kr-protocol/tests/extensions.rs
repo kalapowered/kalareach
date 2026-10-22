@@ -42,6 +42,7 @@ fn host_info() -> HostInfoResult {
             generation: U64::new(2),
             changing: false,
         }),
+        default_shell_mode: None,
     }
 }
 
