@@ -250,7 +250,12 @@ export function PairingFlow({
   // Taking an invitation in: from the pasteboard, from the phone's scanner or from a picture. What
   // comes back says what it was, never what it says; a scanner or a picker the person closed is no
   // failure and says nothing.
+  const [taking, setTaking] = useState(false)
   const takeIn = (take: () => Promise<IntakeView>) => {
+    // One at a time: a second request while the scanner or the picker is up would ask the system
+    // the same question twice.
+    if (taking) return
+    setTaking(true)
     setPasteFailure(null)
     take()
       .then((result) => {
@@ -260,6 +265,9 @@ export function PairingFlow({
       })
       .catch((error: unknown) => {
         say(failureMessage(error), 'danger')
+      })
+      .finally(() => {
+        setTaking(false)
       })
   }
   const paste = () => {
@@ -344,8 +352,8 @@ export function PairingFlow({
             On the host, <code>kr pair invite</code> makes one.
           </p>
           {view.sources.camera ? (
-            <div className="pairing-scan">
-              <Button data-wraps tone="primary" data-testid="scan-code" onClick={scan}>
+            <div className="pairing-scan" aria-busy={taking}>
+              <Button data-wraps tone="primary" data-testid="scan-code" disabled={taking} onClick={scan}>
                 Scan code
               </Button>
             </div>
@@ -397,11 +405,23 @@ export function PairingFlow({
                 Pair
               </Button>
               {view.sources.photo ? (
-                <Button data-wraps tone="quiet" data-testid="choose-photo" onClick={choosePhoto}>
+                <Button
+                  data-wraps
+                  tone="quiet"
+                  data-testid="choose-photo"
+                  disabled={taking}
+                  onClick={choosePhoto}
+                >
                   Choose a photo
                 </Button>
               ) : null}
-              <Button data-wraps tone="quiet" data-testid="paste-invitation" onClick={paste}>
+              <Button
+                data-wraps
+                tone="quiet"
+                data-testid="paste-invitation"
+                disabled={taking}
+                onClick={paste}
+              >
                 Paste invitation
               </Button>
             </div>
