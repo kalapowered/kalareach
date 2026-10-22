@@ -61,6 +61,38 @@ pub const BOOT_FILE: &str = "boot";
 /// The longest boot record this host reads.
 const BOOT_FILE_LIMIT: u64 = 1_024;
 
+/// What an environment's boot record holds: its bytes, and the boot they name when they decode.
+///
+/// A host with no record has not run here before, so there is nothing of an earlier boot. A record
+/// that is there and does not decode is a damaged file rather than a boot, and acting on one as if
+/// it named an earlier boot would be acting for no reason.
+fn read_boot_record(
+    paths: &kr_ipc::paths::EnvironmentPaths,
+) -> Result<(Option<Vec<u8>>, Option<kr_protocol::identity::BootIdentity>)> {
+    let path = paths.state_dir().join(BOOT_FILE);
+    let bytes = kr_ipc::paths::read_owner_only_file(&path, BOOT_FILE_LIMIT)?;
+    let recorded = bytes.as_deref().and_then(|bytes| {
+        kr_cbor::from_canonical_slice::<kr_protocol::identity::BootIdentity>(
+            bytes,
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .ok()
+    });
+    Ok((bytes, recorded))
+}
+
+/// Whether the environment last ran in a boot other than `boot`, where a reboot ended every
+/// process that was left.
+#[cfg(windows)]
+fn runs_in_a_new_boot(
+    paths: &kr_ipc::paths::EnvironmentPaths,
+    boot: &kr_protocol::identity::BootIdentity,
+) -> Result<bool> {
+    Ok(read_boot_record(paths)?
+        .1
+        .is_some_and(|recorded| recorded != *boot))
+}
+
 impl Controller {
     /// Starts the description host and the reading of every session's facts, once, at the daemon's
     /// start: the host takes the owner's settings from the configuration document, finds the
@@ -327,6 +359,16 @@ impl Controller {
         // key store, and the loser would overwrite the key every live worker recorded at spawn.
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
+        // Before the generation moves and before anything is recovered, adopted or accepted: on
+        // Windows an environment's work stays in one login session, so a daemon that is not in the
+        // session its earlier work still runs in does not take that work over.
+        #[cfg(windows)]
+        if !runs_in_a_new_boot(&setup.paths, &setup.boot_identity)? {
+            let here = kr_ipc::starter::current_session().map_err(|error| {
+                ControllerError::supervision(format!("this daemon's login session: {error}"))
+            })?;
+            crate::supervision::windows::refuse_work_in_another_session(&registry, here)?;
+        }
         let generation = lock.advance(&mut registry)?;
         // The environment's machine group: minted here at its first start, and read from then on.
         // A record that cannot be used does not stop the daemon: it serves with no group, takes
@@ -1623,18 +1665,7 @@ impl Controller {
         let path = self.paths.state_dir().join(BOOT_FILE);
         let current = kr_cbor::to_canonical_vec(&self.boot_identity)
             .map_err(|error| ControllerError::registry(error.to_string()))?;
-        let bytes = kr_ipc::paths::read_owner_only_file(&path, BOOT_FILE_LIMIT)?;
-        // A host with no record has not run here before, so there is nothing of an earlier boot to
-        // close. A record that is there and does not decode is a damaged file rather than a boot,
-        // and closing live sessions on the strength of one would be closing them for no reason.
-        // Either way the record is written again below.
-        let recorded = bytes.as_deref().and_then(|bytes| {
-            kr_cbor::from_canonical_slice::<kr_protocol::identity::BootIdentity>(
-                bytes,
-                &kr_cbor::Limits::DEFAULT,
-            )
-            .ok()
-        });
+        let (bytes, recorded) = read_boot_record(&self.paths)?;
         if recorded.is_some_and(|recorded| recorded != self.boot_identity) {
             let rows = {
                 let registry = self.registry.lock().await;
