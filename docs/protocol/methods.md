@@ -281,6 +281,7 @@ links to its document.
 | `events.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED. |  |
 | `agent.instances` | read | `local_ipc`, `paired_device` | Read a session's live agent instances and the requests of theirs that wait on a person, without the screen, the geometry, the input lease or the attachments. |  |
 | `history.page` | read | `local_ipc`, `paired_device`, `workflow` | Page retained history. A history request never creates a worker. |  |
+| `history.times` | read | `local_ipc` | Read when a closed session's retained output was produced: the intervals of its cursors and the wall-clock reading at which each began, and whether the host could prove its clock then. Output in no interval has no recorded time. A history request never creates a worker. |  |
 | `action.read` | read | `local_ipc`, `paired_device`, `workflow` | Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session. |  |
 
 ## Sharing
