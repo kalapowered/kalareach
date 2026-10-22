@@ -43,10 +43,11 @@ const SPEED_READINGS: usize = 3;
 ///
 /// A mutation the host journals is answered once its record is on disk, so a target that includes
 /// one includes the disk's time for it, and an attach commits three records. A reference host's
-/// disk takes well under a millisecond for one; at 25 ms the three are a fifth of the 500 ms a usable
-/// screen is given. Section 27 states no figure for the disk, so, like the stolen share's, this is
-/// the harness's own exclusion rule: a host above it recorded the figure and named what the disk
-/// took.
+/// disk takes well under a millisecond for one; at 25 ms the three are 75 ms, 15% of the
+/// 500 ms a usable screen is given. Section 27 gives that target for a normal local disk and
+/// states no figure for the disk, so, like the stolen share's, this is the harness's own
+/// reading of "normal": a disk above it is not one, and a host with one recorded the figure and
+/// named what the disk took.
 const MAX_DURABLE_WRITE: Duration = Duration::from_millis(25);
 
 /// How many durable writes a reading takes, at most.
