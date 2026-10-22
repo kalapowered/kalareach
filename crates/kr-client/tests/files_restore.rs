@@ -496,6 +496,7 @@ async fn restore(
         world.kit(),
         Arc::clone(source) as Arc<dyn RestoreSource>,
         chosen,
+        None,
     )
     .await
 }
@@ -568,7 +569,7 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
         let prepared = restore(world, &source, None).await.expect("a restore");
         prepared
             .plan()
-            .digest(environment, destination)
+            .digest(environment, destination, "")
             .expect("a digest")
     }
     let base = digest(&world, &first, "env-1", b"/restore/a").await;
@@ -931,7 +932,7 @@ async fn a_bundle_served_for_another_kit_locator_or_origin_does_not_open() {
         producer: StoredEnvelopeKeyPair::generate().expect("a key"),
     };
     let source = serve(world.bundle(&Shape::default()), false);
-    let refused = FilesRestore::prepare(other.kit(), Arc::clone(&source) as _, None)
+    let refused = FilesRestore::prepare(other.kit(), Arc::clone(&source) as _, None, None)
         .await
         .expect_err("refused");
     assert!(matches!(
@@ -986,7 +987,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
     let self_hosted = world
         .seed
         .to_kit(vec![OTHER_ORIGIN.to_owned()], world.locator.clone());
-    let refused = FilesRestore::prepare(self_hosted, Arc::clone(&source) as _, None)
+    let refused = FilesRestore::prepare(self_hosted, Arc::clone(&source) as _, None, None)
         .await
         .expect_err("refused");
     assert!(matches!(refused, RestoreError::OriginNotConfigured));
@@ -1001,7 +1002,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
         vec!["https://Reach.Kala.To".to_owned()],
         world.locator.clone(),
     );
-    let refused = FilesRestore::prepare(respelled, Arc::clone(&source) as _, None)
+    let refused = FilesRestore::prepare(respelled, Arc::clone(&source) as _, None, None)
         .await
         .expect_err("refused");
     assert!(matches!(refused, RestoreError::OriginNotConfigured));
@@ -1011,7 +1012,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
     odd.bundle_locator = "not/an-identifier".to_owned();
     let source =
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
-    let refused = FilesRestore::prepare(odd, Arc::clone(&source) as _, None)
+    let refused = FilesRestore::prepare(odd, Arc::clone(&source) as _, None, None)
         .await
         .expect_err("refused");
     assert!(matches!(
@@ -1025,7 +1026,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
     mistyped.seed_checksum = kr_protocol::scalars::Bytes::new(vec![0; 4]);
     let source =
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
-    let refused = FilesRestore::prepare(mistyped, Arc::clone(&source) as _, None)
+    let refused = FilesRestore::prepare(mistyped, Arc::clone(&source) as _, None, None)
         .await
         .expect_err("refused");
     assert!(matches!(
@@ -1408,7 +1409,7 @@ async fn the_record_says_what_was_written_and_what_was_refused_and_holds_nothing
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a plan");
     let plan = prepared.plan();
-    let digest = plan.digest("env-1", b"/restore/a").expect("a digest");
+    let digest = plan.digest("env-1", b"/restore/a", "").expect("a digest");
     let written = vec![plan.members[0].object_id];
     let record = plan.record(&digest, &written).to_string();
     assert!(record.contains("kalareach-restore/1"));

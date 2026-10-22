@@ -166,7 +166,7 @@ impl std::fmt::Debug for LostWrite {
 /// nothing to compare against.
 #[derive(Clone)]
 pub(super) struct Baseline {
-    position: SyncPosition,
+    pub(super) position: SyncPosition,
     pub(super) bundle: RecoveryBundle,
     /// The digest of the encrypted bundle as it was read or written there, which a record of a
     /// write is compared against.
