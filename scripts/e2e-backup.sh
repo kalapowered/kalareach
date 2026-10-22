@@ -133,7 +133,8 @@ echo
 
 # Built once, before anything is started or sent, so a build failure is not reported as a service
 # that answered wrongly.
-if ! cargo test --locked --quiet -p "$suite" --no-run >"$evidence/build.log" 2>&1; then
+if ! { cargo test --locked --quiet -p "$suite" --no-run &&
+  cargo test --locked --quiet -p kr-controller --test managed_storage --no-run; } >"$evidence/build.log" 2>&1; then
   echo "the legs did not build, so nothing was started or contacted; see $evidence/build.log" >&2
   exit 1
 fi
@@ -194,6 +195,25 @@ run_test() {
   env "$@" KR_REQUIRE_DEPLOYED_ORIGIN=1 \
     cargo test --locked -p "$suite" --test "$group" -- \
     --exact "$test" --nocapture --test-threads=1 >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 1
+  fi
+  if grep -q '^test result: ok\. 1 passed' "$log"; then
+    return 0
+  fi
+  return 2
+}
+
+# Runs the daemon's own leg against a Worker on this machine: one ignored test of the controller's
+# managed-storage suite, which a plain test run lists as ignored and never as passed. It reports as
+# run_test does: 0 passed, 1 failed, 2 did not run.
+run_daemon_test() {
+  local test="$1"
+  local log="$2"
+  shift 2
+  local rc=0
+  env "$@" cargo test --locked -p kr-controller --test managed_storage -- \
+    --ignored --exact "$test" --nocapture --test-threads=1 >"$log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     return 1
   fi
@@ -268,6 +288,7 @@ if [ "$mode" = deployment ]; then
   printf '  %-7s %-10s %s\n' '-' services "local only: needs two services on this machine"
   printf '  %-7s %-10s %s\n' '-' restore "local only: needs a deployment restored from its export on this machine"
   printf '  %-7s %-10s %s\n' '-' retention "local only: needs the driver to move a tombstone's window"
+  printf '  %-7s %-10s %s\n' '-' history "local only: the daemon's own backup of a closed session, and the account's retention moved by the leg"
   printf '  %-7s %-10s %s\n' '-' revocation "local only: its devices and collections would stay on a deployment, since no client operation removes a shared collection's key records"
   printf '  %-7s %-10s %s\n' '-' multi-device "local only: as revocation"
 else
@@ -381,6 +402,33 @@ else
     report FAILED retention "$retention_failed"
   fi
   step stop --name retention >/dev/null || stopped=0
+
+  # The host's own history, through the daemon's production path: a closed session backed up by the
+  # daemon, restored with only the kit through its relay, the generation recorded in the bundle, and
+  # the generation pushed out of two daily snapshots deleted by the daemon.
+  history=""
+  history_failed=""
+  if answer="$(step start --name history)"; then
+    history="$(member "$answer" origin)"
+  else
+    history_failed="the history deployment did not serve; see $evidence/driver.log"
+  fi
+  if [ -z "$history_failed" ] && ! step sign-in --name history --tokens "$tokens" >/dev/null; then
+    history_failed="the history deployment signed no account in; see $evidence/driver.log"
+  fi
+  if [ -n "$history_failed" ]; then
+    report 'NOT RUN' history "$history_failed"
+  else
+    rc=0
+    run_daemon_test a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_and_restored_with_only_the_kit \
+      "$evidence/history.log" KR_DEPLOYED_ORIGIN="$history" KR_BACKUP_TOKENS="$tokens" || rc=$?
+    case "$rc" in
+      0) report ok history "$(proved "$evidence/history.log" "$history")" ;;
+      1) report FAILED history "$(reason "$evidence/history.log")" ;;
+      *) report 'NOT RUN' history "the leg ran nothing" ;;
+    esac
+  fi
+  step stop --name history >/dev/null || stopped=0
 
   # Settings sync across devices, on a deployment of its own: three installations that share one
   # collection, one of them taken out while another is away; and two that change one setting.
@@ -503,6 +551,7 @@ if [ "${#unfinished[@]}" -ne 0 ]; then
       restore) echo "  restore-1.log, restore-2.log, restore-3.log and driver.log, as far as the leg got" ;;
       services) echo "  services-1.log and services-2.log, as far as the leg got" ;;
       retention) echo "  retention-1.log, retention-2.log, retention-3.log, retention-steps.log and driver.log, as far as the leg got" ;;
+      history) echo "  history.log and driver.log, as far as the leg got" ;;
       revocation | multi-device) echo "  $what.log and driver.log, as far as the leg got" ;;
       *) echo "  $what.log" ;;
     esac
