@@ -190,6 +190,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "events.subscribe",
         "events.snapshot",
         "history.page",
+        "history.times",
         "action.read",
         "grant.create",
         "grant.revoke",

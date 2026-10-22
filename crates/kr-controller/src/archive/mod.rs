@@ -631,6 +631,31 @@ impl ArchiveService {
         into.output_left_behind = history.left_behind().map(str::to_owned);
     }
 
+    /// Reads when a closed session's output was produced, between two cursors.
+    ///
+    /// The index is read from the file the session's worker left. A session whose worker has not
+    /// gone is the caller's to refuse, as it is for a page of its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the index could not be read, which a caller states and does not hide: output
+    /// with no recorded time is declared as that.
+    pub fn history_times(
+        &self,
+        session_id: SessionId,
+        from_cursor: u64,
+        to_cursor: u64,
+        limit: usize,
+    ) -> std::result::Result<kr_worker::output_times::Times, kr_worker::output_times::Unavailable>
+    {
+        kr_worker::output_times::read(
+            &self.paths.session_output_times(session_id),
+            from_cursor,
+            to_cursor,
+            limit,
+        )
+    }
+
     /// Reads what one session left behind.
     ///
     /// A journal that is missing, or that is there and cannot be read, produces an archive that

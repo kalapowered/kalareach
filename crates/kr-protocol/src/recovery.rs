@@ -271,6 +271,56 @@ pub struct HistoryPageResult {
     pub gap: Nullable<HistoryGap>,
 }
 
+/// The most intervals one `history.times` answer carries.
+pub const MAX_HISTORY_TIMES: u64 = 2048;
+
+/// Parameters of `history.times`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryTimesParams {
+    /// The session to read.
+    pub session_id: SessionId,
+    /// The first cursor of the range to ask about.
+    pub from_cursor: U64,
+    /// The cursor after the last byte of the range to ask about.
+    pub to_cursor: U64,
+}
+
+/// One interval of retained output, and when its first byte was written.
+///
+/// Every byte of the interval was written at or after `at_ms`, so it is a lower bound on when each
+/// of them was produced. Output in no interval has no recorded time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutputTime {
+    /// The first cursor of the interval, no earlier than the range asked about.
+    pub from_cursor: U64,
+    /// The cursor after its last byte, no later than the range asked about.
+    pub to_cursor: U64,
+    /// The wall-clock reading when its first byte was written.
+    pub at_ms: TimestampMs,
+    /// Whether the worker could prove its wall clock when it took the reading. A reader that
+    /// decides what a person may be shown by time uses only intervals for which this is true.
+    pub proven: bool,
+}
+
+/// The result of `history.times`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryTimesResult {
+    /// The intervals that overlap the range, in order, at most [`MAX_HISTORY_TIMES`].
+    pub intervals: Vec<OutputTime>,
+    /// Where to ask next to go on through the same range: the end of the last interval returned
+    /// when there are more, and the end of the range when there are not.
+    pub next_cursor: U64,
+    /// Whether the range holds nothing more at or after `next_cursor`.
+    pub complete: bool,
+    /// Why the host has no record of when this session's output was produced, when it has none.
+    /// The intervals are then empty, and a reader says that the output carries no time rather than
+    /// giving it one.
+    pub unavailable: Nullable<String>,
+}
+
 /// Why a subscriber must resynchronise.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,

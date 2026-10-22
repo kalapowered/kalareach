@@ -18571,6 +18571,69 @@
       ],
       "type": "object"
     },
+    "HistoryTimesParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `history.times`.",
+      "properties": {
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The first cursor of the range to ask about."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to read."
+        },
+        "to_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor after the last byte of the range to ask about."
+        }
+      },
+      "required": [
+        "session_id",
+        "from_cursor",
+        "to_cursor"
+      ],
+      "type": "object"
+    },
+    "HistoryTimesResult": {
+      "additionalProperties": false,
+      "description": "The result of `history.times`.",
+      "properties": {
+        "complete": {
+          "description": "Whether the range holds nothing more at or after `next_cursor`.",
+          "type": "boolean"
+        },
+        "intervals": {
+          "description": "The intervals that overlap the range, in order, at most [`MAX_HISTORY_TIMES`].",
+          "items": {
+            "$ref": "#/$defs/OutputTime"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "Where to ask next to go on through the same range: the end of the last interval returned\nwhen there are more, and the end of the range when there are not."
+        },
+        "unavailable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the host has no record of when this session's output was produced, when it has none.\nThe intervals are then empty, and a reader says that the output carries no time rather than\ngiving it one."
+        }
+      },
+      "required": [
+        "intervals",
+        "next_cursor",
+        "complete",
+        "unavailable"
+      ],
+      "type": "object"
+    },
     "HostBundle": {
       "additionalProperties": false,
       "description": "The host's key bundle.",
@@ -22830,6 +22893,11 @@
           "type": "string"
         },
         {
+          "const": "history.times",
+          "description": "Read when a closed session's retained output was produced: the intervals of its cursors and the wall-clock reading at which each began, and whether the host could prove its clock then. Output in no interval has no recorded time. A history request never creates a worker.",
+          "type": "string"
+        },
+        {
           "const": "action.read",
           "description": "Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session.",
           "type": "string"
@@ -25079,6 +25147,35 @@
         "digest",
         "byte_len",
         "kind"
+      ],
+      "type": "object"
+    },
+    "OutputTime": {
+      "additionalProperties": false,
+      "description": "One interval of retained output, and when its first byte was written.\n\nEvery byte of the interval was written at or after `at_ms`, so it is a lower bound on when each\nof them was produced. Output in no interval has no recorded time.",
+      "properties": {
+        "at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The wall-clock reading when its first byte was written."
+        },
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The first cursor of the interval, no earlier than the range asked about."
+        },
+        "proven": {
+          "description": "Whether the worker could prove its wall clock when it took the reading. A reader that\ndecides what a person may be shown by time uses only intervals for which this is true.",
+          "type": "boolean"
+        },
+        "to_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor after its last byte, no later than the range asked about."
+        }
+      },
+      "required": [
+        "from_cursor",
+        "to_cursor",
+        "at_ms",
+        "proven"
       ],
       "type": "object"
     },
@@ -43686,6 +43783,12 @@
     "history_page_result": {
       "$ref": "#/$defs/HistoryPageResult"
     },
+    "history_times_params": {
+      "$ref": "#/$defs/HistoryTimesParams"
+    },
+    "history_times_result": {
+      "$ref": "#/$defs/HistoryTimesResult"
+    },
     "host_clock_establish_params": {
       "$ref": "#/$defs/HostClockEstablishParams"
     },
@@ -44171,6 +44274,9 @@
     },
     "output_event": {
       "$ref": "#/$defs/OutputEvent"
+    },
+    "output_time": {
+      "$ref": "#/$defs/OutputTime"
     },
     "owner_confirmation_complete_params": {
       "$ref": "#/$defs/OwnerConfirmationCompleteParams"
