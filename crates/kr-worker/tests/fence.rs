@@ -2017,6 +2017,9 @@ fn is_the_waiting_sleep(pid: u32) -> bool {
 /// launch as `EDITOR_BUSY`. All of that happens while the reading is still outstanding. Later the
 /// command the reading started is gone from the process table, which is what reaping it means,
 /// and the reading, folded in as an answer that establishes nothing, has not closed the session.
+/// A reading taken under the session's lock keeps the session from being built at all, so the
+/// session is built on a task of its own and the case fails, on an assertion, when it is not built
+/// within its bound.
 ///
 /// On macOS the login manager is `launchctl`, which the platform reading runs by its absolute path,
 /// and a person is logged in at the console of the machine that runs the case. The case tells the
@@ -2045,7 +2048,11 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
         ordinary_hook(panic);
     }));
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
-    let mut wired = wired_built(
+    // The session is built on a task of its own, so that a session that cannot be built while the
+    // platform's reading is outstanding fails here: the session's lock is what every request, key
+    // and clock step the worker takes goes through, and a reading taken under it would keep all of
+    // them waiting for as long as the platform command is given.
+    let building = tokio::spawn(wired_built(
         ShellMode::Managed,
         true,
         Bridging {
@@ -2054,8 +2061,14 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
             hello_abi: "zle-5.9",
         },
         |config| config.worker_profile = WorkerProfile::DesktopBound,
-    )
-    .await;
+    ));
+    let built = tokio::time::timeout(Duration::from_secs(60), building).await;
+    assert!(
+        built.is_ok(),
+        "the session was not built while the platform's reading was outstanding, so nothing could \
+         end the launch hold on its own deadline"
+    );
+    let mut wired = built.expect("built in time").expect("the session is built");
 
     // The reading is outstanding when the login manager has been asked a second time and is
     // waiting: the first question was the session's own, when it opened.
