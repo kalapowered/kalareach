@@ -2682,6 +2682,34 @@ impl Rig {
         relay_read(&self.client_endpoint, params).await
     }
 
+    /// One `backup.bundle.write` of `sealed` at the locator, from the place `expected` names.
+    async fn write_bundle(
+        &self,
+        expected: kr_protocol::backup_bundle::BackupBundlePlace,
+        sealed: Vec<u8>,
+    ) -> Result<kr_protocol::backup_bundle::BackupBundleWriteResult, ProtocolError> {
+        let params = kr_protocol::backup_bundle::BackupBundleWriteParams {
+            locator: locator(),
+            expected,
+            request_id: Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes()),
+            signed_at_ms: kr_ipc::now_ms(),
+            sealed_bundle: kr_protocol::scalars::Bytes::new(sealed),
+        };
+        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .mutate(
+                Method::BackupBundleWrite,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.host.environment_id()),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .map(|value| value.to_typed().expect("a result of the declared shape"))
+    }
+
     /// A read of `length` bytes of the first member object of the archive, from `offset`.
     fn object_read(offset: u64, length: u64) -> BackupReadParams {
         BackupReadParams::Object {
@@ -3026,6 +3054,87 @@ async fn a_restores_reads_are_refused_while_privacy_mode_is_on_and_held_to_the_s
         reads_before + 1,
         "the read did reach the service: it was the answer that was held back, not the request"
     );
+}
+
+/// KR-REQ-24.16: the recovery bundle is key material, not content, so the daemon relays the write
+/// that records a checkpoint in it whether privacy mode is on or off. The restore that makes the
+/// call refuses to run under privacy mode before it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_recovery_bundle_is_written_while_privacy_mode_is_on() {
+    use kr_protocol::backup_bundle::{BackupBundlePlace, BackupBundleWriteResult};
+
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    let web = Arc::clone(rig.served.web());
+    let at = locator().to_string();
+    web.put_bundle(&at, ACCOUNT, sealed_bundle_bytes());
+    let BackupReadResult::Bundle {
+        bundle:
+            BackupBundle::Held {
+                write_sequence,
+                revision,
+                recovery,
+                ..
+            },
+    } = rig
+        .read(&BackupReadParams::Bundle { locator: locator() })
+        .await
+        .expect("the bundle is read")
+    else {
+        panic!("the service holds the bundle");
+    };
+    let read_at = BackupBundlePlace {
+        write_sequence,
+        revision,
+        recovery,
+    };
+
+    // The control: with privacy mode off the write is relayed.
+    let first = plaintext(4096);
+    let BackupBundleWriteResult::Written { place } = rig
+        .write_bundle(read_at, first.clone())
+        .await
+        .expect("relayed with privacy mode off")
+    else {
+        panic!("the bundle moved on");
+    };
+    assert_eq!(web.bundle(&at), Some(first));
+
+    // On: the next write is relayed as well.
+    assert!(rig.set_privacy(true).await);
+    let second = plaintext(8192);
+    let written = rig
+        .write_bundle(place, second.clone())
+        .await
+        .expect("privacy mode does not stop the write of key material");
+    assert!(matches!(written, BackupBundleWriteResult::Written { .. }));
+    assert_eq!(web.bundle(&at), Some(second));
+}
+
+/// A write of the recovery bundle moves a bundle that is there on. A place with no name is where
+/// nothing was written, and the service reads a write against it as the first one, so the daemon
+/// sends nothing for it and the bundle is not made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_of_the_recovery_bundle_against_a_place_with_no_name_makes_no_bundle() {
+    use kr_protocol::backup_bundle::BackupBundlePlace;
+
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    let web = Arc::clone(rig.served.web());
+    let at = locator().to_string();
+    let sent = web.arrived().len();
+    let refused = rig
+        .write_bundle(
+            BackupBundlePlace {
+                write_sequence: kr_protocol::scalars::U64::new(1),
+                revision: Nullable::null(),
+                recovery: Nullable::null(),
+            },
+            plaintext(4096),
+        )
+        .await
+        .expect_err("a write against a place with no name is refused");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert_eq!(web.bundle(&at), None, "no bundle was made");
+    assert_eq!(web.arrived().len(), sent, "nothing was sent for it");
 }
 
 /// A delay the service names to a restore's read is owed to everything that asks next: the relay

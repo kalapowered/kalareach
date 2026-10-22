@@ -58,16 +58,16 @@ impl Controller {
     /// Answers `backup.bundle.write`: moves the recovery bundle on by one compare-and-swap, for a
     /// restore that has verified a generation and records it.
     ///
-    /// The call is refused while privacy mode is on, as `backup.read` is, and when it changed while
-    /// the call waited for a token; a write that has been sent is answered as it ended, because a
-    /// restore that is told nothing about a bundle that was in fact written would write it again.
-    /// The daemon keeps no record of the write.
+    /// The bundle is key material (collection locators, trusted writer keys, generation
+    /// checkpoints), not content, so privacy mode neither stops this call nor is stopped by it, as
+    /// with `backup.enable`; the restore that calls it has refused to run under privacy mode
+    /// before it does. A delay the service named still holds it. The daemon keeps no record of the
+    /// write.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service,
-    /// [`ControllerError::PermissionDenied`] while privacy mode is on, and the relay's own
-    /// refusals otherwise.
+    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service, and
+    /// the relay's own refusals otherwise.
     pub(super) async fn backup_bundle_write(
         &self,
         mutation: &MutationRequest,
@@ -81,15 +81,7 @@ impl Controller {
                 kr_protocol::hostinfo::configuration::FILE_NAME,
             )));
         };
-        let before = self.privacy.state().now();
-        if before.private {
-            return Err(ControllerError::PermissionDenied {
-                detail: "privacy mode is on, and nothing is written to the recovery bundle while \
-                         it is"
-                    .to_owned(),
-            });
-        }
-        let answer = relay.write_bundle(write, before).await?;
+        let answer = relay.write_bundle(write).await?;
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }

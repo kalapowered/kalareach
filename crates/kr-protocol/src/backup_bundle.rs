@@ -13,8 +13,10 @@
 //! The daemon keeps no record of a write. A call whose answer was lost is not settled by the
 //! daemon: the caller reads the bundle again and writes from what it finds.
 //!
-//! Like `backup.read`, the call is refused while privacy mode is on or when it changed during the
-//! call, and it sends nothing while the service has asked to be left alone.
+//! The bundle is key material (collection locators, trusted writer keys, generation checkpoints),
+//! not content, so the call is not refused while privacy mode is on, as `backup.enable` is not; the
+//! restore that makes it has refused to run under privacy mode before it does. The call sends
+//! nothing while the service has asked to be left alone.
 
 use core::fmt;
 
