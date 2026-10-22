@@ -58,6 +58,7 @@ pub mod input_domain;
 pub mod journal;
 pub mod lifecycle;
 pub mod local_gate;
+pub mod metrics;
 pub mod output;
 pub mod owned_writer;
 pub mod ownership;
