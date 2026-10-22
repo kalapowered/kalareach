@@ -280,7 +280,7 @@ fn a_document_at_a_higher_level_is_refused_an_edit_and_left_exactly_as_it_was() 
     let installation = Installation::create();
     let environment = installation.environment();
     let path = kr_cli::doctor::configuration::document_path(&environment);
-    let higher = r#"{"version": 3, "level": 6, "ceilings": {"session_limit": 4}, "zq_telemetry": {"enabled": true}}"#;
+    let higher = r#"{"version": 3, "level": 7, "ceilings": {"session_limit": 4}, "zq_telemetry": {"enabled": true}}"#;
     kr_ipc::paths::write_owner_only_file(&path, higher.as_bytes()).expect("writes it");
 
     // The control: this build reads the document, so it is the edit that is refused and not the
@@ -305,7 +305,7 @@ fn a_document_at_a_higher_level_is_refused_an_edit_and_left_exactly_as_it_was() 
     );
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(
-        message.contains("level 6") && message.contains("nothing was written"),
+        message.contains("level 7") && message.contains("nothing was written"),
         "{message}"
     );
     assert_eq!(
@@ -377,7 +377,7 @@ fn an_attach_create_with_no_terminal_to_register_asks_for_no_session() {
     let before = every_path_under(installation.tree.root());
     let mut command = Command::new(kr());
     command
-        .args(["--json", "new", "--attach"])
+        .args(["--json", "new", "--shell-mode", "native_compat", "--attach"])
         .stdin(std::process::Stdio::null())
         .env(
             kr_ipc::paths::RUNTIME_DIR_VARIABLE,
@@ -471,7 +471,7 @@ fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
 
     let mut command = Command::new(kr());
     command
-        .args(["--json", "new", "--invisible"])
+        .args(["--json", "new", "--shell-mode", "native_compat", "--invisible"])
         .env_clear()
         .env("PATH", &path)
         .env("HOME", &home)
