@@ -33,6 +33,7 @@
 //! | [`duplex`] | One supervised owner per live connection: both directions, both queues |
 //! | [`framing`] | How one connector's frames are wrapped and taken apart again |
 //! | [`methods`] | The agent-state reads, the five agent mutations and the plugin action call |
+//! | [`observation`] | What the worker offers the components of its bindings to observe, and what each has missed |
 //! | [`listener`] | The private local endpoint, bridge registration and the pinned binary |
 //! | [`process`] | Launched processes, their credentials and their immutable source frames |
 //! | [`profiles`] | Launch profiles, the stale-launch refusal and one process per conversation |
@@ -72,6 +73,7 @@ pub mod image;
 pub mod ledger;
 pub mod listener;
 pub mod methods;
+pub mod observation;
 pub mod prepare;
 pub mod probe;
 pub mod process;
@@ -245,6 +247,11 @@ pub struct Binding {
     pub package_digest: Digest256,
     /// The three grants, held separately.
     pub grants: BrokerGrants,
+    /// Which streams the `Observation` grant lets a component be offered.
+    ///
+    /// Not persisted: no decision reads a binding row back, and a binding is made again from the
+    /// admissions the worker holds.
+    pub streams: binder::Streams,
     /// The decoding trust, where the binding has any.
     pub trust: Option<DecodingTrust>,
     /// The actions this package registered, by name.
@@ -825,6 +832,8 @@ struct BrokerState {
     action_refusals: BTreeMap<Digest256, Vec<String>>,
     /// Where the plugin runtime has each binding's component, as its link last reported.
     component_states: BTreeMap<BrokerBindingId, (ComponentState, Option<String>)>,
+    /// What a person is told about each binding's component beyond where it stands.
+    component_notes: BTreeMap<BrokerBindingId, component::ComponentNotes>,
     /// Woken when the set of bindings the plugin runtime is wanted for may have changed.
     component_changes: Arc<tokio::sync::Notify>,
 }
@@ -872,6 +881,9 @@ pub struct Broker {
     /// How a component is asked to prepare an action: the plugin runtime's client, once the link
     /// has one, and the bound on how many preparations are under way.
     component_calls: Arc<prepare::ComponentCalls>,
+    /// What the worker has to offer the components of its bindings to observe, and what each has
+    /// missed.
+    observation: Arc<observation::ObservationLane>,
     /// What this worker asks the control daemon about drafts.
     drafts: Arc<crate::daemon_link::Drafts>,
     /// Where the next recovery stops before it writes the gap, for this host's own tests.
@@ -1006,12 +1018,14 @@ impl Broker {
                 revoked: BTreeMap::new(),
                 action_refusals: BTreeMap::new(),
                 component_states: BTreeMap::new(),
+                component_notes: BTreeMap::new(),
                 component_changes: Arc::new(tokio::sync::Notify::new()),
             }),
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
             description_facts: std::sync::OnceLock::new(),
             component_calls: Arc::new(prepare::ComponentCalls::new()),
+            observation: Arc::new(observation::ObservationLane::new()),
             drafts: Arc::new(crate::daemon_link::Drafts::new()),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
@@ -1554,6 +1568,7 @@ impl Broker {
             publisher_id,
             package_digest,
             grants,
+            streams: binder::Streams::default(),
             trust,
             actions: BTreeMap::new(),
             rich_disabled: None,
@@ -1597,6 +1612,7 @@ impl Broker {
                         component: Nullable(component::report_of(
                             binding,
                             state.component_states.get(&binding.binding_id),
+                            state.component_notes.get(&binding.binding_id),
                         )),
                     })
             })
@@ -1652,6 +1668,10 @@ impl Broker {
             .ok_or_else(|| unknown_binding(binding_id))?;
         binding.grants = grants;
         binding.trust = trust;
+        // Observation withdrawn is every stream withdrawn with it.
+        if grant == BrokerGrant::Observation {
+            binding.streams = binder::Streams::default();
+        }
         state.renew_every_gateway_evidence(kr_ipc::now_ms());
         Ok(())
     }
@@ -1816,6 +1836,13 @@ impl Broker {
             )));
         }
         let resource = state.record_native(connection, &forwarded, frame, now)?;
+        let tap = self
+            .observation
+            .wants_native()
+            .then(|| state.observation_tap(connection, &forwarded, resource.as_ref()))
+            .flatten();
+        drop(state);
+        self.offer_upstream(tap, frame, now);
         Ok((forwarded, resource))
     }
 
@@ -1855,6 +1882,13 @@ impl Broker {
         let forwarded = state.gateway.forward_native(connection, frame)?;
         let Some(operation) = state.reverse_operation(connection, &forwarded.method) else {
             let resource = state.record_native(connection, &forwarded, frame, now)?;
+            let tap = self
+                .observation
+                .wants_native()
+                .then(|| state.observation_tap(connection, &forwarded, resource.as_ref()))
+                .flatten();
+            drop(state);
+            self.offer_upstream(tap, frame, now);
             return Ok(UpstreamArrival::Forward {
                 forwarded,
                 resource,
