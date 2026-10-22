@@ -295,8 +295,8 @@ async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else()
 /// confirming a device, enlarging a grant, trusting a repository root and granting an executable
 /// capability, each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has confirmed
 /// exactly them; a confirmation for other rights, or for another action, does not stand in.
-/// KR-REQ-23.47, the part about the confirmation's digest and its single use: each confirmation
-/// names one action digest with its destination and rights, and is spent once.
+/// KR-REQ-23.47, the part about the confirmation's digest: each confirmation names one action
+/// digest with its destination and rights, and one that names others does not stand in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
     let owner_keys = keys();
