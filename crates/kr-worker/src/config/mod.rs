@@ -230,6 +230,13 @@ impl Resolver {
         )
     }
 
+    /// Returns the owner's two settings for session descriptions as the host acts on them, with
+    /// where each came from. The report reads this too, so what it says is what the daemon does.
+    #[must_use]
+    pub fn description_settings(&self) -> configuration::DescriptionSettings {
+        self.loaded.description_settings()
+    }
+
     /// Returns the execution context this configuration chooses, when it chooses one.
     ///
     /// The three rungs above the product default, without it: a caller that has to establish the

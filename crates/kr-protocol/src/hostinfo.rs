@@ -2964,6 +2964,45 @@ pub mod configuration {
             self.document.as_ref().map(|document| &document.preferences)
         }
 
+        /// Returns the owner's two settings for session descriptions as the host acts on them.
+        ///
+        /// The one reading both the daemon and the effective-value report use. Descriptions are on
+        /// and inference on battery is off unless the document chooses otherwise, and a document
+        /// the host cannot use turns both off: on is the product default and wider than anything
+        /// the owner could have chosen, and the choice is in the document that cannot be read.
+        #[must_use]
+        pub fn description_settings(&self) -> DescriptionSettings {
+            let off = DescriptionSettings {
+                enabled: false,
+                enabled_source: ValueSource::Default,
+                on_battery: false,
+                on_battery_source: ValueSource::Default,
+            };
+            if self.fails_closed() {
+                return off;
+            }
+            let Some(document) = self.document.as_ref() else {
+                return DescriptionSettings {
+                    enabled: true,
+                    ..off
+                };
+            };
+            let section = &document.descriptions;
+            let chosen = |value: Option<bool>, default: bool| {
+                value.map_or((default, ValueSource::Default), |value| {
+                    (value, ValueSource::HostConfiguration)
+                })
+            };
+            let (enabled, enabled_source) = chosen(section.enabled(), true);
+            let (on_battery, on_battery_source) = chosen(section.on_battery(), false);
+            DescriptionSettings {
+                enabled,
+                enabled_source,
+                on_battery,
+                on_battery_source,
+            }
+        }
+
         /// Returns the revision this host has applied, or zero when there is no document.
         #[must_use]
         pub fn revision(&self) -> u64 {
@@ -5263,6 +5302,69 @@ pub mod configuration {
 
     /// The key of the row of declared output paths [`automation_rows`] contributes.
     pub const AUTOMATION_TEST_OUTPUTS_KEY: &str = "automation.test_outputs";
+
+    /// What the owner's two settings for session descriptions come to, and where each came from.
+    ///
+    /// Neither setting has a request, a profile or a variable rung: they are the owner's, written
+    /// in this document, and the product default is the rung below. They apply as soon as they are
+    /// written.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct DescriptionSettings {
+        /// Whether descriptions are on.
+        pub enabled: bool,
+        /// The rung `enabled` came from.
+        pub enabled_source: ValueSource,
+        /// Whether inference may run while the host is on battery.
+        pub on_battery: bool,
+        /// The rung `on_battery` came from.
+        pub on_battery_source: ValueSource,
+    }
+
+    /// The rows the descriptions settings contribute to the effective-value report: each with the
+    /// value in force, the rung it came from and "immediately" as its effect.
+    ///
+    /// The source is the host configuration where the document wrote the field and the product
+    /// default where it did not, and presence decides it rather than comparison: a setting written
+    /// as its default value was still chosen by whoever wrote it. `origin` is where the document is.
+    #[must_use]
+    pub fn descriptions_rows(
+        settings: &DescriptionSettings,
+        origin: &str,
+    ) -> Vec<super::EffectiveValue> {
+        use super::export::Declared;
+
+        let row = |key: &'static str, about: &'static str, value: bool, source: ValueSource| {
+            super::EffectiveValue::new(
+                key,
+                about,
+                &Declared::term(if value { "true" } else { "false" }),
+                source,
+                Nullable((source == ValueSource::HostConfiguration).then(|| origin.to_owned())),
+                Nullable::null(),
+                ValueEffect::Immediately,
+            )
+        };
+        vec![
+            row(
+                DESCRIPTIONS_ENABLED_KEY,
+                "whether session descriptions are on",
+                settings.enabled,
+                settings.enabled_source,
+            ),
+            row(
+                DESCRIPTIONS_ON_BATTERY_KEY,
+                "whether inference for descriptions may run while the host is on battery",
+                settings.on_battery,
+                settings.on_battery_source,
+            ),
+        ]
+    }
+
+    /// The key of the row of the descriptions switch [`descriptions_rows`] contributes.
+    pub const DESCRIPTIONS_ENABLED_KEY: &str = "descriptions.enabled";
+
+    /// The key of the row of inference on battery [`descriptions_rows`] contributes.
+    pub const DESCRIPTIONS_ON_BATTERY_KEY: &str = "descriptions.on_battery";
 
     /// The row a document of a level above this build's contributes: the members it holds that
     /// this build does not know and ignores.
