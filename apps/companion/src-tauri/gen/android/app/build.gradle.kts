@@ -1,7 +1,9 @@
 import java.security.MessageDigest
 import java.util.Properties
+import javax.inject.Inject
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.attributes.Attribute
+import org.gradle.process.ExecOperations
 
 plugins {
     id("com.android.application")
@@ -50,17 +52,48 @@ check(handWrittenNativeDeviceTests.isDirectory) {
  * no file fails. The resources go to a directory of the build's own, so a build with no file carries
  * none from another.
  */
-val firebaseResources = layout.buildDirectory.dir("generated/firebase/res")
+abstract class FirebaseResources : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val script: RegularFileProperty
 
-fun firebaseConfiguration(buildType: String) =
-    tasks.register<Exec>("generateFirebaseResources" + buildType.replaceFirstChar { it.uppercase() }) {
-        val script = file("../../../../scripts/firebase-android-configuration.mjs")
-        inputs.file(script)
-        inputs.property("file", providers.environmentVariable("KR_GOOGLE_SERVICES_JSON").orElse(""))
-        outputs.dir(firebaseResources)
-        outputs.upToDateWhen { false }
-        commandLine("node", script.path, firebaseResources.get().asFile.path, buildType, "to.kala.reach")
+    @get:Input
+    abstract val buildType: Property<String>
+
+    @get:Input
+    abstract val applicationId: Property<String>
+
+    @get:OutputDirectory
+    abstract val output: DirectoryProperty
+
+    @get:Inject
+    abstract val exec: ExecOperations
+
+    @TaskAction
+    fun generate() {
+        exec.exec {
+            commandLine(
+                "node", script.get().asFile.path, output.get().asFile.path,
+                buildType.get(), applicationId.get(),
+            )
+        }
     }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val generate = tasks.register<FirebaseResources>(
+            "generateFirebaseResources" + variant.name.replaceFirstChar { it.uppercase() }
+        ) {
+            script.set(file("../../../../scripts/firebase-android-configuration.mjs"))
+            buildType.set(variant.buildType ?: "debug")
+            applicationId.set("to.kala.reach")
+            inputs.property("file", providers.environmentVariable("KR_GOOGLE_SERVICES_JSON").orElse(""))
+            outputs.upToDateWhen { false }
+        }
+        variant.sources.res?.addGeneratedSourceDirectory(generate, FirebaseResources::output)
+    }
+}
 
 android {
     compileSdk = 36
@@ -107,7 +140,6 @@ android {
     }
     sourceSets {
         getByName("main").java.srcDir(handWrittenNativeSources)
-        getByName("main").res.srcDir(firebaseResources)
         getByName("androidTest").java.srcDir(handWrittenNativeDeviceTests)
     }
 }
@@ -223,14 +255,6 @@ afterEvaluate {
     }
 
     tasks.named("preBuild") { dependsOn(verifyNativeLibraries) }
-
-    // The configuration step runs for the build type being built: a release build is the one that
-    // must have the file.
-    val debugFirebase = firebaseConfiguration("debug")
-    val releaseFirebase = firebaseConfiguration("release")
-    tasks.matching { it.name.matches(Regex("(generate|merge).*(Debug|Release)Resources")) }.configureEach {
-        dependsOn(if (name.contains("Release")) releaseFirebase else debugFirebase)
-    }
 }
 
 apply(from = "tauri.build.gradle.kts")
