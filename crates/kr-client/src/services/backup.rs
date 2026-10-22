@@ -70,7 +70,7 @@ pub const MAX_BACKUP_REQUEST_BYTES: usize = 256 * 1024;
 ///
 /// A fetch is the largest answer: one publication, whose descriptor is at most 64 KiB in its
 /// canonical encoding and larger as JSON, where its bytes travel as base64url and its members by
-/// name, beside a collection that names at most sixteen generations and two writers. A descriptor at
+/// name, beside a collection that names at most thirty generations and two writers. A descriptor at
 /// its bound makes a fetch answer well past [`super::http::DEFAULT_RESPONSE_LIMIT_BYTES`], so the
 /// manifest's path carries a bound of its own, the same one a publication request is held to, and
 /// `a_fetch_of_the_largest_descriptor_is_read_under_the_manifests_own_bound` holds this to a
