@@ -41,6 +41,27 @@ check(handWrittenNativeDeviceTests.isDirectory) {
     "The application's hand-written Android device tests are not at $handWrittenNativeDeviceTests"
 }
 
+/**
+ * Firebase's configuration, as the string resources Firebase reads at start.
+ *
+ * It belongs to the account that owns the Firebase project, so it is made from the file
+ * `KR_GOOGLE_SERVICES_JSON` names (`scripts/firebase-android-configuration.mjs`): a debug build with
+ * no file leaves Firebase alone, a file that cannot be used fails the build, and a release build with
+ * no file fails. The resources go to a directory of the build's own, so a build with no file carries
+ * none from another.
+ */
+val firebaseResources = layout.buildDirectory.dir("generated/firebase/res")
+
+fun firebaseConfiguration(buildType: String) =
+    tasks.register<Exec>("generateFirebaseResources" + buildType.replaceFirstChar { it.uppercase() }) {
+        val script = file("../../../../scripts/firebase-android-configuration.mjs")
+        inputs.file(script)
+        inputs.property("file", providers.environmentVariable("KR_GOOGLE_SERVICES_JSON").orElse(""))
+        outputs.dir(firebaseResources)
+        outputs.upToDateWhen { false }
+        commandLine("node", script.path, firebaseResources.get().asFile.path, buildType, "to.kala.reach")
+    }
+
 android {
     compileSdk = 36
     // Android 15 and later run with 16 KB memory pages, and a library linked for 4 KB pages is
@@ -86,6 +107,7 @@ android {
     }
     sourceSets {
         getByName("main").java.srcDir(handWrittenNativeSources)
+        getByName("main").res.srcDir(firebaseResources)
         getByName("androidTest").java.srcDir(handWrittenNativeDeviceTests)
     }
 }
@@ -201,6 +223,14 @@ afterEvaluate {
     }
 
     tasks.named("preBuild") { dependsOn(verifyNativeLibraries) }
+
+    // The configuration step runs for the build type being built: a release build is the one that
+    // must have the file.
+    val debugFirebase = firebaseConfiguration("debug")
+    val releaseFirebase = firebaseConfiguration("release")
+    tasks.matching { it.name.matches(Regex("(generate|merge).*(Debug|Release)Resources")) }.configureEach {
+        dependsOn(if (name.contains("Release")) releaseFirebase else debugFirebase)
+    }
 }
 
 apply(from = "tauri.build.gradle.kts")
