@@ -5705,10 +5705,13 @@ transition keeps what it was refused. It joins that to the next announcement it 
 the newest revision it was refused included, or fences it on its own at the next maintenance pass,
 whichever comes first, up to 65,536 names. The worker takes the input lease and the size claim of
 every caller acting under a grant when the host cannot say whose authority was withdrawn: when a revision reached the
-whole host (revoking a device, or changing the rights ceiling), when the host restarted since the
-revision, when the worker last acknowledged a revision more than 256 back or missed one the notice
-does not describe, or when a share from before the limit held more grants than one notice carries.
-Revoking a device still reaches every connection.
+whole host (changing the rights ceiling or an organisation's policy, for one), when the host
+restarted since the revision, when the worker last acknowledged a revision more than 256 back or
+missed one the notice does not describe, or when a share from before the limit held more grants than
+one notice carries. A caller that keeps its authority loses its lease and its size claim to such a
+revision, takes the lease again on its next request, and is not told that its claim went. Revoking
+a device names the device and the grants withdrawn with it, so it reaches the connections acting
+under those and no others.
 
 `grants::decide` takes the intersection in this order:
 
@@ -6196,10 +6199,12 @@ checks the resource itself before it asks.
 
 Two readers hold a bound as a number, and take it from the filter (`first_moment`): the attention
 inbox and the changed-since-last-visit view of a paired device. A grant with no history cursor
-reaches from its own start there, as it does for a notice. A paired device is served no generated
-summary of what changed, whatever its grant reaches, and the host starts none for it: the moments
-the log keeps are when the host observed a change, which does not date the session text the change
-names, so a summary cannot be shown to stay inside a grant that begins after any of its sources.
+reaches from its own start there, as it does for a notice. A paired device whose grant has a history
+bound is served no generated summary of what changed, however early the bound, and the host starts
+none for it: the moments the log keeps are when the host observed a change, which does not date
+the session text the change names, so a summary cannot be shown to stay inside a grant that begins
+after any of its sources. A device whose grant reaches every moment, as an owner's own device does,
+crosses no bound and is served a summary as the owner is.
 What a model wrote of a session is shown to a device whose history reaches the session's start,
 decided as a summary derived from the interval that is that moment, and a session whose start is
 not known is shown none of it. A retained history page and an export are not served to a paired
