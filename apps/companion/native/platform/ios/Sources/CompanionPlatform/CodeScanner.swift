@@ -51,6 +51,19 @@ struct ScanAnswer: Encodable, CustomStringConvertible, CustomDebugStringConverti
   }
 }
 
+/// What a reader hands over when it answers, after the scanner or the picker has left the screen.
+///
+/// A code is handed over only by an application that is in front now and has been in front since
+/// the reading began. The scanner and the picker watch for the application going to the background,
+/// but their dismissal takes a moment, and the code was decoded before it: an application that left
+/// in between gives the code to nobody, and the answer is that the scan was cancelled.
+private func handedOver(_ outcome: ScanOutcome, leftTheFront: Bool) -> ScanOutcome {
+  if case .text = outcome, leftTheFront || UIApplication.shared.applicationState == .background {
+    return .cancelled
+  }
+  return outcome
+}
+
 /// A scan that has been asked for, which can be ended before the scanner is on the screen.
 final class ScanHandle {
   fileprivate(set) var scanner: CodeScannerViewController?
@@ -91,6 +104,11 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
   /// Whether the camera was set up: when it was not, the scanner has nothing to show.
   private var setUp = false
   private var found = false
+  /// The application went to the background while the scan was under way, or while it closed.
+  private var leftTheFront = false
+  /// Watches for that until the answer is given, which is after the scanner has gone from the
+  /// screen: the scan's other observers go as soon as it ends.
+  private var backgroundWatch: NSObjectProtocol?
   private var lastRead = CFAbsoluteTime(0)
   private static let readEvery: CFAbsoluteTime = 0.12
 
@@ -170,14 +188,18 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       self, selector: #selector(hidePreview), name: UIApplication.willResignActiveNotification, object: nil)
     center.addObserver(
       self, selector: #selector(showPreview), name: UIApplication.didBecomeActiveNotification, object: nil)
-    center.addObserver(
-      self, selector: #selector(cancelTapped), name: UIApplication.didEnterBackgroundNotification, object: nil)
+    backgroundWatch = center.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+    ) { [weak self] _ in
+      self?.leftTheFront = true
+      self?.finish(.cancelled)
+    }
     // A camera another application takes, or one that fails while it runs, leaves a black screen
     // with nothing to say: the scan ends and says the camera could not be used.
     center.addObserver(
       self, selector: #selector(cameraFailed), name: .AVCaptureSessionRuntimeError, object: session)
     center.addObserver(
-      self, selector: #selector(cameraFailed), name: .AVCaptureSessionWasInterrupted, object: session)
+      self, selector: #selector(cameraInterrupted(_:)), name: .AVCaptureSessionWasInterrupted, object: session)
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -279,6 +301,18 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
 
   @objc private func cameraFailed() { finish(.failed) }
 
+  /// The application leaving the front takes the camera from it as well. That ends the scan as a
+  /// cancel, by the observer of the application's going to the background, and is no fault of the
+  /// camera; any other interruption leaves the scanner with nothing to show.
+  @objc private func cameraInterrupted(_ note: Notification) {
+    if let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int,
+      AVCaptureSession.InterruptionReason(rawValue: raw) == .videoDeviceNotAvailableInBackground
+    {
+      return
+    }
+    finish(.failed)
+  }
+
   @objc private func torchTapped() {
     guard let device = device, device.hasTorch else { return }
     do {
@@ -322,7 +356,12 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     }
     let answer = done
     done = nil
-    dismiss(animated: !UIAccessibility.isReduceMotionEnabled) { answer?(outcome) }
+    dismiss(animated: !UIAccessibility.isReduceMotionEnabled) { [self] in
+      let handed = handedOver(outcome, leftTheFront: leftTheFront)
+      if let watching = backgroundWatch { NotificationCenter.default.removeObserver(watching) }
+      backgroundWatch = nil
+      answer?(handed)
+    }
   }
 }
 
@@ -331,18 +370,26 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
 ///
 /// It answers once. A pick the person has not finished, or a picture still being read, ends with a
 /// cancel when a newer request or the application's going to the background comes first, and what
-/// the picture shows after that is dropped: nothing is held for a person who has gone.
+/// the picture shows after that is dropped: nothing is held for a person who has gone. The
+/// application is watched until the answer is given, after the picker has gone from the screen.
 final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
   private var done: ((ScanOutcome) -> Void)?
   private weak var picker: PHPickerViewController?
   private var background: NSObjectProtocol?
+  private var leftTheFront = false
+  /// Whether the picker has finished coming onto the screen: UIKit ignores a dismissal asked for
+  /// before, so a cancel that comes sooner waits for it.
+  private var presented = false
+  private var cancelWhenPresented = false
 
   /// Ends the pick with a cancel, closing the picker. It does nothing once the pick is answered.
   func cancel() {
-    guard let answer = done else { return }
-    done = nil
-    stopWatching()
-    close(picker) { answer(.cancelled) }
+    guard done != nil else { return }
+    guard presented else {
+      cancelWhenPresented = true
+      return
+    }
+    finish(.cancelled)
   }
 
   /// Shows the picker on `presenter` and answers `done` once, with the code in the chosen picture.
@@ -356,8 +403,15 @@ final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
     self.picker = picker
     background = NotificationCenter.default.addObserver(
       forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
-    ) { [weak self] _ in self?.cancel() }
-    presenter.present(picker, animated: true)
+    ) { [weak self] _ in
+      self?.leftTheFront = true
+      self?.cancel()
+    }
+    presenter.present(picker, animated: true) { [weak self] in
+      guard let self = self else { return }
+      self.presented = true
+      if self.cancelWhenPresented { self.finish(.cancelled) }
+    }
   }
 
   func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
@@ -383,8 +437,11 @@ final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
   private func finish(_ outcome: ScanOutcome) {
     guard let answer = done else { return }
     done = nil
-    stopWatching()
-    close(picker) { answer(outcome) }
+    close(picker) { [self] in
+      let handed = handedOver(outcome, leftTheFront: leftTheFront)
+      stopWatching()
+      answer(handed)
+    }
   }
 
   private func stopWatching() {
