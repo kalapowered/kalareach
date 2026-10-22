@@ -1526,11 +1526,12 @@ mod platform {
 /// that was handed over and reported a process, was claimed, or was fenced, since a fenced launch
 /// is unresolved and may still be running. A launch that reported no process is not work: a worker
 /// starts a shell only after its claim, which recovery fences before anything is served. Each
-/// process is read by the kernel, so nothing a record says is believed: a process that has ended
-/// is not work, which is how a sign-out, and then a daemon in the next session, is told apart from
-/// work left behind; a process whose session cannot be read is refused as well, since it is not
-/// shown to be in this one. The caller does not call this for a boot the environment did not run
-/// in, where a reboot ended every process.
+/// process is read by the kernel, so nothing a record says is believed, and the boot a record
+/// belongs to needs no check: a process that has ended is not work, whether a sign-out or a
+/// restart of the machine ended it, which is how a daemon in the next session is told apart from
+/// one beside work left behind. A process this account cannot open is not work either: the
+/// processes of this environment are created by a task of this account, which can open them, so a
+/// recorded number that this account cannot open now belongs to another account's process.
 ///
 /// # Errors
 ///
@@ -1561,20 +1562,21 @@ pub(crate) fn refuse_work_in_another_session(
                 .filter_map(|reservation| reservation.launcher_identity),
         );
     }
-    left.sort_by_key(|identity| identity.pid.get());
-    left.dedup_by_key(|identity| identity.pid.get());
+    // By the whole identity: two records may name one number, of which only the later is a
+    // process that still runs.
+    left.sort();
+    left.dedup();
     let mut elsewhere = Vec::new();
     let mut unread = Vec::new();
     for identity in &left {
         let pid = u32::try_from(identity.pid.get()).unwrap_or(u32::MAX);
-        match process_state(identity) {
-            ProcessState::Ended => {}
-            ProcessState::Running => match kr_ipc::starter::process_facts(pid) {
-                Ok(facts) if facts.session == here => {}
-                Ok(facts) => elsewhere.push(format!("{pid} in session {}", facts.session)),
-                Err(_) => unread.push(pid.to_string()),
-            },
-            ProcessState::Unknown { .. } => unread.push(pid.to_string()),
+        if process_state(identity) != ProcessState::Running {
+            continue;
+        }
+        match kr_ipc::starter::process_facts(pid) {
+            Ok(facts) if facts.session == here => {}
+            Ok(facts) => elsewhere.push(format!("{pid} in session {}", facts.session)),
+            Err(_) => unread.push(pid.to_string()),
         }
     }
     if elsewhere.is_empty() && unread.is_empty() {
@@ -1593,10 +1595,12 @@ pub(crate) fn refuse_work_in_another_session(
             unread.join(", ")
         ));
     }
-    said.push_str(
+    said.push_str(if elsewhere.is_empty() {
+        ". End those processes, or restart the machine"
+    } else {
         ". Sign in to that session and end the work there, or end those processes, or restart the \
-         machine",
-    );
+         machine"
+    });
     Err(crate::error::ControllerError::supervision(said))
 }
 
@@ -2308,6 +2312,12 @@ pub mod testing {
         }
     }
 
+    impl Drop for TestTask {
+        fn drop(&mut self) {
+            let _ = remove(&self.definition);
+        }
+    }
+
     /// The supervisor a daemon a test hosts starts through, for an environment whose task
     /// registered `starter`, by the rule of [`TestTask::product_supervisor`].
     ///
@@ -2437,18 +2447,10 @@ pub mod testing {
             Ok(started)
         }
 
-        /// Ends the process, once, if it is still the one that started.
+        /// Ends the process if it is still the one that started, held by a handle that outlasts
+        /// the check.
         pub fn end(&self) {
-            if kr_ipc::identity::process_state(&self.identity)
-                == kr_ipc::identity::ProcessState::Running
-            {
-                let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_default())
-                    .join("System32")
-                    .join("taskkill.exe");
-                let _ = std::process::Command::new(system)
-                    .args(["/PID", &self.identity.pid.get().to_string(), "/F"])
-                    .output();
-            }
+            let _ = kr_ipc::identity::stop_process(&self.identity, kr_ipc::identity::Stop::Kill);
         }
     }
 
