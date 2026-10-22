@@ -35,6 +35,9 @@ from pathlib import Path
 
 APP = "to.kala.reach"
 
+# The service a fresh installation sends codes through, as the pairing screen names it.
+DEPLOYED_HOST = "reach.kala.to"
+
 
 # ---- The emulator's camera ---------------------------------------------------------------------
 
@@ -146,6 +149,15 @@ class Phone:
                 return node
             time.sleep(0.4)
         self.give_up(f"timed out waiting for {what}")
+
+    def wait_gone(self, unwanted, what: str, timeout: float = 60) -> None:
+        """Waits until no node on the screen is labelled as `unwanted` says, never by a fixed delay."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.find(unwanted) is None:
+                return
+            time.sleep(0.4)
+        self.give_up(f"timed out waiting for {what} to go")
 
     def give_up(self, message: str) -> None:
         """Ends the run, saying what the screen showed, for whoever reads the failure."""
@@ -355,12 +367,14 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
     """The paired phone is an owner device: the host's own request and a second device the host would
     add are confirmed with the phone's screen lock, and a prompt that is cancelled confirms nothing.
 
-    The emulator has no screen lock at first, so the phone offers no ceremony. Once it is given a PIN
-    the ceremony is its screen lock, and the prompt is the system's. The request is listed on the
-    Attention tab; the first prompt is cancelled (the request is still listed and the invitation
-    behind it is refused); the same request is then confirmed, and the host spends that confirmation
-    on the invitation. A second device the host is asked to add shows a
-    value, which the request on the phone shows too.
+    The emulator has no screen lock at first, so the phone offers no ceremony; it is given a PIN
+    before the first request is answered, and the ceremony is then its screen lock, and the prompt is
+    the system's. The request is listed on the Attention tab; the first prompt is cancelled (the
+    request is still listed and the invitation behind it is refused); the same request is then
+    confirmed, and the host spends that confirmation on the invitation. A second device the host is
+    asked to add shows a value, which the request on the phone shows too. While that request is
+    listed the PIN is taken away: the button that confirms goes, the request and its value stay
+    listed, and the button returns when the PIN is set again.
     """
     confirm = "Confirm with your screen lock"
     try:
@@ -370,18 +384,9 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         phone.tap(phone.wait(lambda each: each.startswith("Attention"), "the shell's Attention tab"))
         touch(directory, "go-confirm")
         wait_for_file(directory, "challenge.txt")
-        # The emulator has no screen lock yet, so the phone can check nothing: the request is on the
-        # Attention tab (the tab's badge counts it), and no button named for a ceremony is offered.
-        # The row's words, that this phone cannot check that it is you, are in the screenshot and in
-        # the page's own case: the accessibility tree gives the row to `uiautomator` only once it
-        # has a button to press. The lock is then set while the request is listed, and the button
-        # appears named for it without the request coming or going.
+        # The request is on the Attention tab, which counts it. The lock is set while it is listed,
+        # and the button appears named for it without the request coming or going.
         phone.wait(lambda each: "1 waiting for you" in each, "the host's request counted on the Attention tab", 120)
-        time.sleep(3)
-        if phone.find(lambda each: each.startswith("Confirm with")) is not None:
-            phone.give_up("a phone with no screen lock offers a way to confirm")
-        phone.shot("confirm-no-lock")
-        say("a phone with no screen lock cannot confirm")
         phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
         phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 120))
         phone.wait(lambda each: each == "Confirm on this phone", "the system's prompt", 30)
@@ -406,7 +411,19 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         value = read(directory, "device-value.txt").replace(" ", "")
         spelled = ", ".join(" ".join(group) for group in (value[:4], value[4:]))
         phone.wait(lambda each: spelled in each, f"the value {value} the second device shows", 60)
-        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the second device", 30))
+        phone.wait(lambda each: each == confirm, "the button that confirms the second device", 30)
+        # The page is shown the request with a ceremony; the lock goes while it is listed, and the
+        # page is told: the button goes, and the request and its value stay.
+        phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
+        phone.wait_gone(
+            lambda each: each.startswith("Confirm with"), "the button, once the phone has no screen lock", 120
+        )
+        if phone.find(lambda each: spelled in each) is None:
+            phone.give_up("the request left the list when the screen lock went")
+        phone.shot("confirm-no-lock")
+        say("a phone with no screen lock offers no way to confirm, and still lists the request")
+        phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
+        phone.tap(phone.wait(lambda each: each == confirm, "the button, once the screen lock is back", 120))
         enter_screen_lock(phone)
         phone.wait(lambda each: each.startswith("Confirmed."), "the words for a confirmed request", 60)
         wait_for_file(directory, "device-result.txt", 90)
@@ -679,6 +696,9 @@ def release(adb: str, serial: str, directory: Path, shots: Path, port: str, atte
     deployed = os.environ.get("KR_RELEASE_NO_DEPLOYED") != "1"
     if deployed:
         start_pairing_screen(phone)
+        # A code is sent only to the service the screen names: a package whose default were another
+        # origin would otherwise be tried against it, and still pass.
+        phone.wait(lambda each: each == DEPLOYED_HOST, f"{DEPLOYED_HOST} as the service codes go through", 30)
         phone.wait(lambda each: each == "Pair", "the button that starts an attempt", 30)
         attempts.parent.mkdir(parents=True, exist_ok=True)
         with attempts.open("a", encoding="utf-8") as record:
