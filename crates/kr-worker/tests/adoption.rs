@@ -12,6 +12,7 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
+//! | KR-REQ-03.27 | the program holding the terminal is the session's application, named as a person knows it, with no state of its own while it runs, and the shell at its prompt is not an application; a program that is another until it execs takes the name it has after the exec; the executable the shell integration answered for the line names it when it answered for one |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
@@ -916,7 +917,9 @@ fn monotonic() -> Duration {
 async fn kr_perf_003_an_idle_session_does_not_read_its_foreground_on_every_interval() {
     let setup = Setup::new();
     let mut typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
-    let adoptions = Arc::new(setup.adoptions);
+    // With the producer of the session's application following every look, which adds no read.
+    let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
+    let adoptions = Arc::new(setup.adoptions.following(producer));
     let watching = tokio::spawn(kr_worker::broker::adoption::watch(
         Arc::clone(&adoptions),
         Arc::downgrade(&typing.runtime),
@@ -1060,6 +1063,198 @@ async fn adopts_from_a_typed_line(before: &str) {
         .await
         .expect("the watch ends with the session's adoptions")
         .expect("joined");
+    typing.close().await;
+}
+
+/// A POSIX shell with job control that waits for a line, runs `command` as a foreground job with
+/// the terminal closed to it, and waits for another.
+fn job_shell(
+    setup: &Setup,
+    command: &str,
+    more: &[(&str, String)],
+) -> kr_worker::pty::ShellCommand {
+    let mut shell = kr_worker::testing::posix_script(&format!(
+        "set -m; read line; {command} </dev/null >/dev/null 2>&1; read line"
+    ));
+    shell.environment.extend([
+        (
+            "KR_ADOPTION_PROGRAM".to_owned(),
+            setup.program.display().to_string(),
+        ),
+        (STAND_IN.to_owned(), "60".to_owned()),
+    ]);
+    shell.environment.extend(
+        more.iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone())),
+    );
+    shell
+}
+
+/// Waits until what the producer publishes satisfies `held`, and returns it.
+async fn application_where(
+    published: &mut tokio::sync::watch::Receiver<kr_worker::application::Application>,
+    held: impl FnMut(&kr_worker::application::Application) -> bool,
+) -> kr_worker::application::Application {
+    tokio::time::timeout(LIVENESS, published.wait_for(held))
+        .await
+        .expect("the application becomes what was expected")
+        .expect("the producer is still there")
+        .clone()
+}
+
+/// KR-REQ-03.27: the program the root shell runs from a typed line is the session's application
+/// for as long as it holds the terminal, named as a person knows it and with no state of its own
+/// (the worker does not know what it is doing), and the root shell at its prompt is no
+/// application and is ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_03_27_the_program_holding_the_terminal_is_the_application_until_the_prompt_returns()
+{
+    use kr_protocol::session::ApplicationState;
+
+    let setup = Setup::new();
+    let running = setup.host.root().join("running");
+    let shell = job_shell(
+        &setup,
+        "\"$KR_ADOPTION_PROGRAM\" --exact the_stand_in_program --test-threads 1",
+        &[(STAND_IN_RUNNING, running.display().to_string())],
+    );
+    let mut typing = Typing::start(&setup.host, shell);
+    let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
+    let mut published = producer.subscribe();
+    let adoptions = Arc::new(setup.adoptions.following(Arc::clone(&producer)));
+    let watching = tokio::spawn(kr_worker::broker::adoption::watch(
+        Arc::clone(&adoptions),
+        Arc::downgrade(&typing.runtime),
+    ));
+    assert_eq!(
+        typing.runtime.session().summary().application_state.0,
+        Some(ApplicationState::ShellReady),
+        "a shell at its prompt is ready"
+    );
+
+    typing.type_in(b"\n");
+    assert!(
+        within(LIVENESS, || typing
+            .runtime
+            .session()
+            .summary()
+            .application_state
+            .0
+            .is_none())
+        .await,
+        "a program holding the terminal has no state of its own"
+    );
+    let program = application_where(&mut published, |held| held.name.is_some()).await;
+    assert_eq!(program.name.as_deref(), Some("claude"));
+    assert_eq!(program.state, None);
+
+    let pid = std::fs::read_to_string(&running)
+        .expect("the program says it is running")
+        .split_whitespace()
+        .next()
+        .and_then(|pid| pid.parse::<i32>().ok())
+        .expect("its process identifier");
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(pid).expect("a process"),
+        rustix::process::Signal::TERM,
+    );
+    let back = application_where(&mut published, |held| held.name.is_none()).await;
+    assert_eq!(back.state, Some(ApplicationState::ShellReady));
+    assert_eq!(
+        typing.runtime.session().summary().application_state.0,
+        Some(ApplicationState::ShellReady),
+        "and the prompt returning is the session's state again"
+    );
+
+    let _ = adoptions.close();
+    tokio::time::timeout(LIVENESS, watching)
+        .await
+        .expect("the watch ends with the session's adoptions")
+        .expect("joined");
+    typing.close().await;
+}
+
+/// KR-REQ-03.27: a program that is a wrapper until it execs is named for what it is when each look
+/// finds it, and the name follows the exec: the application is the wrapper's interpreter while the
+/// wrapper runs and the program once it has replaced it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_03_27_a_wrapper_that_execs_the_program_names_the_program_after_the_exec() {
+    let setup = Setup::new();
+    let go = setup.host.root().join("go");
+    let shell = job_shell(
+        &setup,
+        "sh -c 'while [ ! -e \"$KR_ADOPTION_GO\" ]; do sleep 0.05; done; exec \"$KR_ADOPTION_PROGRAM\" \
+         --exact the_stand_in_program --test-threads 1'",
+        &[("KR_ADOPTION_GO", go.display().to_string())],
+    );
+    let mut typing = Typing::start(&setup.host, shell);
+    let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
+    let mut published = producer.subscribe();
+    let adoptions = Arc::new(setup.adoptions.following(Arc::clone(&producer)));
+    let watching = tokio::spawn(kr_worker::broker::adoption::watch(
+        Arc::clone(&adoptions),
+        Arc::downgrade(&typing.runtime),
+    ));
+
+    typing.type_in(b"\n");
+    let interpreter = std::fs::canonicalize("/bin/sh")
+        .expect("the system shell")
+        .file_name()
+        .expect("a file name")
+        .to_string_lossy()
+        .into_owned();
+    let wrapper = application_where(&mut published, |held| held.name.is_some()).await;
+    assert_eq!(
+        wrapper.name.as_deref(),
+        Some(interpreter.as_str()),
+        "while the wrapper runs, it is what holds the terminal"
+    );
+
+    std::fs::write(&go, b"").expect("lets the wrapper exec");
+    let program = application_where(&mut published, |held| {
+        held.name.as_deref() == Some("claude")
+    })
+    .await;
+    assert_eq!(program.state, None);
+
+    let _ = adoptions.close();
+    tokio::time::timeout(LIVENESS, watching)
+        .await
+        .expect("the watch ends with the session's adoptions")
+        .expect("joined");
+    typing.close().await;
+}
+
+/// KR-REQ-03.27: when the shell's integration answered for exactly one command of the line, that
+/// command names the application, not the interpreter the program happens to run under; a program
+/// is not named until two looks have found the same group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_application() {
+    use kr_worker::application::Following;
+
+    let setup = Setup::new();
+    let started = setup.start();
+    let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
+    let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
+    let mut following = Following::new(Arc::clone(&producer));
+    let answered = vec![("/usr/local/bin/assistant".to_owned(), None)];
+    let foreground = Setup::foreground(&started, answered);
+
+    following.look(Some(&foreground));
+    assert_eq!(
+        producer.application().name,
+        None,
+        "one look is not a program that holds the terminal"
+    );
+    following.look(Some(&foreground));
+    assert_eq!(
+        producer.application().name.as_deref(),
+        Some("assistant"),
+        "the second look that finds the same group names it as the line was typed"
+    );
+    following.look(None);
+    assert_eq!(producer.application().name, None);
+    started.end();
     typing.close().await;
 }
 

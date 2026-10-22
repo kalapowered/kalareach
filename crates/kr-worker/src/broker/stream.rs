@@ -746,9 +746,11 @@ impl Broker {
             if started {
                 instance.turn_id = Some(turn);
                 state.component_changes.notify_one();
+                state.application_changed();
             } else if instance.turn_id.as_ref() == Some(&turn) {
                 instance.turn_id = None;
                 state.component_changes.notify_one();
+                state.application_changed();
             }
         }
         if let Some(path) = reading.leaves.get(method)

@@ -581,6 +581,25 @@ impl Store {
         Ok(questions)
     }
 
+    /// Whether this session has a question that is pending.
+    ///
+    /// One existence read, with no row decoded. It does not apply expiry: a caller that
+    /// wants only questions still open expires first, as [`crate::questions::Questions::any_open`]
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuestionError::Unavailable`] when the read fails.
+    pub fn any_pending(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM questions WHERE state = 'pending')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(QuestionError::unavailable)
+    }
+
     /// Answers a question, if it is still pending at the revision the caller was shown.
     ///
     /// # Errors
