@@ -275,8 +275,13 @@ host can show which challenge, which channel and which signer authorised each de
 An owner device answers from its own ceremony. kr-client's `pairing::owner` reads a host's
 outstanding challenges over the device's authorised connection, describes each in one line, asks
 the platform's ceremony within the challenge's remaining lifetime, and signs on
-`owner_device_presence` only when the person confirmed; the desktop application asks Touch ID, the
-Mac's password or Windows Hello (`docs/companion/README.md`).
+`owner_device_presence` only when the person confirmed. The desktop application asks Touch ID, the
+Mac's password or Windows Hello. A phone asks the system's own prompt: an iPhone shows an alert that
+says what is being confirmed, and on Continue asks Face ID, Touch ID or the passcode; an Android
+phone shows the biometric prompt, a strong biometric with the screen lock as its fallback, or the
+screen lock alone where no strong biometric is set up. A phone that cannot ask one of these lists
+the request and offers no way to confirm it. One request is confirmed at a time, and an iPhone that
+leaves the front drops the request unanswered (`docs/companion/README.md`).
 
 Nothing falls back when that owner is gone. A host whose owner devices are all revoked, with no
 enrolled presence signer and no terminal, refuses every confirmation: the terminal bootstrap stays
