@@ -137,6 +137,10 @@ finish() {
         /bin/rm -f "${xcconfig:?}"
     fi
     [ -z "$plist_saved" ] || cp "$plist_saved" "$plist" 2>/dev/null
+    # The messages the provider stand-in recorded, as the phone was handed them, are kept with the
+    # run: they are the real examples the receivers' decode cases are recorded from.
+    mkdir -p "${artefacts:?}/recorded"
+    cp "$harness"/inject-*.json "$artefacts/recorded/" 2>/dev/null
     /bin/rm -rf "${harness:?}"
 }
 trap finish EXIT
