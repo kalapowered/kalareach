@@ -327,7 +327,7 @@ async fn barrier_for(controller: &Controller, reach: Reach) -> kr_protocol::ids:
 fn grants_reach(bytes: &[u8]) -> Reach {
     let grants: std::collections::BTreeSet<_> = bytes.iter().map(|byte| a_grant(*byte)).collect();
     Reach::Grants {
-        with_input: grants.clone(),
+        holding_leases: grants.clone(),
         grants,
     }
 }
@@ -523,7 +523,7 @@ async fn a_revision_names_the_input_grants_it_reached_and_never_more_than_a_noti
         &controller,
         Reach::Grants {
             grants: many(1, 3),
-            with_input: std::collections::BTreeSet::new(),
+            holding_leases: std::collections::BTreeSet::new(),
         },
     )
     .await;
@@ -538,7 +538,7 @@ async fn a_revision_names_the_input_grants_it_reached_and_never_more_than_a_noti
     let big = |first: u32| {
         let grants = many(first, 3 * bound / 4);
         Reach::Grants {
-            with_input: grants.clone(),
+            holding_leases: grants.clone(),
             grants,
         }
     };
@@ -583,7 +583,7 @@ async fn a_worker_that_missed_a_revision_is_told_each_in_order_by_name() {
             })
             .collect();
         Reach::Grants {
-            with_input: grants.clone(),
+            holding_leases: grants.clone(),
             grants,
         }
     };
@@ -632,7 +632,7 @@ async fn a_worker_told_more_notices_than_a_result_reads_is_told_the_host() {
             })
             .collect();
         Reach::Grants {
-            with_input: grants.clone(),
+            holding_leases: grants.clone(),
             grants,
         }
     };

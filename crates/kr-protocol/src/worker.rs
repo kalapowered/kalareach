@@ -550,8 +550,8 @@ pub enum RevisionReach {
     Within {
         /// The last revision before the ones this describes, which the worker must have fenced.
         since: AuthorityRevision,
-        /// The grants the revisions withdrew that can hold an input lease, with everything
-        /// delegated from them that anyone held.
+        /// The grants the revisions withdrew that can hold an input lease or the size of the
+        /// session, with everything delegated from them that anyone held.
         grants: CanonicalSet<GrantId>,
         /// The devices the revisions withdrew.
         devices: CanonicalSet<DeviceId>,

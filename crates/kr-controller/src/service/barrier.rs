@@ -66,9 +66,10 @@ pub(crate) enum Reach {
     Grants {
         /// Every grant the revocation reached.
         grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
-        /// The ones that carry `terminal.input`, which are the only ones a worker holds an input
-        /// lease under, and so the only ones it is told.
-        with_input: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+        /// The ones that carry `terminal.input` or `terminal.geometry`, which are the only ones a
+        /// worker holds an input lease or the size of a session under, and so the only ones it is
+        /// told.
+        holding_leases: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
     },
 }
 
@@ -873,7 +874,7 @@ impl Controller {
                 .chain(revocation.reached.iter())
                 .copied()
                 .collect(),
-            with_input: revocation.reached_with_input.clone(),
+            holding_leases: revocation.reached_holding_leases.clone(),
         };
         let own = self.publish_debts(&[(debt, reach)]);
         let runtime = tokio::runtime::Handle::try_current().ok()?;
@@ -967,7 +968,7 @@ impl Controller {
             let weight = match &reach {
                 Reach::Host => 0,
                 Reach::Device(_) => 1,
-                Reach::Grants { with_input, .. } => with_input.len(),
+                Reach::Grants { holding_leases, .. } => holding_leases.len(),
             };
             if captured.is_empty()
                 || reach == Reach::Host
@@ -998,8 +999,8 @@ impl Controller {
                 Reach::Device(device_id) => {
                     named.devices.insert(*device_id);
                 }
-                Reach::Grants { with_input, .. } => {
-                    named.grants.extend(with_input.iter().copied());
+                Reach::Grants { holding_leases, .. } => {
+                    named.grants.extend(holding_leases.iter().copied());
                 }
             }
         }
