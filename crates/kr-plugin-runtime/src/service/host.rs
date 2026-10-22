@@ -34,11 +34,14 @@ use kr_protocol::scalars::Uuid;
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
 use kr_plugin_service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
 use kr_plugin_service::protocol::{
-    BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, HostProtocol, Notice,
-    PrepareActionCall, Request, RequestBody, ResponseBody, WireNode,
+    BindingRegistration, CallValue, ComponentSource, DecodeCall, EncodeCall, Frame, HostHealth,
+    HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody, WireNode,
+    WireSourceEvent,
 };
 use kr_plugin_service::vocabulary::{
-    Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, event_of, facts_of,
+    Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, MAX_REQUEST_TEXT_BYTES,
+    ScopedSourceEvent, attachments_of, check_attachments, check_facts, check_snapshot, deadline_of,
+    event_of, facts_of,
 };
 
 use crate::runtime::binding::{
@@ -125,6 +128,10 @@ pub struct PluginHost {
     /// comparison made before it.
     packages: Arc<cap_std::fs::Dir>,
     started: std::time::Instant,
+    /// The pause the notice writers take between taking a notice and writing it, which a test
+    /// holds to stand where a document has left the queue and not yet been written.
+    #[cfg(feature = "testing")]
+    notice_hold: Arc<kr_plugin_service::hold::Hold>,
 }
 
 impl core::fmt::Debug for PluginHost {
@@ -213,7 +220,18 @@ impl PluginHost {
             reads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_READS)),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
+            #[cfg(feature = "testing")]
+            notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
         })
+    }
+
+    /// Holds the notice writers, for the tests of what a connection writes: until the returned hold
+    /// is released a writer that took a notice stops with it in hand, before it takes the
+    /// connection's writer, and writes nothing.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_notice_writes(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.notice_hold.set()
     }
 
     /// Returns the host's own identity.
@@ -309,6 +327,8 @@ impl PluginHost {
             notice_writer,
             Arc::clone(&conversation),
             Arc::clone(&served.registered),
+            #[cfg(feature = "testing")]
+            Arc::clone(&self.notice_hold),
         ));
 
         Arc::clone(&self).read_requests(reader, &served).await;
@@ -366,11 +386,19 @@ impl PluginHost {
             }
             let reply_to = request.request_id;
             let name = request.body.name();
+            if let RequestBody::Privacy { private } = request.body {
+                // Answered by the one function that holds the writer while it sets the flag, so
+                // that the answer is after every document the connection wrote.
+                if !set_privacy(served, reply_to, private).await {
+                    return;
+                }
+                continue;
+            }
             if immediate(&request.body) {
                 // Answered on the reading task, because none of these enters a component: the
                 // answer is this host's own and it is already known.
                 let body = self.answer(request.body, served).await;
-                if !respond(&served.writer, reply_to, name, body).await {
+                if !respond(served, reply_to, name, body).await {
                     return;
                 }
                 continue;
@@ -386,7 +414,7 @@ impl PluginHost {
                     ),
                     disabled: false,
                 };
-                if !respond(&served.writer, reply_to, name, body).await {
+                if !respond(served, reply_to, name, body).await {
                     return;
                 }
                 continue;
@@ -399,7 +427,7 @@ impl PluginHost {
                 // An answer that could not be delivered ends the connection. Leaving the reader
                 // waiting for the next request on a connection whose last answer never arrived
                 // would be serving a worker that cannot hear.
-                if !respond(&served.writer, reply_to, name, body).await {
+                if !respond(&served, reply_to, name, body).await {
                     served.conversation.end();
                 }
             });
@@ -434,7 +462,7 @@ impl PluginHost {
                     match notices.send(notice) {
                         // A dropped document is answered where the loss is reported, because the
                         // binding that lost one is not always the binding that made room.
-                        Offered::Kept | Offered::Dropped => {}
+                        Offered::Kept | Offered::Dropped | Offered::Withheld => {}
                         // What had to arrive would not fit. Nothing further this connection said
                         // could be answered honestly, so it is over.
                         Offered::Overflowed => {
@@ -482,6 +510,11 @@ impl PluginHost {
             }
             RequestBody::Event { binding_id, event } => {
                 let binding = self.binding(served.owner, binding_id)?;
+                // A binding the runtime disabled interprets nothing, and a worker that is told so
+                // stops offering it anything.
+                if let Some(reason) = binding.disabled_reason() {
+                    return Err((reason, true));
+                }
                 let scoped = event_of(&event).map_err(|detail| (detail, false))?;
                 let admission = binding.enqueue_observation(scoped);
                 Ok(admission_of(admission))
@@ -551,6 +584,117 @@ impl PluginHost {
                     }),
                 )
             }
+            RequestBody::Decode(call) => {
+                let DecodeCall {
+                    binding_id,
+                    event,
+                    deadline_ms,
+                } = *call;
+                let deadline = deadline_of(deadline_ms).map_err(refused)?;
+                // A request is a native one with an identifier of the upstream's. Refused here, so
+                // that what a scrape looks like never reaches a component that was asked to
+                // interpret a request.
+                let scoped = native_request_of(&event)?;
+                let binding = self.binding(served.owner, binding_id)?;
+                let result = binding.decode_request(scoped, deadline).await;
+                called_of(result.map(|result| {
+                    (
+                        result.answer.map(|decoded| {
+                            CallValue::Decoded(Box::new(wire::wire_decoded_of(decoded)))
+                        }),
+                        result.document,
+                    )
+                }))
+            }
+            RequestBody::Encode(call) => {
+                let EncodeCall {
+                    binding_id,
+                    request,
+                    decision,
+                    event,
+                    deadline_ms,
+                } = *call;
+                let deadline = deadline_of(deadline_ms).map_err(refused)?;
+                check_snapshot(&request).map_err(refused)?;
+                // The decision is one the request offers and the event is the request's own: the
+                // component is given nothing the broker's record of the request does not say.
+                if decision.len() > MAX_REQUEST_TEXT_BYTES
+                    || !request.offered_decisions.contains(&decision)
+                {
+                    return Err(refused(
+                        "the decision is not one of the decisions the request offers".to_owned(),
+                    ));
+                }
+                let scoped = match event.as_ref() {
+                    None => None,
+                    Some(event) => {
+                        let scoped = native_request_of(event)?;
+                        if event.handle != request.handle
+                            || scoped.request_id.as_deref() != Some(request.request_id.as_str())
+                        {
+                            return Err(refused(
+                                "the event is not the source of the request being answered"
+                                    .to_owned(),
+                            ));
+                        }
+                        Some(scoped)
+                    }
+                };
+                let binding = self.binding(served.owner, binding_id)?;
+                let asked = request.request_id.clone();
+                let result = binding
+                    .encode_response(
+                        wire::request_snapshot_of(&request),
+                        decision,
+                        scoped,
+                        deadline,
+                    )
+                    .await;
+                // What a component answers is its own claim about which request it answered, and
+                // an answer for another request is one it was not asked for.
+                if let Ok(result) = result.as_ref()
+                    && let Ok(encoded) = result.answer.as_ref()
+                    && encoded.request_id != asked
+                {
+                    return Err(refused(
+                        "the component's answer names another request than the one it was asked \
+                         about"
+                            .to_owned(),
+                    ));
+                }
+                called_of(result.map(|result| {
+                    (
+                        result.answer.map(|encoded| {
+                            CallValue::Encoded(Box::new(wire::wire_encoded_of(encoded)))
+                        }),
+                        result.document,
+                    )
+                }))
+            }
+            RequestBody::ReviseFacts { binding_id, facts } => {
+                check_facts(&facts).map_err(refused)?;
+                let binding = self.binding(served.owner, binding_id)?;
+                // The plugin a binding serves is fixed when it is registered.
+                if facts.plugin_id != binding.request().facts.plugin_id {
+                    return Err(refused(
+                        "the facts name another plugin than the binding serves".to_owned(),
+                    ));
+                }
+                binding.set_facts(facts_of(&facts));
+                Ok(ResponseBody::Revised)
+            }
+            RequestBody::ReviseAttachments {
+                binding_id,
+                attachments,
+            } => {
+                check_attachments(&attachments).map_err(refused)?;
+                let binding = self.binding(served.owner, binding_id)?;
+                binding.set_attachments(attachments_of(&attachments));
+                Ok(ResponseBody::Revised)
+            }
+            RequestBody::Privacy { .. } => Err(refused(
+                "privacy is answered by the task that reads this connection".to_owned(),
+            )),
             RequestBody::Unbind { binding_id } => {
                 // Removing a binding waits for its thread, so it happens off the executor. The
                 // handle is taken first so the record can be cleared by identity afterwards: the
@@ -629,6 +773,7 @@ impl PluginHost {
             executable,
             component,
         } = registration;
+        check_facts(&facts).map_err(refused)?;
         let admitted = served.bindings.admit()?;
 
         // Reading a file is blocking work, and a payload is up to sixteen mebibytes. Neither
@@ -1020,8 +1165,11 @@ async fn write_notices(
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     conversation: Arc<Conversation>,
     registered: Registered,
+    #[cfg(feature = "testing")] hold: Arc<kr_plugin_service::hold::Hold>,
 ) {
     while let Some(notice) = notices.recv().await {
+        #[cfg(feature = "testing")]
+        hold.pause().await;
         // A document the worker never received leaves it with a stale view, and the component is
         // the only thing that can rebuild one. Which binding lost a document is the queue's answer
         // rather than any one forwarder's: a document is evicted to make room for whatever needed
@@ -1038,6 +1186,12 @@ async fn write_notices(
         }
         let written = tokio::time::timeout(WRITE_DEADLINE, async {
             let mut writer = writer.lock().await;
+            // Looked at under the writer, which `set_privacy` holds while it sets the flag: a
+            // document is written before the answer that says documents are withheld or is not
+            // written at all, whichever of the two tasks took the lock first.
+            if notices.skips_withheld(&notice) {
+                return Ok(());
+            }
             writer.write_message(&Frame::Notice(notice)).await
         })
         .await;
@@ -1059,16 +1213,18 @@ async fn write_notices(
 ///
 /// An answer that will not fit a frame is this host's failure to bound something, not the
 /// connection's end: the caller is told so by name and the connection carries on.
-async fn respond(
-    writer: &Arc<tokio::sync::Mutex<FrameWriter>>,
-    reply_to: u64,
-    name: &str,
-    body: ResponseBody,
-) -> bool {
+async fn respond(served: &Served, reply_to: u64, name: &str, body: ResponseBody) -> bool {
     // The whole of it, the wait for the writer included: a peer that has stopped reading would
     // otherwise hold this task and every other answer on this connection behind it.
     let written = tokio::time::timeout(WRITE_DEADLINE, async {
-        let mut writer = writer.lock().await;
+        let mut writer = served.writer.lock().await;
+        // Looked at under the writer, as a document is: while documents are withheld the
+        // presentation of a decoded request is as much a document as a notice is.
+        let body = if served.notices.documents_withheld() {
+            without_presentation(body)
+        } else {
+            body
+        };
         match writer
             .write_message(&Frame::Response { reply_to, body })
             .await
@@ -1095,6 +1251,79 @@ async fn respond(
     written.unwrap_or(false)
 }
 
+/// Withholds documents on a connection, or stops, and answers once that holds.
+///
+/// The flag is set while the connection's writer is held, so every document the notice writer
+/// wrote is before the answer in the stream and none is written after it while documents are
+/// withheld. The queue drops what it held for the same reason.
+async fn set_privacy(served: &Served, reply_to: u64, private: bool) -> bool {
+    let written = tokio::time::timeout(WRITE_DEADLINE, async {
+        let mut writer = served.writer.lock().await;
+        served.notices.withhold_documents(private);
+        writer
+            .write_message(&Frame::Response {
+                reply_to,
+                body: ResponseBody::PrivacySet { private },
+            })
+            .await
+            .is_ok()
+    })
+    .await;
+    written.unwrap_or(false)
+}
+
+/// Returns an answer with the presentation of a decoded request left out.
+fn without_presentation(body: ResponseBody) -> ResponseBody {
+    match body {
+        ResponseBody::Called {
+            value: Some(CallValue::Decoded(mut decoded)),
+            fault,
+            document,
+        } => {
+            decoded.presentation.clear();
+            ResponseBody::Called {
+                value: Some(CallValue::Decoded(decoded)),
+                fault,
+                document,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Reads an event that is a native request: a framed message on the connector's own upstream
+/// connection, with the identifier the upstream gave it.
+///
+/// What a scrape or a machine-readable stream shows may look exactly like a request and is not one,
+/// and a component asked to interpret it would be asked to establish authority that bytes of that
+/// provenance do not have.
+fn native_request_of(event: &WireSourceEvent) -> Result<ScopedSourceEvent, (String, bool)> {
+    let scoped = event_of(event).map_err(refused)?;
+    if !scoped.provenance.establishes_native_authority() {
+        return Err(refused(
+            "a scrape does not establish native approval authority, so there is no request to \
+             interpret"
+                .to_owned(),
+        ));
+    }
+    if scoped.request_id.is_none() {
+        return Err(refused(
+            "the event carries no native request identifier".to_owned(),
+        ));
+    }
+    if scoped.bytes.len() as u64 > MAX_NODE_BYTES {
+        return Err(refused(
+            "the request is larger than this host carries to a component".to_owned(),
+        ));
+    }
+    Ok(scoped)
+}
+
+/// The refusal of a request this host will not run: nothing is disabled by it.
+fn refused(detail: String) -> (String, bool) {
+    (detail, false)
+}
+
 /// Returns true for the requests this host answers without entering a component.
 ///
 /// An observation is one of them: it is a queue push, and answering it on the reading task is what
@@ -1106,6 +1335,8 @@ const fn immediate(body: &RequestBody) -> bool {
             | RequestBody::Verify { .. }
             | RequestBody::Event { .. }
             | RequestBody::Health
+            | RequestBody::ReviseFacts { .. }
+            | RequestBody::ReviseAttachments { .. }
     )
 }
 
@@ -1257,6 +1488,8 @@ pub fn callable() -> &'static [CallKind] {
     &[
         CallKind::Snapshot,
         CallKind::PrepareAction,
+        CallKind::DecodeRequest,
+        CallKind::EncodeResponse,
         CallKind::Checkpoint,
         CallKind::Restore,
     ]

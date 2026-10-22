@@ -90,6 +90,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-fixture-hostile-decoder"
+version = "0.1.0"
+dependencies = [
+ "kr-fixture-support",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "kr-fixture-infinite-loop"
 version = "0.1.0"
 dependencies = [

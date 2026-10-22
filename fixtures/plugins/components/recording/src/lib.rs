@@ -4,8 +4,9 @@
 //! offered a component asks the component. This one counts what it was asked to do and keeps, for
 //! each of the last eight events it observed, where the event came from, the request identifier it
 //! carried, how long it was and a digest of its bytes, and the identifiers of the last thirty-two
-//! requests it was offered, however many events came after them. Its checkpoint is that account, in
-//! text, so
+//! requests it was offered, however many events came after them. It also keeps what it reads of its
+//! binding and of the draft's attachments when it is asked for its checkpoint, so that a case reads
+//! what the worker told it. Its checkpoint is that account, in text, so
 //! a case reads it through the client's own `checkpoint`, and a restore from it resumes the count.
 //!
 //! What it does with an event's bytes, so that a case can make it misbehave from outside:
@@ -39,9 +40,11 @@ use exports::kalareach::plugin::adapter::{
     Binding, DecodedRequest, EffectPlan, EncodedResponse, Fault, Guest, NamedArgument,
     RequestSnapshot,
 };
+use kalareach::plugin::attachments;
 use kalareach::plugin::document::{self, Node};
 use kalareach::plugin::source_events::{self, Provenance};
 use kalareach::plugin::types::ActionToken;
+use kalareach::plugin::upstream::{self, Activity};
 
 /// How many events the account keeps.
 const KEPT: usize = 8;
@@ -206,14 +209,36 @@ impl Guest for Component {
 
     fn checkpoint() -> Result<Vec<u8>, Fault> {
         let state = state();
+        let facts = upstream::state();
+        let activity = match facts.activity {
+            Activity::Idle => "idle",
+            Activity::Running => "running",
+            Activity::AwaitingPerson => "awaiting_person",
+            Activity::Ended => "ended",
+        };
+        let attachments: Vec<String> = attachments::current()
+            .iter()
+            .map(|attachment| {
+                format!(
+                    "{}:{}:{}",
+                    attachment.attachment_id, attachment.media_type, attachment.size_bytes
+                )
+            })
+            .collect();
         Ok(format!(
-            "bind={};observe={};snapshot={};restore={};seen={};requests={}",
+            "bind={};observe={};snapshot={};restore={};seen={};requests={};facts={}/{}/{}/{}/{};attachments={}",
             state.binds,
             state.observes,
             state.snapshots,
             state.restores,
             state.seen.join("|"),
-            state.requests.join("|")
+            state.requests.join("|"),
+            facts.binding_revision,
+            activity,
+            facts.thread_id.as_deref().unwrap_or("-"),
+            facts.turn_id.as_deref().unwrap_or("-"),
+            upstream::held_rights().join(","),
+            attachments.join("|")
         )
         .into_bytes())
     }

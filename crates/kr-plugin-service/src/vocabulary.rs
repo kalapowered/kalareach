@@ -12,7 +12,7 @@ use kr_protocol::ids::SourceEventHandle;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;
 
-use crate::protocol::{WireFacts, WireSourceEvent};
+use crate::protocol::{WireAttachment, WireFacts, WireRequestSnapshot, WireSourceEvent};
 
 /// The largest single document node the host will carry.
 ///
@@ -253,6 +253,157 @@ pub struct AttachmentFact {
     pub size_bytes: u64,
     /// When the transfer completed, in milliseconds since the Unix epoch.
     pub completed_at_ms: u64,
+}
+
+/// The longest a call's own deadline may be, in milliseconds.
+///
+/// Every call carries the caller's deadline and holds one of the connection's places for as long as
+/// it runs. The longest a worker asks for is a few seconds; this is what keeps a request that names
+/// no end from holding a place for ever.
+pub const MAX_CALL_DEADLINE_MS: u64 = 30_000;
+
+/// The longest a text a worker gives a component about its binding may be, in bytes: an identifier,
+/// a thread, a turn.
+pub const MAX_FACT_TEXT_BYTES: usize = 1024;
+
+/// How many rights a worker may say the current actor holds.
+pub const MAX_HELD_RIGHTS: usize = 64;
+
+/// How many attachments a worker may say the current draft holds.
+pub const MAX_ATTACHMENTS: usize = 64;
+
+/// The longest an attachment's identifier or media type may be, in bytes.
+pub const MAX_ATTACHMENT_ID_BYTES: usize = 256;
+
+/// The longest an attachment's name may be, in bytes.
+pub const MAX_ATTACHMENT_NAME_BYTES: usize = 1024;
+
+/// The longest a native request's method, identifier or one decision's identifier may be, in bytes.
+pub const MAX_REQUEST_TEXT_BYTES: usize = 256;
+
+/// How many decisions a request may offer.
+pub const MAX_OFFERED_DECISIONS: usize = kr_protocol::broker::MAX_OFFERED_DECISIONS;
+
+/// Checks a call's own deadline, and turns it into a duration.
+///
+/// # Errors
+///
+/// Returns the reason when the deadline is nought or over [`MAX_CALL_DEADLINE_MS`].
+pub fn deadline_of(deadline_ms: u64) -> Result<core::time::Duration, String> {
+    if deadline_ms == 0 || deadline_ms > MAX_CALL_DEADLINE_MS {
+        return Err(format!(
+            "a call's deadline is from 1 to {MAX_CALL_DEADLINE_MS} ms and this one is {deadline_ms}"
+        ));
+    }
+    Ok(core::time::Duration::from_millis(deadline_ms))
+}
+
+/// Checks the facts a worker gives a component against the bounds both ends share.
+///
+/// # Errors
+///
+/// Returns the first bound the facts break.
+pub fn check_facts(facts: &WireFacts) -> Result<(), String> {
+    let texts = [
+        ("plugin_id", Some(facts.plugin_id.as_str())),
+        ("activity", Some(facts.activity.as_str())),
+        ("thread_id", facts.thread_id.as_deref()),
+        ("turn_id", facts.turn_id.as_deref()),
+    ];
+    for (name, text) in texts {
+        if text.is_some_and(|text| text.len() > MAX_FACT_TEXT_BYTES) {
+            return Err(format!(
+                "the facts' {name} is over {MAX_FACT_TEXT_BYTES} bytes"
+            ));
+        }
+    }
+    if facts.held_rights.len() > MAX_HELD_RIGHTS {
+        return Err(format!(
+            "the facts name {} held rights and at most {MAX_HELD_RIGHTS} are carried",
+            facts.held_rights.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the attachments a worker gives a component against the bounds both ends share.
+///
+/// # Errors
+///
+/// Returns the first bound the attachments break.
+pub fn check_attachments(attachments: &[WireAttachment]) -> Result<(), String> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(format!(
+            "{} attachments are named and at most {MAX_ATTACHMENTS} are carried",
+            attachments.len()
+        ));
+    }
+    for attachment in attachments {
+        if attachment.attachment_id.len() > MAX_ATTACHMENT_ID_BYTES
+            || attachment.media_type.len() > MAX_ATTACHMENT_ID_BYTES
+            || attachment.name.len() > MAX_ATTACHMENT_NAME_BYTES
+        {
+            return Err(
+                "an attachment's identifier, name or media type is over its bound".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Checks the broker's record of a pending request against the bounds both ends share.
+///
+/// # Errors
+///
+/// Returns the first bound the record breaks.
+pub fn check_snapshot(request: &WireRequestSnapshot) -> Result<(), String> {
+    if request.request_id.len() > MAX_REQUEST_TEXT_BYTES
+        || request.method.len() > MAX_REQUEST_TEXT_BYTES
+    {
+        return Err("a request's identifier or method is over its bound".to_owned());
+    }
+    if request.offered_decisions.len() > MAX_OFFERED_DECISIONS
+        || request
+            .offered_decisions
+            .iter()
+            .any(|decision| decision.len() > MAX_REQUEST_TEXT_BYTES)
+    {
+        return Err(format!(
+            "a request offers at most {MAX_OFFERED_DECISIONS} decisions of at most \
+             {MAX_REQUEST_TEXT_BYTES} bytes each"
+        ));
+    }
+    Ok(())
+}
+
+/// Turns the attachments a worker sent into the ones a component reads.
+#[must_use]
+pub fn attachments_of(attachments: &[WireAttachment]) -> Vec<AttachmentFact> {
+    attachments
+        .iter()
+        .map(|attachment| AttachmentFact {
+            attachment_id: attachment.attachment_id.clone(),
+            name: attachment.name.clone(),
+            media_type: attachment.media_type.clone(),
+            size_bytes: attachment.size_bytes,
+            completed_at_ms: attachment.completed_at_ms,
+        })
+        .collect()
+}
+
+/// Turns the attachments a component reads into the ones that travel.
+#[must_use]
+pub fn wire_attachments(attachments: &[AttachmentFact]) -> Vec<WireAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| WireAttachment {
+            attachment_id: attachment.attachment_id.clone(),
+            name: attachment.name.clone(),
+            media_type: attachment.media_type.clone(),
+            size_bytes: attachment.size_bytes,
+            completed_at_ms: attachment.completed_at_ms,
+        })
+        .collect()
 }
 
 /// Turns the facts a worker sent into the facts a component reads.

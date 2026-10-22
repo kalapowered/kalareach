@@ -43,16 +43,18 @@ use tokio::sync::oneshot;
 use kr_plugin_sdk::identity::PluginIdentity;
 
 use crate::error::{ServiceError, ServiceResult};
+#[cfg(feature = "testing")]
+use crate::hold::{Hold, HoldHandle};
 use crate::launcher::{self, LaunchError};
 use crate::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream, Offered};
 use crate::protocol::{
-    BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth,
-    HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody, WireNamedArgument,
-    WirePlan, WireToken,
+    BindingRegistration, CallValue, ComponentSource, DecodeCall, EncodeCall, Frame, HostDescriptor,
+    HostHealth, HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody,
+    WireDecoded, WireEncoded, WireNamedArgument, WirePlan, WireRequestSnapshot, WireToken,
 };
 use crate::vocabulary::{
-    Admission, BindingFacts, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, ScopedSourceEvent,
-    wire_event, wire_facts,
+    Admission, AttachmentFact, BindingFacts, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES,
+    ScopedSourceEvent, wire_attachments, wire_event, wire_facts,
 };
 
 /// How long a worker waits for an answer before it stops waiting.
@@ -287,7 +289,7 @@ pub struct PluginClient {
     offered: tokio::sync::mpsc::Sender<Request>,
     offered_bytes: Arc<AtomicU64>,
     #[cfg(feature = "testing")]
-    offer_hold: Arc<OfferHold>,
+    offer_hold: Arc<Hold>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -355,7 +357,7 @@ impl PluginClient {
         let (offered, waiting_events) = tokio::sync::mpsc::channel::<Request>(MAX_OFFERED_EVENTS);
         let offered_bytes = Arc::new(AtomicU64::new(0));
         #[cfg(feature = "testing")]
-        let offer_hold = Arc::new(OfferHold::default());
+        let offer_hold = Arc::new(Hold::default());
         let offer_task = tokio::spawn(write_offered(
             waiting_events,
             Arc::clone(&writer),
@@ -539,7 +541,7 @@ impl PluginClient {
     /// it, until the returned hold is released. For the tests of a crate that drives this client.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn hold_offered_writes(&self) -> OfferHoldHandle {
+    pub fn hold_offered_writes(&self) -> HoldHandle {
         self.offer_hold.set()
     }
 
@@ -580,7 +582,9 @@ impl PluginClient {
                     detail: format!("{other} is not an admission this client knows"),
                 }),
             },
-            ResponseBody::Refused { detail, .. } => Err(ServiceError::Protocol { detail }),
+            ResponseBody::Refused {
+                detail, disabled, ..
+            } => Err(refused(detail, disabled)),
             other => Err(protocol_error(&other)),
         }
     }
@@ -715,6 +719,139 @@ impl PluginClient {
         .await
     }
 
+    /// Asks a binding's component to interpret one native request.
+    ///
+    /// The component returns a proposal and sends nothing. What it returns is data to compare with
+    /// the request the caller holds, and not something to believe: the caller checks the identifier
+    /// it names, the decisions it offers and the length of what it says.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal, [`ServiceError::Disabled`] and [`ServiceError::Unavailable`] as
+    /// [`Self::prepare_action`] does, and a refusal at once, with the connection untouched, for a
+    /// request no frame could carry.
+    pub async fn decode(
+        &self,
+        binding_id: BindingId,
+        event: &ScopedSourceEvent,
+        deadline: core::time::Duration,
+    ) -> ServiceResult<Called> {
+        self.call_that_fits(
+            RequestBody::Decode(Box::new(DecodeCall {
+                binding_id: binding_id.get(),
+                event: wire_event(event),
+                deadline_ms: millis(deadline),
+            })),
+            deadline,
+        )
+        .await
+    }
+
+    /// Asks a binding's component to encode a decision the caller validated as the bytes of a
+    /// response.
+    ///
+    /// The bytes come back and have not gone anywhere: the host has no way to send them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decode`].
+    pub async fn encode(
+        &self,
+        binding_id: BindingId,
+        request: WireRequestSnapshot,
+        decision: &str,
+        event: Option<&ScopedSourceEvent>,
+        deadline: core::time::Duration,
+    ) -> ServiceResult<Called> {
+        self.call_that_fits(
+            RequestBody::Encode(Box::new(EncodeCall {
+                binding_id: binding_id.get(),
+                request,
+                decision: decision.to_owned(),
+                event: event.map(wire_event),
+                deadline_ms: millis(deadline),
+            })),
+            deadline,
+        )
+        .await
+    }
+
+    /// Replaces the facts a binding's component reads about its bound execution.
+    ///
+    /// Answered when the host has accepted them. The component sees them in its next call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal or [`ServiceError::Unavailable`].
+    pub async fn revise_facts(
+        &self,
+        binding_id: BindingId,
+        facts: &BindingFacts,
+    ) -> ServiceResult<()> {
+        let body = self
+            .request(RequestBody::ReviseFacts {
+                binding_id: binding_id.get(),
+                facts: wire_facts(facts),
+            })
+            .await?;
+        revised(body)
+    }
+
+    /// Replaces the attachments a binding's component reads the current draft as holding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revise_facts`], and a refusal at once for a request no frame could carry.
+    pub async fn revise_attachments(
+        &self,
+        binding_id: BindingId,
+        attachments: &[AttachmentFact],
+    ) -> ServiceResult<()> {
+        let request = RequestBody::ReviseAttachments {
+            binding_id: binding_id.get(),
+            attachments: wire_attachments(attachments),
+        };
+        check_fits(&request)?;
+        revised(self.request(request).await?)
+    }
+
+    /// Tells the host whether privacy mode stands for the worker this connection serves.
+    ///
+    /// The answer comes once the host holds it: from then on, until it is told otherwise, no
+    /// document of this connection is written and no decoded request carries its presentation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal or [`ServiceError::Unavailable`], and a protocol error for an
+    /// answer that says something other than what was asked.
+    pub async fn privacy(&self, private: bool) -> ServiceResult<()> {
+        let body = self.request(RequestBody::Privacy { private }).await?;
+        match body {
+            ResponseBody::PrivacySet { private: held } if held == private => Ok(()),
+            ResponseBody::PrivacySet { private: held } => Err(ServiceError::Protocol {
+                detail: format!("privacy mode was set to {held} and the request said {private}"),
+            }),
+            ResponseBody::Refused {
+                detail, disabled, ..
+            } => Err(refused(detail, disabled)),
+            other => Err(protocol_error(&other)),
+        }
+    }
+
+    /// Makes a call after checking that its request fits one frame.
+    ///
+    /// A request that will not encode once the writer is taken ends the connection, which is the
+    /// right end for a connection that cannot be written and the wrong one for a caller that asked
+    /// for too much.
+    async fn call_that_fits(
+        &self,
+        body: RequestBody,
+        deadline: core::time::Duration,
+    ) -> ServiceResult<Called> {
+        check_fits(&body)?;
+        self.call(body, deadline).await
+    }
+
     async fn call(
         &self,
         body: RequestBody,
@@ -732,27 +869,26 @@ impl PluginClient {
                 fault,
                 document,
             } => {
-                let (state, plan) = match value {
-                    Some(CallValue::State(state)) => (Some(state), None),
-                    Some(CallValue::Plan(plan)) => (None, Some(*plan)),
-                    Some(CallValue::Document) | None => (None, None),
-                };
-                Ok(Called {
-                    state,
-                    plan,
+                let mut called = Called {
+                    state: None,
+                    plan: None,
+                    decoded: None,
+                    encoded: None,
                     fault,
                     document,
-                })
+                };
+                match value {
+                    Some(CallValue::State(state)) => called.state = Some(state),
+                    Some(CallValue::Plan(plan)) => called.plan = Some(*plan),
+                    Some(CallValue::Decoded(decoded)) => called.decoded = Some(*decoded),
+                    Some(CallValue::Encoded(encoded)) => called.encoded = Some(*encoded),
+                    Some(CallValue::Document) | None => {}
+                }
+                Ok(called)
             }
             ResponseBody::Refused {
                 detail, disabled, ..
-            } => {
-                if disabled {
-                    Err(ServiceError::Disabled { reason: detail })
-                } else {
-                    Err(ServiceError::Protocol { detail })
-                }
-            }
+            } => Err(refused(detail, disabled)),
             other => Err(protocol_error(&other)),
         }
     }
@@ -892,6 +1028,10 @@ pub struct Called {
     pub state: Option<Vec<u8>>,
     /// The effect the component proposed, where the call is `prepare-action` and it answered.
     pub plan: Option<WirePlan>,
+    /// The request the component decoded, where the call is `decode-request` and it answered.
+    pub decoded: Option<WireDecoded>,
+    /// The response the component encoded, where the call is `encode-response` and it answered.
+    pub encoded: Option<WireEncoded>,
     /// The fault the component declared, where it declared one.
     pub fault: Option<String>,
     /// Which of this binding's documents the call drew, where it drew one.
@@ -930,7 +1070,7 @@ async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: No
                 // trust to tell it when a binding stops working, so it ends here rather than
                 // carrying on with a partial account.
                 match notices.send(notice) {
-                    Offered::Kept | Offered::Dropped => {}
+                    Offered::Kept | Offered::Dropped | Offered::Withheld => {}
                     Offered::Overflowed | Offered::Closed => break,
                 }
             }
@@ -946,7 +1086,7 @@ async fn write_offered(
     writer: Writer,
     held: Arc<AtomicU64>,
     pending: Arc<Pending>,
-    #[cfg(feature = "testing")] hold: Arc<OfferHold>,
+    #[cfg(feature = "testing")] hold: Arc<Hold>,
 ) {
     while let Some(request) = offered.recv().await {
         let cost = offered_bytes_of(&request);
@@ -1008,87 +1148,6 @@ async fn write_offered(
     }
 }
 
-/// The pause the writer of offered events takes, for the tests of a crate that drives this client.
-#[cfg(feature = "testing")]
-#[derive(Debug, Default)]
-struct OfferHold {
-    state: Mutex<Option<Arc<OfferHoldState>>>,
-    wake: tokio::sync::Notify,
-}
-
-#[cfg(feature = "testing")]
-#[derive(Debug, Default)]
-struct OfferHoldState {
-    parked: AtomicBool,
-    released: AtomicBool,
-}
-
-#[cfg(feature = "testing")]
-impl OfferHold {
-    fn set(self: &Arc<Self>) -> OfferHoldHandle {
-        let state = Arc::new(OfferHoldState::default());
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
-        OfferHoldHandle {
-            state,
-            hold: Arc::clone(self),
-        }
-    }
-
-    /// Waits while a test holds the writer, and records that the writer has reached the hold.
-    async fn pause(&self) {
-        loop {
-            let held = {
-                let mut slot = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match slot.as_ref() {
-                    None => return,
-                    Some(state) if state.released.load(Ordering::Acquire) => {
-                        *slot = None;
-                        return;
-                    }
-                    Some(state) => {
-                        state.parked.store(true, Ordering::Release);
-                        Arc::clone(state)
-                    }
-                }
-            };
-            if held.released.load(Ordering::Acquire) {
-                continue;
-            }
-            self.wake.notified().await;
-        }
-    }
-}
-
-/// A hold on the writer of offered events. While it is held the writer stops with an event in hand,
-/// taken off the queue and not yet written, and writes nothing.
-#[cfg(feature = "testing")]
-#[derive(Debug)]
-pub struct OfferHoldHandle {
-    state: Arc<OfferHoldState>,
-    hold: Arc<OfferHold>,
-}
-
-#[cfg(feature = "testing")]
-impl OfferHoldHandle {
-    /// Returns true once the writer has an event in hand and has stopped at the hold.
-    #[must_use]
-    pub fn parked(&self) -> bool {
-        self.state.parked.load(Ordering::Acquire)
-    }
-
-    /// Lets the writer go on.
-    pub fn release(&self) {
-        self.state.released.store(true, Ordering::Release);
-        self.hold.wake.notify_one();
-    }
-}
-
 /// Gives back what one offered event reserved.
 fn release(held: &AtomicU64, cost: u64) {
     let _released = held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
@@ -1113,6 +1172,51 @@ fn offered_bytes_of(request: &Request) -> u64 {
     match &request.body {
         RequestBody::Event { event, .. } => offered_cost(event),
         _ => 0,
+    }
+}
+
+/// Turns the host's refusal into the error a caller reads: a binding the host disabled is not a
+/// request it refused.
+fn refused(detail: String, disabled: bool) -> ServiceError {
+    if disabled {
+        ServiceError::Disabled { reason: detail }
+    } else {
+        ServiceError::Protocol { detail }
+    }
+}
+
+/// Reads the answer to a revision.
+fn revised(body: ResponseBody) -> ServiceResult<()> {
+    match body {
+        ResponseBody::Revised => Ok(()),
+        ResponseBody::Refused {
+            detail, disabled, ..
+        } => Err(refused(detail, disabled)),
+        other => Err(protocol_error(&other)),
+    }
+}
+
+/// Checks that a request encodes to one frame the host reads.
+///
+/// # Errors
+///
+/// Returns a protocol error, and writes nothing, when it does not.
+fn check_fits(body: &RequestBody) -> ServiceResult<()> {
+    let request = Request {
+        request_id: u64::MAX,
+        body: body.clone(),
+    };
+    let fits = kr_cbor::to_canonical_vec(&request)
+        .is_ok_and(|encoded| encoded.len() <= StreamKind::Control.max_payload_len());
+    if fits {
+        Ok(())
+    } else {
+        Err(ServiceError::Protocol {
+            detail: format!(
+                "the {} request is larger than one frame carries",
+                body.name()
+            ),
+        })
     }
 }
 
@@ -1164,6 +1268,8 @@ mod tests {
         let answered = Called {
             state: None,
             plan: None,
+            decoded: None,
+            encoded: None,
             fault: None,
             document: Some(1),
         };
@@ -1171,6 +1277,8 @@ mod tests {
         let refused = Called {
             state: None,
             plan: None,
+            decoded: None,
+            encoded: None,
             fault: Some("refused: not mine".to_owned()),
             document: None,
         };

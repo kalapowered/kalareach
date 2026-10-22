@@ -1237,3 +1237,536 @@ async fn a_plugin_runtime_of_an_earlier_protocol_is_refused_at_the_handshake() {
         received.lock().expect("not poisoned")
     );
 }
+
+/// Registers a component by name and returns the client and the binding.
+async fn registered(
+    served: &Served,
+    name: &str,
+    seed: u8,
+) -> Option<(PluginClient, kr_plugin_service::vocabulary::BindingId)> {
+    let wasm = components::component(name)?;
+    let client = served.client().await;
+    let (path, digest, bytes) = served.install(name, &wasm);
+    let request = components::request(name, seed);
+    client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &ComponentSource {
+                path,
+                digest,
+                bytes,
+            },
+        )
+        .await
+        .expect("the binding registers");
+    Some((client, request.binding_id))
+}
+
+/// The broker's record of a pending request, as the plugin contract reads it.
+fn pending_request(
+    request_id: &str,
+    method: &str,
+) -> kr_plugin_service::protocol::WireRequestSnapshot {
+    kr_plugin_service::protocol::WireRequestSnapshot {
+        request_id: request_id.to_owned(),
+        handle: kr_protocol::ids::SourceEventHandle::new("se-1").expect("a bounded handle"),
+        method: method.to_owned(),
+        class: kr_plugin_service::protocol::WireMethodClass::Mutation,
+        received_at_ms: 1_700_000_000_002,
+        deadline_at_ms: None,
+        offered_decisions: vec!["allow".to_owned(), "deny".to_owned()],
+        binding_revision: 3,
+    }
+}
+
+/// What a component says it holds, read from its checkpoint.
+async fn account_of(
+    client: &PluginClient,
+    binding_id: kr_plugin_service::vocabulary::BindingId,
+) -> String {
+    let state = client
+        .checkpoint(binding_id, core::time::Duration::from_millis(500))
+        .await
+        .expect("the checkpoint runs")
+        .state
+        .expect("the component has state");
+    String::from_utf8(state).expect("the account is text")
+}
+
+// KR-REQ-06.07: a request is decoded from the bytes and the provenance the broker retained it
+// with, and what a scrape or an identifier-less event looks like is refused by the host before any
+// component runs. The same binding decodes the request first, so a host that refused every decode
+// would not pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_06_07_a_native_request_is_decoded_and_a_scrape_or_an_unnamed_request_is_refused_before_a_component_runs()
+ {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "hostile-decoder", 11).await else {
+        return;
+    };
+    let deadline = core::time::Duration::from_millis(500);
+
+    let request = components::native_request("se-1", "7", "a request to write");
+    let called = client
+        .decode(binding_id, &request, deadline)
+        .await
+        .expect("a native request is decoded");
+    let decoded = called.decoded.expect("the component's proposal came back");
+    assert_eq!(decoded.request_id, "7");
+    assert_eq!(decoded.decisions, ["allow", "deny"]);
+    assert!(!decoded.summary.is_empty());
+    assert_eq!(decoded.presentation.len(), 1);
+    let account = account_of(&client, binding_id).await;
+    assert!(
+        account.contains("decode=1;") && account.contains("native_protocol/7/18/"),
+        "the component was given {account}"
+    );
+
+    // A terminal scrape that looks exactly like a request is not one.
+    let scrape = components::scrape("se-2", "a request to write");
+    let refused = client
+        .decode(binding_id, &scrape, deadline)
+        .await
+        .expect_err("a scrape is not a request");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { detail } if detail.contains("scrape")),
+        "{refused}"
+    );
+    // A native event with no identifier names nothing to answer.
+    let unnamed = kr_plugin_service::vocabulary::ScopedSourceEvent::new(
+        kr_protocol::ids::SourceEventHandle::new("se-3").expect("a bounded handle"),
+        kr_plugin_service::vocabulary::SourceProvenance::NativeProtocol,
+        1_700_000_000_003,
+        None,
+        b"a notification".to_vec(),
+    );
+    let refused = client
+        .decode(binding_id, &unnamed, deadline)
+        .await
+        .expect_err("an event with no identifier is not a request");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { detail } if detail.contains("identifier")),
+        "{refused}"
+    );
+    // Neither reached the component.
+    assert!(
+        account_of(&client, binding_id).await.contains("decode=1;"),
+        "a component was asked to decode what the host refused"
+    );
+}
+
+// KR-REQ-11.21: an encode returns the bytes of a response for an offered decision and has nowhere
+// to send them. What the host can see is wrong with the question is refused before the component
+// runs, and what it cannot see until the answer is back is refused when it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_21_an_encode_returns_bytes_for_an_offered_decision_and_what_is_wrong_is_refused()
+{
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "hostile-decoder", 12).await else {
+        return;
+    };
+    let deadline = core::time::Duration::from_millis(500);
+    let source = components::native_request("se-1", "7", "a request to write");
+
+    let called = client
+        .encode(
+            binding_id,
+            pending_request("7", "session/request_permission"),
+            "allow",
+            Some(&source),
+            deadline,
+        )
+        .await
+        .expect("an offered decision is encoded");
+    let encoded = called.encoded.expect("the component's bytes came back");
+    assert_eq!(encoded.request_id, "7");
+    assert_eq!(encoded.bytes, br#"{"id":"7","result":"allow"}"#);
+
+    // A decision the request does not offer, an event that is not the request's, and an event of
+    // another request: refused by the host, so the component is not asked.
+    for (name, request, decision, event) in [
+        (
+            "unoffered",
+            pending_request("7", "session/request_permission"),
+            "reboot",
+            Some(&source),
+        ),
+        (
+            "another source",
+            pending_request("8", "session/request_permission"),
+            "allow",
+            Some(&source),
+        ),
+    ] {
+        let refused = client
+            .encode(binding_id, request, decision, event, deadline)
+            .await
+            .expect_err(name);
+        assert!(
+            matches!(&refused, ServiceError::Protocol { .. }),
+            "{name}: {refused}"
+        );
+    }
+    // A component that answers another request than the one it was asked about is refused when it
+    // does, after it ran.
+    let refused = client
+        .encode(
+            binding_id,
+            pending_request("7", "!other-request"),
+            "allow",
+            None,
+            deadline,
+        )
+        .await
+        .expect_err("another request's answer is not this request's");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { detail } if detail.contains("another request")),
+        "{refused}"
+    );
+    let account = account_of(&client, binding_id).await;
+    assert!(
+        account.contains("encode=2;"),
+        "the component ran {account}: once for the answer and once for the one the host refused after"
+    );
+}
+
+// KR-REQ-11.38, KR-REQ-11.40: a decode and an encode that never return are stopped by their
+// bounds, each counts as a fault, and the third in a minute disables the binding: the host then
+// refuses a decode and an event as a disabled binding's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_38_a_decode_and_an_encode_that_never_return_are_stopped_and_the_third_fault_disables_the_binding()
+ {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "hostile-decoder", 13).await else {
+        return;
+    };
+    let deadline = core::time::Duration::from_millis(500);
+    let spinning = components::native_request("se-1", "7", "!spin");
+
+    for _ in 0..2 {
+        let stopped = client
+            .decode(binding_id, &spinning, deadline)
+            .await
+            .expect_err("a decode that never returns is refused by the host");
+        assert!(
+            matches!(&stopped, ServiceError::Protocol { detail } if detail.contains("decode-request")),
+            "{stopped}"
+        );
+    }
+    let stopped = client
+        .encode(
+            binding_id,
+            pending_request("7", "!spin"),
+            "allow",
+            None,
+            deadline,
+        )
+        .await
+        .expect_err("an encode that never returns is refused by the host");
+    assert!(
+        matches!(&stopped, ServiceError::Protocol { detail } if detail.contains("encode-response")),
+        "{stopped}"
+    );
+
+    let honest = components::native_request("se-2", "8", "a request to write");
+    let disabled = client
+        .decode(binding_id, &honest, deadline)
+        .await
+        .expect_err("the third fault disabled the binding");
+    assert!(
+        matches!(&disabled, ServiceError::Disabled { .. }),
+        "{disabled}"
+    );
+    // What an offered event is told is the same, so a worker stops offering it.
+    let offered = client
+        .deliver(binding_id, &components::scrape("se-3", "building"))
+        .await
+        .expect_err("a disabled binding takes no events");
+    assert!(
+        matches!(&offered, ServiceError::Disabled { .. }),
+        "{offered}"
+    );
+    let watchdog = std::time::Instant::now();
+    loop {
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(30),
+            "the host never said the binding was disabled"
+        );
+        if let Some(Notice::Disabled {
+            binding_id: told, ..
+        }) = client.notice().await
+        {
+            assert_eq!(told, binding_id.get());
+            break;
+        }
+    }
+}
+
+// KR-REQ-24.27: once the host has acknowledged that privacy mode stands, no document of the
+// connection is written, though one was taken off the queue before and is held at the writer when
+// the acknowledgement is made; and when privacy mode ends the reader is told that documents were
+// lost, so it expects a fresh one, which the component is asked to draw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_27_no_document_is_written_after_privacy_mode_is_acknowledged_and_a_fresh_one_follows_its_end()
+ {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "hostile-decoder", 14).await else {
+        return;
+    };
+    let deadline = core::time::Duration::from_millis(500);
+
+    // A document taken off the queue and held at the writer.
+    let hold = served.host.hold_notice_writes();
+    let first = client
+        .snapshot(binding_id, deadline)
+        .await
+        .expect("the snapshot runs");
+    assert_eq!(first.document, Some(1));
+    let watchdog = std::time::Instant::now();
+    while !hold.parked() {
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(60),
+            "the writer never took the document off the queue"
+        );
+        tokio::task::yield_now().await;
+    }
+    client
+        .privacy(true)
+        .await
+        .expect("privacy mode is acknowledged");
+    hold.release();
+
+    // A fault is a notice that is not a document, and it is written after the document the writer
+    // held: reading it says the writer is past that document, and nothing it wrote in between
+    // may be one.
+    client
+        .decode(
+            binding_id,
+            &components::native_request("se-2", "8", "!trap"),
+            deadline,
+        )
+        .await
+        .expect_err("a decode that traps is refused");
+    loop {
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(60),
+            "the fault was never written"
+        );
+        match client.notice().await.expect("the connection is open") {
+            Notice::Document { document, .. } => {
+                panic!("document {document} was written after privacy mode was acknowledged")
+            }
+            Notice::Fault { .. } => break,
+            Notice::Gap { .. } | Notice::Disabled { .. } => {}
+        }
+    }
+
+    // Privacy mode ends: the reader is told documents were lost, and a fresh one follows.
+    client
+        .privacy(false)
+        .await
+        .expect("the end is acknowledged");
+    let mut lost = false;
+    loop {
+        assert!(
+            watchdog.elapsed() < core::time::Duration::from_secs(60),
+            "no fresh document followed the end of privacy mode"
+        );
+        match client.notice().await.expect("the connection is open") {
+            Notice::Gap { documents, .. } if documents > 0 => lost = true,
+            Notice::Document { document, last, .. } => {
+                assert!(
+                    lost,
+                    "a document arrived before the reader was told some were lost"
+                );
+                assert_ne!(document, 1, "the document held at the writer was written");
+                if last {
+                    break;
+                }
+            }
+            Notice::Gap { .. } | Notice::Fault { .. } | Notice::Disabled { .. } => {}
+        }
+    }
+}
+
+// KR-REQ-24.27: a decoded request's presentation is a document too, and is not sent while privacy
+// mode stands. What the worker uses of it, the summary and the decisions, is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_24_27_a_decoded_request_carries_no_presentation_while_privacy_mode_stands() {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "hostile-decoder", 15).await else {
+        return;
+    };
+    let deadline = core::time::Duration::from_millis(500);
+    let request = components::native_request("se-1", "7", "a request to write");
+
+    client
+        .privacy(true)
+        .await
+        .expect("privacy mode is acknowledged");
+    let private = client
+        .decode(binding_id, &request, deadline)
+        .await
+        .expect("a request is decoded in privacy mode")
+        .decoded
+        .expect("the proposal came back");
+    assert!(private.presentation.is_empty());
+    assert!(!private.summary.is_empty());
+    assert_eq!(private.decisions, ["allow", "deny"]);
+
+    client
+        .privacy(false)
+        .await
+        .expect("the end is acknowledged");
+    let open = client
+        .decode(binding_id, &request, deadline)
+        .await
+        .expect("a request is decoded")
+        .decoded
+        .expect("the proposal came back");
+    assert_eq!(open.presentation.len(), 1);
+}
+
+// What a worker tells a binding's component about its execution and its draft is what the component
+// reads in its next call, however many revisions came before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_of_a_bindings_facts_and_attachments_is_what_its_component_reads_next() {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "recording", 16).await else {
+        return;
+    };
+    let before = account_of(&client, binding_id).await;
+    assert!(
+        before.contains("facts=3/running/thread-1/turn-1/"),
+        "the component was registered with {before}"
+    );
+
+    let mut facts = components::facts("recording");
+    facts.binding_revision = 9;
+    facts.activity = kr_plugin_service::vocabulary::BindingActivity::AwaitingPerson;
+    facts.thread_id = Some("thread-9".to_owned());
+    facts.turn_id = None;
+    facts.held_rights = Vec::new();
+    client
+        .revise_facts(binding_id, &facts)
+        .await
+        .expect("the facts are accepted");
+    client
+        .revise_attachments(
+            binding_id,
+            &[
+                kr_plugin_service::vocabulary::AttachmentFact {
+                    attachment_id: "att-1".to_owned(),
+                    name: "a picture".to_owned(),
+                    media_type: "image/png".to_owned(),
+                    size_bytes: 1024,
+                    completed_at_ms: 1_700_000_000_100,
+                },
+                kr_plugin_service::vocabulary::AttachmentFact {
+                    attachment_id: "att-2".to_owned(),
+                    name: "notes".to_owned(),
+                    media_type: "text/plain".to_owned(),
+                    size_bytes: 5,
+                    completed_at_ms: 1_700_000_000_200,
+                },
+            ],
+        )
+        .await
+        .expect("the attachments are accepted");
+    let after = account_of(&client, binding_id).await;
+    assert!(
+        after.contains("facts=9/awaiting_person/thread-9/-/;attachments=att-1:image/png:1024|att-2:text/plain:5"),
+        "the component reads {after}"
+    );
+}
+
+// What a worker may ask is bounded, and what is refused for being beyond a bound costs nothing: the
+// binding goes on, and nothing reached its component.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_or_a_call_beyond_its_bounds_is_refused_and_the_binding_goes_on() {
+    let served = Served::start().await;
+    let Some((client, binding_id)) = registered(&served, "hostile-decoder", 17).await else {
+        return;
+    };
+    let request = components::native_request("se-1", "7", "a request to write");
+
+    // A deadline of nothing or of half a minute and more is not a deadline.
+    for deadline in [
+        core::time::Duration::from_millis(0),
+        core::time::Duration::from_secs(31),
+    ] {
+        let refused = client
+            .decode(binding_id, &request, deadline)
+            .await
+            .expect_err("a call's deadline is bounded");
+        assert!(
+            matches!(&refused, ServiceError::Protocol { detail } if detail.contains("deadline")),
+            "{refused}"
+        );
+    }
+    // Facts of another plugin, and facts longer than a fact is.
+    let mut facts = components::facts("hostile-decoder");
+    facts.plugin_id = "kalareach/another".to_owned();
+    let refused = client
+        .revise_facts(binding_id, &facts)
+        .await
+        .expect_err("a binding serves one plugin");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { .. }),
+        "{refused}"
+    );
+    let mut facts = components::facts("hostile-decoder");
+    facts.thread_id = Some("t".repeat(2_000));
+    let refused = client
+        .revise_facts(binding_id, &facts)
+        .await
+        .expect_err("a fact is bounded");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { .. }),
+        "{refused}"
+    );
+    // More attachments than a draft holds.
+    let many: Vec<kr_plugin_service::vocabulary::AttachmentFact> = (0..65)
+        .map(|number| kr_plugin_service::vocabulary::AttachmentFact {
+            attachment_id: format!("att-{number}"),
+            name: "n".to_owned(),
+            media_type: "text/plain".to_owned(),
+            size_bytes: 1,
+            completed_at_ms: 1,
+        })
+        .collect();
+    let refused = client
+        .revise_attachments(binding_id, &many)
+        .await
+        .expect_err("a draft's attachments are bounded");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { .. }),
+        "{refused}"
+    );
+    // A request no frame could carry is refused by the client, which writes nothing, and the
+    // connection is the same one afterwards.
+    let huge = kr_plugin_service::vocabulary::ScopedSourceEvent::new(
+        kr_protocol::ids::SourceEventHandle::new("se-4").expect("a bounded handle"),
+        kr_plugin_service::vocabulary::SourceProvenance::NativeProtocol,
+        1_700_000_000_004,
+        Some("9".to_owned()),
+        vec![b'x'; 1_100_000],
+    );
+    let refused = client
+        .decode(binding_id, &huge, core::time::Duration::from_millis(500))
+        .await
+        .expect_err("a request larger than a frame is refused");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { detail } if detail.contains("frame")),
+        "{refused}"
+    );
+    // None of it reached the component, and the binding decodes.
+    assert!(account_of(&client, binding_id).await.contains("decode=0;"));
+    client
+        .decode(binding_id, &request, core::time::Duration::from_millis(500))
+        .await
+        .expect("the binding goes on");
+}

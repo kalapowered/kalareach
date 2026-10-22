@@ -1112,6 +1112,17 @@ impl BindingHandle {
             .await
     }
 
+    /// Replaces the facts the component reads about its binding.
+    ///
+    /// Coalesced: a revision no call has yet seen is replaced by the next, and the component is told
+    /// the current facts before its next call, never an older revision after a newer one.
+    pub fn set_facts(&self, facts: BindingFacts) {
+        if let Ok(mut slot) = self.pending.facts.lock() {
+            *slot = Some(facts);
+        }
+        self.wake();
+    }
+
     /// Replaces the attachments the current draft holds. Coalesced, as the facts are.
     pub fn set_attachments(&self, attachments: Vec<AttachmentFact>) {
         if let Ok(mut slot) = self.pending.attachments.lock() {
