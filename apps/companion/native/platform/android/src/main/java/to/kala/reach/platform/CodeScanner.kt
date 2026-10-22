@@ -118,24 +118,24 @@ class CodeScanner(
         val view = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
         // A host's direct invitation is a version-23 code, 109 modules wide: it needs more
         // than the default analysis resolution to be read from a hand's length.
-        val selector = ResolutionSelector.Builder()
+        val resolution = ResolutionSelector.Builder()
             .setResolutionStrategy(
                 ResolutionStrategy(Size(1920, 1080), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER),
             )
             .build()
         val frames = ImageAnalysis.Builder()
-            .setResolutionSelector(selector)
+            .setResolutionSelector(resolution)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
         frames.setAnalyzer(analysis) { frame -> analyse(frame) }
         cameraProvider.unbindAll()
         // The back camera, and a device that has only the front one reads with that.
-        val selector = if (cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
+        val lens = if (cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
             CameraSelector.DEFAULT_BACK_CAMERA
         } else {
             CameraSelector.DEFAULT_FRONT_CAMERA
         }
-        val bound = cameraProvider.bindToLifecycle(activity, selector, view, frames)
+        val bound = cameraProvider.bindToLifecycle(activity, lens, view, frames)
         camera = bound
         // A camera another application takes, or one a policy turns off, closes with an error: the
         // scan ends and says the camera could not be used, rather than showing a black screen.
