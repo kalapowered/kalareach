@@ -271,11 +271,16 @@ async fn kr_req_11_38_a_full_lane_loses_the_oldest_observations_and_never_the_re
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_stopped_reading() {
     let gate = std::env::temp_dir().join(format!("kr-observe-gate-{}", kr_ipc::new_uuid()));
+    let begun = std::env::temp_dir().join(format!("kr-observe-begun-{}", kr_ipc::new_uuid()));
     let ask = "printf '\\033[c'; answer=$(dd bs=1 count=9 2>/dev/null | tr -d '\\033')";
+    // The shell says nothing until it is told the component is ready: what was printed before that
+    // predates the component's view.
     let shell = format!(
-        "stty -icanon -echo min 1 time 0 2>/dev/null; echo kalareach-0; {ask}; echo \"answered-0-$answer\"; \
+        "stty -icanon -echo min 1 time 0 2>/dev/null; while [ ! -e '{begun}' ]; do sleep 0.05; done; \
+         echo kalareach-0; {ask}; echo \"answered-0-$answer\"; \
          while [ ! -e '{gate}' ]; do sleep 0.05; done; yes x | head -c 8000000; echo kalareach-1; \
          {ask}; echo \"answered-1-$answer\"; echo kalareach-done",
+        begun = begun.display(),
         gate = gate.display()
     );
     let Some(world) = Observing::start(Options {
@@ -287,6 +292,7 @@ async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_
         return;
     };
     world.until_ready(1).await;
+    std::fs::write(&begun, b"").expect("the shell may begin");
     until(
         "the shell to ask its first question and be answered",
         || async { world.output().contains("answered-0-").then_some(()) },
@@ -343,6 +349,7 @@ async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_
     world.until_ready(1).await;
     assert!(world.broker().rich_disabled(binding(1)).is_none());
     let _ = std::fs::remove_file(&gate);
+    let _ = std::fs::remove_file(&begun);
 }
 
 /// KR-REQ-11.38: an observation the component never returns from is stopped by its bound, which the
