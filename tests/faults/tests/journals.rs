@@ -140,6 +140,8 @@ fn a_stored_intent_and_an_unanswered_marker_are_recovered_by_the_session_that_op
 /// the damage applied as the file is made: every open finds it corrupt, a read fails rather than
 /// finding nothing, recovery leaves the fault standing, and a session that opens it records the
 /// failure; the control, the same file undamaged, reads every receipt.
+/// KR-REQ-27.05, the part about corruption: a journal whose page is damaged is found corrupt each
+/// time it is opened, and what it holds is neither read as empty nor repaired by the session.
 #[test]
 fn a_journal_with_a_damaged_page_is_corrupt_at_every_open_and_its_control_is_not() {
     let (_directory, path) = made("damaged-receipts", Made::WithFault);
@@ -261,6 +263,8 @@ fn unreadable(archive: &Archive) -> bool {
 /// asks for an explicit incomplete archive here, so the table is checked and counted from itself,
 /// the archive names the receipts table, and it claims no count the table has not stood behind.
 /// The same journal undamaged reads complete, with its three receipts.
+/// KR-REQ-27.05, the part about corruption: a damaged receipts table is reported by the archive as
+/// unreadable, naming the table, and not as an empty or a complete one.
 #[test]
 fn the_archive_reports_a_journal_whose_receipts_table_is_damaged_as_unreadable() {
     let (damaged, session_id) = in_a_host("damaged-receipts", Made::WithFault);
