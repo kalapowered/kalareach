@@ -246,6 +246,62 @@ describe('the attachment controls are one named button each (KR-REQ-13.19)', () 
   })
 })
 
+describe('the camera of the attachment picker, when the system refuses it (KR-REQ-13.17)', () => {
+  const open = async (access: 'granted' | 'prompt' | 'denied') => {
+    const person = userEvent.setup()
+    const { controls } = start('android')
+    controls.setCameraAccess(access)
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await screen.findByRole('group', { name: 'Add an attachment' })
+    return { person, controls }
+  }
+
+  it('does not offer the camera, and says how to allow it, once the system asks no more', async () => {
+    const { person, controls } = await open('denied')
+    const notice = await screen.findByTestId('camera-notice')
+    await waitFor(() => {
+      expect(within(notice).getByTestId('camera-open-settings')).toBeInTheDocument()
+    })
+    const group = screen.getByRole('group', { name: 'Add an attachment' })
+    expect(within(group).queryByRole('button', { name: 'Take a photo' })).toBeNull()
+    expect(within(group).getByRole('button', { name: 'Photo library' })).toBeInTheDocument()
+    await person.click(within(notice).getByTestId('camera-open-settings'))
+    expect(controls.settingsOpened.count).toBe(1)
+  })
+
+  it('says the same when the camera closes with no picture because the system refused it just now', async () => {
+    const { controls } = await open('prompt')
+    const camera = await screen.findByRole('button', { name: 'Take a photo' })
+    expect(screen.getByTestId('camera-notice')).toBeEmptyDOMElement()
+    // The person refused the system's question: the WebView closes the picker with no picture.
+    controls.setCameraAccess('denied')
+    const input = camera.nextElementSibling
+    expect(input).toBeInstanceOf(HTMLInputElement)
+    act(() => {
+      input?.dispatchEvent(new Event('cancel'))
+    })
+    const settings = await screen.findByTestId('camera-open-settings')
+    // The button that was pressed is gone, so the focus is on what replaces it.
+    await waitFor(() => {
+      expect(settings).toHaveFocus()
+    })
+  })
+
+  it('says nothing when the person closes an allowed camera', async () => {
+    const { controls } = await open('granted')
+    const camera = await screen.findByRole('button', { name: 'Take a photo' })
+    const asked = controls.cameraAsked.count
+    act(() => {
+      camera.nextElementSibling?.dispatchEvent(new Event('cancel'))
+    })
+    await waitFor(() => {
+      expect(controls.cameraAsked.count).toBeGreaterThan(asked)
+    })
+    expect(screen.getByTestId('camera-notice')).toBeEmptyDOMElement()
+  })
+})
+
 describe('the attachment controls while a draft cannot take a file (KR-REQ-13.19)', () => {
   it('refuses a press on each control and opens no picker', async () => {
     const person = userEvent.setup()

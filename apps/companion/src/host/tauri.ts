@@ -18,6 +18,7 @@ import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
   AttachmentHandle,
+  CameraAccess,
   ConnectionState,
   DroppedFile,
   GrantNotices,
@@ -371,8 +372,9 @@ export function tauriPort(): HostPort {
     pairingPaste: () => call<IntakeView>('pairing_paste', {}),
     pairingScan: () => call<IntakeView>('pairing_scan', {}),
     pairingScanPhoto: () => call<IntakeView>('pairing_scan_photo', {}),
-    pairingOpenSettings: () => call<undefined>('pairing_open_settings', {}),
     pairingKeepAwake: (on) => call<undefined>('pairing_keep_awake', { on }),
+    cameraAccess: () => call<CameraAccess>('camera_access', {}),
+    openAppSettings: () => call<undefined>('app_open_settings', {}),
     pairingStartRead: () => call<undefined>('pairing_start_read', {}),
     pairingStop: () => call<undefined>('pairing_stop', {}),
     onPairing: (listener) => listening<PairingView | PairingUnavailable>(PAIRING_EVENT, listener),

@@ -287,7 +287,7 @@ export function PairingFlow({
     else paste()
   }
   const openSettings = () => {
-    port.pairingOpenSettings().catch((error: unknown) => {
+    port.openAppSettings().catch((error: unknown) => {
       say(failureMessage(error), 'danger')
     })
   }

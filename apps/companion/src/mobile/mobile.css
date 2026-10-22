@@ -879,6 +879,17 @@
   align-items: center;
 }
 
+.m-camera-notice:empty {
+  display: none;
+}
+
+.m-camera-notice {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  align-items: center;
+}
+
 .m-accessory {
   display: flex;
   gap: var(--gap-1);

@@ -156,10 +156,13 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("pairing_paste", None),
     ("pairing_scan", None),
     ("pairing_scan_photo", None),
-    ("pairing_open_settings", None),
     ("pairing_keep_awake", None),
     ("pairing_start_read", None),
     ("pairing_stop", None),
+    // The application's own place in the system's settings: whether the camera is allowed, and the
+    // page where the person allows it.
+    ("camera_access", None),
+    ("app_open_settings", None),
     // The owner's confirmations of this computer's hosts.
     ("owner_confirmations", None),
     ("owner_confirmation_review", None),
@@ -567,10 +570,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_paste,
         pairing_scan,
         pairing_scan_photo,
-        pairing_open_settings,
         pairing_keep_awake,
         pairing_start_read,
         pairing_stop,
+        camera_access,
+        app_open_settings,
         owner_confirmations,
         owner_confirmation_review,
         revocation_view,
@@ -2342,10 +2346,19 @@ pub async fn pairing_scan_photo(state: State<'_, AppState>) -> Result<crate::dev
     take_in(&state, pairing::Source::Photo).await
 }
 
+/// Says whether the system lets this application use the camera, so the attachment picker offers
+/// it only where it would do something, and tells the person where it would not.
+#[tauri::command]
+pub async fn camera_access<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<companion_platform::scan::CameraAccess> {
+    Ok(companion_platform::scan::camera_access(&app).await)
+}
+
 /// Opens this application's page in the system's settings, where the camera is allowed. It opens
 /// nothing else.
 #[tauri::command]
-pub async fn pairing_open_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
+pub async fn app_open_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
     companion_platform::scan::open_settings(&app)
         .await
         .map_err(|error| CommandError::local_failure(error.to_string()))
@@ -3445,10 +3458,11 @@ mod tests {
         "pairing_paste",
         "pairing_scan",
         "pairing_scan_photo",
-        "pairing_open_settings",
         "pairing_keep_awake",
         "pairing_start_read",
         "pairing_stop",
+        "camera_access",
+        "app_open_settings",
         "owner_confirmations",
         "owner_confirmation_review",
         "revocation_view",
@@ -3590,10 +3604,11 @@ mod tests {
                 "pairing_paste",
                 "pairing_scan",
                 "pairing_scan_photo",
-                "pairing_open_settings",
                 "pairing_keep_awake",
                 "pairing_start_read",
                 "pairing_stop",
+                "camera_access",
+                "app_open_settings",
                 "owner_confirmations",
                 "owner_confirmation_review",
                 // The devices of the hosts this computer owns, and revoking one of them: native

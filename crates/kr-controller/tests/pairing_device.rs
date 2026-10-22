@@ -54,6 +54,7 @@ use kr_protocol::pairing::{
 };
 use kr_protocol::scalars::{Nullable, SecretBytes32};
 use net_support::pairing::{self as calls, Signer};
+use net_support::worker::Adopted;
 use net_support::{Device, Host};
 
 /// How long the script is given to take each step the suite waits for.
@@ -543,8 +544,13 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         }
     });
 
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    // The host holds one session, so a phone paired with it has a conversation to open: the
+    // attachment picker is on that screen. The worker is kept until the run ends.
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
     let environment = host.environment_id;
     let run = Run {
         directory: directory.clone(),
@@ -591,4 +597,5 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
     );
     accepting.abort();
     run.host.stop().await;
+    drop(workers);
 }

@@ -177,6 +177,7 @@ if [ "$platform" = android ]; then
         "the scanner is kept out of screenshots"
         "the scanner closes on Cancel"
         "the scanner fits the largest text size"
+        "the camera's refusal is told in the attachment picker"
     )
 fi
 

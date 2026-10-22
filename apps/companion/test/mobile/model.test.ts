@@ -35,6 +35,7 @@ import {
   MAX_CONTROL_LANE_UPLOAD_LEN,
   admit,
   attributesFor,
+  cameraOffer,
   describeBytes
 } from '../../src/mobile/model/media'
 import { describeMode } from '../../src/mobile/model/gestures'
@@ -382,6 +383,34 @@ describe('camera, library and file input (KR-REQ-13.17)', () => {
     expect(describeBytes(512)).toBe('512 bytes')
     expect(describeBytes(2048)).toBe('2 KB')
     expect(describeBytes(3 * 1024 * 1024)).toBe('3.0 MB')
+  })
+})
+
+describe('what the picker offers and says about the camera (KR-REQ-13.17)', () => {
+  it('offers the camera until the system refuses it for good, and says so whenever it is refused', () => {
+    // [what the system said, whether the camera closed with no picture] -> [offered, told]
+    const cases: [Parameters<typeof cameraOffer>, boolean, boolean][] = [
+      // Not read yet: the camera is offered and the system asks when it is pressed.
+      [[null, false], true, false],
+      [[null, true], true, false],
+      [['granted', false], true, false],
+      [['prompt', false], true, false],
+      // Refused for good: pressing it would do nothing, so it is not offered, and the person is told.
+      [['denied', false], false, true],
+      [['denied', true], false, true],
+      // The camera closed with no picture and the system would not let it open: a refusal just now.
+      [['prompt', true], true, true],
+      // The camera closed with no picture and it is allowed: the person cancelled it. Nothing to say.
+      [['granted', true], true, false]
+    ]
+    for (const [input, offered, told] of cases) {
+      const offer = cameraOffer(...input)
+      expect({ input, offered: offer.offered, told: offer.notice !== null }).toEqual({
+        input,
+        offered,
+        told
+      })
+    }
   })
 })
 

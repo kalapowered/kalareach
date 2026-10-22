@@ -641,6 +641,13 @@ export interface IntakeView {
   readonly cancelled: boolean
 }
 
+/**
+ * What the system says of this application's use of the camera: the person allowed it, the system
+ * will ask when the camera is first used, or the system asks no more and only the settings page
+ * can allow it.
+ */
+export type CameraAccess = 'granted' | 'prompt' | 'denied'
+
 /** The ceremony this computer offers an owner. */
 export type CeremonyKind = 'touch_id' | 'password' | 'windows_hello' | 'none'
 
@@ -1802,13 +1809,19 @@ export interface HostPort {
    * chose, in native code, and holds it. Resolves when the picker closes.
    */
   pairingScanPhoto(): Promise<IntakeView>
-  /** Opens this application's page in the system's settings, where the camera is allowed. */
-  pairingOpenSettings(): Promise<void>
   /**
    * Keeps a phone's screen on while the value to compare with the host's shows, and lets it sleep
    * again when the value goes. A computer has nothing to keep on.
    */
   pairingKeepAwake(on: boolean): Promise<void>
+  /**
+   * What the system says of this application's use of the camera. A phone that cannot say answers
+   * `prompt`, which lets the system ask; a computer has no permission to ask for and answers
+   * `granted`.
+   */
+  cameraAccess(): Promise<CameraAccess>
+  /** Opens this application's page in the system's settings, where the camera is allowed. */
+  openAppSettings(): Promise<void>
   /** Starts pairing with the invitation read from the pasteboard. */
   pairingStartRead(): Promise<void>
   /** Ends the attempt on this computer, or drops a pasted invitation. */
