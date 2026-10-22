@@ -484,34 +484,44 @@ and a full hand-off refuses the span at once. A runtime that does not answer is 
 seconds, then for twice as long after each failure up to two minutes, and each entry passed over is
 counted. The two sources have no order between them, and each keeps the order it was pushed in.
 
-Whatever a component does not get is a numbered loss: an entry the lane pushed out or refused, one
-the pump passed over, one the host's queue refused. Before the component is offered anything later,
-the worker asks it for a fresh snapshot, once the client has written what it already held. A loss
-that arrives while a snapshot runs has a number of its own and asks for another. A snapshot the
-component answers or declines discharges its number. One that does not reach the component is asked
-for again after a wait that doubles from one second to thirty.
+Whatever a ready component does not get is a numbered loss: an entry the lane pushed out or
+refused, one the pump passed over, one the host's queue refused. What was pushed before a binding
+became ready, or while the worker had no connection to the runtime, predates the binding's view and
+is not a loss. The lane hands the pump nothing while it holds a loss the pump has not applied, and
+the pump offers a binding nothing while it owes the binding a snapshot, so a component is asked for
+a fresh snapshot before anything later is handed to it. The snapshot waits until the client has
+written what it already held, for up to a second; if the client has not, the binding is passed over
+and asked again soon. A loss that arrives while a snapshot runs has a number of its own and asks for
+another. A snapshot the component answers or declines discharges its number. One that does not
+reach the component is asked for again after a wait that doubles from one second to thirty.
 
 The link keeps three more things. When a component has been offered something since its state was
 last asked for and has then been left alone for two seconds, or its last request is a minute old or
-there has been none, the link asks it for a checkpoint. The worker keeps checkpoints in memory only, at most 8 MiB in all, under
-the package's digest and the instance's source generation, so a new execution never restores an
-earlier one's state. When a binding is registered again, after the runtime was replaced for example,
-the link restores the checkpoint it holds, takes a snapshot, and only then makes the binding ready.
-The observations between the checkpoint and the new registration are not replayed, and the
-component's report says so.
+there has been none, the link asks it for a checkpoint. The worker keeps checkpoints in memory only,
+at most 8 MiB in all, under the package's digest and the source generation the component was
+registered in, so state taken in one generation of the instance's source is never restored into
+another. When a binding is registered again, after the runtime was replaced for example, the link
+restores the checkpoint it holds and makes the binding ready, owing a snapshot that the pump takes
+before it offers the binding anything. The observations between the checkpoint and the new
+registration are not replayed, and the component's report says so. A restore the component does not
+answer is reported the same way, and the snapshot rebuilds its view from whatever it holds. A
+component registered with no checkpoint to restore starts from the live point.
 
 Every thirty seconds the link asks the runtime what it is doing. Two answers in a row that do not
 come count as losing the runtime: the bindings are reported unavailable with the reason, and the link
-asks the daemon for the runtime again. A runtime that has taken no event for ten seconds has stopped
-reading, and the client's writer ends the connection, which the link treats the same way.
+asks the daemon for the runtime again. An event the client cannot write to the runtime within ten
+seconds means the runtime has stopped reading, and the client's writer ends the connection, which
+the link treats the same way.
 
 A component's report carries how it was registered (compiled, with the time it took, or loaded from
 the compiled-code cache), what it last missed, and its last fault, in the words the runtime gave.
 
 Privacy mode does not stop observation for live use. While it is on, the worker takes and holds no
-component state. Turning it on drops the state held, and a component that was offered something
-while it was on is not asked for its state again until it starts again, since what it holds may be
-what it was offered.
+component state, and the runtime's words in a fault are withheld from the report. Turning it on drops
+the state held. A component that was offered anything the worker had while privacy mode was on,
+including something that waited in the lane and was offered after it ended, is not asked for its
+state again until it starts again, since what it holds may be what it was offered. The documents a
+component draws are read and dropped by the worker, in privacy mode as at any other time.
 
 ## Where the broker fits
 
@@ -544,8 +554,7 @@ reach the runtime before a wait the daemon asked for or a backoff has passed, ho
 broker's set changes meanwhile, except that a link nothing wants the runtime of any more forgets
 the wait, and the next binding that wants a component asks at once; the daemon's bound on starts
 is what holds a runtime that keeps ending. The worker's report on its admissions says that this
-host calls none of the component's exports beyond registering it for a binding and preparing an
-action a person invokes.
+host calls none of the component's decode-request or encode-response exports.
 
 ### An action a component prepares
 
