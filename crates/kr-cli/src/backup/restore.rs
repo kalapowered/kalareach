@@ -43,7 +43,9 @@ use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
 use kr_crypto::backup::GenerationStanding;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::hostinfo::configuration::{Change, DeviceConfiguration, Loaded, edit, load};
+use kr_protocol::hostinfo::configuration::{
+    Change, ConfigurationDocument, DeviceConfiguration, LeftOut, Loaded, edit, load,
+};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
@@ -52,7 +54,7 @@ use kr_protocol::scalars::TimestampMs;
 use super::directory::{Destination, Held};
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
-use crate::output::Document;
+use crate::output::{Asked as Arrived, Document, Request};
 
 /// What the person asked of this restore.
 #[derive(Clone, PartialEq, Eq)]
@@ -266,6 +268,8 @@ struct ConfigurationPlan {
     baseline: Loaded,
     /// The parts of the configuration that would change, in this program's words.
     changes: Vec<&'static str>,
+    /// Where the backup holds variables or command integrations that are not applied.
+    left_out: LeftOut,
     /// The document that would result, which the confirmation is bound to.
     resulting: String,
 }
@@ -289,6 +293,16 @@ impl Planned {
     #[must_use]
     pub const fn plan(&self) -> &RestorePlan {
         &self.plan
+    }
+
+    /// Where the backup's variables or command integrations are not applied, when the restore
+    /// applies the configuration and some are left out.
+    #[must_use]
+    pub fn left_out(&self) -> Option<&LeftOut> {
+        match &self.configuration {
+            Asked::Yes(applying) if !applying.left_out.is_empty() => Some(&applying.left_out),
+            Asked::Yes(_) | Asked::No | Asked::NothingToApply => None,
+        }
     }
 
     /// The plan as lines for a person.
@@ -362,6 +376,16 @@ impl Planned {
                 for part in &applying.changes {
                     lines.push(shown!("  changes {}", Shown::said(part)));
                 }
+                if !applying.left_out.is_empty() {
+                    lines.push(shown!(
+                        "  not applied: the variables a session is given and the packages whose \
+                         command integration applies, in {} of the backup's sets of preferences. \
+                         They can hold secrets and run code, so this host keeps its own. The \
+                         restore names the sets when it is done; their values are in \
+                         configuration.json in the folder.",
+                        applying.left_out.sets()
+                    ));
+                }
             }
         }
         lines.push(shown!(
@@ -417,6 +441,25 @@ impl Planned {
             .with(
                 "applies_configuration",
                 matches!(self.configuration, Asked::Yes(_)),
+            )
+            .with(
+                "configuration_left_out",
+                match &self.configuration {
+                    Asked::Yes(applying) => Document::new()
+                        .with("preferences", applying.left_out.preferences)
+                        .with(
+                            "profiles",
+                            applying
+                                .left_out
+                                .profiles
+                                .iter()
+                                .map(|name| Arrived::text(Request::Restore, name))
+                                .collect::<Vec<_>>(),
+                        ),
+                    Asked::No | Asked::NothingToApply => Document::new()
+                        .with("preferences", false)
+                        .with("profiles", Vec::<Arrived>::new()),
+                },
             )
             .with("digest", crate::shown::hex_digest(&self.digest))
             .with("files", files)
@@ -699,16 +742,16 @@ async fn plan_configuration(
             }
         }))
     })?;
-    let current = baseline.document.as_ref().map_or_else(
-        || {
-            DeviceConfiguration::of(
-                &kr_protocol::hostinfo::configuration::ConfigurationDocument::empty(),
-            )
-        },
-        DeviceConfiguration::of,
-    );
+    let hosts = baseline
+        .document
+        .clone()
+        .unwrap_or_else(ConfigurationDocument::empty);
+    // What the document would say after the edit, not what the backup says: the host keeps its own
+    // variables and command integrations.
     Ok(Some(ConfigurationPlan {
-        changes: device.differences(&current),
+        changes: DeviceConfiguration::of(&edited.document)
+            .differences(&DeviceConfiguration::of(&hosts)),
+        left_out: device.left_out(&hosts),
         resulting: edited.contents,
         change,
         baseline,
