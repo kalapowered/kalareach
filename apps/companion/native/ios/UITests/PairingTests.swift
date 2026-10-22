@@ -14,6 +14,11 @@
 //  writes a picture, the script says when the picture is in the library (`<picture>.added`), and
 //  the test says each phase it wants with `go-<phase>` and the host answers it with `done-<phase>`.
 //
+//  The paired phone is an owner device (10.52), and the last two cases are the host asking it to
+//  confirm: a request of the host's own, and a second device the host would add. The phone's
+//  ceremony is Face ID, which the script enrols on the simulator and matches when the test says
+//  the system's prompt is wanted (`faceid-wanted`) and until it says it is done (`faceid-done`).
+//
 
 import XCTest
 
@@ -118,6 +123,58 @@ final class PairingTests: DeviceTestCase {
         newest.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
 
+    // MARK: Confirming
+
+    /// Opens the Attention tab, where the host's requests wait.
+    private func openAttention() {
+        launch()
+        let tab = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Attention'")).firstMatch
+        XCTAssertTrue(tab.waitForExistence(timeout: 60), "the shell did not appear")
+        for _ in 1...3 {
+            tab.tap()
+            let end = Date().addingTimeInterval(20)
+            while Date() < end {
+                if shows("Your hosts need your confirmation") || shows("Reading the inbox") || shows("Filter") { return }
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+        }
+    }
+
+    /// Presses the confirm button the host's request has, named for the phone's ceremony.
+    private func pressConfirm() {
+        press("Confirm with Face ID", timeout: 90)
+    }
+
+    /// The alert the phone draws before the system's ceremony, which says what is being confirmed.
+    private func confirmAlert() -> XCUIElement {
+        let alert = app.alerts.matching(NSPredicate(format: "label CONTAINS 'Confirm on this device'")).firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 30), "no alert asked the person to confirm")
+        return alert
+    }
+
+    /// Goes on from the alert to Face ID, which the script then matches. The first use of Face ID
+    /// by this application asks the person once, in a prompt of the system that names the
+    /// application: it is answered as the person would, and nothing else of the system is touched.
+    private func continueToFaceID() {
+        try? FileManager.default.removeItem(atPath: path("faceid-wanted"))
+        try? FileManager.default.removeItem(atPath: path("faceid-done"))
+        confirmAlert().buttons["Continue"].tap()
+        touch("faceid-wanted")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let end = Date().addingTimeInterval(60)
+        while Date() < end {
+            if shows("Confirmed.") { break }
+            let prompt = springboard.alerts.matching(NSPredicate(format: "label CONTAINS 'KalaReach'")).firstMatch
+            if prompt.exists, prompt.buttons["OK"].exists {
+                prompt.buttons["OK"].tap()
+                say("PROMPT answered OK")
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        waitToShow("Confirmed.", timeout: 30)
+        touch("faceid-done")
+    }
+
     // MARK: The cases
 
     /// A direct invitation whose secret has one bit changed opens nothing, and the page says so.
@@ -190,5 +247,47 @@ final class PairingTests: DeviceTestCase {
         say("PAIRING accepted: one connection")
         touch("code-done")
         waitFor("done-code")
+    }
+
+    /// The host asks its owner to confirm, and the phone is an owner device. The request is listed on
+    /// Attention; the alert the phone draws first is cancelled, which confirms nothing and leaves the
+    /// request listed and the invitation behind it refused; then the same request is confirmed with
+    /// Face ID and the host spends that confirmation on the invitation.
+    func test4TheHostsRequestIsConfirmedWithFaceID() {
+        openAttention()
+        touch("go-confirm")
+        waitFor("challenge.txt")
+        waitToShow("Your hosts need your confirmation", timeout: 90)
+        pressConfirm()
+        let alert = confirmAlert()
+        screenshot("confirm-alert")
+        alert.buttons["Cancel"].tap()
+        waitToShow("Not confirmed. Nothing changed.")
+        say("PAIRING the host's request is cancelled at the alert")
+        touch("confirm-cancelled")
+        waitFor("challenge-open.txt")
+        XCTAssertTrue(read("challenge-open.txt").hasPrefix("unanswered=1"), "the cancelled request was answered: \(read("challenge-open.txt"))")
+        touch("confirm-go")
+        pressConfirm()
+        continueToFaceID()
+        waitFor("confirm-result.txt", timeout: 90)
+        say("PAIRING the host's request is confirmed with Face ID")
+        screenshot("confirmed")
+    }
+
+    /// A second device redeems an invitation, and the host asks the phone to confirm it against the
+    /// value that device shows.
+    func test5ANewDeviceIsConfirmedAgainstTheValueItShows() {
+        openAttention()
+        touch("go-device")
+        waitFor("device-value.txt", timeout: 90)
+        let value = read("device-value.txt").replacingOccurrences(of: " ", with: "")
+        let spelled = value.map { String($0) }.joined(separator: " ")
+        let first = String(spelled.prefix(7)), second = String(spelled.suffix(7))
+        waitToShow("\(first), \(second)", timeout: 60)
+        pressConfirm()
+        continueToFaceID()
+        waitFor("device-result.txt", timeout: 90)
+        say("PAIRING a new device is confirmed against its value")
     }
 }

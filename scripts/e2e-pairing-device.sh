@@ -19,6 +19,13 @@
 #   another service        a code QR that names another service raises the system's alert with that
 #                          service's name before anything is contacted: Cancel contacts nothing, and
 #                          accepting contacts it once (KR-REQ-10.17); screenshots under /tmp
+#   owner confirmations    the paired phone is an owner device: the host's own request appears on the
+#                          phone's Attention tab, and the phone's ceremony (Face ID on the simulator;
+#                          the screen lock's PIN on the emulator) confirms it. A cancelled prompt
+#                          confirms nothing and leaves the request listed; the same request is then
+#                          confirmed, and the host spends that confirmation (KR-REQ-10.52). A second
+#                          device the host asks the phone to confirm is confirmed against the value
+#                          it shows (KR-REQ-10.37)
 #
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build slot:
 #
@@ -57,6 +64,9 @@ log="$artefacts/run.log"
 harness="$(mktemp -d "${TMPDIR:-/tmp}/kr-pairing-device.XXXXXX")"
 harness_pid=""
 feeder_pid=""
+presence_pid=""
+# The PIN the emulator's screen lock is given for the confirmations case, and taken off at the end.
+screen_lock_pin=1234
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
@@ -82,7 +92,7 @@ say() { printf '== [pairing-device] %s\n' "$*" | tee -a "$log"; }
 # photo library with it; and the two files of the iOS build are put back as they were.
 finish() {
     touch "$harness/finish" 2>/dev/null
-    for pid in "$feeder_pid" "$harness_pid"; do
+    for pid in "$feeder_pid" "$presence_pid" "$harness_pid"; do
         [ -n "$pid" ] || continue
         local waited=0
         while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 20 ]; do
@@ -92,6 +102,8 @@ finish() {
         kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
     done
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
+        # The screen lock the confirmations case set, taken off again.
+        "$emulator_adb" -s "$emulator_serial" shell locksettings clear --old "$screen_lock_pin" >/dev/null 2>&1
         "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
         "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
         "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
@@ -170,7 +182,8 @@ required_checks=(
     "cancelled: no connection"
     "accepted: one connection"
 )
-# What only the emulator's run shows: the scanner has a camera there, and the simulator has none.
+# What only one platform's run shows: the scanner has a camera on the emulator and none on the
+# simulator, and the phone's ceremony is Face ID on one and the screen lock on the other.
 platform_checks=()
 if [ "$platform" = android ]; then
     platform_checks=(
@@ -178,6 +191,16 @@ if [ "$platform" = android ]; then
         "the scanner closes on Cancel"
         "the scanner fits the largest text size"
         "the attachment picker offers no file on a paired phone, and says nothing of the camera"
+        "a phone with no screen lock cannot confirm"
+        "the host's request is cancelled at the prompt"
+        "the host's request is confirmed with the screen lock"
+        "a new device is confirmed against its value"
+    )
+else
+    platform_checks=(
+        "the host's request is cancelled at the alert"
+        "the host's request is confirmed with Face ID"
+        "a new device is confirmed against its value"
     )
 fi
 
@@ -236,6 +259,22 @@ judge() { # <driver output>
         say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found"
         bad=1
     fi
+    result="$(host_file challenge-open.txt)"
+    case "$result" in
+        "unanswered=1 refused="?*) say "check=the host kept the cancelled request and refused the invitation behind it ok=1 detail=$result" ;;
+        *) say "check=the host kept the cancelled request and refused the invitation behind it ok=0 detail=${result:-no record}"; bad=1 ;;
+    esac
+    result="$(host_file confirm-result.txt)"
+    case "$result" in
+        *"channel=owner_device_presence consumed=false"*"channel=owner_device_presence consumed=true"*)
+            say "check=the host took the phone's presence once and spent it on the invitation ok=1" ;;
+        *) say "check=the host took the phone's presence once and spent it on the invitation ok=0 detail=${result:-no record}"; bad=1 ;;
+    esac
+    result="$(host_file device-result.txt)"
+    case "$result" in
+        "answered channel=owner_device_presence"*) say "check=the host took the phone's presence for the new device ok=1" ;;
+        *) say "check=the host took the phone's presence for the new device ok=0 detail=${result:-no record}"; bad=1 ;;
+    esac
     result="$(host_file connections.txt)"
     if [ "$result" = "1" ]; then
         say "check=the other service took one connection in all ok=1"
@@ -256,6 +295,24 @@ feed_ios() { # <udid>
             [ -e "$picture.added" ] && continue
             xcrun simctl addmedia "$1" "$picture" >/dev/null 2>&1 && : >"$picture.added"
         done
+        sleep 1
+    done
+}
+
+# Face ID on the simulator: enrolled once, and a matching face sent each second from the moment the
+# test says the prompt is wanted until it says the prompt is done, since a match sent before the
+# system's prompt is up is lost.
+enrol_face_id() { # <udid>
+    xcrun simctl spawn "$1" notifyutil -s com.apple.BiometricKit.enrollmentChanged 1 >/dev/null 2>&1
+    xcrun simctl spawn "$1" notifyutil -p com.apple.BiometricKit.enrollmentChanged >/dev/null 2>&1
+}
+
+match_face_id() { # <udid>
+    while [ ! -e "$harness/finish" ]; do
+        if [ -e "$harness/faceid-wanted" ] && [ ! -e "$harness/faceid-done" ]; then
+            xcrun simctl spawn "$1" notifyutil -p com.apple.BiometricKit_Sim.pearl.match >/dev/null 2>&1
+        fi
+        # Each prompt is its own: the test asks again by removing both files.
         sleep 1
     done
 }
@@ -309,10 +366,13 @@ run_ios() {
     xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
     xcrun simctl install "$udid" "$app" || { say "the application did not install"; return 2; }
 
+    enrol_face_id "$udid"
     # A simulator shares this machine's network: the host is where the invitation says.
     start_harness 127.0.0.1 || return 2
     feed_ios "$udid" &
     feeder_pid=$!
+    match_face_id "$udid" &
+    presence_pid=$!
 
     say "driving the application"
     local out="$artefacts/xcodebuild.log" status=0

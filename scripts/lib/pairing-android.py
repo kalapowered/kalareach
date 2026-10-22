@@ -318,6 +318,95 @@ def scanner_fits_the_largest_text(phone: Phone, port: str) -> None:
     say("the scanner fits the largest text size")
 
 
+# The PIN the emulator's screen lock is given while the confirmations are answered. The emulator is
+# one of this run's own, and the lock is taken off again as soon as the case ends.
+SCREEN_LOCK_PIN = "1234"
+
+
+def enter_screen_lock(phone: Phone) -> None:
+    """Answers the system's prompt for the screen lock as its owner would: types the PIN.
+
+    The prompt is the system's own, drawn over the application, and its title names the application's
+    request. The PIN is typed into the keypad it shows, and the key that ends it is pressed; when the
+    keypad takes no typed text, the digits it shows are touched one by one.
+    """
+    phone.wait(lambda each: each == "Confirm on this phone", "the system's prompt for the screen lock", 30)
+    phone.run("shell", "input", "text", SCREEN_LOCK_PIN)
+    phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        if phone.find(lambda each: each == "Confirm on this phone") is None:
+            return
+        time.sleep(0.3)
+    for digit in SCREEN_LOCK_PIN:
+        key = phone.find(lambda each, digit=digit: each == digit)
+        if key is not None:
+            phone.tap(key)
+    phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
+
+
+def owner_confirmations(phone: Phone, directory: Path) -> None:
+    """The paired phone is an owner device: the host's own request and a second device the host would
+    add are confirmed with the phone's screen lock, and a prompt that is cancelled confirms nothing.
+
+    The phone is given a PIN, so the ceremony it offers is its screen lock, and the prompt is the
+    system's. The request is listed on the Attention tab; the first prompt is cancelled (the request is
+    still listed and the invitation behind it is refused); the same request is then confirmed, and the
+    host spends that confirmation on the invitation. A second device the host is asked to add shows a
+    value, which the request on the phone shows too.
+    """
+    confirm = "Confirm with your screen lock"
+    try:
+        phone.run("shell", "am", "force-stop", APP)
+        phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+        phone.wait(lambda each: each.startswith("Attention"), "the shell's Attention tab", 90)
+        phone.tap(phone.wait(lambda each: each.startswith("Attention"), "the shell's Attention tab"))
+        touch(directory, "go-confirm")
+        wait_for_file(directory, "challenge.txt")
+        # The emulator has no screen lock yet, so the phone can check nothing: the request says so
+        # and offers no button. The lock is then set while the request is listed, and the button
+        # appears named for it, without the request coming or going.
+        phone.wait(
+            lambda each: each.startswith("This phone cannot check that it is you"),
+            "the words for a phone that can check nothing",
+            120,
+        )
+        if phone.find(lambda each: each.startswith("Confirm with")) is not None:
+            phone.give_up("a phone with no screen lock offers a way to confirm")
+        say("a phone with no screen lock cannot confirm")
+        phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
+        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 120))
+        phone.wait(lambda each: each == "Confirm on this phone", "the system's prompt", 30)
+        phone.shot("confirm-prompt")
+        phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+        phone.wait(lambda each: each == "Not confirmed. Nothing changed.", "the words for a prompt that was cancelled", 30)
+        say("the host's request is cancelled at the prompt")
+        touch(directory, "confirm-cancelled")
+        wait_for_file(directory, "challenge-open.txt")
+        if not read(directory, "challenge-open.txt").startswith("unanswered=1"):
+            raise SystemExit(f"the cancelled request was answered: {read(directory, 'challenge-open.txt')}")
+        touch(directory, "confirm-go")
+        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the host's request", 30))
+        enter_screen_lock(phone)
+        phone.wait(lambda each: each.startswith("Confirmed."), "the words for a confirmed request", 60)
+        wait_for_file(directory, "confirm-result.txt", 60)
+        phone.shot("confirmed")
+        say("the host's request is confirmed with the screen lock")
+
+        touch(directory, "go-device")
+        wait_for_file(directory, "device-value.txt", 90)
+        value = read(directory, "device-value.txt").replace(" ", "")
+        spelled = ", ".join(" ".join(group) for group in (value[:4], value[4:]))
+        phone.wait(lambda each: spelled in each, f"the value {value} the second device shows", 60)
+        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the second device", 30))
+        enter_screen_lock(phone)
+        phone.wait(lambda each: each.startswith("Confirmed."), "the words for a confirmed request", 60)
+        wait_for_file(directory, "device-result.txt", 90)
+        say("a new device is confirmed against its value")
+    finally:
+        phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
+
+
 def picker_on_a_paired_phone(phone: Phone) -> None:
     """The attachment picker on a phone paired with a host, with the camera refused for good.
 
@@ -460,6 +549,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     touch(directory, "code-done")
     wait_for_file(directory, "done-code")
     picker_on_a_paired_phone(phone)
+    owner_confirmations(phone, directory)
 
 
 def main() -> None:
