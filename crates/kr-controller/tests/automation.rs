@@ -4129,10 +4129,16 @@ fn replay_the_stream(host: &Host) -> kr_automation::AdmittedTriggers {
         .expect("the position is set back");
     assert_eq!(rewound, 1, "the dispatcher is a registered consumer");
     drop(connection);
-    host.controller
+    let replayed = host
+        .controller
         .automation()
         .service()
-        .admit_triggers(kr_ipc::now_ms().get())
+        .admit_triggers(kr_ipc::now_ms().get());
+    assert!(
+        !replayed.decisions.is_empty(),
+        "the stream was replayed, so its events were decided again"
+    );
+    replayed
 }
 
 /// KR-REQ-25.17: an exhausted chain stays paused with `CAUSAL_LIMIT` whatever replayed or late
@@ -4299,17 +4305,25 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
             .await
             .expect("the call reaches the daemon"),
     );
-    assert_ne!(unheld.code, ErrorCode::CausalLimit, "{unheld:?}");
+    assert_eq!(unheld.code, ErrorCode::PermissionDenied, "{unheld:?}");
     let kept = budget_of(&mut control, root).await.expect("the budget");
     assert!(kept.exhausted && kept.generation.get() == 0, "{kept:?}");
 
     // An authorised rearm gives it a new budget, and the chain goes on from where it stopped.
-    let action = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
     let request = rearming(root, grant_id(45), 0);
+    let original = control
+        .compose(
+            Method::WorkflowRearm,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &request,
+        )
+        .await
+        .expect("the mutation is composed");
     let rearmed: WorkflowRearmResult = typed(
         &control
-            .mutate(Method::WorkflowRearm, action, target.clone(), &request)
+            .repeat(&original)
             .await
             .expect("the call reaches the daemon")
             .expect("workflow.rearm succeeds"),
@@ -4339,19 +4353,20 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
         "{runs:?}"
     );
 
-    // The same request sent again, on a new connection, is answered and gives no second budget,
-    // though the chain has run out again since.
+    // The request as it was, freshness window and all, sent again on a new connection because the
+    // reply was lost, is answered and gives no second budget, though the chain has run out again
+    // since.
     let mut elsewhere = client(&host).await;
     let repeated: WorkflowRearmResult = typed(
         &elsewhere
-            .mutate(Method::WorkflowRearm, action, target.clone(), &request)
+            .repeat(&original)
             .await
             .expect("the call reaches the daemon")
             .expect("the repeat is answered"),
     );
     assert_eq!(repeated, rearmed);
-    // A request that leaves the generation the chain has left, under an action of its own, is
-    // told where the chain is and changes nothing.
+    // A request that leaves the generation the chain has left, under an action of its own, which
+    // is what `kr` sends when it is run again, is told where the chain is and changes nothing.
     let told: WorkflowRearmResult = typed(
         &elsewhere
             .mutate(
@@ -4371,7 +4386,7 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
             .mutate(
                 Method::WorkflowRearm,
                 ActionId::new(kr_ipc::new_uuid()),
-                target,
+                target.clone(),
                 &rearming(root, grant_id(45), 7),
             )
             .await
@@ -4384,7 +4399,45 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
         "no second budget: {kept:?}"
     );
 
-    // The events of the generation before the rearm, replayed, spend nothing of the new budget.
+    // A second rearm, leaving the generation the first one gave, is a rearm of its own. The first
+    // request, sent again now, is not its repeat, because the chain is no longer on the generation
+    // after the one it names: it is refused and gives the chain nothing.
+    let second: WorkflowRearmResult = typed(
+        &elsewhere
+            .mutate(
+                Method::WorkflowRearm,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &rearming(root, grant_id(45), 1),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the second rearm succeeds"),
+    );
+    assert_eq!(second.generation.get(), 2);
+    let ran_out_again = until_budget(
+        &mut control,
+        root,
+        "the chain ran a ceiling's depth further once more and ran out",
+        |budget| budget.generation.get() == 2 && budget.exhausted,
+    )
+    .await;
+    assert!(ran_out_again.paused, "{ran_out_again:?}");
+    let stale = failure(
+        elsewhere
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(stale.code, ErrorCode::DraftConflict, "{stale:?}");
+    let kept = budget_of(&mut control, root).await.expect("the budget");
+    assert!(
+        kept.exhausted && kept.generation.get() == 2,
+        "the first request gave nothing: {kept:?}"
+    );
+
+    // The events of the generations before the last rearm, replayed, spend nothing of the new
+    // budget.
     let replayed = replay_the_stream(&host);
     assert!(replayed.started.is_empty(), "{:?}", replayed.decisions);
     assert!(
@@ -4397,9 +4450,9 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
     );
     let (kept, runs) = read_chain(&mut control, root).await;
     let kept = kept.expect("the chain's budget");
-    assert_eq!(runs.len() as u64, 2 * limit, "no run was added");
+    assert_eq!(runs.len() as u64, 3 * limit, "no run was added");
     assert!(
-        kept.exhausted && kept.paused && kept.generation.get() == 1,
+        kept.exhausted && kept.paused && kept.generation.get() == 2,
         "{kept:?}"
     );
     host.clients.abort();
