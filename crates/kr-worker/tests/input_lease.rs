@@ -3156,6 +3156,11 @@ fn triggered_recording(
     )
 }
 
+/// A program that keeps whatever it reads from the terminal in the file it is given, as it reads it
+/// and with nothing written back.
+const KEEPS_WHAT_IT_READS: &str = "/usr/bin/perl -e 'open(KEPT, \">\", shift) or die; \
+     while (sysread(STDIN, $chunk, 65536)) { syswrite(KEPT, $chunk) }'";
+
 /// A worker with a session whose application keeps what it is typed, and the attachment typing.
 struct Rig {
     _kept: tempfile::TempDir,
@@ -3181,11 +3186,17 @@ impl Rig {
 
     /// Starts the worker with an application that reads nothing until the trigger is pulled, and
     /// keeps all it reads.
+    ///
+    /// The application is a program of the case's own and not the system's `tee`: what a late
+    /// application is typed at is a backlog, and the `tee` of a host whose core utilities are
+    /// uutils' takes what a terminal holds in one read through a pipe of its own and aborts when
+    /// that is more than the pipe has room for, which depends on how much of the backlog the
+    /// kernel has handed on by the time it first reads.
     async fn start_late() -> Self {
         Self::from_script(|received, trigger| {
             format!(
                 "stty raw -echo; printf '\\033[?2004hkr-ready.'; cat {} >/dev/null; \
-                 exec tee {}",
+                 exec {KEEPS_WHAT_IT_READS} {}",
                 kr_worker::testing::shell_quoted(trigger),
                 kr_worker::testing::shell_quoted(received)
             )
