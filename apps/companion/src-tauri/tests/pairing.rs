@@ -1239,6 +1239,36 @@ impl Ceremony for ChangingCeremony {
     }
 }
 
+/// KR-REQ-10.52: a phone with no ceremony still lists what its host asks it to confirm, so it can say
+/// that it cannot check and where to confirm instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phone_with_no_ceremony_still_lists_what_its_host_asks() {
+    let host_owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&host_owner).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+
+    let owner_data = tempfile::tempdir().expect("a directory");
+    let owner_secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    kr_crypto::store::store_device_keys(&*owner_secrets, "device", &host_owner)
+        .expect("the owner's keys are kept");
+    let ceremony = Arc::new(ChangingCeremony {
+        kind: Mutex::new(CeremonyKind::None),
+    });
+    let as_owner = Companion::start(
+        owner_data.path(),
+        support::parts(Arc::clone(&owner_secrets), Arc::new(host.room.clone())),
+        ceremony,
+        Arc::new(StubIntake::default()),
+    );
+    support::record_owned(&as_owner.device(), &host, "the test host");
+    let _ = calls::request(environment, &mut client, an_invitation())
+        .await
+        .expect("the local owner asks");
+    let request = as_owner.listed(|request| request["checkable"] == true).await;
+    assert_eq!(request["checkable"], true);
+}
+
 /// KR-REQ-10.52: a ceremony the phone starts to offer after the application started reaches the page
 /// without a request coming or going, so the button is named for it as soon as it is known.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
