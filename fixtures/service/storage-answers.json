@@ -201,8 +201,64 @@
       "step": "publish generation 17"
     },
     {
-      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(18)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 18, generations: [18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2], bytes: 13520, allowance_bytes: None }, dropped: [1] }",
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(18)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 18, generations: [18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 14365, allowance_bytes: None }, dropped: [] }",
       "step": "publish generation 18"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(19)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 19, generations: [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 15210, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 19"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(20)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 20, generations: [20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 16055, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 20"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(21)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 21, generations: [21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 16900, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 21"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(22)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 22, generations: [22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 17745, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 22"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(23)), descriptor_bytes: 845, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 23, generations: [23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 18590, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 23"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(24)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 24, generations: [24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 19438, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 24"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(25)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 25, generations: [25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 20286, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 25"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(26)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 26, generations: [26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 21134, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 26"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(27)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 27, generations: [27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 21982, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 27"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(28)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 28, generations: [28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 22830, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 28"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(29)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 29, generations: [29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 23678, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 29"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(30)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 30, generations: [30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 24526, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 30"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(31)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 31, generations: [31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2, 1], bytes: 25374, allowance_bytes: None }, dropped: [] }",
+      "step": "publish generation 31"
+    },
+    {
+      "outcome": "Published { duplicate: false, generation: GenerationSummary { backup_generation: BackupGeneration(U64(32)), descriptor_bytes: 848, recipients: 1, .. }, collection: CollectionSummary { archive_id: ArchiveId(Uuid(71717171-7171-7171-7171-717171717171)), checkpoint_generation: 32, generations: [32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 2], bytes: 25377, allowance_bytes: None }, dropped: [1] }",
+      "step": "publish generation 32"
     },
     {
       "outcome": "holds nothing to answer with",
@@ -254,7 +310,7 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "principal": "account:7717bfcc-0349-4baa-8c2d-a71852c6eaa6",
           "retention": {
             "daily_snapshots": 30,
             "provider_recovery_days": 30,
@@ -401,7 +457,7 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "principal": "account:7717bfcc-0349-4baa-8c2d-a71852c6eaa6",
           "retention": {
             "daily_snapshots": 30,
             "provider_recovery_days": 30,
@@ -468,7 +524,7 @@
     {
       "body": {
         "data": {
-          "expires_at": "2026-10-08T14:24:16.555Z",
+          "expires_at": "2026-10-22T03:41:20.944Z",
           "layout": {
             "final_part_bytes": "1000",
             "part_count": 1,
@@ -483,10 +539,10 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "principal": "account:7717bfcc-0349-4baa-8c2d-a71852c6eaa6",
           "reserved_bytes": "1000",
           "state": "created",
-          "upload_id": "Ius28nkhuUQwIrCdSueN7frMDVn2qo2-rP9ySPOo1Nc"
+          "upload_id": "9HaQ5-QJnNq4upJ6Qwskbr4iKfit3RnWYH2NwTtwJwA"
         },
         "ok": true
       },
@@ -598,10 +654,10 @@
             "encrypted_object_hash": "TkwpSzMfeiCZo3m-w0ufn8A9xGq0ZdmY9NaD2lNIfm0",
             "object_id": "72727272-7272-7272-7272-727272727272"
           },
-          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "principal": "account:7717bfcc-0349-4baa-8c2d-a71852c6eaa6",
           "size_bucket_bytes": "1024",
           "state": "stored",
-          "stored_at": "2026-10-08T13:24:17.016Z"
+          "stored_at": "2026-10-22T02:41:21.009Z"
         },
         "ok": true
       },
@@ -637,10 +693,10 @@
             "encrypted_object_hash": "TkwpSzMfeiCZo3m-w0ufn8A9xGq0ZdmY9NaD2lNIfm0",
             "object_id": "72727272-7272-7272-7272-727272727272"
           },
-          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "principal": "account:7717bfcc-0349-4baa-8c2d-a71852c6eaa6",
           "size_bucket_bytes": "1024",
           "state": "duplicate",
-          "stored_at": "2026-10-08T13:24:17.016Z"
+          "stored_at": "2026-10-22T02:41:21.009Z"
         },
         "ok": true
       },
@@ -715,7 +771,7 @@
     {
       "body": {
         "data": {
-          "expires_at": "2026-10-08T14:24:17.434Z",
+          "expires_at": "2026-10-22T03:41:21.056Z",
           "layout": {
             "final_part_bytes": "1000",
             "part_count": 1,
@@ -730,10 +786,10 @@
             "part_size_bytes": "8388608",
             "upload_lifetime_seconds": 3600
           },
-          "principal": "account:9f4406c8-de94-4207-8900-673e3a6024d2",
+          "principal": "account:7717bfcc-0349-4baa-8c2d-a71852c6eaa6",
           "reserved_bytes": "3000",
           "state": "created",
-          "upload_id": "1DVh-HDuuIsHjDRfikQB3_HtvetkEpUB8dlebWRhOqE"
+          "upload_id": "Ud0KzQW1tR7cJkqsISBLu7U6BZ50KSPWbsX5gEpDy_Q"
         },
         "ok": true
       },
@@ -853,8 +909,8 @@
           },
           "state": "enrolled",
           "writer": {
-            "enrolled_at": "2026-10-08T13:24:18.060Z",
-            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
+            "enrolled_at": "2026-10-22T02:41:21.143Z",
+            "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI",
             "writer_revision": "1"
           }
         },
@@ -896,8 +952,8 @@
           },
           "state": "unchanged",
           "writer": {
-            "enrolled_at": "2026-10-08T13:24:18.060Z",
-            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
+            "enrolled_at": "2026-10-22T02:41:21.143Z",
+            "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI",
             "writer_revision": "1"
           }
         },
@@ -943,8 +999,8 @@
           "generation": {
             "backup_generation": "1",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
-            "published_at": "2026-10-08T13:24:18.109Z",
+            "encrypted_manifest_hash": "wdAULEN1XpWfOzbGC07b7z2RC15oQOUjS8pPexxwgWI",
+            "published_at": "2026-10-22T02:41:21.149Z",
             "recipients": 1
           },
           "state": "published"
@@ -996,8 +1052,8 @@
           "generation": {
             "backup_generation": "1",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
-            "published_at": "2026-10-08T13:24:18.109Z",
+            "encrypted_manifest_hash": "wdAULEN1XpWfOzbGC07b7z2RC15oQOUjS8pPexxwgWI",
+            "published_at": "2026-10-22T02:41:21.149Z",
             "recipients": 1
           },
           "state": "duplicate"
@@ -1049,8 +1105,8 @@
           "generation": {
             "backup_generation": "1",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
-            "published_at": "2026-10-08T13:24:18.109Z",
+            "encrypted_manifest_hash": "wdAULEN1XpWfOzbGC07b7z2RC15oQOUjS8pPexxwgWI",
+            "published_at": "2026-10-22T02:41:21.149Z",
             "recipients": 1
           },
           "state": "duplicate"
@@ -1122,8 +1178,8 @@
           "generation": {
             "backup_generation": "2",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "j7PkUR52lN8B7uycGud_Nn3nVlysCjw8_ZRD7MpLrxk",
-            "published_at": "2026-10-08T13:24:18.736Z",
+            "encrypted_manifest_hash": "Cpmp2l1lkow_9VQG9y7UiCZGd5tRimvQvlXm0O7Mllg",
+            "published_at": "2026-10-22T02:41:21.194Z",
             "recipients": 1
           },
           "state": "published"
@@ -1177,8 +1233,8 @@
           "generation": {
             "backup_generation": "4",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
-            "published_at": "2026-10-08T13:24:18.894Z",
+            "encrypted_manifest_hash": "PQ2EGFEoWFclNoJrrcxhdyjpWI6BEIpwITT0TVrN7tU",
+            "published_at": "2026-10-22T02:41:21.212Z",
             "recipients": 1
           },
           "state": "published"
@@ -1248,8 +1304,8 @@
             ]
           },
           "current_writer": {
-            "enrolled_at": "2026-10-08T13:24:18.060Z",
-            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
+            "enrolled_at": "2026-10-22T02:41:21.143Z",
+            "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI",
             "writer_revision": "1"
           },
           "publication": {
@@ -1259,33 +1315,33 @@
                 "backup_generation": "4",
                 "encrypted_manifest": {
                   "encrypted_len": "1103",
-                  "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
+                  "encrypted_object_hash": "PQ2EGFEoWFclNoJrrcxhdyjpWI6BEIpwITT0TVrN7tU",
                   "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
                 },
                 "manifest_key_wraps": [
                   {
-                    "ciphertext": "ADzocuybTCfrePL8Je3GLjAYmz5zp5egu3tb6_B5cD1VETJRujpWokqRu7gAZ2695TtQTMMaF_vZrf43kaaIemsAZhlwpd7s5MVW4ktmlRXM6x7_3je5HNvL9kQRwpypcGvu85hIqRDfD7UERDggLluU36yVA7z_o5cMk9IByaFIRf1XHzi54qCGNZPWx4a8gFKSoRNwwCXlpDahND199t0wYLVg1zIPysts7jdAIs1PRwKaUwxkgKIQVHJTdxthDiVosAW-Nk60aJEk21G0PuzkS0zo4hZUtmmG_4KnGLpBXAmrCI0xggtzIaxLm6-DeJ8hplxygX2USwOvSM46wtgbicH4Lim5kf2xDqAxNGpl27osUhClKL-BEOOiVUt9NbHahpMD1GMrLBiGG3bf4-TlK5m0SSqG-auOlUG-7tdVdQ",
+                    "ciphertext": "EOrdagu4wlbFlneyh0nCdQURVYxomVmELdNu_eCQfQLx6RjET1kWdQMywnIYnnn_q-AslzAteXddm_5weOCdNNN9-zkOyWwtSgyXhAaMQRhAh7Q2VvrBG7vgOaeiki2evP94Rw5hXWpWwa8_YhPXCx7mThuTS4hQexZvL5SEPCfY2xgtP5mLy7Jigq9jVwgGaWCo7ZEbn0-Xgm1bpw2-Pr-wOVu1ThDMe0LG6UflBHn78zi3Z5kt8CCRAUC7VMdCmX9Wy8krMgeof8Uo9wihY7nRfC_nVmBVn5mT_3N7630c-SNIzPnUEXYMX6S-y0EHBmUnVoIMOinl28Q0d1nCw9Q4gFJ9PVLguSSsJX6s7jbLGrumwLKSbUfxOwquwIj-c-jxOngqBSDxUhaDuphB3JtOmkZcfwqcqCWSN0mhgqBmOQ",
                     "context": {
                       "archive_id": "71717171-7171-7171-7171-717171717171",
                       "backup_generation": "4",
-                      "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
+                      "encrypted_object_hash": "PQ2EGFEoWFclNoJrrcxhdyjpWI6BEIpwITT0TVrN7tU",
                       "format": "kr-keywrap/1",
                       "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4",
                       "purpose": "manifest_key",
-                      "recipient_key_id": "cy6Evwnsa2bD1giDl2qoenDSwtX8sOZc5GRphwvMaZw",
-                      "sender_key_id": "y5De5oE7DODNVcQW7EUhYeZaV4kMG5Uit6Eq8aMDrrg"
+                      "recipient_key_id": "v0j88mCkuEEMp2TpCPJhV2zM-kFkcUEGf1hWdwRrM-Q",
+                      "sender_key_id": "83dgeSp8eno45z1k2AQ-BLbI0aaDXdHrez5TXLzYIHI"
                     },
-                    "nonce": "P0CeZltRBUxv22QrqiUbt9M5mAd4b2Ss"
+                    "nonce": "8UmwrqkjDcUFVspr3UhFOSbfZQ_BmVZE"
                   }
                 ],
                 "version": "1"
               },
               "published_at_ms": "2000",
-              "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA"
+              "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI"
             },
-            "signature": "Dd_Iug57Dt6siiwJ_yi4SvLWFZhymeU2fKR5Q0fZeP_sodwEUzQx8RHtnxHHh-xW5bFgnRqguLrPvfdF8LrEDQ"
+            "signature": "O1JiAVkgX0S0A4KKObCD_N-O6r8YkQUsgkmPv7O2FOgdx-LQGV_sZpNGHPeyRYQ8tSHuGi881wPeO_Ja8gRKAQ"
           },
-          "published_at": "2026-10-08T13:24:18.894Z"
+          "published_at": "2026-10-22T02:41:21.212Z"
         },
         "ok": true
       },
@@ -1361,8 +1417,8 @@
             ]
           },
           "current_writer": {
-            "enrolled_at": "2026-10-08T13:24:18.060Z",
-            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
+            "enrolled_at": "2026-10-22T02:41:21.143Z",
+            "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI",
             "writer_revision": "1"
           },
           "publication": {
@@ -1372,33 +1428,33 @@
                 "backup_generation": "1",
                 "encrypted_manifest": {
                   "encrypted_len": "1103",
-                  "encrypted_object_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
+                  "encrypted_object_hash": "wdAULEN1XpWfOzbGC07b7z2RC15oQOUjS8pPexxwgWI",
                   "object_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1"
                 },
                 "manifest_key_wraps": [
                   {
-                    "ciphertext": "Qny07egX4tAVBIkKOZiv6_AerIM0rcQPJxN8U1J9-U-7n27Nf84ikOUCj6juTPtRYReSh9erneL1ORcnnUIVPqnNjh5v3YlnQmRRhuhrHw2zdtKZ4UlRe9c-5rSGQ6jy8ubx1zmZFUoDqQsxeDtVdxnJCF_U3MIhXPTZ1qy3V-Sv8kuxqjJejHdDuEIJ31xyT5xMXXuUd_ECSkImaW42rsvNcvaJajqvmqtO3EMhenOSeWiWWFq4YFAvgnYMQOvGRDplvpxoKyduSVUhs8uwXiZ2_s9vapJ9hdZxKxgm5vk3R1awBpGvay2mnlXp47_NXDg5Y5w72vk1zytvxe_G3usGQVaBhk8npRu3RviMYBZU9vLgY690qG2pbxLcq67mdKuytPjG-3C2OU8YKmzzycElhvNH76TvCE_9MukOC1lJTw",
+                    "ciphertext": "EkHzc0Zlc9U-9T4Zi0_fF5YiHMdjp9OtYKPGrBfUG57bY6DUd7sKfbcZAnY0uuAsJWoRBc-fZYRMslgrOnU1cnyWuegz6TNv3nJAps5B6EihDfb137749kXDAIhrpsj-lejmaMJkuO2i3rFQCDrcuTikVAJGy--bPRlG6-S9bTKNf4MV73MDR-xQF6KJR4BcHErU3WuF3adw72QVRjIb9gz6DXJJk0_tKCtZi_WR1TFamGQ1CRYgbRTcGuCeoOm1qQNOhLXh2DbR2iMukwdr0U8YV8urRrFRMNqhUIBr8iHnXL9CfkDCbbBF8K8XIlOWHtZxXmW1O7r1k8k6GygiPL3IKrA90cA9Fvr8OXlR4dmYqdurA_df43zaMOm2Ts2oU1J_WVk7qPymjiVyXFY1dMtpkcvCc1gBvueu1rJLfHLk2w",
                     "context": {
                       "archive_id": "71717171-7171-7171-7171-717171717171",
                       "backup_generation": "1",
-                      "encrypted_object_hash": "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
+                      "encrypted_object_hash": "wdAULEN1XpWfOzbGC07b7z2RC15oQOUjS8pPexxwgWI",
                       "format": "kr-keywrap/1",
                       "object_id": "a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1",
                       "purpose": "manifest_key",
-                      "recipient_key_id": "cy6Evwnsa2bD1giDl2qoenDSwtX8sOZc5GRphwvMaZw",
-                      "sender_key_id": "y5De5oE7DODNVcQW7EUhYeZaV4kMG5Uit6Eq8aMDrrg"
+                      "recipient_key_id": "v0j88mCkuEEMp2TpCPJhV2zM-kFkcUEGf1hWdwRrM-Q",
+                      "sender_key_id": "83dgeSp8eno45z1k2AQ-BLbI0aaDXdHrez5TXLzYIHI"
                     },
-                    "nonce": "Hob_PRC8epNTbCqTg6op39V6SBkWSoLA"
+                    "nonce": "bmcy-aYlwDeqanw_bmTxVTOnxgDW57OT"
                   }
                 ],
                 "version": "1"
               },
               "published_at_ms": "2000",
-              "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA"
+              "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI"
             },
-            "signature": "UohqaF5zilBvCZEvaLO_nZIw2Fc2BI1sJAILNeqJ98Q7QAUp0Fm1xd7AH585oxHIbWsJiv5ijnL4PzjkN6ztAA"
+            "signature": "AQqQpbhs9aZ5F2h3lXKXTM1kpb2uURqQBd88Y7rhw-o3LSZ_NWvRORtJ466bOL730Qu6KFnyAHjAl_9ZaJzgCg"
           },
-          "published_at": "2026-10-08T13:24:18.109Z"
+          "published_at": "2026-10-22T02:41:21.149Z"
         },
         "ok": true
       },
@@ -1512,8 +1568,8 @@
             ]
           },
           "current_writer": {
-            "enrolled_at": "2026-10-08T13:24:18.060Z",
-            "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
+            "enrolled_at": "2026-10-22T02:41:21.143Z",
+            "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI",
             "writer_revision": "1"
           },
           "publication": {
@@ -1523,33 +1579,33 @@
                 "backup_generation": "4",
                 "encrypted_manifest": {
                   "encrypted_len": "1103",
-                  "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
+                  "encrypted_object_hash": "PQ2EGFEoWFclNoJrrcxhdyjpWI6BEIpwITT0TVrN7tU",
                   "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4"
                 },
                 "manifest_key_wraps": [
                   {
-                    "ciphertext": "ADzocuybTCfrePL8Je3GLjAYmz5zp5egu3tb6_B5cD1VETJRujpWokqRu7gAZ2695TtQTMMaF_vZrf43kaaIemsAZhlwpd7s5MVW4ktmlRXM6x7_3je5HNvL9kQRwpypcGvu85hIqRDfD7UERDggLluU36yVA7z_o5cMk9IByaFIRf1XHzi54qCGNZPWx4a8gFKSoRNwwCXlpDahND199t0wYLVg1zIPysts7jdAIs1PRwKaUwxkgKIQVHJTdxthDiVosAW-Nk60aJEk21G0PuzkS0zo4hZUtmmG_4KnGLpBXAmrCI0xggtzIaxLm6-DeJ8hplxygX2USwOvSM46wtgbicH4Lim5kf2xDqAxNGpl27osUhClKL-BEOOiVUt9NbHahpMD1GMrLBiGG3bf4-TlK5m0SSqG-auOlUG-7tdVdQ",
+                    "ciphertext": "EOrdagu4wlbFlneyh0nCdQURVYxomVmELdNu_eCQfQLx6RjET1kWdQMywnIYnnn_q-AslzAteXddm_5weOCdNNN9-zkOyWwtSgyXhAaMQRhAh7Q2VvrBG7vgOaeiki2evP94Rw5hXWpWwa8_YhPXCx7mThuTS4hQexZvL5SEPCfY2xgtP5mLy7Jigq9jVwgGaWCo7ZEbn0-Xgm1bpw2-Pr-wOVu1ThDMe0LG6UflBHn78zi3Z5kt8CCRAUC7VMdCmX9Wy8krMgeof8Uo9wihY7nRfC_nVmBVn5mT_3N7630c-SNIzPnUEXYMX6S-y0EHBmUnVoIMOinl28Q0d1nCw9Q4gFJ9PVLguSSsJX6s7jbLGrumwLKSbUfxOwquwIj-c-jxOngqBSDxUhaDuphB3JtOmkZcfwqcqCWSN0mhgqBmOQ",
                     "context": {
                       "archive_id": "71717171-7171-7171-7171-717171717171",
                       "backup_generation": "4",
-                      "encrypted_object_hash": "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
+                      "encrypted_object_hash": "PQ2EGFEoWFclNoJrrcxhdyjpWI6BEIpwITT0TVrN7tU",
                       "format": "kr-keywrap/1",
                       "object_id": "a4a4a4a4-a4a4-a4a4-a4a4-a4a4a4a4a4a4",
                       "purpose": "manifest_key",
-                      "recipient_key_id": "cy6Evwnsa2bD1giDl2qoenDSwtX8sOZc5GRphwvMaZw",
-                      "sender_key_id": "y5De5oE7DODNVcQW7EUhYeZaV4kMG5Uit6Eq8aMDrrg"
+                      "recipient_key_id": "v0j88mCkuEEMp2TpCPJhV2zM-kFkcUEGf1hWdwRrM-Q",
+                      "sender_key_id": "83dgeSp8eno45z1k2AQ-BLbI0aaDXdHrez5TXLzYIHI"
                     },
-                    "nonce": "P0CeZltRBUxv22QrqiUbt9M5mAd4b2Ss"
+                    "nonce": "8UmwrqkjDcUFVspr3UhFOSbfZQ_BmVZE"
                   }
                 ],
                 "version": "1"
               },
               "published_at_ms": "2000",
-              "writer_key_id": "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA"
+              "writer_key_id": "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI"
             },
-            "signature": "Dd_Iug57Dt6siiwJ_yi4SvLWFZhymeU2fKR5Q0fZeP_sodwEUzQx8RHtnxHHh-xW5bFgnRqguLrPvfdF8LrEDQ"
+            "signature": "O1JiAVkgX0S0A4KKObCD_N-O6r8YkQUsgkmPv7O2FOgdx-LQGV_sZpNGHPeyRYQ8tSHuGi881wPeO_Ja8gRKAQ"
           },
-          "published_at": "2026-10-08T13:24:18.894Z"
+          "published_at": "2026-10-22T02:41:21.212Z"
         },
         "ok": true
       },
@@ -1705,8 +1761,8 @@
           "generation": {
             "backup_generation": "5",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "U0sb1o7nPSdGHtf3TKqtLMTdNnUwGVZo8SV3rnEBbWA",
-            "published_at": "2026-10-08T13:24:19.433Z",
+            "encrypted_manifest_hash": "cDqcvATXi8z_3PK44iEtYTRAirXIj47H7Lxi5HSjfTM",
+            "published_at": "2026-10-22T02:41:21.275Z",
             "recipients": 1
           },
           "state": "published"
@@ -1762,8 +1818,8 @@
           "generation": {
             "backup_generation": "6",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "eB4N1Paaj3N7lYbElgvMepJ0jDTrPadHNZmRuPxU71s",
-            "published_at": "2026-10-08T13:24:19.676Z",
+            "encrypted_manifest_hash": "EnGxrPQTqQp_BWYhJCgM3WMbindWx03rkkrMMJHRoCs",
+            "published_at": "2026-10-22T02:41:21.288Z",
             "recipients": 1
           },
           "state": "published"
@@ -1820,8 +1876,8 @@
           "generation": {
             "backup_generation": "7",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "dWg6EvnBZuQz6nUQ0JhzYxLvDk-r4MD42Ks9tgt4aCU",
-            "published_at": "2026-10-08T13:24:19.754Z",
+            "encrypted_manifest_hash": "V7wfiISLY2jBdjcraEGXR7bEqZUK9VCL89m9nK8Z1Rs",
+            "published_at": "2026-10-22T02:41:21.301Z",
             "recipients": 1
           },
           "state": "published"
@@ -1879,8 +1935,8 @@
           "generation": {
             "backup_generation": "8",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "a9NmDOP0F4DoTk0MGa15q6SE0hVZwt9BtCY_TGNRZeA",
-            "published_at": "2026-10-08T13:24:19.835Z",
+            "encrypted_manifest_hash": "NUkZQCTeqbwjy62ugn5IAolVLtZGxWAhrmuS6d_JQtM",
+            "published_at": "2026-10-22T02:41:21.349Z",
             "recipients": 1
           },
           "state": "published"
@@ -1939,8 +1995,8 @@
           "generation": {
             "backup_generation": "9",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "-omG9yDCNVEDcUnJMHgHhaJSEwSSupv4zYwTPQj40RE",
-            "published_at": "2026-10-08T13:24:19.947Z",
+            "encrypted_manifest_hash": "Ej3Z_Kcx5bUuRzjHjxuroZ3kw0c_BSO4R_mAdhKu2Rs",
+            "published_at": "2026-10-22T02:41:21.363Z",
             "recipients": 1
           },
           "state": "published"
@@ -2000,8 +2056,8 @@
           "generation": {
             "backup_generation": "10",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "_mn6_mTkNXfzsX7NxddouqxFQ3I_OFTtuBvKKQKAb28",
-            "published_at": "2026-10-08T13:24:20.123Z",
+            "encrypted_manifest_hash": "05FDKsJmFDGKkGRMWei9qXd5AzTcFfbiON14f-Bu9bY",
+            "published_at": "2026-10-22T02:41:21.377Z",
             "recipients": 1
           },
           "state": "published"
@@ -2062,8 +2118,8 @@
           "generation": {
             "backup_generation": "11",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "pD83-hyZpujbx1TcbU4EtNaZuodVMf0Ji3AKTQlI6iA",
-            "published_at": "2026-10-08T13:24:20.154Z",
+            "encrypted_manifest_hash": "dcJglJkrb0myKFU3x_criXdckxGNJyJG-owVuluH5TI",
+            "published_at": "2026-10-22T02:41:21.390Z",
             "recipients": 1
           },
           "state": "published"
@@ -2125,8 +2181,8 @@
           "generation": {
             "backup_generation": "12",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "F0zquKCqlQBbCxylWN9JujIoHYKTWyCfxR1vA69UEAc",
-            "published_at": "2026-10-08T13:24:20.268Z",
+            "encrypted_manifest_hash": "IjDvqPekQYLmyrr3iegTO62YqhgRqYFAJDxtF40SwKk",
+            "published_at": "2026-10-22T02:41:21.402Z",
             "recipients": 1
           },
           "state": "published"
@@ -2189,8 +2245,8 @@
           "generation": {
             "backup_generation": "13",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "PmmIwaYbv58bVXRplYIJ9QCDXrjNfcoLyodTgd3n-TM",
-            "published_at": "2026-10-08T13:24:20.486Z",
+            "encrypted_manifest_hash": "owUWPR-u-AoLC4S5CWupE_2niHYusCgekA9dR0u49LA",
+            "published_at": "2026-10-22T02:41:21.418Z",
             "recipients": 1
           },
           "state": "published"
@@ -2254,8 +2310,8 @@
           "generation": {
             "backup_generation": "14",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "0jl63Jrpmk4QDbaUuXcDyWSXrjsextyoPOb_ToeWRu4",
-            "published_at": "2026-10-08T13:24:20.630Z",
+            "encrypted_manifest_hash": "6U8hxXTX1lCVSm2a387nkKvkUHobdfODLFDb35SshZk",
+            "published_at": "2026-10-22T02:41:21.431Z",
             "recipients": 1
           },
           "state": "published"
@@ -2320,8 +2376,8 @@
           "generation": {
             "backup_generation": "15",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "eYeXTuK_8WYeLBN8j095c2cZj6GHG5Vk3BJsAde8ynE",
-            "published_at": "2026-10-08T13:24:20.871Z",
+            "encrypted_manifest_hash": "wrsmS6k5VNL3kFz5r5Hk0JiIngV0NI1M2CwqQOMGA5I",
+            "published_at": "2026-10-22T02:41:21.443Z",
             "recipients": 1
           },
           "state": "published"
@@ -2387,8 +2443,8 @@
           "generation": {
             "backup_generation": "16",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "af9N-ZLrsQ27buMjB2fXIQBc_w0bXUEx1jYIjbdhokU",
-            "published_at": "2026-10-08T13:24:21.099Z",
+            "encrypted_manifest_hash": "dipFJ5s-3wavn2Kwyqjcb56UeRmDYwiAOyYikGuYF_g",
+            "published_at": "2026-10-22T02:41:21.457Z",
             "recipients": 1
           },
           "state": "published"
@@ -2455,8 +2511,8 @@
           "generation": {
             "backup_generation": "17",
             "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "FtuhrdqmM9BNmm5c2-QsfZuly563tyzU9Er3Ts0fYMM",
-            "published_at": "2026-10-08T13:24:21.209Z",
+            "encrypted_manifest_hash": "3G5cwG60N0rvNM8JkvaOqpx08MaA01H1LDluwslfdbc",
+            "published_at": "2026-10-22T02:41:21.470Z",
             "recipients": 1
           },
           "state": "published"
@@ -2498,9 +2554,1080 @@
           "collection": {
             "allowance_bytes": null,
             "archive_id": "71717171-7171-7171-7171-717171717171",
-            "bytes": "13520",
+            "bytes": "14365",
             "checkpoint_generation": "18",
             "generations": [
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "18",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "_HVBb1GOATRncgC9LD6S2-enEO8uSTWA6q5FIBWFuRU",
+            "published_at": "2026-10-22T02:41:21.517Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 18"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "15210",
+            "checkpoint_generation": "19",
+            "generations": [
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "19",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "QzGSzdqqoJXpHwy1NvGBwc5DJaJ6Xqce-S3NttmZHX8",
+            "published_at": "2026-10-22T02:41:21.530Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 19"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "16055",
+            "checkpoint_generation": "20",
+            "generations": [
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "20",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "RuPLrMXv4WKWsPKDNQ7BTA6IKBs-NPxXma5ijDp72jI",
+            "published_at": "2026-10-22T02:41:21.543Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 20"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "16900",
+            "checkpoint_generation": "21",
+            "generations": [
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "21",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "Z64kObolM2fMpbGxmMfilWclGkDQBDEP_iVUxVlXbYs",
+            "published_at": "2026-10-22T02:41:21.556Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 21"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "17745",
+            "checkpoint_generation": "22",
+            "generations": [
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "22",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "IuCzCf5H7_MgOz3Mp8U0s2BdvXQO93SNumDinjzTYF8",
+            "published_at": "2026-10-22T02:41:21.568Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 22"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "18590",
+            "checkpoint_generation": "23",
+            "generations": [
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "23",
+            "descriptor_bytes": "845",
+            "encrypted_manifest_hash": "-caEe9GPPdTEypSPPdsv_K3LH_P70JxA3AT2yIKhplM",
+            "published_at": "2026-10-22T02:41:21.581Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 23"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "19438",
+            "checkpoint_generation": "24",
+            "generations": [
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "24",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "UDUWM5G7jx4XrGcxBMHS8Nm96jzOnMvROwqy-RwsQ6k",
+            "published_at": "2026-10-22T02:41:21.592Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 24"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "20286",
+            "checkpoint_generation": "25",
+            "generations": [
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "25",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "VLP0RPnvdpR76gL7gTIawpgaLXEIGjEj63CeagCWqOw",
+            "published_at": "2026-10-22T02:41:21.605Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 25"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "21134",
+            "checkpoint_generation": "26",
+            "generations": [
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "26",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "HWMvjli5okAi0hqDrU2XIpmBRs03ZdbigjjzrWCCIrc",
+            "published_at": "2026-10-22T02:41:21.619Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 26"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "21982",
+            "checkpoint_generation": "27",
+            "generations": [
+              "27",
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "27",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "SFaf5gyg75tlekpSlHmbUsDPNNO1EipJzPzawYG_m60",
+            "published_at": "2026-10-22T02:41:21.632Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 27"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "22830",
+            "checkpoint_generation": "28",
+            "generations": [
+              "28",
+              "27",
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "28",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "XUTx7vK1guRc7T-VsljWP6pwLAiLQzvK437EAvDsp7k",
+            "published_at": "2026-10-22T02:41:21.645Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 28"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "23678",
+            "checkpoint_generation": "29",
+            "generations": [
+              "29",
+              "28",
+              "27",
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "29",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "nBdpSnnYup5QpE8ki43BLBoomiFC524TlCMzLB8dwxs",
+            "published_at": "2026-10-22T02:41:21.695Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 29"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "24526",
+            "checkpoint_generation": "30",
+            "generations": [
+              "30",
+              "29",
+              "28",
+              "27",
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "30",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "uls45q0fgm4LONUiQR71iVMU8mdwEEXOzVYGT5jDH6U",
+            "published_at": "2026-10-22T02:41:21.709Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 30"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "25374",
+            "checkpoint_generation": "31",
+            "generations": [
+              "31",
+              "30",
+              "29",
+              "28",
+              "27",
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
+              "18",
+              "17",
+              "16",
+              "15",
+              "14",
+              "13",
+              "12",
+              "11",
+              "10",
+              "9",
+              "8",
+              "7",
+              "6",
+              "5",
+              "4",
+              "2",
+              "1"
+            ]
+          },
+          "dropped": [],
+          "generation": {
+            "backup_generation": "31",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "Yjuxu3TI9Jz5AAUE0UzDXHEvyyaNmkEQZiyUVkGBzo8",
+            "published_at": "2026-10-22T02:41:21.722Z",
+            "recipients": 1
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "path": "/api/backup/manifest",
+      "shape": {
+        "data": {
+          "collection": {
+            "allowance_bytes": "null",
+            "archive_id": "string",
+            "bytes": "string",
+            "checkpoint_generation": "string",
+            "generations": {
+              "array": "string"
+            }
+          },
+          "dropped": {
+            "array": null
+          },
+          "generation": {
+            "backup_generation": "string",
+            "descriptor_bytes": "string",
+            "encrypted_manifest_hash": "string",
+            "published_at": "string",
+            "recipients": "number"
+          },
+          "state": "published"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "publish generation 31"
+    },
+    {
+      "body": {
+        "data": {
+          "collection": {
+            "allowance_bytes": null,
+            "archive_id": "71717171-7171-7171-7171-717171717171",
+            "bytes": "25377",
+            "checkpoint_generation": "32",
+            "generations": [
+              "32",
+              "31",
+              "30",
+              "29",
+              "28",
+              "27",
+              "26",
+              "25",
+              "24",
+              "23",
+              "22",
+              "21",
+              "20",
+              "19",
               "18",
               "17",
               "16",
@@ -2523,10 +3650,10 @@
             "1"
           ],
           "generation": {
-            "backup_generation": "18",
-            "descriptor_bytes": "845",
-            "encrypted_manifest_hash": "vrPPXqQxOFrOnCUQUC_nzqjNCRNE4kt3aayUDd3JYgM",
-            "published_at": "2026-10-08T13:24:21.765Z",
+            "backup_generation": "32",
+            "descriptor_bytes": "848",
+            "encrypted_manifest_hash": "dZPwIfosbwkn-U9XMD12PG1Ynuagy91Scpc56WeaV-s",
+            "published_at": "2026-10-22T02:41:21.735Z",
             "recipients": 1
           },
           "state": "published"
@@ -2560,7 +3687,7 @@
         "ok": true
       },
       "status": 200,
-      "step": "publish generation 18"
+      "step": "publish generation 32"
     },
     {
       "body": {
@@ -2584,8 +3711,8 @@
     {
       "body": {
         "data": {
-          "deleted_at": "2026-10-08T13:24:22.232Z",
-          "purge_after": "2026-10-15T13:24:22.232Z",
+          "deleted_at": "2026-10-22T02:41:21.753Z",
+          "purge_after": "2026-10-29T02:41:21.753Z",
           "retained_bytes": "1000",
           "retention": {
             "daily_snapshots": 30,
@@ -2617,8 +3744,8 @@
     {
       "body": {
         "data": {
-          "deleted_at": "2026-10-08T13:24:22.232Z",
-          "purge_after": "2026-10-15T13:24:22.232Z",
+          "deleted_at": "2026-10-22T02:41:21.753Z",
+          "purge_after": "2026-10-29T02:41:21.753Z",
           "retained_bytes": "1000",
           "retention": {
             "daily_snapshots": 30,
@@ -2668,28 +3795,42 @@
     }
   ],
   "names": [
-    "kg9KXw3984_Zp9KHGMtBDOMxlWUFlLvGR2nQAyFxeSI",
-    "mOTIR12qDuNCeePXfWt-1MoU_Dlabo4KHwvotaAQWbA",
-    "_U0jnRkKQwWxrPr3bFurak1isVGTzPu5Map9oxu1At8",
-    "CVA4evOvjByQh1J2oeHlY8W7Ue4gjJapylyRV1mn4qw",
-    "j7PkUR52lN8B7uycGud_Nn3nVlysCjw8_ZRD7MpLrxk",
-    "JpaZTtR_d23h957SUZ9iRn1SuAn5eHdGmoHsA-rx_U4",
-    "uap-usRu37-s94Snwb_WuOOaHGmN6fmmihx8FE5PswQ",
-    "U0sb1o7nPSdGHtf3TKqtLMTdNnUwGVZo8SV3rnEBbWA",
-    "eB4N1Paaj3N7lYbElgvMepJ0jDTrPadHNZmRuPxU71s",
-    "dWg6EvnBZuQz6nUQ0JhzYxLvDk-r4MD42Ks9tgt4aCU",
-    "a9NmDOP0F4DoTk0MGa15q6SE0hVZwt9BtCY_TGNRZeA",
-    "-omG9yDCNVEDcUnJMHgHhaJSEwSSupv4zYwTPQj40RE",
-    "_mn6_mTkNXfzsX7NxddouqxFQ3I_OFTtuBvKKQKAb28",
-    "pD83-hyZpujbx1TcbU4EtNaZuodVMf0Ji3AKTQlI6iA",
-    "F0zquKCqlQBbCxylWN9JujIoHYKTWyCfxR1vA69UEAc",
-    "PmmIwaYbv58bVXRplYIJ9QCDXrjNfcoLyodTgd3n-TM",
-    "0jl63Jrpmk4QDbaUuXcDyWSXrjsextyoPOb_ToeWRu4",
-    "eYeXTuK_8WYeLBN8j095c2cZj6GHG5Vk3BJsAde8ynE",
-    "af9N-ZLrsQ27buMjB2fXIQBc_w0bXUEx1jYIjbdhokU",
-    "FtuhrdqmM9BNmm5c2-QsfZuly563tyzU9Er3Ts0fYMM",
-    "vrPPXqQxOFrOnCUQUC_nzqjNCRNE4kt3aayUDd3JYgM"
+    "ZXqQ-DJrDHkDUd1lKjONwwbv6qI1zsjxMSNZCMIpye4",
+    "QzZNHGFq3Acdy033Nmz5eSW5tGXL1wmzDDzrTR9JmcI",
+    "wdAULEN1XpWfOzbGC07b7z2RC15oQOUjS8pPexxwgWI",
+    "P6ufNNLwKOhqybFdfJVYA18fnI1RF_kRBvICP5UQE-o",
+    "Cpmp2l1lkow_9VQG9y7UiCZGd5tRimvQvlXm0O7Mllg",
+    "PQ2EGFEoWFclNoJrrcxhdyjpWI6BEIpwITT0TVrN7tU",
+    "g84uH07Bj8ziZAooncInnXdSgsz8Id4-ZqHXxQSDE6k",
+    "cDqcvATXi8z_3PK44iEtYTRAirXIj47H7Lxi5HSjfTM",
+    "EnGxrPQTqQp_BWYhJCgM3WMbindWx03rkkrMMJHRoCs",
+    "V7wfiISLY2jBdjcraEGXR7bEqZUK9VCL89m9nK8Z1Rs",
+    "NUkZQCTeqbwjy62ugn5IAolVLtZGxWAhrmuS6d_JQtM",
+    "Ej3Z_Kcx5bUuRzjHjxuroZ3kw0c_BSO4R_mAdhKu2Rs",
+    "05FDKsJmFDGKkGRMWei9qXd5AzTcFfbiON14f-Bu9bY",
+    "dcJglJkrb0myKFU3x_criXdckxGNJyJG-owVuluH5TI",
+    "IjDvqPekQYLmyrr3iegTO62YqhgRqYFAJDxtF40SwKk",
+    "owUWPR-u-AoLC4S5CWupE_2niHYusCgekA9dR0u49LA",
+    "6U8hxXTX1lCVSm2a387nkKvkUHobdfODLFDb35SshZk",
+    "wrsmS6k5VNL3kFz5r5Hk0JiIngV0NI1M2CwqQOMGA5I",
+    "dipFJ5s-3wavn2Kwyqjcb56UeRmDYwiAOyYikGuYF_g",
+    "3G5cwG60N0rvNM8JkvaOqpx08MaA01H1LDluwslfdbc",
+    "_HVBb1GOATRncgC9LD6S2-enEO8uSTWA6q5FIBWFuRU",
+    "QzGSzdqqoJXpHwy1NvGBwc5DJaJ6Xqce-S3NttmZHX8",
+    "RuPLrMXv4WKWsPKDNQ7BTA6IKBs-NPxXma5ijDp72jI",
+    "Z64kObolM2fMpbGxmMfilWclGkDQBDEP_iVUxVlXbYs",
+    "IuCzCf5H7_MgOz3Mp8U0s2BdvXQO93SNumDinjzTYF8",
+    "-caEe9GPPdTEypSPPdsv_K3LH_P70JxA3AT2yIKhplM",
+    "UDUWM5G7jx4XrGcxBMHS8Nm96jzOnMvROwqy-RwsQ6k",
+    "VLP0RPnvdpR76gL7gTIawpgaLXEIGjEj63CeagCWqOw",
+    "HWMvjli5okAi0hqDrU2XIpmBRs03ZdbigjjzrWCCIrc",
+    "SFaf5gyg75tlekpSlHmbUsDPNNO1EipJzPzawYG_m60",
+    "XUTx7vK1guRc7T-VsljWP6pwLAiLQzvK437EAvDsp7k",
+    "nBdpSnnYup5QpE8ki43BLBoomiFC524TlCMzLB8dwxs",
+    "uls45q0fgm4LONUiQR71iVMU8mdwEEXOzVYGT5jDH6U",
+    "Yjuxu3TI9Jz5AAUE0UzDXHEvyyaNmkEQZiyUVkGBzo8",
+    "dZPwIfosbwkn-U9XMD12PG1Ynuagy91Scpc56WeaV-s"
   ],
   "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
-  "web_commit": "91d71cba101c010ccc811173834ce7109219bf55"
+  "web_commit": "25468ef7c1f163c838a50c7c0563bcfb11bc9d57"
 }

@@ -1615,7 +1615,7 @@ async fn a_fetch_of_the_largest_descriptor_is_read_under_the_manifests_own_bound
     let device = Device::generate();
     let archive = Archive::largest(&device);
     let publication = archive.publication();
-    let generations: Vec<String> = (1..=16)
+    let generations: Vec<String> = (1..=30)
         .rev()
         .map(|generation: u64| generation.to_string())
         .collect();
@@ -1631,7 +1631,7 @@ async fn a_fetch_of_the_largest_descriptor_is_read_under_the_manifests_own_bound
             "published_at": "2026-09-25T17:00:00.000Z",
             "collection": {
                 "archive_id": archive_id(),
-                "checkpoint_generation": "16",
+                "checkpoint_generation": "30",
                 "generations": generations,
                 "bytes": "1048576",
                 "allowance_bytes": "10737418240",

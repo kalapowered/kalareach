@@ -461,7 +461,7 @@ async fn run_the_script(
     journal.decoded(decoded(&answer, fetched_showing));
 
     // The history is bounded.
-    for generation in 5..=18 {
+    for generation in 5..=32 {
         let (next, _) = sealed(generation, b"the notes");
         journal.step(&format!("publish generation {generation}"));
         let answer = manifest(&writer, account_token).publish(&next).await;
