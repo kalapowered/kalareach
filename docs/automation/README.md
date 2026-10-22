@@ -569,19 +569,43 @@ A test result is what this host observed, and nothing a caller reports.
   cancelled, the node settles as cancelled with the reason "run cancelled by request"; when its
   session closes in any way but the suite's own end before the node is settled, the node's answer
   says how the session closed. A node settled as cancelled stays cancelled, whatever the suite does
-  afterwards. The node succeeds only when the suite exited with status zero and the copy still holds
-  exactly the version. If the suite exited with a non-zero exit status or was stopped by a signal,
+  afterwards. The node succeeds only when the suite exited with status zero, the copy still holds
+  exactly the version, and nothing outside the suite's declared outputs was written in the copy
+  while the suite ran. If the suite exited with a non-zero exit status or was stopped by a signal,
   the node will fail, once the host has recorded what it observed. If the suite exited with status
-  zero against a copy that was changed, or that cannot be read back, it attests no version, so the
-  node is left unknown. When the copy was changed and what it held can be read completely, within
+  zero against a copy that was changed, that cannot be read back, that had something written in it
+  and put back, or that this host could not bind to the run, it attests no version, so the node is
+  left unknown. When the copy was changed and what it held can be read completely, within
   the bounds of a capture and the rules for what a version may hold, that is stored as a version of
   its own, which is a reading and not an attestation. When the copy cannot be read back, or a file
   outside the declared outputs that the reading found has a modification time in a later millisecond
   than the closure of the session, no version is stored (the files a reading did store stay in the
   content store); a change after the closure that leaves no such time, such as a deletion, cannot be
-  told from a change the suite made. The host will record what it wrote when it makes the copy and
-  read the copy when it records the result of the suite, but will not monitor the copy while the
-  suite is running.
+  told from a change the suite made.
+* **The result is bound to its run.** Reading the copy when it is made and again when the suite has
+  ended is not enough. A suite that changes a file, tests the change and puts the file back, bytes
+  and modification time included, leaves a copy that reads as the version. So the host also
+  records, after the copy is made and before the suite starts, what the platform says about the
+  copy's own directory and about every file and directory beneath it: the kind of object, its
+  device and inode, its length, the time it was last modified and the time its inode last changed.
+  The change time is the one a run cannot put back. A write, a truncation, a rename, a change of
+  mode and a change of time each move it to the moment they happen, and no call a process can make
+  sets it to an earlier one. When the session has closed, the host records the same again. An
+  entry that is added, gone or different means something was written while the suite ran, and then
+  the result attests no version although the copy reads as the version. A file made and removed
+  again counts, because it moves the change time of the directory it was in. Two checks make equal
+  records mean what they say. The filesystem has to be one whose change times this host knows to be
+  kept (ext2 to ext4, XFS, Btrfs, tmpfs, overlayfs, F2FS and ZFS on Linux; APFS and HFS+ on
+  macOS), and on any other the result is indeterminate. And before the suite starts the host waits,
+  for up to three seconds, until the filesystem's own clock has passed the newest change time it
+  recorded, so that a change made in the same tick as the record still shows. The record is kept in
+  the daemon's memory by the dispatch that waits for the session, so a daemon that stops while the
+  suite runs records no result at all. A platform that keeps no such record has none, and a result
+  there is indeterminate.
+  The record shows that nothing in the copy was written while the suite ran. It does not show what
+  the suite read, which can be anything on the machine. Nor does it show a write through a shared
+  mapping that the platform has not yet recorded when the result is recorded, a write by a process
+  that outlives the session, or a system clock set back by an account allowed to set it.
 * **Declared outputs.** A suite may declare paths it intends to write, other than its source, such
   as a build directory. These paths are not compared, and each one the reading reaches is recorded
   in one reference; a reading that stops at a problem in the source records only the outputs before
@@ -595,7 +619,21 @@ A test result is what this host observed, and nothing a caller reports.
   listed, or an entry of a listing that cannot be read, is listed as an unreadable entry. If a
   directory in an output is a link, a mount, or has a name this host does not carry, it is an entry
   of the listing and is not entered. Nothing in an output enters the content store. A result that
-  attests the version names the output paths it left out of the comparison. A file the suite adds
+  attests the version names the output paths it left out of the comparison. Before the suite
+  starts, the host makes the directories above each declared output that the copy does not have,
+  empty, so that writing the output changes no entry above the directory it is in. That directory,
+  the output's parent, is the one place whose own record the host does not compare, because
+  creating the output changes it, and a record cannot tell the output from a name written beside
+  it. The host watches the parent by name instead, from before the suite starts to after it has
+  ended. A name created, removed, renamed, written or changed there, other than a declared output,
+  makes the result indeterminate however briefly it existed: a scratch file the suite made and
+  removed again at the copy's root, beside an output called `target`, is such a name. On Linux the
+  watcher is the kernel's inotify. On macOS it is FSEvents, which reports on its own schedule, so
+  the host writes a file of its own beside the copy and waits, for up to ten seconds, until the
+  watcher reports it, which means every report up to then has arrived. A watcher that cannot
+  start, that lost reports or that does not answer in that time makes the result indeterminate,
+  and so does a platform with no watcher whenever a suite declares an output. A suite that removes
+  a directory above its declared output is writing outside the output. A file the suite adds
   beside an output is not left out of the comparison and changes the source (an added empty
   directory does not, unless the reading cannot open or list it, reaches a bound, or the change
   set's rules keep its path out, which makes the source indeterminate), so a tool that writes beside
@@ -608,8 +646,8 @@ A test result is what this host observed, and nothing a caller reports.
   declaration with a name this host does not carry as input (a colon, one of `< > " | ? *`, a
   trailing dot or space, a name a Windows device has with or without an extension, a name over 255
   bytes), which the configuration accepts and every dispatch of that suite then refuses. A
-  declaration beneath a file of the version is accepted, since writing there takes the file away
-  first, which reads as a change.
+  declaration beneath a file of the version is accepted, but the directory above its output cannot
+  be made, so the result of a suite that declares one is always indeterminate.
 * **The copy's release.** A copy is taken away by the dispatch at once when no suite ran (the copy
   could not be written whole, or its session could not be made), and otherwise once the session has
   closed and its worker is accounted for; the sweep takes away any other copy. A node that settles
