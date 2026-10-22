@@ -7,7 +7,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-26.43 | each class of parse fault a program can write is counted under its closed label, once for each occurrence and the same on a second read; an adapter whose component the plugin runtime cannot run is counted once for each step into that state, and a package that is not a bundled connector is counted under no name |
+//! | KR-REQ-26.43 | each class of parse fault a program can write is counted under its closed label as often as the terminal engine counted it, the diagnostics that are not parse faults are not counted, and a second read adds nothing; an adapter whose component the plugin runtime cannot run is counted once for each step into that state, and a package that is not a bundled connector is counted under no name |
 
 #![cfg(unix)]
 
@@ -27,6 +27,7 @@ use kr_protocol::ids::{
 use kr_protocol::metrics::{Adapter, Environment, Fault, Outcome, Report};
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_term::diag::DiagnosticKind;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -164,10 +165,10 @@ fn faults(report: &Report) -> Vec<(Fault, u64)> {
 }
 
 /// KR-REQ-26.43: a program that writes each of the four classes of bytes the parser cannot make
-/// sense of is counted under the class's closed label once for each, and reading the report again
-/// adds nothing.
+/// sense of is counted under the class's closed label as often as the terminal engine counted it,
+/// and reading the report again adds nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_once() {
+async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_under_its_label() {
     // A sequence the profile has no class for; text that is not UTF-8; a control sequence cut off
     // by CAN; and an operating-system command past the bound on a control string.
     let world = World::running(
@@ -214,16 +215,44 @@ async fn kr_req_26_43_each_class_of_parse_fault_a_program_writes_is_counted_once
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let settled = world.service.metrics();
+    let totals = world.runtime.session().terminal_diagnostics();
+    let engine_counted = |kind| {
+        totals
+            .iter()
+            .find(|(counted, _)| *counted == kind)
+            .map_or(0, |(_, count)| *count)
+    };
+    for (kind, class) in [
+        (
+            DiagnosticKind::AbandonedControlString,
+            Fault::UnterminatedSequence,
+        ),
+        (DiagnosticKind::MalformedUtf8, Fault::InvalidEncoding),
+        (
+            DiagnosticKind::OversizedControlString,
+            Fault::OversizedFrame,
+        ),
+        (DiagnosticKind::UnclassifiedSequence, Fault::UnknownControl),
+    ] {
+        assert!(
+            engine_counted(kind) >= 1,
+            "the shell wrote {kind:?}: {totals:?}"
+        );
+        let reported = faults(&settled)
+            .into_iter()
+            .find(|(fault, _)| *fault == class)
+            .map(|(_, count)| count);
+        assert_eq!(
+            reported,
+            Some(engine_counted(kind)),
+            "{class:?} is counted as often as the engine counted {kind:?} (first read: {:?})",
+            faults(&first)
+        );
+    }
     assert_eq!(
-        faults(&settled),
-        vec![
-            (Fault::UnterminatedSequence, 1),
-            (Fault::InvalidEncoding, 1),
-            (Fault::OversizedFrame, 1),
-            (Fault::UnknownControl, 1),
-        ],
-        "each class once, in the report's fixed order (first read: {:?})",
-        faults(&first)
+        settled.terminal_parse_fault.len(),
+        4,
+        "the diagnostics that are not parse faults are not counted as one: {totals:?}"
     );
     assert_eq!(
         world.service.metrics(),
