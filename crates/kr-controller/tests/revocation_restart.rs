@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use kr_protocol::method::Method;
 use kr_protocol::sharing::{RoleSelection, SessionRole};
-use net_support::environment::Environment;
-use net_support::worker::share;
+use net_support::worker::{Adopted, share};
 use net_support::{on_the_host, recipient};
 
 /// KR-REQ-10.45: a revocation commits its withdrawal and the fence debt it owes in one
@@ -26,12 +25,12 @@ use net_support::{on_the_host, recipient};
 /// pass can publish the revision before the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_revocation_whose_revision_could_not_be_published_is_finished_by_the_next_start() {
-    let Environment {
+    let Adopted {
         host,
         owner,
-        worker,
-    } = Environment::start().await;
-    let session_id = worker.session_id;
+        workers,
+    } = Adopted::start(1).await;
+    let session_id = workers[0].session_id;
     let (device, record) = recipient(&host, &owner).await;
     let granted = share(
         &host,
@@ -149,5 +148,5 @@ async fn a_revocation_whose_revision_could_not_be_published_is_finished_by_the_n
         "the worker fenced the revision the start advanced to: {fenced:?}"
     );
     host.stop().await;
-    drop(worker);
+    drop(workers);
 }
