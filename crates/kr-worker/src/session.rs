@@ -1543,6 +1543,18 @@ impl Session {
         input.end_lease()
     }
 
+    /// Sets what the session's application is doing, and returns whether that changed anything.
+    ///
+    /// A session that no longer accepts input has no application to describe: closing clears the
+    /// state, and nothing sets it again afterwards.
+    pub(crate) fn set_application_state(&mut self, state: Option<ApplicationState>) -> bool {
+        if !self.state().accepts_input() || self.application_state == state {
+            return false;
+        }
+        self.application_state = state;
+        true
+    }
+
     /// Renders the session for the wire.
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
