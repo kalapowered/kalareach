@@ -973,6 +973,14 @@ impl Controller {
             .store(pages, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Returns the workers that still owe names of a revocation, for this host's own tests: the
+    /// ones the daemon goes on asking for them, apart from any announcement.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn names_owed_for_tests(&self) -> Vec<SessionId> {
+        self.leases.owing_names()
+    }
+
     /// Replaces what this host holds of its qualification, for a test of the door on a host that
     /// does not qualify.
     #[cfg(feature = "testing")]

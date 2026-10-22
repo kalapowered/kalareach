@@ -2555,6 +2555,14 @@ page, because that page *is* the acknowledgement; what the later ones complete i
 `WorkerBarrier.names_pending` says how much of it has not arrived rather than letting a partial
 report read as a complete one.
 
+A page the worker refuses because its dispatch boundary is held is asked for again after a pause
+that doubles, ten times at most for one announcement, which is about five seconds across all the
+workers it collects from. The actions the fence could not take back come before the intents it took
+back, on every page of one revision, so an announcement that stops early has them. What a worker
+still owes after that is asked for by the daemon apart from any announcement, every five seconds
+while none is running, and lands in the report of its own revision. A repeat of a revocation with
+its action identifier is answered as it was first, with the names its workers have given since.
+
 An announcement that arrives while the worker is inside a dispatch transition is answered with a
 refusal that says to come back, and the daemon reports that worker `pending`. The fence takes the
 same serial boundary a dispatch does, which is what makes its two answers two answers: it reads an

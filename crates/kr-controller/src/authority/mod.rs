@@ -809,6 +809,25 @@ impl AuthorityBarrier {
     /// Takes the next ticket for a round or an exchange that is about to run.
     pub fn begin_round(&self) -> Round<'_> {
         let mut roster = self.ordered();
+        self.take_ticket(&mut roster)
+    }
+
+    /// Takes the next ticket as [`Self::begin_round`] does, and only when no other round or
+    /// exchange is running.
+    ///
+    /// For work that is done apart from any announcement and gives way to one: the check and the
+    /// ticket are one step under the roster's lock, so work that would start while an announcement
+    /// runs is not started.
+    pub fn begin_round_if_idle(&self) -> Option<Round<'_>> {
+        let mut roster = self.ordered();
+        if roster.running.is_empty() {
+            Some(self.take_ticket(&mut roster))
+        } else {
+            None
+        }
+    }
+
+    fn take_ticket(&self, roster: &mut Roster) -> Round<'_> {
         let ticket = roster.next_ticket;
         roster.next_ticket = roster.next_ticket.saturating_add(1);
         roster.running.insert(ticket, None);

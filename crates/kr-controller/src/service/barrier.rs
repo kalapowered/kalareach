@@ -61,6 +61,9 @@ struct EvidenceBudget {
 struct Retries {
     left: u32,
     pause: std::time::Duration,
+    /// Whether the collection is the evidence pass's and not an announcement's, which this host's
+    /// own tests tell apart: a pass is not an announcement they count.
+    by_the_pass: bool,
 }
 
 impl Retries {
@@ -69,6 +72,15 @@ impl Retries {
         Self {
             left: MAX_PAGE_RETRIES,
             pause: PAGE_RETRY_PAUSE,
+            by_the_pass: false,
+        }
+    }
+
+    /// What one run of the evidence pass may spend.
+    fn for_the_pass() -> Self {
+        Self {
+            by_the_pass: true,
+            ..Self::for_an_announcement()
         }
     }
 
@@ -822,7 +834,9 @@ impl Controller {
                     return;
                 };
                 #[cfg(feature = "testing")]
-                self.record_announcement(session_id, &notice);
+                if !retries.by_the_pass {
+                    self.record_announcement(session_id, &notice);
+                }
                 match tokio::time::timeout(WORKER_EXCHANGE, link.client().announce_revision(notice))
                     .await
                 {
@@ -1419,8 +1433,11 @@ impl Controller {
             return;
         }
         // Held as an announcement holds its round, so a worker that ends while this runs keeps
-        // the names it had given until this is over.
-        let round = self.leases.begin_round();
+        // the names it had given until this is over. An announcement collects the same names and
+        // is the one that matters when it runs, so this gives way to it.
+        let Some(round) = self.leases.begin_round_if_idle() else {
+            return;
+        };
         let revision = {
             let registry = self.registry.lock().await;
             let Ok(revision) = registry.authority_revision() else {
@@ -1429,7 +1446,7 @@ impl Controller {
             round.at(revision);
             revision
         };
-        let mut retries = Retries::for_an_announcement();
+        let mut retries = Retries::for_the_pass();
         for session_id in owing {
             // A worker whose session has closed is bound no more, and owes nothing it can give.
             let Ok(Some(binding)) = self.binding_or_bind(session_id).await else {
