@@ -426,22 +426,35 @@ the largest text size, and the attachment picker on a phone whose camera the sys
 good: a host this phone is paired with takes no file from it, so every source is disabled and the
 screen says nothing of the camera. It then shows the paired phone as an owner device: the host asks
 it to confirm one of its own requests and, separately, a second device it would add. A cancelled
-prompt confirms nothing and
-leaves the request listed and the invitation behind it refused; the same request is then confirmed,
-with Face ID on the simulator and the PIN of the emulator's screen lock, and the host spends that
-confirmation on the invitation. On the emulator a phone with no screen lock says that it cannot
-confirm, and offers the button once a lock is set. It searches the phone's log for the invitation's
-text and secret.
+prompt confirms nothing and leaves the request listed and the invitation behind it refused. On the
+simulator the alert is cancelled once, and the system's Face ID is then sent a face that does not
+match and cancelled at the system's sheet, so that Face ID is shown to run and a refusal there to
+leave the request unanswered; on the emulator the system's prompt for the screen lock is cancelled.
+The same request is then confirmed, with a matching face on the simulator and the PIN of the
+emulator's screen lock, and the host spends that confirmation on the invitation. On the emulator the
+PIN is taken away while the second device's request is listed: the button that confirms goes while
+the request and its value stay, and the button returns when the PIN is set again. The run then
+searches the phone's log for the invitation's text and secret, and for the text and code of the
+code QR; a log that could not be read, or that shows nothing of the application, fails that check
+and is never counted as clean. It also checks the development package: the network security
+configuration the verifier's library merges in keeps cleartext off, and the development build
+names its own configuration so its development server, which speaks plain HTTP, stays in reach.
 
 `scripts/e2e-android-release.sh` shows that the minified Android release build checks who it is
 talking to, and that it can reach the deployed service. The build is signed with the debug key,
-checked as a package (`scripts/check-android-release-package.sh`: the verifier's network security
-configuration is in it, cleartext traffic is off except to certificate authorities' revocation-list
-hosts, and none of this project's hosts is among them), installed on the emulator and driven through
-its pairing screen. A local TLS server whose certificate a private authority issued records what the
-phone does: it connects, ends the handshake with a fatal alert after the server's hello, and sends no
-request, since the emulator trusts no such authority. That control is a refusal of an issuer, not of a
-name that does not match, and it cannot tell a build that kept the platform verifier from one that
+checked as a package (`scripts/lib/android-network-config.py`), installed on the emulator and driven
+through its pairing screen. The check follows the manifest's name for its network security
+configuration to the file the package holds under it and reads what the configuration permits: cleartext
+traffic is off by default, it is permitted to the revocation-list hosts of the authorities the
+deployed service's certificates come from (`c.pki.goog`, `e5.c.lencr.org` and `crls.ssl.com`, by
+their exact names), and it is permitted to no host of this project nor any parent domain of one. It
+first runs against configurations that must fail (one the manifest does not name, a disabled entry,
+a parent where an exact host is needed, a broad exception, a permissive default), built from the real
+output of the build tools, and stops if any answers wrongly. A local TLS server whose certificate a
+private authority issued records what the phone does: it connects and ends the handshake after the
+server's hello, as a TLS alert or as a closed connection (the two are recorded apart), and sends no
+request, since the emulator trusts no such authority. That control is a refusal of an issuer, not of
+a name that does not match, and it cannot tell a build that kept the platform verifier from one that
 lost it. What tells them apart is a public origin whose certificate the system trusts and which
 offers no pairing (`KR_RELEASE_PUBLIC_ORIGIN=https://example.com`): with the verifier the screen says
 that the origin offers no pairing, and without the retention rule of `proguard-rules.pro` it says that
@@ -451,7 +464,8 @@ admits a socket for any locator and reserves nothing for an unknown one: it ends
 code no host answered, and a build whose verifier cannot check the service's certificate ends with the
 words for a service that could not be reached. A release build with no network security configuration
 for the revocation-list fetch is that build: Android's revocation check needs a list over plain HTTP,
-and the certificates Cloudflare serves for the deployed service name nothing else.
+and the certificates Cloudflare serves for the deployed service name nothing else. The attempt is
+sent only once the pairing screen names the deployed service as the one codes go through.
 
 ## An owner's confirmations
 
@@ -482,14 +496,20 @@ request's description in it:
 `LAContext` on macOS, and Windows Hello through `UserConsentVerifier` for this window on Windows.
 On a phone the platform plugin asks. An iPhone first shows an alert with the request's description
 and Cancel and Continue, because Face ID completes when it sees the face and an alert makes the
-person choose to go on; Continue starts `LAContext` with the passcode as its fallback. An Android
+person choose to go on; Continue starts `LAContext` with the passcode as its fallback. The alert
+ends as not confirmed when the application goes to the background. An Android
 phone shows the system's biometric prompt: a strong biometric with the screen lock as its fallback
 from Android 11, or the screen lock alone when no strong biometric is set up, and before Android 11
 a strong biometric alone. A phone with none of these confirms nothing. Which ceremony a phone offers
 is asked of the plugin and kept for five seconds, so the person can set a lock in Settings while the
 request is listed, and the page is told when the answer changes. Only this watcher gets the phone's
-ceremony: revocation and settings sync have none on a phone. The prompt is bounded by the
-challenge's remaining lifetime. Only a confirmation inside it signs,
+ceremony: revocation and settings sync have none on a phone. One request is confirmed at a time: a
+review that starts while the person is being asked about another is refused and asks nothing, and a
+phone's plugin answers a second request that reaches it with "not confirmed" and leaves the prompt
+that is up alone, because the system's prompt keeps one callback for every prompt of an activity and
+a second prompt would take the first one's answer. The prompt is bounded by the
+challenge's remaining lifetime, and a ceremony that is never answered ends when that time and a
+margin have passed. Only a confirmation inside it signs,
 with this computer's key, and completes the challenge; when the time runs out the prompt is
 dismissed and the answer is "not confirmed". Nothing on the page can answer the prompt, so a click
 that desktop automation synthesises can start a review and cannot finish one. While a review runs,
