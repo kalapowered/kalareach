@@ -598,64 +598,16 @@ pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUna
 pub fn detect() -> Vec<TerminalApplication> {
     #[cfg(target_vendor = "apple")]
     {
-        let mut found = Vec::new();
-        for (id, name, path) in [
-            ("iterm2", "iTerm2", "/Applications/iTerm.app"),
-            (
-                "apple-terminal",
-                "Terminal",
-                "/System/Applications/Utilities/Terminal.app",
-            ),
-            (
-                "apple-terminal",
-                "Terminal",
-                "/Applications/Utilities/Terminal.app",
-            ),
-        ] {
-            if std::path::Path::new(path).exists()
-                && !found
-                    .iter()
-                    .any(|application: &TerminalApplication| application.id == id)
-            {
-                found.push(TerminalApplication {
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    detail: path.to_owned(),
-                });
-            }
-        }
-        found
+        detect_under(std::path::Path::new("/"))
     }
     #[cfg(all(unix, not(target_vendor = "apple")))]
     {
-        // A desktop terminal is opened through the configured desktop launcher. Without one there
-        // is nothing to open a window with, whatever is installed.
-        let Some(launcher) = executable_in_path("gio").or_else(|| executable_in_path("gtk-launch"))
-        else {
-            return Vec::new();
-        };
-        [
-            "gnome-terminal",
-            "konsole",
-            "xfce4-terminal",
-            "alacritty",
-            "kitty",
-            "xterm",
-        ]
-        .into_iter()
-        .filter_map(|name| {
-            executable_in_path(name).map(|path| TerminalApplication {
-                id: name.to_owned(),
-                name: name.to_owned(),
-                detail: format!("{path} through {launcher}"),
-            })
-        })
-        .collect()
+        detect_on(std::env::var_os("PATH").as_deref())
     }
     #[cfg(not(unix))]
     {
         let mut found = Vec::new();
-        if let Some(path) = executable_in_path("wt.exe") {
+        if let Some(path) = executable_in(std::env::var_os("PATH").as_deref(), "wt.exe") {
             found.push(TerminalApplication {
                 id: "windows-terminal".to_owned(),
                 name: "Windows Terminal".to_owned(),
@@ -672,11 +624,76 @@ pub fn detect() -> Vec<TerminalApplication> {
     }
 }
 
-/// Returns the first executable of this name on `PATH`.
+/// The macOS terminals found in the file system rooted at `root`, iTerm2 before Terminal.app.
+///
+/// The probe is whether each application is installed, so the root is the one thing a test
+/// changes: it puts the applications it wants found under a directory of its own.
+#[cfg(target_vendor = "apple")]
+fn detect_under(root: &std::path::Path) -> Vec<TerminalApplication> {
+    let mut found = Vec::new();
+    for (id, name, path) in [
+        ("iterm2", "iTerm2", "/Applications/iTerm.app"),
+        (
+            "apple-terminal",
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
+            "apple-terminal",
+            "Terminal",
+            "/Applications/Utilities/Terminal.app",
+        ),
+    ] {
+        if root.join(path.trim_start_matches('/')).exists()
+            && !found
+                .iter()
+                .any(|application: &TerminalApplication| application.id == id)
+        {
+            found.push(TerminalApplication {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                detail: path.to_owned(),
+            });
+        }
+    }
+    found
+}
+
+/// The Linux terminals found in the directories of `search`, which opens them through the
+/// configured desktop launcher.
+///
+/// A desktop terminal is opened through the configured desktop launcher. Without one there is
+/// nothing to open a window with, whatever is installed.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn detect_on(search: Option<&std::ffi::OsStr>) -> Vec<TerminalApplication> {
+    let Some(launcher) =
+        executable_in(search, "gio").or_else(|| executable_in(search, "gtk-launch"))
+    else {
+        return Vec::new();
+    };
+    [
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "alacritty",
+        "kitty",
+        "xterm",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        executable_in(search, name).map(|path| TerminalApplication {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            detail: format!("{path} through {launcher}"),
+        })
+    })
+    .collect()
+}
+
+/// Returns the first executable of this name in the directories of `search`.
 #[cfg(not(target_vendor = "apple"))]
-fn executable_in_path(name: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+fn executable_in(search: Option<&std::ffi::OsStr>, name: &str) -> Option<String> {
+    std::env::split_paths(search?)
         .map(|directory| directory.join(name))
         .find(|candidate| candidate.is_file())
         .map(|candidate| candidate.display().to_string())
@@ -967,6 +984,133 @@ mod tests {
         let error = select(None, None, &[]).expect_err("refused");
         assert_eq!(error, TerminalUnavailable::NoneAvailable);
         assert_eq!(error.code(), ErrorCode::TerminalUnavailable);
+    }
+
+    /// KR-REQ-07.31: a macOS host prefers iTerm2 when it is installed and otherwise Terminal.app,
+    /// found at either place it is installed and listed once. Detection runs over a directory of
+    /// its own that holds the applications a case wants found.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_macos_host_lists_iterm2_before_terminal_and_each_once() {
+        let detected = |installed: &[&str]| {
+            let root = tempfile::tempdir().expect("a directory");
+            for application in installed {
+                std::fs::create_dir_all(root.path().join(application)).expect("an application");
+            }
+            detect_under(root.path())
+        };
+        let ids = |found: &[TerminalApplication]| -> Vec<String> {
+            found
+                .iter()
+                .map(|application| application.id.clone())
+                .collect()
+        };
+        const ITERM: &str = "Applications/iTerm.app";
+        const SYSTEM_TERMINAL: &str = "System/Applications/Utilities/Terminal.app";
+        const OLDER_TERMINAL: &str = "Applications/Utilities/Terminal.app";
+
+        let both = detected(&[SYSTEM_TERMINAL, ITERM]);
+        assert_eq!(ids(&both), ["iterm2", "apple-terminal"], "{both:?}");
+        let chosen = select(None, None, &both).expect("a terminal is detected");
+        assert_eq!(chosen.source, Source::Detected);
+        assert_eq!(chosen.application.id, "iterm2", "iTerm2 is preferred");
+
+        let alone = detected(&[SYSTEM_TERMINAL]);
+        assert_eq!(ids(&alone), ["apple-terminal"], "{alone:?}");
+        let older = detected(&[OLDER_TERMINAL]);
+        assert_eq!(ids(&older), ["apple-terminal"], "{older:?}");
+        let twice = detected(&[OLDER_TERMINAL, SYSTEM_TERMINAL, ITERM]);
+        assert_eq!(
+            ids(&twice),
+            ["iterm2", "apple-terminal"],
+            "Terminal.app is listed once however many places it is installed: {twice:?}"
+        );
+        assert!(detected(&[]).is_empty(), "nothing installed, nothing found");
+    }
+
+    /// KR-REQ-07.31: a Linux host opens a desktop terminal through the configured desktop launcher,
+    /// `gio` or else `gtk-launch`: the terminals installed are found when a launcher is, each says
+    /// which launcher it is opened through, and with no launcher nothing is found, whatever is
+    /// installed. Detection runs over a search path of its own, whose directory holds the programs
+    /// a case wants found.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn a_linux_host_finds_its_desktop_terminals_only_through_a_desktop_launcher() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let search = std::ffi::OsString::from(directory.path());
+        let install = |names: &[&str]| {
+            for name in names {
+                std::fs::write(directory.path().join(name), b"").expect("a program");
+            }
+        };
+        let remove = |names: &[&str]| {
+            for name in names {
+                std::fs::remove_file(directory.path().join(name)).expect("removed");
+            }
+        };
+        let found = || {
+            let mut found = detect_on(Some(search.as_os_str()));
+            found.sort_by(|first, second| first.id.cmp(&second.id));
+            found
+        };
+        let ids = |found: &[TerminalApplication]| -> Vec<String> {
+            found
+                .iter()
+                .map(|application| application.id.clone())
+                .collect()
+        };
+        let through =
+            |launcher: &str| format!("through {}", directory.path().join(launcher).display());
+
+        // Terminals with no launcher: a window could not be opened, so none is offered.
+        install(&[
+            "gnome-terminal",
+            "konsole",
+            "xfce4-terminal",
+            "alacritty",
+            "kitty",
+            "xterm",
+        ]);
+        assert!(found().is_empty(), "no launcher, no terminal");
+
+        // `gtk-launch` alone is a launcher.
+        install(&["gtk-launch"]);
+        let by_gtk = found();
+        assert_eq!(
+            ids(&by_gtk),
+            [
+                "alacritty",
+                "gnome-terminal",
+                "kitty",
+                "konsole",
+                "xfce4-terminal",
+                "xterm"
+            ],
+            "{by_gtk:?}"
+        );
+        assert!(
+            by_gtk
+                .iter()
+                .all(|application| application.detail.ends_with(&through("gtk-launch"))),
+            "{by_gtk:?}"
+        );
+
+        // `gio` is preferred where both are there.
+        install(&["gio"]);
+        let by_gio = found();
+        assert_eq!(ids(&by_gio), ids(&by_gtk));
+        assert!(
+            by_gio
+                .iter()
+                .all(|application| application.detail.ends_with(&through("gio"))),
+            "{by_gio:?}"
+        );
+
+        // Only what is installed is found.
+        remove(&["konsole", "xfce4-terminal", "alacritty", "kitty", "xterm"]);
+        assert_eq!(ids(&found()), ["gnome-terminal"]);
+        remove(&["gnome-terminal"]);
+        assert!(found().is_empty(), "a launcher and no terminal");
     }
 
     /// What a Windows host detects and opens a console with, run there and not read from the
