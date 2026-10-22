@@ -896,6 +896,7 @@ async fn a_value_past_what_a_float_holds_is_written_whole() {
         &SessionSelector::Display(9_007_199_254_740_993),
         DEFAULT_MAX_BYTES,
         42,
+        Form::Json,
     )
     .await
     .expect("exports");
@@ -1273,6 +1274,10 @@ async fn the_document_is_the_same_bytes_for_the_same_session() {
     let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
         .await
         .expect("exports");
+    eprintln!(
+        "GOLDEN-BEGIN{}GOLDEN-END",
+        String::from_utf8_lossy(&exported.document)
+    );
     assert_eq!(
         exported.document,
         include_bytes!("golden/session-export.json"),
