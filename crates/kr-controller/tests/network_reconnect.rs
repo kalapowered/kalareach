@@ -57,6 +57,12 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
     for _ in 0..CYCLES {
         session.close();
         session = connect(&host, &device, &record).await;
+        // The host counts a connection when it admits it, which is after the transport's handshake
+        // that `connect` waits for; a request it answers is one it has admitted.
+        session
+            .read(Method::HostInfo, &())
+            .await
+            .expect("the host answers the device that came back");
         if !doctor(&host).await.metrics.reconnect_time.is_empty() {
             break;
         }
