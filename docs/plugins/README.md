@@ -559,8 +559,9 @@ component fault disables rich meaning without stalling or discarding valid nativ
   the method whose requests it answers, where the answer repeats the request's identifier and puts
   the decision, and the application's own value for each decision. A table that answers none says
   `null`. The destination is also what an installation's `approval.decode` grant trusts a package
-  to interpret: exactly the requests it answers, whether the table's own reading or the package's
-  component interprets them. A table that answers none gives its package no such trust.
+  to interpret: exactly the requests it answers. The table's own reading interprets them when the
+  package ships no component, and the package's component interprets them, and the table does not,
+  when it does. A table that answers none gives its package no such trust.
 - **Decision response:** for a table of an application server that reads the answer as the response
   to the request it asked, the requests that ask for a decision (one to eight routed methods the
   application sends), the member of the response's result that carries the decision, and the
@@ -671,12 +672,30 @@ The host supplies four interfaces and nothing else:
 - `upstream` reports the binding state and the rights the actor holds. There is no send function.
 - `attachments` lists completed attachment handles. Transfer finishes first; the component never
   sees the bytes and never starts an upload.
-- `document` emits nodes from the closed union, bounded at 1 MiB per call.
+- `document` emits nodes from the closed union, bounded at 1 MiB per call. While privacy mode stands
+  for the session the host writes none of the documents a component draws, and sends the nodes that
+  present a decoded request empty, so a component cannot assume a person saw what it drew.
 
 `decode-request` and `encode-response` return values and send nothing. After encoding, the broker
 rechecks the pending request, the actor grant and the binding revision, then atomically claims and
 dispatches. A native answer that arrives during encoding wins, and the rich response returns the
 resolved state instead.
+
+A component of a package that is trusted to decode a method decodes that method's requests alone.
+The connector's table does not read them first, and does not read them after the component declines.
+A component that only draws therefore leaves its package's approvals opaque for the terminal to
+answer, unless its `decode-request` returns the request's identifier, every decision the table maps
+and an empty summary. In general `decode-request` returns the identifier of the request it was
+handed, at least one decision it offers, each one the table maps for that request and none twice,
+and a one-line summary. A proposal that names another request, a decision the table does not map or
+one twice, or a summary over 4,096 bytes, is refused whole and the request stays opaque. A summary
+is carried as written and never cut, because a shortened sentence can say something the component
+did not. A person sees it beside the approval, and an invitation to share the approval shows it as
+what the approval asks. The decisions carry the table's labels and never the component's. The
+component's class for the method and the nodes it presents the request with are read and not used,
+since the table classifies a method and a person answers the approval itself. A component that
+traps, runs out its deadline, declines or answers a request it was not asked about leaves the
+request as it was.
 
 There is no ambient filesystem, network, process or environment access anywhere in the import
 surface. A component describes an effect and returns it; the broker decides whether it happens.
