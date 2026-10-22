@@ -32423,9 +32423,10 @@ export interface WorkflowRunSummary {
  * it is made under, and the budget generation it leaves.
  *
  * The generation is what makes a repeat of the request a repeat and not a second budget. The
- * first request moves the chain from that generation to the next. A request that names a
- * generation the chain has already left, such as the same request sent again after its reply was
- * lost, is answered with the generation the chain went to and establishes nothing.
+ * first request moves the chain from that generation to the next. The same request sent again
+ * after its reply was lost, while the chain is still on that next generation, is answered with it
+ * and establishes nothing. A request that names a generation the chain is neither on nor just
+ * past, which is what the same request becomes once the chain has been rearmed again, is refused.
  */
 export interface WorkflowRearmParams {
   /**

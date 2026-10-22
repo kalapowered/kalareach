@@ -1528,7 +1528,9 @@ gives no second budget. A run of the command without `--generation`
 can give a chain that has since run out again a second budget, because it reads the generation anew.
 When a failure is not the daemon's refusal, the command prints that line again.
 
-On success the command prints `Rearmed chain <root>: its budget is on generation <n>.` With `--json`
+On success the command prints `Chain <root>: the rearm that leaves budget generation <m> has been
+made, and its budget is on generation <n>.` The answer to a repeat of a re-arm is the answer to the
+first, so the line says that the re-arm has been made and not which request made it. With `--json`
 it prints `{ "ok": true, "causal_root_id": "...", "generation": "1" }`, the generation as text, as
 the protocol encodes a 64-bit number. The runs the re-arm continues start in the daemon once the
 re-arm has committed, and `workflow.read` shows them.

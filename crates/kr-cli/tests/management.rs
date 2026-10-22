@@ -723,6 +723,23 @@ async fn a_chain_whose_budget_ran_out_is_rearmed_from_the_command_line() {
         kept.exhausted && kept.generation == 1,
         "the repeat gave no second budget: {kept:?}"
     );
+    // In words, a repeat says which rearm has been made and where the chain is: it was not the
+    // command that gave the budget.
+    let told = host.kr(&[
+        "workflow",
+        "rearm",
+        &root_text,
+        "--grant",
+        &grant_text,
+        "--generation",
+        "0",
+    ]);
+    let told_in_words = String::from_utf8_lossy(&told.stdout);
+    assert_eq!(told.status.code(), Some(0), "{told_in_words}");
+    assert!(
+        told_in_words.contains("generation 0") && told_in_words.contains("generation 1"),
+        "{told_in_words}"
+    );
 
     // Without the generation the command leaves the one the chain is on, and says what it did.
     let shown = host.kr(&["workflow", "rearm", &root_text, "--grant", &grant_text]);
