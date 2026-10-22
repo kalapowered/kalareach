@@ -38,8 +38,8 @@
 //!   job above that kills on close; if the platform ever closed one early, the worker would end by
 //!   the Task Scheduler's action, still not by the daemon's.
 //!
-//! The claim and the session record are plain owner-only files and work on every platform; only
-//! Windows has a starter to use them.
+//! The claim is a plain owner-only file and works on every platform; only Windows has a starter to
+//! use it.
 
 use std::path::Path;
 
