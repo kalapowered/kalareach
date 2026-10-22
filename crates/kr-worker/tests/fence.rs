@@ -2558,9 +2558,10 @@ const STARTUP_PROMPT_SHELLS: [ShellKind; 4] = [
 /// keystrokes because the bridge is authenticated: a session that refused input until it was ready
 /// would leave the profile asking a question nobody could answer.
 ///
-/// What the phase says is read from the worker's own driver for the session, which `session.create`
-/// and `shell.launch` consult: this suite starts no service on it, so the create and launch
-/// refusals themselves are the cases keyed to those methods.
+/// What the phase says is read from the worker's own driver for the session, which `shell.launch`
+/// consults, and the create's own wait (`await_qualification`, the one a managed create is answered
+/// from) is asked of the runtime: this suite starts no service on it, so the launch refusal itself
+/// is the case keyed to that method.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
@@ -2592,29 +2593,40 @@ async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is
             );
             assert!(!phase.permits_launch(), "{kind:?}");
         }
+        // The wait a managed create answers from, asked once with no time to wait: a session whose
+        // profile is still asking is not an answer to a create.
+        let pending = shell
+            .runtime
+            .await_qualification(Duration::ZERO)
+            .await
+            .expect_err("the create is not answered while the profile asks");
+        assert_eq!(
+            pending.code,
+            ErrorCode::ShellIntegrationUnsupported,
+            "{kind:?}"
+        );
 
         let mut keys = shell.keys();
         keys.type_line(&shell, "the-answer");
         shell.produced(b"kr-answer-<the-answer>", 1).await;
-        // The profile has finished, so the entry's activation is what qualifies the session.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                {
-                    let session = shell.runtime.session();
-                    let driver = session.fence().expect("a driver");
-                    let phase = driver.phase();
-                    if phase.reports_ready() {
-                        assert!(phase.permits_launch(), "{kind:?}");
-                        return;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!("{kind:?}: the session never reported ready after the profile finished")
-        });
+        // The profile has finished, so the entry's activation is what qualifies the session, and
+        // the create is answered.
+        shell
+            .runtime
+            .await_qualification(Duration::from_secs(30))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{kind:?}: the create was not answered after the profile finished: {error:?}"
+                )
+            });
+        {
+            let session = shell.runtime.session();
+            let driver = session.fence().expect("a driver");
+            let phase = driver.phase();
+            assert!(phase.reports_ready(), "{kind:?}");
+            assert!(phase.permits_launch(), "{kind:?}");
+        }
         shell.close().await;
     }
 }
@@ -2648,6 +2660,16 @@ async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_sti
             );
             assert!(!phase.permits_launch(), "{kind:?}");
         }
+        let pending = shell
+            .runtime
+            .await_qualification(Duration::ZERO)
+            .await
+            .expect_err("the create is not answered while the profile asks");
+        assert_eq!(
+            pending.code,
+            ErrorCode::ShellIntegrationUnsupported,
+            "{kind:?}"
+        );
         assert!(
             shell.close().await,
             "{kind:?}: the session waiting for its profile did not close within its bound"
