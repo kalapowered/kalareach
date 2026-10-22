@@ -254,6 +254,8 @@ const ASKS_THE_LIBRARY: &str = "echo \"colors=$(tput colors)\"\n\
 /// A managed session reads the private database: the file the library names is in the worker's
 /// state directory, the truecolour flag only that database carries is there, and the environment's
 /// diagnostics say which directory was selected.
+/// KR-REQ-08.41, the part about the private database: a managed session's shell, asking the host's
+/// own terminfo library, is answered by the pinned `xterm-256color` the worker wrote.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_managed_shell_reads_the_private_database() {
     let state = Scratch::new();
@@ -804,6 +806,8 @@ impl Sshd {
 
 /// An unmanaged shell reached over SSH keeps the stock `xterm-256color`: the terminal name is
 /// forwarded, the private database is not, and a remote environment reads its own.
+/// KR-REQ-08.41, the part about the SSH baseline: a program reached over SSH is answered by the
+/// remote host's stock `xterm-256color`, not by the private database.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remote_shell_over_ssh_keeps_the_stock_database() {
     let work = Scratch::new();

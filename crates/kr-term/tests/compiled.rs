@@ -562,6 +562,9 @@ mod tools {
 
     /// The system's own tools read every capability of the compiled file back equal to the Rust
     /// data, and every string capability equal to the responder's reply.
+    /// KR-REQ-08.41, the part about the pinned database being consistent with the responder: the
+    /// file the host's `infocmp` and `tput` read is the pinned description, and each string
+    /// capability in it is what the terminal answers to the same query.
     #[test]
     fn the_systems_tools_read_back_what_the_data_says() {
         let root = Scratch::new("readback");
@@ -674,6 +677,8 @@ mod tools {
 
     /// The reference compiler, given the source `infocmp` prints for the entry, writes the same
     /// bytes: the file is what `tic -x` would have made, not merely something a reader accepts.
+    /// KR-REQ-08.41, the part about the private database being a terminfo entry the host's own
+    /// libraries load: the compiled file equals the reference compiler's.
     #[test]
     fn the_reference_compiler_writes_the_same_bytes() {
         for description in [Description::pinned(), odd_sized()] {
@@ -799,6 +804,9 @@ mod tools {
     /// capability by capability, apart from what is listed above and why. A stock database on
     /// another release, or a change here, that adds a difference fails this and has to be
     /// answered in the list and in the terminal reference.
+    /// KR-REQ-08.41, the part about the SSH baseline: what the private entry says differs from a
+    /// stock `xterm-256color`, which a remote host reads, only in the capabilities listed with
+    /// their reasons.
     #[test]
     fn the_private_database_names_the_sequences_a_stock_database_names() {
         for infocmp in infocmps() {
