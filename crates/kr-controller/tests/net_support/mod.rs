@@ -1089,13 +1089,24 @@ impl Device {
 
     /// The identity this device presents once the host has given it `device_id`.
     pub fn paired_identity(&self, device_id: DeviceId) -> Arc<LocalIdentity> {
-        Arc::new(LocalIdentity::new(
+        self.paired_identity_receiving(device_id, kr_protocol::hello::ReceiveLimits::default())
+    }
+
+    /// The identity this device presents when it says it can receive `max_receive` and no more.
+    pub fn paired_identity_receiving(
+        &self,
+        device_id: DeviceId,
+        max_receive: kr_protocol::hello::ReceiveLimits,
+    ) -> Arc<LocalIdentity> {
+        let mut identity = LocalIdentity::new(
             device_id,
             DeviceKeyRevision::new(1),
             *self.keys.transport.public(),
             self.keys.authorisation.clone(),
             build(),
-        ))
+        );
+        identity.max_receive = max_receive;
+        Arc::new(identity)
     }
 }
 
@@ -1281,7 +1292,23 @@ impl PairedDial {
 
 /// How `device`, paired as `record`, dials `host`.
 pub fn paired_dial(host: &Host, device: &Device, record: &DeviceRecord) -> PairedDial {
+    paired_dial_receiving(
+        host,
+        device,
+        record,
+        kr_protocol::hello::ReceiveLimits::default(),
+    )
+}
+
+/// How `device`, paired as `record`, dials `host` saying it can receive `max_receive` and no more.
+pub fn paired_dial_receiving(
+    host: &Host,
+    device: &Device,
+    record: &DeviceRecord,
+    max_receive: kr_protocol::hello::ReceiveLimits,
+) -> PairedDial {
     let mut dial = paired_dial_by(host, device, record);
+    dial.identity = device.paired_identity_receiving(record.device_id, max_receive);
     for socket in host.network.bound_sockets() {
         dial.addr = dial.addr.with_ip_addr(socket);
     }
@@ -1366,6 +1393,18 @@ impl RawDevice {
             .expect("the paired device connects")
     }
 
+    /// Connects a paired device that says it can receive `max_receive` and no more.
+    pub async fn connect_receiving(
+        host: &Host,
+        device: &Device,
+        record: &DeviceRecord,
+        max_receive: kr_protocol::hello::ReceiveLimits,
+    ) -> Self {
+        Self::dialled(paired_dial_receiving(host, device, record, max_receive))
+            .await
+            .expect("the paired device connects")
+    }
+
     /// Connects a device under the identity `record` gave it, and returns why the host did not let
     /// it in where it did not: a device that is not paired with `host` is one such. An attempt the
     /// transport gave up on is made again, so a refusal is the host's own.
@@ -1378,7 +1417,11 @@ impl RawDevice {
         device: &Device,
         record: &DeviceRecord,
     ) -> std::result::Result<Self, kr_client::ClientError> {
-        let transport = paired_dial(host, device, record).try_dial().await?;
+        Self::dialled(paired_dial(host, device, record)).await
+    }
+
+    async fn dialled(dial: PairedDial) -> std::result::Result<Self, kr_client::ClientError> {
+        let transport = dial.try_dial().await?;
         let first = {
             use kr_client::transport::ControlTransport as _;
             transport.initial_action_window().action_window_id.clone()

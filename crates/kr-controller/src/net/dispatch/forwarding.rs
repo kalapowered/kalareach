@@ -461,6 +461,7 @@ impl RemoteConnection {
                 Arc::clone(&self.budget),
                 Arc::clone(&self.lost),
                 super::super::proxy::Purpose::Attachment,
+                self.receive,
             )
             .await
         {

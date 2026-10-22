@@ -20,6 +20,7 @@ use kr_ipc::client::BoundLink;
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Request, Response};
 use kr_protocol::grant::HistoryScope;
+use kr_protocol::hello::ReceiveLimits;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
     ControllerConnectionRole, ForwardedLease, ForwardedMutation, ForwardedRequest, ScreenBasis,
@@ -227,6 +228,9 @@ impl WorkerProxy {
     /// it speaks for; and only then does it carry anything. Declaring before presenting is what
     /// keeps a proxy from displacing the daemon's own authority connection.
     ///
+    /// `receive` is what the device this link serves said it can receive. The worker cuts what it
+    /// answers to fit it, so no frame the device must discard is ever relayed to it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the worker cannot be reached, does not prove itself, or refuses the
@@ -237,12 +241,13 @@ impl WorkerProxy {
         notifications: tokio::sync::mpsc::Sender<Relayed>,
         budget: Arc<RelayBudget>,
         lost: Arc<tokio::sync::Notify>,
+        receive: ReceiveLimits,
     ) -> Result<Arc<Self>> {
         // Bounded, because every step of it waits for a worker: a session that has stopped reading
         // its socket must not be able to hold a device's attachment open indefinitely.
         tokio::time::timeout(
             OPEN_TIMEOUT,
-            Self::handshake(controller, worker, notifications, budget, lost),
+            Self::handshake(controller, worker, notifications, budget, lost, receive),
         )
         .await
         .map_err(|_| {
@@ -256,8 +261,11 @@ impl WorkerProxy {
         notifications: tokio::sync::mpsc::Sender<Relayed>,
         budget: Arc<RelayBudget>,
         lost: Arc<tokio::sync::Notify>,
+        receive: ReceiveLimits,
     ) -> Result<Arc<Self>> {
-        let mut client = BoundLink::connect(&worker.endpoint, controller.build_id.clone()).await?;
+        let mut client =
+            BoundLink::connect_receiving(&worker.endpoint, controller.build_id.clone(), receive)
+                .await?;
         client.verify_worker(&worker.descriptor).await?;
         client
             .send(&ControlFrame::ControllerRole(
@@ -728,6 +736,7 @@ mod tests {
             notifications,
             Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
             lost,
+            kr_protocol::hello::ReceiveLimits::default(),
         )
         .await
         .expect("the worker accepts the link");

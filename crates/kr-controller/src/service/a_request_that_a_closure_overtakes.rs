@@ -62,6 +62,7 @@ async fn a_closure_ends_the_links_held_to_its_worker() {
             Arc::clone(&connection.budget),
             Arc::clone(&connection.lost),
             Purpose::Attachment,
+            kr_protocol::hello::ReceiveLimits::default(),
         )
         .await
         .expect("the worker accepts the link");
@@ -115,6 +116,7 @@ async fn a_closure_does_not_end_the_link_a_close_is_delivered_over() {
             Arc::clone(&connection.budget),
             Arc::clone(&connection.lost),
             Purpose::Close,
+            kr_protocol::hello::ReceiveLimits::default(),
         )
         .await
         .expect("the worker accepts the link");
@@ -151,6 +153,7 @@ async fn a_link_that_a_closure_overtakes_while_it_opens_is_refused() {
                     Arc::clone(&connection.budget),
                     Arc::clone(&connection.lost),
                     Purpose::Attachment,
+                    kr_protocol::hello::ReceiveLimits::default(),
                 )
                 .await
         }

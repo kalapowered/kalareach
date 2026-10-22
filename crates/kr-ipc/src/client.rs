@@ -564,14 +564,15 @@ impl BoundLink {
 
     /// Connects and says the link can receive `max_receive`, rather than the usual limits.
     ///
-    /// A host cuts what it answers to fit what the peer said it can receive, and a peer that can
-    /// receive far less than usual is how that cutting is proved. Every link this product makes
-    /// connects with the usual limits; this is compiled away outside this repository's own tests.
+    /// A worker cuts what it answers to fit what the peer said it can receive. A link a control
+    /// daemon opens to carry a device's requests says what the device said it can receive, so a
+    /// worker that is asked for more than the device can take refuses it there, and the daemon
+    /// never relays a frame the device must discard. The daemon's own links connect with the usual
+    /// limits.
     ///
     /// # Errors
     ///
     /// Returns what [`BoundLink::connect`] returns.
-    #[cfg(feature = "testing")]
     pub async fn connect_receiving(
         endpoint: &Endpoint,
         build_id: BuildId,

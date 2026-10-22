@@ -792,6 +792,7 @@ impl RemoteConnection {
                 let envelope = self.envelope(decided.acting.grant.grant_id, validated);
                 let grant_rights = rights;
                 let history = decided.acting.grant.history.clone();
+                let receive = self.receive;
                 let request_id = mutation.request_id;
                 // The answer comes back before the link that carried the close is released,
                 // because releasing it is what tells the worker the acceptance was delivered.
@@ -815,6 +816,7 @@ impl RemoteConnection {
                             Some(&observer),
                             answer,
                             delivered,
+                            receive,
                         )
                         .await;
                 });

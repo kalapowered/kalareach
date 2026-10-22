@@ -269,6 +269,11 @@ impl Worker {
 
     /// Asks a question from inside the session, as a verified source bound to it does.
     pub fn ask(&self, request: &str) -> Question {
+        self.ask_with_context(request, "the release is tagged")
+    }
+
+    /// As [`Self::ask`], for a question that comes with `context` to decide it by.
+    pub fn ask_with_context(&self, request: &str, context: &str) -> Question {
         self.service
             .questions()
             .create(
@@ -285,7 +290,7 @@ impl Worker {
                     session_id: self.session_id,
                     request_id: request.to_owned(),
                     agent_name: Nullable::some("an agent".to_owned()),
-                    context: "the release is tagged".to_owned(),
+                    context: context.to_owned(),
                     question: format!("Publish the release ({request})?"),
                     kind: QuestionKind::Confirm,
                     choices: Vec::new(),
