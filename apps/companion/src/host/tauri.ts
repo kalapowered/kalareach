@@ -31,6 +31,7 @@ import type {
   PairingOrigin,
   PairingUnavailable,
   PairingView,
+  PushView,
   IntakeView,
   RecoveryView,
   RevocationView,
@@ -74,6 +75,9 @@ export const STANDING_EVENT = 'kr://standing'
 
 /** The event the backend publishes the pairing screen's state on. */
 export const PAIRING_EVENT = 'kr://pairing'
+
+/** The event native code publishes where notifications stand on. */
+export const PUSH_EVENT = 'kr://push'
 
 /** The event the backend publishes the owner confirmations on. */
 export const CONFIRMATIONS_EVENT = 'kr://confirmations'
@@ -366,6 +370,11 @@ export function tauriPort(): HostPort {
 
     hostsUse: (reference) => choose('hosts_use', reference),
     hostsForget: (reference) => choose('hosts_forget', reference),
+    pushView: () => call<PushView>('push_view', {}),
+    pushEnable: (reference) => call<PushView>('push_enable', { reference }),
+    pushRefresh: () => call<PushView>('push_refresh', {}),
+    notificationRoute: () => call<string | null>('notification_route', {}),
+    onPush: (listener) => listening<PushView>(PUSH_EVENT, listener),
     pairingView: () => call<PairingView>('pairing_view', {}),
     pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
     pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),

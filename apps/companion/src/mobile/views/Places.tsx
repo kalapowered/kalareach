@@ -30,6 +30,7 @@ import {
 import { ask } from '../model/call'
 import { useHeld } from '../model/held'
 import { useKeepPlace } from '../model/keep-place'
+import { useNotifications } from '../model/push'
 import { minimumTarget, type Surface } from '../platform'
 import { SharedWithYou, hasShares } from './SharedWithYou'
 
@@ -273,15 +274,19 @@ export function MobileSessions({
 export function MobileHosts({
   surface,
   connected,
-  environmentId
+  environmentId,
+  resumed = 0
 }: {
   readonly surface: Surface
   /** Whether a host is being reached now, or null before anything has said. */
   readonly connected?: boolean | null
   /** The environment the connection belongs to, which says which host is reached. */
   readonly environmentId?: string | null
+  /** How many times the application has come to the front, each of which looks again at notifications. */
+  readonly resumed?: number
 }): ReactNode {
   const { port } = useApp()
+  const notifications = useNotifications(resumed)
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
@@ -333,6 +338,7 @@ export function MobileHosts({
         forgetHost={async (reference) => {
           await port.hostsForget(reference)
         }}
+        notifications={notifications}
       />
       {error ? <Banner tone="warning" title="The hosts could not be read" detail={error} /> : null}
       {rows ? (
