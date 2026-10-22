@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 185,
+  "method_count": 186,
   "methods": [
     {
       "capability": "none",
@@ -5830,6 +5830,40 @@
         "workflow"
       ],
       "summary": "Start a run, recording the trigger event, definition version and causal parent.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "automation",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "causal root + the budget generation it leaves"
+        }
+      },
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "workflow.rearm",
+      "name": "workflow.rearm",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "automation.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "workflow"
+      ],
+      "summary": "Give a causal chain whose budget ran out a new one, under a grant this host holds with the right to manage automation, and continue the chain from the descendants the exhausted budget refused. A chain whose budget has not run out is refused. The request names the generation it leaves, so a repeat of it after a lost reply is answered with the generation the chain went to and gives no second budget. Nothing an event carries can rearm a chain.",
       "version": 1
     },
     {

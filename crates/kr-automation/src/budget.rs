@@ -283,6 +283,7 @@ impl CausalBudget {
         let elapsed = now_ms.saturating_sub(self.started_at_ms);
         CausalBudgetSummary {
             causal_root_id: self.causal_root_id,
+            generation: U64::new(self.generation),
             depth: U64::new(self.depth),
             max_depth: U64::new(self.max_depth),
             total_runs: U64::new(self.total_runs),

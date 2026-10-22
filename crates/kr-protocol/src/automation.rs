@@ -404,6 +404,9 @@ pub struct WorkflowDefinition {
 pub struct CausalBudgetSummary {
     /// Causal root identifier.
     pub causal_root_id: CausalRootId,
+    /// The budget generation the chain is on: nought until it is rearmed, and one more for each
+    /// rearm. A `workflow.rearm` names the generation it leaves.
+    pub generation: U64,
     /// Current depth reached.
     pub depth: U64,
     /// Maximum allowed depth.
@@ -648,6 +651,39 @@ pub struct WorkflowRunResult {
     pub depth: U64,
     /// Current run status.
     pub status: WorkflowRunStatus,
+}
+
+/// Parameters for `workflow.rearm`.
+///
+/// A rearm is the explicit, authorised act that gives a causal chain a new budget after its
+/// budget ran out. Nothing an event carries can make one: the request names the chain, the grant
+/// it is made under, and the budget generation it leaves.
+///
+/// The generation is what makes a repeat of the request a repeat and not a second budget. The
+/// first request moves the chain from that generation to the next. A request that names a
+/// generation the chain has already left, such as the same request sent again after its reply was
+/// lost, is answered with the generation the chain went to and establishes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRearmParams {
+    /// The chain, by its causal root.
+    pub causal_root_id: CausalRootId,
+    /// The grant the rearm is made under, which this host holds as live, for this environment,
+    /// with the right to manage automation. A paired device names the grant it holds.
+    pub grant_reference: GrantId,
+    /// The budget generation the chain is on now, as `workflow.read` shows it.
+    pub generation: U64,
+}
+
+/// Result of `workflow.rearm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRearmResult {
+    /// The chain.
+    pub causal_root_id: CausalRootId,
+    /// The generation the chain's budget is on now: the one after the generation the request
+    /// named.
+    pub generation: U64,
 }
 
 /// Parameters for `workflow.read`.
