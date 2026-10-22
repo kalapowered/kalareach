@@ -35,7 +35,6 @@ tauri-build = { workspace = true, features = [] }
 [dependencies]
 # Draws the kit as a QR code to print.
 qrcodegen.workspace = true
-# Clears the buffers that hold the kit's QR code once it is written.
 # The one secure store, the Android TLS verifier's start and the browser-backed sign-in session.
 companion-platform.workspace = true
 kr-cbor.workspace = true
@@ -64,7 +63,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ureq.workspace = true
-# The text of an invitation read from a code is cleared when it is dropped.
+# Clears the text of an invitation read from a code when it is dropped, and the buffers that hold
+# the kit's QR code once it is written.
 zeroize.workspace = true
 
 # The desktop sign-in's loopback listener, which a phone does not link.
