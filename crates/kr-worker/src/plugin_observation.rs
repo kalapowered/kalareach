@@ -239,6 +239,12 @@ async fn written(client: &PluginClient) -> bool {
 /// withdrawn or the runtime was lost.
 async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
     for binding in broker.observing(entry.audience()) {
+        // The connection is taken before the view is read: a view read first may be one of a
+        // registration the connection has since replaced, and the entry would go to the component
+        // of the next one, which was made ready from a later entry.
+        let Some(client) = broker.component_calls().client() else {
+            return;
+        };
         let Some(view) = lane
             .view(binding)
             .filter(|view| view.ready && entry.seq() >= view.ready_from)
@@ -248,9 +254,6 @@ async fn offer(broker: &Broker, lane: &ObservationLane, entry: &Entry) {
         if !broker.observing(entry.audience()).contains(&binding) {
             continue;
         }
-        let Some(client) = broker.component_calls().client() else {
-            return;
-        };
         if view.is_silent(Instant::now()) {
             lost(
                 broker,
