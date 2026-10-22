@@ -1043,7 +1043,8 @@ fn a_created_session_attached_on_a_terminal(
     let terminal = world.terminal_running_in(
         directory,
         &format!(
-            "{} new --attach --palette probe {arguments} --shell /bin/sh --startup interactive \
+            "{} new --attach --palette probe {arguments} --shell /bin/sh --shell-mode native_compat \
+             --startup interactive \
              --headless; printf 'create-finished-%s\\n' \"$?\"",
             support::kr().display()
         ),
@@ -1170,7 +1171,8 @@ async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
     .expect("says from which run the destination is unreachable");
 
     let terminal = world.terminal_running(&format!(
-        "{} new --attach --palette probe --environment dest --shell /bin/sh --startup interactive \
+        "{} new --attach --palette probe --environment dest --shell /bin/sh --shell-mode native_compat \
+         --startup interactive \
          --headless; printf 'create-finished-%s\\n' \"$?\"",
         support::kr().display()
     ));
@@ -1334,7 +1336,8 @@ async fn what_was_typed_while_a_create_asked_for_colours_reaches_the_bridged_she
     let world = World::start().await;
     world.enrol_destination();
     let terminal = world.terminal_running(&format!(
-        "{} new --attach --palette probe --environment dest --shell /bin/sh --startup interactive \
+        "{} new --attach --palette probe --environment dest --shell /bin/sh --shell-mode native_compat \
+         --startup interactive \
          --headless; printf 'create-finished-%s\\n' \"$?\"",
         support::kr().display()
     ));
