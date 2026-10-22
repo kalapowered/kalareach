@@ -72,6 +72,7 @@ emulator_serial=""
 emulator_adb=""
 # Whether the phone's logs were searched for an invitation's text and secret, and whether any held one.
 logs_searched=0
+log_problem=""
 logs_found=0
 
 # What the iOS run makes or changes outside this script's own directories: a simulator of its own,
@@ -210,22 +211,37 @@ host_file() { # <name>
 }
 
 # Searches one of the phone's logs for every form of an invitation's text and secret that the host
-# recorded: the log is read whole, and a match in it fails the run.
-search_log() { # <command that prints the log...>
+# recorded: the log is read whole, and a match in it fails the run. A log that could not be read, or
+# that does not show the application at work, is a failed check and never an empty one: a reader
+# that fails prints nothing, and nothing holds no secret.
+search_log() { # <extended pattern the application's own lines match> <command that prints the log...>
+    local application="$1"
+    shift
     cat "$harness"/secrets-*.txt >"$harness/secrets.all" 2>/dev/null
-    [ -s "$harness/secrets.all" ] || return 0
+    [ -s "$harness/secrets.all" ] || { log_problem="the host recorded no invitation text to search for"; return 0; }
     # The control: the same search finds a line that holds one, so a search that finds nothing is
     # one that looked.
     head -n 1 "$harness/secrets.all" >"$harness/log-control.txt"
     if ! grep -q -i -F -f "$harness/secrets.all" "$harness/log-control.txt"; then
-        logs_found=2
+        log_problem="the search did not find a line that holds an invitation's text"
         return 0
     fi
-    "$@" >"$harness/log-searched.txt" 2>/dev/null
-    logs_searched=$((logs_searched + 1))
-    if grep -q -i -F -f "$harness/secrets.all" "$harness/log-searched.txt"; then
-        logs_found=1
+    if ! "$@" >"$harness/log-searched.txt" 2>"$harness/log-searched.err"; then
+        log_problem="the log could not be read: $(head -c 200 "$harness/log-searched.err" | tr '\n' ' ')"
+        return 0
     fi
+    if ! grep -q -E "$application" "$harness/log-searched.txt"; then
+        log_problem="the log holds no line of the application, so it does not cover the run ($(wc -l <"$harness/log-searched.txt" | tr -d ' ') lines)"
+        return 0
+    fi
+    local searched=0
+    grep -q -i -F -f "$harness/secrets.all" "$harness/log-searched.txt" || searched=$?
+    case "$searched" in
+        0) logs_found=1 ;;
+        1) ;;
+        *) log_problem="the search of the log failed"; return 0 ;;
+    esac
+    logs_searched=$((logs_searched + 1))
 }
 
 # Decides the run from the lines the driver reported and the files the host wrote.
@@ -253,15 +269,15 @@ judge() { # <driver output>
         say "check=the host showed its value and approved the phone ok=0 detail=no record"
         bad=1
     fi
-    if [ "$logs_searched" -ge 1 ] && [ "$logs_found" = 0 ]; then
+    if [ "$logs_searched" -ge 1 ] && [ "$logs_found" = 0 ] && [ -z "$log_problem" ]; then
         say "check=no log holds an invitation's text or secret ok=1 detail=$logs_searched log read whole"
     else
-        say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found"
+        say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found${log_problem:+, $log_problem}"
         bad=1
     fi
     result="$(host_file challenge-open.txt)"
     case "$result" in
-        "unanswered=1 refused="?*) say "check=the host kept the cancelled request and refused the invitation behind it ok=1 detail=$result" ;;
+        "unanswered=1 refused=OwnerConfirmationRequired") say "check=the host kept the cancelled request and refused the invitation behind it ok=1 detail=$result" ;;
         *) say "check=the host kept the cancelled request and refused the invitation behind it ok=0 detail=${result:-no record}"; bad=1 ;;
     esac
     result="$(host_file confirm-result.txt)"
@@ -381,7 +397,7 @@ run_ios() {
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
-    search_log xcrun simctl spawn "$udid" log show --last 40m --style compact
+    search_log 'KalaReach|to\.kala\.reach' xcrun simctl spawn "$udid" log show --last 40m --style compact
     judge "$out" || status=2
     [ "$status" = 0 ] || return 2
 }
@@ -419,6 +435,10 @@ run_android() {
         apk="$companion/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
     fi
     [ -f "$apk" ] || { say "there is no package at $apk"; return 2; }
+    # The development build reaches its development server over plain HTTP: the network security
+    # configuration the verifier's library brings must not take that away from it.
+    python3 "$here/scripts/lib/android-network-config.py" debug "$apk" | tee -a "$log" \
+        || { say "the package's network security configuration is not the development build's"; return 2; }
     build_harness || return 2
 
     # A device already on the serial is someone else's: it is neither used nor stopped.
@@ -475,7 +495,7 @@ run_android() {
     python3 "$here/scripts/lib/pairing-android.py" drive "$adb" "$serial" "$harness" "$shots" "$grpc_port" >"$out" 2>&1 || status=$?
     sed 's/^/    /' "$out" | tee -a "$log"
     # The crash buffer, and the main buffer without the compositor's and the screen reader's polling.
-    search_log "$adb" -s "$serial" logcat -d -b all
+    search_log 'RustStdoutStderr|to\.kala\.reach' "$adb" -s "$serial" logcat -d -b all
     "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -2000 >"$artefacts/logcat.log"
     # What the application's native half printed to its standard streams.
