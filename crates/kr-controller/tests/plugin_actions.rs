@@ -697,9 +697,6 @@ async fn kr_req_23_30_a_connection_that_ended_while_the_component_prepared_rejec
 /// KR-REQ-23.30: an action is answered within its own deadline whatever its component does. With
 /// the plugin host stopped, a call that is never answered is given up on, and the action is
 /// rejected, while the host is still stopped.
-/// KR-REQ-27.05, the part about plugin timeouts: a plugin host that never answers costs the action
-/// that asked it, which is rejected with nothing written upstream, and the call is given up on
-/// while the host is still stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_nothing_else() {
     let Some(acting) = Acting::start().await else {
