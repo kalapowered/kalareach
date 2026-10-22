@@ -1147,22 +1147,33 @@ async fn what_was_read_is_let_go_of_when_the_application_stops_being_in_front() 
         "nothing is waiting to be used"
     );
 
-    // An intake that waits at the alert holds nothing, whatever the answer.
+    // An intake that waits at the alert holds nothing, and what it read is let go of when the
+    // application leaves the front, not when the alert is finally answered: the person's answer is
+    // never sent here, and the intake still ends.
     let answer = intake.hold_the_alert();
     intake.will_read(&text);
-    let (view, ()) = tokio::join!(take_in(&*intake, &device, Source::Camera), async {
-        tokio::time::timeout(WATCHDOG, async {
-            while intake.asked.lock().expect("the record").is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the alert is raised");
-        device.suspend();
-        answer.send(true).expect("the intake waits");
-    });
+    let (view, ()) = tokio::join!(
+        tokio::time::timeout(WATCHDOG, take_in(&*intake, &device, Source::Camera)),
+        async {
+            tokio::time::timeout(WATCHDOG, async {
+                while intake.asked.lock().expect("the record").is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the alert is raised");
+            device.suspend();
+        }
+    );
+    let view = view.expect("the intake ended without an answer to the alert");
     assert!(view.cancelled && view.invitation.is_none());
     assert!(device.view().invitation.is_none(), "nothing was restored");
+    // A late answer to the alert changes nothing.
+    let _ = answer.send(true);
+    assert!(
+        device.view().invitation.is_none(),
+        "a late answer restored nothing"
+    );
 
     // An intake still waiting for its reader goes on, and holds what the reader read.
     let before = intake.read_from.lock().expect("the record").len();
