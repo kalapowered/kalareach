@@ -2515,8 +2515,9 @@ pub fn a_planted_alias_that_changes_an_agent_name_is_reported_not_hidden(kind: S
 /// request says so: it names the program the alias makes it run, which is not the enabled one, so
 /// it gets no flag either.
 ///
-/// Zsh and Bash only: those are the packages whose executor asks the worker before a command
-/// starts.
+/// Zsh, Bash and Fish: the packages whose executor asks the worker before a command starts. The
+/// PowerShell module answers a resolve to a command lookup handler that calls it, so what its
+/// session shows of a typed command is the corpus comparison above.
 pub fn an_enabled_integration_adds_its_flags_only_to_the_agents_interactive_invocation(
     kind: ShellKind,
 ) {
