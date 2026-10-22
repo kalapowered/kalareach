@@ -7255,6 +7255,107 @@ async fn a_restarted_daemon_serves_though_a_live_sessions_directory_never_answer
     host.clients.abort();
 }
 
+/// What a look at `path` answers, asked on a thread of its own: a mount that waits instead of
+/// failing fails the case on [`HUNG_START_GUARD`] and does not hold it.
+#[cfg(target_os = "linux")]
+fn error_of_looking_at(path: &std::path::Path) -> std::io::Error {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(std::fs::metadata(path));
+    });
+    receiver
+        .recv_timeout(HUNG_START_GUARD)
+        .expect("a look at a mount whose server has stopped waits")
+        .expect_err("a look at a mount whose server has stopped fails")
+}
+
+/// KR-REQ-14.32: a daemon that starts does not place a live session at the directory above the one
+/// it started in when that directory answers with an error at once. The directory of one session
+/// is now a mount whose server has stopped, as a network mount's can be: every look at it fails
+/// with an error that is not a missing name, so the daemon cannot say where the session started
+/// and it counts against every hold until it closes. The directory above the mount is outside
+/// the repository, so a session placed there would count against nothing and a hold would be
+/// granted.
+///
+/// The mount is the user-space filesystem of the case above with its server stopped, which this
+/// account can place with the helper its distribution installs; a host without it leaves the case
+/// out and says why, unless `KR_REQUIRE_FUSE` is set. It is placed while no daemon runs, over the
+/// directory the session started in, below a directory of its own away from the repository and
+/// from everything the host removes when it is torn down. The hold is asked on a worktree of the
+/// repository that can be reached: one under the mount could not be held whatever the sessions
+/// were, since the look at its own place fails.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_daemon_keeps_a_session_unplaced_whose_directory_fails_at_once() {
+    use kr_ipc::testing::hung_mount::HungMount;
+
+    let outer = tempfile::TempDir::new().expect("a directory of its own on the internal disk");
+    let probe = outer.path().join("probe");
+    std::fs::create_dir(&probe).expect("a place to try a mount");
+    if HungMount::attach_where_possible(&probe).is_none() {
+        return;
+    }
+    let mounted = outer.path().join("mounted");
+    std::fs::create_dir(&mounted).expect("the directory the mount will be put on");
+
+    let (host, apart) = working_host_apart().await;
+    let mut control = client(&host).await;
+    let (project, _checkout) =
+        adopted_project(&mut control, host.environment_id, host.work()).await;
+    let tree = worktree_of(
+        &mut control,
+        host.environment_id,
+        project,
+        host.work(),
+        "tree",
+    )
+    .await;
+    let failing = session_in(&mut control, &host, &mounted).await;
+    drop(control);
+    host.clients.abort();
+
+    let mount = Arc::new(std::sync::Mutex::new(None));
+    let host = restarted_after(host, apart, {
+        let (mount, mounted) = (Arc::clone(&mount), mounted.clone());
+        move |_| {
+            let mut placed = HungMount::attach(&mounted).expect("the mount is placed");
+            placed.stop_server();
+            *mount.lock().expect("the mount's holder") = Some(placed);
+            assert_ne!(
+                error_of_looking_at(&mounted).kind(),
+                std::io::ErrorKind::NotFound,
+                "the mount fails at once with an error that is not a missing name"
+            );
+        }
+    })
+    .await;
+
+    let service = Arc::clone(host.controller.project().service());
+    let opened = service
+        .open_workspace_repository(tree)
+        .expect("the worktree opens")
+        .identity();
+    assert_eq!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .expect_err("the session that could not be placed is in the way of every hold"),
+        kr_project::holds::Refusal::SessionsBound(1)
+    );
+    drop(mount.lock().expect("the mount's holder").take());
+    let mut control = client(&host).await;
+    close_session(&mut control, &host, &failing).await;
+    assert!(
+        service
+            .hold_workspace(tree, opened.work_tree, opened.git_dir)
+            .expect("the records read")
+            .is_ok(),
+        "the session started outside every tree never counted against this one"
+    );
+    host.clients.abort();
+}
+
 /// The closure the registry holds for a session, once one is recorded.
 fn recorded_closure(
     environment: &kr_ipc::paths::EnvironmentPaths,

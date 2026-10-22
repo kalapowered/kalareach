@@ -480,7 +480,8 @@ fn a_hold_turns_away_the_cleanup_of_a_directory_that_holds_the_repositorys_check
 /// repository it started, including in the user's own checkout when that is only a project and
 /// no workspace has been selected on it, and a session that started where no tree is recorded
 /// blocks nothing. The session is found by the directory it started in: a subdirectory, a
-/// name that does not exist yet, a file, and a link all stand for the tree they are in.
+/// name that does not exist yet, a file, a name under a file, and a link all stand for the
+/// directory they are in.
 #[test]
 fn a_session_in_any_tree_of_the_repository_blocks_a_hold_on_another_tree() {
     let fixture = Fixture::create();
@@ -490,6 +491,7 @@ fn a_session_in_any_tree_of_the_repository_blocks_a_hold_on_another_tree() {
     let source = fixture.work().join("source");
     let elsewhere = fixture.work().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).expect("a directory outside every tree");
+    std::fs::write(elsewhere.join("note.txt"), b"a file\n").expect("a file outside every tree");
     std::os::unix::fs::symlink(&source, fixture.work().join("alias")).expect("a link");
 
     let starts = |directory: Option<&str>| service.session_place(directory);
@@ -523,6 +525,10 @@ fn a_session_in_any_tree_of_the_repository_blocks_a_hold_on_another_tree() {
     }
 
     for (what, place) in [
+        (
+            "a name under a file outside every tree",
+            starts(Some(&named(elsewhere.join("note.txt/inside")))),
+        ),
         (
             "a directory outside every tree",
             starts(Some(&named(elsewhere))),
@@ -560,6 +566,117 @@ fn a_session_that_began_before_its_tree_was_known_still_blocks_the_hold() {
     );
     drop(registration);
     assert!(hold(service, linked).is_ok());
+}
+
+/// Takes the right to search a directory away until it is dropped, and says whether that kept
+/// this account out: an account that ignores directory modes (root) is not kept out.
+struct Unsearchable {
+    directory: std::path::PathBuf,
+}
+
+impl Unsearchable {
+    /// Makes `directory` readable and writable but not searchable, and returns it with whether
+    /// `through` can no longer be reached.
+    fn make(directory: &std::path::Path, through: &std::path::Path) -> (Self, bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o600))
+            .expect("the directory's mode is changed");
+        let held = Self {
+            directory: directory.to_owned(),
+        };
+        let kept_out = std::fs::metadata(through).is_err();
+        (held, kept_out)
+    }
+}
+
+impl Drop for Unsearchable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _ = std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// KR-REQ-14.32: a start directory that cannot be looked at is not a missing name. The host may
+/// not search the directory above it, so it cannot say where a session started there: the
+/// session counts against every hold and a writer there writes anywhere, and neither is placed
+/// in the directory that does open, which sits outside every tree this host records. The same
+/// path stands for the directory it is in once that directory can be searched.
+#[test]
+fn a_directory_that_cannot_be_looked_at_is_placed_nowhere_and_not_at_the_one_above_it() {
+    let fixture = Fixture::create();
+    let project = adopt(&fixture, "source", 1);
+    let linked = worktree(&fixture, project, "linked", 2);
+    let service = fixture.service();
+    let locked = fixture.work().join("locked");
+    let inside = locked.join("inside");
+    std::fs::create_dir_all(&inside).expect("a directory outside every tree");
+    let named = |path: &std::path::Path| path.display().to_string();
+
+    let control = service.session_place(Some(&named(&inside)));
+    assert!(
+        matches!(control, SessionPlace::Chain(_)),
+        "a directory that can be searched is placed"
+    );
+    assert!(!service.footprint_inside(&inside).anywhere);
+
+    let (_held, kept_out) = Unsearchable::make(&locked, &inside);
+    if !kept_out {
+        eprintln!("skipped: this account is not kept out of a directory by its mode");
+        return;
+    }
+    let place = service.session_place(Some(&named(&inside)));
+    assert_eq!(place, SessionPlace::Unknown, "it is not placed above");
+    assert!(
+        service.footprint_inside(&inside).anywhere,
+        "and a writer there writes anywhere"
+    );
+    let _registration = service
+        .holds()
+        .begin_session(session(1), place)
+        .expect("nothing is held");
+    assert_eq!(
+        hold(service, linked).expect_err("a session that cannot be placed is in the way"),
+        Refusal::SessionsBound(1)
+    );
+}
+
+/// KR-REQ-14.32: a hold is not granted while a tree this host records for the repository cannot be
+/// looked at. The directories above every such tree are what a removal of the directory holding
+/// it meets, and those of the nearest directory that does open are not its own.
+#[test]
+fn a_recorded_tree_that_cannot_be_looked_at_keeps_a_hold_from_being_granted() {
+    let fixture = Fixture::create();
+    let project = adopt(&fixture, "source", 1);
+    let linked = worktree(&fixture, project, "linked", 2);
+    let guarded = fixture.work().join("guarded");
+    std::fs::create_dir(&guarded).expect("a directory to hold a second tree");
+    create(
+        &fixture,
+        project,
+        WorkspaceKind::Isolated,
+        Some(IsolationMechanism::GitWorktree),
+        &guarded,
+        "second",
+        3,
+    )
+    .expect("the second worktree is made");
+    let service = fixture.service();
+    assert!(
+        hold(service, linked).is_ok(),
+        "the repository is held while every tree it has can be looked at"
+    );
+
+    let (_held, kept_out) = Unsearchable::make(&guarded, &guarded.join("second"));
+    if !kept_out {
+        eprintln!("skipped: this account is not kept out of a directory by its mode");
+        return;
+    }
+    assert_eq!(
+        hold(service, linked).expect_err("a tree of the repository cannot be looked at"),
+        Refusal::TreeUnreadable
+    );
 }
 
 fn adopt_existing(fixture: &Fixture, name: &str, seed: u8) -> ProjectRepositoryId {
