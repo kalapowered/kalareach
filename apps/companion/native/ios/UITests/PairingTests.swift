@@ -192,6 +192,13 @@ final class PairingTests: DeviceTestCase {
             Thread.sleep(forTimeInterval: 0.5)
         }
         XCTAssertTrue(cancelled, "the system's Face ID sheet never said the face was not recognised")
+        // The review ends with the sheet: where the sheet is still up, it is cancelled again.
+        let over = Date().addingTimeInterval(60)
+        while Date() < over, !app.buttons["Confirm with Face ID"].firstMatch.isEnabled {
+            let still = springboard.buttons["Cancel"].firstMatch
+            if still.exists { still.tap() }
+            Thread.sleep(forTimeInterval: 1)
+        }
         try? FileManager.default.removeItem(atPath: path("faceid-nomatch"))
         touch("faceid-done")
     }
