@@ -21921,7 +21921,7 @@
         },
         {
           "const": "organisation.list",
-          "description": "The organisations this host is enrolled in, the key each is pinned to, the policy applied for each with the adapters it allows, the adapters the policies allow together, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
+          "description": "The organisations this host is enrolled in, the key each is pinned to, the policy applied for each with the adapters it allows, the adapters the policies allow together and the adapters the catalogue admits under now, the devices bound to member accounts and the lease each holds, whether exclusive management is on, and every time it was turned off, with how the owner confirmed it.",
           "type": "string"
         },
         {
@@ -24253,6 +24253,22 @@
       "additionalProperties": false,
       "description": "The result of `organisation.list`.",
       "properties": {
+        "adapter_allowlist_in_force": {
+          "anyOf": [
+            {
+              "description": "A set encoded as a sequence in strictly ascending order. A sequence that is unsorted or repeats a member is rejected.",
+              "items": {
+                "$ref": "#/$defs/PluginId"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The adapters the catalogue admits under now: the list the host has put in force, or null\nwhile it admits every adapter the host qualifies. It is the list in\n`effective_adapter_allowlist` once the host has put that in force, and it differs from it\nonly until then, while a change waits for a synchronisation that holds the catalogue. It is\nwhat the catalogue holds when the answer is made; it does not show that every session's\nworker has finished the round that follows a change, and it is read beside the other list,\nnot with it, so a change made at that moment can show in one alone."
+        },
         "clock_trusted": {
           "description": "Whether this host trusts its own clock. While it does not, it installs no lease and\nfollows no chain, and the owner trusts the clock again with `host.clock.establish`.",
           "type": "boolean"
@@ -24271,7 +24287,7 @@
               "type": "null"
             }
           ],
-          "description": "The adapters the enrolled organisations' policies allow together: the adapters every\norganisation that states a list allows, or null while none does. Two organisations whose\nlists share nothing leave an empty set, which allows no adapter. This is the list the host\nputs in force when a policy changes, and again at each admissions pass until it lands;\n`plugin.list` says which packages the admissions in force leave out."
+          "description": "The adapters the enrolled organisations' policies allow together: the adapters every\norganisation that states a list allows, or null while none does. Two organisations whose\nlists share nothing leave an empty set, which allows no adapter. This is the list the host\nputs in force when a policy changes, and again at each admissions pass until it lands;\n`adapter_allowlist_in_force` is the list in force now, and `plugin.list` says which packages\nthe admissions in force leave out."
         },
         "enrolments": {
           "description": "The organisations this host is enrolled in, by organisation identity.",
@@ -24306,6 +24322,7 @@
       "required": [
         "enrolments",
         "effective_adapter_allowlist",
+        "adapter_allowlist_in_force",
         "exclusive",
         "clock_trusted",
         "exclusive_events",
@@ -24434,7 +24451,7 @@
               "type": "null"
             }
           ],
-          "description": "The adapters the enrolled organisations' policies allow together as the answer was made: the\nadapters every organisation that states a list allows, or null while none does. The host puts\nthis list in force when it records the policy; `organisation.list` reports the list the\npolicies state at any time."
+          "description": "The adapters the enrolled organisations' policies allow together as the answer was made: the\nadapters every organisation that states a list allows, or null while none does. The host puts\nthis list in force when it records the policy; `organisation.list` reports the list the\npolicies state and the list in force at any time."
         },
         "organisation_id": {
           "$ref": "#/$defs/OrganisationId",

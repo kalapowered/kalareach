@@ -1949,7 +1949,9 @@ rotation is followed from, the highest key revision accepted and the enrolment r
 requiring the organisation names. It shows the revision of the policy applied for the organisation
 and the adapters it allows, or that none is applied. It shows the devices bound to member accounts
 of that organisation, and the lease last recorded for each. After the organisations, it shows the
-adapters their policies allow together. It also shows whether the host is exclusively
+adapters their policies allow together and the adapters the host admits now. The two lists are the
+same once the host has put the first in force, and they differ while a change waits for a
+synchronisation that holds the catalogue, which the output then says. It also shows whether the host is exclusively
 organisation-managed, and whether it trusts its clock. It shows each time exclusive management was
 turned off. It prints the device identifier, authorisation key and key identifier that a lease for the host's
 own local owner is signed for, and names each session whose worker cannot be told what that owner may do. A
@@ -2265,7 +2267,8 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 `accepted_head` and `root_key_id`, the identifier of the organisation's first key in hexadecimal.
 `kr organisation list --json` returns `ok`, `exclusive`, `clock_trusted`, `effective_adapter_allowlist`
 (the adapters the organisations' policies allow together, as an array of identifiers, or null while
-no organisation states a list), `host_device` (with `device_id`, `authorisation_key` and
+no organisation states a list), `adapter_allowlist_in_force` (the adapters the catalogue admits
+under now, in the same form), `host_device` (with `device_id`, `authorisation_key` and
 `authorisation_key_id`), `workers_without_local_enforcement`, `enrolments` and `exclusive_events`.
 Each enrolment has `organisation_id`, `root_key_id`, `anchor_revision`, `anchor_key_id`,
 `accepted_head`, `enrolment_revision`, `organisation_policy_revision` (null while no policy is

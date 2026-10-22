@@ -218,6 +218,11 @@ fn refused_as(
     error
 }
 
+/// The list `organisation.list` says is in force.
+async fn list_in_force(fixture: &Fixture) -> Nullable<CanonicalSet<PluginId>> {
+    fixture.listed().await.adapter_allowlist_in_force
+}
+
 /// Whether the doctor's catalogue evidence says that the adapters the organisations allow could not
 /// be confirmed in force.
 async fn the_doctor_says_the_list_is_not_in_force(
@@ -655,6 +660,11 @@ async fn kr_req_18_06_the_effective_list_is_the_intersection_of_the_organisation
         first.effective_adapter_allowlist,
         allowed(&[CLAUDE_CODE, CODEX])
     );
+    assert_eq!(
+        list_in_force(&fixture).await,
+        allowed(&[CLAUDE_CODE, CODEX]),
+        "the list in force is the one the policy states"
+    );
     let unlisted = apply(&fixture, second.policy(1, 1, None, now), None)
         .await
         .expect("the second organisation's policy, with no list");
@@ -662,6 +672,10 @@ async fn kr_req_18_06_the_effective_list_is_the_intersection_of_the_organisation
         unlisted.effective_adapter_allowlist,
         allowed(&[CLAUDE_CODE, CODEX]),
         "no list adds no constraint"
+    );
+    assert_eq!(
+        list_in_force(&fixture).await,
+        allowed(&[CLAUDE_CODE, CODEX])
     );
 
     // Both state one.
@@ -673,6 +687,11 @@ async fn kr_req_18_06_the_effective_list_is_the_intersection_of_the_organisation
     .await
     .expect("a list from the second organisation");
     assert_eq!(both.effective_adapter_allowlist, allowed(&[CODEX]));
+    assert_eq!(
+        list_in_force(&fixture).await,
+        allowed(&[CODEX]),
+        "the list in force is the intersection of the two lists"
+    );
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
 
     // Lists that share nothing.
@@ -680,6 +699,7 @@ async fn kr_req_18_06_the_effective_list_is_the_intersection_of_the_organisation
         .await
         .expect("a list that shares nothing with the first");
     assert_eq!(nothing.effective_adapter_allowlist, allowed(&[]));
+    assert_eq!(list_in_force(&fixture).await, allowed(&[]));
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
     assert_eq!(
         applied_policies(&fixture).len(),
@@ -702,6 +722,7 @@ async fn kr_req_18_06_the_effective_list_is_the_intersection_of_the_organisation
         fixture.listed().await.effective_adapter_allowlist,
         allowed(&[EXAMPLE])
     );
+    assert_eq!(list_in_force(&fixture).await, allowed(&[EXAMPLE]));
     assert!(is_admitted(&admission(&fixture).await));
     assert_eq!(
         applied_policies(&fixture)
@@ -764,6 +785,15 @@ async fn kr_req_18_06_a_list_that_could_not_be_put_in_force_is_told_and_then_put
             None,
             "the list is not in force"
         );
+        // The owner sees the difference: the policy states a list that the catalogue does not
+        // admit under yet.
+        let listed = fixture.listed().await;
+        assert_eq!(listed.effective_adapter_allowlist, allowed(&[CODEX]));
+        assert_eq!(
+            listed.adapter_allowlist_in_force,
+            Nullable::null(),
+            "the list the policies state is not the list in force"
+        );
     }
     assert_eq!(
         fixture.listed().await.enrolments[0].organisation_policy_revision,
@@ -781,6 +811,11 @@ async fn kr_req_18_06_a_list_that_could_not_be_put_in_force_is_told_and_then_put
         .expect("an answer");
     assert_eq!(answered.adapter_allowlist, allowed(&[CODEX]));
     assert!(is_left_out_by_the_allowlist(&admission(&fixture).await));
+    assert_eq!(
+        list_in_force(&fixture).await,
+        allowed(&[CODEX]),
+        "and the list is in force once it landed"
+    );
     drop(client);
 
     // A later policy fails the same way. The host's own pass, which finds the catalogue held too,

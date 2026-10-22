@@ -599,6 +599,11 @@ async fn a_policy_is_applied_listed_and_not_applied_again_when_older() {
         "{listed}"
     );
     assert_eq!(
+        listed["adapter_allowlist_in_force"],
+        serde_json::json!(adapters),
+        "the list in force is the one the applied policy states: {listed}"
+    );
+    assert_eq!(
         listed["enrolments"][0]["adapter_allowlist"],
         serde_json::json!(adapters),
         "{listed}"

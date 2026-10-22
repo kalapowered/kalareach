@@ -1118,9 +1118,10 @@ impl Controller {
         Ok(())
     }
 
-    /// `organisation.list`: what this host holds for each organisation it is enrolled in, whether
-    /// it is exclusively organisation-managed, whether it trusts its clock, and the times
-    /// exclusive management was turned off.
+    /// `organisation.list`: what this host holds for each organisation it is enrolled in, the list
+    /// the policies state and the list the catalogue admits under now, whether it is exclusively
+    /// organisation-managed, whether it trusts its clock, and the times exclusive management was
+    /// turned off.
     pub(crate) async fn organisation_list(&self) -> Result<ParamsValue> {
         let without_local_enforcement = {
             let registry = self.registry.lock().await;
@@ -1181,6 +1182,9 @@ impl Controller {
         encode(&OrganisationListResult {
             enrolments,
             effective_adapter_allowlist: allowlist_on_the_wire(policy.adapter_allowlist().as_ref()),
+            adapter_allowlist_in_force: allowlist_on_the_wire(
+                self.catalogue.adapters_in_force().as_ref(),
+            ),
             exclusive: policy.is_exclusively_managed(),
             clock_trusted,
             exclusive_events: self.sharing.grants().exclusive_management_events()?,
