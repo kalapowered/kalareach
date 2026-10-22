@@ -619,7 +619,12 @@ impl RemoteConnection {
             held = self
                 .controller
                 .automation()
-                .retained(&actor_id, mutation, entry.method)
+                .retained(
+                    &actor_id,
+                    mutation,
+                    entry.method,
+                    Some(self.device.grant.grant_id),
+                )
                 .await;
         }
         // A catalogue mutation's receipt lives with the catalogue, beside the state the effect

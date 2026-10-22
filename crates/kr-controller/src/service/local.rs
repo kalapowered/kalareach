@@ -878,7 +878,10 @@ impl Controller {
             retained = self.changesets.retained(actor_id, &mutation, method).await;
         }
         if retained.is_none() && crate::automation::AutomationModule::serves(method) {
-            retained = self.automation.retained(actor_id, &mutation, method).await;
+            retained = self
+                .automation
+                .retained(actor_id, &mutation, method, None)
+                .await;
         }
         if retained.is_none() && crate::attention::AttentionModule::serves(method) {
             retained = self.attention.retained(actor_id, &mutation, method);

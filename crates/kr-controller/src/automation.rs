@@ -2995,19 +2995,53 @@ impl AutomationModule {
     /// An action either has a record, written in the same transaction as its effect, or has not
     /// been performed; there is no record of one still under way to be mistaken for either. A
     /// run that is still dispatching nodes has its record, and a repeat is told where it stands.
+    ///
+    /// A rearm keeps no record: the chain's own state answers its repeat, to a caller that may
+    /// rearm the chain (`caller_grant` is the grant a paired device holds, none at the local
+    /// socket).
     #[must_use]
     pub async fn retained(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
+        caller_grant: Option<GrantId>,
     ) -> Option<ControlFrame> {
+        if method == Method::WorkflowRearm {
+            return self.rearmed(mutation, caller_grant).await;
+        }
         let key = action_key(actor_id, mutation, method).ok()?;
         let service = Arc::clone(&self.service);
         match blocking(move || service.answered(&key)).await {
             Ok(None) => None,
             Ok(Some(answer)) => Some(frame(mutation.request_id, encode_answer(&answer))),
             Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
+        }
+    }
+
+    /// The answer to a rearm that was performed, when `mutation` is its repeat.
+    ///
+    /// Anything else, a refusal included, is no answer here: the request goes on to be admitted
+    /// and decided as a new one, which refuses it for the reason it has.
+    async fn rearmed(
+        &self,
+        mutation: &MutationRequest,
+        caller_grant: Option<GrantId>,
+    ) -> Option<ControlFrame> {
+        let service = Arc::clone(&self.service);
+        let params = mutation.params.clone();
+        let now_ms = self.daemon.now_ms();
+        let answer = blocking(move || {
+            let asked: WorkflowRearmParams = typed(&params)?;
+            service
+                .rearmed(&asked, caller_grant, now_ms)?
+                .map(|result| encode(&result))
+                .transpose()
+        })
+        .await;
+        match answer {
+            Ok(Some(value)) => Some(frame(mutation.request_id, Ok(value))),
+            Ok(None) | Err(_) => None,
         }
     }
 
