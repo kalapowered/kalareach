@@ -25,7 +25,7 @@ use kr_e2e_m1b::device::{Device, PairedHost, Remote};
 use kr_e2e_m1b::host::{Host, HostOptions, Preparation};
 use kr_e2e_m1b::run::{Run, ended_within, groups, running};
 use kr_e2e_m1b::view::View;
-use kr_e2e_m1b::window::{Window, answered, contains};
+use kr_e2e_m1b::window::{Window, answered};
 use kr_e2e_m1b::{LIVENESS, ceremony, shells};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_plugin_catalogue::transport::RepositoryTransport;
@@ -740,33 +740,60 @@ impl Person {
         self.window.wait_for_screen(needle, why)
     }
 
+    /// Clears the shell's screen, so that what it shows afterwards is what the next line did.
+    ///
+    /// A row of the screen is what a person would read, whichever bytes painted it, so a row left
+    /// by an earlier line is told from one the next line made only when the earlier ones are gone.
+    fn clears_the_screen(&self) {
+        self.window.type_text(b"\x0c");
+        let started = Instant::now();
+        loop {
+            let rows = self.window.screen();
+            if !rows.iter().any(|row| row.contains(RAN_AS_TYPED)) {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "the shell did not clear its screen in {:?}; it shows:\n{}",
+                started.elapsed(),
+                rows.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Types `line`, which runs through the integration, and waits until the screen shows `needle`.
     ///
     /// The shell asks the worker what a line runs and waits for the answer for one second at most,
     /// the product's bound; on a machine too loaded for the worker to answer in that time the line
     /// runs as it was typed, and the stand-in, which is not told to serve a gateway, says what it
-    /// serves and ends. Nothing was started and nothing recorded, so the line is typed again once
-    /// the shell has the answer that was late, and the wait is for the screen to show `needle`,
-    /// whatever the number of lines it took.
+    /// serves and ends. Nothing was started and nothing recorded by it, so the line is typed
+    /// again, on a cleared screen so that the row that says it is this line's own, and the wait is
+    /// for the screen to show `needle`, whatever the number of lines it took. A launcher that
+    /// refused the launch says so, and that is not a late answer: it fails at once.
     fn types_until_it_shows(&self, line: &str, needle: &str, why: &str) -> Vec<String> {
         let started = Instant::now();
+        let mut typed = 0_usize;
         loop {
-            let mark = self.window.mark();
+            self.clears_the_screen();
             self.types(line);
+            typed += 1;
             loop {
                 let rows = self.window.screen();
                 if rows.iter().any(|row| row.contains(needle)) {
                     return rows;
                 }
-                if contains(
-                    &self.window.collected().since(mark),
-                    RAN_AS_TYPED.as_bytes(),
-                ) {
+                assert!(
+                    !rows.iter().any(|row| row.contains("kr-hook:")),
+                    "{why}: the launcher refused the line (typed {typed} times), and the screen is:\n{}",
+                    rows.join("\n")
+                );
+                if rows.iter().any(|row| row.contains(RAN_AS_TYPED)) {
                     break;
                 }
                 assert!(
                     started.elapsed() < LIVENESS,
-                    "{why}: waited {:?} for {needle:?}, and the screen is:\n{}",
+                    "{why}: waited {:?} for {needle:?} (typed {typed} times), and the screen is:\n{}",
                     started.elapsed(),
                     rows.join("\n")
                 );
@@ -774,7 +801,7 @@ impl Person {
             }
             assert!(
                 started.elapsed() < LIVENESS,
-                "{why}: the line ran as typed each time it was typed in {:?}",
+                "{why}: the line ran as typed each of the {typed} times it was typed in {:?}",
                 started.elapsed()
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -1047,6 +1074,7 @@ fn kr_req_12_07_a_codex_typed_in_a_managed_root_shell_is_served_by_a_gateway_and
     // take paths it would add the gateway's address, and the stand-in would be a terminal waiting
     // to connect; run as typed it is given no address, and says what it serves and ends.
     let absolute = ctx.codex().display().to_string();
+    person.clears_the_screen();
     person.types(&format!("{absolute} resume"));
     let _ = person.sees(
         "codex-stand-in: serves",
