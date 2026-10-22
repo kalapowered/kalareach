@@ -31,7 +31,9 @@ use kr_protocol::scalars::{DurationMs, Nullable};
 use kr_transport::window::{AcceptedDeadline, DeadlineBound};
 
 use crate::service::Controller;
-use crate::service::net::tests::{daemon_on, manual_clocks, stopped};
+use crate::service::net::tests::{
+    clocks_that_pass_with_the_boot, daemon_on, manual_clocks, stopped,
+};
 
 /// How long a mutation's freshness lasts, on the continuous clock the test moves.
 const STANDING: Duration = Duration::from_secs(60);
@@ -558,7 +560,9 @@ async fn a_refused_write_of_the_clock_changes_nothing_and_a_restart_finds_the_di
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_write_of_the_continuity_leaves_the_host_unproven() {
     let temp = kr_ipc::testing::TempHost::create();
-    let (_continuous, _wall, clocks) = manual_clocks();
+    // Neither clock is moved here, and the daemon stops and starts three times in one boot: the
+    // wall clock has to pass as the boot does, however long the runner takes between two starts.
+    let clocks = clocks_that_pass_with_the_boot();
     let controller = daemon_on(&temp, clocks.clone()).await;
     assert!(proven(&controller), "the clock is proven where it starts");
     let registry = registry(&temp);
