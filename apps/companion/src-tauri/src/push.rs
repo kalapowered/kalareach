@@ -301,7 +301,7 @@ impl PushDesk {
                 CommandError::local_failure(format!("the gateway's origin: {error}"))
             })?;
         let file = data.join(DIRECTORY).join(RECORD);
-        let record = read_record(&file);
+        let record = after_a_restart(read_record(&file), (wiring.clock)());
         Ok(Arc::new(Self {
             file,
             data: data.to_path_buf(),
@@ -794,6 +794,21 @@ fn read_record(file: &Path) -> Record {
     }
 }
 
+/// What a record says when the application starts. A run that was under way then ended with the
+/// process, and nothing is running it now, so it is a stop the person can mend and not a state that
+/// says it is working for ever. A run that reached an end stays as it was.
+fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
+    for kept in record.hosts.values_mut() {
+        if kept.phase == Phase::Working {
+            kept.phase = Phase::Attention;
+            "Turning on notifications was interrupted. Try again.".clone_into(&mut kept.words);
+            kept.settings = false;
+            kept.updated_ms = now_ms;
+        }
+    }
+    record
+}
+
 fn unreachable_native() -> String {
     "This phone could not be asked about notifications.".to_owned()
 }
@@ -982,5 +997,53 @@ mod probe {
 
     pub(super) fn origin(data: &Path) -> Option<GatewayOrigin> {
         GatewayOrigin::new(request(data)?.get("origin")?.as_str()?).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(phase: Phase, settings: bool) -> HostPush {
+        HostPush {
+            sender_record_id: Some(PushSenderRecordId::new(kr_ipc::new_uuid())),
+            phase,
+            words: "words".to_owned(),
+            settings,
+            updated_ms: 7,
+        }
+    }
+
+    /// What a record says when the application starts: a run the system ended in the middle is not
+    /// left saying it is working, since nothing is running it, and what a run reached stays as it was.
+    #[test]
+    fn a_run_that_was_cut_short_is_not_left_saying_it_is_working() {
+        let kept_id = PushSenderRecordId::new(kr_ipc::new_uuid());
+        let mut working = host(Phase::Working, false);
+        working.sender_record_id = Some(kept_id);
+        let on = host(Phase::On, false);
+        let stopped = host(Phase::Attention, true);
+        let record = Record {
+            version: VERSION,
+            hosts: BTreeMap::from([
+                ("working".to_owned(), working),
+                ("on".to_owned(), on.clone()),
+                ("stopped".to_owned(), stopped.clone()),
+            ]),
+        };
+
+        let started = after_a_restart(record, 99);
+
+        let working = &started.hosts["working"];
+        assert_eq!(working.phase, Phase::Attention);
+        assert!(!working.settings, "nothing the system's setting can mend");
+        assert_eq!(working.updated_ms, 99);
+        assert_eq!(
+            working.sender_record_id,
+            Some(kept_id),
+            "asking again issues under the authorisation this phone already has"
+        );
+        assert_eq!(started.hosts["on"], on);
+        assert_eq!(started.hosts["stopped"], stopped);
     }
 }
