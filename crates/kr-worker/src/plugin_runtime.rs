@@ -584,11 +584,8 @@ fn as_service_id(binding_id: BrokerBindingId) -> BindingId {
     BindingId::new(binding_id.get())
 }
 
-/// Which code the runtime is asked to run: the package, its release and its exact bytes.
-///
-/// The catalogue generation the package was resolved against is not something an admission
-/// carries; the admission revision the binding was decided at stands for it, and the runtime keeps
-/// the identity for its own diagnostics and decides nothing from it.
+/// Which code the runtime is asked to run: the package, its release, the generation of its
+/// repository the admissions carried and its exact bytes.
 fn identity_of(want: &ComponentWant) -> Result<PluginIdentity, String> {
     let version = PackageVersion::parse(&want.version).map_err(|error| {
         format!(
@@ -600,7 +597,7 @@ fn identity_of(want: &ComponentWant) -> Result<PluginIdentity, String> {
         want.plugin_id.clone(),
         version,
         PayloadDigest::from_bytes(*want.package_digest.as_bytes()),
-        RepositoryGeneration::new(want.revision),
+        RepositoryGeneration::new(want.repository_generation.get()),
     ))
 }
 

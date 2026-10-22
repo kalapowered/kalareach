@@ -500,6 +500,7 @@ impl Acting {
                                 enrolment_key: "test".to_owned(),
                             },
                         },
+                        kr_protocol::ids::RepositoryGeneration::new(1),
                         kr_worker::broker::ledger::BoundExecutable {
                             path: "/bin/sh".to_owned(),
                             digest: Digest256::from_bytes([3; 32]),

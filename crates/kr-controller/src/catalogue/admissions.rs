@@ -20,7 +20,7 @@ use kr_protocol::admission::{
 };
 use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::ids::{EnvironmentId, PluginId, PublisherId};
+use kr_protocol::ids::{EnvironmentId, PluginId, PublisherId, RepositoryGeneration};
 use kr_protocol::limits::{
     MAX_ADMISSION_PARTS, MAX_ADMISSION_RECORD_BYTES, MAX_ADMITTED_PATH_BYTES, MAX_CONTROL_FRAME_LEN,
 };
@@ -450,6 +450,7 @@ fn admitted(
         version: package.version.to_string(),
         package_digest: digest(package.package_digest),
         origin: origin(&package.origin),
+        repository_generation: RepositoryGeneration::new(package.repository_generation),
         package_dir,
         grants: capability_names(&package.grants),
         bridge: Nullable::from(bridge),
@@ -524,6 +525,7 @@ mod tests {
                 repository_id: "r".repeat(64),
                 enrolment_key: "0123456789abcdef0123456789abcdef".to_owned(),
             },
+            repository_generation: kr_protocol::ids::RepositoryGeneration::new(1),
             package_dir: long("store"),
             grants: kr_plugin_sdk::capability::PluginCapability::ALL
                 .iter()

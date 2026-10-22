@@ -1953,6 +1953,36 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
     assert!(reported(&worker, source.package_digest).is_empty());
 }
 
+/// KR-REQ-06.06: the plugin runtime is told to run the package a binding holds under the generation
+/// of the package's repository that the admissions carried, which is not the admission revision
+/// the binding was decided at.
+#[test]
+fn kr_req_06_06_a_binding_runs_its_package_under_the_repository_generation_the_admissions_carried()
+{
+    let worker = Worker::open();
+    let source = worker.package(&fixture::Shape {
+        component: true,
+        ..fixture::Shape::claude_code()
+    });
+    let package = AdmittedPackage {
+        repository_generation: kr_protocol::ids::RepositoryGeneration::new(7),
+        ..testing::admitted(&source)
+    };
+    let frame = worker.admit(3, vec![package]);
+    assert_ne!(
+        frame.revision.get(),
+        7,
+        "the admission revision is another number"
+    );
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("the package binds");
+    let wants = worker.broker.component_wants();
+    assert_eq!(wants.len(), 1, "{wants:?}");
+    assert_eq!(wants[0].repository_generation.get(), 7);
+}
+
 /// KR-REQ-11.13: a package's declared actions that this host cannot register are refused by name
 /// when it is bound, and the worker's report on its admissions names them against the package.
 #[test]

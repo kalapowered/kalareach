@@ -315,13 +315,44 @@ impl RetainedLevel {
     }
 }
 
+/// A package the daemon admits is written for a worker of the retained level without the
+/// generation of its repository, which that level's reader refuses as a member it does not know,
+/// and read from it as admitted under no generation.
+fn leave_out_the_repository_generation(value: &mut CanonicalValue) -> Result<(), String> {
+    remove_member(value, "repository_generation");
+    Ok(())
+}
+
+fn say_no_repository_generation(value: &mut CanonicalValue) -> Result<(), String> {
+    insert_member(
+        value,
+        "repository_generation",
+        CanonicalValue::integer(0).map_err(|error| error.to_string())?,
+    )
+}
+
+/// The frame of a snapshot of admissions that carries one package, as this build writes it with no
+/// generation known, and as the retained level reads it.
+const ADMITTED_PACKAGE_CURRENT: &[u8] =
+    include_bytes!("../retained/0.76/golden/admitted-package.current.cbor");
+const ADMITTED_PACKAGE_RETAINED: &[u8] =
+    include_bytes!("../retained/0.76/golden/admitted-package.retained.cbor");
+
 /// The levels this release retains, in the order of [`RETAINED_WORKER_LEVELS`].
 pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     RETAINED_WORKER_LEVELS[0],
     include_str!("../retained/0.76/surface.schema.json"),
     include_str!("../retained/0.76/RELEASE"),
     include_str!("../retained/0.76/PLUGIN_HOST"),
-    &[],
+    &[Declared {
+        at: "AdmittedPackage.repository_generation",
+        write: leave_out_the_repository_generation,
+        read: say_no_repository_generation,
+        golden: &[Golden {
+            current: ADMITTED_PACKAGE_CURRENT,
+            retained: ADMITTED_PACKAGE_RETAINED,
+        }],
+    }],
     &[Compatible {
         at: "SessionSummary.application",
         reason: "A member that is absent from the wire for a session whose worker knows no \
@@ -1086,6 +1117,28 @@ impl Visit for Rewriting<'_> {
         }
         Ok(())
     }
+}
+
+/// Adds the member `name`, holding `member`, to the map `value` is. For a rewrite.
+///
+/// # Errors
+///
+/// Returns why when `value` is not a map or already has the member.
+pub fn insert_member(
+    value: &mut CanonicalValue,
+    name: &str,
+    member: CanonicalValue,
+) -> Result<(), String> {
+    let CanonicalValue::Map(map) = value else {
+        return Err("not a map".to_owned());
+    };
+    let mut entries = std::mem::take(map).into_entries();
+    if entries.iter().any(|(key, _)| key == name) {
+        return Err(format!("the map already has a member named {name}"));
+    }
+    entries.push((name.to_owned(), member));
+    *map = kr_cbor::CanonicalMap::from_entries(entries).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Removes the member `name` of the map `value` is, when it has one. For a rewrite.
