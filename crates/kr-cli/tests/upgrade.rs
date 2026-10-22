@@ -1310,8 +1310,8 @@ async fn host_info_of(host: &Host) -> kr_protocol::hostinfo::HostInfoResult {
 /// live, and waits, exit 9, naming the session, while a session of this release is live.
 ///
 /// The two releases also read each other's `host.info`: the release before's own `kr` reads the
-/// answer of this release's daemon, which says where privacy mode stands, and this release reads
-/// the answer of the release before's daemon, which does not, and asks `privacy.status` instead.
+/// answer of this release's daemon, and this release reads the answer of the release before's
+/// daemon; each says where privacy mode stands, and `privacy.status` reports it as well.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_for_one_of_this_release()
  {
@@ -1383,13 +1383,16 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
     );
-    // The release before's daemon says nothing of privacy mode in `host.info`, and reports it only
+    // The release before's daemon says where privacy mode stands in `host.info` too, and reports it
     // under `privacy.status`, which is what a device that manages the host asks of it.
-    // Goes once no retained level is below 0.76: the release this case rolls back to is then one
-    // that says it in `host.info`.
-    assert!(
-        host_info_of(host).await.privacy.is_none(),
-        "the release before's daemon sends no privacy member"
+    assert_eq!(
+        host_info_of(host).await.privacy.map(|state| (
+            state.enabled,
+            state.generation.get(),
+            state.changing
+        )),
+        Some((false, 0, false)),
+        "the release before's daemon says where privacy mode stands"
     );
     {
         let endpoint = host

@@ -17266,7 +17266,7 @@
               "type": "null"
             }
           ],
-          "description": "The remote dispatch lease the daemon took for this mutation, for a paired device's.\n\nAbsent for a local caller, whose actions do not depend on the lease, for `session.close`\n([`needs_a_dispatch_lease`]), and on a link to a worker of an earlier release, which cannot\nread it.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before the lease travelled reads, and a daemon sends one only to a\nworker at its own level. A worker at this level admits a paired device's mutation that\nneeds a lease only with one."
+          "description": "The remote dispatch lease the daemon took for this mutation, for a paired device's.\n\nAbsent for a local caller, whose actions do not depend on the lease, and for\n`session.close` ([`needs_a_dispatch_lease`]).\n\nIt is absent from the wire when it is absent. A worker admits a paired device's mutation\nthat needs a lease only with one."
         },
         "mutation": {
           "$ref": "#/$defs/MutationRequest",

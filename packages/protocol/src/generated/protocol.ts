@@ -9605,14 +9605,11 @@ export interface ForwardedMutation {
   /**
    * The remote dispatch lease the daemon took for this mutation, for a paired device's.
    *
-   * Absent for a local caller, whose actions do not depend on the lease, for `session.close`
-   * ([`needs_a_dispatch_lease`]), and on a link to a worker of an earlier release, which cannot
-   * read it.
+   * Absent for a local caller, whose actions do not depend on the lease, and for
+   * `session.close` ([`needs_a_dispatch_lease`]).
    *
-   * It is absent from the wire when it is absent, so a mutation without one is byte for byte
-   * what a worker built before the lease travelled reads, and a daemon sends one only to a
-   * worker at its own level. A worker at this level admits a paired device's mutation that
-   * needs a lease only with one.
+   * It is absent from the wire when it is absent. A worker admits a paired device's mutation
+   * that needs a lease only with one.
    */
   lease?: ForwardedLease | null
   mutation: MutationRequest1
