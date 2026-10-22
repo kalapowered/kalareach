@@ -1475,6 +1475,10 @@ fn an_invitation_is_scoped_to_the_session_it_shares() {
     );
 }
 
+/// KR-REQ-19.02: a delegation cannot grant a right the delegating actor lacks. Only a holder of
+/// `session.share` can pass anything on, and only from a grant it holds: a viewer it just created
+/// cannot pass its view on, and a device that merely names the owner's grant cannot delegate from
+/// it.
 #[test]
 fn a_delegation_narrows_what_the_issuer_holds() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
