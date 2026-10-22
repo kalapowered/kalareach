@@ -6163,6 +6163,7 @@ pub mod export {
         ),
         field("HostDoctorResult", "launch_probes", ContentClass::Structure),
         field("HostDoctorResult", "metrics", ContentClass::Structure),
+        field("HostMetrics", "counted", ContentClass::Structure),
         field("MetricsReport", "reconnect_time", ContentClass::Structure),
         field(
             "MetricsReport",
