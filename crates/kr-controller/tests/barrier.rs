@@ -3522,6 +3522,109 @@ async fn the_names_a_busy_worker_still_owed_are_collected_without_another_announ
     );
 }
 
+/// A revocation of a grant answered by a daemon that asks its worker for no page after the
+/// acknowledgement, so the answer holds the barrier and leaves names pending.
+///
+/// `None` when the worker refused the first announcement whole, which leaves it pending.
+async fn a_revocation_answered_with_names_unasked() -> Option<Left> {
+    let hosted = hosted_worker().await;
+    let first = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    announced_until(&hosted.controller, first, |barrier| barrier.holds()).await;
+    hosted.controller.limit_evidence_pages_for_tests(0);
+
+    let device = actor("device:phone");
+    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    seed_undispatched_intents(&hosted, &device, affected);
+    let grant = a_share_of_typists(&hosted, 0x63, 0);
+    let mut client = LocalClient::connect(&hosted.client_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon");
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            ActionId::new(Uuid::from_bytes([0x64; 16])),
+            ActionTarget::environment(hosted.environment_id),
+            &kr_protocol::sharing::GrantRevokeParams { grant_id: grant },
+        )
+        .await
+        .expect("the revocation is composed");
+    let answered: kr_protocol::sharing::RevocationResult =
+        tokio::time::timeout(Duration::from_secs(120), client.repeat(&mutation))
+            .await
+            .expect("the revocation is answered")
+            .expect("the daemon answers")
+            .expect("the grant is revoked")
+            .to_typed()
+            .expect("a revocation result");
+    let reported = worker_report(&answered.barrier, hosted.session_id);
+    (answered.barrier.holds() && reported.names_pending.get() > 0).then_some(Left {
+        hosted,
+        client,
+        mutation,
+        answered,
+        affected,
+    })
+}
+
+/// KR-REQ-09.13: a repeat of a revocation whose revision the daemon no longer holds a report of is
+/// answered as it was first given, with the names it named, and not as a worker with none.
+///
+/// The daemon holds the report of a revision for a while (eight revisions, and a restart ends it).
+/// The first answer names some actions and leaves the rest pending; later revocations push its
+/// report out; a live entry that says nothing of the revision is not a worker that named nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_a_revocation_whose_report_has_gone_keeps_the_names_it_was_given() {
+    let mut left = None;
+    for _ in 0..5 {
+        left = a_revocation_answered_with_names_unasked().await;
+        if left.is_some() {
+            break;
+        }
+    }
+    let mut left = left.expect("a revocation was acknowledged before another holder refused it");
+    for _ in 0..=kr_controller::authority::MAX_HELD_FENCE_REPORTS {
+        let later = tokio::time::timeout(
+            Duration::from_secs(60),
+            left.hosted.controller.revoke_authority(),
+        )
+        .await
+        .expect("the revocation reports")
+        .expect("the revocation is recorded");
+        announced_until(&left.hosted.controller, later, |barrier| barrier.holds()).await;
+    }
+
+    let again: kr_protocol::sharing::RevocationResult = left
+        .client
+        .repeat(&left.mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from its record")
+        .to_typed()
+        .expect("a revocation result");
+    let first = worker_report(&left.answered.barrier, left.hosted.session_id);
+    let repeated = worker_report(&again.barrier, left.hosted.session_id);
+    assert_eq!(
+        (
+            repeated.names_pending.get(),
+            repeated.rejected_actions_total.get(),
+            repeated.possibly_executed_total.get()
+        ),
+        (
+            first.names_pending.get(),
+            first.rejected_actions_total.get(),
+            first.possibly_executed_total.get()
+        ),
+        "the repeat says what the first answer said of a report the daemon no longer holds"
+    );
+    assert!(repeated.names_pending.get() > 0);
+}
+
 /// KR-REQ-09.13: a repeat of a revocation, with its action identifier, is answered with the names
 /// the worker has given since it was first answered.
 ///
