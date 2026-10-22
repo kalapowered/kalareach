@@ -2,7 +2,7 @@
 """Drives the installed companion application on the Android emulator through its own screens, for
 `scripts/e2e-pairing-device.sh android`.
 
-Two commands:
+Three commands:
 
   aim <grpc port>
       Moves the emulator's virtual camera to its first view of the wall's picture. The emulator's
@@ -14,6 +14,11 @@ Two commands:
       through `uiautomator`, which names the page's own buttons and texts, and driven by taps at
       the centre of what it names. Every prompt of the system is answered by the button a person
       would press. A line `PAIRING <what held>` is printed for each thing the run showed.
+
+  release <adb> <serial> <harness directory> <screenshot directory> <port> <attempts file>
+      Drives the minified release build through its pairing screen, for
+      `scripts/e2e-android-release.sh`: one attempt at the deployed service, then an attempt at the
+      local server whose certificate the system does not trust.
 
 It uses the Python standard library alone.
 """
@@ -552,12 +557,118 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     owner_confirmations(phone, directory)
 
 
+# ---- The release build's verified TLS ----------------------------------------------------------
+
+
+def a_code_no_host_holds() -> str:
+    """Ten characters of the pairing alphabet that no host was given: a locator nobody reserved."""
+    import secrets
+
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def start_pairing_screen(phone: Phone) -> None:
+    """Starts the application afresh and opens the pairing screen."""
+    phone.run("shell", "am", "force-stop", APP)
+    phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+    phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
+    phone.press("Hosts")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
+
+
+def type_into_field(phone: Phone, text: str, replacing: int = 0, holding: str = "") -> None:
+    """Types `text` into the text field on the screen whose text starts with `holding` (the code
+    field, empty or showing its placeholder, when it is blank), after taking out `replacing`
+    characters."""
+    fields = [node for node in phone.screen() if node["class"] == "android.widget.EditText"]
+    field = next(
+        (
+            node
+            for node in fields
+            if node["label"].startswith(holding) and (holding or not node["label"].startswith("https://"))
+        ),
+        None,
+    )
+    if field is None:
+        phone.give_up("the screen shows no such text field")
+    phone.tap(field)
+    if replacing:
+        phone.run("shell", "input", "keyevent", "KEYCODE_MOVE_END")
+        phone.run("shell", "input", "keyevent", *(["KEYCODE_DEL"] * replacing))
+    phone.run("shell", "input", "text", text)
+
+
+def release(adb: str, serial: str, directory: Path, shots: Path, port: str, attempts: Path) -> None:
+    """Drives the minified release build through its pairing screen.
+
+    The deployed room first: one attempt with a code no host holds. The room admits a socket for any
+    locator and gives an unknown one the shape of a known one, so the attempt ends the way an
+    admitted attempt does, with the words for a code no host answered. A build that lost the
+    platform verifier cannot get as far, and says the service could not be reached. The two
+    sentences differ, so the screen decides it.
+
+    Then the local server whose certificate the system does not trust: the phone says it could not
+    reach the service, and the server's own record (judged by the script) says what the phone did.
+    """
+    phone = Phone(adb, serial, shots)
+    shots.mkdir(parents=True, exist_ok=True)
+    failed = False
+
+    start_pairing_screen(phone)
+    phone.wait(lambda each: each == "Pair", "the button that starts an attempt", 30)
+    type_into_field(phone, a_code_no_host_holds())
+    attempts.parent.mkdir(parents=True, exist_ok=True)
+    with attempts.open("a", encoding="utf-8") as record:
+        record.write(f"attempt at the deployed service at {time.strftime('%Y-%m-%d %H:%M:%S %Z')} local time\n")
+    say_plain(f"one attempt at the deployed service at {time.strftime('%H:%M:%S')} local time")
+    phone.press("Pair")
+    end = time.monotonic() + 180
+    outcome = ""
+    while time.monotonic() < end:
+        words = " | ".join(node["label"] for node in phone.screen() if node["label"])
+        if "No host answered for this code" in words:
+            outcome = "admitted"
+            break
+        if "could not be reached" in words or "does not offer pairing" in words:
+            outcome = "unreachable"
+            break
+        time.sleep(1)
+    phone.shot("release-deployed")
+    if outcome == "admitted":
+        print("RELEASE-TLS the application admitted the attempt at the deployed service", flush=True)
+    else:
+        failed = True
+        words = " | ".join(node["label"] for node in phone.screen() if node["label"])
+        print(f"RELEASE-TLS-FAILED the deployed service was not reached as an admitted attempt: {outcome or 'no outcome'}: {words}", flush=True)
+
+    start_pairing_screen(phone)
+    phone.press("Change")
+    phone.wait(lambda each: each == "Use this service", "the field for the pairing service", 30)
+    type_into_field(phone, f"https://127.0.0.1:{port}", replacing=40, holding="https://")
+    phone.press("Use this service")
+    phone.wait(lambda each: "127.0.0.1" in each, "the local service as the one codes go through", 30)
+    type_into_field(phone, a_code_no_host_holds())
+    phone.press("Pair")
+    phone.wait(lambda each: "could not be reached" in each, "the words for a service that could not be reached", 120)
+    phone.shot("release-local")
+    print("RELEASE-TLS the application could not reach the local server", flush=True)
+    if failed:
+        raise SystemExit(1)
+
+
+def say_plain(text: str) -> None:
+    print(f"RELEASE-TLS-NOTE {text}", flush=True)
+
+
 def main() -> None:
     arguments = sys.argv[1:]
     if len(arguments) == 2 and arguments[0] == "aim":
         aim(arguments[1])
     elif len(arguments) == 6 and arguments[0] == "drive":
         drive(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
+    elif len(arguments) == 7 and arguments[0] == "release":
+        release(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5], Path(arguments[6]))
     else:
         raise SystemExit(__doc__)
 
