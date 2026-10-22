@@ -1763,8 +1763,10 @@ kr host shell-mode --clear              # the product default, managed
 ```
 
 The choice is one section of the versioned per-user host configuration document, and `--set` and
-`--clear` each apply one validated revision of it. It takes effect for the sessions created
-afterwards; a running session keeps the mode it was created in. A request outranks it
+`--clear` each apply one validated revision of it. The command asks the running control daemon what
+is in force, so it needs one, and it reaches the daemon before it writes: with none running it says
+so and changes nothing. It takes effect for the sessions created afterwards; a running session
+keeps the mode it was created in. A request outranks it
 (`kr new --shell-mode`, the companion's new-session form), and it outranks the product default,
 `managed`. The answer names the rung it came from: `host_configuration` or `default`. With
 `--json` the answer is `{ "ok": true, "environment_id": "...", "shell_mode": { "mode": "...",
