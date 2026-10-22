@@ -85,9 +85,9 @@ fn shipped() -> PathBuf {
 }
 
 /// The shipped packages as an installation hands them to the worker under the seed's grant: the
-/// release the repository ships of each, with the ceiling's three capabilities granted and no
-/// native bridge put in place and no executable qualified.
-fn bundled() -> Vec<(String, ConnectorSource)> {
+/// release the repository ships of each, with the ceiling's three capabilities granted, and
+/// `also` besides, and no native bridge put in place and no executable qualified.
+fn bundled(also: &[PluginCapability]) -> Vec<(String, ConnectorSource)> {
     let mut packages = Vec::new();
     for entry in std::fs::read_dir(shipped()).expect("the shipped repository reads") {
         let name = entry
@@ -118,6 +118,7 @@ fn bundled() -> Vec<(String, ConnectorSource)> {
                     PluginCapability::BrokerSemanticEvents,
                 ]
                 .into_iter()
+                .chain(also.iter().copied())
                 .collect(),
                 qualified: Vec::new(),
             },
@@ -133,33 +134,37 @@ struct Setup {
     host: kr_ipc::testing::TempHost,
     broker: Arc<Broker>,
     adoptions: Adoptions,
+    /// The connectors the worker installed from what it admitted: what a session's command
+    /// integrations are looked up in.
+    sources: ConnectorSources,
     packages: Vec<(String, ConnectorSource)>,
 }
 
 impl Setup {
-    /// Admits every shipped package.
+    /// Admits every shipped package with the ceiling a seeded host gives it.
     fn new() -> Self {
+        Self::granting(&[])
+    }
+
+    /// Admits every shipped package with the ceiling's capabilities and `also`.
+    fn granting(also: &[PluginCapability]) -> Self {
         let host = kr_ipc::testing::TempHost::create();
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         );
-        let packages = bundled();
+        let packages = bundled(also);
         let admitted: Vec<_> = packages
             .iter()
             .map(|(_, source)| testing::admitted(source))
             .collect();
-        let _ = testing::admit(
-            &Admissions::new(),
-            &ConnectorSources::new(),
-            &broker,
-            admitted,
-            1,
-        );
+        let sources = ConnectorSources::new();
+        let _ = testing::admit(&Admissions::new(), &sources, &broker, admitted, 1);
         let adoptions = Adoptions::new(Arc::clone(&broker), host.environment_id());
         Self {
             host,
             broker,
             adoptions,
+            sources,
             packages,
         }
     }
@@ -231,16 +236,27 @@ fn foreground(typed: &Typed, program: &Path, bypass: CommandBypassReason) -> For
 }
 
 /// KR-REQ-01.06, KR-REQ-12.23: under the configuration a seeded host starts with, each of the six
-/// agents' names typed at a managed root shell's prompt is run as it was typed.
+/// agents' names typed at a managed root shell's prompt is run as it was typed, and the shipped
+/// adapters that declare a command integration do not apply it.
 ///
-/// The decision is the integration's own (`resolve`), given the line `<name> --exact
-/// the_stand_in_program --test-threads 1` and the entries a seeded host gives a session, which are
-/// none: the invocation is bypassed as not integrated, and the command and the argument vector it
-/// will run are the ones typed, with nothing added. That is the native terminal route every bundled
-/// agent has by default.
+/// The packages are the shipped ones, admitted with the ceiling the seed gives them. Claude Code,
+/// Gemini CLI and Qoder CLI each declare an integration for their command, and it applies only
+/// under the capability `command_integration.launch`, which the ceiling does not include: no
+/// connector the worker installed stands for any of the six names, so the entries a session is
+/// given are none. The integration's own decision (`resolve`), given the line `<name> --exact
+/// the_stand_in_program --test-threads 1` and those entries, bypasses the invocation as not
+/// integrated, and the command and the argument vector it will run are the ones typed, with nothing
+/// added. That is the native terminal route every bundled agent has by default. The control grants
+/// the capability besides: the three that declare an integration are then found by their command
+/// names, and the other three are not, so the lookup above is not empty by construction.
 #[test]
 fn each_agent_name_typed_under_the_default_configuration_is_run_as_typed() {
+    let setup = Setup::new();
     for command in AGENT_COMMANDS {
+        assert!(
+            setup.sources.for_command(command).is_none(),
+            "{command}: no integration applies under the seed's ceiling"
+        );
         let (line, resolution) = decided(command);
         assert_eq!(
             resolution,
@@ -253,6 +269,15 @@ fn each_agent_name_typed_under_the_default_configuration_is_run_as_typed() {
         );
         assert!(!resolution.establishes_backend(), "{command}");
     }
+
+    let launching = Setup::granting(&[PluginCapability::CommandIntegrationLaunch]);
+    for command in AGENT_COMMANDS {
+        assert_eq!(
+            launching.sources.for_command(command).is_some(),
+            ["claude", "gemini", "qodercli"].contains(&command),
+            "{command}: the adapters that declare an integration apply it once the capability is granted"
+        );
+    }
 }
 
 /// KR-REQ-12.23, KR-REQ-01.06: under the configuration a seeded host starts with, Claude Code,
@@ -263,7 +288,8 @@ fn each_agent_name_typed_under_the_default_configuration_is_run_as_typed() {
 /// What each is found as is the whole of what the worker does with it: the line was answered, by
 /// the integration's own decision, that the command is not integrated; the instance is in the native
 /// terminal mode; no backend, launch
-/// record or registration stands behind it, and its bridges are refused; it is bound to the
+/// record or registration stands behind it, and the refusal of its bridges is recorded for the
+/// views; it is bound to the
 /// bundled adapter, which holds the observation the ceiling gives it and no right to act. Nothing
 /// of the adapter changes the program, its name or its arguments.
 ///
@@ -305,7 +331,7 @@ fn the_bundled_agents_with_one_adapter_that_recognises_them_run_as_typed_and_are
         );
         assert!(
             summary.refusal.as_ref().is_some(),
-            "{command}: none of its bridges is admitted"
+            "{command}: a refusal of its bridges is recorded"
         );
         let instance = summary.application_instance_id;
         assert_eq!(
