@@ -84,6 +84,9 @@ pub enum Request {
     /// The lines on a session's screen, shown to the person who is about to share it: `kr share
     /// invite --live`.
     Screen,
+    /// The names of the profiles whose variables or command integrations a restore left out of
+    /// the configuration it applied, so that the person can add them again: `kr backup restore`.
+    Restore,
 }
 
 /// Content the person asked to read.
