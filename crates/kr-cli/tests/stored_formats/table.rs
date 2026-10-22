@@ -1024,6 +1024,23 @@ pub fn table() -> Vec<Store> {
                 ),
             ],
         },
+        // The time each part of a session's retained output was produced, which a session's worker
+        // keeps beside its spool. A worker is a program of its own: no lock an update holds keeps it
+        // off the file between the update's check and its switch.
+        Store {
+            levels: None,
+            writers: Writers::Commands,
+            entry: entry(
+                "output-times",
+                StoreScope::Environment,
+                "output-times/*.sqlite",
+                sqlite_table("times_schema"),
+                version(kr_worker::output_times::VERSION),
+                version(kr_worker::output_times::VERSION),
+            ),
+            owned: Vec::new(),
+            kept: Vec::new(),
+        },
         Store {
             levels: None,
             writers: Writers::Daemon,

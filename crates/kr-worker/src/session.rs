@@ -515,7 +515,16 @@ impl Session {
         )?;
         let mut history = match config.spool_directory.as_ref() {
             Some(directory) => {
-                OutputHistory::with_spool(config.resident_bytes, directory, SpoolLayout::DEFAULT)?
+                let history = OutputHistory::with_spool(
+                    config.resident_bytes,
+                    directory,
+                    SpoolLayout::DEFAULT,
+                )?;
+                // A spool where an environment keeps one has its time index beside it.
+                match kr_ipc::paths::output_times_beside(directory) {
+                    Some(times) => history.with_time_index(times),
+                    None => history,
+                }
             }
             None => OutputHistory::in_memory(config.resident_bytes),
         };
@@ -3214,6 +3223,10 @@ impl Session {
         }
         let (cursor, owed) = {
             let mut span = self.trace.acquisition(crate::trace::Site::IngestRetain);
+            // What the index records with the time of this output: whether the clock that reads it
+            // is one the host can prove.
+            self.history
+                .set_clock_proven(self.time.may_collect_expired());
             let appended = self.history.append_deferred(bytes);
             span.held();
             appended
@@ -4620,6 +4633,13 @@ impl Session {
         }
     }
 
+    /// Returns the handle to the time index of this session's output, for a pass of maintenance to
+    /// write beyond the session's lock.
+    #[must_use]
+    pub fn output_time_index(&self) -> Option<crate::output_times::TimeIndex> {
+        self.history.time_index()
+    }
+
     /// Applies section 20's output retention, on the host's own maintenance cadence.
     ///
     /// The host-wide figure is measured from the environment's whole spool directory rather than
@@ -4628,22 +4648,36 @@ impl Session {
     /// nothing, which under-reports and therefore evicts less rather than more, and a session
     /// whose spool is configured somewhere else reads that other directory's contents instead.
     pub fn collect_output(&mut self) -> Vec<crate::persistence::retention::Eviction> {
-        let host_bytes = self
-            .config
-            .spool_directory
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map_or_else(|| self.history.retained_bytes(), retained_bytes_under);
+        self.collect_output_under(crate::persistence::retention::OutputRetention::DEFAULT)
+    }
+
+    /// Applies output retention under `retention`, which is section 20's own figures for the
+    /// host's pass and other ones for a test.
+    pub fn collect_output_under(
+        &mut self,
+        retention: crate::persistence::retention::OutputRetention,
+    ) -> Vec<crate::persistence::retention::Eviction> {
         // Section 9 stops expiry-based collection while the wall clock cannot be proved, and
         // removing output because it is seven days old is exactly that. The caps are applied
         // either way: they are about bytes rather than about time.
         let age_permitted = self.time.may_collect_expired();
-        self.history.apply_retention(
-            crate::persistence::retention::OutputRetention::DEFAULT,
-            host_bytes,
-            kr_ipc::now_ms(),
-            age_permitted,
-        )
+        let now = kr_ipc::now_ms();
+        match self
+            .config
+            .spool_directory
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            Some(spools) => {
+                self.history
+                    .apply_retention_to_host(spools, retention, now, age_permitted)
+            }
+            None => {
+                let held = self.history.retained_bytes();
+                self.history
+                    .apply_retention(retention, held, now, age_permitted)
+            }
+        }
     }
 
     /// Writes down what the time contract has to survive a restart, when it has changed.
@@ -4950,6 +4984,12 @@ impl Session {
         // One last look before the record is written, so a process that started late is still
         // accounted for.
         self.observe_owned();
+        // The times the output was produced at are written before the closure is, so a reader that
+        // finds the closure finds them. This is the one write of the index made with the session
+        // held: the session has stopped producing output, so nothing waits on it, and the worker
+        // may exit as soon as the closure is delivered. A write that fails leaves the output
+        // without times, which a reader is told, and is not a failure of the closure.
+        let _ = self.history.flush_times();
         // Only confirmed terminations are listed, and coverage follows the boundary this host
         // actually has rather than the outcome it would prefer. A terminal process group cannot
         // see a descendant that left it, so a host with only that never reports complete.
@@ -5335,39 +5375,6 @@ impl PrivacyCleanup {
         .collect();
         (!parts.is_empty()).then(|| parts.join("; "))
     }
-}
-
-/// Returns how many bytes of retained output live under one directory.
-///
-/// One level of session directories, each holding fixed-size segments, so the walk is bounded by
-/// the number of sessions and the segments each keeps rather than by how much output they have
-/// produced. A directory or a file this host cannot read counts as nothing, which under-reports
-/// the host figure and therefore evicts less rather than more. Output still in a session's
-/// resident window has not reached a spool and is not counted.
-fn retained_bytes_under(root: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
-    let mut total = 0;
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_file() {
-            total += entry.metadata().map(|data| data.len()).unwrap_or(0);
-            continue;
-        }
-        if !kind.is_dir() {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            total += file.metadata().map(|data| data.len()).unwrap_or(0);
-        }
-    }
-    total
 }
 
 /// A session's live agent instances, and how many announcements it has made about them.

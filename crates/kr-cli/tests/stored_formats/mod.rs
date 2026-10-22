@@ -1989,6 +1989,16 @@ fn is_sidecar_of(name: &str, file: &str) -> bool {
         .any(|suffix| name == format!("{file}{suffix}"))
 }
 
+/// Whether `name` is a sidecar of one of the databases a pattern such as `*.sqlite` names.
+fn is_sidecar_of_records(name: &str, pattern: &str) -> bool {
+    pattern.contains('*')
+        && pattern.ends_with(".sqlite")
+        && ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+            name.strip_suffix(suffix)
+                .is_some_and(|database| matches(pattern, database))
+        })
+}
+
 /// Looks for the name in the claims: the claim and whether the name is a sidecar of a store's file.
 fn find<'a>(claims: &'a [(String, Covers)], name: &str) -> Option<&'a Covers> {
     claims
@@ -2095,7 +2105,8 @@ fn unlisted(directory: &Path, relative: &str, patterns: &[&str], found: &mut Vec
             match pattern.split_once('/') {
                 None => {
                     listed |= matches(pattern, &name)
-                        || (!pattern.contains('*') && is_sidecar_of(&name, pattern));
+                        || (!pattern.contains('*') && is_sidecar_of(&name, pattern))
+                        || is_sidecar_of_records(&name, pattern);
                 }
                 Some((first, rest)) if matches(first, &name) => {
                     listed = true;
@@ -2132,10 +2143,20 @@ fn database_is_named(relative: &str, table: &[Store], named: &[Named]) -> bool {
     } else {
         (StoreScope::StateRoot, relative.to_owned())
     };
-    if table
-        .iter()
-        .any(|store| store.entry.scope == scope && store.entry.path == inner)
-    {
+    // A store that is every record of one extension in a directory names each database there.
+    let is_a_record = |store: &Store| {
+        store.entry.records().is_some_and(|(directory, extension)| {
+            inner.rsplit_once('/').is_some_and(|(parent, name)| {
+                parent == directory
+                    && name
+                        .rsplit_once('.')
+                        .is_some_and(|(_, found)| found == extension)
+            })
+        })
+    };
+    if table.iter().any(|store| {
+        store.entry.scope == scope && (store.entry.path == inner || is_a_record(store))
+    }) {
         return true;
     }
     let first = inner.split('/').next().unwrap_or_default();
