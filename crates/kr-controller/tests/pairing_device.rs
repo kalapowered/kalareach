@@ -66,16 +66,35 @@ const PICTURE: u32 = 1024;
 /// The fixture's code invitation, whose code a phone's scanner reads. Only its origin is replaced.
 const FIXTURES: &str = include_str!("../../../fixtures/pairing/codes.json");
 
-/// Waits until `file` exists, or `within` passes.
+/// Waits until `file` exists, or `within` passes, or the script says the run is finished.
 async fn appears(file: &Path, within: Duration) -> bool {
+    let finish = file.parent().map(|directory| directory.join("finish"));
     let end = Instant::now() + within;
     while !file.exists() {
-        if Instant::now() >= end {
+        if Instant::now() >= end || finish.as_ref().is_some_and(|finish| finish.exists()) {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     true
+}
+
+/// An invitation's text and its secret in the forms a log could print them in, one to a line: what
+/// no log of a phone may hold. The script searches the phone's logs for every line.
+fn secret_forms(text: &str, secret: &[u8; 32]) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use std::fmt::Write as _;
+
+    let mut hex = String::new();
+    for byte in secret {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!(
+        "{text}\n{hex}\n{}\n{}\n",
+        URL_SAFE_NO_PAD.encode(secret),
+        STANDARD.encode(secret)
+    )
 }
 
 /// Writes `bytes` to `file` where only this user can read it, whole: the script reads a file the
@@ -280,9 +299,25 @@ impl Run {
         let mut secret = *payload.secret.expose();
         secret[0] ^= 1;
         payload.secret = SecretBytes32::from_bytes(secret);
+        let text = text_of(payload);
         write_private(
-            &self.directory.join("control.png"),
-            &qr_picture(&text_of(payload)),
+            &self.directory.join("secrets-control.txt"),
+            secret_forms(&text, &secret).as_bytes(),
+        );
+        write_private(&self.directory.join("control.png"), &qr_picture(&text));
+        // The failed confirmations the invitation still allows, before the phone tries it and
+        // after: a host the phone never reached has refused nothing.
+        let remaining = |status: &kr_protocol::preauth::PairStatusResult| {
+            status
+                .owner
+                .0
+                .as_ref()
+                .map(|view| view.remaining_confirmations)
+        };
+        let before = remaining(
+            &calls::owner_status(client, invited.invitation_id)
+                .await
+                .expect("the invitation's status"),
         );
         assert!(
             appears(&self.directory.join("control-done"), STEP).await,
@@ -291,10 +326,19 @@ impl Run {
         let status = calls::owner_status(client, invited.invitation_id)
             .await
             .expect("the invitation's status");
-        let locked = status.owner.0.and_then(|view| view.candidate.0).is_some();
+        let locked = status
+            .owner
+            .0
+            .as_ref()
+            .and_then(|view| view.candidate.0.as_ref())
+            .is_some();
         self.say(
             "control-result.txt",
             &format!("candidate_locked={}\n", u8::from(locked)),
+        );
+        self.say(
+            "control-refused.txt",
+            &format!("refused={}\n", u8::from(remaining(&status) < before)),
         );
         let _ = calls::cancel(self.environment, client, invited.invitation_id, false).await;
     }
@@ -305,7 +349,13 @@ impl Run {
         let mut client = self.host.client().await;
         let client = &mut client;
         let invited = self.invite(client).await;
-        let text = text_of(payload_for(&invited, &self.peer));
+        let payload = payload_for(&invited, &self.peer);
+        let secret = *payload.secret.expose();
+        let text = text_of(payload);
+        write_private(
+            &self.directory.join("secrets-direct.txt"),
+            secret_forms(&text, &secret).as_bytes(),
+        );
         self.say("direct-length.txt", &format!("{}\n", text.len()));
         write_private(&self.directory.join("direct.png"), &qr_picture(&text));
         let value = self
