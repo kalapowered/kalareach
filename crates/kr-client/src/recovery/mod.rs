@@ -192,15 +192,24 @@ pub enum RecoveryError {
         /// The generation both name.
         generation: u64,
     },
-    /// The bundle the service now holds records an older generation of the archive than the one
+    /// The bundle the service now holds records an older generation of an archive than the one
     /// this restore read in it, or none.
     #[error(
-        "the recovery bundle no longer records generation {known} of that archive, which this \
+        "the recovery bundle no longer records generation {known} of an archive, which this \
          restore read in it, so nothing is recorded"
     )]
     CheckpointWentBack {
-        /// The newest generation this restore read the bundle record.
+        /// The generation this restore read the bundle record for the archive.
         known: u64,
+    },
+    /// The bundle the service now holds is an older revision than the one this restore read.
+    #[error(
+        "the service now holds revision of the recovery bundle older than revision {first}, which \
+         this restore read, so nothing is recorded"
+    )]
+    BundleWentBackToAnOlderRevision {
+        /// The revision this restore read first.
+        first: u64,
     },
     /// The file is an offline export in another format than this release reads.
     #[error("that file is not an offline export this release reads")]
