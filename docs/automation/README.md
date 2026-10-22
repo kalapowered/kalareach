@@ -652,7 +652,10 @@ A test result is what this host observed, and nothing a caller reports.
   also watches the root of the volume, without descending into it, and any such report makes the
   result indeterminate. A watcher that cannot start, that lost reports or that does not answer in
   that time makes the result indeterminate, and so does a platform with no watcher whenever a
-  suite declares an output. A file the suite adds
+  suite declares an output. FSEvents does lose reports, and falls behind by more than the host
+  waits, when files are written by the tens of thousands in one burst, by a suite or by anything
+  else on the machine, so on macOS such a run can get an indeterminate result that says its watcher
+  cannot be trusted, and a run again may not. A file the suite adds
   beside an output is not left out of the comparison and changes the source (an added empty
   directory leaves the source as it was, unless the reading cannot open or list it, reaches a
   bound, or the change set's rules keep its path out, which makes the source indeterminate, so no
