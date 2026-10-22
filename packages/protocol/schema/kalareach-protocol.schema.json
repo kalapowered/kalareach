@@ -18688,7 +18688,7 @@
             "reconnect_time": [],
             "terminal_parse_fault": []
           },
-          "description": "What this host has measured about itself: how long its paired devices were without a\nconnection, the faults its terminals' parsers met and the failures of its adapters.\n\nLocal diagnostics, counted in memory from the start of the process that counted them and\nsent to no service. A paired device that asks for the host's diagnostics reads them as a\nsupport bundle holds them. Every label is one of this build's own words, so the report\ncarries no terminal content, key, prompt or filename."
+          "description": "What this host has measured about itself: how long its paired devices were without a\nconnection, the faults its terminals' parsers met and the failures of its adapters.\n\nLocal diagnostics, counted in memory from the start of the process that counted them and\nsent to no service. The owner reads them, and so does a paired device that holds the right\nto manage the host; a device that holds only a right over a session is answered a report\nwith nothing counted. Every label is one of this build's own words, so the report carries no\nterminal content, key, prompt or filename."
         }
       },
       "required": [
