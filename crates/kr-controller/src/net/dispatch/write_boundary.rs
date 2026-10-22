@@ -1245,6 +1245,121 @@ async fn a_response_is_not_written_under_a_lease_installed_after_its_own_ended()
     }
 }
 
+/// KR-REQ-26.43: what the host measured about itself goes in a diagnostics answer only to the
+/// decision the answer is written under, whichever decision it was read under. An answer read
+/// under a decision that held `host.manage` and written under one that does not goes without its
+/// counts, as one written under the decision that holds it goes with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_that_manages_the_host()
+ {
+    use kr_protocol::metrics::{Adapter, MetricOutcome};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::super::tests::daemon(&temp).await;
+    controller
+        .metrics()
+        .adapter_failed(Adapter::Codex, MetricOutcome::Unavailable);
+    let connection_with = |byte: u8, actions: &[ActionRight]| {
+        let (mut grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        grant.actions = actions.iter().copied().collect();
+        let mut device = record_for(&grant);
+        device.endpoint_id = kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]);
+        device.authorisation = kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]);
+        controller.devices().commit(&device).expect("paired");
+        let recording = Arc::new(Recording::default());
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            device,
+            Box::new(Arc::clone(&recording)),
+        );
+        (connection, recording)
+    };
+    let (managing, kept_by_the_manager) =
+        connection_with(61, &[ActionRight::SessionView, ActionRight::HostManage]);
+    let (viewing, kept_by_the_viewer) = connection_with(62, &[ActionRight::SessionView]);
+
+    // The answer is read under the decision that holds the right, and carries the count.
+    let read = managing
+        .answer_now(ControlFrame::Request(diagnostics(1)))
+        .await
+        .expect("an answer");
+    let frame = read.frame().clone();
+    assert_eq!(
+        counted_in(&frame),
+        Some(1),
+        "the answer is read with the count"
+    );
+
+    for (connection, kept) in [
+        (&managing, &kept_by_the_manager),
+        (&viewing, &kept_by_the_viewer),
+    ] {
+        let asked = connection
+            .ask(None, Method::HostDoctor.entry(), false)
+            .expect("the grant admits the diagnostics");
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame: frame.clone(),
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        assert_eq!(kept.frames().len(), 1, "one answer");
+    }
+    assert_eq!(
+        counted_in(&kept_by_the_manager.frames()[0]),
+        Some(1),
+        "written under the decision that manages the host, the answer holds the count"
+    );
+    assert_eq!(
+        counted_in(&kept_by_the_viewer.frames()[0]),
+        Some(0),
+        "written under one that does not, it counts nothing"
+    );
+    drop(controller);
+}
+
+/// A diagnostics request of a paired device.
+fn diagnostics(request_id: u64) -> kr_protocol::envelope::Request {
+    kr_protocol::envelope::Request {
+        request_id: kr_protocol::ids::RequestId::new(request_id),
+        method: Method::HostDoctor.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        params: kr_protocol::envelope::ParamsValue::empty(),
+    }
+}
+
+/// How many adapter failures a diagnostics answer counts, or `None` when it has no `metrics`
+/// member.
+fn counted_in(frame: &ControlFrame) -> Option<u64> {
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: kr_protocol::envelope::Outcome::Ok(value),
+        ..
+    }) = frame
+    else {
+        panic!("not the diagnostics' answer: {frame:?}");
+    };
+    let kr_cbor::CanonicalValue::Map(map) = value.as_value() else {
+        panic!("not a map: {value:?}");
+    };
+    map.get("metrics")?;
+    let answer: kr_protocol::hostinfo::HostDoctorResult =
+        value.to_typed().expect("a diagnostics answer");
+    Some(
+        answer
+            .metrics
+            .adapter_failure
+            .iter()
+            .map(|series| series.count.get())
+            .sum(),
+    )
+}
+
 /// A session listing asked by a paired device.
 fn listing(request_id: u64) -> kr_protocol::envelope::Request {
     kr_protocol::envelope::Request {
