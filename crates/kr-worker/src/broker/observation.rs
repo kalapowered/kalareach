@@ -31,7 +31,7 @@
 //! to remove them from.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -120,10 +120,19 @@ pub struct Entry {
     pub source: Source,
     /// When the worker had it, in milliseconds since the Unix epoch.
     pub at_ms: u64,
+    /// Whether privacy mode was on when the worker had it, so that a component offered it later
+    /// holds something made in privacy mode however privacy mode stands then.
+    pub private: bool,
     cost: u64,
 }
 
 impl Entry {
+    /// Returns the number this entry was pushed under: entries are offered in this order.
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Returns true when the upstream is waiting on this entry's request. Such an entry is never
     /// evicted to make room.
     #[must_use]
@@ -160,13 +169,24 @@ impl Tally {
     }
 }
 
+/// What the lane lost of the upstream frames one package's table read on one instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeLoss {
+    /// The instance whose connection read them.
+    pub instance: ApplicationInstanceId,
+    /// The package whose table read them: only its bindings are owed a snapshot for them.
+    pub package: PackageIdentity,
+    /// How many, and how much.
+    pub tally: Tally,
+}
+
 /// What the lane lost since the pump last looked, by who would have been offered it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneLoss {
     /// Terminal output.
     pub terminal: Tally,
-    /// Upstream frames, by the instance whose connection read them.
-    pub native: BTreeMap<ApplicationInstanceId, Tally>,
+    /// Upstream frames, by the instance and the package that read them.
+    pub native: Vec<NativeLoss>,
 }
 
 impl LaneLoss {
@@ -188,9 +208,10 @@ pub enum Pushed {
 /// The lane's account of what it has lost, since it began.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Account {
-    /// Entries evicted to make room.
+    /// Ordinary entries lost for want of room: pushed out by a newer one, or too late to fit.
     pub evicted: Tally,
-    /// Entries refused for want of room.
+    /// Entries the upstream is waiting on, and entries larger than the lane, that were not taken
+    /// for want of room.
     pub refused: Tally,
 }
 
@@ -218,9 +239,12 @@ pub struct View {
     pub last_checkpoint_attempt: Option<Instant>,
     /// What the component last missed, in the words a person is told.
     pub loss_note: Option<String>,
-    /// Whether the component was offered something while privacy mode was on, so that its state may
-    /// hold it. None is taken from it until it starts again.
+    /// Whether the component was offered something made while privacy mode was on, so that its
+    /// state may hold it. None is taken from it until it starts again.
     pub private_content: bool,
+    /// The first entry the binding may be offered: those pushed before it was made ready are older
+    /// than its view.
+    pub ready_from: u64,
 }
 
 impl View {
@@ -273,12 +297,24 @@ impl Inner {
         let bytes = entry.cost;
         match &entry.source {
             Source::Terminal(_) => self.pending_loss.terminal.add(bytes),
-            Source::Native(frame) => self
-                .pending_loss
-                .native
-                .entry(frame.instance)
-                .or_default()
-                .add(bytes),
+            Source::Native(frame) => {
+                let losses = &mut self.pending_loss.native;
+                let at = losses.iter().position(|loss| {
+                    loss.instance == frame.instance && loss.package == frame.package
+                });
+                let loss = if let Some(at) = at {
+                    &mut losses[at]
+                } else {
+                    losses.push(NativeLoss {
+                        instance: frame.instance,
+                        package: frame.package.clone(),
+                        tally: Tally::default(),
+                    });
+                    let last = losses.len() - 1;
+                    &mut losses[last]
+                };
+                loss.tally.add(bytes);
+            }
         }
         if refused {
             self.account.refused.add(bytes);
@@ -300,6 +336,9 @@ pub struct ObservationLane {
     terminal_wanted: AtomicBool,
     /// Whether privacy mode is on: no component's state is taken or held.
     private: AtomicBool,
+    /// Advances each time privacy mode is turned on or off, so that a state asked for before the
+    /// change is not held after it.
+    privacy_epoch: AtomicU64,
     /// Wakes the link when a binding that was owed nothing is offered something, so that the time
     /// its state falls due is worked out again.
     checkpoint_wake: tokio::sync::Notify,
@@ -356,6 +395,7 @@ impl ObservationLane {
             native_wanted: AtomicBool::new(false),
             terminal_wanted: AtomicBool::new(false),
             private: AtomicBool::new(false),
+            privacy_epoch: AtomicU64::new(0),
             checkpoint_wake: tokio::sync::Notify::new(),
             #[cfg(feature = "testing")]
             hold: Mutex::new(None),
@@ -418,6 +458,7 @@ impl ObservationLane {
             seq,
             source,
             at_ms,
+            private: self.private.load(Ordering::Acquire),
             cost,
         };
         if cost > OBSERVATION_QUEUE_BYTES {
@@ -461,6 +502,11 @@ impl ObservationLane {
     /// bound until [`Self::finish`].
     pub fn take(&self) -> Option<Entry> {
         let mut inner = self.inner();
+        // What the lane has lost is owed to the components before anything later is handed to them,
+        // and it is the pump's to apply: while a loss waits, no entry is taken.
+        if !inner.pending_loss.is_empty() {
+            return None;
+        }
         let from_authoritative = match (inner.ordinary.front(), inner.authoritative.front()) {
             (None, None) => return None,
             (Some(_), None) => false,
@@ -481,6 +527,12 @@ impl ObservationLane {
         let mut inner = self.inner();
         inner.held = inner.held.saturating_sub(entry.cost);
         inner.in_flight_entries = inner.in_flight_entries.saturating_sub(1);
+    }
+
+    /// Returns true while the lane has lost something the pump has not yet applied.
+    #[must_use]
+    pub fn loss_pending(&self) -> bool {
+        !self.inner().pending_loss.is_empty()
     }
 
     /// Waits until something may have been pushed, or a binding's silence or retry may be over.
@@ -531,14 +583,17 @@ impl ObservationLane {
     /// Says whether a binding may be offered anything.
     pub fn set_ready(&self, binding: BrokerBindingId, ready: bool) {
         let mut inner = self.inner();
+        let next = inner.next_seq;
         let view = inner.views.entry(binding).or_default();
         view.ready = ready;
+        view.silent_until = None;
         if ready {
             // A component made ready has been registered afresh, so it holds nothing it was offered
-            // before.
+            // before, and nothing pushed before it is for it.
             view.private_content = false;
-        } else {
-            view.silent_until = None;
+            view.silence = None;
+            view.snapshot_retry = None;
+            view.ready_from = next;
         }
         drop(inner);
         self.wake.notify_one();
@@ -566,6 +621,23 @@ impl ObservationLane {
         let mut inner = self.inner();
         inner.views.remove(&binding);
         drop_checkpoint(&mut inner, binding);
+    }
+
+    /// Forgets the view and the held state of every binding that is not in `wanted`: a binding that
+    /// ended while the plugin runtime was lost is not unbound by anything else.
+    pub fn forget_unwanted(&self, wanted: &std::collections::BTreeSet<BrokerBindingId>) {
+        let mut inner = self.inner();
+        let gone: Vec<BrokerBindingId> = inner
+            .views
+            .keys()
+            .chain(inner.checkpoints.keys())
+            .filter(|binding| !wanted.contains(binding))
+            .copied()
+            .collect();
+        for binding in gone {
+            inner.views.remove(&binding);
+            drop_checkpoint(&mut inner, binding);
+        }
     }
 
     /// Returns a copy of a binding's view.
@@ -630,8 +702,9 @@ impl ObservationLane {
     }
 
     /// Records that something was offered to the binding, which is one more thing its state holds
-    /// that has not been taken.
-    pub fn offered(&self, binding: BrokerBindingId, now: Instant) {
+    /// that has not been taken. `made_in_privacy` says whether privacy mode was on when the worker
+    /// had it.
+    pub fn offered(&self, binding: BrokerBindingId, now: Instant, made_in_privacy: bool) {
         let mut inner = self.inner();
         let Some(view) = inner.views.get_mut(&binding) else {
             return;
@@ -639,7 +712,7 @@ impl ObservationLane {
         let first = view.offered_since_checkpoint == 0;
         view.offered_since_checkpoint = view.offered_since_checkpoint.saturating_add(1);
         view.last_offer = Some(now);
-        if self.private.load(Ordering::Acquire) {
+        if made_in_privacy || self.private.load(Ordering::Acquire) {
             view.private_content = true;
         }
         drop(inner);
@@ -750,17 +823,33 @@ impl ObservationLane {
         }
     }
 
-    /// Holds a binding's state. Nothing is held under privacy mode, and the oldest is dropped
-    /// rather than the total passing [`CHECKPOINT_BYTES`].
-    pub fn hold(&self, binding: BrokerBindingId, held: Held) {
-        if self.is_private() {
-            return;
-        }
+    /// Returns the number privacy mode's changes have reached: a state asked for under one number is
+    /// held only under the same one.
+    #[must_use]
+    pub fn privacy_epoch(&self) -> u64 {
+        self.privacy_epoch.load(Ordering::Acquire)
+    }
+
+    /// Holds a binding's state, asked for when privacy mode stood at `epoch`. Nothing is held under
+    /// privacy mode, nothing asked for before a change of it, and nothing from a component that was
+    /// offered something made in it; the oldest is dropped rather than the total passing
+    /// [`CHECKPOINT_BYTES`].
+    pub fn hold(&self, binding: BrokerBindingId, held: Held, epoch: u64) {
         let size = held.state.len() as u64;
         if size > CHECKPOINT_BYTES {
             return;
         }
         let mut inner = self.inner();
+        // Read under the lock the fence takes, so that a fence is either before this or after it.
+        if self.is_private()
+            || self.privacy_epoch() != epoch
+            || inner
+                .views
+                .get(&binding)
+                .is_none_or(|view| view.private_content)
+        {
+            return;
+        }
         drop_checkpoint(&mut inner, binding);
         while inner.checkpoint_bytes.saturating_add(size) > CHECKPOINT_BYTES {
             let Some(oldest) = inner.checkpoint_order.front().copied() else {
@@ -821,7 +910,11 @@ impl ObservationLane {
     /// was offered something while it was on is not asked for its state again, since the state may
     /// hold what it was offered, until it starts again.
     pub fn set_private(&self, private: bool) {
-        self.private.store(private, Ordering::Release);
+        // Under the lock a fence and a hold take, so that neither sees half of the change.
+        let _inner = self.inner();
+        if self.private.swap(private, Ordering::AcqRel) != private {
+            self.privacy_epoch.fetch_add(1, Ordering::AcqRel);
+        }
         if !private {
             self.checkpoint_wake.notify_one();
         }
@@ -838,6 +931,7 @@ impl ObservationLane {
     /// pump and in size by the lane. Returns the checkpoints dropped and their bytes.
     pub fn fence(&self) -> Fenced {
         let mut inner = self.inner();
+        self.privacy_epoch.fetch_add(1, Ordering::AcqRel);
         let records = inner.checkpoints.len();
         let bytes = inner.checkpoint_bytes;
         inner.checkpoints.clear();
