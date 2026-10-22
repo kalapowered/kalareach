@@ -9902,6 +9902,83 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-20.17: putting the device's configuration back replaces the preferences, profiles,
+    /// default profile, description settings and agent choices, and moves nothing that restricts
+    /// the host, selects a service, runs a command or decides how the daemon starts. It is one
+    /// validated edit: a configuration that would leave a default profile naming nothing is
+    /// refused, with the document as it was.
+    #[test]
+    fn putting_the_devices_configuration_back_moves_nothing_that_restricts_or_redirects_the_host() {
+        use crate::desktop::SleepInhibitionSetting;
+        use configuration::{
+            AutomationSelection, ControllerStartup, DeviceConfiguration, TestSuite, ValueEffect,
+        };
+
+        let mut host = ConfigurationDocument::empty();
+        host.revision = 6;
+        host.preferences.sleep_inhibition = Nullable::some(SleepInhibitionSetting::Off);
+        host.ceilings.session_limit = Nullable::some(2);
+        host.storage.origin = Nullable::some("https://storage.example".to_owned());
+        host.startup.controller = Nullable::some(ControllerStartup::Service);
+        host.automation = AutomationSelection {
+            test_suites: Nullable::some(
+                [(
+                    "unit".to_owned(),
+                    TestSuite {
+                        command: "cargo test".to_owned(),
+                        outputs: vec!["target".to_owned()],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let loaded = configuration::load(Some(configuration::contents(&host).as_bytes()));
+        assert_eq!(loaded.status.state, DocumentState::Loaded);
+
+        let mut backed_up = ConfigurationDocument::empty();
+        backed_up.preferences.sleep_inhibition = Nullable::some(SleepInhibitionSetting::BatteryToo);
+        backed_up.profiles.insert(
+            "review".to_owned(),
+            crate::hostinfo::configuration::PreferenceSet::default(),
+        );
+        backed_up.default_profile = Nullable::some("review".to_owned());
+        backed_up.descriptions.enabled = Nullable::some(true);
+        // What the backup holds that this host must keep its own of.
+        backed_up.ceilings.session_limit = Nullable::some(200);
+        backed_up.storage.origin = Nullable::some("https://elsewhere.example".to_owned());
+        backed_up.startup.controller = Nullable::some(ControllerStartup::Standalone);
+
+        let change = Change::DeviceConfiguration(Box::new(DeviceConfiguration::of(&backed_up)));
+        assert_eq!(change.key(), "device_configuration");
+        assert_eq!(change.effect(), ValueEffect::NewSessionsOnly);
+        let edited = configuration::edit(&loaded, &change).expect("a validated edit");
+        assert_eq!(edited.revision, 7);
+        let document = &edited.document;
+        assert_eq!(document.preferences, backed_up.preferences);
+        assert_eq!(document.profiles, backed_up.profiles);
+        assert_eq!(document.default_profile, backed_up.default_profile);
+        assert_eq!(document.descriptions, backed_up.descriptions);
+        assert_eq!(document.ceilings, host.ceilings, "a restriction stays");
+        assert_eq!(document.storage, host.storage, "the service stays");
+        assert_eq!(document.startup, host.startup, "the start choice stays");
+        assert_eq!(document.automation, host.automation, "the commands stay");
+        let reread = configuration::load(Some(edited.contents.as_bytes()));
+        assert_eq!(reread.document.as_ref(), Some(document));
+
+        // A default profile that names no profile is the document's own refusal, and nothing moves.
+        let mut dangling = backed_up.clone();
+        dangling.profiles.clear();
+        let refused = configuration::edit(
+            &loaded,
+            &Change::DeviceConfiguration(Box::new(DeviceConfiguration::of(&dangling))),
+        );
+        assert!(matches!(
+            refused,
+            Err(configuration::EditRefused::Invalid(_))
+        ));
+    }
+
     /// KR-REQ-25.14: the document's `automation` section is the one place a command a workflow
     /// runs is written. A suite is a name, a command and the paths it writes, each held to a rule
     /// the document is refused for breaking, and a refusal repeats none of them. The report lists

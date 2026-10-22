@@ -11,9 +11,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use kr_client::ClientError;
 use kr_client::recovery::{
-    CandidateState, FilesRestore, MemberRefusal, MemberRole, MemberVerdict, PublicationRefusal,
-    RestoreError, RestoreSource, SignInCause, SourceService, SourceSignIn, fresh_locator,
+    BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, FilesRestore,
+    MemberRefusal, MemberRole, MemberVerdict, PublicationRefusal, RecoveryError, RestoreError,
+    RestoreSource, SignInCause, SourceService, SourceSignIn, fresh_locator,
 };
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
 use kr_crypto::backup::{
@@ -31,6 +33,7 @@ use kr_protocol::archive::{
     ManifestPayload, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryKit, TrustedProducer,
     TrustedWriter,
 };
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
 
@@ -348,6 +351,11 @@ struct Scripted {
     generations: Mutex<BTreeMap<ArchiveId, BackupGenerationPublication>>,
     objects: Mutex<BTreeMap<(ArchiveId, BackupObjectId), Vec<u8>>>,
     asked: Mutex<Vec<String>>,
+    /// Where the bundle is in the collection's order: a write takes the next place.
+    place: Mutex<u64>,
+    /// Answer a request held to a checkpoint with nothing when the generation held is older, as the
+    /// real service does; a hostile one serves what it holds whatever it was asked.
+    honours_the_hold: bool,
     /// Answer every object read with no bytes, as a service that has lost the object might.
     serves_empty_ranges: bool,
     /// How many empty answers have been given, so a restore that keeps asking fails here.
@@ -366,9 +374,16 @@ impl Scripted {
             generations: Mutex::default(),
             objects: Mutex::default(),
             asked: Mutex::default(),
+            place: Mutex::new(1),
+            honours_the_hold: false,
             serves_empty_ranges: false,
             empty_answers: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    fn honouring_the_hold(mut self) -> Self {
+        self.honours_the_hold = true;
+        self
     }
 
     fn publishing(self, sealed: &Sealed) -> Self {
@@ -386,6 +401,36 @@ impl Scripted {
 
     fn asked(&self) -> Vec<String> {
         self.asked.lock().expect("asked").clone()
+    }
+
+    /// Where the bundle is now.
+    fn position(&self) -> SyncPosition {
+        let place = *self.place.lock().expect("place");
+        SyncPosition::at(
+            place,
+            kr_client::services::SyncRevision::new(id(u8::try_from(0x70 + place).expect("few"))),
+            None,
+        )
+    }
+
+    /// Replaces the bundle at the next place, as a write from another device would.
+    fn replace_bundle(&self, sealed: Vec<u8>) -> SyncPosition {
+        *self.place.lock().expect("place") += 1;
+        let mut held = self.bundle.lock().expect("bundle");
+        let at = held.as_ref().map(|(at, _)| at.clone()).expect("a bundle");
+        *held = Some((at, sealed));
+        drop(held);
+        self.position()
+    }
+
+    /// The sealed bundle the service holds.
+    fn sealed_bundle(&self) -> Vec<u8> {
+        self.bundle
+            .lock()
+            .expect("bundle")
+            .as_ref()
+            .map(|(_, sealed)| sealed.clone())
+            .expect("a bundle")
     }
 
     fn object_reads(&self) -> usize {
@@ -416,11 +461,7 @@ impl RestoreSource for Scripted {
             let held = self.bundle.lock().expect("bundle").clone();
             Ok(match held {
                 Some((at, ciphertext)) if self.anywhere || at == locator => SyncFetched::Held {
-                    position: SyncPosition::at(
-                        1,
-                        kr_client::services::SyncRevision::new(id(0x77)),
-                        None,
-                    ),
+                    position: self.position(),
                     ciphertext,
                 },
                 _ => SyncFetched::Absent { recovery: None },
@@ -443,12 +484,18 @@ impl RestoreSource for Scripted {
             }
         ));
         Box::pin(async move {
-            Ok(self
+            let held = self
                 .generations
                 .lock()
                 .expect("generations")
                 .get(&archive_id)
-                .cloned())
+                .cloned();
+            Ok(held.filter(|held| {
+                !(self.honours_the_hold
+                    && checkpoint.is_some_and(|checkpoint| {
+                        held.payload.descriptor.backup_generation < checkpoint.backup_generation
+                    }))
+            }))
         })
     }
 
@@ -837,22 +884,73 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
     ));
     assert_eq!(source.object_reads(), 0);
 
-    // The honest service holds nothing as new as the checkpoint: the restore stops there, and
-    // does not look for an older generation.
+    // The honest service holds nothing at all: asked held to the checkpoint and then without it,
+    // it answers nothing both times, and the restore stops, having read no object.
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape())));
     assert!(matches!(
         restore(&world, &source, None).await.expect_err("stopped"),
         RestoreError::NothingAsNewAsTheCheckpoint { checkpoint: 5 }
     ));
-    assert_eq!(
-        source
-            .asked()
-            .iter()
-            .filter(|call| call.starts_with("generation"))
-            .count(),
-        1,
-        "the restore never asks again without the checkpoint"
+    assert_eq!(source.object_reads(), 0);
+
+    // The honest service holds only an older generation: held to the checkpoint it answers
+    // nothing, and the restore asks once more, without it, to say what the service does hold. That
+    // is verified before it is named, and no object is read.
+    let source = Arc::new(
+        Scripted::serving(&world, world.bundle(&shape()))
+            .publishing(&older)
+            .honouring_the_hold(),
     );
+    assert!(matches!(
+        restore(&world, &source, None).await.expect_err("refused"),
+        RestoreError::OlderThanTheCheckpoint {
+            checkpoint: 5,
+            held: 3
+        }
+    ));
+    assert_eq!(source.object_reads(), 0);
+    // Naming that generation restores it, and the standing says it was named.
+    let prepared = FilesRestore::prepare(
+        world.kit(),
+        Arc::clone(&source) as Arc<dyn RestoreSource>,
+        None,
+        Some(BackupGeneration::new(3)),
+    )
+    .await
+    .expect("the named generation restores");
+    assert_eq!(prepared.plan().generation.get(), 3);
+    // A generation the service does not hold is not accepted, and the refusal says what it holds.
+    assert!(matches!(
+        FilesRestore::prepare(
+            world.kit(),
+            Arc::clone(&source) as Arc<dyn RestoreSource>,
+            None,
+            Some(BackupGeneration::new(4)),
+        )
+        .await
+        .expect_err("refused"),
+        RestoreError::OlderThanTheCheckpoint {
+            checkpoint: 5,
+            held: 3
+        }
+    ));
+    // With no checkpoint there is nothing to accept an older generation past.
+    let source = Arc::new(
+        Scripted::serving(&world, world.bundle(&Shape::default()))
+            .publishing(&older)
+            .honouring_the_hold(),
+    );
+    assert!(matches!(
+        FilesRestore::prepare(
+            world.kit(),
+            Arc::clone(&source) as Arc<dyn RestoreSource>,
+            None,
+            Some(BackupGeneration::new(3)),
+        )
+        .await
+        .expect_err("refused"),
+        RestoreError::NoCheckpointToAcceptPast
+    ));
 
     // With no checkpoint at all, an archive the service holds restores, and says nothing is
     // proven; and one it does not hold is a different stop.
@@ -866,6 +964,197 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
         restore(&world, &source, None).await.expect_err("stopped"),
         RestoreError::NoGeneration
     ));
+}
+
+/// A service that takes writes of the bundle by compare-and-swap, the way the real one does, with
+/// one thing a test can script: a write that lands from somewhere else just before the restore's
+/// own, or an answer to the restore's own that never arrives.
+#[derive(Debug)]
+struct Bundle {
+    source: Arc<Scripted>,
+    /// The sealed bundle another device writes just before the next write meets the service.
+    meanwhile: Mutex<Option<Vec<u8>>>,
+    /// Whether the next write that applies is answered at all.
+    loses_the_answer: Mutex<bool>,
+    /// How many writes met the service.
+    writes: Mutex<usize>,
+}
+
+impl Bundle {
+    fn over(source: &Arc<Scripted>) -> Self {
+        Self {
+            source: Arc::clone(source),
+            meanwhile: Mutex::new(None),
+            loses_the_answer: Mutex::new(false),
+            writes: Mutex::new(0),
+        }
+    }
+}
+
+impl BundleWriter for Bundle {
+    fn write<'a>(&'a self, write: BundleWrite<'a>) -> ServiceFuture<'a, BundleWritten> {
+        Box::pin(async move {
+            *self.writes.lock().expect("writes") += 1;
+            if let Some(other) = self.meanwhile.lock().expect("meanwhile").take() {
+                self.source.replace_bundle(other);
+            }
+            if write.expected != self.source.position() {
+                return Ok(BundleWritten::Conflict);
+            }
+            let placed = self.source.replace_bundle(write.sealed.to_vec());
+            if std::mem::take(&mut *self.loses_the_answer.lock().expect("loses")) {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    "the answer did not arrive".to_owned(),
+                )));
+            }
+            Ok(BundleWritten::Written(placed))
+        })
+    }
+}
+
+/// The bundle the service holds, opened under the world's seed.
+fn bundle_held(world: &World, source: &Scripted) -> RecoveryBundle {
+    let key = world
+        .seed
+        .bundle_key_for(&kr_protocol::archive::RecoveryContext {
+            service_origin: ORIGIN.to_owned(),
+            bundle_locator: world.locator.clone(),
+        })
+        .expect("a bundle key");
+    kr_crypto::archive::decrypt_recovery_bundle(&key, &source.sealed_bundle())
+        .expect("the bundle opens")
+}
+
+/// KR-REQ-24.16, 20.12: the checkpoint a restore records is written on what the bundle holds when
+/// the write is made, so a writer that another device added between the restore's read and its
+/// write is still in the bundle afterwards, and a write whose answer never came is neither done
+/// twice nor taken for undone.
+#[tokio::test]
+async fn recording_the_checkpoint_keeps_what_another_device_wrote_to_the_bundle_meanwhile() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let before = bundle_held(&world, &source);
+    assert!(before.checkpoints.is_empty());
+
+    // Another device enrols a writer after the restore read the bundle.
+    let added = TrustedWriter {
+        writer_key_id: AuthorisationKeyPair::generate().expect("a key").key_id(),
+        signing_key: *AuthorisationKeyPair::generate().expect("a key").public(),
+        enrolled_at_ms: TimestampMs::new(1_500),
+    };
+    let other = world.bundle(&Shape {
+        more_writers: vec![added.clone()],
+        ..Shape::default()
+    });
+    let bundle = Bundle::over(&source);
+    *bundle.meanwhile.lock().expect("meanwhile") = Some(other);
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("recorded");
+    assert!(matches!(recorded, CheckpointRecorded::Written { .. }));
+    assert_eq!(
+        *bundle.writes.lock().expect("writes"),
+        2,
+        "a conflict, then the write"
+    );
+
+    let after = bundle_held(&world, &source);
+    assert!(
+        after.trusted_writers.contains(&added),
+        "the writer another device added is still trusted"
+    );
+    assert_eq!(after.trusted_producers, before.trusted_producers);
+    assert_eq!(after.collections, before.collections);
+    assert_eq!(
+        after.checkpoints.iter().cloned().collect::<Vec<_>>(),
+        [ArchiveCheckpoint {
+            verified_at_ms: TimestampMs::new(9_000),
+            ..checkpoint_of(&sealed)
+        }]
+    );
+    assert_eq!(after.revision.get(), before.revision.get() + 1);
+
+    // A write that landed and was not answered: the next read finds the checkpoint recorded, and
+    // nothing is written a second time.
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    *bundle.loses_the_answer.lock().expect("loses") = true;
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("settled by reading");
+    assert!(matches!(recorded, CheckpointRecorded::AlreadyThere));
+    assert_eq!(*bundle.writes.lock().expect("writes"), 1);
+    assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+}
+
+/// KR-REQ-24.16: a checkpoint is never lowered and never recorded over another manifest of the
+/// same generation. A restore that another restore overtakes finds the bundle already past it.
+#[tokio::test]
+async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_its_generation() {
+    let world = World::new();
+    let members = honest_members();
+    let sealed = world.seal(4, &members);
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+
+    // Another restore recorded a newer generation of the archive after this one read the bundle.
+    let newer = world.seal(6, &members);
+    let bundle = Bundle::over(&source);
+    *bundle.meanwhile.lock().expect("meanwhile") = Some(world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&newer)),
+        ..Shape::default()
+    }));
+    // The bundle is changed once the restore has read it, so that the restore's write is the first
+    // thing to meet the newer bundle; it reads again and finds nothing to record.
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect("nothing to record");
+    assert!(matches!(recorded, CheckpointRecorded::AlreadyThere));
+    let held = bundle_held(&world, &source);
+    assert_eq!(
+        held.checkpoints.iter().cloned().collect::<Vec<_>>(),
+        [checkpoint_of(&newer)],
+        "the higher checkpoint stays"
+    );
+
+    // Another restore recorded this very generation with another encrypted manifest.
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let second = world.seal(4, &[("host/configuration.json", b"{}".to_vec())]);
+    let bundle = Bundle::over(&source);
+    *bundle.meanwhile.lock().expect("meanwhile") = Some(world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&second)),
+        ..Shape::default()
+    }));
+    let refused = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await
+        .expect_err("a disagreement");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(ref cause)
+            if matches!(**cause, RecoveryError::CheckpointDisagrees { generation: 4 })
+    ));
+    assert_eq!(
+        bundle_held(&world, &source)
+            .checkpoints
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [checkpoint_of(&second)],
+        "the bundle is left as the other restore wrote it"
+    );
 }
 
 /// KR-REQ-24.16: the archive that is opened is the one whose publication was verified. Another
