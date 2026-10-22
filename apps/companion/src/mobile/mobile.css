@@ -879,8 +879,17 @@
   align-items: center;
 }
 
+/* With nothing to say the region takes no room but stays in the accessibility tree, so a screen
+   reader that watches it hears the words when they arrive: only its sight is taken away. */
 .m-camera-notice:empty {
-  display: none;
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .m-camera-notice {

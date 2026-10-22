@@ -142,8 +142,45 @@ test.describe('the page follows the system text size', () => {
 // every control can be reached and pressed, and the two bars keep room for what they are the bars
 // of: they hold their size at one and a half times the base size, as the platforms' own bars do.
 test.describe('at the largest text size on a screen 320 points wide', () => {
+  /** A request the host asks this phone to confirm, with the longest words a ceremony's button has. */
+  const toConfirm = (ceremony: 'biometric' | 'none') => async (page: Page) => {
+    await page.evaluate((kind) => {
+      window.krTestHost?.setConfirmations({
+        ceremony: kind,
+        requests: [
+          {
+            reference: 'request-1',
+            host_name: 'studio-with-a-long-name-that-has-to-wrap',
+            title: 'Add a device',
+            detail: 'Confirm adding Pixel 8 (Android) to studio, which may view sessions for 60 minutes.',
+            value: 'f3c1 46fd',
+            facts: [],
+            notice: null,
+            statement: null,
+            reading: null,
+            expires_at_ms: Date.now() + 600_000,
+            checkable: true
+          }
+        ]
+      })
+    }, ceremony)
+    await expect(page.getByTestId('confirmation-row')).toBeVisible()
+    // The message that announces the request passes by itself, and the controls are counted once
+    // it has gone: one that leaves while they are being tried is not one that was missed.
+    const toast = page.locator('.toast')
+    await expect(toast).toContainText('needs your confirmation')
+    await toast.getByRole('button', { name: 'Dismiss' }).click()
+    await expect(toast).toHaveCount(0)
+    expect(
+      await overrunning(page, '[data-testid="confirmations"]'),
+      'lines of the request that run past the screen or their box'
+    ).toEqual([])
+  }
+
   const SCREENS: readonly (readonly [string, string, ((page: Page) => Promise<void>) | null])[] = [
     ['the attention inbox', '&tab=attention', null],
+    ['the attention inbox with a request a ceremony confirms', '&tab=attention', toConfirm('biometric')],
+    ['the attention inbox with a request this phone cannot confirm', '&tab=attention', toConfirm('none')],
     ['the session list', '&tab=sessions', null],
     ['the hosts', '&tab=hosts', null],
     ['the hosts when the pairing records could not be opened', '&tab=hosts&pairing_records=unavailable', null],
