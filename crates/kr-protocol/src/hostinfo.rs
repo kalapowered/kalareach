@@ -3862,6 +3862,86 @@ pub mod configuration {
         problems
     }
 
+    /// The device's own configuration: its settings, its profiles and its layout, as a backup
+    /// carries them and a restore may put them back.
+    ///
+    /// It is the sections of the document that say how this host behaves for its owner, and none
+    /// that say what it may do or where it reaches. The ceilings, the services it selects (network,
+    /// voice, storage, authority, mailbox, relay), the commands its workflows run, the references
+    /// to its secrets and how its control daemon is started stay as the host has them: a restore
+    /// from a copy made earlier does not lift a restriction, point the host at another service or
+    /// install a command, and the start choice also writes what the service manager holds.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct DeviceConfiguration {
+        /// The preferences that apply when no profile is selected.
+        pub preferences: PreferenceSet,
+        /// The named profiles.
+        pub profiles: BTreeMap<String, PreferenceSet>,
+        /// The profile selected when a request and the allowlist name none.
+        pub default_profile: Nullable<String>,
+        /// The owner's settings for session descriptions.
+        pub descriptions: DescriptionsSelection,
+        /// What was written down for the agents of each package.
+        pub agents: BTreeMap<String, AgentChoice>,
+    }
+
+    impl DeviceConfiguration {
+        /// The device's own configuration a document holds.
+        #[must_use]
+        pub fn of(document: &ConfigurationDocument) -> Self {
+            Self {
+                preferences: document.preferences.clone(),
+                profiles: document.profiles.clone(),
+                default_profile: document.default_profile.clone(),
+                descriptions: document.descriptions.clone(),
+                agents: document.agents.clone(),
+            }
+        }
+
+        /// The parts of the configuration in which `self` differs from `other`, each in this
+        /// program's own words and none in the document's: a profile's name and a variable's name
+        /// are the owner's text and are not repeated.
+        #[must_use]
+        pub fn differences(&self, other: &Self) -> Vec<&'static str> {
+            let mut parts = Vec::new();
+            parts.extend(preference_differences(
+                &self.preferences,
+                &other.preferences,
+            ));
+            if self.profiles != other.profiles {
+                parts.push("the named profiles");
+            }
+            if self.default_profile != other.default_profile {
+                parts.push("the default profile");
+            }
+            if self.descriptions != other.descriptions {
+                parts.push("the description settings");
+            }
+            if self.agents != other.agents {
+                parts.push("the agent choices");
+            }
+            parts
+        }
+    }
+
+    /// The preferences in which two sets differ.
+    fn preference_differences(ours: &PreferenceSet, theirs: &PreferenceSet) -> Vec<&'static str> {
+        let mut parts = Vec::new();
+        if ours.sleep_inhibition != theirs.sleep_inhibition {
+            parts.push("the sleep setting");
+        }
+        if ours.worker_profile != theirs.worker_profile {
+            parts.push("the profile sessions are created in");
+        }
+        if ours.command_integrations != theirs.command_integrations {
+            parts.push("the packages whose command integration applies");
+        }
+        if ours.environment_additions != theirs.environment_additions {
+            parts.push("the variables a session is given");
+        }
+        parts
+    }
+
     /// One change to a configuration document.
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Change {
@@ -3897,6 +3977,12 @@ pub mod configuration {
             /// Whether inference may run while the host is on battery.
             on_battery: Option<bool>,
         },
+        /// Put the device's own configuration back, from a backup.
+        ///
+        /// Every section of [`DeviceConfiguration`] becomes what it names, and nothing else in the
+        /// document moves: the ceilings, the services it selects, the commands its workflows run,
+        /// the secret references and the start choice are the host's own.
+        DeviceConfiguration(Box<DeviceConfiguration>),
     }
 
     impl Change {
@@ -3912,6 +3998,7 @@ pub mod configuration {
                 Self::ControllerStartup(_) => STARTUP_CONTROLLER.key,
                 Self::CommandIntegration { .. } => COMMAND_INTEGRATIONS.key,
                 Self::Descriptions { .. } => "descriptions",
+                Self::DeviceConfiguration(_) => "device_configuration",
             }
         }
 
@@ -3924,9 +4011,11 @@ pub mod configuration {
                 | Self::GrantRights(_)
                 | Self::Enrolment(_)
                 | Self::Descriptions { .. } => ValueEffect::Immediately,
-                Self::WorkerProfile(_) | Self::CommandIntegration { .. } => {
-                    ValueEffect::NewSessionsOnly
-                }
+                // Each part takes effect as it does alone: the descriptions at once, the profile and
+                // the integrations for the sessions created afterwards.
+                Self::WorkerProfile(_)
+                | Self::CommandIntegration { .. }
+                | Self::DeviceConfiguration(_) => ValueEffect::NewSessionsOnly,
                 Self::ControllerStartup(_) => Selection::EFFECT,
             }
         }
@@ -4136,6 +4225,20 @@ pub mod configuration {
                 if let Some(on_battery) = on_battery {
                     document.descriptions.on_battery = Nullable::some(*on_battery);
                 }
+            }
+            Change::DeviceConfiguration(device) => {
+                let DeviceConfiguration {
+                    preferences,
+                    profiles,
+                    default_profile,
+                    descriptions,
+                    agents,
+                } = device.as_ref().clone();
+                document.preferences = preferences;
+                document.profiles = profiles;
+                document.default_profile = default_profile;
+                document.descriptions = descriptions;
+                document.agents = agents;
             }
             Change::CommandIntegration { plugin_id, enabled } => {
                 // One package at a time, in the host's own list, which stays sorted and names each

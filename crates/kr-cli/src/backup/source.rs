@@ -15,11 +15,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::error::ClientError;
-use kr_client::recovery::{RestoreSource, SignInCause, SourceService, SourceSignIn};
+use kr_client::recovery::{
+    BundleWrite, BundleWriter, BundleWritten, RestoreSource, SignInCause, SourceService,
+    SourceSignIn,
+};
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition, SyncRecoveryId, SyncRevision};
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
 use kr_protocol::archive::{ArchiveCheckpoint, BackupGenerationPublication};
+use kr_protocol::backup_bundle::{
+    BackupBundlePlace, BackupBundleWriteParams, BackupBundleWriteResult,
+};
 use kr_protocol::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupObjectId};
@@ -219,5 +225,84 @@ impl RestoreSource for DaemonSource {
                 _ => Err(contrary()),
             }
         })
+    }
+}
+
+/// The control daemon's relay, as the place a restore records the checkpoint it verified.
+///
+/// Each write opens a connection of its own: the connections of a restore have waited for as long
+/// as the files took to write, and the daemon ends one that stops reading.
+pub struct DaemonBundleWriter {
+    paths: kr_ipc::paths::HostPaths,
+    selector: crate::cli::EnvironmentSelector,
+}
+
+kr_client::debug_as_name!(DaemonBundleWriter);
+
+impl DaemonBundleWriter {
+    /// A writer that reaches the environment `environment` names under `paths`, or this
+    /// installation's own.
+    #[must_use]
+    pub const fn new(paths: kr_ipc::paths::HostPaths, environment: Option<String>) -> Self {
+        Self {
+            paths,
+            selector: crate::cli::EnvironmentSelector { environment },
+        }
+    }
+}
+
+impl BundleWriter for DaemonBundleWriter {
+    fn write<'a>(&'a self, write: BundleWrite<'a>) -> ServiceFuture<'a, BundleWritten> {
+        Box::pin(async move {
+            let locator: Uuid = write.locator.parse().map_err(|_| {
+                ClientError::Host(kr_client::error::refusal(
+                    ErrorCode::InvalidArgument,
+                    Shown::said("the bundle locator is not an identifier"),
+                ))
+            })?;
+            let place = |position: SyncPosition| BackupBundlePlace {
+                write_sequence: U64::new(position.write_sequence),
+                revision: Nullable(position.revision.0.map(|revision| revision.get())),
+                recovery: Nullable(position.recovery().map(|recovery| recovery.get())),
+            };
+            let params = BackupBundleWriteParams {
+                locator,
+                expected: place(write.expected),
+                request_id: write.request_id,
+                signed_at_ms: kr_protocol::scalars::TimestampMs::new(write.signed_at_ms),
+                sealed_bundle: kr_protocol::scalars::Bytes::new(write.sealed.to_vec()),
+            };
+            let mut daemon = Daemon::open(&self.paths, &self.selector)
+                .await
+                .map_err(from_command)?;
+            let answer = daemon
+                .mutate::<_, BackupBundleWriteResult>(Method::BackupBundleWrite, &params)
+                .await
+                .map_err(from_command)?;
+            Ok(match answer {
+                BackupBundleWriteResult::Written { place } => {
+                    BundleWritten::Written(position(place))
+                }
+                BackupBundleWriteResult::Conflict { .. } => BundleWritten::Conflict,
+                BackupBundleWriteResult::Wait {
+                    retry_after_seconds,
+                } => BundleWritten::Wait {
+                    seconds: retry_after_seconds.get(),
+                },
+            })
+        })
+    }
+}
+
+/// Where the daemon says a write left the bundle, as the client library names a place.
+fn position(place: BackupBundlePlace) -> SyncPosition {
+    let recovery = place.recovery.0.map(SyncRecoveryId::new);
+    match place.revision.0 {
+        Some(revision) => SyncPosition::at(
+            place.write_sequence.get(),
+            SyncRevision::new(revision),
+            recovery,
+        ),
+        None => SyncPosition::removed_at(place.write_sequence.get(), recovery),
     }
 }
