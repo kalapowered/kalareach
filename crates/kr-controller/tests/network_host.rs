@@ -131,6 +131,79 @@ async fn the_diagnostics_answer_both_doors_and_carry_no_credential_to_a_device()
     host.stop().await;
 }
 
+/// KR-REQ-26.43: what the host measured about itself is read by its owner and by a paired device
+/// that manages the host, and a device that holds only the right to view a session is answered
+/// with none. The counts name a bundled connector that failed, which is a fact about the host and
+/// not about any session, so a grant over one session does not reach them; the rest of the
+/// diagnostics are the same for it as for the manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_43_the_hosts_metrics_reach_a_paired_device_only_under_host_management() {
+    use kr_protocol::metrics::{Adapter, MetricOutcome};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    host.controller()
+        .metrics()
+        .adapter_failed(Adapter::Codex, MetricOutcome::Unavailable);
+    let (_manager, managing) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::HostManage, ActionRight::SessionView],
+    )
+    .await;
+    let (_viewer, viewing) =
+        net_support::paired_device(&host, &owner, &[ActionRight::SessionView]).await;
+    let mut local = host.client().await;
+
+    let at_the_machine: HostDoctorResult = typed(
+        &local
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    );
+    let by_the_manager: HostDoctorResult = typed(
+        &managing
+            .read(Method::HostDoctor, &())
+            .await
+            .expect("host.doctor is served to a device that manages the host"),
+    );
+    let by_the_viewer: HostDoctorResult = typed(
+        &viewing
+            .read(Method::HostDoctor, &())
+            .await
+            .expect("host.doctor is served to a device that views a session"),
+    );
+
+    for (who, answer) in [
+        ("the owner at the machine", &at_the_machine),
+        ("a device that manages the host", &by_the_manager),
+    ] {
+        assert_eq!(answer.metrics.adapter_failure.len(), 1, "{who}: {answer:?}");
+        let series = &answer.metrics.adapter_failure[0];
+        assert_eq!(series.adapter, Adapter::Codex, "{who}");
+        assert_eq!(series.outcome, MetricOutcome::Unavailable, "{who}");
+        assert_eq!(series.count.get(), 1, "{who}");
+    }
+    assert!(
+        by_the_viewer.metrics.is_empty(),
+        "a device that holds only session.view read the host's metrics: {by_the_viewer:?}"
+    );
+    // The metrics are all that is left out for it: the checks are the manager's own.
+    let verdicts = |result: &HostDoctorResult| {
+        result
+            .checks
+            .iter()
+            .map(|check| (check.id().to_owned(), check.status))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(verdicts(&by_the_viewer), verdicts(&by_the_manager));
+
+    managing.close();
+    viewing.close();
+    host.stop().await;
+}
+
 /// KR-REQ-23.33: the skill setup group needs the host owner at the machine. A paired device whose
 /// grant manages the host is refused `agent_tools.install`, `agent_tools.status` and
 /// `agent_tools.remove` through the daemon, and the refused installation writes nothing: no action
