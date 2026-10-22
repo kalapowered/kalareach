@@ -27,6 +27,9 @@ pub const fn fault_of(kind: DiagnosticKind) -> Option<Fault> {
         DiagnosticKind::MalformedUtf8 => Some(Fault::InvalidEncoding),
         // A raw eight-bit control is a valid way to write the control the profile handles.
         DiagnosticKind::RawC1Control
+        // A well-formed sequence whose parameter named more than the grid has, as a program
+        // that moves the cursor a screen's width writes at every prompt.
+        | DiagnosticKind::ParameterReduced
         // The profile has no raster graphics, and says so when a program draws one: a program
         // using a feature this terminal lacks, which is not a malformed sequence.
         | DiagnosticKind::ImageSequenceDisabled

@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 pub enum DiagnosticKind {
     /// A sequence with no class in this profile revision was consumed.
     UnclassifiedSequence,
+    /// A parameter larger than the grid can act on was reduced to what it can, so the sequence was
+    /// understood and the screen it drew is the one a physical terminal would show.
+    ParameterReduced,
     /// A control string passed its bound and was discarded whole.
     OversizedControlString,
     /// A control string was abandoned before its terminator.
@@ -51,6 +54,7 @@ impl DiagnosticKind {
     pub const fn id(self) -> &'static str {
         match self {
             Self::UnclassifiedSequence => "unclassified-sequence",
+            Self::ParameterReduced => "parameter-reduced",
             Self::OversizedControlString => "oversized-control-string",
             Self::AbandonedControlString => "abandoned-control-string",
             Self::MalformedUtf8 => "malformed-utf8",
