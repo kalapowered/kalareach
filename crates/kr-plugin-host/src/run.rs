@@ -22,7 +22,7 @@ use kr_ipc::framed::split;
 use kr_ipc::paths::HostPaths;
 use kr_plugin_runtime::service::host::{HostConfig, PluginHost};
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult, host_endpoint};
-use kr_plugin_service::protocol::RendezvousAccepted;
+use kr_plugin_service::protocol::{HostProtocol, RendezvousAccepted};
 use kr_protocol::frame::StreamKind;
 
 use crate::options::Options;
@@ -42,7 +42,7 @@ pub async fn run(options: Options) -> LaunchResult<()> {
     environment.create()?;
 
     let identity = HostIdentity::generate(options.environment_id())?;
-    let endpoint = host_endpoint(&environment)?;
+    let endpoint = host_endpoint(&environment, &HostProtocol::THIS)?;
 
     // The endpoint is the host's to own, and a previous incarnation's socket file may still be
     // sitting there. Binding is what proves this process holds it, and holding the listener from

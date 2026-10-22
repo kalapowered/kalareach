@@ -61,8 +61,8 @@ use kr_protocol::scalars::{AuthorisationKey, Nonce256};
 use kr_protocol::worker::ReservationId;
 
 use crate::protocol::{
-    self, HostDescriptor, HostRendezvous, HostVerifyProof, RENDEZVOUS_DOMAIN, RendezvousAccepted,
-    VERIFY_DOMAIN,
+    self, HostDescriptor, HostProtocol, HostRendezvous, HostVerifyProof, RENDEZVOUS_DOMAIN,
+    RendezvousAccepted, VERIFY_DOMAIN,
 };
 
 /// The largest descriptor this host writes or reads.
@@ -78,9 +78,11 @@ const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
 /// the check to the rename. Each attempt takes a number, and a publication that finds a newer
 /// number when its turn comes writes nothing and says so. Two launches for one environment
 /// therefore publish in order, and the older one never wins.
-static PUBLICATIONS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<EnvironmentId, Arc<std::sync::Mutex<u64>>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static PUBLICATIONS: std::sync::LazyLock<std::sync::Mutex<Turns>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Turns::new()));
+
+/// The publication turns, by environment and descriptor file.
+type Turns = std::collections::HashMap<(EnvironmentId, &'static str), Arc<std::sync::Mutex<u64>>>;
 
 /// The source of publication numbers, which are never reused inside a process.
 static NEXT_PUBLICATION: AtomicU64 = AtomicU64::new(1);
@@ -109,14 +111,20 @@ impl Drop for Waiting {
     }
 }
 
-/// Returns one environment's publication turn.
-fn publication_turn(environment_id: EnvironmentId) -> Arc<std::sync::Mutex<u64>> {
+/// Returns the publication turn of one environment's descriptor of one protocol.
+///
+/// The turn belongs to the file and not to the environment alone: two protocols publish different
+/// files, and a publication that took its number first must not make the other one stale.
+fn publication_turn(
+    environment_id: EnvironmentId,
+    protocol: &HostProtocol,
+) -> Arc<std::sync::Mutex<u64>> {
     PUBLICATIONS.lock().map_or_else(
         |_poisoned| Arc::new(std::sync::Mutex::new(0)),
-        |mut environments| {
+        |mut turns| {
             Arc::clone(
-                environments
-                    .entry(environment_id)
+                turns
+                    .entry((environment_id, protocol.descriptor))
                     .or_insert_with(|| Arc::new(std::sync::Mutex::new(0))),
             )
         },
@@ -137,6 +145,7 @@ fn publish_in_turn(
     turn: &std::sync::Mutex<u64>,
     abandoned: &core::sync::atomic::AtomicBool,
     environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
     descriptor: &HostDescriptor,
 ) -> LaunchResult<()> {
     let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -156,7 +165,7 @@ fn publish_in_turn(
         });
     }
     *newest = attempt;
-    publish_descriptor(environment, descriptor)
+    publish_descriptor(environment, protocol, descriptor)
 }
 
 /// What can go wrong starting or verifying a plugin host.
@@ -665,13 +674,16 @@ pub fn fresh_challenge() -> LaunchResult<Nonce256> {
     Ok(Nonce256::from_bytes(*secret.expose()))
 }
 
-/// Returns the endpoint a plugin host serves workers on.
+/// Returns the endpoint a plugin host of `protocol` serves workers on.
 ///
 /// # Errors
 ///
 /// Returns [`LaunchError::Endpoint`] when the path is too long for a socket address.
-pub fn host_endpoint(environment: &EnvironmentPaths) -> LaunchResult<Endpoint> {
-    endpoint_in(environment, protocol::ENDPOINT_NAME)
+pub fn host_endpoint(
+    environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
+) -> LaunchResult<Endpoint> {
+    endpoint_in(environment, protocol.endpoint)
 }
 
 /// Returns the endpoint a launcher takes one reservation's rendezvous on.
@@ -707,10 +719,10 @@ fn endpoint_in(environment: &EnvironmentPaths, name: &str) -> LaunchResult<Endpo
     }
 }
 
-/// Returns where a plugin-host descriptor is published.
+/// Returns where the descriptor of a plugin host of `protocol` is published.
 #[must_use]
-pub fn descriptor_path(environment: &EnvironmentPaths) -> PathBuf {
-    environment.runtime_dir().join(protocol::DESCRIPTOR_FILE)
+pub fn descriptor_path(environment: &EnvironmentPaths, protocol: &HostProtocol) -> PathBuf {
+    environment.runtime_dir().join(protocol.descriptor)
 }
 
 /// Publishes a descriptor, atomically and owner-only.
@@ -720,12 +732,21 @@ pub fn descriptor_path(environment: &EnvironmentPaths) -> PathBuf {
 /// Returns [`LaunchError::Endpoint`] when the file cannot be written.
 pub fn publish_descriptor(
     environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
     descriptor: &HostDescriptor,
 ) -> LaunchResult<()> {
+    if descriptor.protocol != protocol.name {
+        return Err(LaunchError::Refused {
+            detail: format!(
+                "a descriptor of protocol {} is not published as one of {}",
+                descriptor.protocol, protocol.name
+            ),
+        });
+    }
     let document = serde_json::to_vec(descriptor).map_err(|error| LaunchError::Refused {
         detail: format!("the descriptor could not be written: {error}"),
     })?;
-    kr_ipc::paths::write_owner_only_file(&descriptor_path(environment), &document)?;
+    kr_ipc::paths::write_owner_only_file(&descriptor_path(environment, protocol), &document)?;
     Ok(())
 }
 
@@ -737,8 +758,11 @@ pub fn publish_descriptor(
 ///
 /// Returns [`LaunchError::Endpoint`] when the file cannot be read, or [`LaunchError::Refused`] when
 /// it is not a descriptor this host wrote.
-pub fn read_descriptor(environment: &EnvironmentPaths) -> LaunchResult<Option<HostDescriptor>> {
-    let path = descriptor_path(environment);
+pub fn read_descriptor(
+    environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
+) -> LaunchResult<Option<HostDescriptor>> {
+    let path = descriptor_path(environment, protocol);
     let Some(bytes) = kr_ipc::paths::read_owner_only_file(&path, MAX_DESCRIPTOR_BYTES)? else {
         return Ok(None);
     };
@@ -749,12 +773,11 @@ pub fn read_descriptor(environment: &EnvironmentPaths) -> LaunchResult<Option<Ho
                 path.display()
             ),
         })?;
-    if descriptor.protocol != kr_protocol::retained::PLUGIN_HOST_PROTOCOL {
+    if descriptor.protocol != protocol.name {
         return Err(LaunchError::Refused {
             detail: format!(
-                "the descriptor names protocol {}, and this host speaks {}",
-                descriptor.protocol,
-                kr_protocol::retained::PLUGIN_HOST_PROTOCOL
+                "the descriptor names protocol {}, and this one is for {}",
+                descriptor.protocol, protocol.name
             ),
         });
     }
@@ -771,8 +794,11 @@ pub fn read_descriptor(environment: &EnvironmentPaths) -> LaunchResult<Option<Ho
 /// # Errors
 ///
 /// Returns [`LaunchError::Refused`] when a present descriptor cannot be removed.
-pub fn retire_descriptor(environment: &EnvironmentPaths) -> LaunchResult<()> {
-    match std::fs::remove_file(descriptor_path(environment)) {
+pub fn retire_descriptor(
+    environment: &EnvironmentPaths,
+    protocol: &HostProtocol,
+) -> LaunchResult<()> {
+    match std::fs::remove_file(descriptor_path(environment, protocol)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(LaunchError::Refused {
@@ -858,6 +884,7 @@ fn fence(reservation_id: ReservationId, listener: Listener) -> HostFence {
 pub struct HostReservation {
     reservation_id: ReservationId,
     environment_id: EnvironmentId,
+    protocol: HostProtocol,
     listener: Listener,
     endpoint: Endpoint,
 }
@@ -873,18 +900,19 @@ impl core::fmt::Debug for HostReservation {
 }
 
 impl HostReservation {
-    /// Reserves a launch and binds the rendezvous endpoint.
+    /// Reserves a launch of a host of `protocol` and binds the rendezvous endpoint.
     ///
     /// # Errors
     ///
     /// Returns [`LaunchError::Endpoint`] when the endpoint cannot be bound.
-    pub fn open(environment: &EnvironmentPaths) -> LaunchResult<Self> {
+    pub fn open(environment: &EnvironmentPaths, protocol: HostProtocol) -> LaunchResult<Self> {
         let reservation_id = ReservationId::new(kr_ipc::new_uuid());
         let endpoint = rendezvous_endpoint(environment, reservation_id)?;
         let listener = Listener::bind(&endpoint)?;
         Ok(Self {
             reservation_id,
             environment_id: environment.environment_id(),
+            protocol,
             listener,
             endpoint,
         })
@@ -1019,7 +1047,7 @@ impl HostReservation {
                     // finishes. So it is fenced rather than merely bounded -- it writes nothing once
                     // a later launch has taken the environment's publication -- and the wait for it
                     // is inside the deadline like every other stage.
-                    let turn = publication_turn(self.environment_id);
+                    let turn = publication_turn(self.environment_id, &self.protocol);
                     // Set when this acceptance stops waiting, however it stops: its own deadline,
                     // or a caller that dropped it. A publication still queued behind somebody
                     // else's then publishes nothing, because a descriptor for a startup nobody is
@@ -1032,10 +1060,11 @@ impl HostReservation {
                     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let publishing = {
                         let paths = environment.clone();
+                        let protocol = self.protocol;
                         let descriptor = descriptor.clone();
                         let abandoned = Arc::clone(&abandoned);
                         tokio::task::spawn_blocking(move || {
-                            publish_in_turn(&turn, &abandoned, &paths, &descriptor)
+                            publish_in_turn(&turn, &abandoned, &paths, &protocol, &descriptor)
                         })
                     };
                     match tokio::time::timeout(left, publishing).await {
@@ -1150,7 +1179,7 @@ impl HostReservation {
                     .to_owned(),
             });
         }
-        let expected = host_endpoint(environment)?.as_text();
+        let expected = host_endpoint(environment, &self.protocol)?.as_text();
         if claim.endpoint != expected {
             return Err(LaunchError::Refused {
                 detail: format!(
@@ -1161,7 +1190,7 @@ impl HostReservation {
         }
         Ok((
             HostDescriptor {
-                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                protocol: self.protocol.name.to_owned(),
                 environment_id: claim.environment_id,
                 reservation_id: claim.reservation_id,
                 endpoint: claim.endpoint,
@@ -1186,6 +1215,7 @@ impl HostReservation {
 /// Returns the launch, rendezvous or verification failure.
 pub async fn start(
     environment: &EnvironmentPaths,
+    protocol: HostProtocol,
     program: impl Into<PathBuf>,
     packages: &Path,
     supervisor: &Arc<dyn HostSupervisor>,
@@ -1196,7 +1226,7 @@ pub async fn start(
     retire_ended_hosts(environment, supervisor).await;
     // The rendezvous listener exists before anything is started, so a host that connects the
     // instant it starts finds somebody listening.
-    let reservation = HostReservation::open(environment)?;
+    let reservation = HostReservation::open(environment, protocol)?;
     let plan = reservation.plan(environment, program, packages)?;
     // Made before anything is started, so a launch cannot fail on a directory that does not exist
     // yet. It is inside this environment's state directory, which this host owns and which holds
@@ -1321,7 +1351,7 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
-        let endpoint = host_endpoint(&environment).expect("an endpoint");
+        let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
         let descriptor = HostDescriptor {
             protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             environment_id: host.environment_id(),
@@ -1333,31 +1363,50 @@ mod tests {
         };
 
         assert!(
-            read_descriptor(&environment).expect("a read").is_none(),
+            read_descriptor(&environment, &HostProtocol::THIS)
+                .expect("a read")
+                .is_none(),
             "an environment with no plugin host has no descriptor"
         );
-        publish_descriptor(&environment, &descriptor).expect("the descriptor is published");
+        publish_descriptor(&environment, &HostProtocol::THIS, &descriptor)
+            .expect("the descriptor is published");
         assert_eq!(
-            read_descriptor(&environment).expect("a read"),
+            read_descriptor(&environment, &HostProtocol::THIS).expect("a read"),
             Some(descriptor.clone())
         );
 
         let mut foreign = descriptor;
         foreign.protocol = "kr-plugin-host/99".to_owned();
-        publish_descriptor(&environment, &foreign).expect("the descriptor is published");
-        let error = read_descriptor(&environment).expect_err("a foreign protocol is refused");
+        // Publishing refuses a descriptor of another protocol, so the foreign one is written as
+        // another host would have.
+        assert!(matches!(
+            publish_descriptor(&environment, &HostProtocol::THIS, &foreign),
+            Err(LaunchError::Refused { .. })
+        ));
+        kr_ipc::paths::write_owner_only_file(
+            &descriptor_path(&environment, &HostProtocol::THIS),
+            &serde_json::to_vec(&foreign).expect("a document"),
+        )
+        .expect("the file is written");
+        let error = read_descriptor(&environment, &HostProtocol::THIS)
+            .expect_err("a foreign protocol is refused");
         assert!(error.to_string().contains("kr-plugin-host/99"));
 
-        retire_descriptor(&environment).expect("the descriptor is retired");
-        assert!(read_descriptor(&environment).expect("a read").is_none());
-        retire_descriptor(&environment).expect("a second retirement is quiet");
+        retire_descriptor(&environment, &HostProtocol::THIS).expect("the descriptor is retired");
+        assert!(
+            read_descriptor(&environment, &HostProtocol::THIS)
+                .expect("a read")
+                .is_none()
+        );
+        retire_descriptor(&environment, &HostProtocol::THIS).expect("a second retirement is quiet");
     }
 
     #[tokio::test]
     async fn a_launch_resolves_what_it_names_before_the_host_changes_directory() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let reservation = HostReservation::open(&environment).expect("a reservation");
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
 
         // Relative names, as a caller in this directory would give them. The host runs somewhere
         // else, so a name left relative would be looked for there: the executable would not be
@@ -1392,7 +1441,8 @@ mod tests {
     async fn the_argument_vector_carries_only_non_secret_facts() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let reservation = HostReservation::open(&environment).expect("a reservation");
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
         let arguments = reservation.arguments(&environment, std::path::Path::new("/var/packages"));
         assert!(arguments.contains(&"--reservation".to_owned()));
         assert!(arguments.contains(&"--rendezvous".to_owned()));
@@ -1571,6 +1621,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1580,7 +1631,11 @@ mod tests {
         .expect_err("nothing started");
         assert!(matches!(outcome, LaunchError::NotStarted { .. }));
         // Nothing was published, so no worker can be told there is a host.
-        assert!(read_descriptor(&environment).expect("a read").is_none());
+        assert!(
+            read_descriptor(&environment, &HostProtocol::THIS)
+                .expect("a read")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1593,6 +1648,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1601,7 +1657,11 @@ mod tests {
         .await
         .expect_err("nothing reported itself");
         assert!(matches!(outcome, LaunchError::NoRendezvous { .. }));
-        assert!(read_descriptor(&environment).expect("a read").is_none());
+        assert!(
+            read_descriptor(&environment, &HostProtocol::THIS)
+                .expect("a read")
+                .is_none()
+        );
     }
 
     /// The job of a host this launch started is taken away once the host has ended, and not
@@ -1618,6 +1678,7 @@ mod tests {
         // defined, and it is taken away all the same.
         let outcome = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1669,6 +1730,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1695,6 +1757,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1726,6 +1789,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1780,6 +1844,7 @@ mod tests {
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
             &environment,
+            HostProtocol::THIS,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
             &supervisor,
@@ -1818,7 +1883,8 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
-        let reservation = HostReservation::open(&environment).expect("a reservation");
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
         let endpoint = reservation.endpoint().clone();
 
         // Somebody connects to the rendezvous endpoint and never writes a claim. The deadline
@@ -1848,7 +1914,11 @@ mod tests {
             waited < core::time::Duration::from_secs(1),
             "the launcher waited {waited:?}"
         );
-        assert!(read_descriptor(&environment).expect("a read").is_none());
+        assert!(
+            read_descriptor(&environment, &HostProtocol::THIS)
+                .expect("a read")
+                .is_none()
+        );
         silent.abort();
     }
 
@@ -1860,17 +1930,19 @@ mod tests {
             HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
         let descriptor = descriptor_of(&identity, "/run/kr/first.sock");
 
-        let turn = publication_turn(host.environment_id());
+        let turn = publication_turn(host.environment_id(), &HostProtocol::THIS);
         let waiting = core::sync::atomic::AtomicBool::new(false);
 
         // The launch that reaches publication first publishes first.
         let later = descriptor_of(&identity, "/run/kr/second.sock");
-        publish_in_turn(&turn, &waiting, &environment, &later).expect("the first publication wins");
+        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::THIS, &later)
+            .expect("the first publication wins");
 
         // A launch that reached publication later, with a number of its own, publishes after it.
         let third = descriptor_of(&identity, "/run/kr/third.sock");
-        publish_in_turn(&turn, &waiting, &environment, &third).expect("a later launch publishes");
-        let published = read_descriptor(&environment)
+        publish_in_turn(&turn, &waiting, &environment, &HostProtocol::THIS, &third)
+            .expect("a later launch publishes");
+        let published = read_descriptor(&environment, &HostProtocol::THIS)
             .expect("a read")
             .expect("a descriptor");
         assert_eq!(published.endpoint, "/run/kr/third.sock");
@@ -1878,29 +1950,94 @@ mod tests {
         // A launch that stopped waiting publishes nothing, however long it was queued: replacing a
         // descriptor for a startup nobody is waiting on is the one thing it must not do.
         let abandoned = core::sync::atomic::AtomicBool::new(true);
-        let refused = publish_in_turn(&turn, &abandoned, &environment, &descriptor)
-            .expect_err("an abandoned publication is refused");
+        let refused = publish_in_turn(
+            &turn,
+            &abandoned,
+            &environment,
+            &HostProtocol::THIS,
+            &descriptor,
+        )
+        .expect_err("an abandoned publication is refused");
         assert!(matches!(refused, LaunchError::Refused { .. }), "{refused}");
-        let published = read_descriptor(&environment)
+        let published = read_descriptor(&environment, &HostProtocol::THIS)
             .expect("a read")
             .expect("a descriptor");
         assert_eq!(published.endpoint, "/run/kr/third.sock");
 
         // Another environment's publications are its own.
         let elsewhere = kr_ipc::testing::TempHost::create();
-        let their_turn = publication_turn(elsewhere.environment_id());
+        let their_turn = publication_turn(elsewhere.environment_id(), &HostProtocol::THIS);
         let their_identity =
             HostIdentity::generate(elsewhere.environment_id()).expect("an identity");
         let theirs = descriptor_of(&their_identity, "/run/kr/fourth.sock");
-        publish_in_turn(&their_turn, &waiting, &elsewhere.environment(), &theirs)
-            .expect("another environment is unaffected");
+        publish_in_turn(
+            &their_turn,
+            &waiting,
+            &elsewhere.environment(),
+            &HostProtocol::THIS,
+            &theirs,
+        )
+        .expect("another environment is unaffected");
+    }
+
+    #[test]
+    fn a_publication_of_one_protocol_is_not_made_stale_by_one_of_another() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity =
+            HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
+        let this = HostProtocol::THIS;
+        let second = HostProtocol::SECOND;
+        let mut for_this = descriptor_of(&identity, "/run/kr/p3.sock");
+        for_this.protocol = this.name.to_owned();
+        let mut for_second = descriptor_of(&identity, "/run/kr/p.sock");
+        for_second.protocol = second.name.to_owned();
+
+        // The first protocol's publication takes its number and then waits for its turn, which
+        // something else holds; the second protocol's publication then takes a later number and
+        // publishes. When the first gets its turn its number is older than the second's, and it
+        // must still publish: they write different files.
+        let first_turn = publication_turn(host.environment_id(), &this);
+        let second_turn = publication_turn(host.environment_id(), &second);
+        let held = first_turn.lock().expect("the turn");
+        let numbered = NEXT_PUBLICATION.load(core::sync::atomic::Ordering::Relaxed);
+        let waiting = core::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let publishing = scope
+                .spawn(|| publish_in_turn(&first_turn, &waiting, &environment, &this, &for_this));
+            while NEXT_PUBLICATION.load(core::sync::atomic::Ordering::Relaxed) == numbered {
+                std::thread::yield_now();
+            }
+            publish_in_turn(&second_turn, &waiting, &environment, &second, &for_second)
+                .expect("the second protocol publishes");
+            drop(held);
+            publishing
+                .join()
+                .expect("the thread ends")
+                .expect("the first protocol publishes although its number is the older");
+        });
+        assert_eq!(
+            read_descriptor(&environment, &this)
+                .expect("a read")
+                .expect("a descriptor")
+                .endpoint,
+            "/run/kr/p3.sock"
+        );
+        assert_eq!(
+            read_descriptor(&environment, &second)
+                .expect("a read")
+                .expect("a descriptor")
+                .endpoint,
+            "/run/kr/p.sock"
+        );
     }
 
     #[tokio::test]
     async fn one_reservation_is_one_host_and_a_second_claim_is_refused_and_counted() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let reservation = HostReservation::open(&environment).expect("a reservation");
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
         let reservation_id = reservation.reservation_id();
         let endpoint = reservation.endpoint().clone();
         // The fence takes the endpoint the reservation was made on, which is the only address a

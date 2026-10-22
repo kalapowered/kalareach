@@ -46,8 +46,9 @@ use crate::error::{ServiceError, ServiceResult};
 use crate::launcher::{self, LaunchError};
 use crate::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream, Offered};
 use crate::protocol::{
-    BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth, Notice,
-    PrepareActionCall, Request, RequestBody, ResponseBody, WireNamedArgument, WirePlan, WireToken,
+    BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth,
+    HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody, WireNamedArgument,
+    WirePlan, WireToken,
 };
 use crate::vocabulary::{
     Admission, BindingFacts, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, ScopedSourceEvent,
@@ -301,7 +302,9 @@ impl core::fmt::Debug for PluginClient {
 }
 
 impl PluginClient {
-    /// Connects to the plugin host named in the environment's descriptor, and verifies it.
+    /// Connects to the plugin host of this build's protocol named in the environment's descriptor
+    /// (`plugin-host-3.json`), and verifies it. A host of another protocol has a descriptor of its
+    /// own, which this client never reads, so it never opens a connection to that host.
     ///
     /// The descriptor is a hint. What settles which process is answering is the challenge below:
     /// the host signs a fresh nonce with the key the descriptor records, and a process that cannot
@@ -313,7 +316,7 @@ impl PluginClient {
     /// cannot be reached, and [`ServiceError::Protocol`] when the host answers with
     /// something this client cannot read or cannot verify.
     pub async fn connect(environment: &EnvironmentPaths) -> ServiceResult<Self> {
-        let descriptor = launcher::read_descriptor(environment)
+        let descriptor = launcher::read_descriptor(environment, &HostProtocol::THIS)
             .map_err(unavailable)?
             .ok_or_else(|| ServiceError::Unavailable {
                 detail: "this environment has no plugin host".to_owned(),
@@ -379,13 +382,13 @@ impl PluginClient {
 
         let hello = client
             .request(RequestBody::Hello {
-                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
+                protocol: HostProtocol::THIS.name.to_owned(),
             })
             .await?;
         let ResponseBody::Hello { protocol, .. } = hello else {
             return Err(protocol_error(&hello));
         };
-        if protocol != kr_protocol::retained::PLUGIN_HOST_PROTOCOL {
+        if protocol != HostProtocol::THIS.name {
             return Err(ServiceError::Protocol {
                 detail: format!("the host speaks {protocol}"),
             });
@@ -1074,5 +1077,46 @@ mod tests {
             reason: "three faults".to_owned(),
         };
         assert_eq!(notice_binding(&notice), binding_id);
+    }
+
+    /// A host of the first protocol answers on its endpoint, and nothing in this build's client may
+    /// reach it: it reads the descriptor of its own protocol only.
+    #[tokio::test]
+    async fn the_client_of_this_protocol_never_opens_the_endpoint_of_another() {
+        use crate::launcher::{HostIdentity, host_endpoint, publish_descriptor};
+        use kr_ipc::endpoint::Listener;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
+        let second = HostProtocol::SECOND;
+        let endpoint = host_endpoint(&environment, &second).expect("an endpoint");
+        let listener = Listener::bind(&endpoint).expect("the first protocol's host is listening");
+        let descriptor = HostDescriptor {
+            protocol: second.name.to_owned(),
+            environment_id: host.environment_id(),
+            reservation_id: kr_protocol::worker::ReservationId::new(
+                kr_protocol::scalars::Uuid::from_bytes([1; 16]),
+            ),
+            endpoint: endpoint.as_text(),
+            boot_identity: identity.boot_identity().clone(),
+            process_start_identity: identity.process_start_identity().clone(),
+            host_public_key: *identity.public_key(),
+        };
+        publish_descriptor(&environment, &second, &descriptor).expect("published");
+
+        let refused = PluginClient::connect(&environment)
+            .await
+            .expect_err("a host of another protocol is not this client's");
+        assert!(
+            matches!(&refused, ServiceError::Unavailable { detail } if detail.contains("no plugin host")),
+            "{refused}"
+        );
+        // The attempt is over, and a connection it had made would be waiting here.
+        let accepted = tokio::time::timeout(core::time::Duration::ZERO, listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the client opened a connection to the first protocol's host"
+        );
     }
 }

@@ -34,7 +34,7 @@ use kr_plugin_catalogue::{
 };
 use kr_plugin_service::client::PluginClient;
 use kr_plugin_service::launcher;
-use kr_plugin_service::protocol::HostHealth;
+use kr_plugin_service::protocol::{HostHealth, HostProtocol};
 use kr_protocol::admission::{ComponentState, PluginRuntimeState, PluginRuntimeWanted};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::hello::PROTOCOL_VERSION;
@@ -250,7 +250,9 @@ impl Drop for HostEnding {
                     .collect()
             })
             .unwrap_or_default();
-        if let Ok(Some(published)) = launcher::read_descriptor(&self.environment) {
+        if let Ok(Some(published)) =
+            launcher::read_descriptor(&self.environment, &HostProtocol::THIS)
+        {
             hosts.push(published.process_start_identity);
         }
         for host in hosts {
@@ -843,7 +845,7 @@ impl World {
 
     /// The process identity the descriptor names, where a plugin runtime is published.
     fn published_host(&self) -> Option<ProcessStartIdentity> {
-        launcher::read_descriptor(&self.environment())
+        launcher::read_descriptor(&self.environment(), &HostProtocol::THIS)
             .ok()
             .flatten()
             .map(|descriptor| descriptor.process_start_identity)

@@ -139,13 +139,29 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 
 /// The protocol the plugin host speaks to the workers that register with it.
 ///
-/// A worker connects to its environment's one plugin host directly, so a daemon of one release can
-/// meet a host of another and a worker of one release a host of another. The name is part of what
-/// a retained level records (`PLUGIN_HOST`), and a bump needs the retained levels to speak both.
-/// A host and a worker of another protocol refuse each other at the handshake, and a descriptor
-/// that names another protocol is not one a worker uses: the control daemon takes it away and
-/// starts a runtime of its own. The second protocol adds the request that prepares an action.
-pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/2";
+/// A worker connects to its environment's plugin host directly, so a daemon of one release can meet
+/// a host of another and a worker of one release a host of another. A host process speaks one
+/// protocol, and each protocol has an endpoint and a descriptor of its own, so the hosts of two
+/// protocols run side by side: this build's workers use a host of this protocol, and the workers
+/// of a retained level a host of the protocol that level recorded (`PLUGIN_HOST`), which the
+/// control daemon adopts when it runs and otherwise starts from the program of that level's
+/// release ([`RETAINED_PLUGIN_HOST_PROTOCOLS`]). A host and a worker of another protocol refuse
+/// each other at the handshake. The third protocol adds the requests that decode a native request,
+/// encode a response and revise a binding's facts and attachments.
+///
+/// Every frame of a released protocol is closed: a request, a response or notice variant, or a
+/// member added to a record after a release exists would meet a host or a worker of the release
+/// before that the level records by this name alone, and no check would see it.
+pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/3";
+
+/// The plugin host protocols a retained level may record besides [`PLUGIN_HOST_PROTOCOL`], each of
+/// which the control daemon has a route for (an adopted host or one started from the program of
+/// the level's release).
+///
+/// `check` fails a retained level that recorded another protocol, and an entry no retained level
+/// records. The 0.78 cut, which stops retaining level 0.76, removes `kr-plugin-host/2` here and its
+/// route in `kr-plugin-service` and the control daemon.
+pub const RETAINED_PLUGIN_HOST_PROTOCOLS: [&str; 1] = ["kr-plugin-host/2"];
 
 /// The definition that names the parameters of a read the control daemon makes of a worker itself,
 /// by the method it makes it with.
@@ -677,17 +693,29 @@ pub fn check() -> Result<(), Vec<String>> {
                 retained.level
             ));
         }
-        if retained.plugin_host.trim() != PLUGIN_HOST_PROTOCOL {
+        let host = retained.plugin_host.trim();
+        if host != PLUGIN_HOST_PROTOCOL && !RETAINED_PLUGIN_HOST_PROTOCOLS.contains(&host) {
             problems.push(format!(
-                "level {} kept the plugin host protocol {}, and this build speaks {PLUGIN_HOST_PROTOCOL}",
-                retained.level,
-                retained.plugin_host.trim()
+                "level {} kept the plugin host protocol {host}, which has no route: this build \
+                 speaks {PLUGIN_HOST_PROTOCOL} and routes {RETAINED_PLUGIN_HOST_PROTOCOLS:?}",
+                retained.level
             ));
         }
         if THIS_LEVEL <= retained.level {
             problems.push(format!(
                 "level {} is not below this build's level {THIS_LEVEL}",
                 retained.level
+            ));
+        }
+    }
+    for protocol in RETAINED_PLUGIN_HOST_PROTOCOLS {
+        if !RETAINED
+            .iter()
+            .any(|retained| retained.plugin_host.trim() == protocol)
+        {
+            problems.push(format!(
+                "the plugin host protocol {protocol} is routed and no retained level records it: \
+                 remove its route"
             ));
         }
     }
@@ -791,6 +819,15 @@ impl Level {
     #[must_use]
     pub const fn retained(retained: &'static RetainedLevel) -> Self {
         Self(Which::Retained(retained))
+    }
+
+    /// The plugin host protocol the workers of this level speak.
+    #[must_use]
+    pub fn plugin_host(self) -> &'static str {
+        match self.0 {
+            Which::This => PLUGIN_HOST_PROTOCOL,
+            Which::Retained(retained) => retained.plugin_host.trim(),
+        }
     }
 
     /// The compatibility level.

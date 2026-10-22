@@ -1194,11 +1194,21 @@ answers only the process it recorded for that session, as the kernel names that 
 the runtime, or finds the one a previous daemon started, and answers that it is running or why it
 cannot be reached and how long to leave before asking again. The runtime reports itself on a
 rendezvous endpoint of its own, signed with a keypair it generated at startup and keeps in memory,
-and the daemon publishes an owner-only descriptor at `plugin-host.json` beside the worker
-descriptors. The worker reads it, challenges the process behind the endpoint, and registers its
-bindings with it directly; the daemon is not in that path again.
+and the daemon publishes an owner-only descriptor in the file its protocol names, `plugin-host-3.json`
+for this release's, beside the worker descriptors. The worker reads it, challenges the process
+behind the endpoint, and registers its bindings with it directly; the daemon is not in that path
+again.
 
-The daemon starts at most five runtimes in ten minutes. A runtime that ends is started again by the
+A worker of a retained level speaks the protocol that level recorded, and a host of that protocol
+has an endpoint and a descriptor of its own (`p.sock` and `plugin-host.json` for the release before's
+`kr-plugin-host/2`). The daemon holds one runtime for each protocol it serves, answers a worker with
+the runtime of the protocol its level speaks, and adopts a host of a retained protocol that a daemon
+of that release started and that outlived the update. Where none runs it starts the
+`kr-plugin-host` of the release the worker runs, from the release store; a host that keeps no
+store, and a release the store no longer holds, leave the worker's rich bindings unavailable with the
+reason, and its terminal untouched. `docs/plugins/runtime.md` has the details.
+
+The daemon starts at most five runtimes of each protocol in ten minutes. A runtime that ends is started again by the
 next request, which a worker makes at once for the first loss of a run and after a wait that
 doubles from half a second to thirty for the ones after, and past the bound the answer
 is that the runtime is not started again yet, with the time the window next admits one. When the

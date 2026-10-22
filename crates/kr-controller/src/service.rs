@@ -384,7 +384,7 @@ pub struct Controller {
     supervisor: Arc<dyn WorkerSupervisor>,
     /// The environment's plugin runtime: started through `supervisor` when a worker first asks
     /// for it, and never at this daemon's start.
-    plugin_runtime: Arc<plugin_runtime::PluginRuntime>,
+    plugin_runtimes: plugin_runtime::PluginRuntimes,
     /// The environment's backup service: the generations this host has produced, their staged
     /// ciphertext and the outbox that carries them.
     ///

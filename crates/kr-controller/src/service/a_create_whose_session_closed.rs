@@ -145,6 +145,7 @@ impl Gone {
             .expect("an endpoint");
         let worker = KnownWorker {
             level: kr_protocol::retained::Level::this(),
+            release: None,
             descriptor: WorkerDescriptor {
                 session_id: reservation.session_id,
                 session_epoch: kr_protocol::ids::SessionEpoch::V1,

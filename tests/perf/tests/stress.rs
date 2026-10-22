@@ -55,7 +55,7 @@ use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::launcher::{
     self, HostFence, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor,
 };
-use kr_plugin_service::protocol::ComponentSource;
+use kr_plugin_service::protocol::{ComponentSource, HostProtocol};
 use kr_plugin_service::vocabulary::{
     BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance,
 };
@@ -732,6 +732,7 @@ impl PluginHost {
         });
         let (descriptor, fence) = launcher::start(
             &environment,
+            HostProtocol::THIS,
             &host.plugin_host,
             &packages,
             &supervisor,
@@ -863,7 +864,7 @@ fn end_plugin_host(environment: &EnvironmentPaths, pid: u32, label: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = kr_controller::supervision::retire_service_job(&environment.jobs_dir(), label);
-    let _ = launcher::retire_descriptor(environment);
+    let _ = launcher::retire_descriptor(environment, &HostProtocol::THIS);
 }
 
 /// The processes of the host, by what they are.
