@@ -240,7 +240,10 @@ impl Hosted {
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(Recording {
-                inner: self.tree.supervisor(kr_controller::supervision::detect()),
+                inner: self.tree.supervisor(kr_controller::supervision::detect(
+                    &self.tree.environment(),
+                    &self.worker,
+                )),
                 launched: Arc::clone(&self.launched),
             }),
             worker_program: self.worker.clone(),

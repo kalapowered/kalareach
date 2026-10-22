@@ -536,7 +536,7 @@ impl World {
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(Recording {
-                inner: self.tree.supervisor(detect()),
+                inner: self.tree.supervisor(detect(&environment, &self.worker)),
                 requested: Arc::clone(&self.requested),
             }),
             worker_program: self.worker.clone(),
@@ -1646,9 +1646,11 @@ fn serve_a_control_daemon_for_the_runtime_test() {
                     secret_store: StoreSelection::File,
                     boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
                     supervisor: if services == "child" {
-                        Box::new(AsChild { inner: detect() })
+                        Box::new(AsChild {
+                            inner: detect(&environment, &worker),
+                        })
                     } else {
-                        detect()
+                        detect(&environment, &worker)
                     },
                     worker_program: worker.clone(),
                     build_id: build(),

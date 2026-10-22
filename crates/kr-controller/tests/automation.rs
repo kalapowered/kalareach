@@ -406,7 +406,7 @@ async fn working_host_on_clocks(
     let environment_id = temp.environment_id();
     let worker = temp.root().join("kr-worker");
     let supervisor = wrap(Box::new(Patient {
-        inner: temp.supervisor(kr_controller::supervision::detect()),
+        inner: temp.supervisor(kr_controller::supervision::detect(&environment, &worker)),
     }));
     let controller = start_daemon_with(&environment, environment_id, clocks, supervisor, worker)
         .await
@@ -453,7 +453,7 @@ async fn working_host_apart() -> (Host, Apart) {
 /// [`working_host_apart`] whose daemon starts its workers through the supervisor `supervisor`
 /// makes, which the host the test runs on would otherwise choose.
 async fn working_host_apart_started_by(
-    supervisor: fn() -> Box<dyn WorkerSupervisor>,
+    supervisor: fn(&kr_ipc::paths::EnvironmentPaths, &std::path::Path) -> Box<dyn WorkerSupervisor>,
 ) -> (Host, Apart) {
     let temp = teardown::Tree::create();
     let environment = temp.environment();
@@ -461,7 +461,7 @@ async fn working_host_apart_started_by(
     let worker = temp.root().join("kr-worker");
     kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
     let supervisor = Box::new(Patient {
-        inner: temp.supervisor(supervisor()),
+        inner: temp.supervisor(supervisor(&environment, &worker)),
     });
     let (ready_sender, ready) = std::sync::mpsc::channel();
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
@@ -7392,7 +7392,7 @@ fn recorded_closure(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crashed_session_counts_as_a_writer_until_the_daemon_restarts() {
-    let (host, apart) = working_host_apart_started_by(|| {
+    let (host, apart) = working_host_apart_started_by(|_, _| {
         Box::new(kr_controller::supervision::DetachedSupervisor::new())
     })
     .await;
