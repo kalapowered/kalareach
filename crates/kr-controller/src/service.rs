@@ -544,6 +544,11 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_retained_lookup: ReadPause,
+    /// Where this host's own tests stop an automation mutation that has passed the admission it
+    /// arrived under, before the workflow journal's transaction asks the admission again, so that
+    /// a fence can land in between. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_automation_admission: ReadPause,
     /// Where this host's own tests stop a network connection the transport has authorised, before
     /// the host registers it, so that a revocation can land in between. Compiled away in every
     /// shipped build.
