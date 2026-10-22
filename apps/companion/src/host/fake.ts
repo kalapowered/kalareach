@@ -951,7 +951,7 @@ export function fakeHost(
   const intakes: IntakeSource[] = []
   const settingsOpened = { count: 0 }
   const keptAwake = { on: false, asked: 0 }
-  const holds = new Map<IntakeSource, Promise<void>>()
+  const intakeHolds = new Map<IntakeSource, Promise<void>>()
   const takeIn = (source: IntakeSource): Promise<IntakeView> => {
     intakes.push(source)
     const finish = (): IntakeView => {
@@ -959,9 +959,9 @@ export function fakeHost(
       if (result.invitation !== null) publishPairing({ invitation: result.invitation })
       return result
     }
-    const held = holds.get(source)
+    const held = intakeHolds.get(source)
     if (held === undefined) return Promise.resolve(finish())
-    holds.delete(source)
+    intakeHolds.delete(source)
     return held.then(finish)
   }
   const startedCodes: string[] = []
@@ -3233,7 +3233,7 @@ export function fakeHost(
     },
     holdIntake(source) {
       let release = (): void => undefined
-      holds.set(
+      intakeHolds.set(
         source,
         new Promise<void>((resolve) => {
           release = resolve
