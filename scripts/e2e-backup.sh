@@ -246,6 +246,12 @@ report() {
   local result="$1"
   local leg="$2"
   local what="$3"
+  # A leg that sent nothing prints no line of what it proved, and a test that returned early still
+  # ends as passed: an ok with nothing proved is a leg that did not run.
+  if [ "$result" = ok ] && [ -z "${what//[; ]/}" ]; then
+    result='NOT RUN'
+    what="the leg printed no line of what it proved, so it may have sent nothing"
+  fi
   case "$result" in
     ok) passed=$((passed + 1)) ;;
     FAILED) failed=$((failed + 1)); unfinished+=("$leg") ;;
