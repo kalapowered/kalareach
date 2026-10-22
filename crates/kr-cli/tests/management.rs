@@ -749,6 +749,9 @@ async fn a_chain_whose_budget_ran_out_is_rearmed_from_the_command_line() {
         said.contains(&root_text) && said.contains("generation 2"),
         "{said}"
     );
+    // The line names the command that gives no second budget: the one that names the generation
+    // this run left. A run that reads the generation again is not that command.
+    assert!(said.contains("--generation 1"), "{said}");
     // The generation it left is said before the request goes out, which is all a person has to
     // repeat it with when the reply is lost.
     let before_the_request = String::from_utf8_lossy(&shown.stderr);

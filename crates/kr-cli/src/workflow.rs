@@ -90,10 +90,11 @@ async fn rearm(
         // them gave the budget; it says what holds after either.
         output::line(&stdout_line!(
             "Chain {}: the rearm that leaves budget generation {} has been made, and its budget \
-             is on generation {}. The same command sent again gives it no second budget.",
+             is on generation {}. A command that names --generation {} gives it no second budget.",
             closed_word(&rearmed.causal_root_id),
             generation,
-            rearmed.generation.get()
+            rearmed.generation.get(),
+            generation
         ));
     }
     Ok(())
