@@ -1,4 +1,4 @@
-//! The cross-language vectors under `fixtures/service/` and `fixtures/push/`.
+//! The cross-language vectors under `fixtures/service/`, `fixtures/push/` and `fixtures/metrics/`.
 //!
 //! Every value here is built from the types in this crate and a fixed set of test bytes, so the
 //! documents are byte stable and the TypeScript package can assert the same encodings. Rust is
@@ -208,6 +208,10 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
         (SERVICE_REQUESTS_FILE_NAME, render(&service_requests())),
         (PUSH_FILE_NAME, render(&push())),
         (SERVICES_FILE_NAME, render(&services())),
+        (
+            crate::metrics::VECTOR_FILE_NAME,
+            render(&crate::metrics::vector()),
+        ),
     ]
 }
 
