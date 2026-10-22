@@ -9497,12 +9497,33 @@ fn a_stop_freezes_a_tree_whole_before_it_is_killed() {
     );
 }
 
+/// The marked sleeps the tree's inner shell starts. Every other process on the machine that runs
+/// the same program with the same argument is somebody else's: another copy of this case, another
+/// run on a shared machine, or a sleep a failed run left behind for its whole minute.
+const MARKED_SLEEP: &str = "/bin/sleep 61.75";
+
+/// The processes of `table` beneath `root`, at any depth.
+fn beneath(table: &[kr_e2e_m1b::run::Entry], root: u32) -> std::collections::BTreeSet<u32> {
+    let mut found = std::collections::BTreeSet::from([root]);
+    loop {
+        let before = found.len();
+        for entry in table {
+            if found.contains(&entry.parent) {
+                found.insert(entry.pid);
+            }
+        }
+        if found.len() == before {
+            return found;
+        }
+    }
+}
+
 #[test]
 fn a_tree_whose_descendant_keeps_starting_children_is_caught_whole() {
     // The shell's child is another shell that starts a marked sleep every hundredth of a second,
     // so children are being started while the walk goes down to it.
     let (mut tree, root) = test_tree(
-        "/bin/sh -c 'while :; do /bin/sleep 61.75 & /bin/sleep 0.01; done'; :",
+        &format!("/bin/sh -c 'while :; do {MARKED_SLEEP} & /bin/sleep 0.01; done'; :"),
         1,
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -9510,14 +9531,14 @@ fn a_tree_whose_descendant_keeps_starting_children_is_caught_whole() {
     tree.named.extend(frozen.stopped.iter().cloned());
     tree.named.extend(frozen.unconfirmed.iter().cloned());
     assert!(frozen.complete, "{frozen:?}");
-    let marked = |table: &[kr_e2e_m1b::run::Entry]| -> Vec<u32> {
-        table
-            .iter()
-            .filter(|entry| entry.command == "/bin/sleep 61.75")
-            .map(|entry| entry.pid)
-            .collect()
-    };
-    let before = marked(&kr_e2e_m1b::run::process_table().expect("the process table"));
+    let root_pid = u32::try_from(root.pid.get()).expect("the shell's number");
+    let table = kr_e2e_m1b::run::process_table().expect("the process table");
+    let beneath_the_tree = beneath(&table, root_pid);
+    let before: Vec<u32> = table
+        .iter()
+        .filter(|entry| entry.command == MARKED_SLEEP && beneath_the_tree.contains(&entry.pid))
+        .map(|entry| entry.pid)
+        .collect();
     assert!(
         before.len() > 2,
         "the inner shell started its children: {before:?}"
@@ -9539,7 +9560,12 @@ fn a_tree_whose_descendant_keeps_starting_children_is_caught_whole() {
         "each is seen stopped before anything is killed"
     );
     assert!(kill_and_wait(&tree.named), "the tree ended");
-    let after = marked(&kr_e2e_m1b::run::process_table().expect("the process table"));
+    let after: Vec<u32> = kr_e2e_m1b::run::process_table()
+        .expect("the process table")
+        .iter()
+        .filter(|entry| entry.command == MARKED_SLEEP && before.contains(&entry.pid))
+        .map(|entry| entry.pid)
+        .collect();
     assert!(after.is_empty(), "nothing of the tree is left: {after:?}");
 }
 
