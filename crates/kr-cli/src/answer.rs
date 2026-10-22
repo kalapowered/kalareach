@@ -16,6 +16,7 @@
 
 use crate::output::{Asked, Document, Request, closed};
 use kr_protocol::admission::LiveReleaseSummary;
+use kr_protocol::automation::WorkflowRearmResult;
 use kr_protocol::catalogue::CatalogueDelegation;
 use kr_protocol::catalogue::CatalogueListResult;
 use kr_protocol::catalogue::CataloguePinResult;
@@ -227,6 +228,15 @@ fn exclusion(value: &Exclusion) -> Document {
             "detail",
             crate::shown::exported("Exclusion", "detail", &value.detail),
         )
+}
+
+/// `WorkflowRearmResult`, in the shape the protocol answers it.
+#[must_use]
+pub fn workflow_rearm_result(value: &WorkflowRearmResult) -> Document {
+    Document::new()
+        .with("causal_root_id", closed(&value.causal_root_id))
+        .with("generation", closed(&value.generation))
+        .with("ok", true)
 }
 
 /// `ChangesetReadResult`, in the shape the protocol answers it.

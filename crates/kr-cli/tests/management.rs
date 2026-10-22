@@ -621,6 +621,125 @@ async fn a_paired_device_is_listed_and_revoked() {
     );
 }
 
+/// KR-REQ-25.17: `kr workflow rearm` is the explicit, authorised request that gives a chain whose
+/// budget ran out a new one, sent as one `workflow.rearm` under a grant the host holds with the
+/// management right.
+///
+/// The chain is one the daemon's own journal holds, run out as a breached ceiling leaves it. The
+/// command reads the generation the chain is on and leaves it; the same command naming that
+/// generation again is answered and gives no second budget; a chain that has not run out and a
+/// chain the daemon holds no budget for are the daemon's refusals, with the exit code of one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_whose_budget_ran_out_is_rearmed_from_the_command_line() {
+    use kr_controller::grants::GrantRecord;
+
+    let host = Host::start().await;
+    let device = DeviceId::new(Uuid::from_bytes([0xf0; 16]));
+    let grant = GrantId::new(Uuid::from_bytes([0x71; 16]));
+    host.controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: Grant {
+                    grant_id: grant,
+                    parent_grant_id: Nullable::null(),
+                    issuer_device_id: device,
+                    recipient_device_id: device,
+                    authority_revision: host.controller.policy().authority_revision(),
+                    environment_selector: EnvironmentSelector::Any,
+                    session_selector: SessionSelector::Any,
+                    actions: [ActionRight::AutomationManage].into_iter().collect(),
+                    history: HistoryScope {
+                        lower_bound_ms: Nullable::null(),
+                        include_live_screen: false,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    expiry: GrantExpiry::Never,
+                    organisation: Nullable::null(),
+                },
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+
+    // A chain whose budget ran out, in the daemon's own journal.
+    let journal = host.controller.automation().journal();
+    let definition = kr_automation::create_workflow_definition(
+        kr_protocol::ids::WorkflowId::new(Uuid::from_bytes([0x72; 16])),
+        1,
+        "a chain that ran out",
+        grant,
+        Vec::new(),
+        Vec::new(),
+    );
+    let now = kr_ipc::now_ms().get();
+    journal
+        .save_definition(&definition, now)
+        .expect("the revision is installed");
+    let context = kr_automation::CausalContext::new_root();
+    let root = context.root_id;
+    let mut budget = journal
+        .commit_trigger_and_run(
+            kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x73; 16])),
+            &definition,
+            "evt-root",
+            &context,
+            now,
+        )
+        .expect("the root run is admitted");
+    let run_out = |budget: &mut kr_automation::CausalBudget| {
+        budget.exhaust();
+        journal.save_budget(budget).expect("the budget is saved");
+    };
+    run_out(&mut budget);
+    let (root_text, grant_text) = (root.to_string(), grant.to_string());
+
+    let rearmed = host.kr_json(&["workflow", "rearm", &root_text, "--grant", &grant_text]);
+    assert_eq!(text(&rearmed["generation"]), "1", "{rearmed}");
+    assert_eq!(text(&rearmed["causal_root_id"]), root_text, "{rearmed}");
+
+    // The chain runs out again, and the command naming the generation it left is a repeat.
+    let mut budget = journal.get_budget(root).unwrap().expect("the budget");
+    run_out(&mut budget);
+    let repeated = host.kr_json(&[
+        "workflow",
+        "rearm",
+        &root_text,
+        "--grant",
+        &grant_text,
+        "--generation",
+        "0",
+    ]);
+    assert_eq!(text(&repeated["generation"]), "1", "{repeated}");
+    let kept = journal.get_budget(root).unwrap().expect("the budget");
+    assert!(
+        kept.exhausted && kept.generation == 1,
+        "the repeat gave no second budget: {kept:?}"
+    );
+
+    // Without the generation the command leaves the one the chain is on, and says what it did.
+    let shown = host.kr(&["workflow", "rearm", &root_text, "--grant", &grant_text]);
+    let said = String::from_utf8_lossy(&shown.stdout);
+    assert_eq!(shown.status.code(), Some(0), "{said}");
+    assert!(
+        said.contains(&root_text) && said.contains("generation 2"),
+        "{said}"
+    );
+
+    // The chain has budget now, and a chain the daemon holds nothing for has none to rearm.
+    let live = host.refused(&["workflow", "rearm", &root_text, "--grant", &grant_text]);
+    assert_eq!(live["exit_code"], 8, "the daemon refused: {live}");
+    let nobody = host.refused(&["workflow", "rearm", NOBODY, "--grant", &grant_text]);
+    assert_eq!(nobody["exit_code"], 8, "{nobody}");
+}
+
 /// KR-REQ-07.47, KR-REQ-10.52: every `kr plugin` and `kr plugin repo` operation is a client of its
 /// own method. The two lists answer; each operation on a repository or a package this host does
 /// not have is the daemon's own refusal; and adding a repository asks the host for the owner
