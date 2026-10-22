@@ -6435,6 +6435,32 @@ impl WorkerService {
         )
     }
 
+    /// Refuses an attach by a caller whose grant does not reach the live screen.
+    ///
+    /// An attachment is drawn the visible screen, which section 10 reaches only for a grant whose
+    /// history scope includes it, so the scope the daemon sent with the attach decides, and a
+    /// caller that arrives with none has nothing to be drawn it by. Only the local owner needs no
+    /// grant. Checked before the attachment is made and before the dispatch marker, so a refusal
+    /// leaves nothing behind.
+    fn check_screen_reach(caller: &Caller) -> Result<()> {
+        if caller.is_local_owner() {
+            return Ok(());
+        }
+        match &caller.history {
+            Some(history) if history.include_live_screen => Ok(()),
+            Some(_) => Err(WorkerError::PermissionDenied {
+                detail: "this grant's history does not include the live screen, so it cannot \
+                         attach to the session"
+                    .to_owned(),
+            }),
+            None => Err(WorkerError::PermissionDenied {
+                detail: "this attach carries no history scope for the grant it was decided under, \
+                         so what it may be drawn is not known"
+                    .to_owned(),
+            }),
+        }
+    }
+
     /// Checks a mutation's target, authority and preconditions without acting on it.
     fn validate(
         &self,
@@ -6447,7 +6473,8 @@ impl WorkerService {
         match method {
             Method::SessionAttach => {
                 let params: SessionAttachParams = parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Self::check_session(session, params.session_id)?;
+                Self::check_screen_reach(caller)
             }
             // An attachment of this session, not only one this connection made. The local owner is
             // the operating-system user the listener has already authenticated, and `kr detach`
@@ -8341,9 +8368,11 @@ impl WorkerService {
                     // drawn: section 10's live-screen exception, and asking the filter rather than
                     // naming the scope here keeps that decision in one place. Which grant the
                     // attach was decided under is the daemon's to say, below.
-                    let filter = crate::history_filter::HistoryFilter::new(
-                        crate::history_filter::ViewerScope::forwarded(kr_ipc::now_ms().get()),
-                    );
+                    let filter = caller.history_filter_for_the_screen().ok_or_else(|| {
+                        WorkerError::PermissionDenied {
+                            detail: "this attach carries no history scope".to_owned(),
+                        }
+                    })?;
                     // A share's issuer was shown the screen as text, so an attachment decided under
                     // one is drawn that and no title and no link target behind it. Only a daemon
                     // that says the attach was decided under a pairing grant gets the live screen:
@@ -8929,6 +8958,14 @@ impl Caller {
                     }
         });
         self.viewer_scope(session_view)
+            .map(crate::history_filter::HistoryFilter::new)
+    }
+
+    /// Returns the filter that decides how much of the screen this caller is drawn: the one its
+    /// grant's history scope gives, or none for a caller that carries no scope.
+    #[must_use]
+    fn history_filter_for_the_screen(&self) -> Option<crate::history_filter::HistoryFilter> {
+        self.viewer_scope(true)
             .map(crate::history_filter::HistoryFilter::new)
     }
 

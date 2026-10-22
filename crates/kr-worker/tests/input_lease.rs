@@ -4995,6 +4995,20 @@ impl Proxied {
         params: &T,
     ) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
         let mutation = self.mutation(method, params).await;
+        if method == Method::SessionAttach {
+            return self
+                .link
+                .forward_within(
+                    &mutation,
+                    &self.actor,
+                    &self.rights(),
+                    Self::deadline(),
+                    Some(common::a_lease(1, 1)),
+                    common::a_scope_with_the_live_screen(),
+                )
+                .await
+                .expect("reaches the worker");
+        }
         self.link
             .forward(
                 &mutation,

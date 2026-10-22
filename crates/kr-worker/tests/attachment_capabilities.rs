@@ -181,12 +181,13 @@ impl Wired {
         };
         let lease = common::a_lease_after_the_announcement(daemon, self.environment_id, 1, 1).await;
         daemon
-            .forward(
+            .forward_within(
                 &mutation,
                 &envelope,
                 grant_rights,
                 U64::new(kr_ipc::clock::boot_elapsed_ms() + 30_000),
                 Some(lease),
+                common::a_scope_with_the_live_screen(),
             )
             .await
             .expect("the forward reaches the worker")

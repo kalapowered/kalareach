@@ -675,6 +675,17 @@ pub fn a_lease(generation: u64, revision: u64) -> kr_protocol::local::ForwardedL
     }
 }
 
+/// The history scope of a grant that includes the live screen and reaches back to the start of
+/// time: what the daemon sends beside an attach it decided under such a grant.
+pub fn a_scope_with_the_live_screen() -> kr_protocol::grant::HistoryScope {
+    kr_protocol::grant::HistoryScope {
+        lower_bound_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(1)),
+        include_live_screen: true,
+        named_questions: kr_protocol::scalars::CanonicalSet::new(),
+        named_approvals: kr_protocol::scalars::CanonicalSet::new(),
+    }
+}
+
 /// [`announced`], and a lease of `generation` for what it announced.
 pub async fn a_lease_after_the_announcement(
     daemon: &mut kr_ipc::client::Client<impl kr_ipc::client::Codec>,

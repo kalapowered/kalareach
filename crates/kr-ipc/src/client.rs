@@ -1117,7 +1117,7 @@ impl<C: Codec> Client<C> {
     ///
     /// The frame carries no history scope: this is the link a local caller's own action travels,
     /// and a worker of any build reads it. A scope goes only over a proxy link, to a worker that
-    /// states it holds results to one.
+    /// states it holds results to one ([`Self::forward_within`]).
     ///
     /// `lease` is the remote dispatch lease the host took for a paired device's mutation, and a
     /// local caller's action, which does not depend on the lease, passes none. A link to a worker of
@@ -1142,6 +1142,34 @@ impl<C: Codec> Client<C> {
             accepted_deadline_boot_ms,
             lease,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// As [`Self::forward`], with the history scope of the grant the host decided the mutation
+    /// under, for a worker that states it holds results to one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error, or a transport failure.
+    pub async fn forward_within(
+        &mut self,
+        mutation: &MutationRequest,
+        actor: &kr_protocol::actor::ActorEnvelope,
+        grant_rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>,
+        accepted_deadline_boot_ms: kr_protocol::scalars::U64,
+        lease: Option<kr_protocol::local::ForwardedLease>,
+        history: kr_protocol::grant::HistoryScope,
+    ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
+        self.forward_for(
+            mutation,
+            actor,
+            grant_rights,
+            accepted_deadline_boot_ms,
+            lease,
+            None,
+            Some(history),
         )
         .await
     }
@@ -1170,10 +1198,12 @@ impl<C: Codec> Client<C> {
             accepted_deadline_boot_ms,
             None,
             Some(workflow_run_id),
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_for(
         &mut self,
         mutation: &MutationRequest,
@@ -1182,6 +1212,7 @@ impl<C: Codec> Client<C> {
         accepted_deadline_boot_ms: kr_protocol::scalars::U64,
         lease: Option<kr_protocol::local::ForwardedLease>,
         workflow_run_id: Option<kr_protocol::ids::WorkflowRunId>,
+        history: Option<kr_protocol::grant::HistoryScope>,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         if !kr_protocol::local::may_travel_to_a_worker(grant_rights) {
             return Err(IpcError::RightNotForwarded(
@@ -1195,7 +1226,7 @@ impl<C: Codec> Client<C> {
                 actor: actor.clone(),
                 grant_rights: grant_rights.clone(),
                 accepted_deadline_boot_ms,
-                history: None,
+                history,
                 screen_basis: None,
                 workflow_run_id,
                 lease,

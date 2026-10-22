@@ -417,12 +417,18 @@ impl World {
         let rights: CanonicalSet<ActionRight> = [ActionRight::SessionView].into_iter().collect();
         tokio::spawn(async move {
             let answer = link
-                .forward(
+                .forward_within(
                     &mutation,
                     &actor,
                     &rights,
                     bound.deadline_boot_ms,
                     bound.lease,
+                    kr_protocol::grant::HistoryScope {
+                        lower_bound_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(1)),
+                        include_live_screen: true,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
                 )
                 .await
                 .expect("the forward reaches the worker");
