@@ -915,8 +915,9 @@ impl Attention {
     /// read from.
     ///
     /// A change the host recorded before the moment the viewer's history reaches back to is not in
-    /// the view, nor is its place: the viewer has no history of it. The cursors still cover it, so
-    /// the next view starts where this one ended.
+    /// the view, nor is its place in a page: the viewer has no history of it, and a page holds
+    /// `max_changes` of the changes it does reach. The cursors still cover the others, so the next
+    /// view starts where this one ended.
     ///
     /// # Errors
     ///
@@ -931,13 +932,13 @@ impl Attention {
         content: Content,
     ) -> Result<ChangedPage> {
         self.live()?;
-        let mut changed =
-            self.state
-                .visits
-                .changed_since(actor, session_id, max_changes, oldest_output_cursor);
-        changed
-            .changes
-            .retain(|(change, _)| viewer.reaches(Some(change.at_ms)));
+        let changed = self.state.visits.changed_since(
+            actor,
+            session_id,
+            max_changes,
+            oldest_output_cursor,
+            &|at_ms| viewer.reaches(Some(at_ms)),
+        );
         let texts = if content == Content::Whole {
             changed
                 .changes
