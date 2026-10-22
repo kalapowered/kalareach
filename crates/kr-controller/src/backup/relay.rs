@@ -24,6 +24,10 @@
 //!   read that finds privacy mode on, or changed since the read began, or a delay owed, sends
 //!   nothing. A request already on its way when privacy mode is turned on cannot be recalled; its
 //!   answer is not given (`Controller::backup_read` compares the state after the read).
+//! * **The bundle's write is not held to privacy mode.** The recovery bundle is key material, not
+//!   content, so the write that records a checkpoint in it is sent whatever privacy mode says, as
+//!   the bundle's setup is. The restore that asks for it refuses to run under privacy mode first.
+//!   A delay the service named holds it, as it holds every request.
 //! * **The service's words stay out.** A refusal by the service reaches the person as its code with
 //!   a sentence of this program's own, never as the service's text, which can repeat what was
 //!   asked. A failure on this host says what it is in this program's words.
@@ -65,6 +69,9 @@ use crate::quiet::Quiet;
 tokio::task_local! {
     /// The privacy state a read began under, for the read being answered in this task.
     static READING: Published;
+    /// Set while a write of the recovery bundle is being answered in this task. The bundle is key
+    /// material, not content, so privacy mode neither stops that write nor is stopped by it.
+    static WRITING: ();
 }
 
 /// The token source the relay's clients present, which checks where a request is about to leave.
@@ -91,6 +98,10 @@ impl Gated {
                     "the service asked to be left alone, and the time has not passed",
                 ),
             ));
+        }
+        // A write of the recovery bundle moves no content and is not held to privacy mode.
+        if WRITING.try_with(|()| ()).is_ok() {
+            return Ok(());
         }
         let now = self.privacy.now();
         // A read that has not said which state it began under is not sent.
@@ -345,12 +356,13 @@ impl BackupRelay {
         })
     }
 
-    /// Writes the recovery bundle on by one compare-and-swap, which began under the privacy state
-    /// `began`.
+    /// Writes the recovery bundle on by one compare-and-swap.
     ///
     /// It moves a bundle that is there: the call names the place the bundle was read at, and a
     /// service that holds it elsewhere answers [`BackupBundleWriteResult::Conflict`]. Nothing is
     /// kept here about the write, so a write whose answer is lost is the caller's to read about.
+    /// The bundle is key material, so privacy mode does not hold the write back; a delay the
+    /// service named does.
     ///
     /// # Errors
     ///
@@ -360,14 +372,15 @@ impl BackupRelay {
     pub async fn write_bundle(
         &self,
         params: BackupBundleWriteParams,
-        began: Published,
     ) -> Result<BackupBundleWriteResult> {
         if params.sealed_bundle.as_slice().len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
             return Err(ControllerError::InvalidArgument(format!(
                 "a sealed recovery bundle is at most {MAX_SEALED_RECOVERY_BUNDLE_BYTES} bytes"
             )));
         }
-        if params.expected.write_sequence.get() == 0 {
+        // A place with no name is where nothing was written, and the service reads a write against
+        // it as the first one. Only `backup.enable` makes a bundle.
+        if params.expected.write_sequence.get() == 0 || params.expected.revision.0.is_none() {
             return Err(ControllerError::InvalidArgument(
                 "a bundle is moved on from a write that is there, and the first write is one"
                     .to_owned(),
@@ -376,7 +389,7 @@ impl BackupRelay {
         if let Some(left) = self.quiet.left() {
             return Ok(write_wait(left));
         }
-        match READING.scope(began, self.exchange(params)).await {
+        match WRITING.scope((), self.exchange(params)).await {
             Ok(result) => Ok(result),
             Err(Failure::Local(error)) => Err(error),
             Err(Failure::Exchange(error)) => self.refused(&error, "write").map(write_wait),
