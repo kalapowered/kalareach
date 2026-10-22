@@ -2134,7 +2134,7 @@ mod tests {
         assert_eq!(room.opened(), 0, "a refused charge opens no room");
     }
 
-    /// KR-REQ-10.32: the lookup bridge, on a multi-threaded runtime.
+    /// The lookup bridge, on a multi-threaded runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_lookup_bridge_on_a_multi_threaded_runtime() {
         a_successful_start_hands_the_socket_over_once().await;
@@ -2143,8 +2143,8 @@ mod tests {
         a_refused_charge_opens_nothing().await;
     }
 
-    /// KR-REQ-10.32: the lookup bridge, on a current-thread runtime, where the awaiting thread is
-    /// the one that drives the room's I/O while the blocking thread waits.
+    /// The lookup bridge, on a current-thread runtime, where the awaiting thread is the one that
+    /// drives the room's I/O while the blocking thread waits.
     #[tokio::test(flavor = "current_thread")]
     async fn the_lookup_bridge_on_a_current_thread_runtime() {
         a_successful_start_hands_the_socket_over_once().await;
