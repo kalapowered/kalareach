@@ -696,6 +696,26 @@ fn tmux_strings_and_flags(info: &str) -> String {
         .join("\n")
 }
 
+/// `text` as one word of an `sshd` option, which the server reads as its own configuration line:
+/// quotes and a space end or join words there, and a `%` begins a token. The word is quoted, with
+/// a backslash before a quote or a backslash inside it, and a `%` is doubled.
+fn option_word(text: &str) -> String {
+    let mut word = String::with_capacity(text.len() + 2);
+    word.push('"');
+    for character in text.chars() {
+        match character {
+            '"' | '\\' => {
+                word.push('\\');
+                word.push(character);
+            }
+            '%' => word.push_str("%%"),
+            other => word.push(other),
+        }
+    }
+    word.push('"');
+    word
+}
+
 /// A private `sshd`, run as the current user on a loopback port with a host key and an authorised
 /// key made for this test, and stopped when it is dropped. It touches neither the account's
 /// `authorized_keys` nor the host's own `sshd`, and it runs none of the account's `~/.ssh/rc`. The
@@ -744,8 +764,7 @@ impl Sshd {
             .and_then(|listener| listener.local_addr())
             .expect("a free loopback port")
             .port();
-        let log = std::fs::File::create(work.0.join("sshd.log")).expect("a log");
-        let child = std::process::Command::new(sshd)
+        let mut child = std::process::Command::new(sshd)
             .args(["-D", "-e", "-f", "/dev/null", "-h"])
             .arg(&host_key)
             .arg("-p")
@@ -760,43 +779,74 @@ impl Sshd {
                 "PermitUserRC=no",
             ])
             .arg("-o")
-            .arg(format!("AuthorizedKeysFile={}", authorised.display()))
+            .arg(format!(
+                "AuthorizedKeysFile={}",
+                option_word(&authorised.display().to_string())
+            ))
             .args(["-o", "PasswordAuthentication=no"])
             .args(["-o", "KbdInteractiveAuthentication=no"])
             .stdin(std::process::Stdio::null())
-            .stdout(log.try_clone().expect("a log handle"))
-            .stderr(log)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("sshd starts");
+        let log = child.stderr.take().expect("sshd's log");
         let server = Self {
             child,
             port,
             client_key,
         };
-        // Ready is a connection that is accepted, not a moment that has passed.
-        let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
-        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+        // Ready is the moment sshd says it listens: the socket is bound by then, and a connection
+        // made after it is held for sshd to accept. The log ends when sshd does, so a server that
+        // stopped before it listened ends the wait at once, with what it said.
+        let (told, listening) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut said = String::new();
+            let mut announced = false;
+            // The log is read to its end whatever it says: a server whose log nobody reads blocks
+            // or ends on its next line.
+            for line in std::io::BufReader::new(log).lines().map_while(Result::ok) {
+                if announced {
+                    continue;
+                }
+                said.push_str(&line);
+                said.push('\n');
+                if line.contains("Server listening on") {
+                    announced = true;
+                    let _ = told.send(Ok(()));
+                }
+            }
+            if !announced {
+                let _ = told.send(Err(said));
+            }
+        });
+        match tokio::task::spawn_blocking(move || listening.recv_timeout(LIVENESS_DEADLINE))
             .await
-            .is_err()
+            .expect("the wait for sshd ends")
         {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "sshd never accepted a connection: {}",
-                std::fs::read_to_string(work.0.join("sshd.log")).unwrap_or_default()
-            );
-            tokio::task::yield_now().await;
+            Ok(Ok(())) => Some(server),
+            Ok(Err(said)) => panic!("sshd stopped before it listened: {said}"),
+            Err(_) => panic!("sshd never said it listened within {LIVENESS_DEADLINE:?}"),
         }
-        Some(server)
     }
 
     /// The `ssh` command line that runs `command` on this server with a terminal.
+    ///
+    /// The identity file is given as an option, whose value the client reads as a word of its own
+    /// configuration as `sshd` does: `-i` takes the path as a file name, whatever it holds, and
+    /// then reads a `%` in it as the start of a token.
     fn command(&self, command: &str) -> String {
+        let identity = format!(
+            "IdentityFile={}",
+            option_word(&self.client_key.display().to_string())
+        );
         format!(
-            "ssh -tt -F /dev/null -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+            "ssh -tt -F /dev/null -o {identity} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
              -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=ERROR -p {port} \
              127.0.0.1 {command}",
+            identity = kr_worker::testing::shell_word(&identity),
             command = kr_worker::testing::shell_word(command),
-            key = kr_worker::testing::shell_quoted(&self.client_key),
             port = self.port
         )
     }
