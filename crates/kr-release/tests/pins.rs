@@ -42,7 +42,7 @@ fn edit(copy: &tempfile::TempDir, file: &str, change: &dyn Fn(String) -> String)
     std::fs::write(path, changed).expect("a file");
 }
 
-/// KR-REQ-12.33: the eight pins, each at the exact version the workspace names, with the graph the
+/// The eight pins, each at the exact version the workspace names, with the graph the
 /// lock resolves for it and the pairing vectors; the unedited checkout is the control of the
 /// refusals below.
 #[test]

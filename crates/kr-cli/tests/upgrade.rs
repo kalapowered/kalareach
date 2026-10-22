@@ -755,7 +755,7 @@ impl Prepared {
     }
 }
 
-/// KR-REQ-26.03, KR-REQ-26.06: the first command of a package manager's `kr` brings a host that
+/// KR-REQ-26.03: the first command of a package manager's `kr` brings a host that
 /// runs the release before to this release. The release before knows nothing of package managers,
 /// so what is offered it is what it takes of any update, a release archive; it checks the release
 /// and switches as it does for one a person names, and the manager is recorded.

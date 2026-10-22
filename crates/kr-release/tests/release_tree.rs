@@ -211,7 +211,7 @@ fn inputs(tree: &Path) -> Inputs {
     }
 }
 
-/// KR-REQ-07.38, KR-REQ-12.33: the manifest of a tree names, for each shell package, the pins of
+/// KR-REQ-07.38: the manifest of a tree names, for each shell package, the pins of
 /// the shell and the identity the build recorded; the unedited tree passes, which is the control
 /// of the refusals below.
 #[test]
@@ -560,7 +560,7 @@ fn a_relocated_tree_finds_its_modules_through_the_search_path_the_manifest_names
     );
 }
 
-/// KR-REQ-26.41: a tree is signed by the threshold of keys the root names, and a host's check of
+/// A tree is signed by the threshold of keys the root names, and a host's check of
 /// what was signed refuses a tree that changed after it, or one that one key signed.
 #[test]
 #[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]

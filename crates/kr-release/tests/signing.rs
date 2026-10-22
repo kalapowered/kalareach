@@ -74,7 +74,7 @@ fn tuf_key(pair: &Ed25519KeyPair) -> Key {
     Sign::tuf_key(pair)
 }
 
-/// KR-REQ-26.41: a two-key threshold is met by two distinct keys and not by one.
+/// A two-key threshold is met by two distinct keys and not by one.
 #[test]
 fn a_threshold_of_two_is_met_by_two_keys_and_not_by_one() {
     let (first, second) = (pair(), pair());
@@ -123,7 +123,7 @@ fn described_again(key: &Key) -> Vec<(&'static str, Key)> {
     ]
 }
 
-/// KR-REQ-26.41: one key the root describes twice is one key, however the second description
+/// One key the root describes twice is one key, however the second description
 /// differs. Each way gives it another identifier and the same key; with a threshold of two, one
 /// private key would sign for both. The root is refused before a signature is counted.
 #[test]
@@ -194,7 +194,7 @@ fn described(kind: &str, scheme: &str, public: &[u8]) -> Key {
     .expect("a key")
 }
 
-/// KR-REQ-26.41: the library that checks a signature reads one key in more than one encoding: an
+/// The library that checks a signature reads one key in more than one encoding: an
 /// Ed25519 key as its 32 raw bytes or wrapped in its 44-byte `SubjectPublicKeyInfo`, and an
 /// elliptic-curve key as a compressed or an uncompressed point. A root that names one key under two
 /// of them has two names for one private key, and a threshold of two would count that key twice. A
