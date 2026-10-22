@@ -2427,16 +2427,17 @@ async fn a_summary_asked_for_is_written_by_the_model_and_served_beside_the_chang
 }
 
 /// KR-REQ-18.02 and KR-REQ-10.49: a summary is generated text, written from every change in an
-/// interval and from the session text those changes name, so it is served to the owner and to no
-/// paired device, whatever its grant's history, and asked for by none.
+/// interval and from the session text those changes name, so it is served to a paired device only
+/// when its grant reaches every moment, and asked for by no other.
 ///
-/// The owner's is written. A grant that starts at the first change, one that starts after it and
-/// one with no lower bound that started after it are each served the changes their history
-/// reaches and none of the summary, although it is written and `summarise` is asked for: the
+/// The owner's is written. A grant that starts at the beginning of time, as an owner's own device's
+/// does, is served the same summary; a grant with a bound, whether it starts at the first change or
+/// after it, and one with no lower bound that started after it, are served the changes their
+/// history reaches and none of the summary, although it is written and `summarise` is asked for: the
 /// moment a change was observed does not date the text it names, so a summary cannot be shown to
 /// stay inside a grant that begins after any of its sources.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_summary_is_served_to_the_owner_and_to_no_paired_device() {
+async fn a_summary_is_served_to_a_device_that_reaches_every_moment_and_to_none_with_a_bound() {
     use kr_controller::attention::Caller;
     use kr_protocol::envelope::ParamsValue;
     use kr_protocol::method::MethodVersion;
@@ -2489,12 +2490,12 @@ async fn a_summary_is_served_to_the_owner_and_to_no_paired_device() {
         grant
     };
 
-    // A device is served the changes its history reaches and none of a summary, and asks for none.
-    // The changes are the turn and its change set of each of the two records.
+    // A device with a bound is served the changes its history reaches and none of a summary, and
+    // asks for none. The changes are the turn and its change set of each of the two records.
     for (grant, started, changes) in [
         (voice_grant(at + 1), at, 2),
-        (no_history.clone(), at + 1, 2),
         (voice_grant(at), at, 4),
+        (no_history.clone(), at + 1, 2),
     ] {
         let served = read_as(Caller::device(&grant, started)).await;
         assert_eq!(served.changes.len(), changes);
@@ -2504,11 +2505,12 @@ async fn a_summary_is_served_to_the_owner_and_to_no_paired_device() {
     assert_eq!(
         environment.figures().jobs.summary_asks,
         0,
-        "a device starts no job"
+        "a grant with a bound starts no job"
     );
 
-    // The owner's is written, and no device is served it, whatever its grant reaches.
-    environment
+    // The owner's is written, and a device whose grant starts at the beginning of time is served
+    // the same summary, with the same provenance. The grants with a bound are still served none.
+    let written = environment
         .changed_until("the summary", session_id, |changed| {
             changed.summary.0.is_some()
         })
@@ -2516,6 +2518,8 @@ async fn a_summary_is_served_to_the_owner_and_to_no_paired_device() {
         .summary
         .0
         .expect("a summary");
+    let reaching = read_as(Caller::device(&voice_grant(0), at)).await;
+    assert_eq!(reaching.summary.0.as_ref(), Some(&written));
     for (grant, started) in [
         (voice_grant(at), at),
         (voice_grant(at + 1), at),
