@@ -2413,16 +2413,18 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
         "the session's output reached the terminal through the relay",
     );
     answered(&output, queries);
-    let mut keys = keys.lock().expect("the writer is not poisoned");
+    let types = |bytes: &[u8]| {
+        let mut writer = keys.lock().expect("the writer is not poisoned");
+        writer.write_all(bytes).expect("types into the terminal");
+        writer.flush().expect("and it reaches the command");
+    };
 
     // The session begins to close, and stays closing: its termination is never started, so the
     // application goes on running and the attachment goes on being served.
     let (acceptance, closing) = hosted.runtime.close(ClosureReason::CloseRequested);
     assert!(acceptance.initiated, "the close was admitted");
     // A line typed now is refused, and the relay sees the refusal go to the client.
-    keys.write_all(b"typed while closing\r")
-        .expect("types into the terminal");
-    keys.flush().expect("and it reaches the command");
+    types(b"typed while closing\r");
     relay.refusal_passed_on().await;
     // The application writes once more. It reaches the client after the refusal, on the same
     // connection, and the client handles what it is sent in order: a terminal showing this has
