@@ -892,6 +892,140 @@ fn kr_req_11_24_a_withdrawn_grant_reaches_every_release_of_the_package() {
     assert!(matches!(refused, BrokerError::Grant(_)), "{refused}");
 }
 
+/// KR-REQ-11.24 and KR-REQ-06.07: the `Observation` grant is one grant for four capabilities, and
+/// which streams a component may be offered is which of two the installation granted: the
+/// connector's own frames (`broker.semantic_events`) and the terminal's output (`terminal.stream`).
+/// A binding takes them from the installation's effective capabilities when it is made, and a
+/// package that was granted neither is offered nothing.
+#[test]
+fn kr_req_11_24_a_binding_is_offered_the_streams_its_installation_granted() {
+    let worker = Worker::open();
+    let mut both = worker.claude_code();
+    both.granted.insert(PluginCapability::BrokerSemanticEvents);
+    both.granted.insert(PluginCapability::TerminalStream);
+    let mut frames_only = worker.package(&fixture::Shape::gemini_cli(&["--flag"]));
+    frames_only
+        .granted
+        .insert(PluginCapability::BrokerSemanticEvents);
+    frames_only
+        .granted
+        .remove(&PluginCapability::TerminalStream);
+    let mut terminal_only = worker.package(&fixture::Shape::qoder_cli());
+    terminal_only
+        .granted
+        .remove(&PluginCapability::BrokerSemanticEvents);
+    terminal_only
+        .granted
+        .insert(PluginCapability::TerminalStream);
+    let mut neither = declarative(worker.packages.path());
+    for capability in [
+        PluginCapability::BrokerSemanticEvents,
+        PluginCapability::TerminalStream,
+        PluginCapability::TranscriptTail,
+        PluginCapability::ProcessObserve,
+    ] {
+        neither.granted.remove(&capability);
+    }
+    let frame = worker.admit(
+        1,
+        [&both, &frames_only, &terminal_only, &neither]
+            .into_iter()
+            .map(testing::admitted)
+            .collect(),
+    );
+    for (number, source) in [
+        (1, &both),
+        (2, &frames_only),
+        (3, &terminal_only),
+        (4, &neither),
+    ] {
+        worker.register(number);
+        worker
+            .bind(number, number, source.package_digest, frame)
+            .expect("binds");
+    }
+    let streams = |number: u8| {
+        worker
+            .broker
+            .binding_record(binding(number))
+            .expect("the binding is live")
+            .streams
+    };
+    assert_eq!(
+        (streams(1).semantic, streams(1).terminal),
+        (true, true),
+        "both, when both were granted"
+    );
+    assert_eq!((streams(2).semantic, streams(2).terminal), (true, false));
+    assert_eq!((streams(3).semantic, streams(3).terminal), (false, true));
+    assert!(streams(4).is_none(), "neither, when neither was granted");
+    assert!(
+        !worker.grants(4).holds(BrokerGrant::Observation),
+        "and then no observation grant either"
+    );
+}
+
+/// KR-REQ-11.24 and KR-REQ-06.07: a stream the installation withdraws is withdrawn from the binding
+/// at once, though the binding still holds the `Observation` grant through another capability, and
+/// one the installation grants again is in force once the change is recorded. The grants a
+/// withdrawal of one stream leaves alone are left alone, and the binding's row is unchanged, since
+/// no decision reads a stream back from it.
+#[test]
+fn kr_req_11_24_a_withdrawn_stream_is_withdrawn_though_the_observation_grant_stays() {
+    let worker = Worker::open();
+    let mut source = worker.claude_code();
+    source
+        .granted
+        .insert(PluginCapability::BrokerSemanticEvents);
+    source.granted.insert(PluginCapability::TerminalStream);
+    let first = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, first)
+        .expect("binds");
+    let before = worker.grants(1);
+    let streams = || {
+        let bound = worker
+            .broker
+            .binding_record(binding(1))
+            .expect("the binding is live")
+            .streams;
+        (bound.semantic, bound.terminal)
+    };
+    assert_eq!(streams(), (true, true));
+
+    // The installation withdraws the terminal's output and keeps the connector's frames.
+    let mut without_terminal = source.clone();
+    without_terminal
+        .granted
+        .remove(&PluginCapability::TerminalStream);
+    worker.hand_over(Snapshot::admitting(
+        2,
+        vec![testing::admitted(&without_terminal)],
+    ));
+    assert_eq!(
+        streams(),
+        (true, false),
+        "the terminal's output is withdrawn"
+    );
+    assert_eq!(
+        worker.grants(1),
+        before,
+        "and the grants, which never named it, are as they were"
+    );
+
+    // And one the installation grants again is in force once the record is written.
+    worker.hand_over(Snapshot::admitting(3, vec![testing::admitted(&source)]));
+    assert_eq!(streams(), (true, true));
+
+    // A withdrawn observation grant takes every stream with it.
+    worker
+        .broker
+        .withdraw_grant(binding(1), BrokerGrant::Observation)
+        .expect("the grant is withdrawn");
+    assert_eq!(streams(), (false, false));
+}
+
 /// Brings the store back, as the host's maintenance does: the journal writes its own gap, and the
 /// broker commits its gap and finishes its recovery, with nothing handed over meanwhile.
 fn recover(worker: &mut Worker) {
