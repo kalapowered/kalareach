@@ -52,9 +52,7 @@ impl Other {
     /// The release the worker runs, from the build it stated: `kr-worker/<release>`.
     #[must_use]
     pub fn release(&self) -> Option<ReleaseName> {
-        let build = self.stated.as_ref()?;
-        let release = build.build_id.as_str().strip_prefix("kr-worker/")?;
-        ReleaseName::new(release).ok()
+        self.stated.as_ref()?.worker_release()
     }
 
     /// The `kr` of the worker's release in this host's store, held, where the store keeps one that

@@ -446,21 +446,23 @@ impl Controller {
         // its components from the catalogue's own store. Nothing here starts it: it is started
         // when a worker first asks.
         let supervisor: Arc<dyn WorkerSupervisor> = Arc::from(setup.supervisor);
-        let plugin_runtime = Arc::new(super::plugin_runtime::PluginRuntime::new(
-            setup.paths.clone(),
-            Arc::clone(&supervisor),
+        let releases = Arc::new(super::plugin_runtime::StoreReleases::of_this_process());
+        let plugin_runtimes = super::plugin_runtime::PluginRuntimes::new(
+            &setup.paths,
+            &supervisor,
             worker_program.parent().map_or_else(
                 || PathBuf::from(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX)),
                 |directory| {
                     directory.join(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX))
                 },
             ),
-            setup
+            &setup
                 .paths
                 .state_dir()
                 .join("catalogue")
                 .join(kr_plugin_catalogue::PACKAGES_ROOT),
-        ));
+            &releases,
+        );
         // The grants and the invitations live in the daemon's own registry database, beside the
         // devices that hold them, so an authority object and the device it was issued to are in
         // one file and one backup.
@@ -1088,7 +1090,7 @@ impl Controller {
             wall,
             network: std::sync::OnceLock::new(),
             supervisor,
-            plugin_runtime,
+            plugin_runtimes,
             backup,
             backup_runtime,
             backup_relay,

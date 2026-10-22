@@ -218,7 +218,7 @@ impl Controller {
         if let Some(Err(refused)) = &challenged {
             report_unretained(reservation.display_number, refused);
         }
-        if let Some(Ok((proof, described, level))) = challenged
+        if let Some(Ok((proof, described, stated))) = challenged
             && let Some(key) = reservation.claimed_key
         {
             // The worker is alive and is the one this reservation admitted. Its descriptor and its
@@ -228,7 +228,7 @@ impl Controller {
                 &key,
                 &proof,
                 &endpoint,
-                (described, level),
+                (described, stated),
                 held,
             )
             .await?;
@@ -426,13 +426,13 @@ impl Controller {
                 .challenge(&endpoint, &row.public_key, row.session_id)
                 .await
             {
-                Ok((proof, described, level)) => {
+                Ok((proof, described, stated)) => {
                     self.adopt(
                         row.display_number,
                         &row.public_key,
                         &proof,
                         &endpoint,
-                        (described, level),
+                        (described, stated),
                         &held,
                     )
                     .await?;
@@ -466,7 +466,7 @@ impl Controller {
     ) -> Result<(
         kr_protocol::worker::WorkerVerifyProof,
         Option<SessionSummary>,
-        kr_protocol::retained::Level,
+        crate::directory::Stated,
     )> {
         let identity = &self.identity;
         let generation = self.generation;
@@ -497,7 +497,7 @@ impl Controller {
                 ControllerError::supervision("the worker did not answer its challenge in time")
             })??;
         let described = crate::directory::describe(&mut client, session_id).await;
-        Ok((proof, described, client.level()))
+        Ok((proof, described, crate::directory::Stated::of(&client)))
     }
 
     /// Records a recovered worker and republishes its descriptor, and admits the worker with the
@@ -511,7 +511,7 @@ impl Controller {
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
-        (described, level): (Option<SessionSummary>, kr_protocol::retained::Level),
+        (described, stated): (Option<SessionSummary>, crate::directory::Stated),
         held: &ReservationHold,
     ) -> Result<()> {
         let record = WorkerRecord {
@@ -564,7 +564,8 @@ impl Controller {
             KnownWorker {
                 descriptor,
                 endpoint: endpoint.clone(),
-                level,
+                level: stated.level,
+                release: stated.release,
             },
             described,
             held,

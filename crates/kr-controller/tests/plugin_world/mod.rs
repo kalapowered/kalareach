@@ -32,7 +32,7 @@ use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_service::client::PluginClient;
 use kr_plugin_service::launcher;
-use kr_plugin_service::protocol::ComponentSource;
+use kr_plugin_service::protocol::{ComponentSource, HostProtocol};
 use kr_protocol::admission::{PluginRuntimeState, PluginRuntimeWanted};
 use kr_protocol::envelope::{ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue};
 use kr_protocol::hello::PROTOCOL_VERSION;
@@ -264,7 +264,9 @@ impl Drop for HostEnding {
                 hosts.extend(process.clone());
             }
         }
-        if let Ok(Some(published)) = launcher::read_descriptor(&self.environment) {
+        if let Ok(Some(published)) =
+            launcher::read_descriptor(&self.environment, &HostProtocol::THIS)
+        {
             hosts.push(published.process_start_identity);
         }
         for host in &hosts {
@@ -387,7 +389,7 @@ impl Hosted {
 
     /// The process the descriptor names, where a plugin host is published.
     pub fn published(&self) -> Option<ProcessStartIdentity> {
-        launcher::read_descriptor(&self.environment())
+        launcher::read_descriptor(&self.environment(), &HostProtocol::THIS)
             .ok()
             .flatten()
             .map(|descriptor| descriptor.process_start_identity)

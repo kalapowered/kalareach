@@ -382,9 +382,10 @@ pub struct Controller {
     /// revocation path can reach it.
     network: std::sync::OnceLock<Arc<net::NetworkGuard>>,
     supervisor: Arc<dyn WorkerSupervisor>,
-    /// The environment's plugin runtime: started through `supervisor` when a worker first asks
-    /// for it, and never at this daemon's start.
-    plugin_runtime: Arc<plugin_runtime::PluginRuntime>,
+    /// The environment's plugin runtimes, one for each protocol this daemon serves: each is
+    /// started through `supervisor` when a worker of its level first asks for it, and never at
+    /// this daemon's start.
+    plugin_runtimes: plugin_runtime::PluginRuntimes,
     /// The environment's backup service: the generations this host has produced, their staged
     /// ciphertext and the outbox that carries them.
     ///
