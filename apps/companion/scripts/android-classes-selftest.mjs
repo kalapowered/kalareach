@@ -24,6 +24,7 @@ import { definedStrings, missingFrom, packagesOf, requestFrom } from './android-
 const PRESENT = [
   'to.kala.reach.companion.push.KalaReachMessagingService',
   'to.kala.reach.companion.push.PreviewWorker',
+  'to.kala.reach.companion.push.ChallengeWorker',
   'to.kala.reach.platform.PlatformPlugin'
 ]
 
@@ -77,7 +78,7 @@ const code = dex({ defined: PRESENT })
 const filler = { name: 'AndroidManifest.xml', bytes: Buffer.from('not a manifest', 'utf8') }
 
 expect(
-  'an APK whose application dex carries both classes is whole',
+  'an APK whose application dex carries every class is whole',
   'whole.apk',
   zip([filler, { name: 'classes.dex', bytes: code }]),
   'nothing'
@@ -105,9 +106,12 @@ expect(
   'reference-only.apk',
   zip([
     filler,
-    { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]], referenced: [PRESENT[1]] }) }
+    {
+      name: 'classes.dex',
+      bytes: dex({ defined: [PRESENT[0], PRESENT[2], PRESENT[3]], referenced: [PRESENT[1]] })
+    }
   ]),
-  PRESENT.slice(1).join(', ')
+  PRESENT[1]
 )
 expect(
   'an archive comment holding the end-of-directory signature is still read',
@@ -142,14 +146,32 @@ expect(
 expect(
   'an application missing the worker is named, not passed',
   'partial.apk',
-  zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
-  PRESENT.slice(1).join(', ')
+  zip([
+    filler,
+    { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[2], PRESENT[3]] }) }
+  ]),
+  PRESENT[1]
+)
+expect(
+  'an application missing only the challenge worker is named, not passed',
+  'no-challenge-worker.apk',
+  zip([
+    filler,
+    { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[1], PRESENT[3]] }) }
+  ]),
+  PRESENT[2]
 )
 expect(
   'an application missing only the platform plugin is named, not passed',
   'no-plugin.apk',
-  zip([filler, { name: 'classes.dex', bytes: dex({ defined: PRESENT.slice(0, 2) }) }]),
-  PRESENT[2]
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: PRESENT.slice(0, 3) }) }]),
+  PRESENT[3]
+)
+expect(
+  'an application that defines only the service is named for everything else',
+  'service-only.apk',
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
+  PRESENT.slice(1).join(', ')
 )
 expect(
   'a dex layout this does not read is refused rather than guessed at',
