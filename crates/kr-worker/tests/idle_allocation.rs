@@ -111,7 +111,9 @@ fn fill_the_screen(engine: &mut TerminalEngine, cursor: &mut u64, columns: usize
 fn the_bytes_a_session_holds_idle_and_after_it_has_printed_a_great_deal_are_within_its_budgets() {
     // The idle grids: the canonical size section 27 measures, and one with four times the cells.
     // Neither holds what the budgets reserve: the cache is not made ahead and the screens are
-    // allocated as they are written.
+    // allocated as they are written. The bound is a quarter of the cache's, which is what "not made
+    // ahead" is measured against here; the performance pin on an idle grid has a bound of its own,
+    // set for its own row.
     let (small, small_idle) =
         held_by(|| TerminalEngine::new(dimensions(120, 40), clock()).expect("a canonical grid"));
     let (large, large_idle) =
@@ -189,7 +191,7 @@ fn the_bytes_a_session_holds_idle_and_after_it_has_printed_a_great_deal_are_with
             .enable_all()
             .build()
             .expect("a runtime");
-        let session = runtime.block_on(async { idle_session(&host) });
+        let session = runtime.block_on(idle_session(&host));
         (runtime, session)
     });
     eprintln!("an idle worker session: {worker_bytes} bytes beside its shell");
@@ -219,8 +221,13 @@ fn the_bytes_a_session_holds_idle_and_after_it_has_printed_a_great_deal_are_with
 /// cache's bound or the budget's, ahead of use, would be many times this.
 const WORKER_IDLE_BYTES: usize = 2 * 1024 * 1024;
 
-/// Opens a session whose root shell waits for input, and starts the runtime that serves it.
-fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtime::SessionRuntime> {
+/// What the session's shell prints before it waits for input.
+const READY: &str = "kr-ready";
+
+/// Opens a session whose root shell waits for input, starts the runtime that serves it, and returns
+/// once the runtime has read what the shell first printed: its reading path has run and what it
+/// allocates for itself is counted.
+async fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtime::SessionRuntime> {
     let session_id =
         kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
     let config = kr_worker::session::SessionConfig {
@@ -228,7 +235,7 @@ fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtime::Ses
         session_epoch: kr_protocol::ids::SessionEpoch::V1,
         environment_id: host.environment_id(),
         display_number: kr_protocol::session::DisplayNumber::new(1),
-        shell: kr_worker::testing::posix_script("exec cat"),
+        shell: kr_worker::testing::posix_script(&format!("printf {READY}; exec cat")),
         shell_mode: kr_protocol::session::ShellMode::NativeCompat,
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         desktop: kr_protocol::identity::DesktopBinding::none(),
@@ -243,5 +250,26 @@ fn idle_session(host: &kr_ipc::testing::TempHost) -> Arc<kr_worker::runtime::Ses
     };
     let mut opened = kr_worker::session::Session::open(config).expect("opens");
     opened.launch().expect("launches");
-    Arc::new(kr_worker::runtime::SessionRuntime::start(opened, clock()).expect("starts"))
+    let runtime =
+        Arc::new(kr_worker::runtime::SessionRuntime::start(opened, clock()).expect("starts"));
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let page = runtime
+                .session()
+                .history_page(0, 1024 * 1024)
+                .expect("reads the retained output");
+            if page
+                .bytes
+                .as_slice()
+                .windows(READY.len())
+                .any(|window| window == READY.as_bytes())
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime read what the shell first printed");
+    runtime
 }
