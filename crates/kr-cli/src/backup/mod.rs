@@ -290,6 +290,7 @@ fn print(outcome: &Outcome, json: bool) {
                 for line in planned.lines() {
                     output::say(&line);
                 }
+                say_left_out(&planned);
             }
         }
         Outcome::Restored {
@@ -378,23 +379,28 @@ fn print(outcome: &Outcome, json: bool) {
                 if let Some(words) = &configuration_words {
                     output::say(words);
                 }
-                // The sets of preferences whose variables and command integrations stayed the
-                // host's own, by name, so that the person can add them again.
-                if let Some(left_out) = planned.left_out() {
-                    if left_out.preferences {
-                        output::say(&Shown::said(
-                            "Not applied: the variables and command integrations of the base \
-                             preferences.",
-                        ));
-                    }
-                    for name in &left_out.profiles {
-                        output::line(&stdout_line!(
-                            "Not applied: the variables and command integrations of the profile {}.",
-                            Asked::text(Request::Restore, name)
-                        ));
-                    }
-                }
+                say_left_out(&planned);
             }
         }
+    }
+}
+
+/// Names the sets of preferences whose variables and command integrations the restore keeps the
+/// host's own of: the base preferences, and each profile by name, so that a person can add them
+/// again. A name is the owner's own text, and no variable or value is named.
+fn say_left_out(planned: &restore::Planned) {
+    let Some(left_out) = planned.left_out() else {
+        return;
+    };
+    if left_out.preferences {
+        output::say(&Shown::said(
+            "Not applied: the variables and command integrations of the base preferences.",
+        ));
+    }
+    for name in &left_out.profiles {
+        output::line(&stdout_line!(
+            "Not applied: the variables and command integrations of the profile {}.",
+            Asked::text(Request::Restore, name)
+        ));
     }
 }
