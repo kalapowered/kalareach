@@ -123,7 +123,7 @@ export function MobileSessions({
     const reads: Watch = watch([], () => {
       const current = reads.read()
       if (current === null) return
-      ask(() => port.sessionList({}))
+      ask(() => port.sessionList({ environment_id: null, include_closed: false }))
         .then((answer) => {
           if (!current()) return
           const sessions = (answer satisfies SessionListResult).sessions ?? []

@@ -277,6 +277,33 @@ describe('the lists of a phone', () => {
   })
 })
 
+describe('the sessions list of a phone against a host that holds it to the operation (KR-REQ-13.08)', () => {
+  // A host refuses an operation's parameters when one is missing, so a list read with fewer than the
+  // operation names shows the person that the sessions could not be read. The scripted host answers
+  // whatever it is sent, so what the screen sends is what is checked.
+  it('reads the list with every parameter the operation names', async () => {
+    const { port, controls } = fakeHost()
+    const asked: unknown[] = []
+    const read = port.sessionList.bind(port)
+    port.sessionList = (params) => {
+      asked.push(params)
+      return read(params)
+    }
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="android" />
+      </AppProvider>
+    )
+    await openTab('Sessions')
+    expect(await screen.findByText('Session 1')).toBeInTheDocument()
+    expect(controls).toBeDefined()
+    expect(asked.length).toBeGreaterThan(0)
+    for (const params of asked) {
+      expect(params).toEqual({ environment_id: null, include_closed: false })
+    }
+  })
+})
+
 describe('the lists of a phone, when the host changes', () => {
   // KR-REQ-13.08: choosing another host while one is reached shows nothing of the first host's
   // sessions: not before the second answers, not when it answers, and not when it refuses to. A row
