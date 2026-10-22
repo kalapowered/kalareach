@@ -422,6 +422,19 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "output times",
+        holds: "when each part of the retained output was produced: intervals of its cursors, each with the wall-clock reading of its first byte and whether the clock could be proved",
+        durability: Durability::BestEffortFile,
+        retention: Retention::PeriodOrByteCap(crate::persistence::retention::OUTPUT_RETENTION),
+        // Instants and cursors; none of the output's own bytes.
+        content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::WorkerThenArchive,
+        reconciliation: Reconciliation::RebuiltWithGaps,
+        evictable_under_history_cap: true,
+        served_by_archive: true,
+    },
+    StoreDescriptor {
         name: "resident history",
         holds: "the most recent output, in memory, ahead of the spool",
         durability: Durability::ProcessMemory,
@@ -664,13 +677,18 @@ mod tests {
     }
 
     #[test]
-    fn only_terminal_content_and_host_events_are_evictable_under_the_cap() {
+    fn only_terminal_content_what_describes_it_and_host_events_are_evictable_under_the_cap() {
         let evictable: Vec<&str> = evictable_under_history_cap()
             .map(|store| store.name)
             .collect();
         assert_eq!(
             evictable,
-            vec!["host_events", "output spool", "resident history"]
+            vec![
+                "host_events",
+                "output spool",
+                "output times",
+                "resident history"
+            ]
         );
     }
 

@@ -21,6 +21,7 @@
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`lifecycle`] | What a live session is watched for: the root shell's exit, its desktop, and what it owns |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
+//! | [`output_times`] | When retained output was produced: intervals of the output's cursors and the instant each began |
 //! | [`privacy`] | Privacy mode: the generation, the four things it asks of every subsystem, and what it keeps |
 //! | [`persistence`] | The durability contract: commit points, per-store declarations, the journal-fault seam, the outbox, retention and migrations |
 //! | [`ownership`] | Which processes a session owns, and how much of that the host can account for |
@@ -57,6 +58,7 @@ pub mod journal;
 pub mod lifecycle;
 pub mod local_gate;
 pub mod output;
+pub mod output_times;
 pub mod owned_writer;
 pub mod ownership;
 pub mod persistence;
