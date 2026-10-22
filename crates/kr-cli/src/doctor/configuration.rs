@@ -41,7 +41,11 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
 /// Reads the configuration document at `path`, bounded and owner-only.
 #[must_use]
 pub fn load_at(path: &std::path::Path) -> configuration::Loaded {
-    match configuration::read_file(path, configuration::MAX_LEN) {
+    match configuration::read_file(
+        path,
+        configuration::MAX_LEN,
+        kr_ipc::paths::check_configuration_file,
+    ) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
         Err(error) => configuration::unreadable(error),
     }
