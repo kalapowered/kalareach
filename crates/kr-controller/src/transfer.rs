@@ -280,7 +280,7 @@ impl kr_transfer::SessionRetention for ArchiveAnswers<'_> {
         &self,
         sessions: &std::collections::BTreeSet<SessionId>,
     ) -> kr_transfer::Result<std::collections::BTreeSet<SessionId>> {
-        let view = self.owner.archive_retention().map_err(|error| {
+        let retained = self.owner.retained_among(sessions).map_err(|error| {
             kr_transfer::TransferError::RetentionUnavailable {
                 detail: error.to_string(),
             }
@@ -294,11 +294,7 @@ impl kr_transfer::SessionRetention for ArchiveAnswers<'_> {
         {
             pause.wait();
         }
-        Ok(sessions
-            .iter()
-            .copied()
-            .filter(|session_id| view.retains(*session_id))
-            .collect())
+        Ok(retained)
     }
 
     fn clock_is_proven(&self, reading: TimestampMs) -> bool {
