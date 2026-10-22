@@ -5864,3 +5864,459 @@ async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores(
         "{session}: the output came back"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The host's own history, against a Worker on this machine.
+// ---------------------------------------------------------------------------------------------
+
+/// The daemon's relay of a restore's reads, as a restore source: what `kr backup restore` reads
+/// through, over the daemon's local socket.
+#[derive(Debug)]
+struct Relay {
+    endpoint: kr_ipc::paths::Endpoint,
+}
+
+impl Relay {
+    async fn ask(&self, params: BackupReadParams) -> kr_client::Result<BackupReadResult> {
+        relay_read(&self.endpoint, &params)
+            .await
+            .map_err(kr_client::ClientError::Host)
+    }
+}
+
+impl kr_client::recovery::RestoreSource for Relay {
+    fn service(&self) -> ServiceFuture<'_, kr_client::recovery::SourceService> {
+        Box::pin(async move {
+            match self.ask(BackupReadParams::Service {}).await? {
+                BackupReadResult::Service { origin, sign_in } => {
+                    assert_eq!(sign_in, BackupSignIn::Usable);
+                    Ok(kr_client::recovery::SourceService {
+                        origin,
+                        sign_in: kr_client::recovery::SourceSignIn::Usable,
+                    })
+                }
+                other => panic!("the daemon answered a service read with {other:?}"),
+            }
+        })
+    }
+
+    fn bundle<'a>(
+        &'a self,
+        locator: &'a str,
+    ) -> ServiceFuture<'a, kr_client::services::SyncFetched> {
+        Box::pin(async move {
+            let locator: Uuid = locator.parse().expect("an identifier");
+            match self.ask(BackupReadParams::Bundle { locator }).await? {
+                BackupReadResult::Bundle {
+                    bundle:
+                        BackupBundle::Held {
+                            write_sequence,
+                            revision,
+                            recovery,
+                            ciphertext,
+                        },
+                } => {
+                    let recovery = recovery.0.map(kr_client::services::SyncRecoveryId::new);
+                    Ok(kr_client::services::SyncFetched::Held {
+                        position: kr_client::services::SyncPosition::at(
+                            write_sequence.get(),
+                            kr_client::services::SyncRevision::new(
+                                revision.0.expect("a bundle write has a name"),
+                            ),
+                            recovery,
+                        ),
+                        ciphertext: ciphertext.as_slice().to_vec(),
+                    })
+                }
+                BackupReadResult::Bundle {
+                    bundle: BackupBundle::Absent { recovery },
+                } => Ok(kr_client::services::SyncFetched::Absent {
+                    recovery: recovery.0.map(kr_client::services::SyncRecoveryId::new),
+                }),
+                other => panic!("the daemon answered a bundle read with {other:?}"),
+            }
+        })
+    }
+
+    fn generation<'a>(
+        &'a self,
+        archive_id: ArchiveId,
+        checkpoint: Option<&'a ArchiveCheckpoint>,
+    ) -> ServiceFuture<'a, Option<kr_protocol::archive::BackupGenerationPublication>> {
+        Box::pin(async move {
+            match self
+                .ask(BackupReadParams::Generation {
+                    archive_id,
+                    checkpoint: Nullable(checkpoint.cloned()),
+                })
+                .await?
+            {
+                BackupReadResult::Generation { publication } => Ok(publication.0),
+                other => panic!("the daemon answered a generation read with {other:?}"),
+            }
+        })
+    }
+
+    fn object(
+        &self,
+        archive_id: ArchiveId,
+        object: BackupObjectId,
+        offset: u64,
+        length: u64,
+    ) -> ServiceFuture<'_, Vec<u8>> {
+        Box::pin(async move {
+            match self
+                .ask(BackupReadParams::Object {
+                    archive_id,
+                    object_id: object,
+                    offset: kr_protocol::scalars::U64::new(offset),
+                    length: kr_protocol::scalars::U64::new(length),
+                })
+                .await?
+            {
+                BackupReadResult::Object { bytes } => Ok(bytes.as_slice().to_vec()),
+                other => panic!("the daemon answered an object read with {other:?}"),
+            }
+        })
+    }
+}
+
+/// The daemon's relay of the write that records a verified generation in the bundle.
+#[derive(Debug)]
+struct RelayBundles {
+    endpoint: kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+}
+
+impl kr_client::recovery::BundleWriter for RelayBundles {
+    fn write<'a>(
+        &'a self,
+        write: kr_client::recovery::BundleWrite<'a>,
+    ) -> ServiceFuture<'a, kr_client::recovery::BundleWritten> {
+        use kr_protocol::backup_bundle::{
+            BackupBundlePlace, BackupBundleWriteParams, BackupBundleWriteResult,
+        };
+        use kr_protocol::scalars::U64;
+
+        Box::pin(async move {
+            let place = |position: kr_client::services::SyncPosition| BackupBundlePlace {
+                write_sequence: U64::new(position.write_sequence),
+                revision: Nullable(position.revision.0.map(|revision| revision.get())),
+                recovery: Nullable(position.recovery().map(|recovery| recovery.get())),
+            };
+            let params = BackupBundleWriteParams {
+                locator: write.locator.parse().expect("an identifier"),
+                expected: place(write.expected),
+                request_id: write.request_id,
+                signed_at_ms: TimestampMs::new(write.signed_at_ms),
+                sealed_bundle: kr_protocol::scalars::Bytes::new(write.sealed.to_vec()),
+            };
+            let mut client = LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            let answered: BackupBundleWriteResult = client
+                .mutate(
+                    Method::BackupBundleWrite,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(self.environment),
+                    &params,
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .map_err(kr_client::ClientError::Host)?
+                .to_typed()
+                .expect("a result of the declared shape");
+            Ok(match answered {
+                BackupBundleWriteResult::Written { place } => {
+                    kr_client::recovery::BundleWritten::Written(
+                        kr_client::services::SyncPosition::at(
+                            place.write_sequence.get(),
+                            kr_client::services::SyncRevision::new(
+                                place.revision.0.expect("a write has a name"),
+                            ),
+                            place
+                                .recovery
+                                .0
+                                .map(kr_client::services::SyncRecoveryId::new),
+                        ),
+                    )
+                }
+                BackupBundleWriteResult::Conflict { .. } => {
+                    kr_client::recovery::BundleWritten::Conflict
+                }
+                BackupBundleWriteResult::Wait {
+                    retry_after_seconds,
+                } => kr_client::recovery::BundleWritten::Wait {
+                    seconds: retry_after_seconds.get(),
+                },
+            })
+        })
+    }
+}
+
+/// KR-REQ-18.05 and 20.22, through the daemon's production path against a Worker on this machine:
+/// the host's own history, a closed session with output, is backed up by the daemon's producer once
+/// the owner's setup has made the kit; a host that holds nothing but the kit restores the session
+/// through the daemon's relay, byte for byte, and records the generation it verified in the bundle
+/// at the Worker; and, with the account's retention at two daily snapshots, the daemon deletes the
+/// objects of the generation pushed out, which the Worker holds as tombstones that are still
+/// charged.
+///
+/// The only part stood in is where the account's token comes from: the Worker's development-only
+/// sign-in wrote it, and the daemon is signed in with it before it starts. The carrier waits on a
+/// timer that runs by itself. Ignored unless it is asked for, so an ordinary run of this workspace
+/// sends nothing anywhere; `scripts/e2e-backup.sh` starts the Worker and runs it:
+///
+/// ```text
+/// KR_DEPLOYED_ORIGIN=http://127.0.0.1:<port> KR_BACKUP_TOKENS=<file> \
+///   cargo test -p kr-controller --test managed_storage a_closed_sessions_history -- --ignored
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs only against a Worker on this machine named by KR_DEPLOYED_ORIGIN and KR_BACKUP_TOKENS"]
+async fn a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_and_restored_with_only_the_kit()
+ {
+    use kr_client::recovery::{FilesRestore, MemberRole, parse_kit};
+
+    let (Some(origin), Some(tokens)) = (
+        std::env::var("KR_DEPLOYED_ORIGIN").ok(),
+        std::env::var_os("KR_BACKUP_TOKENS"),
+    ) else {
+        panic!("KR_DEPLOYED_ORIGIN and KR_BACKUP_TOKENS name the Worker to ask");
+    };
+    let tokens: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(tokens).expect("the tokens file")).expect("tokens");
+    let secret = tokens[&origin]["write"]
+        .as_str()
+        .expect("a backup.write token for this origin")
+        .to_owned();
+    let gateway = GatewayOrigin::new(origin.clone()).expect("the Worker's origin");
+
+    // The host: a closed session with output in its registry and spool, the Worker selected as its
+    // storage service, and the account signed in with the token the Worker's sign-in wrote.
+    let host = kr_ipc::testing::TempHost::create();
+    let output: &[u8] = b"first line\r\nsecond line\r\n";
+    let session = closed_session(&host, output, 9_000);
+    write_document(&host, Some(&origin));
+    keep_sign_in(&host, &origin, &secret, &["openid", "backup.write"], 3600).await;
+    let (controller, endpoint, _serving) = start_daemon(&host, HeldTimer::automatic()).await;
+    let writer = daemon_writer(&host);
+    let producer = daemon_producer(&host);
+
+    // The owner sets backups up from a kit it made, as the command does.
+    let archive = ArchiveId::new(kr_ipc::new_uuid());
+    let made = kr_client::recovery::prepare_setup(&kr_client::recovery::SetupInputs {
+        origin: gateway.as_str(),
+        archive_id: archive,
+        writer: (writer.key_id(), *writer.public()),
+        producer: (producer.key_id(), *producer.public()),
+        enabled_at_ms: kr_ipc::now_ms(),
+        replace: false,
+    })
+    .expect("a setup is prepared");
+    assert!(
+        matches!(
+            enable_at(&endpoint, host.environment_id(), &made.params).await,
+            BackupEnableResult::Enabled { .. }
+        ),
+        "the Worker takes the bundle, the writer and the setup"
+    );
+
+    // The daemon's producer makes the host's first generation and the carrier sends it.
+    let published = |generation: u64| {
+        controller
+            .backup()
+            .generation(archive, BackupGeneration::new(generation))
+            .expect("the store reads")
+            .is_some_and(|record| {
+                record.production == Production::Complete && record.remote == Remote::Published
+            })
+    };
+    let runtime = controller.backup_runtime().expect("a carrier");
+    let mut passes = runtime.passes();
+    within(
+        "the host's first generation is published at the Worker",
+        async {
+            while !published(1) {
+                passes.changed().await.expect("the carrier is running");
+            }
+        },
+    )
+    .await;
+
+    // A host that holds nothing but the kit restores it through the daemon's relay.
+    let kit = parse_kit(&made.kit).expect("the kit");
+    let relay = Arc::new(Relay {
+        endpoint: endpoint.clone(),
+    });
+    let prepared = FilesRestore::prepare(kit.clone(), relay, Some(archive), None)
+        .await
+        .expect("the kit opens the bundle and the host's generation at the Worker");
+    assert_eq!(prepared.plan().generation.get(), 1);
+    let (member, _, _) = prepared
+        .plan()
+        .restored()
+        .find(|(_, _, role)| *role == MemberRole::Session)
+        .expect("the session is in the plan");
+    let restored = prepared
+        .member(member.object_id)
+        .await
+        .expect("the session opens");
+    let document: serde_json::Value =
+        serde_json::from_slice(restored.expose()).expect("a session export");
+    assert_eq!(document["format"], "kalareach-session-export/1");
+    let read_back: Vec<u8> = document["output"]["chunks"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .flat_map(|chunk| {
+            kr_protocol::scalars::from_base64url(chunk["base64url"].as_str().expect("text"))
+                .expect("decodes")
+        })
+        .collect();
+    assert_eq!(
+        read_back, output,
+        "the session {session} comes back byte for byte"
+    );
+
+    // The restore records the generation it verified in the bundle, at the Worker.
+    let recorded = prepared
+        .record_checkpoint(
+            &RelayBundles {
+                endpoint: endpoint.clone(),
+                environment: host.environment_id(),
+            },
+            kr_ipc::now_ms(),
+        )
+        .await
+        .expect("the checkpoint is recorded at the Worker");
+    assert!(matches!(
+        recorded,
+        kr_client::recovery::CheckpointRecorded::Written { bundle_revision: 2 }
+    ));
+    let seed = kr_crypto::kdf::RecoverySeed::from_kit(&kit).expect("the seed");
+    let context = kit
+        .context(gateway.as_str())
+        .expect("the kit names the origin");
+    let read = relay_read(
+        &endpoint,
+        &BackupReadParams::Bundle {
+            locator: made.params.bundle_locator,
+        },
+    )
+    .await
+    .expect("the bundle is read");
+    let BackupReadResult::Bundle {
+        bundle: BackupBundle::Held { ciphertext, .. },
+    } = read
+    else {
+        panic!("the Worker holds the bundle");
+    };
+    let bundle = kr_crypto::archive::decrypt_recovery_bundle(
+        &seed.bundle_key_for(&context).expect("a key"),
+        ciphertext.as_slice(),
+    )
+    .expect("the kit opens the bundle");
+    assert_eq!(bundle.revision.get(), 2);
+    assert_eq!(
+        bundle
+            .checkpoints
+            .iter()
+            .map(|checkpoint| (checkpoint.archive_id, checkpoint.backup_generation.get()))
+            .collect::<Vec<_>>(),
+        [(archive, 1)],
+        "the bundle at the Worker records the generation the restore verified"
+    );
+    assert!(
+        bundle
+            .trusted_writers
+            .iter()
+            .any(|trusted| trusted.writer_key_id == writer.key_id()),
+        "what the host's setup put in the bundle is still there"
+    );
+
+    // With two daily snapshots recorded for the account, the generations that follow push the first
+    // out of the chain, and the daemon deletes its objects: tombstones at the Worker, still charged.
+    let http: Arc<dyn ServiceHttp> = Arc::new(
+        HttpService::with(
+            gateway.clone(),
+            kr_client::services::HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport"),
+    );
+    let owner = Arc::new(Owner {
+        key: AuthorisationKeyPair::generate().expect("an owner key"),
+    });
+    let storage = kr_client::services::ManagedStorageService::new(
+        gateway,
+        Arc::clone(&http),
+        Arc::clone(&owner) as _,
+    )
+    .presenting(Arc::new(Bearer(secret)));
+    let status = kr_client::services::StorageService::status(&storage)
+        .await
+        .expect("the account's storage status");
+    kr_client::services::StorageService::set_retention(
+        &storage,
+        &kr_client::services::RetentionChange {
+            backup: kr_client::services::BackupState::On,
+            daily_snapshots: Some(2),
+            expected_revision: status.retention_revision,
+        },
+    )
+    .await
+    .expect("two daily snapshots are recorded");
+    let first_objects = controller
+        .backup()
+        .objects(archive, BackupGeneration::new(1))
+        .expect("a read")
+        .len() as u64;
+    assert!(
+        first_objects >= 2,
+        "the session, the configuration and the manifest"
+    );
+    let (sender, device) = (
+        StoredEnvelopeKeyPair::generate().expect("a producer key"),
+        StoredEnvelopeKeyPair::generate().expect("a recipient key"),
+    );
+    for generation in [2u8, 3] {
+        seal_and_admit(
+            &controller,
+            &writer,
+            (&sender, &device),
+            archive,
+            u64::from(generation),
+            &[(generation, plaintext(2048))],
+            false,
+        );
+        within("the generation is published at the Worker", async {
+            while !published(u64::from(generation)) {
+                passes.changed().await.expect("the carrier is running");
+            }
+        })
+        .await;
+    }
+    within(
+        "the daemon deletes the generation pushed out of the chain",
+        async {
+            loop {
+                let held = kr_client::services::StorageService::status(&storage)
+                    .await
+                    .expect("the account's storage status");
+                if held.tombstoned.objects > 0 {
+                    assert_eq!(
+                        held.tombstoned.objects, first_objects,
+                        "exactly the first generation's objects are tombstones"
+                    );
+                    assert!(held.tombstoned.bytes > 0, "a tombstone is still charged");
+                    break;
+                }
+                passes.changed().await.expect("the carrier is running");
+            }
+        },
+    )
+    .await;
+    eprintln!(
+        "history: the daemon backed up a closed session, a kit alone restored it and recorded its generation, and the generation pushed out of two snapshots is a tombstone ({origin})"
+    );
+}
