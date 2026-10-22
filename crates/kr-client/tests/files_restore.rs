@@ -1256,7 +1256,7 @@ async fn a_checkpoint_is_not_lowered_and_not_recorded_over_another_manifest_of_i
     assert!(matches!(
         refused,
         RestoreError::Recovery(ref cause)
-            if matches!(**cause, RecoveryError::BundleWentBackToAnOlderRevision { first: 3 })
+            if matches!(**cause, RecoveryError::BundleWentBackToAnOlderRevision { newest: 3 })
     ));
     assert_eq!(*bundle.writes.lock().expect("writes"), 0);
 
@@ -1348,7 +1348,7 @@ async fn a_retry_does_not_write_on_a_bundle_older_than_one_an_attempt_read() {
     assert!(matches!(
         refused,
         RestoreError::Recovery(ref cause)
-            if matches!(**cause, RecoveryError::BundleWentBackToAnOlderRevision { first: 6 })
+            if matches!(**cause, RecoveryError::BundleWentBackToAnOlderRevision { newest: 6 })
     ));
     assert_eq!(
         *writer.writes.lock().expect("writes"),

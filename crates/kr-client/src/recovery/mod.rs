@@ -202,14 +202,14 @@ pub enum RecoveryError {
         /// The generation this restore read the bundle record for the archive.
         known: u64,
     },
-    /// The bundle the service now holds is an older revision than the one this restore read.
+    /// The bundle the service now holds is an older revision than the newest one this restore read.
     #[error(
-        "the service now holds revision of the recovery bundle older than revision {first}, which \
-         this restore read, so nothing is recorded"
+        "the service now holds a revision of the recovery bundle older than revision {newest}, \
+         which this restore read, so nothing is recorded"
     )]
     BundleWentBackToAnOlderRevision {
-        /// The revision this restore read first.
-        first: u64,
+        /// The newest revision this restore read.
+        newest: u64,
     },
     /// The file is an offline export in another format than this release reads.
     #[error("that file is not an offline export this release reads")]
