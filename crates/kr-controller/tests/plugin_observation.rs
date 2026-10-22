@@ -27,6 +27,7 @@ mod plugin_world;
 
 use kr_protocol::gateway::{PendingKind, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
+use kr_worker::broker::observation::Audience;
 use plugin_world::observing::{
     Observing, Options, Spec, answered, binding, credential, digest, highest_line, notification,
     request, unlisted,
@@ -76,6 +77,15 @@ async fn kr_req_06_07_a_frame_the_worker_offers_reaches_the_components_that_may_
     for number in [1, 2, 3] {
         world.until_ready(number).await;
     }
+    // Of the four bindings only the first may be offered the connector's frames: the second runs
+    // another package, the third holds the grant and no stream, and the fourth is rich-disabled.
+    assert_eq!(
+        world.broker().observing(Audience::Native {
+            instance: plugin_world::observing::instance(),
+            package: Some(&plugin_world::acting::installed()),
+        }),
+        [binding(1)]
+    );
 
     let frames = [
         notification("one"),
