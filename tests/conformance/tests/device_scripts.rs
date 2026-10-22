@@ -30,43 +30,65 @@ struct Script {
     args: &'static [&'static str],
     /// Whether the script waits for the device to report that it has booted.
     waits_for_boot: bool,
+    /// What the script is told in its environment to get as far as the device.
+    env: &'static [(&'static str, &'static str)],
 }
 
-const SCRIPTS: [Script; 7] = [
+const SCRIPTS: [Script; 9] = [
     Script {
         path: "scripts/e2e-mobile.sh",
         args: &["android"],
         waits_for_boot: true,
+        env: &[],
     },
     Script {
         path: "scripts/e2e-voice-device.sh",
         args: &["android"],
         waits_for_boot: false,
+        env: &[],
     },
     Script {
         path: "scripts/e2e-voice-call-bridge.sh",
         args: &["android"],
         waits_for_boot: false,
+        env: &[],
     },
     Script {
         path: "scripts/e2e-voice-call-device.sh",
         args: &["android"],
         waits_for_boot: false,
+        env: &[],
     },
     Script {
         path: "apps/companion/e2e/android-stores.sh",
         args: &["application.apk"],
         waits_for_boot: false,
+        env: &[],
     },
     Script {
         path: "apps/companion/e2e/standing-emulator.sh",
         args: &[],
         waits_for_boot: false,
+        env: &[],
     },
     Script {
         path: "apps/companion/e2e/system-text-size-android.sh",
         args: &["application.apk"],
         waits_for_boot: false,
+        env: &[],
+    },
+    Script {
+        path: "scripts/e2e-pairing-device.sh",
+        args: &["android"],
+        waits_for_boot: false,
+        env: &[],
+    },
+    Script {
+        // The package it installs is named, so the script goes no further than the device for it.
+        path: "scripts/e2e-android-release.sh",
+        args: &[],
+        waits_for_boot: false,
+        env: &[("KR_RELEASE_APK", "application.apk")],
     },
 ];
 
@@ -216,6 +238,11 @@ fn run(
         ),
     );
 
+    // The signer and the aligner a release run looks for before it builds anything.
+    for tool in ["apksigner", "zipalign"] {
+        stand_in(&sdk.join("build-tools/36.0.0"), tool, &record, "exit 0");
+    }
+
     // What a script calls on the way to the device. A build succeeds without building, and the
     // host build names an executable as cargo does; the page server stays up until the script that
     // started it has gone, as the real one does; nothing is already serving; the image reader does
@@ -228,11 +255,22 @@ fn run(
         &record,
         &format!(
             "case \"$*\" in\n\
-             *--message-format=json*) echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"{}\",\"target\":{{\"name\":\"voice_device\"}}}}' ;;\n\
+             *--message-format=json*) for host in voice_device pairing_device release_tls_device; do echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"{path}\",\"target\":{{\"name\":\"'$host'\"}}}}'; done ;;\n\
              *) exit 1 ;;\n\
              esac",
-            tools.join("voice_device").display()
+            path = tools.join("voice_device").display()
         ),
+    );
+    // Python reads what the build said, and the checks of a package and the driver of the emulator
+    // run on a device that is not there: they say nothing and succeed.
+    stand_in(
+        &tools,
+        "python3",
+        &record,
+        "case \"$1\" in\n\
+         */android-network-config.py | */pairing-android.py) exit 0 ;;\n\
+         esac\n\
+         exec /usr/bin/python3 \"$@\"",
     );
     stand_in(
         &tools,
@@ -280,7 +318,7 @@ fn run(
         .env("KR_STANDING_SHOTS", root.join("scratch"))
         .env("KR_TEXT_SIZE_SHOTS", root.join("scratch"))
         .env("KR_MOBILE_SETTLE", "0");
-    for (name, value) in extra {
+    for (name, value) in script.env.iter().chain(extra.iter()) {
         command.env(name, value);
     }
     let output = command.output().expect("the script runs");
