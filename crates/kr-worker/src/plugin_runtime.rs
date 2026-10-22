@@ -142,9 +142,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         lane,
         health_due: None,
         health_failures: 0,
-        notices_epoch: 0,
     };
-    link.notices_epoch = link.lane.privacy_epoch();
     loop {
         let Some(wants) = broker.upgrade().map(|broker| broker.component_wants()) else {
             return;
@@ -183,9 +181,6 @@ struct Link {
     health_due: Option<tokio::time::Instant>,
     /// How many times in a row the runtime did not answer.
     health_failures: u32,
-    /// The number privacy mode's changes had reached when the link last read a notice from the
-    /// runtime. A notice read after a change may be about something that happened before it.
-    notices_epoch: u64,
 }
 
 /// One binding's refusal by the runtime.
@@ -633,13 +628,6 @@ impl Link {
                 notice = notice => Event::Notice(notice),
             }
         };
-        // Whether what a notice says may have happened in privacy mode: it is on, or it changed since
-        // the last notice was read, which may have been after this one was written.
-        let epoch = self.lane.privacy_epoch();
-        let may_be_private = self.lane.is_private() || epoch != self.notices_epoch;
-        if matches!(event, Event::Notice(Some(_))) {
-            self.notices_epoch = epoch;
-        }
         match event {
             Event::Changed | Event::Timer => {}
             Event::Notice(None) => self.lose(broker, "the plugin runtime ended its connection"),
@@ -647,7 +635,7 @@ impl Link {
                 // The runtime has stopped running this component for good. The broker holds that
                 // for the binding's life; the next pass sees it no longer wanted and unbinds it.
                 // Its reason carries the last fault's words, which are withheld as a fault's are.
-                let reason = if may_be_private {
+                let reason = if self.lane.words_withheld() {
                     "the plugin runtime disabled the component after repeated faults; its words \
                      are withheld for privacy mode"
                         .to_owned()
@@ -666,12 +654,16 @@ impl Link {
                 detail,
                 faults_in_window,
             })) => {
+                // Decided by the connection the notice came on and never by when it was read: the
+                // words may come from anything a component was handed, however long ago and
+                // however many notices are waiting behind this one.
+                let withheld = self.lane.words_withheld();
                 if let Some(broker) = broker.upgrade() {
                     broker.note_component(
                         BrokerBindingId::new(binding_id),
                         ComponentNote::Fault(FaultNote {
                             call: call.to_string(),
-                            detail: (!may_be_private).then_some(detail),
+                            detail: (!withheld).then_some(detail),
                             faults_in_window,
                         }),
                     );
@@ -864,6 +856,11 @@ impl Link {
     /// Keeps the connection to the runtime, or lets it go, and tells the broker, which asks
     /// components to prepare actions over it.
     fn hold(&mut self, broker: &Weak<Broker>, client: Option<Arc<PluginClient>>) {
+        if client.is_some() {
+            // Before anything is registered on it, so that its notices are judged by privacy mode
+            // from the start of the connection.
+            self.lane.began_connection();
+        }
         if let Some(broker) = broker.upgrade() {
             broker.component_calls().set(client.clone());
         }

@@ -301,6 +301,8 @@ struct Inner {
     checkpoints: BTreeMap<BrokerBindingId, Held>,
     checkpoint_order: VecDeque<BrokerBindingId>,
     checkpoint_bytes: u64,
+    /// Whether privacy mode has been on since the link made the connection it now holds.
+    words_tainted: bool,
 }
 
 impl Inner {
@@ -764,12 +766,17 @@ impl ObservationLane {
 
     /// Marks that a component is about to be handed something made in privacy mode, or while it
     /// stood, before the hand-over, so that an answer that does not come back cannot leave the
-    /// component holding it unmarked.
+    /// component holding it unmarked. The connection the component is on is marked too
+    /// ([`Self::words_withheld`]): the pump may have read what it needed before the link made that
+    /// connection, so that privacy mode having stood on it is not the only way it can be handed
+    /// something made in privacy mode.
     pub fn expose(&self, binding: BrokerBindingId, made_in_privacy: bool) {
         if !(made_in_privacy || self.private.load(Ordering::Acquire)) {
             return;
         }
-        if let Some(view) = self.inner().views.get_mut(&binding) {
+        let mut inner = self.inner();
+        inner.words_tainted = true;
+        if let Some(view) = inner.views.get_mut(&binding) {
             view.private_content = true;
         }
     }
@@ -924,9 +931,12 @@ impl ObservationLane {
     /// hold what it was offered, until it starts again.
     pub fn set_private(&self, private: bool) {
         // Under the lock a fence and a hold take, so that neither sees half of the change.
-        let _inner = self.inner();
+        let mut inner = self.inner();
         if self.private.swap(private, Ordering::AcqRel) != private {
             self.privacy_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        if private {
+            inner.words_tainted = true;
         }
         if !private {
             self.checkpoint_wake.notify_one();
@@ -937,6 +947,30 @@ impl ObservationLane {
     #[must_use]
     pub fn is_private(&self) -> bool {
         self.private.load(Ordering::Acquire)
+    }
+
+    /// Says that the link has made a connection to the plugin runtime. Nothing a connection before
+    /// it said can be read from this one, so the words the runtime gives on it are withheld only if
+    /// privacy mode is on now ([`Self::words_withheld`]).
+    pub fn began_connection(&self) {
+        let mut inner = self.inner();
+        inner.words_tainted = self.private.load(Ordering::Acquire);
+    }
+
+    /// Says whether the words the plugin runtime gives, in a fault and in the reason it disabled a
+    /// component, must not be kept.
+    ///
+    /// They are withheld once privacy mode has been on at any time since the connection that carries
+    /// them was made, or a component on it has been handed something made in privacy mode
+    /// ([`Self::expose`]), and until the link makes another. What decides it is the connection and
+    /// not the notice: any component on it may have been handed something while privacy mode stood, by
+    /// an observation, a restore or an action, and the words can be made of what a component was
+    /// handed. Every notice about every component on the connection is withheld, however many wait
+    /// and however late each is read, and a notice of an earlier connection cannot be read from a
+    /// later one.
+    #[must_use]
+    pub fn words_withheld(&self) -> bool {
+        self.inner().words_tainted
     }
 
     /// Drops every checkpoint held, which is everything this lane holds that is derived from what a
