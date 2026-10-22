@@ -22,7 +22,7 @@ pub fn keys(writer: Box<dyn Write + Send>) -> Keys {
 }
 
 /// What a terminal has been sent, and the replies it still owes.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Transcript {
     /// Every byte the terminal has been sent, as it was sent.
     pub bytes: Vec<u8>,
@@ -43,7 +43,6 @@ impl Transcript {
 }
 
 /// A reply a terminal types the moment the question it answers has arrived.
-#[derive(Debug)]
 struct Owed {
     question: &'static [u8],
     reply: Vec<u8>,
