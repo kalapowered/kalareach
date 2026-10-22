@@ -64,6 +64,11 @@ private func handedOver(_ outcome: ScanOutcome, leftTheFront: Bool) -> ScanOutco
   return outcome
 }
 
+/// How long a scanner or a picker is given to come onto the screen. One the system does not show
+/// (its presenter is busy with something else) would leave the request unanswered and the page's
+/// controls disabled, so the request ends instead.
+private let presentationDeadline: TimeInterval = 10
+
 /// A scan that has been asked for, which can be ended before the scanner is on the screen.
 final class ScanHandle {
   fileprivate(set) var scanner: CodeScannerViewController?
@@ -111,6 +116,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
   private var backgroundWatch: NSObjectProtocol?
   private var lastRead = CFAbsoluteTime(0)
   private static let readEvery: CFAbsoluteTime = 0.12
+  private static let hintWords = "Point the camera at the code on your host"
 
   /// Shows the scanner on `presenter`, after the camera is allowed, and answers `done` once. The
   /// handle ends the scan early.
@@ -131,6 +137,9 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       scanner.view.accessibilityViewIsModal = true
       handle.scanner = scanner
       presenter.present(scanner, animated: !UIAccessibility.isReduceMotionEnabled)
+      DispatchQueue.main.asyncAfter(deadline: .now() + presentationDeadline) { [weak scanner] in
+        scanner?.abandonIfNotShown()
+      }
     }
     switch AVCaptureDevice.authorizationStatus(for: .video) {
     case .authorized:
@@ -158,7 +167,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     outline.lineWidth = 4
     view.layer.addSublayer(outline)
 
-    hint.text = "Point the camera at the code on your host"
+    hint.text = Self.hintWords
     hint.textColor = .white
     hint.textAlignment = .center
     hint.numberOfLines = 0
@@ -188,6 +197,8 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       self, selector: #selector(hidePreview), name: UIApplication.willResignActiveNotification, object: nil)
     center.addObserver(
       self, selector: #selector(showPreview), name: UIApplication.didBecomeActiveNotification, object: nil)
+    center.addObserver(
+      self, selector: #selector(captureChanged), name: UIScreen.capturedDidChangeNotification, object: nil)
     backgroundWatch = center.addObserver(
       forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
     ) { [weak self] _ in
@@ -210,11 +221,16 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
       finish(outcome)
       return
     }
-    guard !finished else { return }
+    if finished {
+      // Shown after the request was given up on: it has nothing to say and goes.
+      dismiss(animated: false)
+      return
+    }
     guard setUp else {
       finish(.failed)
       return
     }
+    if screenIsCaptured { setPreview(hidden: true) }
     frames.async { self.session.startRunning() }
     UIAccessibility.post(notification: .screenChanged, argument: hint)
   }
@@ -299,7 +315,12 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
 
   @objc private func cancelTapped() { finish(.cancelled) }
 
-  @objc private func cameraFailed() { finish(.failed) }
+  /// A notification arrives on the thread that posts it, and the scan ends on the main one: the
+  /// camera's own queues post these, and the scanner's state and its dismissal are the main
+  /// queue's.
+  @objc private func cameraFailed() {
+    DispatchQueue.main.async { [weak self] in self?.finish(.failed) }
+  }
 
   /// The application leaving the front takes the camera from it as well. That ends the scan as a
   /// cancel, by the observer of the application's going to the background, and is no fault of the
@@ -310,7 +331,7 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
     {
       return
     }
-    finish(.failed)
+    cameraFailed()
   }
 
   @objc private func torchTapped() {
@@ -327,14 +348,44 @@ final class CodeScannerViewController: UIViewController, AVCaptureVideoDataOutpu
 
   /// What the camera sees is not shown in the application switcher, so it goes at once: the layer's
   /// own change would fade it, and the picture the switcher takes would be of the fade.
+  ///
+  /// Nor is it shown while the screen is being recorded or sent to another screen: what the
+  /// preview holds can be an invitation's whole secret. iOS has no way to keep a screenshot from
+  /// being taken (Android's secure window has none here), and says so only afterwards, so a
+  /// screenshot of the preview is the one thing this cannot stop; a direct invitation does not
+  /// pair a device by itself, since the host's owner approves it against the value both screens show.
   @objc private func hidePreview() { setPreview(hidden: true) }
-  @objc private func showPreview() { setPreview(hidden: false) }
+  @objc private func showPreview() { setPreview(hidden: screenIsCaptured) }
+
+  /// Recording or mirroring started or stopped.
+  @objc private func captureChanged() {
+    let inactive = UIApplication.shared.applicationState != .active
+    setPreview(hidden: screenIsCaptured || inactive)
+  }
+
+  private var screenIsCaptured: Bool { view.window?.windowScene?.screen.isCaptured ?? false }
 
   private func setPreview(hidden: Bool) {
     CATransaction.begin()
     CATransaction.setDisableActions(true)
     preview.isHidden = hidden
     CATransaction.commit()
+    hint.text = hidden && screenIsCaptured
+      ? "The camera view is hidden while the screen is recorded or shared"
+      : Self.hintWords
+  }
+
+  /// Gives the request up when the scanner never came onto the screen: it answers as the scan's end
+  /// would have (a cancel that was waiting for it, else a failure), with nothing to dismiss.
+  func abandonIfNotShown() {
+    guard !appeared, !finished else { return }
+    finished = true
+    NotificationCenter.default.removeObserver(self)
+    if let watching = backgroundWatch { NotificationCenter.default.removeObserver(watching) }
+    backgroundWatch = nil
+    let answer = done
+    done = nil
+    answer?(deferred ?? .failed)
   }
 
   /// Ends the scan once, whichever of the person, a code or the system ends it first, and answers
@@ -409,9 +460,26 @@ final class PhotoReader: NSObject, PHPickerViewControllerDelegate {
     }
     presenter.present(picker, animated: true) { [weak self] in
       guard let self = self else { return }
+      guard self.done != nil else {
+        // Shown after the request was given up on: it has nothing to say and goes.
+        self.picker?.dismiss(animated: false)
+        return
+      }
       self.presented = true
       if self.cancelWhenPresented { self.finish(.cancelled) }
     }
+    DispatchQueue.main.asyncAfter(deadline: .now() + presentationDeadline) { [weak self] in
+      self?.abandonIfNotPresented()
+    }
+  }
+
+  /// Gives the request up when the picker never came onto the screen, as its end would have
+  /// answered it: a cancel that was waiting for it, else a failure.
+  private func abandonIfNotPresented() {
+    guard !presented, let answer = done else { return }
+    done = nil
+    stopWatching()
+    answer(cancelWhenPresented ? .cancelled : .failed)
   }
 
   func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
