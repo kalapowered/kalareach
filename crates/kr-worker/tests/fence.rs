@@ -6516,6 +6516,64 @@ async fn a_launch_carries_the_recorded_directory_and_a_refusal_for_it_or_an_edit
     }
 }
 
+/// KR-REQ-23.38: `shell.launch` checks the editor. A session that runs a stock shell has no
+/// managed root editor to install into, so a launch sent to it is refused
+/// SHELL_INTEGRATION_UNSUPPORTED before anything is dispatched: its receipt says it was rejected
+/// and not that it may have happened, and nothing of the command reaches the terminal. The holder
+/// of the input lease asks, so the lease is not what refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_to_a_session_that_runs_a_stock_shell_is_refused_before_it_is_dispatched() {
+    let wired = wired_with(ShellMode::NativeCompat, false).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let refused = client
+        .mutate(
+            Method::ShellLaunch,
+            action_id,
+            wired.target(),
+            &ShellLaunchParams {
+                session_id: wired.session_id,
+                command: LaunchCommand::QuotedCommand("kr-into-a-stock-shell".to_owned()),
+                expected_prompt_generation: PromptGeneration::new(1),
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a stock shell has no managed editor");
+    assert_eq!(
+        refused.code,
+        ErrorCode::ShellIntegrationUnsupported,
+        "{refused}"
+    );
+
+    let read: kr_protocol::receipt::ActionReadResult = client
+        .request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the receipt is read")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Rejected,
+        "the launch was refused before the dispatch marker, not after it: {:?}",
+        read.receipt
+    );
+    terminal_holds_none_of(&wired, holder, 0, &["kr-into-a-stock-shell"]).await;
+    wired.close().await;
+}
+
 // --------------------------------------------------------------------------------------------
 // KR-REQ-12.03: a launch the foreground has moved past.
 // --------------------------------------------------------------------------------------------
