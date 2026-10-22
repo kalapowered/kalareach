@@ -968,7 +968,7 @@ mod unix {
         #[test]
         fn only_apfs_is_trusted_to_keep_change_times() {
             assert!(super::known_name("apfs").is_ok());
-            for other in ["nfs", "smbfs", "msdos", "exfat", "autofs"] {
+            for other in ["hfs", "nfs", "smbfs", "msdos", "exfat", "autofs"] {
                 assert!(super::known_name(other).is_err(), "{other}");
             }
         }
