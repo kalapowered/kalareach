@@ -3042,7 +3042,7 @@ async fn forwarded_outcome_for_device<T: serde::Serialize>(
         accepted_deadline_boot_ms: kr_protocol::scalars::U64::new(
             kr_ipc::clock::boot_elapsed_ms() + 30_000,
         ),
-        history: None,
+        history: (method == Method::SessionAttach).then(common::a_scope_with_the_live_screen),
         screen_basis: basis,
         workflow_run_id: None,
         lease: Some(lease),

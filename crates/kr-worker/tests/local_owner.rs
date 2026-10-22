@@ -541,8 +541,9 @@ impl Wired {
     ) -> Result<ParamsValue, ProtocolError> {
         // The daemon sends the scope of the grant an attach was decided under, and the worker
         // draws the screen by it.
-        let history = (method == Method::SessionAttach && actor.ingress.is_remote())
-            .then(common::a_scope_with_the_live_screen);
+        let owner = actor.ingress == ActorIngress::LocalIpc && !actor.grant_id.is_present();
+        let history =
+            (method == Method::SessionAttach && !owner).then(common::a_scope_with_the_live_screen);
         self.forward_action_within(daemon, actor, rights, method, params, action_id, history)
             .await
     }
