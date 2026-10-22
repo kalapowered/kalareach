@@ -6643,6 +6643,83 @@ async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version(
     host.clients.abort();
 }
 
+/// KR-REQ-14.34: a result is bound to the run it describes. A suite that changes a tested path and
+/// restores it, bytes and modification time, before it ends leaves a copy that reads as the
+/// version, and its result attests nothing: the node is left unknown and no version is named. A
+/// suite that makes a file and removes it again is a write too, beside a declared output as
+/// elsewhere. The controls are a suite that only reads the copy and a suite that writes only its
+/// declared output, which attest the version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suite_that_changes_a_tested_path_and_restores_it_attests_nothing() {
+    let host = working_host_with_suites(&[
+        ("reads", "grep -q . README.md", &[]),
+        (
+            "restores",
+            r#"d=$(mktemp -d) && cp -p README.md "$d/ref" && echo changed > README.md && cat "$d/ref" > README.md && touch -r "$d/ref" README.md && rm -r "$d""#,
+            &[],
+        ),
+        ("makes-and-removes", "echo x > stray.py && rm stray.py", &[]),
+        ("builds", "mkdir out && echo built > out/artefact", &["out"]),
+        (
+            "scratches-beside-its-output",
+            "mkdir out && echo built > out/artefact && echo x > conftest.py && rm conftest.py",
+            &["out"],
+        ),
+    ])
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 80).await;
+
+    let (run, receipt, read) = tests_run(&mut control, &host, 81, "reads", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    let result = read
+        .results
+        .iter()
+        .find(|result| result.command == "reads")
+        .expect("the suite's result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+    assert_eq!(result.tested_version.0, Some(version));
+
+    // A suite that writes only where it declares output is attested, and one that makes a file
+    // beside that output and removes it again, at the copy's root where the output is, is not.
+    let (_, receipt, read) = tests_run(&mut control, &host, 84, "builds", version).await;
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    let result = read
+        .results
+        .iter()
+        .find(|result| result.command == "builds")
+        .expect("the suite's result is recorded");
+    assert_eq!(result.tested_source, TestedSource::UnmodifiedVersion);
+
+    for (number, suite) in [
+        (82, "restores"),
+        (83, "makes-and-removes"),
+        (85, "scratches-beside-its-output"),
+    ] {
+        let (_, receipt, read) = tests_run(&mut control, &host, number, suite, version).await;
+        assert_eq!(receipt.status, NodeStatus::Unknown, "{suite}: {receipt:?}");
+        let result = read
+            .results
+            .iter()
+            .find(|result| result.command == suite)
+            .expect("the suite's result is recorded");
+        assert_eq!(
+            result.tested_source,
+            TestedSource::Indeterminate,
+            "{suite}: {result:?}"
+        );
+        assert_eq!(result.tested_version.0, None, "{suite} attests no version");
+        assert_eq!(
+            result.receipt.exit_status.0,
+            Some(U64::new(0)),
+            "{suite} passed, and what it passed against is what is not established"
+        );
+    }
+    host.clients.abort();
+}
+
 /// KR-REQ-25.14 and KR-REQ-24.10: a command that is running when the daemon stops is
 /// not forgotten. The node it belonged to settles unknown, nothing runs it again, and the new
 /// daemon's sweep finds what the dispatch wrote down, closes the session, removes the directory the

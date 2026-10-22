@@ -166,6 +166,11 @@ libsodium-sys-stable = "=1.24.0"
 # so a profile qualified against one build of the runtime cannot be loaded by another.
 llama-cpp-2 = { version = "=0.1.156", default-features = false }
 llama-cpp-sys-2 = { version = "=0.1.156", default-features = false }
+# Reports the names written in a test's copy while its command runs, on macOS, where the change
+# record alone cannot tell a declared output from a file made beside it and removed again. Cut to
+# the FSEvents backend and used on macOS only; Linux uses the kernel's inotify through `rustix`.
+# Pinned to the newest stable release.
+notify = { version = "=8.2.0", default-features = false }
 # The Apple runtime bindings the companion application's user-verification ceremony calls through.
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", default-features = false }
