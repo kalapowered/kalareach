@@ -6634,6 +6634,13 @@ pub mod export {
         field("HostInfoResult", "power", ContentClass::Structure),
         field("HostInfoResult", "machine", ContentClass::Structure),
         field("HostInfoResult", "privacy", ContentClass::Structure),
+        field(
+            "HostInfoResult",
+            "default_shell_mode",
+            ContentClass::Structure,
+        ),
+        field("DefaultShellMode", "mode", ContentClass::Term),
+        field("DefaultShellMode", "source", ContentClass::Term),
         field("HostPrivacyState", "enabled", ContentClass::Term),
         field("HostPrivacyState", "generation", ContentClass::Number),
         field("HostPrivacyState", "changing", ContentClass::Term),

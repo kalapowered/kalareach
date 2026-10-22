@@ -952,6 +952,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                     (None, true) => Some(None),
                     (None, false) => None,
                 };
+                // The daemon is reached before anything is written: a choice that cannot then be
+                // read back as what is in force is not made.
+                let mut client = open_controller(&environment.paths, build_id()).await?;
                 if let Some(chosen) = change {
                     let writers = kr_cli::barrier::hold_for_configuration(&environment.paths)?;
                     let permit =
@@ -962,7 +965,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                         &permit,
                     )?;
                 }
-                let mut client = open_controller(&environment.paths, build_id()).await?;
                 let info: HostInfoResult =
                     host_read(&mut client, &environment.paths, Method::HostInfo, &()).await?;
                 let (mode, source) = info.default_shell_mode.map_or(
