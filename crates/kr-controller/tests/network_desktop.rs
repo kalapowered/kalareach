@@ -538,13 +538,11 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
             assert!(listed, "the platform's own listing names process {process}");
         }
     } else {
+        // What the platform said about its facility leaves this host as its class and length, so
+        // a device is told that the host says why and not the words.
         assert!(
-            power
-                .withheld_reason
-                .0
-                .as_deref()
-                .is_some_and(|reason| reason.contains("facility") || reason.contains("assertion")),
-            "a host that cannot hold the assertion says which facility did not: {power:?}"
+            power.withheld_reason.is_present(),
+            "a host that cannot hold the assertion says why it does not: {power:?}"
         );
     }
 
