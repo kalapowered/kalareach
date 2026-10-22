@@ -700,6 +700,11 @@ export interface FakeHostControls {
   leaveNextVoiceAllowFenceUnreadable(): void
   /** What the next intake from `source` finds. */
   setIntake(source: IntakeSource, result: IntakeView): void
+  /**
+   * The next intake from `source` waits, as a scanner the person has not closed does, until the
+   * returned function is called.
+   */
+  holdIntake(source: IntakeSource): () => void
   /** The sources the page took an invitation in from, in order. */
   readonly intakes: IntakeSource[]
   /** How many times the page asked to open this application's page in the system's settings. */
@@ -946,11 +951,18 @@ export function fakeHost(
   const intakes: IntakeSource[] = []
   const settingsOpened = { count: 0 }
   const keptAwake = { on: false, asked: 0 }
+  const holds = new Map<IntakeSource, Promise<void>>()
   const takeIn = (source: IntakeSource): Promise<IntakeView> => {
     intakes.push(source)
-    const result = intakeResults[source]
-    if (result.invitation !== null) publishPairing({ invitation: result.invitation })
-    return Promise.resolve(result)
+    const finish = (): IntakeView => {
+      const result = intakeResults[source]
+      if (result.invitation !== null) publishPairing({ invitation: result.invitation })
+      return result
+    }
+    const held = holds.get(source)
+    if (held === undefined) return Promise.resolve(finish())
+    holds.delete(source)
+    return held.then(finish)
   }
   const startedCodes: string[] = []
   let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
@@ -3218,6 +3230,18 @@ export function fakeHost(
     },
     setPairing(change) {
       publishPairing(change)
+    },
+    holdIntake(source) {
+      let release = (): void => undefined
+      holds.set(
+        source,
+        new Promise<void>((resolve) => {
+          release = resolve
+        })
+      )
+      return () => {
+        release()
+      }
     },
     setIntake(source, result) {
       intakeResults[source] = result

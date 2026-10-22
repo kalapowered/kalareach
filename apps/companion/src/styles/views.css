@@ -1479,7 +1479,7 @@
  * The scanner's one control, above the code field: as wide as the column, so a thumb finds it
  * without aiming, and as tall as every control is.
  */
-.pairing-scan .button {
+.pairing-scan .btn {
   width: 100%;
 }
 

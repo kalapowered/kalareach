@@ -450,6 +450,44 @@ describe('pairing with a host', () => {
     })
     expect(screen.getByTestId('paste-failure').textContent).not.toMatch(/camera/)
     expect(screen.queryByTestId('open-settings')).toBeNull()
+
+    // A camera that could not be started is a fourth thing: not a refusal Settings can undo.
+    controls.setIntake('camera', {
+      invitation: null,
+      failure: 'reader_failed',
+      cleared: false,
+      declined: false,
+      cancelled: false
+    })
+    await userEvent.click(screen.getByTestId('scan-code'))
+    await waitFor(() => {
+      expect(screen.getByTestId('paste-failure').textContent).toMatch(/could not be started/)
+    })
+    expect(screen.getByTestId('paste-failure').textContent).not.toMatch(/Settings/)
+    expect(screen.queryByTestId('open-settings')).toBeNull()
+  })
+
+  // KR-REQ-10.38: while the scanner or the picker is up, the person cannot start another intake.
+  it('offers no second intake while one is under way', async () => {
+    const { controls } = start()
+    act(() => {
+      controls.setPairing({ sources: { camera: true, photo: true } })
+    })
+    const release = controls.holdIntake('camera')
+    await userEvent.click(await screen.findByTestId('scan-code'))
+    await waitFor(() => {
+      expect(screen.getByTestId('scan-code')).toBeDisabled()
+    })
+    expect(screen.getByTestId('choose-photo')).toBeDisabled()
+    expect(screen.getByTestId('paste-invitation')).toBeDisabled()
+    expect(controls.intakes).toEqual(['camera'])
+    act(() => {
+      release()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('scan-code')).toBeEnabled()
+    })
+    expect(screen.getByTestId('choose-photo')).toBeEnabled()
   })
 
   // KR-REQ-10.38: where a direct invitation is taken in with the scanner, trying it again is
