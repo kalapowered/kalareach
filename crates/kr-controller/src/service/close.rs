@@ -982,9 +982,10 @@ impl Controller {
         let unanswered = directories.len() - places.len();
         if unanswered > 0 {
             eprintln!(
-                "kr-controller: {unanswered} directories that live sessions started in did not \
-                 answer within {} seconds, so those sessions count against every capture until \
-                 they end",
+                "kr-controller: {unanswered} of {} directories that live sessions started in did \
+                 not answer within {} seconds, so the sessions that started in them count against \
+                 every capture until they close or a later start places them",
+                directories.len(),
                 SESSION_PLACE_BUDGET.as_secs()
             );
         }
@@ -1292,8 +1293,9 @@ fn directory_of(reservation: &crate::registry::Reservation) -> Option<(SessionId
 ///
 /// Each directory is opened on a thread of its own that nothing waits for: a thread stuck on a
 /// mount that never answers is left there, so it holds neither the other directories nor the end
-/// of this daemon's runtime or process. It holds the environment's identity and nothing else. A
-/// thread that cannot be started leaves its directory without an answer.
+/// of this daemon's runtime. It holds the environment's identity and nothing else. A thread that
+/// cannot be started leaves its directory without an answer. A call into a mount that does not
+/// stop on a fatal signal can still keep the process from finishing its exit.
 async fn places_within(
     environment_id: kr_protocol::ids::EnvironmentId,
     directories: &BTreeSet<Option<String>>,

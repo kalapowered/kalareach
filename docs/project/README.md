@@ -983,12 +983,11 @@ directory above it, matched at the moment a reservation is asked for against eve
 records, a project's own checkout included whether or not a workspace was ever selected on it, so
 a terminal opened before the host knew its repository still counts. A session with no directory
 starts at the root and counts nowhere; one whose directory is not an absolute path, or whose
-request the daemon could not read after a restart, counts against every reservation. So does one
-whose directory had not answered when the daemon started. A daemon that starts opens the
-directories of the sessions it finds alive together and waits five seconds at most for all of
-them before it goes on to serve. A session whose directory is still silent after that, such as
-one on a network mount whose server has gone, counts against every reservation until it closes or
-a later start places it.
+request the daemon could not read after a restart, counts against every reservation. A daemon
+that starts opens the directories of the sessions it finds alive together and waits five seconds
+at most for all of them before it goes on to serve. A session whose directory is still silent
+after that, such as one on a network mount whose server has gone, counts against every
+reservation as well, until it closes or a later start places it.
 
 A session counts until its closure is recorded. Three cases end differently. In the first two the
 host waits for the kernel to say that the worker's process has ended; it asks for sixty seconds,
