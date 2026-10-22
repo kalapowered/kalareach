@@ -650,6 +650,25 @@ export interface HostRow {
   readonly in_contact: boolean | null
 }
 
+/** Where one paired host's notifications stand, as native code tells it. */
+export interface PushHostView {
+  /** The host, by the reference the pairing screen lists it under. */
+  readonly reference: string
+  /** Off, working, on, or stopped for something the person or the network can mend. */
+  readonly state: 'off' | 'working' | 'on' | 'needs_attention'
+  /** What is true now, in words. */
+  readonly words: string
+  /** True when what stopped it is the system's notification setting, which only the person changes. */
+  readonly settings: boolean
+}
+
+/** What the screen shows of notifications: whether this device has any, and each paired host's. */
+export interface PushView {
+  /** A phone has notifications to turn on. A computer has none, and the screen shows nothing of them. */
+  readonly available: boolean
+  readonly hosts: readonly PushHostView[]
+}
+
 /** Where this device reads a code from, besides the pasteboard. A computer reads from neither. */
 export interface PairingSources {
   /** The device has a camera the scanner can use. */
@@ -1850,6 +1869,28 @@ export interface HostPort {
    * was the one in use, and then there is none until another is chosen.
    */
   hostsForget(reference: string): Promise<ConnectionState>
+
+  /** Where each paired host's notifications stand. */
+  pushView(): Promise<PushView>
+  /**
+   * Turns notifications on for the host `reference` names, and starts the steps that make this
+   * phone a place the host can send them to: native code asks the system, asks the notification
+   * service, answers its challenge and hands the host what it needs. Resolves with where they
+   * stand at once; later changes arrive through {@link HostPort.onPush}.
+   */
+  pushEnable(reference: string): Promise<PushView>
+  /** Looks again at where notifications stand, and mends what changed since the last look. */
+  pushRefresh(): Promise<PushView>
+  /**
+   * The screen a tap on a notification opened the application on, once: `attention`, or null when
+   * the application was not opened by a tap since it last asked.
+   */
+  notificationRoute(): Promise<string | null>
+  /**
+   * Tells `listener` each time where notifications stand changes. Resolves, with the function that
+   * stops it, once the listener is registered: nothing published before then reaches it.
+   */
+  onPush(listener: (view: PushView) => void): Promise<() => void>
 
   /** Everything the pairing screen shows. */
   pairingView(): Promise<PairingView>
