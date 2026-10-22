@@ -885,8 +885,9 @@ attempt's own deadline and the connection's last call.
 authorised session, checks each challenge against what it would authorise, and describes it in one
 line: what, on which host, and for how long. A challenge whose display does not match its digest is
 marked as one this device cannot check, and nothing is signed for it. The platform's ceremony is a
-trait the application implements; it is asked with that line and the challenge's remaining
-lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
+trait the application implements, and names itself as a `CeremonyKind` (Touch ID, Face ID, the
+password or passcode, Windows Hello, a phone's strong biometric or screen lock, or none); it is
+asked with that line and the challenge's remaining lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
 completed. Only the host's own refusal makes a review "not confirmed". A host that says nothing for
 ten seconds, one that replies that it does not know what came of the answer, or a connection that
 ends after the answer went, may still have taken it: the device asks what the host lists, and the

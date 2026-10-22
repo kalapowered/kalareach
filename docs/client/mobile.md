@@ -122,6 +122,14 @@ processes are doing, so the row says exactly that and nothing more, is never cou
 failures, and offers nothing to decide. The row states how long contact has been lost as plain
 elapsed time.
 
+A host this phone owns can also ask its owner devices to confirm one of its own sensitive actions,
+or a device it is about to add. Those requests head the tab, above the inbox's own, and count in
+the tab's badge. Each shows its description and the time left, and a button named for the phone's
+ceremony (Face ID, Touch ID or passcode on an iPhone; fingerprint or face, or screen lock, on an
+Android phone). The button asks native code for a review, the system draws the prompt, and nothing
+on the page can answer it. A phone with no passcode or screen lock has no ceremony and says so
+instead of offering a button.
+
 ## Input
 
 - The Camera, photo library, and files items are provided by the platform, and a button opens each

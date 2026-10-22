@@ -409,7 +409,7 @@ page does, through the invoke path on Tauri's mock runtime, and keeps every answ
 payload of the two events the application publishes. None of them carries an invitation's text or
 secret, the code's secret characters, a challenge's identifier, nonce or digest, the owner's proof,
 the transcript and bundle digests the owner approves, or a key of this computer, the owner or the
-host, and a secret planted in one event is found by the same scan. The same suite runs the watcher
+host, and a secret planted in one event is found by the same scan. It shows the page told when the ceremony a phone offers changes. The same suite runs the watcher
 against two hosts that share a relay and against a host that answers nothing, and reads a code for
 another service through a stub alert that declines and then accepts it. It reads a code through a
 scripted scanner and picker behind the same seam, and shows that a reading never prints the
@@ -424,7 +424,14 @@ alert a code for another service raises, with Cancel contacting nothing and acce
 that service once. On the emulator it also shows the scanner kept out of screenshots and fitted to
 the largest text size, and the attachment picker on a phone whose camera the system has refused for
 good: a host this phone is paired with takes no file from it, so every source is disabled and the
-screen says nothing of the camera. It searches the phone's log for the invitation's text and secret.
+screen says nothing of the camera. It then shows the paired phone as an owner device: the host asks
+it to confirm one of its own requests and, separately, a second device it would add. A cancelled
+prompt confirms nothing and
+leaves the request listed and the invitation behind it refused; the same request is then confirmed,
+with Face ID on the simulator and the PIN of the emulator's screen lock, and the host spends that
+confirmation on the invitation. On the emulator a phone with no screen lock says that it cannot
+confirm, and offers the button once a lock is set. It searches the phone's log for the invitation's
+text and secret.
 
 ## An owner's confirmations
 
@@ -434,8 +441,12 @@ the connection and answers nothing is out of contact until the next round and ho
 host. The requests head Attention, and each row has its title,
 its description in one line, the time left, and a button named for this computer's ceremony:
 "Confirm with Touch ID", "Confirm with your password" on a Mac without Touch ID, or "Confirm with
-Windows Hello". A computer with no ceremony, Linux among them, shows no button and says where to
-confirm instead. A request whose description does not match what it would authorise says it could
+Windows Hello". A phone names its own: "Confirm with Face ID", "Confirm with Touch ID" or "Confirm
+with your passcode" on an iPhone, "Confirm with your fingerprint or face" or "Confirm with your
+screen lock" on an Android phone. A computer with no ceremony, Linux among them, shows no button and
+says where to confirm instead, and a phone with no passcode or screen lock says that it cannot check
+that it is you, and to set a lock or confirm on another device. A phone lists the requests on its
+Attention tab, above its invitations, and counts them in the tab's badge. A request whose description does not match what it would authorise says it could
 not be checked, and has no button either.
 
 New requests are announced once, on whichever screen is open, in one message for all that arrive
@@ -449,7 +460,16 @@ The button sends native code a reference and nothing else. Native code finds the
 under that reference and asks the operating system, which draws the prompt and prints the
 request's description in it:
 `LAContext` on macOS, and Windows Hello through `UserConsentVerifier` for this window on Windows.
-The prompt is bounded by the challenge's remaining lifetime. Only a confirmation inside it signs,
+On a phone the platform plugin asks. An iPhone first shows an alert with the request's description
+and Cancel and Continue, because Face ID completes when it sees the face and an alert makes the
+person choose to go on; Continue starts `LAContext` with the passcode as its fallback. An Android
+phone shows the system's biometric prompt: a strong biometric with the screen lock as its fallback
+from Android 11, or the screen lock alone when no strong biometric is set up, and before Android 11
+a strong biometric alone. A phone with none of these confirms nothing. Which ceremony a phone offers
+is asked of the plugin and kept for five seconds, so the person can set a lock in Settings while the
+request is listed, and the page is told when the answer changes. Only this watcher gets the phone's
+ceremony: revocation and settings sync have none on a phone. The prompt is bounded by the
+challenge's remaining lifetime. Only a confirmation inside it signs,
 with this computer's key, and completes the challenge; when the time runs out the prompt is
 dismissed and the answer is "not confirmed". Nothing on the page can answer the prompt, so a click
 that desktop automation synthesises can start a review and cannot finish one. While a review runs,
