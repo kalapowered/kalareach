@@ -317,6 +317,55 @@ def scanner_fits_the_largest_text(phone: Phone, port: str) -> None:
     say("the scanner fits the largest text size")
 
 
+def picker_after_a_refusal(phone: Phone) -> None:
+    """The attachment picker's camera, once the system has been told never to let this application
+    use it, tells the person so and says where to allow it, and never does nothing.
+
+    The permission is withdrawn the way "Don't allow" with "Don't ask again" leaves it. The system
+    ends the application's process when a permission is taken from it, so the application is started
+    again and the host's one session is opened from its Sessions tab, where the picker is.
+    """
+    camera = "android.permission.CAMERA"
+    phone.run("shell", "pm", "revoke", APP, camera)
+    phone.run("shell", "pm", "set-permission-flags", APP, camera, "user-fixed", "user-set")
+    phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+    phone.wait(lambda each: each.startswith("Sessions"), "the shell's Sessions tab", 90)
+    phone.press("Sessions")
+    tabs = ("Attention", "Sessions", "Hosts", "Account")
+    row = phone.wait(
+        lambda each: not each.startswith(tabs) and each not in ("Sessions",) and "session" in each.lower(),
+        "the host's session in the list",
+        90,
+    )
+    phone.tap(row)
+    phone.wait(lambda each: each == "Photo library", "the attachment picker", 60)
+    # The camera is offered until the system has been asked and has said no, and then it is told.
+    phone.press("Take a photo")
+    phone.wait(
+        lambda each: each.startswith("KalaReach cannot use the camera"),
+        "the words that say the camera is not allowed",
+        30,
+    )
+    phone.shot("camera-refused")
+    if phone.find(lambda each: each == "Open Settings") is None:
+        phone.give_up("the picker does not offer the settings page")
+    # The settings page is this application's own: the system's page for it opens, over the application.
+    phone.press("Open Settings")
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        focus = phone.run("shell", "dumpsys", "window").stdout.decode("utf-8", "replace")
+        if "mCurrentFocus" in focus and "settings" in next(
+            (line for line in focus.splitlines() if "mCurrentFocus" in line), ""
+        ).lower():
+            break
+        time.sleep(0.5)
+    else:
+        phone.give_up("the settings page did not open")
+    phone.shot("camera-settings")
+    phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+    say("the camera's refusal is told in the attachment picker")
+
+
 def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
     phone = Phone(adb, serial, shots)
     shots.mkdir(parents=True, exist_ok=True)
@@ -422,6 +471,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     say("accepted: one connection")
     touch(directory, "code-done")
     wait_for_file(directory, "done-code")
+    picker_after_a_refusal(phone)
 
 
 def main() -> None:

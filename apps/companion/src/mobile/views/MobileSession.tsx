@@ -98,6 +98,7 @@ import { focusEscape, readingOf, SENTINEL } from '../../terminal/keys'
 import { FALLBACK_GRID, useTerminalView } from '../../terminal/view'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
+import { useCameraControl } from '../model/camera'
 import { afterKey, held as holds, NO_LATCH, pressModifier, rowKey, type Latch } from '../model/accessory'
 import { ask } from '../model/call'
 import { describeMode } from '../model/gestures'
@@ -177,6 +178,7 @@ export function MobileSession({
   readonly connected: boolean | null
 }): ReactNode {
   const { port, say, drafts: book, paths, openings } = useApp()
+  const camera = useCameraControl(port, say)
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
   const keptEntryLine = keptEntry(shown)
@@ -1432,6 +1434,7 @@ export function MobileSession({
               )}
               <AttachmentPicker
                 surface={surface}
+                camera={camera}
                 disabled={!fileOffer.offered}
                 onPicked={(files) => {
                   for (const { picked, file } of files) {

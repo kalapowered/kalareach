@@ -289,8 +289,8 @@ that means, and each rule is a fact about a file here rather than a convention:
 - **Exports are written where a dialog put them.** The page asks for a destination, the platform's
   own save dialog answers, and the backend remembers that answer for exactly one write. A path the
   page names is refused.
-- **Pairing's secrets stay native.** The page types a code or asks for the pasteboard to be read,
-  and is shown views: an invitation's service and proposed rights in words, an attempt's state, the
+- **Pairing's secrets stay native.** The page types a code, or asks for the pasteboard, the
+  scanner or a picture to be read, and is shown views: an invitation's service and proposed rights in words, an attempt's state, the
   grouped value both devices show, and a confirmation's description. It is never sent an
   invitation's text or secret, a key, a transcript, a challenge or a proof, and it cannot complete
   a confirmation: `owner.confirmation.complete` is a method only native code calls.
@@ -313,8 +313,9 @@ choice is visible where the rest of the boundary is.
 ## Pairing with a host
 
 "Pair with a host" is where this computer becomes one of a host's devices, and it runs in native
-code, in `src-tauri/src/device`. The page asks for a code or for the pasteboard to be read, and
-native code does the rest with `kr-client`'s pairing module:
+code, in `src-tauri/src/device`. The page asks for a code, or for an invitation to be read from the
+pasteboard, the camera or a picture, and native code does the rest with `kr-client`'s pairing
+module:
 
 - This computer's keys are in the platform's secret store, the Keychain, the Credential Manager or
   the Secret Service, under "KalaReach Companion". The name it offers a host is its host name.
@@ -375,12 +376,27 @@ sessions still to confirm, and says when the answer left workers out, before the
 call that ends says the same, and says when the host's answer gave no status for its workers that
 the app could read. The allowance stays until the person changes it.
 
-An invitation on the pasteboard is read by native code, not by the page. A code invitation that
-names a service other than this computer's raises the system's own alert, modal to the companion's
-window, before anything connects there. The alert names both services, and declining it connects
-nowhere. Each change reaches the page as a view on the `kr://pairing` event. The page reads each
-view, and the connection's state for the indicator in its top bar, only once its listener is
-registered, and keeps a change it heard over a read that answers later.
+An invitation on the pasteboard, in the code a phone's scanner sees, or in a picture the person
+chooses, is read by native code, not by the page. Only a phone has the scanner and the picker: the
+pairing view says which sources the device has, and a computer offers the pasteboard alone. The
+scanner is a full-screen camera view (CameraX on Android, `AVCaptureSession` on iOS) and the picker
+is the system's own. Both decode with the platform's detector, Vision on iOS and ZXing on Android,
+and the text of a code goes from the platform's half to Rust and no further. Printing a reading
+shows its kind and never its text. The Android scanner's window is secure, so a screenshot does not
+show what the camera sees. The page is told that an invitation was found, never what it says.
+
+One intake runs at a time, and a new one ends the one before it. An invitation a phone read is
+dropped when the application stops being in front, and so is a picture still being read. The
+camera's failures have words of their own: the camera is not allowed, with a button that opens only
+this application's page in the system's settings, the picture shows no code, and the camera or the
+picture could not be opened. A phone keeps its screen on while the value to compare with the host's
+shows.
+
+A code invitation that names a service other than this computer's raises the system's own alert,
+modal to the companion's window, before anything connects there. The alert names both services, and
+declining it connects nowhere. Each change reaches the page as a view on the `kr://pairing` event.
+The page reads each view, and the connection's state for the indicator in its top bar, only once its
+listener is registered, and keeps a change it heard over a read that answers later.
 
 `src-tauri/tests/paired_host.rs` pairs a phone with kr-controller's in-process host and then reads
 through the paired connection: the host chosen first, the commands the grant allows and refuses,
@@ -395,7 +411,19 @@ secret, the code's secret characters, a challenge's identifier, nonce or digest,
 the transcript and bundle digests the owner approves, or a key of this computer, the owner or the
 host, and a secret planted in one event is found by the same scan. The same suite runs the watcher
 against two hosts that share a relay and against a host that answers nothing, and reads a code for
-another service through a stub alert that declines and then accepts it.
+another service through a stub alert that declines and then accepts it. It reads a code through a
+scripted scanner and picker behind the same seam, and shows that a reading never prints the
+invitation's text, that an intake overtaken while it waited holds nothing, and that what a phone
+read is dropped when the application stops being in front.
+
+`scripts/e2e-pairing-device.sh` pairs a phone with a real host through the installed application's
+own screens, on the iOS Simulator and on the Android emulator. The host is kr-controller's daemon
+on the loopback interface, and it holds one session. The run shows a changed secret locking nothing,
+the value the phone shows equal to the host's, the phone paired once the host approves it, and the
+alert a code for another service raises, with Cancel contacting nothing and accepting contacting
+that service once. On the emulator it also shows the scanner kept out of screenshots and fitted to
+the largest text size, and the attachment picker telling the person that the camera is not allowed
+after the system has refused it. It searches the phone's log for the invitation's text and secret.
 
 ## An owner's confirmations
 

@@ -273,6 +273,19 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     invoke.resolve(["camera": AVCaptureDevice.default(for: .video) != nil, "photo": true])
   }
 
+  /// What the system says of this application's use of the camera: `granted`, `denied` when the
+  /// person refused it or a restriction does (the system asks no more), and `prompt` before the
+  /// first use. The attachment picker asks this before it offers the camera.
+  @objc public func cameraAccess(_ invoke: Invoke) {
+    let access: String
+    switch AVCaptureDevice.authorizationStatus(for: .video) {
+    case .authorized: access = "granted"
+    case .notDetermined: access = "prompt"
+    default: access = "denied"
+    }
+    invoke.resolve(["access": access])
+  }
+
   /// Shows the scanner and answers when it closes.
   @objc public func scanCamera(_ invoke: Invoke) {
     beginScan(invoke) { presenter, scan in

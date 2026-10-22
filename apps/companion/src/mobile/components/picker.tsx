@@ -10,11 +10,17 @@
  * open the picker. The input is the platform's way in and not a second control, so `hidden` takes it
  * out of the accessibility tree and the focus order: a one-point input that carried the name would
  * be a control too small to touch, found by a person who goes by what assistive technology lists.
+ *
+ * The camera is the one source that can be refused by the system, and a WebView says nothing when
+ * it is: its picker closes with no picture. The screen reads the camera's permission (`camera`), so
+ * the button is offered only where it would do something, and a refusal is told with the way to
+ * allow the camera.
  */
 
-import { useRef, type ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 
 import { attributesFor, describeSource, type PickSource, type Picked } from '../model/media'
+import type { CameraControl } from '../model/camera'
 import { minimumTarget, type Surface } from '../platform'
 
 /** The three sources, in the order a phone offers them. */
@@ -24,25 +30,58 @@ const SOURCES: readonly PickSource[] = ['camera', 'library', 'files']
 export function AttachmentPicker({
   onPicked,
   surface,
-  disabled
+  disabled,
+  camera
 }: {
   readonly onPicked: (files: readonly { readonly picked: Picked; readonly file: File }[]) => void
   readonly surface: Surface
   readonly disabled?: boolean
+  /** What the system says of the camera. Without it the camera is offered and the system asks. */
+  readonly camera?: CameraControl
 }): ReactNode {
   const target = minimumTarget(surface)
+  const offered = camera?.offer.offered ?? true
+  const notice = camera?.offer.notice ?? null
+  // The button that was pressed may have just gone, since it would do nothing now: the next thing
+  // to do is its replacement, so the focus goes there rather than to the page.
+  const settings = useRef<HTMLButtonElement | null>(null)
+  const refusedJustNow = camera?.refusedJustNow === true
+  useEffect(() => {
+    if (refusedJustNow) settings.current?.focus()
+  }, [refusedJustNow])
   return (
-    <div className="m-composer-actions" role="group" aria-label="Add an attachment">
-      {SOURCES.map((source) => (
-        <PickerButton
-          key={source}
-          source={source}
-          target={target}
-          disabled={disabled}
-          onPicked={onPicked}
-        />
-      ))}
-    </div>
+    <>
+      <div className="m-composer-actions" role="group" aria-label="Add an attachment">
+        {SOURCES.filter((source) => source !== 'camera' || offered).map((source) => (
+          <PickerButton
+            key={source}
+            source={source}
+            target={target}
+            disabled={disabled}
+            camera={source === 'camera' ? camera : undefined}
+            onPicked={onPicked}
+          />
+        ))}
+      </div>
+      {/* Always drawn, so a screen reader that watches it hears the words when they arrive. */}
+      <div className="m-camera-notice" role="status" data-testid="camera-notice">
+        {notice === null ? null : (
+          <>
+            <p className="small">{notice}</p>
+            <button
+              ref={settings}
+              type="button"
+              className="btn"
+              style={{ minInlineSize: target, minBlockSize: target }}
+              data-testid="camera-open-settings"
+              onClick={camera?.openSettings}
+            >
+              Open Settings
+            </button>
+          </>
+        )}
+      </div>
+    </>
   )
 }
 
@@ -50,15 +89,28 @@ function PickerButton({
   source,
   target,
   disabled,
+  camera,
   onPicked
 }: {
   readonly source: PickSource
   readonly target: number
   readonly disabled?: boolean
+  readonly camera?: CameraControl
   readonly onPicked: (files: readonly { readonly picked: Picked; readonly file: File }[]) => void
 }): ReactNode {
   const input = useRef<HTMLInputElement | null>(null)
   const attributes = attributesFor(source)
+  // A picker closed with no choice is a `cancel` on the input. React does not wire that event for a
+  // file input, so it is listened for here.
+  const closedEmpty = camera?.closedEmpty
+  useEffect(() => {
+    const field = input.current
+    if (closedEmpty === undefined || field === null) return undefined
+    field.addEventListener('cancel', closedEmpty)
+    return () => {
+      field.removeEventListener('cancel', closedEmpty)
+    }
+  }, [closedEmpty])
   return (
     <>
       <button
@@ -93,7 +145,10 @@ function PickerButton({
           }))
           // The same file picked twice in a row must still raise a change, so the input is cleared.
           event.target.value = ''
-          if (chosen.length > 0) onPicked(chosen)
+          if (chosen.length > 0) {
+            camera?.pictured()
+            onPicked(chosen)
+          }
         }}
       />
     </>

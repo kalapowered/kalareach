@@ -128,7 +128,14 @@ elapsed time.
   one through a file input that is already mapped to the correct picker in the webview and hidden
   from assistive technology, so a screen reader sees one button for each item, with the appropriate
   name. `capture` opens the camera; an image filter opens the photo library; no filter opens the
-  file browser. A picked file is uploaded, not held in the screen: the page hands its bytes to
+  file browser. The camera is the one source the system can refuse, and a web view says nothing
+  when it does: its picker closes with no picture. So the screen asks native code whether the
+  application may use the camera, when it opens and when the application comes back to the front,
+  and does not offer "Take a photo" once the system asks no more. A camera that closes with no
+  picture while the system does not allow it is told the same way. In both cases the screen says
+  that KalaReach cannot use the camera and offers "Open Settings", which opens only this
+  application's page in the system's settings; a camera that is allowed and closed by the person
+  says nothing. A picked file is uploaded, not held in the screen: the page hands its bytes to
   native code, which sends them through the transfer service, and the file stays on the draft,
   uploading, uploaded or failed, until the person removes it. The phone takes a picked file of up to
   1,020 KB, what its connection carries in one chunk; a larger one is refused with that reason. A

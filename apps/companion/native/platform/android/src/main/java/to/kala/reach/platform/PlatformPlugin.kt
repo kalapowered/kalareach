@@ -149,6 +149,22 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("camera", camera).put("photo", false))
     }
 
+    /**
+     * What the system says of this application's use of the camera: `granted`, `denied` when the
+     * person refused it for good (the system asks no more), and `prompt` otherwise. The attachment
+     * picker asks this before it offers the camera, because the WebView's own request for the
+     * camera is refused without a word once the system asks no more.
+     */
+    @Command
+    fun cameraAccess(invoke: Invoke) {
+        val access = when (getPermissionState("camera")) {
+            PermissionState.GRANTED -> "granted"
+            PermissionState.DENIED -> "denied"
+            else -> "prompt"
+        }
+        invoke.resolve(JSObject().put("access", access))
+    }
+
     /** Shows the scanner, after the camera is allowed, and answers when it closes. */
     @Command
     fun scanCamera(invoke: Invoke) {

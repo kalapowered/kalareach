@@ -50,6 +50,7 @@ import type { LaunchSurface, RetainedArtefacts, ShellKind } from '../model/pendi
 import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
+  CameraAccess,
   ConnectionState,
   DroppedFile,
   HostEvent,
@@ -709,6 +710,10 @@ export interface FakeHostControls {
   readonly intakes: IntakeSource[]
   /** How many times the page asked to open this application's page in the system's settings. */
   readonly settingsOpened: { count: number }
+  /** What the system says of the camera from now on, which the page reads when it asks. */
+  setCameraAccess(access: CameraAccess): void
+  /** How many times the page asked what the system says of the camera. */
+  readonly cameraAsked: { count: number }
   /** Whether the screen is being kept on, and how many times it was asked to be. */
   readonly keptAwake: { on: boolean; asked: number }
   /** The codes the page started pairing with, in order. */
@@ -950,6 +955,8 @@ export function fakeHost(
   }
   const intakes: IntakeSource[] = []
   const settingsOpened = { count: 0 }
+  const cameraAccessNow: { access: CameraAccess } = { access: 'prompt' }
+  const cameraAsked = { count: 0 }
   const keptAwake = { on: false, asked: 0 }
   const intakeHolds = new Map<IntakeSource, Promise<void>>()
   const takeIn = (source: IntakeSource): Promise<IntakeView> => {
@@ -2153,13 +2160,17 @@ export function fakeHost(
     pairingPaste: () => takeIn('pasteboard'),
     pairingScan: () => takeIn('camera'),
     pairingScanPhoto: () => takeIn('photo'),
-    pairingOpenSettings: () => {
-      settingsOpened.count += 1
-      return Promise.resolve()
-    },
     pairingKeepAwake: (on) => {
       keptAwake.on = on
       keptAwake.asked += 1
+      return Promise.resolve()
+    },
+    cameraAccess: () => {
+      cameraAsked.count += 1
+      return Promise.resolve(cameraAccessNow.access)
+    },
+    openAppSettings: () => {
+      settingsOpened.count += 1
       return Promise.resolve()
     },
     pairingStartRead: () => {
@@ -3247,6 +3258,10 @@ export function fakeHost(
       intakeResults[source] = result
     },
     intakes,
+    setCameraAccess(access) {
+      cameraAccessNow.access = access
+    },
+    cameraAsked,
     settingsOpened,
     keptAwake,
     startedCodes,

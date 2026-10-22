@@ -6,6 +6,9 @@
 //! scanner, and the picture comes from the system's picker, which hands this application only the
 //! picture the person chose.
 //!
+//! The attachment picker's camera asks the same plugin whether the system lets this application use
+//! the camera, so a refusal is told to the person and never left as a picker that does nothing.
+//!
 //! Both decode with the platform's own detector (Vision on iOS, ZXing on Android) and answer one of
 //! five things: the text of the code, that the person closed the scanner or the picker, that the
 //! picture shows no code, that the camera is not allowed, or that the camera could not be started or
@@ -56,6 +59,26 @@ pub struct Sources {
     pub camera: bool,
     /// The device offers a picker for pictures.
     pub photo: bool,
+}
+
+/// What the system says of this application's use of the camera.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraAccess {
+    /// The person allowed it.
+    Granted,
+    /// The system has not been asked, or will ask again when the camera is first used.
+    Prompt,
+    /// The person refused it, or a policy does: the system asks no more, and only the settings page
+    /// can allow it.
+    Denied,
+}
+
+/// What the native half answers to a question about the camera's permission.
+#[cfg(any(mobile, test))]
+#[derive(Deserialize)]
+struct AccessAnswer {
+    access: CameraAccess,
 }
 
 /// What the native half answers to a request to read a code.
@@ -123,6 +146,35 @@ pub async fn camera<R: Runtime>(app: &AppHandle<R>) -> Result<Scan, PlatformErro
 /// Returns an error when the platform cannot show the picker, or when this device has none.
 pub async fn photo<R: Runtime>(app: &AppHandle<R>) -> Result<Scan, PlatformError> {
     ask(app, "scanPhoto").await
+}
+
+/// What the system says of this application's use of the camera.
+///
+/// A phone that cannot say is taken to be one that will ask, which is what offers the camera and
+/// lets the system answer; a device with no camera permission to ask for (a desktop) has nothing to
+/// refuse.
+pub async fn camera_access<R: Runtime>(app: &AppHandle<R>) -> CameraAccess {
+    #[cfg(mobile)]
+    {
+        use tauri::Manager as _;
+
+        let platform = app.state::<crate::Platform<R>>();
+        platform
+            .call::<AccessAnswer>("cameraAccess", ())
+            .await
+            .map_or_else(
+                |error| {
+                    tracing::warn!(%error, "the platform was not asked about the camera");
+                    CameraAccess::Prompt
+                },
+                |answer| answer.access,
+            )
+    }
+    #[cfg(not(mobile))]
+    {
+        let _ = app;
+        CameraAccess::Granted
+    }
 }
 
 /// Opens this application's own page in the system's settings, where the camera is allowed.
@@ -211,6 +263,25 @@ mod tests {
         assert_eq!(read(r#"{"outcome":"failed"}"#), Scan::Failed);
         assert!(serde_json::from_str::<Answer>(r#"{"outcome":"text"}"#).is_err());
         assert!(serde_json::from_str::<Answer>(r#"{"outcome":"other"}"#).is_err());
+    }
+
+    /// What the native halves send about the camera is what this module reads.
+    #[test]
+    fn the_three_answers_about_the_camera_are_read() {
+        let read = |text: &str| serde_json::from_str::<AccessAnswer>(text).map(|each| each.access);
+        assert_eq!(
+            read(r#"{"access":"granted"}"#).ok(),
+            Some(CameraAccess::Granted)
+        );
+        assert_eq!(
+            read(r#"{"access":"prompt"}"#).ok(),
+            Some(CameraAccess::Prompt)
+        );
+        assert_eq!(
+            read(r#"{"access":"denied"}"#).ok(),
+            Some(CameraAccess::Denied)
+        );
+        assert!(read(r#"{"access":"other"}"#).is_err());
     }
 
     /// The text of a code holds an invitation's secret, so no way of printing a reading shows it.
