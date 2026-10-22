@@ -1879,6 +1879,42 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
         "{}",
         text(&words_preview.stderr)
     );
+    // A preview in words names the same sets before anything is confirmed.
+    let plain_preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &words_into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--apply-configuration",
+            ],
+            None,
+        )
+        .await;
+    assert!(
+        plain_preview.status.success(),
+        "{}",
+        text(&plain_preview.stderr)
+    );
+    let previewed = text(&plain_preview.stdout);
+    assert_eq!(
+        previewed
+            .lines()
+            .filter(|line| line.starts_with("Not applied"))
+            .count(),
+        2,
+        "{previewed}"
+    );
+    assert!(
+        previewed
+            .lines()
+            .any(|line| line.starts_with("Not applied") && line.contains("tools")),
+        "{previewed}"
+    );
     let in_words = rig
         .run(
             &[
@@ -1897,11 +1933,15 @@ async fn a_restore_applies_the_devices_configuration_and_nothing_that_restricts_
         .await;
     assert!(in_words.status.success(), "{}", text(&in_words.stderr));
     let said = text(&in_words.stdout);
+    let not_applied: Vec<&str> = said
+        .lines()
+        .filter(|line| line.starts_with("Not applied"))
+        .collect();
+    assert_eq!(not_applied.len(), 2, "{said}");
     assert!(
-        said.contains("Not applied: the variables and command integrations of the profile tools."),
+        not_applied.iter().any(|line| line.contains("tools")),
         "{said}"
     );
-    assert!(said.contains("of the base preferences"), "{said}");
     assert!(
         !said.contains("BASH_ENV") && !said.contains("restored/tool"),
         "{said}"
