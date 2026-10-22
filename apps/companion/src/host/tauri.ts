@@ -24,6 +24,7 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
+  HostCoverView,
   KitSaved,
   OpenRequest,
   OwnerView,
@@ -435,6 +436,7 @@ export function tauriPort(): HostPort {
     recoveryTurnOn: () => call<RecoveryView>('recovery_turn_on', {}),
     recoverySettle: () => call<RecoveryView>('recovery_settle', {}),
     recoverySaveKit: (path) => call<KitSaved>('recovery_save_kit', { path }),
+    recoveryCoverHost: (replace) => call<HostCoverView>('recovery_cover_host', { replace }),
 
     subscribe: (listener: (event: HostEvent) => void) =>
       listening<PublishedEvent>(HOST_EVENT, (published) => {

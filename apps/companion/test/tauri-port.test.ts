@@ -716,6 +716,8 @@ describe('the desktop port and recovery', () => {
     await port.recoveryTurnOn()
     await port.recoverySettle()
     await port.recoverySaveKit('/tmp/kit.txt')
+    await port.recoveryCoverHost(false)
+    await port.recoveryCoverHost(true)
     await port.accountSignInForRecovery()
     expect(shell.invoked).toEqual([
       { command: 'sync_service_view', args: {} },
@@ -724,6 +726,8 @@ describe('the desktop port and recovery', () => {
       { command: 'recovery_turn_on', args: {} },
       { command: 'recovery_settle', args: {} },
       { command: 'recovery_save_kit', args: { path: '/tmp/kit.txt' } },
+      { command: 'recovery_cover_host', args: { replace: false } },
+      { command: 'recovery_cover_host', args: { replace: true } },
       { command: 'account_sign_in_for_recovery', args: {} }
     ])
   })

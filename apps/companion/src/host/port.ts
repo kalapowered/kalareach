@@ -339,6 +339,33 @@ export interface KitSaved {
   readonly path: string
 }
 
+/**
+ * Why the host on this computer was left as it was when recovery was asked to cover it. The causes
+ * a sign-in, an unusable setup or a host's refusal name are the protocol's own words, kept as the
+ * backend sends them.
+ */
+export type HostLeft =
+  | { readonly reason: 'no_service' }
+  | { readonly reason: 'other_service'; readonly host: string }
+  | { readonly reason: 'sign_in'; readonly sign_in: string }
+  | { readonly reason: 'setup_under_way'; readonly kit_fingerprints: readonly string[] }
+  | { readonly reason: 'other_kit'; readonly host_fingerprint: string }
+  | { readonly reason: 'unusable'; readonly why: string }
+  | { readonly reason: 'declined'; readonly cause: { readonly kind: string } }
+
+/** What covering the host on this computer with this computer's recovery came to. */
+export type HostCoverView =
+  | {
+      readonly state: 'covered'
+      /** The fingerprint of this computer's kit. */
+      readonly kit_fingerprint: string
+      /** The fingerprint of the kit the host was set up under before, when it was replaced. */
+      readonly replaced: string | null
+      /** Whether the host was set up under this computer's recovery already. */
+      readonly already: boolean
+    }
+  | { readonly state: 'left'; readonly why: HostLeft }
+
 /* ---- The person's settings -----------------------------------------------------------------------
  *
  * Native code keeps the settings in a file on this computer and is their one source: the page holds
@@ -1931,6 +1958,14 @@ export interface HostPort {
    * writes it; nothing the kit holds reaches the page.
    */
   recoverySaveKit(path: string): Promise<KitSaved>
+  /**
+   * Covers the host on this computer with this computer's recovery, so that this computer's kit
+   * opens the archives the host makes. Native code reads the host's status, commits the bundle
+   * naming the host's archive and sets the host up with the bytes that landed; the page names only
+   * whether a replacement of a setup under another kit is asked for. The answer says the host is
+   * covered only after the host has said it is set up, and otherwise says why nothing was changed.
+   */
+  recoveryCoverHost(replace: boolean): Promise<HostCoverView>
 
   /**
    * Tells `listener` each event the host publishes. Resolves, with the function that stops it,

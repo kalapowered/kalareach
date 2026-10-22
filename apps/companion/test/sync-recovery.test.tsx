@@ -204,6 +204,59 @@ describe('recovery', () => {
     })
   })
 
+  it('covers the host on this computer, says why it cannot, and replaces a setup only on a second, confirmed choice', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    expect(await within(recovery).findByTestId('recovery-host-help')).toBeInTheDocument()
+    expect(within(recovery).queryByTestId('recovery-replace-host')).toBeNull()
+
+    // A host set up under another kit is left as it is: the card says so, names that kit, and
+    // offers the replacement as a second step, which asks before it does anything.
+    controls.recovery.coverHostAnswers({
+      state: 'left',
+      why: { reason: 'other_kit', host_fingerprint: 'CCCC-DDDD' }
+    })
+    await person.click(within(recovery).getByTestId('recovery-cover-host'))
+    const said = await within(recovery).findByTestId('recovery-host')
+    expect(said).toHaveAttribute('data-state', 'left')
+    expect(said).toHaveTextContent('CCCC-DDDD')
+    expect(said).toHaveTextContent('Nothing was changed')
+    expect(controls.recovery.hostCovers).toEqual([{ replace: false }])
+
+    await person.click(within(recovery).getByTestId('recovery-replace-host'))
+    expect(within(recovery).getByTestId('recovery-replace-warning')).toBeInTheDocument()
+    expect(controls.recovery.hostCovers).toHaveLength(1)
+    // Leaving it as it is sends nothing.
+    await person.click(within(recovery).getByTestId('recovery-replace-cancel'))
+    expect(within(recovery).queryByTestId('recovery-replace-warning')).toBeNull()
+    expect(controls.recovery.hostCovers).toHaveLength(1)
+
+    controls.recovery.coverHostAnswers({
+      state: 'covered',
+      kit_fingerprint: 'ABCD-EFGH',
+      replaced: 'CCCC-DDDD',
+      already: false
+    })
+    await person.click(within(recovery).getByTestId('recovery-replace-host'))
+    await person.click(within(recovery).getByTestId('recovery-replace-confirm'))
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-host')).toHaveAttribute('data-state', 'covered')
+    })
+    expect(controls.recovery.hostCovers).toEqual([{ replace: false }, { replace: true }])
+    expect(within(recovery).getByTestId('recovery-host')).toHaveTextContent('ABCD-EFGH')
+    expect(within(recovery).getByTestId('recovery-host')).toHaveTextContent('CCCC-DDDD')
+    // Covered: the step is done, and no replacement is offered.
+    expect(within(recovery).queryByTestId('recovery-cover-host')).toBeNull()
+    expect(within(recovery).queryByTestId('recovery-replace-host')).toBeNull()
+    await waitFor(() => {
+      expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
+    })
+  })
+
   it('says that a bundle stays where it was made when another sync service is chosen', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
