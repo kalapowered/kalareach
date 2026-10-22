@@ -450,9 +450,9 @@ impl Record {
 #[cfg(unix)]
 const INSTALLER_FILE: &str = "installer";
 
-/// The package manager that put this store's releases there, when one did: it owns which release is
-/// current. It is a file of its own and not a member of the store's record, so a release before
-/// this one, which reads that record, finds it as it wrote it.
+/// The package manager that put this store's releases there, when one did. It only records who
+/// admitted them; `current` says which one runs. It is a file of its own and not a member of the
+/// store's record, so a release before this one, which reads that record, finds it as it wrote it.
 ///
 /// # Errors
 ///
@@ -469,7 +469,7 @@ pub fn installer(store: &Store) -> Result<Option<String>> {
     }
 }
 
-/// Names `installer` as the package manager that owns this store's releases.
+/// Names `installer` as the package manager that admitted this store's releases.
 #[cfg(unix)]
 fn write_installer(store: &Store, installer: &str) -> Result<()> {
     if self::installer(store)?.as_deref() == Some(installer) {

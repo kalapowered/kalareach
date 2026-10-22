@@ -128,7 +128,9 @@ release is checked against the update channel's root, the daemons are handed ove
 switched under the same rules. An update that waits for a live worker, exit 9, is not a failure: its
 reason is said on standard error and the command goes on with the release that is still current,
 and the release the update left staged is offered again at the next command. An update that fails
-after it staged the release is refused once, with its reason, and the release is not offered again.
+after it staged the release is refused once, with its reason, and the release is not offered again,
+unless an earlier failed update is still recorded: `kr host rollback` settles that one, and the
+release can always be taken with its archive and `kr host update --archive`.
 A release that is already in the store and not staged, as one is after a rollback, or that is no
 newer than the current one is not offered again: the command goes on with the release that is
 current, and a rollback stands. A release that carries no update channel root, or cannot be checked, is refused
@@ -137,7 +139,8 @@ in turn, and the one that does not get them goes on with the release that is cur
 
 `kr host rollback`, `kr host versions` and `kr doctor` admit nothing. They run as the store's copy
 of the release that is current, so a release that the current one refuses cannot hold back the
-commands that recover from it. Any other command that stops because its release was refused names
+commands that recover from it. Where this user's store has no current release they run as the
+package manager's `kr`, which keeps no releases, and the two that need a store say so. Any other command that stops because its release was refused names
 the store's own `kr`, which runs the release that is current.
 
 The store names the package manager in its `installer` file. The file only records who admitted

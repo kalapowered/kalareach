@@ -1467,9 +1467,10 @@ jobs:
       # The startup customisations people run, pinned by URL and digest and fetched once here. The
       # relocation cases start a shell over a package from the corpus of them, and the qualification
       # and install steps below read the same corpus; a case that finds no index fails rather than
-      # returns. The fetch checks every archive against its pin whether it came from the cache or the
-      # network, so the cache is named by the lock that pins them and costs a fetch at worst. It is
-      # saved by a green run on the default branch only, as the last step does for the sources.
+      # returns. The fetch checks what it fetched against its pin and what the cache holds against
+      # the digest recorded beside it, so the cache is named by the lock that pins them and costs a
+      # fetch at worst. It is saved by a green run on the default branch only, as the last step does
+      # for the sources.
       - name: Restore the startup customisations
         id: shell-stacks
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

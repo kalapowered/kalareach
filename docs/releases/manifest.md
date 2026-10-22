@@ -167,8 +167,9 @@ files, with the channel's release keys. It runs for a tag and the default branch
 
 The channel's release keys do not exist yet. They are made at a key ceremony and held in hardware
 and on offline media, and no mechanism of this repository gives a run one. So the job that signs
-stops at that step on every platform, with the same refusal, and **tagging a host release does not
-publish one until the ceremony has been held.** The ceremony belongs to the project owner. A release
+stops at that step on every platform and **tagging a host release does not publish one until the
+ceremony has been held.** On macOS it stops sooner, at the Developer ID step, while that identity is
+not set up; the step for the channel keys follows it. The ceremony belongs to the project owner. A release
 that has been published is never changed: a correction is a new commit under its own tag.
 
 ## Package managers
@@ -194,10 +195,12 @@ any update does, and the command goes on with the release that is current. The c
 be one from before package managers, and it takes an archive as it takes any update, since the
 manifest keeps the member that release requires of a shell package. An update that waited leaves its
 release staged, and the next command offers it again; one that failed after it staged the release
-is not offered again. A release the store keeps already, and no update left staged, or one no newer than the current
+is not offered again, unless an earlier failed update is still recorded, which `kr host rollback`
+settles. A release the store keeps already, and no update left staged, or one no newer than the current
 release, is not offered again, so a rollback stands. `kr host rollback`, `kr host versions` and
-`kr doctor` admit nothing: they run as the store's copy of the release that is current, so a
-release that one refuses never holds them back, and a refusal of any other command names that copy.
+`kr doctor` admit nothing: they run as the store's copy of the release that is current (as the
+package manager's `kr` where the default store has none), so a release that one refuses never holds
+them back, and a refusal of any other command names that copy.
 The store names the package manager in a file of its own, `installer`; the file only records who
 admitted the releases, and `current` says which one runs. A release before this one does not know
 the file and treats the install as its own. Removing the package removes the package manager's
