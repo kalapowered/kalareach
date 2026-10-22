@@ -143,9 +143,98 @@ impl Controller {
             return self.answered_from_the_barrier(marker).await;
         }
         match self.answer_without_fence(actor_id, mutation, &record) {
+            Some(Ok(answer)) if matches!(record, crate::grants::ActionRecord::Answered { .. }) => {
+                self.revocation_read_again(actor_id, mutation, answer).await
+            }
             Some(answer) => answer,
             None => self.revocation_on_record(actor_id, mutation).await,
         }
+    }
+
+    /// The answer a revocation was given, with the names its workers have given since.
+    ///
+    /// A revocation answers when its barrier has held, and the names a busy worker had not given
+    /// by then are collected afterwards ([`Self::collect_names_owed`]). The answer is kept as it
+    /// was given, so a retry of the same action reads the barrier of its revision as it stands
+    /// now, and takes from it what a worker has named since. It takes nothing else: a worker the
+    /// daemon no longer holds a report of, as after a restart, keeps the answer it was given.
+    async fn revocation_read_again(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        answer: ParamsValue,
+    ) -> Result<ParamsValue> {
+        let owes = |result: &kr_protocol::sharing::RevocationResult| {
+            result
+                .barrier
+                .workers
+                .iter()
+                .any(|worker| worker.names_pending.get() > 0)
+        };
+        let named = match mutation.method.method() {
+            Some(Method::GrantRevoke) => {
+                Some(parse::<kr_protocol::sharing::GrantRevokeParams>(&mutation.params)?.grant_id)
+            }
+            _ => None,
+        };
+        match mutation.method.method() {
+            Some(Method::GrantRevoke | Method::DeviceRevoke) => {
+                let Ok(given) = answer.to_typed::<kr_protocol::sharing::RevocationResult>() else {
+                    return Ok(answer);
+                };
+                if !owes(&given) {
+                    return Ok(answer);
+                }
+                let audience = Audience::of(actor_id);
+                encode(&self.with_the_names_since(audience, named, given).await?)
+            }
+            Some(Method::GrantTransfer) => {
+                let Ok(mut given) = answer.to_typed::<kr_protocol::sharing::GrantTransferResult>()
+                else {
+                    return Ok(answer);
+                };
+                if !owes(&given.revoked) {
+                    return Ok(answer);
+                }
+                given.revoked = self
+                    .with_the_names_since(Audience::Host, None, given.revoked)
+                    .await?;
+                encode(&given)
+            }
+            _ => Ok(answer),
+        }
+    }
+
+    /// `given`, with the barrier of its revision as the daemon holds it now for each worker that
+    /// had names to give and has given more.
+    async fn with_the_names_since(
+        &self,
+        audience: Audience,
+        named: Option<kr_protocol::ids::GrantId>,
+        given: kr_protocol::sharing::RevocationResult,
+    ) -> Result<kr_protocol::sharing::RevocationResult> {
+        let live = self.barrier_as_it_stands(given.authority_revision).await?;
+        let live = self.barrier_for(audience, named, live)?;
+        let mut barrier = given.barrier.clone();
+        for worker in &mut barrier.workers {
+            if worker.names_pending.get() == 0 {
+                continue;
+            }
+            if let Some(now) = live.workers.iter().find(|now| {
+                now.session_id == worker.session_id
+                    && now.state.holds()
+                    && now.names_pending.get() < worker.names_pending.get()
+            }) {
+                *worker = now.clone();
+            }
+        }
+        let mut answer = kr_protocol::sharing::RevocationResult::bounded(
+            given.authority_revision,
+            given.revoked_grants.iter().copied(),
+            barrier,
+        );
+        answer.revoked_grants_total = given.revoked_grants_total;
+        Ok(answer)
     }
 
     /// The answer a record is owed, when nothing has to run first: every state but an unfinished
