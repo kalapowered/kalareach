@@ -383,11 +383,12 @@ scanner is a full-screen camera view (CameraX on Android, `AVCaptureSession` on 
 is the system's own. Both decode with the platform's detector, Vision on iOS and ZXing on Android,
 and the text of a code goes from the platform's half to Rust and no further. Printing a reading
 shows its kind and never its text. The Android scanner's window is secure, so a screenshot does not
-show what the camera sees. iOS has no way to keep a screenshot from being taken, and says so only
-afterwards, so the iOS scanner hides its preview when the application leaves the active state and
-while the screen is recorded or shared, and cannot stop a screenshot; a direct invitation does not
-pair a device by itself, since the host's owner approves it against the value both screens show.
-The page is told that an invitation was found, never what it says.
+show what the camera sees. iOS has no way to keep a screenshot from being taken, so the iOS scanner
+hides its preview when the application leaves the active state and while the screen is recorded or
+shared, and cannot stop a screenshot. A screenshot taken while the scanner shows a direct
+invitation's code can hold that code; the invitation is short-lived and is spent by one pairing,
+and it does not pair a device by itself, since the host's owner approves the device against the
+value both screens show. The page is told that an invitation was found, never what it says.
 
 One intake runs at a time, and a new one ends the one before it. An invitation a phone read is
 dropped when the application goes to the background (on Android, when it pauses), and so is a
