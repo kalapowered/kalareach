@@ -67,6 +67,7 @@ import type {
   PairingUnavailable,
   PairingSources,
   PairingView,
+  PushView,
   IntakeView,
   RecoveryView,
   RevocationStanding,
@@ -674,6 +675,16 @@ export interface FakeHostControls {
   settleOwedVoice(): void
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
+  /** Changes where notifications stand, as native code would publish it. */
+  setPush(view: PushView): void
+  /** The references the person turned notifications on for, in order. */
+  readonly pushEnabled: string[]
+  /** How many times the page asked native code to look again at where notifications stand. */
+  readonly pushLooks: { count: number }
+  /** The screen the next tap on a notification will have opened the application on, or none. */
+  routeNextTapTo(route: string | null): void
+  /** How many times the page asked which screen a tap opened the application on. */
+  readonly routeAsks: { count: number }
   /** The references the page asked to use as the host its commands go to, in order. */
   readonly usedHosts: string[]
   /** The references the person forgot, in order. */
@@ -947,6 +958,17 @@ export function fakeHost(
         return null
     }
   })()
+  /** Where notifications stand: a phone has them, and nothing is on until the person asks. */
+  let push: PushView = { available: true, hosts: [] }
+  const pushEnabled: string[] = []
+  const pushLooks = { count: 0 }
+  const pushListeners = new Set<(view: PushView) => void>()
+  let routeNext: string | null = null
+  const routeAsks = { count: 0 }
+  const publishPush = (view: PushView) => {
+    push = view
+    for (const listener of pushListeners) listener(push)
+  }
   /** While set, the pairing view's answers wait for it. */
   let pairingViewGate: Promise<void> | null = null
   const pairingListeners = new Set<(view: PairingView | PairingUnavailable) => void>()
@@ -2155,6 +2177,32 @@ export function fakeHost(
       }
       return terminalOpensAnswer.then(() => view.handle)
     },
+    pushView: () => Promise.resolve(push),
+    pushEnable: (reference) => {
+      if (!pairing.hosts.some((host) => host.reference === reference)) {
+        refuse('INVALID_ARGUMENT', 'This computer is not paired with that host.')
+      }
+      pushEnabled.push(reference)
+      publishPush({
+        ...push,
+        hosts: [
+          ...push.hosts.filter((host) => host.reference !== reference),
+          { reference, state: 'working', words: 'Asking for permission.', settings: false }
+        ]
+      })
+      return Promise.resolve(push)
+    },
+    pushRefresh: () => {
+      pushLooks.count += 1
+      return Promise.resolve(push)
+    },
+    notificationRoute: () => {
+      routeAsks.count += 1
+      const route = routeNext
+      routeNext = null
+      return Promise.resolve(route)
+    },
+    onPush: (listener) => register(pushListeners, listener),
     pairingView: () => {
       if (pairingViewGate === null) {
         if (recordsNotOpen !== null) refuse('RESOURCE_UNAVAILABLE', recordsNotOpen)
@@ -3311,6 +3359,15 @@ export function fakeHost(
     setPairing(change) {
       publishPairing(change)
     },
+    setPush(view) {
+      publishPush(view)
+    },
+    pushEnabled,
+    pushLooks,
+    routeNextTapTo(route) {
+      routeNext = route
+    },
+    routeAsks,
     holdIntake(source) {
       let release = (): void => undefined
       intakeHolds.set(
