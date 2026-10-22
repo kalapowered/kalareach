@@ -385,11 +385,12 @@ fn kr_req_11_13_a_binding_is_made_only_from_the_admissions_held_at_their_frame()
     assert!(!live[0].ending);
 }
 
-/// KR-REQ-11.13 and KR-REQ-12.15: a live binding keeps the executable it was bound with, and an
-/// upgrade of the installed agent affects new bindings only. A later synchronisation that names
-/// another version for the same build changes the version a new binding takes, and a newer build
-/// at the same path changes the path's digest and version a new binding takes; the live binding's
-/// path, digest and version stay what they were, in memory and in its row.
+/// KR-REQ-11.13, KR-REQ-12.15 and KR-REQ-29.04: a live binding keeps the executable it was bound
+/// with, and an upgrade of the installed agent affects new bindings only. A later synchronisation
+/// that names another version for the same build changes the version a new binding takes, and a
+/// newer build at the same path changes the path's digest and version a new binding takes; the live
+/// binding's path, digest and version stay what they were, in memory and in its row, which is a
+/// qualification update that does not turn a live binding into another version.
 #[test]
 fn kr_req_11_13_a_binding_keeps_the_executable_it_was_bound_with() {
     let worker = Worker::open();
