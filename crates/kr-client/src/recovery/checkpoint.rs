@@ -24,39 +24,50 @@ use kr_protocol::archive::{ArchiveCheckpoint, RecoveryBundle};
 
 use crate::recovery::{RecoveryError, Result};
 
-/// Holds a bundle read later to the checkpoint this restore already read in the bundle: a service
-/// that answers with an older authentic bundle is not recorded into, because writing on it would
-/// lower the checkpoint it replaced.
+/// Holds a bundle read later to the bundle this restore read first: it is not an older revision, and
+/// every checkpoint the first read found is still there, at that generation or a newer one. A
+/// service that answers a later read with an older authentic bundle is not recorded into, because
+/// writing on it would lower a checkpoint it replaced, whichever archive's it was.
 ///
 /// # Errors
 ///
-/// Returns [`RecoveryError::CheckpointWentBack`] when `bundle` records an older generation of the
-/// archive than `known`, or none, and [`RecoveryError::CheckpointDisagrees`] when it records the
-/// same generation with another encrypted manifest.
-pub(crate) fn hold_to_known_checkpoint(
+/// Returns [`RecoveryError::CheckpointWentBack`] when `bundle` is an older revision than
+/// `first_revision`, or records an older generation than one of `known` for an archive, or none;
+/// and [`RecoveryError::CheckpointDisagrees`] when it records the same generation of an archive
+/// with another encrypted manifest.
+pub(crate) fn hold_to_the_first_read(
     bundle: &RecoveryBundle,
-    known: &ArchiveCheckpoint,
+    first_revision: u64,
+    known: &[ArchiveCheckpoint],
 ) -> Result<()> {
-    let held = bundle
-        .checkpoints
-        .iter()
-        .filter(|held| held.archive_id == known.archive_id)
-        .max_by_key(|held| held.backup_generation);
-    match held {
-        Some(held) if held.backup_generation > known.backup_generation => Ok(()),
-        Some(held) if held.backup_generation == known.backup_generation => {
-            if held.encrypted_manifest_hash == known.encrypted_manifest_hash {
-                Ok(())
-            } else {
-                Err(RecoveryError::CheckpointDisagrees {
-                    generation: known.backup_generation.get(),
-                })
+    if bundle.revision.get() < first_revision {
+        return Err(RecoveryError::BundleWentBackToAnOlderRevision {
+            first: first_revision,
+        });
+    }
+    for known in known {
+        let held = bundle
+            .checkpoints
+            .iter()
+            .filter(|held| held.archive_id == known.archive_id)
+            .max_by_key(|held| held.backup_generation);
+        match held {
+            Some(held) if held.backup_generation > known.backup_generation => {}
+            Some(held) if held.backup_generation == known.backup_generation => {
+                if held.encrypted_manifest_hash != known.encrypted_manifest_hash {
+                    return Err(RecoveryError::CheckpointDisagrees {
+                        generation: known.backup_generation.get(),
+                    });
+                }
+            }
+            _ => {
+                return Err(RecoveryError::CheckpointWentBack {
+                    known: known.backup_generation.get(),
+                });
             }
         }
-        _ => Err(RecoveryError::CheckpointWentBack {
-            known: known.backup_generation.get(),
-        }),
     }
+    Ok(())
 }
 
 /// The bundle that records `verified`, or nothing when the bundle already records it or a newer
