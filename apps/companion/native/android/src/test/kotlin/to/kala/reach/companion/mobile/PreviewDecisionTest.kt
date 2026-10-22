@@ -1,5 +1,6 @@
 package to.kala.reach.companion.mobile
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -16,20 +17,37 @@ class PreviewDecisionTest {
     private val recipient = ByteArray(PreviewEnvelope.KEY_ID_LENGTH) { 0x91.toByte() }
     private val sender = ByteArray(PreviewEnvelope.KEY_ID_LENGTH) { 0x76.toByte() }
 
+    /**
+     * What the gateway sends for one delivery: the sealed envelope as the JSON text of an object
+     * under `preview`, beside the identifiers and the generic alert. The same shape the web side
+     * builds and the iOS extension reads.
+     */
     private fun payload(
         expiresAtMillis: Long = now + 60_000,
         recipientKeyId: ByteArray = recipient,
-        nonceLength: Int = PreviewEnvelope.NONCE_LENGTH
-    ): Map<String, String> =
-        mapOf(
-            "preview_nonce" to encode(ByteArray(nonceLength) { 1 }),
-            "preview_ciphertext" to encode(ByteArray(64) { 2 }),
-            "envelope_id" to "e-1",
-            "recipient_key_id" to encode(recipientKeyId),
-            "sender_key_id" to encode(sender),
-            "expires_at_ms" to expiresAtMillis.toString(),
-            "size_bucket_bytes" to "1024"
+        nonceLength: Int = PreviewEnvelope.NONCE_LENGTH,
+        nonce: String = encode(ByteArray(nonceLength) { 1 })
+    ): Map<String, String> {
+        val routing =
+            JSONObject()
+                .put("envelope_id", "e-1")
+                .put("recipient_key_id", encode(recipientKeyId))
+                .put("sender_key_id", encode(sender))
+                .put("expires_at_ms", expiresAtMillis.toString())
+                .put("payload_type", "notification_preview")
+                .put("thread_id", JSONObject.NULL)
+                .put("size_bucket_bytes", "1024")
+        val preview =
+            JSONObject()
+                .put("routing", routing)
+                .put("nonce", nonce)
+                .put("ciphertext", encode(ByteArray(64) { 2 }))
+        return mapOf(
+            "notification_id" to "0f3a9c7e-51d2-4b08-a614-3e85cb609f22",
+            "alert" to "A KalaReach session needs attention.",
+            "preview" to preview.toString()
         )
+    }
 
     @Test
     fun aRevealedPreviewReplacesTheAlert() {
@@ -124,7 +142,7 @@ class PreviewDecisionTest {
         val impossible = "A".repeat(33)
         val decision =
             PreviewDecider(providingKeys(), openingTo("x"))
-                .decide(payload() + mapOf("preview_nonce" to impossible), now)
+                .decide(payload(nonce = impossible), now)
         assertEquals(PreviewDecision.Generic(GenericReason.MALFORMED_PREVIEW), decision)
     }
 
@@ -132,7 +150,7 @@ class PreviewDecisionTest {
     fun theFieldsDecodeToExactlyTheBytesThatWereEncoded() {
         val nonce = ByteArray(PreviewEnvelope.NONCE_LENGTH) { (it * 7 + 3).toByte() }
         val parsed =
-            PreviewEnvelope.parse(payload() + mapOf("preview_nonce" to encode(nonce)))
+            PreviewEnvelope.parse(payload(nonce = encode(nonce)))
         check(parsed is ParsedPreview.Sealed)
         assertEquals(nonce.toList(), parsed.envelope.nonce.toList())
         assertEquals(

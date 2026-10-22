@@ -3,9 +3,12 @@ package to.kala.reach.companion.mobile
 /**
  * What the application may sign, and when.
  *
- * The same rule as on the other platform: the application signs an action only after its required
- * authentication, and a receiver or a background worker never signs at all. A worker holds one key
- * that opens a preview and can do nothing else.
+ * The application signs an action only after its required authentication, and a receiver or a
+ * background worker never signs one. A worker holds one key that opens a preview and can do nothing
+ * else. The one statement a receiver does sign is the answer to a registration challenge, which is
+ * not an action: it proves the phone receives what is sent to its token, it is made by one function
+ * that signs nothing else (`ChallengeAnswerer`), and it is made only for the registration the
+ * application is waiting for.
  */
 
 /** Whether this process has the authentication signing requires. */
