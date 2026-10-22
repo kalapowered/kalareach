@@ -10,6 +10,9 @@
 //! * a request other than the one the component was handed;
 //! * a decision the connector's table does not map to an answer, or one offered twice.
 //!
+//! The component chooses which of the mapped decisions to offer and in what order, since a decoder
+//! is inside the trust boundary and the native terminal can still give any answer the upstream
+//! accepts.
 //! The summary is carried whole. A summary longer than the decoder's trust allows is refused by the
 //! trust's own check when the broker interprets the projection, and is never cut to fit, since a
 //! shortened sentence can say something the component did not. The component's own class for the

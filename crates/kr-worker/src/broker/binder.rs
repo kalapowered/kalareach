@@ -646,6 +646,8 @@ impl BrokerState {
         self.owed_rows.remove(&binding_id);
         self.settle_owed_rows(now);
         self.renew_gateway_evidence(changed.application_instance_id, now);
+        // Which streams a component is offered is read by the link on its next pass.
+        self.component_changes.notify_one();
         Ok(())
     }
 
