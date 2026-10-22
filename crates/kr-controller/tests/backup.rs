@@ -9424,7 +9424,9 @@ async fn the_host_keeps_the_newest_published_generations_and_deletes_the_objects
     assert_eq!(generations_kept(0), 2);
     assert_eq!(generations_kept(1), 2, "a figure of one keeps two");
     assert_eq!(generations_kept(5), 5);
-    assert_eq!(generations_kept(30), SERVICE_CHAIN_LENGTH);
+    assert_eq!(generations_kept(30), 30, "thirty daily snapshots are thirty kept generations");
+    assert_eq!(generations_kept(31), 30, "no more than the service's chain");
+    assert_eq!(SERVICE_CHAIN_LENGTH, 30);
 
     let host = Host::open();
     host.set_up();

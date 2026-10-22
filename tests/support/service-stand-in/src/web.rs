@@ -50,7 +50,7 @@ pub const BACKUP_WRITE_SCOPE: &str = "backup.write";
 pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
 
 /// The most generations one collection keeps; the oldest is dropped first.
-pub const MAX_GENERATIONS: usize = 16;
+pub const MAX_GENERATIONS: usize = 30;
 
 /// The one account this web knows, and the token that proves it.
 pub const ACCOUNT: &str = "account-one";
