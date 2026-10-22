@@ -183,6 +183,31 @@ describe('creating a session (KR-REQ-07.21)', () => {
     expect(controls.sessionCreates).toHaveLength(0)
   })
 
+  it('does not start a reopened sheet on what the host said at the last opening', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.withDefaultShell('native_compat', 'host_configuration')
+    open(port)
+    let sheet = await startCreating(person)
+    expect(within(sheet).getByRole('radio', { name: /Stock shell/ })).toBeChecked()
+    await person.click(within(sheet).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+
+    // The host is asked again as the sheet opens, and has not answered yet: nothing it said before
+    // is shown as if it were what it says now, and nothing can be created on it.
+    const held = controls.hold('hostInfo')
+    sheet = await startCreating(person)
+    expect(within(sheet).queryByTestId('shell-default')).toBeNull()
+    await person.type(within(sheet).getByRole('textbox', { name: 'Directory' }), '/Users/rs/work/notes')
+    expect(within(sheet).getByRole('button', { name: 'Create session' })).toBeDisabled()
+
+    held.release()
+    expect(await within(sheet).findByTestId('shell-default')).toHaveTextContent('chosen in its configuration')
+    expect(within(sheet).getByRole('button', { name: 'Create session' })).toBeEnabled()
+  })
+
   it('says why the host refused a managed shell, and a stock shell is only ever the person’s choice', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
