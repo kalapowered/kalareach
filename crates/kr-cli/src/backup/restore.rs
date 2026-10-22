@@ -125,8 +125,9 @@ pub trait HostConfiguration: Send + Sync {
 pub struct Run<'a> {
     /// Where ciphertext comes from.
     pub source: Arc<dyn RestoreSource>,
-    /// Where the generation this restore verified is recorded once its files are written.
-    pub bundles: &'a dyn BundleWriter,
+    /// Where the generation this restore verified is recorded once its files are written, or
+    /// nothing when the restore read an export file and reached no service.
+    pub bundles: Option<&'a dyn BundleWriter>,
     /// The one generation older than the bundle's checkpoint that the person accepts.
     pub accept_older: Option<BackupGeneration>,
     /// This host's configuration, when the person asked for the backup's to be applied.
@@ -487,7 +488,14 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
 
     // What the restore leaves besides the files. Neither undoes them: the record is published, and
     // a failure here is said and left for the next run.
-    let checkpoint = record_checkpoint(&prepared, run.bundles).await;
+    let checkpoint = match run.bundles {
+        Some(bundles) => record_checkpoint(&prepared, bundles).await,
+        None => CheckpointResult::NotRecorded(shown!(
+            "this restore read an export file and reached no service, so the recovery bundle does \
+             not record generation {}; restore from the service to record it",
+            prepared.plan().generation.get()
+        )),
+    };
     let applied = match (&planned.configuration, run.configuration) {
         (Asked::Yes(applying), Some(host)) => {
             match host.apply(&applying.change, &applying.baseline) {
