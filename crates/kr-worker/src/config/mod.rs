@@ -50,7 +50,11 @@ pub fn document_path(paths: &EnvironmentPaths) -> PathBuf {
 #[must_use]
 pub fn load(paths: &EnvironmentPaths) -> Loaded {
     let path = document_path(paths);
-    match configuration::read_file(&path, configuration::MAX_LEN) {
+    match configuration::read_file(
+        &path,
+        configuration::MAX_LEN,
+        kr_ipc::paths::check_configuration_file,
+    ) {
         Ok(bytes) => configuration::load(bytes.as_deref()),
         Err(error) => configuration::unreadable(error),
     }

@@ -126,7 +126,7 @@ configuration file this host reads.
 | `level` | The highest level among the sections the document holds that arrived with a level. A writer sets it, and a document that states none is at level 1. See "Levels" below |
 | `revision` | Rises by one with each validated edit. An edit names the revision it was built on and is refused if another writer moved it first, so no edit silently erases another |
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
-| owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
+| owner-only | A document that is a symbolic link or a junction, that belongs to another user, or that another user can reach, is refused rather than read. On Unix that is the owner and the mode (nothing for the group or others); on Windows it is the owner and the file's access-control list, which may name this user, the machine's own accounts and no one else |
 | unknown fields | Refused, in a document at or below the reader's level. A misspelled key is a mistake a person can see, not a setting that quietly does nothing. See "Levels" for a document above it |
 | omitted fields | The product's own value, and reported as the product's own. Every budget inside `enrolment` is separate: the example above configures one of the eleven, and `kr doctor` names that one rather than reporting eleven choices nobody made |
 
