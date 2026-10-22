@@ -3791,6 +3791,7 @@ fn reading_transfers_from_2() -> Vec<ReleaseStore> {
         .map(|store| match store.store.as_str() {
             "transfers" => ReleaseStore {
                 migrates_from: 2,
+                reads_through: None,
                 ..store
             },
             _ => store,
@@ -3806,6 +3807,7 @@ fn reading_a_store_at(name: &str, migrates_from: u32, version: u32) -> Vec<Relea
             if store.store == name {
                 ReleaseStore {
                     migrates_from,
+                    reads_through: None,
                     version,
                     ..store
                 }
@@ -4263,6 +4265,7 @@ async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before
         recording: Recording::SqliteUserVersion,
         version: 1,
         migrates_from: 1,
+        reads_through: None,
     });
     stores.push(ReleaseStore {
         store: "journals".to_owned(),
@@ -4271,6 +4274,7 @@ async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before
         recording: Recording::Unknown,
         version: 1,
         migrates_from: 1,
+        reads_through: None,
     });
     let target = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(stores);
     let archive = host.scratch("archives").join("newer-kinds.tar.gz");
@@ -9815,6 +9819,7 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
             },
             version,
             migrates_from: 1,
+            reads_through: None,
         },
         digest: digest.to_owned(),
         kept: Vec::new(),
