@@ -64,7 +64,7 @@ export function failureWords(
       }
     case 'did_not_finish':
       return {
-        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask it for a new one.`,
+        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask the host for a new one.`,
         action: 'new_invitation'
       }
     default:
@@ -179,6 +179,14 @@ function codeWords(
         sentence: `No KalaReach invitation was found in that picture. ${
           reading === 'photo' ? 'Choose another picture' : 'Choose another picture, or scan the code'
         }.`,
+        action: 'new_invitation'
+      }
+    case 'reader_failed':
+      return {
+        sentence:
+          reading === 'photo'
+            ? 'That picture could not be opened. Choose another picture, or scan the code.'
+            : 'The camera could not be started. Close anything else that is using it and try again, or type the code.',
         action: 'new_invitation'
       }
     case 'store_failed':

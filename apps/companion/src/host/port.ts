@@ -522,6 +522,7 @@ export type FailureKind =
   | 'nothing_to_paste'
   | 'camera_denied'
   | 'no_code_found'
+  | 'reader_failed'
   | 'store_failed'
   | 'approval_unknown'
 

@@ -131,6 +131,14 @@ impl IntakeView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Intake(u64);
 
+/// Which intake is under way, by number, and whether it has read its text.
+#[derive(Default)]
+struct Intaking {
+    number: u64,
+    /// The text is read. What remains is the person's answer to the alert, and holding.
+    read: bool,
+}
+
 /// An invitation taken in, held until it is used, dropped or too old.
 struct Held {
     invitation: Invitation,
@@ -156,8 +164,8 @@ pub struct Device {
     origin_file: PathBuf,
     origin: Mutex<RendezvousOrigin>,
     held: Mutex<Option<Held>>,
-    /// The intake under way, by number: a newer one, a stop and an attempt's start void it.
-    intake: Mutex<u64>,
+    /// The intake under way: a newer one, a stop and an attempt's start void it.
+    intake: Mutex<Intaking>,
     sources: Mutex<Sources>,
     running: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     progress: watch::Sender<AttemptState>,
@@ -344,7 +352,7 @@ impl Device {
             origin_file,
             origin: Mutex::new(origin),
             held: Mutex::new(None),
-            intake: Mutex::new(0),
+            intake: Mutex::new(Intaking::default()),
             sources: Mutex::new(Sources::default()),
             running: Mutex::new(None),
             progress: watch::channel(AttemptState::Idle).0,
@@ -603,11 +611,12 @@ impl Device {
     /// in hand at a time, so closing the scanner or the picker leaves none rather than the one
     /// before it.
     pub fn begin_intake(&self) -> Intake {
-        let mut number = lock(&self.intake);
-        *number += 1;
-        let intake = Intake(*number);
+        let mut intaking = lock(&self.intake);
+        intaking.number += 1;
+        intaking.read = false;
+        let intake = Intake(intaking.number);
         let let_go = lock(&self.held).take().is_some();
-        drop(number);
+        drop(intaking);
         if let_go {
             (self.changed)();
         }
@@ -618,12 +627,39 @@ impl Device {
     /// voided it.
     #[must_use]
     pub fn owns(&self, intake: Intake) -> bool {
-        *lock(&self.intake) == intake.0
+        lock(&self.intake).number == intake.0
+    }
+
+    /// Says that `intake` has read its text, when it is still the one under way.
+    pub fn mark_read(&self, intake: Intake) {
+        let mut intaking = lock(&self.intake);
+        if intaking.number == intake.0 {
+            intaking.read = true;
+        }
     }
 
     /// Voids the intake under way, when there is one.
     pub fn void_intakes(&self) {
-        *lock(&self.intake) += 1;
+        lock(&self.intake).number += 1;
+    }
+
+    /// The application stopped being in front. What was read and is not used yet is let go of: the
+    /// invitation held for the person, and an intake that has read its text and waits for the
+    /// answer to the alert, which then holds nothing. An intake still waiting for the scanner or
+    /// the picker is left to that reader, which ends itself when the application leaves; a
+    /// question the system asks, such as the camera's, also stops the application being in front,
+    /// and must not end the scan it is asked for.
+    pub fn suspend(&self) {
+        let mut intaking = lock(&self.intake);
+        if intaking.read {
+            intaking.number += 1;
+            intaking.read = false;
+        }
+        let let_go = lock(&self.held).take().is_some();
+        drop(intaking);
+        if let_go {
+            (self.changed)();
+        }
     }
 
     /// Holds `invitation` for `intake`, when it is still the intake under way, and drops it when
@@ -637,8 +673,8 @@ impl Device {
     ) -> Option<InvitationSummary> {
         // The check and the holding are one step under the intake's lock, so a stop that voids the
         // intake is either before both or after both.
-        let number = lock(&self.intake);
-        if *number != intake.0 {
+        let intaking = lock(&self.intake);
+        if intaking.number != intake.0 {
             return None;
         }
         let summary = invitation.summary();
@@ -647,7 +683,7 @@ impl Device {
             read_at: Instant::now(),
             read_wall: std::time::SystemTime::now(),
         });
-        drop(number);
+        drop(intaking);
         // The invitation leaves when its time is up, whether or not anything looks at it again.
         let device = Arc::downgrade(self);
         tauri::async_runtime::spawn(async move {
