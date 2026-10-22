@@ -3443,6 +3443,53 @@ Two contracts `docs/transport/README.md` names, and where they are kept:
   control stream ends. The worker's own dispatch path holds no await between the marker and the
   outcome, so it cannot be cancelled part way.
 
+## What the host measures about itself
+
+A host counts three things about its own work and shows them to its owner: how long a paired device
+was without a connection, the faults a session's terminal parser met, and the failures of the
+adapters a session runs. They are local diagnostics. The totals are kept in memory, start again
+from zero when the process that counted them does, appear in `kr doctor` and in a support bundle
+the owner writes, and are sent nowhere.
+
+| Metric | Unit | What it counts | Labels |
+| --- | --- | --- | --- |
+| `reconnect.time` | milliseconds | A paired device's gap between one connection and the next. Each series keeps a count, the total time and the longest gap | `transport`, `attempt`, `outcome`, `environment` |
+| `terminal.parse_fault` | events | Bytes a program wrote that its session's terminal parser could not make sense of | `fault`, `environment` |
+| `adapter.failure` | events | An adapter that did not answer | `adapter`, `outcome`, `environment` |
+
+Every label is one of a closed list, declared once in the protocol crate and written to
+`fixtures/metrics/host.json`, which the service repository's tests hold its own declaration to. A
+name, a unit or a permitted value cannot change on one side alone. There is no label that carries
+text a caller chose, so no line of terminal output, prompt, key or file name can reach one.
+
+* `transport` is `direct` or `relay`: the path the connection was sending on when the host admitted
+  it, or the relay it was dialled through when no path was selected yet. The daemon never reports
+  `local`.
+* `attempt` is `1`, `2-3`, `4-8` or `9+`: the position, among the connections of that device the
+  host admitted or refused since its last one ended, of the connection that ended the gap. An
+  attempt that never reached the host is not seen and is not counted.
+* `outcome` is `ok` when the host admitted the connection and `refused` when it turned the
+  connection away after the gap began. A device that has a connection already is not reconnecting,
+  and a device the host has not seen since it started has no gap to measure. A gap is read on the
+  continuous clock every deadline of this host is read on, so time spent suspended counts.
+* `fault` is `unterminated_sequence` (a control sequence or string abandoned before its end),
+  `invalid_encoding`, `oversized_frame` (a control string past its bound, or a passthrough envelope
+  nested too deep) or `unknown_control` (a sequence the terminal profile has no class for). The other
+  diagnostics of a session's terminal, such as a query the host answered or a clipboard write it
+  refused, are not parse faults and are not counted here.
+* `adapter` is one of the agent connectors the product bundles. A package that is not one of them
+  is counted under no name. `outcome` is `unavailable` when the adapter's connection could not take
+  a frame the host sent, or when the plugin runtime could not run its component, counted once for
+  each step into that state, and `timeout` when the adapter took a request and did not answer it in
+  time.
+* `environment` is `production` for a build that runs from a release in the install store and
+  `development` for any other. A host never reports `staging`, which is a deployment of the
+  service.
+
+`kr doctor` prints each series as a `metric` line and carries the same in `--json` under `metrics`;
+a support bundle carries the lines as they are, since they are made only of this build's own words
+and numbers.
+
 ## Journals and the receipt contract
 
 Each worker has its own SQLite journal in write-ahead-logging mode with full synchronisation.
