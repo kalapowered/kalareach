@@ -4166,9 +4166,7 @@ impl WorkerService {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
         let session = self.runtime.session();
-        let observation =
-            crate::broker::observation::ObservationPrivacy::over(self.broker.observation());
-        let completion = session.reconcile_privacy(&[&attention, &observation]);
+        let completion = session.reconcile_privacy(&[&attention]);
         let privacy = session.privacy();
         let session_id = session.id();
         drop(session);
