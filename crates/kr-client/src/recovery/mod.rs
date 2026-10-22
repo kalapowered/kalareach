@@ -34,9 +34,11 @@
 //! password reset therefore returns an account and nothing else: [`SeedSource`] is the complete
 //! list of places a seed comes from, and a service is not one of them.
 
+mod account_source;
 mod archive;
 mod bundle;
 mod checkpoint;
+mod export;
 mod files;
 mod host_archive;
 mod kit;
@@ -51,14 +53,19 @@ use kr_protocol::scalars::Digest256;
 use crate::services::SyncPosition;
 use crate::shown::{IoFault, Said, Shown};
 
+pub use crate::recovery::account_source::AccountSource;
 pub use crate::recovery::archive::{
     ArchiveServices, SettingsArchive, SettingsBackedUp, SettingsCollection, Unsettled,
 };
 pub use crate::recovery::bundle::{
-    BundleStore, LostWrite, Migrated, MigrationRecord, OfflineExport, WriterEnabled,
-    bundle_collection, fresh_locator,
+    BundleStore, LostWrite, Migrated, MigrationRecord, WriterEnabled, bundle_collection,
+    fresh_locator,
 };
 pub use crate::recovery::checkpoint::advance_checkpoint;
+pub use crate::recovery::export::{
+    ExportSource, ExportedArchive, ExportedObject, MAX_EXPORT_BYTES, OFFLINE_EXPORT_FORMAT,
+    OfflineExport,
+};
 pub use crate::recovery::files::{
     BundleWrite, BundleWriter, BundleWritten, Candidate, CandidateGeneration, CandidateState,
     CheckpointRecorded, FilesRestore, MAX_CONFIGURATION_MEMBER_BYTES, MAX_RANGE_BYTES,
@@ -185,6 +192,9 @@ pub enum RecoveryError {
         /// The generation both name.
         generation: u64,
     },
+    /// The file is an offline export in another format than this release reads.
+    #[error("that file is not an offline export this release reads")]
+    UnsupportedExport,
     /// The host did not say how setting its backups up under this recovery ended.
     ///
     /// The bundle names the archive. Asking again reads the host's status again and finds the

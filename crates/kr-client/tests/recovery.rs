@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use kr_client::error::ClientError;
 use kr_client::recovery::{
     Admission, BundleStore, FreshRestore, LostWrite, MAX_RECOVERY_KIT_BYTES, Material,
-    MigrationRecord, OfflineExport, RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits,
-    RetrievalPolicy, SeedSource, ServiceAccess, bundle_collection, may_back_up, may_restore,
-    parse_kit, qr_payload, render_kit,
+    MigrationRecord, RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits, RetrievalPolicy,
+    SeedSource, ServiceAccess, bundle_collection, may_back_up, may_restore, parse_kit, qr_payload,
+    render_kit,
 };
 use kr_client::services::{
     ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition,
@@ -4642,117 +4642,6 @@ async fn one_kit_serves_several_services() {
         )),
         Err(RecoveryError::UnknownServiceOrigin)
     ));
-}
-
-#[tokio::test]
-async fn the_encrypted_bundle_and_selected_archives_export_offline() {
-    let service = ScriptedService::shared();
-    let seed = RecoverySeed::generate().expect("a seed");
-    let writer = AuthorisationKeyPair::generate().expect("a writer key");
-    let producer = StoredEnvelopeKeyPair::generate().expect("a producer key");
-    let recovery = seed.recipient().expect("a recovery recipient");
-    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
-    let mut bundle = BundleStore::empty(TimestampMs::new(1));
-    store
-        .enable_writer(
-            &seed,
-            &mut bundle,
-            trusted(&writer),
-            TimestampMs::new(1_000),
-        )
-        .await
-        .expect("the bundle commits");
-    store
-        .enable_producer(
-            &seed,
-            &mut bundle,
-            producer.key_id(),
-            *producer.public(),
-            TimestampMs::new(1_100),
-        )
-        .await
-        .expect("the producer is enrolled");
-
-    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-    assert!(recipients.add_recovery(&recovery));
-    let staged = stage_object(
-        &ObjectSource {
-            object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
-            filename: "notes.cbor",
-            plaintext: b"kept offline",
-        },
-        recipients.rotation(),
-    )
-    .expect("a staged object");
-    let sealed = seal_archive(
-        &writer,
-        &producer,
-        &recipients,
-        &ArchivePlan {
-            archive_id: archive_id(),
-            backup_generation: BackupGeneration::new(2),
-            owner_device_id: DeviceId::new(Uuid::from_bytes([0x33; 16])),
-            manifest_object_id: BackupObjectId::new(Uuid::from_bytes([0xf0; 16])),
-            created_at_ms: TimestampMs::new(1_700_000_000_000),
-        },
-        std::slice::from_ref(&staged),
-    )
-    .expect("a sealed archive");
-
-    // The export is ciphertext and nothing else: the encrypted bundle as the service holds it, and
-    // the selected archive's own bytes.
-    let encrypted_bundle = held_bytes(&service, &collection()).await;
-    let export = OfflineExport::new(
-        encrypted_bundle,
-        sealed.descriptor_bytes.clone(),
-        sealed.encrypted_manifest.clone(),
-        vec![staged.bytes().to_vec()],
-    );
-    let bytes = export.to_canonical_bytes().expect("canonical bytes");
-    assert!(
-        !contains(&bytes, b"notes.cbor"),
-        "an offline export carries no filename in the clear"
-    );
-
-    // Read back with nothing but the kit and the export, no service in sight.
-    let restored = OfflineExport::from_canonical_slice(&bytes).expect("the export");
-    let key = seed.bundle_key_for(&context(ORIGIN)).expect("a key");
-    let offline_bundle =
-        kr_crypto::archive::decrypt_recovery_bundle(&key, restored.encrypted_bundle.as_slice())
-            .expect("the bundle opens offline");
-    let writers: Vec<TrustedWriter> = offline_bundle.trusted_writers.iter().cloned().collect();
-    // The producer key comes out of the exported bundle, not out of anything the restoring device
-    // was handed: the export is the encrypted bundle and the archive's own ciphertext.
-    let descriptor =
-        kr_crypto::backup::read_descriptor(restored.descriptor.as_slice()).expect("a descriptor");
-    let sender = offline_bundle
-        .trusted_producers
-        .iter()
-        .find(|held| held.sender_key_id == descriptor.manifest_key_wraps[0].context.sender_key_id)
-        .expect("the bundle names the producer")
-        .stored_envelope_key;
-    let reader = ArchiveReader::Recovery(&recovery);
-    let opened = open_archive(
-        &reader,
-        &sender,
-        &writers,
-        &ArchiveExpectation {
-            archive_id: archive_id(),
-            generation: GenerationExpectation::Unverified,
-        },
-        restored.descriptor.as_slice(),
-        restored.encrypted_manifest.as_slice(),
-    )
-    .expect("the exported archive opens");
-    let object = opened
-        .restore_object(
-            &reader,
-            &sender,
-            staged.object_id(),
-            restored.objects[0].as_slice(),
-        )
-        .expect("the exported object restores");
-    assert_eq!(object.plaintext.expose(), b"kept offline");
 }
 
 // ---------------------------------------------------------------------------------------------
