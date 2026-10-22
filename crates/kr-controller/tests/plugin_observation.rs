@@ -18,11 +18,15 @@
 //! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime is stopped and refuses what is handed to it |
 //! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
 //! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline |
+//! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
+//! | KR-REQ-24.27 | turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, and turning it off lets state be taken again |
 
 #![cfg(unix)]
 
 mod plugin_world;
 
+use kr_protocol::gateway::{PendingKind, PendingState};
+use kr_protocol::local::ControllerConnectionRole;
 use plugin_world::observing::{
     Observing, Options, Spec, answered, binding, credential, digest, highest_line, notification,
     request, unlisted,
@@ -281,12 +285,17 @@ async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_refu
     plugin_world::acting::signal(&host, rustix::process::Signal::STOP);
     std::fs::write(&gate, b"").expect("the gate opens");
     let lane = world.broker().observation();
-    until("the hand-off to the stopped runtime to refuse", || async {
-        lane.view(binding(1))
-            .is_some_and(|view| view.lost_seq > 0)
-            .then_some(())
+    let refused = tokio::time::timeout(plugin_world::PATIENCE, async {
+        while !lane.view(binding(1)).is_some_and(|view| view.lost_seq > 0) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     })
     .await;
+    assert!(
+        refused.is_ok(),
+        "the hand-off to the stopped runtime never refused: {}",
+        world.diagnostics(1)
+    );
 
     // The terminal finished printing and was answered, and the runtime is still stopped.
     until("the terminal to drain and be answered", || async {
@@ -496,4 +505,270 @@ async fn kr_req_11_41_a_component_compiled_at_registration_is_observed_inside_it
         world.reason(1)
     );
     assert!(world.broker().rich_disabled(binding(1)).is_none());
+}
+
+/// KR-REQ-24.06: a plugin runtime that is killed while the worker holds a receipt, a question and an
+/// approval takes none of them with it, and the component that ran in it is registered again in the
+/// replacement and restored to the state the worker held.
+///
+/// The worker holds all three: the receipt of an owner's attach is in its journal, the agent's
+/// question is in its ledger, and the upstream's permission request was read into an approval by a
+/// binding trusted to decode it and is in its broker. Neither the runtime nor its component holds
+/// any of them. The runtime is killed with `SIGKILL` after the worker has taken its component's
+/// state, and the daemon starts another on the worker's asking. The three are read again, and are
+/// equal; the person's answer to the approval goes to the upstream once, through the native
+/// terminal, and the person's answer to the question is taken. The component in the replacement
+/// has been restored, so it has the count it had and not a new one.
+///
+/// What is not claimed: a plugin that reconnects and answers on a restored connection. No entry
+/// reopens a gateway connection that has closed, and the runtime's end does not close one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_06_a_plugin_runtime_that_is_killed_leaves_the_receipt_the_approval_and_the_question_and_its_component_is_restored()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::semantic_only(1),
+        Spec::interpreter(2),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+
+    let mut window = world.owner().await;
+    let action_id = world.attach(&mut window).await;
+    let (question_id, caller_token) = world.ask();
+    world.send(&notification("before"));
+    world.send(&request(7));
+    let approval = until("the request to be read into an approval", || async {
+        world
+            .broker()
+            .pending_resources()
+            .into_iter()
+            .find(|resource| {
+                resource.request.upstream.as_str() == "7"
+                    && resource.kind == PendingKind::Approval
+                    && resource.interpretation_verified
+            })
+            .map(|resource| resource.resource_id)
+    })
+    .await;
+    world.send(&notification("after"));
+
+    // The component has observed all three frames, and the worker holds its state as of the last.
+    world
+        .until_account(
+            1,
+            "the component to have observed the three frames",
+            |account| account.observes >= 3,
+        )
+        .await;
+    world.until_held(1, "observe=3;").await;
+    let before = world
+        .live(&mut window, action_id, question_id, approval)
+        .await;
+    assert_eq!(
+        before.question.state,
+        kr_protocol::question::QuestionState::Pending
+    );
+    assert_eq!(
+        before.approval.as_ref().map(|approval| approval.state),
+        Some(PendingState::Pending),
+        "{before:?}"
+    );
+
+    // The runtime is killed, and the daemon starts another on the worker's asking.
+    let host = world.hosted.published().expect("the runtime is published");
+    plugin_world::kill(&host);
+    until("the runtime to have ended", || async {
+        (kr_ipc::identity::process_state(&host) == kr_ipc::identity::ProcessState::Ended)
+            .then_some(())
+    })
+    .await;
+    let replacement = until("a replacement runtime to be published", || async {
+        world
+            .hosted
+            .published()
+            .filter(|published| *published != host)
+    })
+    .await;
+    assert_ne!(replacement, host);
+    assert_eq!(
+        world.hosted.started(),
+        2,
+        "the daemon started one replacement"
+    );
+
+    // The component is registered in it again and restored to what the worker held.
+    let account = world
+        .until_account(1, "the component to have been restored", |account| {
+            account.restores >= 1
+        })
+        .await;
+    assert_eq!(account.restores, 1, "{account:?}");
+    assert_eq!(
+        account.observes, 3,
+        "it resumed from the state the worker held and not from nothing: {account:?}"
+    );
+    assert_eq!(account.requests, ["7"]);
+    world.until_ready(1).await;
+    let reason = world.reason(1);
+    assert!(
+        reason.contains("were not replayed"),
+        "the report says what the restore did not replay: {reason}"
+    );
+
+    // What the worker held is where the runtime's end left it.
+    let after = world
+        .live(&mut window, action_id, question_id, approval)
+        .await;
+    assert_eq!(
+        after, before,
+        "the receipt, the question and the approval are unchanged"
+    );
+
+    // And is live. The person answers the approval through the native terminal, and the upstream
+    // is given the answer once; the person answers the question, and the agent reads the answer.
+    world
+        .terminal
+        .write(&serde_json::json!({ "id": 7, "result": { "outcome": "allow" } }))
+        .await;
+    let answers = || {
+        world
+            .written
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|frame| {
+                    frame.get("id") == Some(&serde_json::json!(7)) && frame.get("result").is_some()
+                })
+            })
+            .count()
+    };
+    until("the upstream to have been given the answer", || async {
+        (answers() == 1).then_some(())
+    })
+    .await;
+    let settled = until("the approval to settle", || async {
+        world
+            .broker()
+            .recorded(approval)
+            .ok()
+            .flatten()
+            .filter(|resource| resource.state != PendingState::Pending)
+    })
+    .await;
+    assert_eq!(settled.state, PendingState::Resolved);
+    assert_eq!(answers(), 1, "the answer went once");
+    let resolved = world.answer_yes(&mut window, &after.question).await;
+    assert_eq!(
+        resolved.state,
+        kr_protocol::question::QuestionState::Answered
+    );
+    assert!(
+        world
+            .read_back(question_id, caller_token)
+            .answer
+            .is_present(),
+        "the agent is told the answer"
+    );
+
+    // The component goes on observing from where it was restored.
+    world.send(&notification("again"));
+    world
+        .until_account(
+            1,
+            "the component to have observed the next frame",
+            |account| account.observes >= 4,
+        )
+        .await;
+}
+
+/// KR-REQ-24.27: turning privacy mode on drops the state the worker holds for a component, and while
+/// it is on no state is taken or held; observation for live use goes on; a component that was offered
+/// something while it was on is not asked for its state again, since what it holds may be what it
+/// was offered; and a component that starts again has its state taken from then on.
+///
+/// The state is what a component returns when it is asked for a checkpoint: a record of what it was
+/// offered, held in the worker so that a component started again after its runtime ended can be
+/// restored. Privacy mode removes the caches derived from what a session produced, so a component
+/// that is started again after it starts from the live point and not from a restored state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_privacy_mode_drops_the_state_held_for_a_component_and_none_is_taken_of_what_it_was_offered_in_it()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::semantic_only(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    // Far enough on that every time rule has passed, so that what the lane would ask for is decided
+    // by what it is owed and not by how long it has been since.
+    let later = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+    world.send(&notification("one"));
+    world.until_held(1, "observe=1;").await;
+    assert_eq!(lane.held_checkpoints().0, 1);
+
+    // Privacy mode on: what is held is dropped.
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    world.tell_privacy(&mut authority, 1, true).await;
+    assert!(lane.is_private());
+    assert_eq!(
+        lane.held_checkpoints(),
+        (0, 0),
+        "the state held was dropped"
+    );
+
+    // Observation for live use goes on. The component is owed a checkpoint it is not asked for.
+    world.send(&notification("two"));
+    world
+        .until_account(
+            1,
+            "the component to observe a frame sent while private",
+            |account| account.observes >= 2,
+        )
+        .await;
+    assert!(
+        lane.view(binding(1))
+            .is_some_and(|view| view.offered_since_checkpoint > 0 && view.private_content)
+    );
+    assert!(lane.checkpoint_due(later).is_empty());
+    assert_eq!(lane.held_checkpoints(), (0, 0));
+
+    // Privacy mode off: what the component was offered while it was on is still in it, so it is
+    // still not asked.
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
+    assert!(
+        lane.view(binding(1))
+            .is_some_and(|view| view.offered_since_checkpoint > 0)
+    );
+    assert!(lane.checkpoint_due(later).is_empty());
+    assert_eq!(lane.held_checkpoints(), (0, 0));
+
+    // A runtime that ends is replaced, and the component in it starts from the live point: nothing
+    // is restored. Its state is taken from then on.
+    let host = world.hosted.published().expect("the runtime is published");
+    plugin_world::kill(&host);
+    until("a replacement runtime to be published", || async {
+        world
+            .hosted
+            .published()
+            .filter(|published| *published != host)
+    })
+    .await;
+    let account = world
+        .until_account(1, "the component to be registered again", |account| {
+            account.binds >= 1
+        })
+        .await;
+    assert_eq!(account.restores, 0, "{account:?}");
+    assert_eq!(account.observes, 0, "{account:?}");
+    world.until_ready(1).await;
+    world.send(&notification("three"));
+    world.until_held(1, "observe=1;").await;
 }
