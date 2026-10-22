@@ -39,6 +39,7 @@ worker directly for what a session owns.
 | `kr workspace [list/create/remove]` | — | The shared or isolated working copies of a repository. A live session is never moved |
 | `kr changeset [capture/read/materialize]` | — | Capture an exact version of a workspace's work, read one, or write one out on its own |
 | `kr diff [read/apply/revert]` | — | Read changes, or apply or revert a change-set version at a destination you name |
+| `kr workflow rearm <causal-root> --grant <id>` | — | Give a causal chain of automation workflows whose budget ran out a new budget, and continue it |
 | `kr device [list/revoke]` | — | The devices paired with this host, and revoking one |
 | `kr share [invite/list/revoke/transfer]` | — | Share a session with a paired device, see who holds a share, take one back, or hand a session's control to another device |
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
@@ -1493,6 +1494,33 @@ destination stopped being what the request expected part way, `OUTCOME_UNKNOWN` 
 stopped before it finished or cannot say what the destination holds. The text names each path
 that changed or could not be established and the versions to recover from, and the `--json`
 document is the host's whole result with the failure's code and status beside it.
+
+## `kr workflow`
+
+| Command | What it does |
+| --- | --- |
+| `kr workflow rearm <causal-root> --grant <grant> [--generation <n>]` | Gives a causal chain whose budget ran out a new budget, and continues it |
+
+Workflows that trigger one another share one causal budget. When it runs out, the chain is paused,
+no further descendant starts, and one attention item says so. Only an explicit, authorised re-arm
+gives the chain a new budget, and `kr workflow rearm` is that request. It is a client of the one
+method `workflow.rearm`, and the daemon decides every refusal.
+
+The chain is named by its causal root. The attention item for an exhausted chain names it as
+`automation.causal_budget.` followed by the root's identifier, and the identifier is the argument.
+`--grant` names the grant the re-arm is made under, which the host must hold as live, for this
+environment, with the right to manage automation. The command reads the budget generation the chain
+is on, shown as `generation` beside the chain's budget in `workflow.read`, and asks to leave it. With
+`--generation <n>` it asks to leave the generation you name instead, which is what makes a repeat of
+the command safe: a chain already past that generation is told where it is and is given no second
+budget, whether or not it has run out again since. A chain whose budget has not run out, a
+generation the chain is not on, a grant without the right, and a root the host holds no budget for
+are each refused, with the exit code of a refusal by the daemon.
+
+The command prints `Rearmed chain <root>: its budget is on generation <n>.` With `--json` it prints
+`{ "ok": true, "causal_root_id": "...", "generation": "1" }`, the generation as text, as the protocol
+encodes a 64-bit number. The runs the re-arm continues start in the daemon once the re-arm has
+committed, and `workflow.read` shows them.
 
 ## `kr device`
 
