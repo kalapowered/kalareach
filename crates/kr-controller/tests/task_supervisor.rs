@@ -458,39 +458,27 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
     let _ = here.0.kill();
 }
 
-/// KR-REQ-07.58: a recorded number that now belongs to a process this account cannot open is not
-/// work in another session. The processes of an environment are created by a task of the account
-/// that runs its daemon, which can open them, so a number it cannot open is another account's
-/// process, and a daemon that refused to start for it could not be cleared by anything but a
-/// restart of the machine. The account that runs this finds such a number among the processes of
-/// the machine when it has one; a run that is to have one, as the standard account of the sign-out
-/// leg does, says so in `KR_EXPECT_UNOPENABLE_PROCESS`.
+/// KR-REQ-07.58: a recorded process the kernel will not describe is not work in another session.
+/// The processes of an environment are created by a task of the account that runs its daemon,
+/// which can open them, so a recorded number that this account cannot open belongs to another
+/// account's process by now, and a daemon that refused to start for it could not be cleared by
+/// anything but a restart of the machine. The kernel's answer for the number it never describes,
+/// the system idle process's, is the same "not established" that a refused access gives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_recorded_process_this_account_cannot_open_is_not_work_in_another_session() {
+async fn a_recorded_process_the_kernel_will_not_describe_is_not_work_in_another_session() {
     use kr_ipc::identity::{ProcessState, process_state};
     use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 
-    let unopenable = (4..100_000_u64).step_by(4).find_map(|pid| {
-        let recorded =
-            ProcessStartIdentity::new(pid, ProcessStartSource::WindowsProcessCreationTime, 1);
-        matches!(process_state(&recorded), ProcessState::Unknown { .. }).then_some(recorded)
-    });
-    let Some(recorded) = unopenable else {
-        assert!(
-            std::env::var_os("KR_EXPECT_UNOPENABLE_PROCESS").is_none(),
-            "this account was to find a process it cannot open and found none"
-        );
-        return;
-    };
-    println!(
-        "the process this account cannot open: {}",
-        recorded.pid.get()
+    let recorded = ProcessStartIdentity::new(0, ProcessStartSource::WindowsProcessCreationTime, 1);
+    assert!(
+        matches!(process_state(&recorded), ProcessState::Unknown { .. }),
+        "the kernel does not establish what the number is"
     );
     for left in [Left::Worker, Left::Claimed] {
         let host = TempHost::create();
         leave(&host, left, &recorded);
         start_daemon(&host).await.unwrap_or_else(|refused| {
-            panic!("{left:?} work on a number it cannot open: {refused}")
+            panic!("{left:?} work on a number the kernel does not describe: {refused}")
         });
     }
 }
