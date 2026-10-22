@@ -66,12 +66,14 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
         !report.reconnect_time.is_empty(),
         "the host counted none of the {CYCLES} times the device came back"
     );
+    // The round that showed the first gap is the round that counted it, once: the loop ends there.
+    assert_eq!(report.reconnect_time.len(), 1, "{report:?}");
     for series in &report.reconnect_time {
         assert_eq!(series.outcome, MetricOutcome::Ok, "{series:?}");
         assert_eq!(series.attempt, ReconnectAttempt::One, "{series:?}");
         assert_eq!(series.environment, Environment::Development, "{series:?}");
-        assert!(series.count.get() >= 1);
-        assert!(series.longest_ms.get() <= series.total_ms.get());
+        assert_eq!(series.count.get(), 1, "{series:?}");
+        assert_eq!(series.longest_ms, series.total_ms, "{series:?}");
     }
     assert_eq!(
         report.terminal_parse_fault.len() + report.adapter_failure.len(),
