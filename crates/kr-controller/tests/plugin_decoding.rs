@@ -25,7 +25,7 @@ use kr_worker::broker::decoding::NotDecoded;
 use plugin_world::observing::{
     Observing, Options, Spec, binding, digest, package, request, request_noting,
 };
-use plugin_world::until;
+use plugin_world::{PATIENCE, until};
 
 /// The recorded request the upstream gave `id`, whatever has become of it.
 fn resource_for(world: &Observing, id: &str) -> Option<PendingResource> {
@@ -39,6 +39,31 @@ fn resource_for(world: &Observing, id: &str) -> Option<PendingResource> {
 /// The approval the request the upstream gave `id` has become, once it is one.
 fn approval_for(world: &Observing, id: &str) -> Option<PendingResource> {
     resource_for(world, id).filter(|resource| resource.interpretation_verified)
+}
+
+/// Waits until the request the upstream gave `id` has become an approval, and says where the
+/// request, the component and the binding's report stand when it never does.
+async fn approved(world: &Observing, id: &str) -> PendingResource {
+    let found = tokio::time::timeout(PATIENCE, async {
+        loop {
+            if let Some(approval) = approval_for(world, id) {
+                return approval;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    match found {
+        Ok(approval) => approval,
+        Err(_) => panic!(
+            "waited {PATIENCE:?} for request {id} to become an approval; the record has it as \
+             {:?}; the component's account is {:?}; {}",
+            resource_for(world, id)
+                .map(|resource| (resource.state, resource.interpretation_verified)),
+            world.raw_account(1).await,
+            world.diagnostics(1)
+        ),
+    }
 }
 
 /// What the native terminal answers a request with.
@@ -77,10 +102,7 @@ async fn kr_req_11_21_a_request_the_connector_leaves_to_its_component_becomes_th
     };
     let frame = request(7);
     world.send(&frame);
-    let approval = until("the request to be read into an approval", || async {
-        approval_for(&world, "7")
-    })
-    .await;
+    let approval = approved(&world, "7").await;
     assert_eq!(approval.state, PendingState::Pending);
 
     // The decoder is named, the request's bytes are kept whole, and the projection is the
@@ -145,10 +167,7 @@ async fn kr_acc_016_a_decoder_that_answers_what_it_was_not_asked_makes_no_approv
         return;
     };
     world.send(&request(100));
-    until("the honest request to be read", || async {
-        approval_for(&world, "100")
-    })
-    .await;
+    approved(&world, "100").await;
 
     let wrong = [
         ("!other-request", NotDecoded::OtherRequest),
@@ -219,10 +238,7 @@ async fn kr_req_11_26_a_request_answered_natively_while_its_decode_is_held_is_no
     hold.release();
 
     world.send(&request(22));
-    until("the next request to be read", || async {
-        approval_for(&world, "22")
-    })
-    .await;
+    approved(&world, "22").await;
     let first = resource_for(&world, "21").expect("the first request is recorded");
     assert!(!first.interpretation_verified);
     assert_ne!(first.state, PendingState::Pending, "{first:?}");
@@ -255,10 +271,7 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     };
     let lane = world.broker().observation();
     world.send(&request(31));
-    until("the request to be read", || async {
-        approval_for(&world, "31")
-    })
-    .await;
+    approved(&world, "31").await;
     let view = lane.view(binding(1)).expect("the component has a view");
     assert!(!view.private_content, "{view:?}");
 
@@ -278,10 +291,7 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     assert!(!lane.is_private());
     hold.release();
 
-    until("the request made in privacy mode to be read", || async {
-        approval_for(&world, "32")
-    })
-    .await;
+    approved(&world, "32").await;
     let view = lane.view(binding(1)).expect("the component has a view");
     assert!(
         view.private_content,
@@ -312,10 +322,7 @@ async fn kr_req_11_26_a_binding_has_a_share_of_the_decode_queue_and_a_request_pa
     hold.release();
 
     for number in 41..=48 {
-        until("a queued request to be read", || async {
-            approval_for(&world, &number.to_string())
-        })
-        .await;
+        approved(&world, &number.to_string()).await;
     }
     let refused = resource_for(&world, "49").expect("the refused request is recorded");
     assert!(!refused.interpretation_verified);
