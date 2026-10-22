@@ -792,4 +792,37 @@ mod tests {
         .expect("an answer");
         assert_eq!(missing["reason"], "key_missing");
     }
+
+    /// A challenge a gateway really sent, recorded from a device run, names the registration its
+    /// phone waits for and is answered until the moment the gateway stops taking an answer, and not
+    /// after it. What the vectors give a test is the payload; this is the message around it.
+    #[test]
+    fn a_challenge_a_gateway_really_sent_is_answered_until_it_lapses() {
+        let recorded: Value =
+            serde_json::from_str(include_str!("../fixtures/push/recorded-challenge.json"))
+                .expect("a recording");
+        let data: BTreeMap<String, String> =
+            serde_json::from_value(recorded["message"]["data"].clone()).expect("the data");
+        let expires: u64 = data[EXPIRES_KEY].parse().expect("a time");
+        let pending: PendingRegistration = serde_json::from_value(serde_json::json!({
+            "registration_id": data[REGISTRATION_KEY],
+            "token_digest": data[TOKEN_DIGEST_KEY],
+            "gateway_origin": data[ORIGIN_KEY],
+            "platform": "android",
+            "deadline_ms": expires + 120_000,
+            "state": "pending",
+        }))
+        .expect("the record that waits for it");
+
+        let before = verdict(&data, Some(&pending), expires - 1);
+        assert_eq!(before["verdict"], "answer", "{before}");
+        assert_eq!(
+            before["url"],
+            format!("{}{REGISTER_ROUTE}", data[ORIGIN_KEY]),
+            "the answer goes to the gateway that sent the challenge"
+        );
+        let at = verdict(&data, Some(&pending), expires);
+        assert_eq!(at["verdict"], "refused", "{at}");
+        assert_eq!(at["reason"], "expired");
+    }
 }
