@@ -123,6 +123,59 @@ limit covers: a host that has spent its nonces has still asked the status questi
 A registration that replaces an authorisation also owes the gateway a revocation, which is two
 requests more, outside these limits.
 
+### What the phone does first
+
+A person turns notifications on for one paired host, on the Hosts screen. The phone asks the system
+for permission to notify (iOS `requestAuthorization`, Android 13 `POST_NOTIFICATIONS`) and for the
+registration token its provider gave the installation. A refusal is a state in words and changes
+nothing else. Stopping notifications later is the system's setting, and ending a destination is the
+host's: a host ends it when it unpairs the device.
+
+Before the phone proposes the token it writes a record that the native half owns and that holds no
+secret: the registration identifier, the digest of the token, the gateway origin, the platform, the
+state (`pending`, `answered`, `refused`, `expired` or `superseded`) and a deadline seven minutes
+away, two longer than the gateway's five. A record past its deadline reads as expired on every
+read, in whatever process reads it, because nothing runs a timer in a stopped process. The phone
+then sends `push.installation.register` and the gateway sends the challenge to the token as a data
+message that carries `kr_challenge`, `kr_registration_id`, `kr_token_digest`, `kr_gateway_origin` and
+`kr_expires_at_ms`.
+
+The native receiver answers it: the Android messaging service, and on iOS the application
+delegate's method for a push that woke the application. Both pass the message and the record to one
+Rust function, `classify`, which holds no secret and says whether to answer. It says no when the
+message is not a challenge, when no record is pending, when the record or the challenge itself has
+expired, when the registration, the token digest or the gateway origin is not the record's, and when
+a field is malformed. Only after a yes does the receiver read the installation's key and call
+`sign`, which returns the answer and the signed request that carries it; the receiver posts that to
+the origin the record names and moves the record to `answered` or `refused`. The function is reached
+through JNI on Android and through C symbols on iOS, and it signs nothing but a managed-service
+request and this answer. A post that did not reach the gateway is asked again on Android by
+WorkManager inside the deadline. On iOS nothing asks again: the challenge is lost, the record
+expires, and the person tries again.
+
+The companion's core waits by reading the record each half second. That is a read of a local file
+and sends nothing. When the record says `answered` it checks that the phone is still paired with the
+host the person chose, asks the gateway for `push.sender.issue` under the authorisation identifier
+the phone keeps for that host (a new one the first time), and hands the credential to the host with
+`device.push.register` and the preview key with `device.preview_key.update`. The credential lives in
+memory between the two calls and is never kept. The preview key's seed goes to a store that a
+receiver reads and nothing else is put in: on Android a directory of its own beside the secure
+store, which separates files and not processes, and on iOS the shared keychain group the extension
+reads.
+
+Every step can be repeated. A lost answer, a restart or a changed token is mended by starting again
+from the proposal or the issue under a new action. Issuing again under the same record identifier
+gives a fresh bearer at the next revision, the host keeps the higher revision and owes the gateway no
+revocation, and one authorisation stands. The phone repeats the sequence when the token changes, and
+once a minute at most when the application comes to the front after a stop that the person or the
+network could mend.
+
+The phone shows the host's generic alert and nothing more. A sealed preview is delivered and left
+unopened, and the key is filed so that an opener added later needs no new registration. Android
+receives a data message and shows the notification itself, under the identifier the host gave it
+and with a tap that opens the attention screen. On iOS the system shows the alert, the extension
+runs, and a tap is routed by the notification delegate set at launch.
+
 ### What neither question shows
 
 The gateway's answers do not tie the bearer to a sender record or a sender record to an
