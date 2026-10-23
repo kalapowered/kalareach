@@ -3420,9 +3420,9 @@ mod tests {
     /// and the working copy the next verification starts from leaves those floors out.
     ///
     /// KR-REQ-11.07, the root progress a verification keeps: a root recorded with the reset it
-    /// owes stays owed when a later root changes nothing, the working copy the next verification
-    /// starts from leaves the timestamp and snapshot floors out while it is owed, and only the
-    /// sync that publishes a verified checkpoint settles it.
+    /// owes stays owed when a later root changes nothing, the working copy made for the reset
+    /// leaves the timestamp and snapshot floors out, and only the sync that publishes a verified
+    /// checkpoint settles it.
     #[tokio::test]
     async fn a_reset_kept_with_a_root_is_owed_until_a_checkpoint_is_published() {
         let home = tempfile::tempdir().expect("a temporary directory");
