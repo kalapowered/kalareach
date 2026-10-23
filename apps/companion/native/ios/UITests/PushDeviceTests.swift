@@ -206,14 +206,15 @@ final class PushDeviceTests: DeviceTestCase {
             screenshot("sent-\(act)")
             write("acted-\(act)", "sent \(screenText())")
         case "observe":
-            // The page says that a question the person had chosen an answer to, and had not sent,
-            // was answered by someone else, and offers nothing to send.
+            // The page says that a question the person had chosen Yes to, and had not sent, was
+            // answered by someone else, and offers nothing to send.
             let send = anyElement(labelled: "Send answer", within: app)
             let said = { [app] (words: String) -> Bool in
                 app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", words)).firstMatch.exists
             }
             let end = Date().addingTimeInterval(60)
-            while Date() < end, send.exists || !(said("no longer waiting") && said("answered by someone else") && said("You had chosen")) {
+            // The page writes "You had chosen Yes." in three pieces, which the screen's text joins as "You had chosen | Yes".
+            while Date() < end, send.exists || !(said("no longer waiting") && said("answered by someone else") && screenText().contains("You had chosen | Yes")) {
                 Thread.sleep(forTimeInterval: 0.25)
             }
             screenshot("ended-\(act)")
