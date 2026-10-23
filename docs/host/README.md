@@ -1395,13 +1395,13 @@ installation wants, so a recipe a stopped daemon left part way is finished or ta
 anything else is served. The recipe keeps a journal of its own for each package under
 `native-bridges/` in the environment's state directory, apart from the catalogue's records, and
 never changes a method's answer or receipt: an installation's answer says what the catalogue did,
-and the journal says what the recipe did. Its version check needs a signed record that names the
+and the journal says what the recipe did. Its version check needs a qualified build that names the
 application's executable by digest: a build the release's entry in the repository's signed index
-names for this host's platform. Records arrive with a synchronisation, so the bridges are brought up
-to date after every sync as well. A recipe is refused, and the journal says why, when no signed
-record names an executable of the application, when no such executable is on the search path, when
-an executable there is not one a record names, and when the version a record names is outside the
-range the recipe is written for. `docs/plugins/catalogue.md` has what is checked before anything is
+names for this host's platform. Qualified builds arrive with a synchronisation, so the bridges are
+brought up to date after every sync as well. A recipe is refused, and the journal says why, when the
+signed index names no qualified build of an executable of the application, when no such executable
+is on the search path, when an executable there is not one a qualified build names, and when the
+version a qualified build names is outside the range the recipe is written for. `docs/plugins/catalogue.md` has what is checked before anything is
 written and what a removal leaves.
 
 The registry admits a paired device to all thirteen of these methods, and the daemon serves them
@@ -6527,7 +6527,7 @@ has nothing to compare against is refused rather than believed, because evidence
 a package this host cannot identify is a claim about something else.
 
 Evidence is never permission. Only a probe this host ran or a binding that performed the operation
-here can say a capability works here; a signed catalogue record is evidence about a version. A
+here can say a capability works here; a signed qualification result is evidence about a version. A
 probe declares the operations it will perform and the budget it may spend before it runs, and a
 probe with a destructive effect needs its own isolated test context.
 
