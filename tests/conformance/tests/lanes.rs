@@ -122,19 +122,22 @@ fn a_row_the_android_lane_ran_reads_passed_and_the_ios_files_say_where_they_run(
         &[executed(step(Platform::Linux), 0, Ok(junit("junit")))],
     );
     assert!(document.passed(), "{:?}", document.problems);
-    // VoiceCaptureGateTest.kt has ten cases and names the row; the Swift file is another report's.
+    // VoiceCaptureGateTest.kt has ten cases, and the comment above its class names the rows, so
+    // every case of the class reads them. The Swift file is another report's: it names 15.34 above
+    // two of its classes and above eleven of its cases, and 15.35 above the same two classes and
+    // five cases, and each is a record of its own that says where it runs.
     assert_eq!(
         counts(&document, "KR-REQ-15.34"),
-        (Verdict::Passed, 10, 0, 1)
+        (Verdict::Passed, 10, 0, 13)
     );
     assert_eq!(
         counts(&document, "KR-REQ-15.35"),
-        (Verdict::Passed, 14, 0, 1)
+        (Verdict::Passed, 14, 0, 7)
     );
     let tests = &document.identifiers["KR-REQ-15.34"].tests;
     let swift = tests
         .iter()
-        .find(|test| test.test.ends_with("VoiceCaptureStateTests.swift"))
+        .find(|test| test.test.contains("VoiceCaptureStateTests.swift"))
         .expect("the Swift file's record");
     assert_eq!(swift.outcome, Outcome::NotRun);
     assert!(
@@ -155,14 +158,16 @@ fn a_row_the_android_lane_ran_reads_passed_and_the_ios_files_say_where_they_run(
         )
     );
     assert!(
-        case.source.ends_with("VoiceCaptureGateTest.kt:13"),
+        // The most particular key is the one recorded: the comment above the case, not the one
+        // above its class.
+        case.source.ends_with("VoiceCaptureGateTest.kt:28"),
         "{case:?}"
     );
     assert_eq!(document.run.toolchain.phones["gradle"], "8.14.3");
 }
 
 #[test]
-fn a_row_the_ios_lane_ran_reads_passed_from_every_class_of_the_file_that_names_it() {
+fn a_row_the_ios_lane_ran_reads_passed_from_the_classes_and_cases_that_name_it() {
     let map = map_of(&fixtures().join("lanes"));
     let document = assemble(
         Platform::MacOs,
@@ -170,10 +175,12 @@ fn a_row_the_ios_lane_ran_reads_passed_from_every_class_of_the_file_that_names_i
         &[executed(step(Platform::MacOs), 0, Ok(xcode("ios.json")))],
     );
     assert!(document.passed(), "{:?}", document.problems);
-    // The file declares five test classes with 39 cases; LaunchPlanTests.swift names no row.
+    // The file declares five test classes with 39 cases; LaunchPlanTests.swift names no row. The
+    // row is named above two classes and above cases of one other, so the cases of the other three
+    // classes do not read it.
     assert_eq!(
         counts(&document, "KR-REQ-15.34"),
-        (Verdict::Passed, 39, 0, 1)
+        (Verdict::Passed, 22, 0, 4)
     );
     let case = document.identifiers["KR-REQ-15.34"]
         .tests
@@ -192,7 +199,65 @@ fn a_row_the_ios_lane_ran_reads_passed_from_every_class_of_the_file_that_names_i
 }
 
 #[test]
-fn a_failing_case_fails_every_row_its_file_names_and_the_run() {
+fn a_comment_keys_the_case_below_it_the_class_below_it_or_the_whole_file() {
+    use kr_conformance::lane::Part;
+    use kr_conformance::map::Binding;
+    let map = map_of(&fixtures().join("lanes"));
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    let swift = "apps/companion/native/ios/Tests/VoiceCaptureStateTests.swift";
+    let parts = |row: &str| -> Vec<(Part, Binding)> {
+        map.keys[&row.parse().expect("an identifier")]
+            .iter()
+            .filter_map(|(place, key)| match place {
+                Place::Lane { file, part, .. } if file == swift => {
+                    Some((part.clone(), key.binding))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let case = |class: &str, name: &str| Part::Case {
+        class: class.to_owned(),
+        name: name.to_owned(),
+    };
+    // The comment at the head of the file names three rows, and keys the whole file for them.
+    for row in ["KR-REQ-15.36", "KR-ACC-014", "KR-REQ-15.13"] {
+        assert!(
+            parts(row).contains(&(Part::File, Binding::FileComment)),
+            "{row}: {:?}",
+            parts(row)
+        );
+    }
+    // The comment above a class keys that class's cases, and the one above a case that case.
+    let fifteen_34 = parts("KR-REQ-15.34");
+    assert!(
+        fifteen_34.contains(&(
+            Part::Class("VoiceCaptureGateTests".to_owned()),
+            Binding::ModuleComment
+        )),
+        "{fifteen_34:?}"
+    );
+    assert!(
+        fifteen_34.contains(&(
+            case(
+                "VoiceCaptureGateTests",
+                "testNothingIsCapturedWithoutAPermit()"
+            ),
+            Binding::AttachedComment
+        )),
+        "{fifteen_34:?}"
+    );
+    // Nothing keys 15.34 in the classes that do not name it, nor the file as a whole.
+    assert!(
+        fifteen_34
+            .iter()
+            .all(|(part, _)| !matches!(part, Part::File)
+                && !matches!(part, Part::Class(class) if class == "VoiceCaptureStateTests"))
+    );
+}
+
+#[test]
+fn a_failing_case_fails_every_row_its_comments_name_for_it_and_the_run() {
     let map = map_of(&fixtures().join("lanes"));
     let android = assemble(
         Platform::Linux,
@@ -204,8 +269,11 @@ fn a_failing_case_fails_every_row_its_file_names_and_the_run() {
         )],
     );
     assert!(!android.passed());
-    assert_eq!(counts(&android, "KR-REQ-15.34"), (Verdict::Failed, 9, 1, 1));
-    // The file is the unit of keying, so the row the file names beside it fails with it.
+    assert_eq!(
+        counts(&android, "KR-REQ-15.34"),
+        (Verdict::Failed, 9, 1, 13)
+    );
+    // The comment above the class names the rows beside it, so they fail with the class's case.
     assert_eq!(counts(&android, "KR-REQ-15.35").0, Verdict::Failed);
     assert!(android.failures_outside_identifiers.is_empty());
     let ios = assemble(
@@ -230,7 +298,7 @@ fn a_failing_case_fails_every_row_its_file_names_and_the_run() {
 }
 
 #[test]
-fn a_file_the_lane_ran_and_reported_nothing_of_is_failed_and_never_not_run() {
+fn a_key_the_lane_ran_and_reported_nothing_of_is_failed_and_never_not_run() {
     let map = map_of(&fixtures().join("lanes"));
     let mut cases = junit("junit");
     cases.retain(|case| case.class.ends_with("VoiceServiceActionsTest"));
@@ -239,12 +307,48 @@ fn a_file_the_lane_ran_and_reported_nothing_of_is_failed_and_never_not_run() {
         &map,
         &[executed(step(Platform::Linux), 0, Ok(cases))],
     );
-    let gate = document.identifiers["KR-REQ-15.34"]
+    let gate: Vec<_> = document.identifiers["KR-REQ-15.34"]
         .tests
         .iter()
-        .find(|test| test.test.ends_with("VoiceCaptureGateTest.kt"))
-        .expect("the file's record");
-    assert_eq!(gate.outcome, Outcome::Failed);
+        .filter(|test| test.test.contains("VoiceCaptureGateTest.kt"))
+        .collect();
+    assert!(!gate.is_empty());
+    assert!(gate.iter().all(|test| test.outcome == Outcome::Failed));
+    assert_eq!(
+        document.identifiers["KR-REQ-15.34"].verdict,
+        Verdict::Failed
+    );
+}
+
+#[test]
+fn a_case_the_lane_did_not_report_fails_the_rows_its_comment_names() {
+    // The comment above a case names a case the tool never reported, as when the source reading
+    // took a function for a test that the tool does not run. The row fails; it is not left to the
+    // other cases of the class.
+    let map = map_of(&fixtures().join("lanes"));
+    let mut cases = junit("junit");
+    cases.retain(|case| case.name != "nothing_is_captured_without_a_permit");
+    let document = assemble(
+        Platform::Linux,
+        &map,
+        &[executed(step(Platform::Linux), 0, Ok(cases))],
+    );
+    let record = document.identifiers["KR-REQ-15.34"]
+        .tests
+        .iter()
+        .find(|test| {
+            test.test
+                .ends_with("VoiceCaptureGateTest.nothing_is_captured_without_a_permit")
+        })
+        .expect("the case's record");
+    assert_eq!(record.outcome, Outcome::Failed);
+    assert!(
+        record
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no case nothing_is_captured_without_a_permit")),
+        "{record:?}"
+    );
     assert_eq!(
         document.identifiers["KR-REQ-15.34"].verdict,
         Verdict::Failed
@@ -348,7 +452,7 @@ fn a_case_no_file_can_be_given_to_fails_every_row_of_its_lane() {
         let swift_record = document.identifiers["KR-REQ-15.34"]
             .tests
             .iter()
-            .find(|test| test.test.ends_with("VoiceCaptureStateTests.swift"))
+            .find(|test| test.test.contains("VoiceCaptureStateTests.swift"))
             .expect("the Swift file's record");
         assert!(
             swift_record
@@ -393,8 +497,9 @@ fn an_expected_failure_that_leaves_the_exit_status_at_0_still_fails_the_run() {
 fn a_class_given_to_the_wrong_single_file_still_fails_the_run() {
     // The limit of the rule: a class missed in its own file and listed in another that names no row
     // stays attributed to that other file. Its failure then fails the run and is listed among the
-    // failures outside any row, though the rows of the file that holds the class read from its
-    // other classes.
+    // failures outside any row. The rows the comment above that class names fail with it, since no
+    // case of the class is the file's to give them; the rows named elsewhere in the file read from
+    // its other classes.
     let mut map = map_of(&fixtures().join("lanes"));
     map.lane_classes
         .get_mut("apps/companion/native/ios/Tests/VoiceCaptureStateTests.swift")
@@ -419,14 +524,11 @@ fn a_class_given_to_the_wrong_single_file_still_fails_the_run() {
     assert!(document.problems.is_empty(), "{:?}", document.problems);
     assert_eq!(document.failures_outside_identifiers.len(), 1);
     assert!(document.failures_outside_identifiers[0].contains("VoiceRecorderReaderTests"));
-    // The rows of the file that holds the class read from its other classes: the limit.
-    for row in [
-        "KR-REQ-15.13",
-        "KR-REQ-15.34",
-        "KR-REQ-15.35",
-        "KR-REQ-15.36",
-        "KR-ACC-014",
-    ] {
+    // The rows the missed class names fail; the others read from the file's other classes.
+    for row in ["KR-REQ-15.36", "KR-ACC-014"] {
+        assert_eq!(document.identifiers[row].verdict, Verdict::Failed, "{row}");
+    }
+    for row in ["KR-REQ-15.13", "KR-REQ-15.34", "KR-REQ-15.35"] {
         assert_eq!(document.identifiers[row].verdict, Verdict::Passed, "{row}");
     }
 }
@@ -708,7 +810,7 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
     assert!(document.passed(), "{:?}", document.problems);
     assert_eq!(
         counts(&document, "KR-REQ-15.34"),
-        (Verdict::Passed, 10, 0, 1)
+        (Verdict::Passed, 10, 0, 13)
     );
     assert_eq!(document.run.toolchain.phones["gradle"], "8.14.3");
     assert_eq!(document.run.toolchain.phones["java"], "unknown");
@@ -724,10 +826,11 @@ fn a_phone_test_file_whose_braces_do_not_balance_is_one_problem_that_names_it() 
     let text = std::fs::read_to_string(&source).expect("the fixture");
     let cut = text.rfind('}').expect("a closing brace");
     std::fs::write(&target, &text[..cut]).expect("a file");
-    // The directory holds no Cargo workspace, which is a problem of its own; the file has one.
+    // The directory holds no Cargo workspace, which is a problem of its own; the file has one. A
+    // file that cannot be read keys nothing, and the problem stops the report.
     let map = map_of(root.path());
     assert!(
-        map.keys
+        !map.keys
             .values()
             .flat_map(|places| places.keys())
             .any(|place| matches!(place, Place::Lane { file, .. } if file == kotlin))
@@ -759,7 +862,7 @@ fn a_phone_test_file_that_names_a_row_and_declares_no_class_is_a_problem() {
     std::fs::write(&target, text).expect("a file");
     let map = map_of(root.path());
     assert!(
-        map.keys
+        !map.keys
             .values()
             .flat_map(|places| places.keys())
             .any(|place| matches!(place, Place::Lane { file, .. } if file == kotlin))
