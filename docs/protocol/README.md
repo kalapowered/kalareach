@@ -374,6 +374,26 @@ message; it is then removed and returned beside the message by `kr_protocol::wir
 This build implements no extension, so it offers and selects none and every extension member it
 receives is refused. Local connections negotiate none.
 
+## Expiry and freshness
+
+Every authority in the protocol ends, and each ending is one of these bounds. The documents named
+beside them hold the rest of each rule.
+
+| What | Bound | Described in |
+| --- | --- | --- |
+| A pairing invitation | Five minutes, single use | [Pairing](../pairing/README.md) |
+| An action window | Issued for one connection and the host's boot, and replaced on the live connection at half its validity. A mutation's accepted deadline is the earliest of the window's expiry, its receipt time plus the requested lifetime and any authority deadline | [Action windows](../transport/README.md#action-windows) |
+| The remote dispatch lease | At most five seconds, taken when the daemon forwards an action, and held by the worker as well as the daemon | [The remote dispatch lease](../transport/README.md#the-remote-dispatch-lease) |
+| A membership lease | At most fifteen minutes, refreshed every five | [Account authority objects](#account-authority-objects) |
+| A signed service request | Admitted within five minutes of the service's clock in either direction; its nonce is remembered for twice that long | [The service credential](#the-service-credential) |
+| A relay lease | The lease states its own end; a revocation and a consumption receipt are signed objects | [Relay leases and receipts](#relay-leases-and-receipts) |
+| A grant | The expiry it states, the end of the grantee's pairing, whichever comes first; a delegated grant never outlives its parent | [Grants, sharing and revocation](../host/README.md#grants-sharing-and-revocation) |
+| A mutation's receipt and a de-duplication record | Thirty days | [Journals and the receipt contract](../host/README.md#journals-and-the-receipt-contract) |
+| Retained session output | Seven days, 128 MiB for a session and 1 GiB for the host, whichever applies first | [Retained output, and what eviction leaves behind](../host/README.md#retained-output-and-what-eviction-leaves-behind) |
+
+Every deadline is measured on a clock that counts suspended time, and a host that cannot prove its
+wall clock decides nothing by it ([The host time contract](../host/README.md#the-host-time-contract)).
+
 ## Receipt states
 
 A receipt has a monotonically increasing revision and moves only along these edges:
