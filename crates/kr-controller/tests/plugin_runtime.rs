@@ -14,9 +14,14 @@
 
 #![cfg(unix)]
 
+#[path = "plugin_world/ended.rs"]
+mod ended;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use ended::kill;
 
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{
@@ -255,9 +260,13 @@ impl Drop for HostEnding {
         {
             hosts.push(published.process_start_identity);
         }
-        for host in hosts {
-            kill(&host);
-        }
+        // Seen to end, as the plugin world's teardown sees it: a host this test cannot end is a
+        // process left running on the machine, and the test says so.
+        let running = ended::end_hosts(&hosts, std::time::Instant::now() + Duration::from_secs(30));
+        assert!(
+            running.is_empty() || std::thread::panicking(),
+            "this test left plugin hosts that were not seen to end ({running:?})"
+        );
     }
 }
 
@@ -288,17 +297,6 @@ impl Drop for Apart {
     fn drop(&mut self) {
         self.end_with_its_group();
     }
-}
-
-/// Ends a process the daemon started, by the identity it was started under, after checking that it
-/// is still that process.
-fn kill(process: &ProcessStartIdentity) {
-    if kr_ipc::identity::process_state(process) != ProcessState::Running {
-        return;
-    }
-    let pid = rustix::process::Pid::from_raw(i32::try_from(process.pid.get()).expect("a pid"))
-        .expect("a process");
-    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
 }
 
 /// Stops a process that is running, as a signal from a terminal would, after checking that it is
