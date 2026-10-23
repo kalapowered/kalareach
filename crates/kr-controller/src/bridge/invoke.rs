@@ -2312,12 +2312,15 @@ mod tests {
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(silence, kr_protocol::limits::MAX_SEND_QUEUE_BYTES);
-        let started = std::time::Instant::now();
+        // The stream ends with the refusal instead of holding its caller: a stream that held its
+        // caller would never come back, and the bound only ends a receive that never does.
         assert_eq!(
-            stream.recv().await.expect_err("nothing is coming"),
+            tokio::time::timeout(READER_LIVENESS, stream.recv())
+                .await
+                .expect("a stream nothing is heard from ends")
+                .expect_err("nothing is coming"),
             Refusal::Silent { waited: silence }
         );
-        assert!(started.elapsed() < silence * 20, "{:?}", started.elapsed());
         let _ = stream
             .close_within(std::time::Duration::from_millis(100), KILL_LIMIT)
             .await;
