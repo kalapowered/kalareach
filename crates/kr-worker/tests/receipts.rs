@@ -6522,6 +6522,61 @@ fn a_revocation_this_journal_can_no_longer_count_for_is_not_answered_as_an_empty
 
 /// KR-REQ-09.12, 09.13: what one controller took is not what a replacement holds.
 ///
+/// KR-REQ-09.12, 09.13: a fence that failed part way and ran again names nothing new, and its
+/// revision is still not an empty one.
+///
+/// The names the first pass committed are the revision's answer. Once the daemon has taken them the
+/// journal forgets them, and what it must then say is that it can no longer count for the
+/// revision, not that the fence found nothing to take back.
+#[test]
+fn a_fence_that_ran_again_after_failing_part_way_is_not_answered_as_one_that_named_nothing() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = temp
+        .environment()
+        .journal_database(SessionId::new(kr_ipc::new_uuid()));
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
+    let mut journal = Journal::open(&path).expect("a journal");
+    let mut intent = at(21, 21, 21, TimestampMs::new(1_000));
+    intent.actor_id = actor("device:phone");
+    journal.accept(&intent).expect("an admitted intent");
+
+    // The boundary the next fence starts from cannot be written, after the intent was rejected and
+    // named: the pass fails with its name committed.
+    let other = rusqlite::Connection::open(&path).expect("the same database");
+    other
+        .execute_batch(
+            "CREATE TRIGGER refuse_boundary BEFORE INSERT ON fence_state
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let (fenced, outcome) = journal.fence_for_revocation(4, None, kr_ipc::now_ms(), 0, 1);
+    assert_eq!(fenced.rejected, 1);
+    outcome.expect_err("the boundary is refused");
+    other
+        .execute_batch("DROP TRIGGER refuse_boundary;")
+        .expect("the fault is cleared");
+
+    let (fenced, outcome) = journal.fence_for_revocation(4, None, kr_ipc::now_ms(), 0, 1);
+    outcome.expect("the fence runs again");
+    assert_eq!(fenced.named(), 0, "the name is already there");
+    assert_eq!(
+        journal.evidence_page(4, 0).expect("a page").rejected.len(),
+        1,
+        "the first pass's name is the revision's answer"
+    );
+
+    // The daemon takes the name and the next revocation forgets it.
+    journal
+        .note_evidence_delivered(4, 1, 1)
+        .expect("the delivery is recorded");
+    let (_, outcome) = journal.fence_for_revocation(5, None, kr_ipc::now_ms(), 0, 1);
+    outcome.expect("the next fence runs");
+    assert!(
+        !journal.evidence_answerable(4).expect("reads"),
+        "a revision whose fence named an action is not answered as an empty one once its names are gone"
+    );
+}
+
 /// The daemon keeps the names it has collected in its own memory, so a replacement starts with
 /// none of them. A journal that counted the previous controller's pages as delivered would drop
 /// names the new one has never seen and cannot ask for again.

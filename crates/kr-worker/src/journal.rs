@@ -1943,10 +1943,27 @@ impl Journal {
         if let Err(error) = self.record_fence_boundary(reached) {
             return (fenced, Err(error));
         }
+        // A pass that failed part way keeps the names it committed, and the pass that runs again
+        // names none of them anew, so what this pass named is not what the revision holds.
         if fenced.named() == 0 {
-            self.remember_empty_fence(revision);
+            match self.evidence_rows(revision) {
+                Ok(0) => self.remember_empty_fence(revision),
+                Ok(_) => {}
+                Err(error) => return (fenced, Err(error)),
+            }
         }
         (fenced, Ok(reached))
+    }
+
+    /// How many names this journal holds for `revision`.
+    fn evidence_rows(&self, revision: u64) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1",
+                params![i64::try_from(revision).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))
     }
 
     /// Remembers that the fence for `revision` ran to its end and named nothing.
@@ -2234,14 +2251,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
     pub fn evidence_answerable(&self, revision: u64) -> Result<bool> {
         let key = i64::try_from(revision).unwrap_or(i64::MAX);
-        let held: i64 = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .map_err(|error| faulted(&self.health, error))?;
+        let held = self.evidence_rows(revision)?;
         if held > 0 {
             return Ok(true);
         }
