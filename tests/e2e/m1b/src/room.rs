@@ -78,24 +78,46 @@ impl CandidateSocket {
     ///
     /// Returns why the room could not be reached.
     pub async fn open(origin: &RendezvousOrigin, locator: &Locator) -> Result<Self, String> {
-        tokio::time::timeout(OPEN_DEADLINE, Self::open_now(origin, locator))
+        Self::open_trusting(origin, locator, None).await
+    }
+
+    /// As [`Self::open`], verifying the room's certificate against `tls`'s roots when it is given
+    /// one and against the platform's trust store otherwise: a room a test runs on loopback is
+    /// reached through a certificate authority the test issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the room could not be reached.
+    pub async fn open_trusting(
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        tls: Option<&Arc<ClientConfig>>,
+    ) -> Result<Self, String> {
+        tokio::time::timeout(OPEN_DEADLINE, Self::open_now(origin, locator, tls))
             .await
             .map_err(|_| format!("the room was not reached within {OPEN_DEADLINE:?}"))?
     }
 
-    async fn open_now(origin: &RendezvousOrigin, locator: &Locator) -> Result<Self, String> {
+    async fn open_now(
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        trusted: Option<&Arc<ClientConfig>>,
+    ) -> Result<Self, String> {
         let authority = origin
             .as_str()
             .strip_prefix("https://")
             .ok_or("a rendezvous origin is an https origin")?;
         let (host, port) = host_and_port(authority)?;
-        let mut tls = ClientConfig::builder_with_provider(Arc::new(
-            tokio_rustls::rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .and_then(BuilderVerifierExt::with_platform_verifier)
-        .map_err(|error| format!("the platform's certificate verifier: {error}"))?
-        .with_no_client_auth();
+        let mut tls = match trusted {
+            Some(trusted) => (**trusted).clone(),
+            None => ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .and_then(BuilderVerifierExt::with_platform_verifier)
+            .map_err(|error| format!("the platform's certificate verifier: {error}"))?
+            .with_no_client_auth(),
+        };
         // The upgrade is an HTTP/1.1 request, so that is the one protocol offered.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = ServerName::try_from(host.to_owned())

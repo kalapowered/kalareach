@@ -25,6 +25,12 @@ name = "gateway"
 required-features = ["legs"]
 
 [[test]]
+# What a candidate does when the room says no host is attached to carry its first frame, against a
+# room that says so, behind TLS a test issues: no deployment is involved.
+name = "pairing_room"
+required-features = ["legs"]
+
+[[test]]
 # Sharing a session with a guest, checked with the processes a person runs and a paired device that
 # is this repository's client library, over loopback: no deployment is involved.
 name = "sharing"
@@ -124,8 +130,12 @@ kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 # The connector packages a test publishes and installs are the worker's own test packages, so the
 # integration a session is given is read from the package a worker reads.
 kr-worker = { workspace = true, features = ["testing"] }
+# A rendezvous room a test runs on loopback behind a certificate authority it issues: the harness
+# the client's own failure suite serves its rooms through, included by path.
+rcgen.workspace = true
 tempfile.workspace = true
 tough.workspace = true
+tokio-websockets = { workspace = true, features = ["server"] }
 
 [lints]
 workspace = true
