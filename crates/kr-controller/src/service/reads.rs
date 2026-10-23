@@ -389,6 +389,7 @@ impl Controller {
                 summary.state = SessionState::Closed;
                 summary.attachment_count = U64::ZERO;
                 summary.application_state = Nullable::null();
+                summary.application = None;
                 summary.root_process = Nullable::null();
                 summary.closure = Nullable::some(closure.clone());
                 summary
