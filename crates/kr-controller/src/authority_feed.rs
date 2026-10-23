@@ -673,6 +673,7 @@ async fn pass(
     let mut latest = None;
     let mut read_through = false;
     let mut compared = false;
+    let mut put_off = Vec::new();
     for _ in 0..shared.most_pages.load(Ordering::SeqCst) {
         let state = shared
             .client
@@ -705,7 +706,13 @@ async fn pass(
                 }
             } else {
                 contiguous = false;
-                unfinished = true;
+                // While the host is behind its feed, a record that is not settled is one put off,
+                // and it is settled below once the host has caught up.
+                if controller.policy().behind_its_feed() {
+                    put_off.push(record.clone());
+                } else {
+                    unfinished = true;
+                }
             }
         }
         cursor = state.next_after_sequence.get();
@@ -730,7 +737,7 @@ async fn pass(
     }
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
-    if let Some(latest) = latest {
+    if let Some(mut latest) = latest {
         // A registry found behind the feed is raised to the feed's revision, in one barrier, before
         // the feed is called read: until then what the host decides stands on an earlier state.
         if controller.policy().behind_its_feed() {
@@ -739,6 +746,13 @@ async fn pass(
                 .await
                 .map_err(Stopped::local)?;
             shared.observed().catching_up = false;
+            // What was put off is judged now, on the registry as it stands, and numbered above
+            // everything the host has issued.
+            for record in &put_off {
+                if !settle(shared, controller, record, &mut latest).await? {
+                    unfinished = true;
+                }
+            }
         }
         name_owners(shared, controller, &latest).await?;
     }
@@ -797,16 +811,21 @@ async fn settle(
         && held.completion == RevocationCompletion::Complete
     {
         // A registry restored to an earlier state has lost what this host carried out for the
-        // request, which the feed still shows complete: it is carried out again, and carrying it
-        // out twice is carrying it out once.
-        if controller.policy().behind_its_feed() {
-            controller
-                .replay_feed_request(request)
-                .await
-                .map_err(Stopped::local)?;
-        }
+        // request, which the feed still shows complete: what the registry does not show done is
+        // carried out again, whatever its counter says.
+        controller
+            .replay_feed_request(request)
+            .await
+            .map_err(Stopped::local)?;
         controller.authority_feed_settled(id, shared.host_device_id);
         return Ok(true);
+    }
+    // A request the registry does not show completed waits until the host has caught up: it is
+    // judged, numbered and carried out on the registry as it will stand then, not on the earlier
+    // state it was restored to, and the owner who issued it is not refused for the host's being
+    // behind.
+    if controller.policy().behind_its_feed() {
+        return Ok(false);
     }
     let now = controller.wall_now_ms();
     let noted = controller.authority_feed_record(id);

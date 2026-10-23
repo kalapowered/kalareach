@@ -540,15 +540,55 @@ impl Controller {
         Ok(policy.behind_its_feed())
     }
 
-    /// Carries out again a request the feed shows this host completed, for a registry restored to
-    /// a state from before it was carried out. What the restored registry holds nothing for is
-    /// skipped, and what it already revoked withdraws nothing.
+    /// Carries out again a request the feed shows this host completed, for what the registry does
+    /// not show withdrawn: a registry restored to a state from before it was carried out, or put
+    /// back to one whose counter stands at the feed's, has lost it.
+    ///
+    /// The request is the owner's own, checked against the owner's key as a request read for the
+    /// first time is; a request whose issuer the registry does not know cannot be checked, and is
+    /// not carried out. What is already withdrawn is left alone, so a request the registry shows
+    /// done raises no barrier, and carrying one out twice is carrying it out once.
     ///
     /// # Errors
     ///
-    /// Returns an error when a revocation cannot be written or its barrier raised.
+    /// Returns an error when a record cannot be read, a revocation cannot be written or its barrier
+    /// cannot be raised.
     pub(crate) async fn replay_feed_request(&self, request: &RevocationRequest) -> Result<()> {
-        let plan = self.plan_of(request)?;
+        let host = self.host_device_id();
+        if request.host_device_id != host {
+            return Ok(());
+        }
+        let Some(issuer) = self.devices.record_for_device(request.issuer_device_id)? else {
+            return Ok(());
+        };
+        if kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let named = self.plan_of(request)?;
+        let held = self.devices.devices()?;
+        let mut plan = Plan {
+            devices: named
+                .devices
+                .into_iter()
+                .filter(|id| {
+                    held.iter()
+                        .any(|record| record.device_id == *id && record.revoked_at_ms.is_none())
+                })
+                .collect(),
+            grants: Vec::new(),
+        };
+        for grant_id in named.grants {
+            if self
+                .sharing
+                .grants()
+                .record(grant_id)?
+                .is_some_and(|record| record.revoked_at_ms.is_none())
+            {
+                plan.grants.push(grant_id);
+            }
+        }
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(());
         }

@@ -6,10 +6,11 @@
 //! * **The host on this computer** takes `device.revoke` over a connection it admits now. A
 //!   revocation that names a device leaves this computer's connection admitted; what withdraws it
 //!   is a revision of the whole host (a change of the rights ceiling, of the organisation or of the
-//!   membership leases, a start that finds a fence still owed, or a revocation that names more than
-//!   a notice carries). The connection this computer holds may have been withdrawn by one of those
-//!   since it was opened, so this computer opens another and sends over the one it already holds
-//!   only when no other opens. The method is the local owner's alone, so a paired device never
+//!   membership leases, a start that finds a fence still owed, a host that catches up with its
+//!   authority feed after a restore, or a revocation that names more than a notice carries). The
+//!   connection this computer holds may have been withdrawn by one of those since it was opened,
+//!   so this computer opens another and sends over the one it already holds only when no other
+//!   opens. The method is the local owner's alone, so a paired device never
 //!   sends it, and the host's answer, with the state of its dispatch barrier, is the
 //!   acknowledgement.
 //! * **A host this computer is paired with as an owner** is reached through its authority feed.
