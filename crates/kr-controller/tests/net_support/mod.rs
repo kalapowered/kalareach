@@ -1969,7 +1969,19 @@ pub async fn owned_by(
     device: &Device,
     record: &DeviceRecord,
 ) -> (GrantCreateResult, RawDevice) {
-    let selection = RoleSelection::plain(SessionRole::Owner);
+    shared_as(host, session_id, device, record, SessionRole::Owner).await
+}
+
+/// Shares `session_id` with the device `record` names in `role`, as the person at this machine
+/// does, and has that device redeem it on a connection of its own, which is returned.
+pub async fn shared_as(
+    host: &Host,
+    session_id: SessionId,
+    device: &Device,
+    record: &DeviceRecord,
+    role: SessionRole,
+) -> (GrantCreateResult, RawDevice) {
+    let selection = RoleSelection::plain(role);
     let created: GrantCreateResult = host
         .client()
         .await
@@ -2003,7 +2015,7 @@ pub async fn owned_by(
             },
         )
         .await
-        .expect("the owner share is redeemed");
+        .expect("the share is redeemed");
     (created, connection)
 }
 

@@ -14,8 +14,56 @@
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
+mod support;
 
 include!("support/sharing_harness.rs");
+
+/// The ceremony of an owner device, whose person confirms or does not as the test says.
+struct Person {
+    confirms: AtomicBool,
+}
+
+impl kr_client::pairing::owner::Ceremony for Person {
+    fn kind(&self) -> kr_client::pairing::owner::CeremonyKind {
+        kr_client::pairing::owner::CeremonyKind::TouchId
+    }
+
+    fn verify<'a>(
+        &'a self,
+        _reason: &'a str,
+        _within: Duration,
+    ) -> kr_client::pairing::BoxFuture<'a, kr_client::pairing::owner::CeremonyOutcome> {
+        let confirmed = self.confirms.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if confirmed {
+                kr_client::pairing::owner::CeremonyOutcome::Confirmed
+            } else {
+                kr_client::pairing::owner::CeremonyOutcome::NotConfirmed
+            }
+        })
+    }
+}
+
+/// The companion of the person who owns the scene's host, as a second computer of theirs: it lists
+/// what the host holds open for its owner devices and answers through `person`.
+fn owner_companion(
+    scene: &Scene,
+    data: &std::path::Path,
+    person: &Arc<Person>,
+) -> support::Companion {
+    let secrets: Arc<dyn kr_crypto::store::SecretStore> =
+        Arc::new(kr_crypto::store::MemoryStore::new());
+    kr_crypto::store::store_device_keys(&*secrets, "device", &scene.owner)
+        .expect("the owner's keys are kept");
+    let companion = support::Companion::start(
+        data,
+        support::parts(secrets, Arc::new(scene.host.room.clone())),
+        Arc::clone(person) as Arc<dyn kr_client::pairing::owner::Ceremony>,
+        support::StubIntake::holding("", false),
+    );
+    support::record_owned(&companion.device(), &scene.host, "the test host");
+    companion
+}
 
 /// KR-REQ-18.12, KR-REQ-18.13: the owner's invitation, naming a device and a role, its acceptance
 /// and its withdrawal reach the page as the methods' own results, in shapes the protocol defines,
@@ -505,7 +553,7 @@ async fn an_action_the_host_never_saw_is_not_done_only_after_the_bound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
     use kr_protocol::confirmation::{ConfirmationDisplay, TransferControlPlan};
-    use net_support::pairing::{self as calls, Signer};
+    use net_support::pairing as calls;
 
     let scene = Scene::start().await;
     // The device holds the session as an owner of it, and another device is to receive it.
@@ -568,7 +616,7 @@ async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
         "and nothing was written"
     );
 
-    // The owner device shows what the host described, and answers it.
+    // The plan the host holds open for the owner devices.
     let mut client = scene.host.client().await;
     let pending = calls::pending(&mut client).await.expect("readable").pending;
     assert_eq!(pending.len(), 1);
@@ -578,10 +626,79 @@ async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
     let plan: &TransferControlPlan = plan;
     assert_eq!(plan.source_grant_id, from);
     assert_eq!(plan.to_device_id, taker_record.device_id);
-    let (proof, presented) = calls::sign(&pending[0].request, &Signer::OwnerDevice(&scene.owner));
-    calls::complete(scene.host.environment_id, &mut client, proof, presented)
+
+    // The owner device is a companion of its own: it lists what the host holds open, and what it
+    // lists is that plan, in its own screen's words, before anything is confirmed.
+    let owner_data = tempfile::tempdir().expect("a directory");
+    let person = Arc::new(Person {
+        confirms: AtomicBool::new(false),
+    });
+    let as_owner = owner_companion(&scene, owner_data.path(), &person);
+    let request = as_owner
+        .listed(|request| request["checkable"] == true)
+        .await;
+    assert_eq!(
+        request["title"], "Hand control of a session to another device",
+        "{request}"
+    );
+    let fact = |label: &str| -> String {
+        request["facts"]
+            .as_array()
+            .expect("facts")
+            .iter()
+            .find(|each| each["label"] == label)
+            .and_then(|each| each["value"].as_str())
+            .unwrap_or_else(|| panic!("the sheet shows {label}: {request}"))
+            .to_owned()
+    };
+    assert_eq!(fact("Session"), plan.session_id.to_string());
+    assert_eq!(fact("From"), plan.from_device_name.as_str());
+    assert_eq!(fact("To"), plan.to_device_name.as_str());
+    let detail = request["detail"].as_str().expect("the sheet's sentence");
+    // The giving device holds the session as an owner of it, the only role whose rights include
+    // sharing and so the only one a hand-over can start from; its list is longer than a dialog's
+    // line, so the line names the role, and the sheet lists each kind of action beside it.
+    assert!(
+        detail.contains("who may act as the session's owner for"),
+        "the sheet says what the receiving device may do: {detail}"
+    );
+    assert_eq!(
+        fact("Allows"),
+        "type in terminals, direct agents, answer agents' approval requests and questions, \
+         share sessions with others, create, rename and close sessions, read files, resize \
+         terminals, change terminal colours and view sessions"
+    );
+
+    // A person who does not confirm leaves everything as it was: nothing is answered, nothing is
+    // sent, and the session stays with the giving device.
+    let request_reference = request["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+    assert_eq!(
+        as_owner.call(
+            "owner_confirmation_review",
+            json!({ "request": { "reference": request_reference } })
+        ),
+        Ok(json!("not_confirmed"))
+    );
+    let declined = scene
+        .issuer
+        .call("transfer_answered", json!({ "reference": reference }))
         .await
-        .expect("the owner answers");
+        .expect("read");
+    assert_eq!(declined["state"], "waiting");
+    assert!(net_support::holds(&scene.host, from));
+
+    // The person confirms, and the application sends what was confirmed.
+    person.confirms.store(true, Ordering::SeqCst);
+    assert_eq!(
+        as_owner.call(
+            "owner_confirmation_review",
+            json!({ "request": { "reference": request_reference } })
+        ),
+        Ok(json!("confirmed"))
+    );
 
     let answered = scene
         .issuer

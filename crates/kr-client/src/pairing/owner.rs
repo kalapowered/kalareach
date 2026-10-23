@@ -48,6 +48,7 @@ use kr_protocol::pairing::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{DurationMs, Nullable};
+use kr_protocol::sharing::SessionRole;
 use serde::Serialize;
 
 use super::BoxFuture;
@@ -529,11 +530,23 @@ pub fn describe_rights(
     rights: &kr_protocol::scalars::CanonicalSet<ActionRight>,
     sessions: &kr_protocol::grant::SessionSelector,
 ) -> String {
-    authority_over(rights, sessions).unwrap_or_else(|| "do what the host allows".to_owned())
+    authority_over(Rights::Listed, rights, sessions)
+        .unwrap_or_else(|| "do what the host allows".to_owned())
+}
+
+/// How a line says what a grant lets a device do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rights {
+    /// Each kind of thing the rights let it do, which names every one of them.
+    Listed,
+    /// The role whose rights these are exactly, which stands for every one of them, and the kinds
+    /// listed where the rights are not exactly a role's.
+    Role,
 }
 
 /// The words for what a pairing grant lets a device do, or `None` when a right has no words here.
 fn authority_over(
+    form: Rights,
     rights: &kr_protocol::scalars::CanonicalSet<ActionRight>,
     sessions: &kr_protocol::grant::SessionSelector,
 ) -> Option<String> {
@@ -541,12 +554,41 @@ fn authority_over(
     if !matches!(sessions, kr_protocol::grant::SessionSelector::None)
         || rights.contains(&ActionRight::HostManage)
     {
-        return authority(rights);
+        return authority_in(form, rights, false);
     }
     if rights.is_empty() {
         return Some(NONE.to_owned());
     }
-    authority(rights).map(|words| format!("{words}, and {NONE}"))
+    authority_in(form, rights, false).map(|words| format!("{words}, and {NONE}"))
+}
+
+/// What `rights` let a device do, said as `form` says it: in the role they are exactly when the form
+/// is [`Rights::Role`] and they are one's, and by listing the kinds otherwise. `of_the_session` says
+/// the line names the session, so that the role is the session's.
+fn authority_in(
+    form: Rights,
+    rights: &kr_protocol::scalars::CanonicalSet<ActionRight>,
+    of_the_session: bool,
+) -> Option<String> {
+    if form == Rights::Role
+        && let Some(role) = role_of(rights)
+    {
+        return Some(if of_the_session {
+            format!("act as the session's {role}")
+        } else {
+            format!("act as a session {role}")
+        });
+    }
+    authority(rights)
+}
+
+/// The role whose default rights are exactly `rights`, which is what the sharing sheet and the
+/// invitation name the grant by. A set that is one right more or one right fewer is no role's.
+fn role_of(rights: &kr_protocol::scalars::CanonicalSet<ActionRight>) -> Option<SessionRole> {
+    SessionRole::ALL.into_iter().find(|role| {
+        let defaults = role.default_actions();
+        defaults.len() == rights.len() && defaults.iter().all(|right| rights.contains(right))
+    })
 }
 
 /// What `rights` let a device do, in words, or `None` when a right has no words here.
@@ -701,6 +743,12 @@ fn digest_prefix(digest: &kr_protocol::scalars::Digest256) -> String {
 /// at most [`MAX_REASON_CHARS`] characters, even with the names shortened, there is no line: a
 /// prompt that left authority out would be asking the person to approve what it did not show.
 ///
+/// A set of rights is said by listing the kinds of action it allows. Where that does not fit, a set
+/// that is exactly one role's default rights is said by the role ("act as the session's
+/// controller"), and a role's name stands for every right the role holds. It never stands for a set
+/// that is one right more or fewer than a role's, which stays listed and, where the list does not
+/// fit, has no line. The page that shows the line lists every right beside it.
+///
 /// # Errors
 ///
 /// Returns [`CannotCheck::CannotShow`] when no line can say it all.
@@ -709,17 +757,22 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
         return Err(CannotCheck::CannotShow);
     }
     // Each pass says less than the one before. A host's name is shortened first; then what a grant
-    // says of the organisation it answers to. The last pass leaves that to the page beside the
+    // says of the organisation it answers to. The last of those leaves that to the page beside the
     // line: the clause only narrows the access the line states, so a line that has no room for it
     // is still the whole of what the confirmation authorises, and a grant that could be shown
-    // without the clause is never made unshowable by it.
-    for (names, membership_form) in [
-        (40, Membership::Full),
-        (24, Membership::Full),
-        (16, Membership::Full),
-        (16, Membership::Organisation),
-        (16, Membership::Members),
-        (16, Membership::Unsaid),
+    // without the clause is never made unshowable by it. The pass after them names the role whose
+    // rights the grant is exactly, where it is one's: a role stands for every right it holds, as
+    // host management's phrase does, so nothing the confirmation authorises is left out, and the
+    // page beside the line lists each right. A grant that is not exactly a role's is listed in
+    // every pass, and where the list does not fit there is no line.
+    for (names, membership_form, form) in [
+        (40, Membership::Full, Rights::Listed),
+        (24, Membership::Full, Rights::Listed),
+        (16, Membership::Full, Rights::Listed),
+        (16, Membership::Organisation, Rights::Listed),
+        (16, Membership::Members, Rights::Listed),
+        (16, Membership::Unsaid, Rights::Listed),
+        (16, Membership::Unsaid, Rights::Role),
     ] {
         let host = shown_host(host_name, names);
         let text = match subject {
@@ -738,8 +791,12 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 };
                 format!(
                     "issue an invitation from {host}: {offered}, for a device that may {} {}{}",
-                    authority_over(&proposed_grant.actions, &proposed_grant.session_selector)
-                        .ok_or(CannotCheck::CannotShow)?,
+                    authority_over(
+                        form,
+                        &proposed_grant.actions,
+                        &proposed_grant.session_selector
+                    )
+                    .ok_or(CannotCheck::CannotShow)?,
                     duration(&proposed_grant.expiry, now_ms),
                     membership(proposed_grant, membership_form)
                 )
@@ -751,8 +808,12 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 "confirm adding {} ({}) to {host}, which may {} {}{}. {}",
                 shown(candidate.device_name.as_str(), names),
                 platform(candidate.platform),
-                authority_over(&proposed_grant.actions, &proposed_grant.session_selector)
-                    .ok_or(CannotCheck::CannotShow)?,
+                authority_over(
+                    form,
+                    &proposed_grant.actions,
+                    &proposed_grant.session_selector
+                )
+                .ok_or(CannotCheck::CannotShow)?,
                 duration(&proposed_grant.expiry, now_ms),
                 membership(proposed_grant, membership_form),
                 shows_value(&group_verification_value(&candidate.verification_value))
@@ -817,7 +878,7 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 session_label(plan.session_id),
                 shown(plan.from_device_name.as_str(), names),
                 shown(plan.to_device_name.as_str(), names),
-                authority(&plan.actions).ok_or(CannotCheck::CannotShow)?,
+                authority_in(form, &plan.actions, true).ok_or(CannotCheck::CannotShow)?,
                 duration(&plan.expiry, now_ms)
             ),
             Subject::EnrolOrganisation(plan) => format!(
@@ -868,7 +929,10 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 } else {
                     format!(
                         ", so that a device may {}",
-                        authority(&described.destination_rights).ok_or(CannotCheck::CannotShow)?
+                        // The sheet of a described request lists no rights beside the line, so the
+                        // line lists them: a role's name stands for rights only where a sheet does.
+                        authority_in(Rights::Listed, &described.destination_rights, false)
+                            .ok_or(CannotCheck::CannotShow)?
                     )
                 };
                 format!(
@@ -1323,6 +1387,118 @@ mod tests {
             reason(&described, "studio", NOW).expect("a line"),
             "widen what devices may do on studio, so that a device may change files. The host did \
              not say which location or package; its digest starts f3f3 f3f3"
+        );
+    }
+
+    /// The rights a role carries by default.
+    fn rights_of(role: SessionRole) -> Vec<ActionRight> {
+        role.default_actions().to_vec()
+    }
+
+    /// KR-REQ-18.15, KR-REQ-10.06: where the kinds of action a grant allows do not fit in one line,
+    /// a set of rights that is exactly a role's default set is said by the role, and a role's name
+    /// stands for every right the role holds. A hand-over of a controller's or an owner's session
+    /// has a line to confirm; before, its list was longer than a dialog's line and it had none.
+    #[test]
+    fn a_role_stands_for_its_rights_where_the_list_does_not_fit() {
+        let line_for = |role: SessionRole| {
+            let mut plan = transfer_plan();
+            plan.actions = rights_of(role).into_iter().collect();
+            reason(&Subject::TransferControl(Box::new(plan)), "studio", NOW)
+        };
+        for (role, said) in [
+            (SessionRole::Controller, "act as the session's controller"),
+            (SessionRole::Owner, "act as the session's owner"),
+        ] {
+            let line = line_for(role).unwrap_or_else(|failure| panic!("{role}: {failure:?}"));
+            assert!(line.contains(said), "{role}: {line}");
+            assert!(line.contains("for 60 minutes"), "{role}: {line}");
+            assert!(line.chars().count() <= MAX_REASON_CHARS, "{role}: {line}");
+        }
+        // Where the list fits, it is the list: the role is not said in its place.
+        for role in [SessionRole::Viewer, SessionRole::Reviewer] {
+            let line = line_for(role).expect("a line");
+            assert!(line.contains("view sessions"), "{role}: {line}");
+            assert!(!line.contains("act as"), "{role}: {line}");
+        }
+    }
+
+    /// KR-REQ-10.06: a role's name stands for exactly its rights and no other set. A set that is
+    /// one right fewer or one right more than an owner's has no role to be said by, so it is listed
+    /// as before and, where the list does not fit, there is no line.
+    #[test]
+    fn a_set_one_right_off_a_roles_is_listed_and_where_that_does_not_fit_has_no_line() {
+        let owner = rights_of(SessionRole::Owner);
+        let mut one_fewer = owner.clone();
+        one_fewer.retain(|right| *right != ActionRight::SessionClose);
+        let mut one_more = owner;
+        one_more.push(ActionRight::FilesUpload);
+        for (what, rights) in [("one right fewer", one_fewer), ("one right more", one_more)] {
+            let mut plan = transfer_plan();
+            plan.actions = rights.into_iter().collect();
+            assert_eq!(
+                reason(&Subject::TransferControl(Box::new(plan)), "studio", NOW),
+                Err(CannotCheck::CannotShow),
+                "{what}"
+            );
+        }
+    }
+
+    /// A request the host only describes has no facts beside its line on the sheet, so its rights are
+    /// listed in the line, and a set that is exactly a role's and does not fit has no line.
+    #[test]
+    fn a_described_request_is_never_said_by_a_role() {
+        let described = Subject::Described(DescribedAction {
+            action: SensitiveAction::EnlargeGrant,
+            action_digest: Digest256::from_bytes([0xf3; 32]),
+            destination_keys: Nullable::null(),
+            destination_rights: rights_of(SessionRole::Owner).into_iter().collect(),
+        });
+        assert_eq!(
+            reason(&described, "studio", NOW),
+            Err(CannotCheck::CannotShow)
+        );
+    }
+
+    /// KR-REQ-10.06: the rule is the line's, not the hand-over's: an invitation and a device
+    /// confirmation whose rights are exactly a role's say the role where their list does not fit,
+    /// and keep the rest of the line as it was.
+    #[test]
+    fn an_invitation_and_a_device_confirmation_say_a_role_their_rights_are_exactly() {
+        let rights = rights_of(SessionRole::Owner);
+        let invitation = Subject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            origin: None,
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: grant(&rights, an_hour()),
+        };
+        assert_eq!(
+            reason(&invitation, "studio", NOW).expect("a line"),
+            "issue an invitation from studio: a QR code on this network, for a device that may \
+             act as a session owner for 60 minutes"
+        );
+        let device = Subject::ConfirmDevice {
+            candidate: candidate("Pixel 8"),
+            proposed_grant: grant(&rights, an_hour()),
+        };
+        assert_eq!(
+            reason(&device, "studio", NOW).expect("a line"),
+            "confirm adding Pixel 8 (Android) to studio, which may act as a session owner for 60 \
+             minutes. It shows f3c1 46fd."
+        );
+        // Not a role's: the list is said where it fits, as before.
+        let broad = Subject::ConfirmDevice {
+            candidate: candidate("Pixel 8"),
+            proposed_grant: grant(
+                &[ActionRight::SessionView, ActionRight::TerminalInput],
+                an_hour(),
+            ),
+        };
+        assert!(
+            !reason(&broad, "studio", NOW)
+                .expect("a line")
+                .contains("act as"),
+            "a grant that is no role's is never said by one"
         );
     }
 
@@ -2773,6 +2949,29 @@ mod tests {
         );
         assert!(asked.0.lock().expect("the record").is_empty());
         assert_eq!(listing.completions.load(Ordering::SeqCst), 0);
+    }
+
+    /// KR-REQ-10.06, KR-REQ-18.15: a device confirmation whose rights are exactly an owner's has a
+    /// line to show where its list would not fit, and it is offered to the ceremony: the person is
+    /// asked about the role, and what the confirmation covers is every right the role holds.
+    #[tokio::test]
+    async fn rights_that_are_exactly_a_roles_are_offered_to_the_ceremony_by_the_role() {
+        let owner = rights_of(SessionRole::Owner);
+        let (confirmations, listing) =
+            listed_device(candidate("Pixel 8"), grant(&owner, an_hour()));
+        let listed = confirmations.pending().await.expect("the listing");
+        let asked = Asked(Mutex::new(Vec::new()));
+        assert_eq!(
+            confirmations.review(&listed[0], &asked).await,
+            ReviewOutcome::Confirmed
+        );
+        let lines = asked.0.lock().expect("the record").clone();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("which may act as a session owner for 60 minutes"),
+            "{lines:?}"
+        );
+        assert_eq!(listing.completions.load(Ordering::SeqCst), 1);
     }
 
     /// KR-REQ-10.06: a device confirmation whose value is not a verification value as a host
