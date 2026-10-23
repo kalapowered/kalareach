@@ -3679,7 +3679,7 @@ mod tests {
         assert!(matches!(err, AutomationError::DuplicateTrigger { .. }));
     }
 
-    /// KR-PERF-003: whoever waits on the journal is told about every commit that changed a row,
+    /// Whoever waits on the journal is told about every commit that changed a row,
     /// whichever way it was made. An action's own transaction, a refusal it recorded and a
     /// registration are all seen; a read, a repeat answered from a record and a registration that
     /// was already made, which wrote nothing, are not.
