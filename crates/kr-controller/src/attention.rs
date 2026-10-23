@@ -5610,38 +5610,47 @@ pub(crate) mod tests {
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let (_link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut releasing = Vec::new();
         for _ in 0..3 {
             let module = Arc::clone(&module);
             let stop = Arc::clone(&stop);
+            let releases = Arc::clone(&releases);
             releasing.push(tokio::spawn(async move {
                 while !stop.load(Ordering::SeqCst) {
                     let fences = module.release.read().await;
                     // One transport write's worth of holding it.
                     std::thread::sleep(Duration::from_millis(2));
                     drop(fences);
+                    releases.fetch_add(1, Ordering::SeqCst);
                     tokio::task::yield_now().await;
                 }
             }));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let started = Instant::now();
+        // The statement is stated beside releases that are under way: every task has released once.
+        tokio::time::timeout(WRITER_LIVENESS, async {
+            while releases.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the release loops are under way");
         writer
             .write_message(&statement(1, true, Some(0)))
             .await
             .expect("states");
-        let acknowledged = tokio::time::timeout(
-            Duration::from_secs(2),
-            reader.read_message::<ControlFrame>(),
-        )
-        .await
-        .expect("the statement is applied in time")
-        .expect("acknowledged");
+        // Acknowledged while the releases go on: they are stopped only after it, so an exclusive
+        // request that waited for the releasers to stop would never be answered, and the bound
+        // only ends a request that never is.
+        let acknowledged =
+            tokio::time::timeout(WRITER_LIVENESS, reader.read_message::<ControlFrame>())
+                .await
+                .expect("the statement is applied while other sessions release")
+                .expect("acknowledged");
         assert!(matches!(
             acknowledged,
             ControlFrame::AttentionBarrierAcknowledged(_)
         ));
-        assert!(started.elapsed() < Duration::from_secs(1));
         stop.store(true, Ordering::SeqCst);
         for task in releasing {
             task.await.expect("the release loop ends");
@@ -6594,9 +6603,11 @@ pub(crate) mod tests {
             linked(&temp, 1, &module, SessionId::new(kr_ipc::new_uuid())).await;
         let bound = Duration::from_millis(200);
 
-        let started = Instant::now();
-        let unanswered = link
-            .ask(
+        // The request is bounded: it comes back unanswered, which the case waits for on its own
+        // liveness bound and not on a figure of its own.
+        let unanswered = tokio::time::timeout(
+            WRITER_LIVENESS,
+            link.ask(
                 ControlFrame::AttentionText(AttentionTextRequest {
                     request_id: RequestId::new(1),
                     records: Vec::new(),
@@ -6604,19 +6615,22 @@ pub(crate) mod tests {
                 }),
                 RequestId::new(1),
                 bound,
-            )
-            .await;
+            ),
+        )
+        .await
+        .expect("a request with no answer comes back");
         assert!(unanswered.is_none());
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(
             !link.closed.load(Ordering::SeqCst),
             "a request written whole leaves the link usable"
         );
 
+        // The writer is held for the whole of the next request: a wait for it that did not count
+        // against the bound would never come back.
         let held = link.writer.lock().await;
-        let started = Instant::now();
-        let waited = link
-            .ask(
+        let waited = tokio::time::timeout(
+            WRITER_LIVENESS,
+            link.ask(
                 ControlFrame::AttentionText(AttentionTextRequest {
                     request_id: RequestId::new(2),
                     records: Vec::new(),
@@ -6624,13 +6638,11 @@ pub(crate) mod tests {
                 }),
                 RequestId::new(2),
                 bound,
-            )
-            .await;
+            ),
+        )
+        .await
+        .expect("the wait for the writer counts against the bound");
         assert!(waited.is_none());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the wait for the writer counts against the bound"
-        );
         drop(held);
     }
 
