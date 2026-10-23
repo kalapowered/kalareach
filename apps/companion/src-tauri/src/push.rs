@@ -80,6 +80,9 @@ const CHALLENGE_WITHIN_MS: u64 = (5 + 2) * 60 * 1000;
 /// phone: it is a read of the file the receiver writes.
 const LOOK_EVERY: Duration = Duration::from_millis(500);
 
+/// How long a sequence waits for the provider's registration token once the person has agreed.
+const TOKEN_WITHIN: Duration = Duration::from_secs(20);
+
 /// The soonest the same host is tried again after a try that needed the person: asking the system
 /// or the gateway again at every foreground would be a loop with a person in it.
 const RETRY_AFTER_MS: u64 = 60 * 1000;
@@ -261,6 +264,13 @@ pub struct PushDesk {
     record: Mutex<Record>,
     /// The hosts a sequence is running for, so there is one at a time for each.
     running: Mutex<BTreeSet<DeviceId>>,
+    /// The hosts whose registration is out of date: the token changed after the run that made it
+    /// read the token. A host stays here until a run has read the token that now stands.
+    stale: Mutex<BTreeSet<DeviceId>>,
+    /// Held from the moment a registration is written until its challenge is answered. The phone
+    /// keeps one record of the registration it waits for, and the gateway one pending attempt, so a
+    /// second host's registration would replace the first's: they go one at a time.
+    registering: tokio::sync::Mutex<()>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -314,6 +324,8 @@ impl PushDesk {
             origin,
             record: Mutex::new(record),
             running: Mutex::new(BTreeSet::new()),
+            stale: Mutex::new(BTreeSet::new()),
+            registering: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
         }))
     }
@@ -358,11 +370,8 @@ impl PushDesk {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when this computer is not paired with that host, or is not a phone.
+    /// Returns a refusal when this phone is not paired with that host.
     pub fn enable(self: &Arc<Self>, reference: &str) -> Result<PushView> {
-        if !cfg!(mobile) {
-            return Err(CommandError::unsupported("notifications are a phone's"));
-        }
         let host = self
             .device
             .host_by_reference(reference)
@@ -373,16 +382,17 @@ impl PushDesk {
     }
 
     /// Looks again at where notifications stand, and mends what a change since the last look
-    /// needs: a token that changed is registered again, and a try that stopped for the person is
-    /// tried again once the person has had time to act.
+    /// needs: a token that changed is registered again, for every host that asked, and a try that
+    /// stopped for the person is tried again once the person has had time to act.
+    ///
+    /// A token that changed is remembered for each host until a run has read it, so a host whose
+    /// run was under way at the time registers again when that run ends.
     pub async fn refresh(self: &Arc<Self>) -> PushView {
-        if !cfg!(mobile) {
-            return self.view();
-        }
         let changed = self.native.token_changed().await.unwrap_or(false);
         let now = (self.wiring.clock)();
         let due: Vec<PairedHost> = {
             let record = lock(&self.record);
+            let mut stale = lock(&self.stale);
             self.device
                 .pairing()
                 .hosts
@@ -390,16 +400,18 @@ impl PushDesk {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|host| {
-                    record
-                        .hosts
-                        .get(&host.host_device_id.to_string())
-                        .is_some_and(|kept| match kept.phase {
-                            Phase::On => changed,
-                            Phase::Attention => {
-                                now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS)
+                    let Some(kept) = record.hosts.get(&host.host_device_id.to_string()) else {
+                        return false;
+                    };
+                    match kept.phase {
+                        Phase::On | Phase::Working => {
+                            if changed {
+                                stale.insert(host.host_device_id);
                             }
-                            Phase::Working => false,
-                        })
+                            kept.phase == Phase::On && stale.contains(&host.host_device_id)
+                        }
+                        Phase::Attention => now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS),
+                    }
                 })
                 .collect()
         };
@@ -416,6 +428,7 @@ impl PushDesk {
 
     /// Forgets what is kept of `host`, as the person forgetting the host does.
     pub fn forgotten(&self, host: DeviceId) {
+        lock(&self.stale).remove(&host);
         let mut record = lock(&self.record);
         if record.hosts.remove(&host.to_string()).is_some() {
             self.keep(&record);
@@ -424,24 +437,41 @@ impl PushDesk {
         (self.changed)();
     }
 
-    /// Starts the sequence for `host` unless one is running for it.
+    /// Starts the sequence for `host` unless one is running for it, and runs it again when it ends
+    /// well and the token changed while it ran.
     fn start(self: &Arc<Self>, host: PairedHost) {
         if !lock(&self.running).insert(host.host_device_id) {
             return;
         }
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            let outcome = desk.sequence(&host).await;
-            match outcome {
-                Ok(()) => desk.set(
-                    &host,
-                    Phase::On,
-                    "Notifications are on for this host.",
-                    None,
-                ),
-                Err(stop) => desk.set_stopped(&host, &stop),
+            loop {
+                let ended_well = match desk.sequence(&host).await {
+                    Ok(()) => {
+                        desk.set(
+                            &host,
+                            Phase::On,
+                            "Notifications are on for this host.",
+                            None,
+                        );
+                        true
+                    }
+                    Err(stop) => {
+                        desk.set_stopped(&host, &stop);
+                        // What stopped it decides when it is tried again, with the token as it
+                        // stands then.
+                        lock(&desk.stale).remove(&host.host_device_id);
+                        false
+                    }
+                };
+                lock(&desk.running).remove(&host.host_device_id);
+                let again = ended_well
+                    && lock(&desk.stale).contains(&host.host_device_id)
+                    && lock(&desk.running).insert(host.host_device_id);
+                if !again {
+                    break;
+                }
             }
-            lock(&desk.running).remove(&host.host_device_id);
         });
     }
 
@@ -473,13 +503,15 @@ impl PushDesk {
                 settings: true,
             });
         }
-        let Some(token) = self.token().await? else {
+        let Some(token) = self.token_within(TOKEN_WITHIN).await? else {
             return Err(
                 "This phone has no notification token yet. Try again in a moment."
                     .to_owned()
                     .into(),
             );
         };
+        // The run has read the token that stands: a change after this is a new one.
+        lock(&self.stale).remove(&host.host_device_id);
         let origin = self.gateway_origin();
         let signer = Arc::new(InstallationSigner::new(
             self.device.identity().keys.authorisation.clone(),
@@ -487,6 +519,14 @@ impl PushDesk {
         let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
         let gateway = PushGateway::new(origin.clone(), http, signer.clone());
 
+        // One registration at a time for the whole phone, until its challenge is answered.
+        self.set(
+            host,
+            Phase::Working,
+            "Waiting for the notification service.",
+            None,
+        );
+        let one_at_a_time = self.registering.lock().await;
         // The record is written before the token is proposed, so a challenge that arrives before the
         // gateway's answer to the proposal is the challenge of a registration the receiver knows.
         let registration_token = RegistrationToken::new(token).map_err(|_| {
@@ -507,12 +547,6 @@ impl PushDesk {
             .pending_set(&pending)
             .await
             .map_err(|_| "This phone could not keep the registration it began.".to_owned())?;
-        self.set(
-            host,
-            Phase::Working,
-            "Waiting for the notification service.",
-            None,
-        );
         let proposal = PushRegistrationProposal {
             installation_key: *self.device.identity().keys.authorisation.public(),
             platform: pending.platform,
@@ -539,6 +573,7 @@ impl PushDesk {
             Registration::Active { .. } => {}
         }
         self.await_challenge(&pending).await?;
+        drop(one_at_a_time);
 
         // The host is the one the person chose. A phone that was unpaired or forgot the host
         // while the challenge was awaited stops here, before the host is asked anything.
@@ -615,6 +650,23 @@ impl PushDesk {
         self.native.token().await.map_err(|_| unreachable_native())
     }
 
+    /// The registration token, waited for up to `within`: a provider makes one a moment after the
+    /// person agrees and the system has given the application its own token, which is after the
+    /// permission step has said yes.
+    async fn token_within(&self, within: Duration) -> std::result::Result<Option<String>, String> {
+        let mut waited = Duration::ZERO;
+        loop {
+            if let Some(token) = self.token().await? {
+                return Ok(Some(token));
+            }
+            if waited >= within {
+                return Ok(None);
+            }
+            tokio::time::sleep(LOOK_EVERY).await;
+            waited += LOOK_EVERY;
+        }
+    }
+
     /// Waits for the receiver to answer the challenge, reading the record it writes.
     async fn await_challenge(
         &self,
@@ -643,9 +695,6 @@ impl PushDesk {
                         "The notification service refused this phone's answer ({}).",
                         held.reason.unwrap_or_else(|| "no reason given".to_owned())
                     ));
-                }
-                PendingState::Superseded => {
-                    return Err("A newer registration replaced this one.".to_owned());
                 }
             }
             tokio::time::sleep(LOOK_EVERY).await;
