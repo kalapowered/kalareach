@@ -100,13 +100,15 @@ pub enum Binding {
     SectionComment,
     /// A comment on a function of test code that it calls.
     CalledFunction,
-    /// A module comment of a module it is in.
+    /// A module comment of a module it is in, or the comment above the Kotlin or Swift class it
+    /// is in.
     ModuleComment,
     /// A case table it runs.
     CaseTable,
     /// Its title, or its suite's.
     Title,
-    /// A comment at the head of its file.
+    /// A comment at the head of its file, or any comment of a Kotlin or Swift file of a lane the
+    /// report does not read.
     FileComment,
 }
 

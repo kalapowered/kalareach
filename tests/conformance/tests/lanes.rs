@@ -322,8 +322,8 @@ fn a_key_the_lane_ran_and_reported_nothing_of_is_failed_and_never_not_run() {
 
 #[test]
 fn a_comment_above_a_case_keys_that_case_and_not_the_others_of_its_file() {
-    // OwnerAuthenticatorsTest.kt has four cases, and the comments above two of them name the row.
-    // The results are those Gradle wrote for the file.
+    // VoiceCeremonyTest.kt has ten cases, and the comment above one of them names the row. The
+    // results are those Gradle wrote for the file.
     let map = map_of(&fixtures().join("lanes"));
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     let document = assemble(
@@ -332,27 +332,24 @@ fn a_comment_above_a_case_keys_that_case_and_not_the_others_of_its_file() {
         &[executed(step(Platform::Linux), 0, Ok(junit("junit")))],
     );
     assert!(document.passed(), "{:?}", document.problems);
-    assert_eq!(
-        counts(&document, "KR-REQ-10.52"),
-        (Verdict::Passed, 2, 0, 0)
-    );
-    let named: Vec<&str> = document.identifiers["KR-REQ-10.52"]
+    let signature = "VoiceCeremonyTest.signature_covers_action_hash_and_verifies";
+    let android: Vec<_> = document.identifiers["KR-REQ-15.13"]
         .tests
         .iter()
-        .map(|test| test.test.as_str())
+        .filter(|test| test.test.contains("VoiceCeremonyTest"))
         .collect();
-    assert!(named.iter().all(|test| test.ends_with(
-        "OwnerAuthenticatorsTest.a_strong_biometric_is_asked_with_the_screen_lock_as_its_fallback_from_android_11"
-    ) || test.ends_with(
-        "OwnerAuthenticatorsTest.before_android_11_only_a_strong_biometric_on_a_locked_phone_is_asked"
-    )), "{named:?}");
-    // A case of the file that no comment names for the row does not fail it; it fails the run, and
-    // is listed among the failures outside any row.
+    assert_eq!(android.len(), 1, "{android:?}");
+    assert!(android[0].test.ends_with(signature), "{android:?}");
+    assert_eq!(android[0].outcome, Outcome::Passed);
+    // Another case of the file fails the run and is listed outside any row; the row it was not
+    // named for does not fail with it.
     let mut cases = junit("junit");
     cases
         .iter_mut()
-        .find(|case| case.name.starts_with("the_wait_is_the_time"))
-        .expect("a case of the file")
+        .find(|case| {
+            case.class.ends_with("VoiceCeremonyTest") && !case.name.starts_with("signature")
+        })
+        .expect("another case of the file")
         .outcome = LibtestOutcome::Failed;
     let document = assemble(
         Platform::Linux,
@@ -360,12 +357,15 @@ fn a_comment_above_a_case_keys_that_case_and_not_the_others_of_its_file() {
         &[executed(step(Platform::Linux), 1, Ok(cases))],
     );
     assert!(!document.passed());
-    assert_eq!(
-        document.identifiers["KR-REQ-10.52"].verdict,
-        Verdict::Passed
-    );
     assert_eq!(document.failures_outside_identifiers.len(), 1);
-    assert!(document.failures_outside_identifiers[0].contains("the_wait_is_the_time"));
+    assert!(document.failures_outside_identifiers[0].contains("VoiceCeremonyTest"));
+    let android_after: Vec<_> = document.identifiers["KR-REQ-15.13"]
+        .tests
+        .iter()
+        .filter(|test| test.test.contains("VoiceCeremonyTest"))
+        .map(|test| test.outcome.clone())
+        .collect();
+    assert_eq!(android_after, [Outcome::Passed]);
 }
 
 #[test]
@@ -596,7 +596,7 @@ fn a_selection_without_the_phones_group_leaves_the_lane_files_out() {
     );
     assert!(document.identifiers.is_empty());
     let document = assemble(Platform::Linux, &map, &[]);
-    assert_eq!(document.identifiers.len(), 6);
+    assert_eq!(document.identifiers.len(), 5);
 }
 
 #[test]
@@ -893,6 +893,79 @@ fn a_phone_test_file_whose_braces_do_not_balance_is_one_problem_that_names_it() 
         own[0].contains("cannot be read for its classes"),
         "{:?}",
         map.problems
+    );
+}
+
+#[test]
+fn a_phone_test_file_whose_tests_cannot_be_followed_keys_nothing_and_is_one_problem() {
+    let root = tempfile::tempdir().expect("a directory");
+    let kotlin = "apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/ExpressionTest.kt";
+    let target = root.path().join(kotlin);
+    std::fs::create_dir_all(target.parent().expect("a directory")).expect("directories");
+    // The second test has no block body, so the braces of the third would be taken for its.
+    std::fs::write(
+        &target,
+        "package to.kala.reach.companion.mobile\n\nclass ExpressionTest {\n    /** KR-REQ-15.35: about the first. */\n    @Test fun first() {\n    }\n\n    @Test fun second() = assertEquals(1, 1)\n\n    /** KR-REQ-15.34: about the third. */\n    @Test fun third() {\n    }\n}\n",
+    )
+    .expect("a file");
+    let map = map_of(root.path());
+    let own: Vec<&String> = map
+        .problems
+        .iter()
+        .filter(|problem| problem.starts_with(kotlin))
+        .collect();
+    assert_eq!(own.len(), 1, "{:?}", map.problems);
+    assert!(own[0].contains("cannot be read for its tests"), "{own:?}");
+    assert!(
+        !map.keys
+            .values()
+            .flat_map(|places| places.keys())
+            .any(|place| matches!(place, Place::Lane { file, .. } if file == kotlin))
+    );
+}
+
+#[test]
+fn a_comment_between_two_tests_names_a_row_it_keys_for_none() {
+    let root = tempfile::tempdir().expect("a directory");
+    let kotlin = "apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/BetweenTest.kt";
+    let target = root.path().join(kotlin);
+    std::fs::create_dir_all(target.parent().expect("a directory")).expect("directories");
+    std::fs::write(
+        &target,
+        "package to.kala.reach.companion.mobile\n\nclass BetweenTest {\n    /** KR-REQ-15.35: about the first. */\n    @Test fun first() {\n    }\n\n    // KR-REQ-15.34: a remark a blank line above the second.\n\n    @Test fun second() {\n    }\n}\n",
+    )
+    .expect("a file");
+    let map = map_of(root.path());
+    assert!(
+        !map.problems
+            .iter()
+            .any(|problem| problem.starts_with(kotlin)),
+        "{:?}",
+        map.problems
+    );
+    let keyed = |row: &str| -> Vec<lane::Part> {
+        map.keys
+            .get(&row.parse().expect("an identifier"))
+            .into_iter()
+            .flatten()
+            .filter_map(|(place, _)| match place {
+                Place::Lane { file, part, .. } if file == kotlin => Some(part.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        keyed("KR-REQ-15.35"),
+        [lane::Part::Case {
+            class: "to.kala.reach.companion.mobile.BetweenTest".to_owned(),
+            name: "first".to_owned()
+        }]
+    );
+    assert!(keyed("KR-REQ-15.34").is_empty());
+    assert!(
+        map.references[&"KR-REQ-15.34".parse().expect("an identifier")]
+            .iter()
+            .any(|reference| reference.source.starts_with(kotlin))
     );
 }
 
