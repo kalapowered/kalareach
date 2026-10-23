@@ -10,6 +10,7 @@
 
 import { expect, test } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -74,7 +75,9 @@ for (const surface of ['ios', 'android'] as const) {
           const box = await button.boundingBox()
           expect(box?.height ?? 0, `${name} is a finger tall`).toBeGreaterThanOrEqual(TARGET[surface] - 1)
         }
-        await row.screenshot({ path: `/tmp/kr-push-notifications-${state.name}-${label}-${test.info().project.name}.png` })
+        await row.screenshot({
+          path: screenshotPath(`kr-push-notifications-${state.name}-${label}-${test.info().project.name}`)
+        })
         expect(await overrunning(page, '[data-testid="host-notifications"]'), 'nothing runs past the screen').toEqual([])
       })
     }
