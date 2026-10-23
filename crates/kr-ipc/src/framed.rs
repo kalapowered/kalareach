@@ -180,9 +180,12 @@ impl Readiness {
         // A descriptor of this connection's own, so waiting on it borrows nothing the writer
         // holds. A connection this cannot be taken for is one whose writes fail anyway, and the
         // wait below then yields rather than pretending to be readiness.
-        Self(connection.writability().ok().and_then(|descriptor| {
-            tokio::io::unix::AsyncFd::with_interest(descriptor, tokio::io::Interest::WRITABLE).ok()
-        }))
+        Self(
+            connection
+                .writability()
+                .ok()
+                .and_then(|descriptor| readiness::writable(descriptor).ok()),
+        )
     }
 
     async fn ready(&self) -> Result<()> {
@@ -198,6 +201,34 @@ impl Readiness {
         // see: the next wait asks the kernel again instead of trusting a readiness nobody consumed.
         guard.clear_ready();
         Ok(())
+    }
+}
+
+/// The registration of a connection's own descriptor with the runtime's reactor.
+///
+/// The crate denies unsafe code and relaxes the rule for the modules that need it: tokio registers
+/// a descriptor for readiness only through an unsafe constructor, because the reactor keeps the
+/// descriptor's number and only the caller can promise that the number stays open and names the
+/// same socket until the registration ends.
+#[cfg(unix)]
+mod readiness {
+    #![expect(
+        unsafe_code,
+        reason = "tokio registers a descriptor for readiness only through an unsafe constructor"
+    )]
+
+    use std::os::fd::OwnedFd;
+    use tokio::io::Interest;
+    use tokio::io::unix::{AsyncFd, AsyncFdRegisterError};
+
+    /// Registers `descriptor` with the current runtime for writability.
+    pub fn writable(
+        descriptor: OwnedFd,
+    ) -> Result<AsyncFd<OwnedFd>, AsyncFdRegisterError<OwnedFd>> {
+        // SAFETY: the descriptor is a duplicate made for this wait alone, and it moves into the
+        // `AsyncFd`: nothing else holds its number, so it stays open and names the same socket
+        // until the `AsyncFd` drops it, and an `OwnedFd` gives the same number on every call.
+        unsafe { AsyncFd::register_with_interest(descriptor, Interest::WRITABLE) }
     }
 }
 
