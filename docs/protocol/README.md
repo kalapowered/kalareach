@@ -56,20 +56,21 @@ Three rules are easy to get wrong:
   objects with different digests. A closed schema therefore requires every field to be present, and
   the Rust types use `Nullable<T>` rather than `Option<T>` so that a missing field is an error. The
   exception is a member that a type declares absent when unset. It is left out of the encoding when
-  it holds nothing, which is `None` for an optional member, `false` for the two flags `error_withheld`
-  of a receipt and `link_fenced` of an error, and the empty or default value for the few others, such
-  as the extension offers of a hello. A value that states such a member at its default is refused as
-  non-canonical, because it would re-encode to different bytes: a sender that writes
-  `"link_fenced": false` or `"line_token": null` is refused, and one that leaves the member out is
-  not. The members are `presentation_reason` of an attachment summary, `line_token` of a detach,
-  `link_fenced` of an error, `machine`, `privacy`, `default_shell_mode` and `metrics` of the host
-  reads, `cause` of a history gap, `error_withheld` of a receipt, `session_id` of an action read,
-  `environment_sources`, `root` and `application` of a session summary, `metrics` of a session read,
-  `session` of a close result, the forwarded request members of a local connection (`history`,
-  `screen_basis`, `workflow_run_id`, `lease`, `origin`, `build`), the release manifest's
-  `dependencies`, `upstream`, `source_commit`, `schema_hash` and `reads_through`, and the optional
+  it holds nothing: `None` for an optional member, `false` for the three flags `error_withheld` of a
+  receipt, `link_fenced` of an error and `holds_local_access` of a worker launch, and the empty or
+  default value for a few others, such as the extension offers of a hello. A value that states such a
+  member at its default is refused as non-canonical, because it would re-encode to different bytes: a
+  sender that writes `"link_fenced": false` or `"line_token": null` is refused, and one that leaves
+  the member out is not. The members are `presentation_reason` of an attachment summary,
+  `line_token` of a detach, `link_fenced` of an error, `machine`, `privacy`, `default_shell_mode`
+  and `metrics` of the host reads, `cause` of a history gap, `error_withheld` of a receipt,
+  `session_id` of an action read, `environment_sources`, `root` and `application` of a session
+  summary, `metrics` of a session read, `session` of a close result, `origin` and `build` of the
+  local hello and its acknowledgement and `build` of the bridge hello acknowledgement, `history`,
+  `screen_basis`, `workflow_run_id` and `lease` of a forwarded request or mutation, and the optional
   members of a worker launch and of an authority revision notice. The generated schema and
-  TypeScript type these members as the type or null, which is wider than what a decoder accepts.
+  TypeScript type accept the explicit default that the decoder refuses: null for an optional member
+  and `false` for a flag.
 - **Numbers are never floating point.** Decimal or scaled values use a schema-defined integer or
   text representation. UUIDs are 16-byte strings. Timestamps are integer UTC milliseconds, never
   tagged dates.
@@ -160,7 +161,7 @@ wire string, so a reader can verify the order from the encoded values alone.
 The first two domains below are described in this section. The table after them lists every domain
 the protocol defines; each constant sits beside the type it covers in `crates/kr-protocol/src`, except
 the short-code attempt counter and the two device-confirmation domains, which `crates/kr-pairing`
-holds.
+holds, and the plugin-host and relay-request domains, whose crates the table names.
 
 - `kr-connect/1` for the connection proof transcript.
 - `kr-mutation/1` for the mutation payload digest.
@@ -181,7 +182,7 @@ holds.
 | `kr-revocation/1`, `kr-authority/1` | A revocation request signature; a host authority revision record signature | `pairing.rs` |
 | `kr-membership-lease/2`, `kr-policy-authority/1`, `kr-policy-authority-head/1`, `kr-organisation-policy/1` | The four account authority objects | `account.rs` |
 | `kr-mailbox-claim/1` | The value that claims a mailbox | `mailbox.rs` |
-| `kr-archive-manifest/1`, `kr-recovery-bundle/1`, `kr-backup-writer/1`, `kr-backup-publication/1` | An archive manifest signature; the key a recovery bundle is stored under; a collection's writer enrolment; one published generation | `archive.rs` |
+| `kr-archive-manifest/1`, `kr-recovery-bundle/1`, `kr-backup-writer/1`, `kr-backup-publication/1` | An archive manifest signature; the context a recovery bundle's key is derived from; a collection's writer enrolment; one published generation | `archive.rs` |
 | `kr-collection-keys/1` | A shared collection's key record | `collection_keys.rs` |
 | `kr-relay/lease/1`, `kr-relay/revoke/1`, `kr-relay/receipt/1`, `kr-relay/instance/1` | A relay lease, its revocation, a consumption receipt and an instance registration | `relay.rs` |
 | `kr-service-request/1`, `kr-service-request/1/host` | A service request signed by an installation; one signed by a host | `service.rs` |
@@ -189,11 +190,14 @@ holds.
 | `kr-push-delivery/1`, `kr-push-token/1`, `kr-push-credential/1`, `kr-push-request/1` | Digests: a delivery request, a provider token, a delivery credential's bearer and a signed push request body | `push.rs` |
 | `kr-voice/confirm/1`, `kr-voice/action/1` | A voice confirmation signature; a voice action digest | `voice.rs` |
 | `kr-worker/1/rendezvous`, `kr-worker/1/verify`, `kr-controller/1/generation` | A worker's startup rendezvous; its answer to a verification challenge; a controller's generation token | `worker.rs` |
-| `kr-host-clock/1`, `kr-catalogue-trust/2`, `kr-plugin-grant/1`, `kr-plugin-install/2`, `kr-organisation/enrol/1` | What an owner confirms: the host clock again, a repository's trust root, a package's grant, a package's installation, an organisation's enrolment. Each is the first member of the value whose digest the confirmation covers | `confirmation.rs` |
+| `kr-host-clock/1`, `kr-catalogue-trust/2`, `kr-plugin-grant/1`, `kr-plugin-install/2`, `kr-organisation/enrol/1`, `kr-organisation/exclusive/1`, `kr-transfer/2` | What an owner confirms: the host clock again, a repository's trust root, a package's grant, a package's installation, an organisation's enrolment, the exclusive-management setting of an organisation set, the complete plan of a grant transfer. Each is the first member of the value whose digest the confirmation covers, and an owner device computes the same digest again from what it is shown | `confirmation.rs` |
+| `kr-plugin-host/1/rendezvous`, `kr-plugin-host/1/verify` | A plugin host's startup claim; its answer to a verification challenge | `crates/kr-plugin-service/src/protocol.rs` |
+| `kr-relay-lease-request/1`, `kr-relay-lease-revoke/1`, `kr-relay-payer-sign-in/1`, `kr-relay-admission-request/1` | The body digests of the four relay control-plane requests ([The relay requests](#the-relay-requests)) | `crates/kr-client/src/services/relay.rs`, `admission.rs` |
 
 `kr-sharing/1` is not one of these: it derives a grant or invitation identity from an action
 identifier and a purpose label, so that a retry finds the identity it made. The client library adds
-two digest domains of its own, which [the cryptography reference](../crypto/README.md) names.
+two more digest domains, for a shared collection's key mark and a membership plan, which [the
+cryptography reference](../crypto/README.md) names.
 
 The mutation digest covers the method and version, the actor and grant, the complete target, the
 preconditions, the action identifier, the action window, the requested time to live, and the
@@ -320,7 +324,8 @@ the message fails:
    keys, invalid UTF-8, key order, forbidden representations and the limits.
 2. **Schema.** `kr_cbor::check` reads the value against the structure its type publishes and refuses
    a key that structure does not declare. The structure is compiled, once per type, from the JSON
-   Schema this repository publishes in `packages/protocol/schema/`. Variants told apart by a tag
+   Schema that `schema_for::<T>()` derives from the Rust type, which is the schema this repository
+   publishes in `packages/protocol/schema/`. Variants told apart by a tag
    field are checked against the variant the tag names, exactly as the typed decoder selects it; a
    tag that names no variant is refused.
 3. **Type.** serde builds the typed value, and the round trip holds it to the one encoding the type
@@ -376,15 +381,20 @@ receives is refused. Local connections negotiate none.
 
 ## Expiry and freshness
 
-Every authority in the protocol ends, and each ending is one of these bounds. The documents named
-beside them hold the rest of each rule.
+The bounds below are the ones the protocol fixes in this repository. The documents named beside them
+hold the rest of each rule; a lifetime that a service or a configuration sets is described where that
+service or configuration is.
 
 | What | Bound | Described in |
 | --- | --- | --- |
 | A pairing invitation | Five minutes, single use | [Pairing](../pairing/README.md) |
-| An action window | Issued for one connection and the host's boot, and replaced on the live connection at half its validity. A mutation's accepted deadline is the earliest of the window's expiry, its receipt time plus the requested lifetime and any authority deadline | [Action windows](../transport/README.md#action-windows) |
+| An owner-confirmation challenge | Two minutes, single use | [Pairing](../pairing/README.md) |
+| An action window | At most five minutes, issued for one connection and the host's boot, and replaced on the live connection at half its validity | [Action windows](../transport/README.md#action-windows) |
+| A mutation's lifetime | Requested as a time to live, two minutes by default and five minutes at most. The accepted deadline is the earliest of the window's expiry, the receipt time plus the requested lifetime and any authority deadline | [Action windows](../transport/README.md#action-windows) |
 | The remote dispatch lease | At most five seconds, taken when the daemon forwards an action, and held by the worker as well as the daemon | [The remote dispatch lease](../transport/README.md#the-remote-dispatch-lease) |
-| A membership lease | At most fifteen minutes, refreshed every five | [Account authority objects](#account-authority-objects) |
+| A membership lease, and a policy-authority head | At most fifteen minutes; a lease is refreshed every five | [Account authority objects](#account-authority-objects) |
+| A push registration challenge and a mailbox claim challenge | Five minutes each | [Push objects](#push-objects), [The mailbox](method-reference.md#the-mailbox) |
+| A push delivery credential | Thirty days, and a host may renew it from seven days before it ends | [Push objects](#push-objects) |
 | A signed service request | Admitted within five minutes of the service's clock in either direction; its nonce is remembered for twice that long | [The service credential](#the-service-credential) |
 | A relay lease | The lease states its own end; a revocation and a consumption receipt are signed objects | [Relay leases and receipts](#relay-leases-and-receipts) |
 | A grant | The expiry it states, the end of the grantee's pairing, whichever comes first; a delegated grant never outlives its parent | [Grants, sharing and revocation](../host/README.md#grants-sharing-and-revocation) |
@@ -586,8 +596,9 @@ Reading the fields:
   pairing presents a transcript proof, a service method presents a service credential, and a
   private-IPC method presents its caller token, none of which involve a grant.
 - The entries of `sync.compare_exchange` and `backup.manifest` list only the service credential. The
-  requests of those methods that touch an account's recovery bundle, and a backup generation's
-  publication, also carry the account token for `backup.write`, as [the service
+  requests of those methods that touch an account's recovery bundle also carry the account token, for
+  `backup.write` when the device writes it and `backup.restore` when it only reads it, and a backup
+  generation's publication carries the token for `backup.write`, as [the service
   credential](#the-service-credential) describes; the entry does not record that, and neither entry
   names the collection or archive it addresses as its resource (it says `mailbox`).
 - `required_rights` is an intersection, not a choice. An entry with a condition other than `always`
@@ -665,7 +676,7 @@ convention:
 ### What version 1 offers an agent
 
 An agent running in a session reaches the host through its contact tools, which call four
-private-IPC methods under the caller token of its own verified application: `question.create`,
+private-IPC methods over a connection bound to its own verified application: `question.create`,
 `question.read_own`, `question.cancel_own` and `alert.create`. Each names one question or one
 session, and none is a listing or a search. No method lets an agent list sessions, search a
 session's history, read another session's output, send input to another session, route a message
@@ -825,7 +836,7 @@ Two kinds of caller reach these methods, so there are two domains and no other d
 installation signs under `kr-service-request/1` with its device authorisation key. A host signs under
 `kr-service-request/1/host` with its host signing key, which is how `push.sender.renew`,
 `push.sender.revoke` and a host's `authority.sync` are proven, and how the host proves its own
-backup storage and `backup.manifest` requests. The separation is in the bytes rather
+mailbox, backup storage and `backup.manifest` requests. The separation is in the bytes rather
 than in a label beside them, so relabelling a signature cannot turn one into the other.
 
 The five mailbox, authority-feed, settings-sync, backup-manifest and storage groups send a JSON
@@ -833,10 +844,11 @@ document as the request body, and a signature covers bytes and not a document. S
 `body_digest` is the SHA-256 of `canonical_body`, the document encoded in KR-CBOR-1: member names
 as text in canonical order, every string as CBOR text (decimal counters, identifiers and base64url
 data stay text, and are not turned into integers or byte strings), and a JSON number only where it
-is an exact unsigned integer no greater than 2^53-1. A float, a negative number, a fraction, a
-larger integer and an object that repeats a member are refused before anything is signed, and the
-service recomputes the digest from the document it holds, so neither side depends on how the other
-wrote its JSON. `canonical_body_digest` in `crates/kr-protocol/src/service.rs` is that function and
+is an exact unsigned integer no greater than 2^53-1. The rule is on the value and not the spelling:
+`1000` and `1e3` are one number and give one digest. A fraction, a negative number and an integer
+above the bound are refused before anything is signed. The function receives a parsed document, so
+it cannot see a member that an earlier parse of the JSON text repeated. The service recomputes the
+digest from the document it holds, so neither side depends on how the other wrote its JSON. `canonical_body_digest` in `crates/kr-protocol/src/service.rs` is that function and
 `fixtures/service/services.json` holds its cases, with the bodies it refuses. This differs from
 the typed objects of [the two representations](#the-two-representations), which are rebuilt from
 their typed fields.
@@ -847,8 +859,8 @@ signature itself. The one
 exception is a storage part. Its HTTP body is the ciphertext, and the same signed JSON travels in
 the `kr-service-request` header as unpadded base64url, so the signature covers the part's declared
 length and SHA-256 and the service bounds what it reads before it reads any of it. A request for
-something an account owns also carries the account token as an `authorization` header, which the
-signature does not cover.
+something an account owns also carries the account token as an `authorization: Bearer <token>`
+header, which the signature does not cover.
 
 A service admits a signature whose `signed_at_ms` is inside five minutes of its own clock, in either
 direction, and remembers the nonce for twice that long: a signature dated the full window ahead is
@@ -885,6 +897,25 @@ scheme, a canonically spelled host, an optional non-default port, and nothing el
 difference is that plain HTTP is admitted for a loopback host, which is what a development
 deployment serves on. `fixtures/service/requests.json` publishes every origin both languages accept
 and every spelling both refuse, and each language's tests run the whole list.
+
+### The relay requests
+
+Four requests of the relay control plane are signed under the same credential, but they are not
+entries of the method registry. The credential therefore names the method as text, and the signed
+`body_digest` is not the `canonical_body` digest above. The body is a typed object, and its digest
+is the SHA-256 of `CBOR([domain, body])` in KR-CBOR-1, with the body's scalars in their wire form (a
+counter as an integer, an identifier as sixteen bytes), so JSON is still never what a signature
+covers.
+
+| Method named in the credential | Path | Body digest domain |
+| --- | --- | --- |
+| `relay.lease.issue` | `/api/relay/lease` | `kr-relay-lease-request/1` |
+| `relay.lease.revoke` | `/api/relay/lease/revoke` | `kr-relay-lease-revoke/1` |
+| `relay.payer.sign_in` | `/api/relay/payer-authorisation/sign-in` | `kr-relay-payer-sign-in/1` |
+| `relay.admission.issue` | `/api/relay/admission` | `kr-relay-admission-request/1` |
+
+`fixtures/relay/requests.json` holds the payer sign-in vector, and the lease and admission vectors
+are in `crates/kr-client/tests/relay_service.rs`.
 
 ## Push objects
 
@@ -983,15 +1014,18 @@ read them from `crates/*/tests/`, and the vitest suites read the same files, wit
 below. The signature vectors are in `fixtures/crypto/`, and the pairing vectors are in
 `fixtures/pairing/` ([the pairing reference](../pairing/README.md)).
 
-Six sets of files are not shared vectors. `fixtures/accounts/rotated-policy.json` is a record
+Some files are not shared vectors. `fixtures/accounts/rotated-policy.json` is a record
 captured from the managed service's own signing code across a rotation of an organisation's
 policy-signing key, which only the daemon's test reads. Five files in `fixtures/service/` are
 answers recorded from the managed service, which only the Rust tests of the service clients in
 `crates/kr-client/tests/` read: `authority-answers.json`, `bundle-answers.json`,
-`bundle-write-answers.json`, `settings-answers.json` and `storage-answers.json`. The generator does
-not write or check these six files, because the service produced them and not this repository. It
-does write and check `fixtures/service/requests.json`, `fixtures/service/services.json`,
-`fixtures/push/push.json` and `fixtures/metrics/host.json`.
+`bundle-write-answers.json`, `settings-answers.json` and `storage-answers.json`; each records the
+web commit it was taken at. The generator does not write or check these six files, because the
+service produced them and not this repository. Three more files have only a Rust reader:
+`fixtures/metrics/host.json`, `fixtures/relay/requests.json` and
+`fixtures/cbor/before-deserialisation.json`. The generator writes and checks
+`fixtures/service/requests.json`, `fixtures/service/services.json`, `fixtures/push/push.json` and
+`fixtures/metrics/host.json`.
 
 Values use a small tagged grammar, so a fixture can express a byte string, a 64-bit integer and a
 deliberately unsorted map, none of which plain JSON can carry:
