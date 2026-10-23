@@ -508,8 +508,9 @@ The relay lease keeper, the carrier and the voice service each take their client
 `managed-services` check in `kr doctor` says, for account login, relay leases, sync and backup and
 managed inference, whether the daemon holds a client of it and, for each it does not, what to do
 instead. The account login is held only where a sign-in can start: a host that selects no service, one
-whose route is closed, and one whose only selection is a broker that is not the account service have none
-to name, although the host keeps what it needs to read and end a sign-in it already holds. The check is
+whose only selection is a relay lease service at another origin, one whose route is closed, and one whose
+only selection is a broker that is not the account service have none to name, although the host keeps what
+it needs to read and end a sign-in it already holds. The check is
 `ok` when all four are held and `not_applicable` otherwise, never a warning or a failure: a host that
 holds none of them is a complete host, and the check says nothing about what an account is entitled to,
 which is what the service answers when a client calls it. Registering a phone for push is the phone's,
