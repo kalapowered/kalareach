@@ -1264,6 +1264,12 @@ fn script(path: &Path, body: &str) {
 /// given, that command names the application and not the interpreter. Only that shows it: a
 /// program that merely reads the script, or that has replaced the command, is named for its own
 /// image. A program is not named until two looks have found the same group.
+///
+/// The interpreter is the process's image or the file its first argument names: macOS's `/bin/sh`
+/// runs as the shell the machine selects and keeps its own path as the first argument, so the image
+/// alone would name every such script for the shell. The first argument is the process's own claim,
+/// which is enough to name a program for display and for the sleep demand's reason, and decides
+/// nothing of authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_program_that_runs_it() {
     use kr_worker::application::Following;
