@@ -67,6 +67,10 @@ pub struct ComponentCalls {
     changed: tokio::sync::Notify,
     /// The preparations inside a component now.
     running: Arc<tokio::sync::Semaphore>,
+    /// The pause a preparation takes between the component's reply and what is made of it, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    hold: Arc<kr_plugin_service::hold::Hold>,
 }
 
 impl ComponentCalls {
@@ -75,7 +79,17 @@ impl ComponentCalls {
             client: Mutex::new(None),
             changed: tokio::sync::Notify::new(),
             running: Arc::new(tokio::sync::Semaphore::new(MAX_PREPARATIONS)),
+            #[cfg(feature = "testing")]
+            hold: Arc::default(),
         }
+    }
+
+    /// Holds the next preparation after the component has replied and before its reply is read, and
+    /// returns the handle that lets it go. For this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_replies(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.hold.set()
     }
 
     /// Publishes the runtime's connection, or withdraws it.
@@ -627,6 +641,8 @@ impl Broker {
             )
             .await;
         drop(place);
+        #[cfg(feature = "testing")]
+        self.component_calls.hold.pause().await;
         // What the runtime says of a component, and what a component says of itself, is made of what
         // it was handed, and a component handed anything in privacy mode, or on a connection it
         // stood on, has its words withheld from what a person is told. A reply that was written on

@@ -13,7 +13,7 @@
 //! | --- | --- |
 //! | KR-REQ-23.30 | `plugin.action.invoke` runs the component registered for the binding, validates the plan it proposes against the action, the grant, the effect class and the arguments, transmits the plan that validates once, and rejects every other with a receipt that says it never dispatched |
 //! | KR-REQ-11.28, KR-REQ-23.30 | through a connector whose table spells a cancellation, the plan a component prepares for the cancellation it was invited to prepare is validated against the token the host issued and written from the table's template, naming the thread and the running turn; every plan that is not that one, and a component's prompt, which the table spells no source for, is refused before the marker and nothing is written |
-//! | KR-REQ-24.27 | the words a component declines an action with, and the names its plan chooses, are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, and the binding is marked as handed something made in privacy mode |
+//! | KR-REQ-24.27 | the words a component declines an action with, and the names its plan chooses, are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, including when the reply is read after the connection was replaced, and the binding is marked as handed something made in privacy mode |
 //! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
 //!
 //! The scripted peer stands in for a vendor's agent. A test that needs a stopped plugin host stops
@@ -41,7 +41,7 @@ use plugin_world::acting::{
     ACTIONS, Acting, Change, a_lease, a_paired_device, announce, answer, binding, read_receipt,
     send, signal, until_receipt, until_settled, until_the_devices_receipt_is,
 };
-use plugin_world::{PATIENCE, kill};
+use plugin_world::{PATIENCE, kill, until};
 
 /// KR-REQ-23.30: the plan a component proposes for the cancellation it was invited to prepare is
 /// validated and transmitted once, as the method its action goes out as, and the receipt says the
@@ -968,6 +968,89 @@ async fn kr_req_11_31_a_component_that_faults_disables_its_binding_and_the_nativ
             .count(),
         native as usize
     );
+}
+
+/// KR-REQ-24.27: what a component declined an action with is withheld when the reply is read after
+/// the connection it came on has been replaced, and privacy mode has ended meanwhile.
+///
+/// The connection's own state says whether privacy mode has stood on it, and a connection made
+/// after privacy mode ended says nothing of the one before. The reply is held after the component
+/// has given it, privacy mode ends, the runtime is killed and the link publishes the next
+/// connection, and the reply is read then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_a_reply_read_after_its_connection_was_replaced_is_still_withheld() {
+    let Some(acting) = Acting::start_linked().await else {
+        return;
+    };
+    let broker = acting.hosted._service.broker();
+    let mut client = acting.client().await;
+    let mut request_id = 0_u64;
+    // Until the component is registered the action cannot be asked of it, and can be asked again.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        request_id += 1;
+        let mut mutation = acting.invocation(&client, "cancel.fault", b"{}");
+        mutation.request_id = RequestId::new(request_id);
+        let Outcome::Error(refusal) = send(&mut client, mutation).await else {
+            panic!("an action its component declines was carried");
+        };
+        if refusal.code == ErrorCode::InvalidArgument {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {PATIENCE:?} for the component to decline the action: {refusal:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut authority = acting
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    acting.hosted.tell_privacy(&mut authority, 1, true).await;
+    let held = broker.component_calls().hold_replies();
+    let old = broker
+        .component_calls()
+        .client()
+        .expect("the runtime is connected");
+    let mut asking = acting.client().await;
+    let mut mutation = acting.invocation(&asking, "cancel.fault", b"{}");
+    mutation.request_id = RequestId::new(1);
+    asking
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("writes the mutation");
+    until("the reply to be held", || async {
+        held.parked().then_some(())
+    })
+    .await;
+
+    // Privacy mode ends, and the runtime is replaced while the reply waits.
+    acting.hosted.tell_privacy(&mut authority, 2, false).await;
+    let host = acting.hosted.published().expect("the runtime is published");
+    kill(&host);
+    until("the link to publish the next connection", || async {
+        broker
+            .component_calls()
+            .client()
+            .filter(|current| !Arc::ptr_eq(current, &old))
+            .map(|_| ())
+    })
+    .await;
+    held.release();
+
+    let Outcome::Error(refusal) = answer(&mut asking, Some(1)).await else {
+        panic!("an action its component declines was carried");
+    };
+    assert_eq!(refusal.code, ErrorCode::InvalidArgument, "{refusal:?}");
+    assert!(
+        !refusal.message.contains("is not something to do"),
+        "the component's words reached a person after their connection was replaced: {}",
+        refusal.message
+    );
+    assert!(refusal.message.contains("withheld"), "{}", refusal.message);
 }
 
 /// KR-REQ-24.27: what a component says when it declines an action it was handed arguments for is
