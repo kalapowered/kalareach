@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::evidence::{self, Figure, KnownDifference};
 use crate::id::{Family, Identifier};
 use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Toolchain};
-use crate::lane;
+use crate::lane::{self, Part};
 use crate::libtest::Outcome as LibtestOutcome;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference};
 use crate::plan::{self, ApplicationsPlan, Group, Platform};
@@ -777,6 +777,17 @@ fn unowned_lane_cases(options: &Options, map: &Map, executed: &[Executed]) -> Ve
         .collect()
 }
 
+/// Whether a key of `part` covers a case the lane's tool reported, among the cases of the classes
+/// of the file the key is in: all of them for the file, those of one class (and the classes nested
+/// in it) for a class, one case for a test.
+fn covers(part: &Part, case: &lane::Case) -> bool {
+    match part {
+        Part::File => true,
+        Part::Class(class) => lane::declares(std::slice::from_ref(class), &case.class),
+        Part::Case { class, name } => case.class == *class && case.name == *name,
+    }
+}
+
 /// Resolves keyed places to outcomes against what ran.
 struct Resolver<'a> {
     options: &'a Options,
@@ -852,15 +863,22 @@ impl<'a> Resolver<'a> {
                 line,
                 title,
             } => self.typescript(package, file, *line, title, key),
-            Place::Lane { file, reason } => self.lane(file, reason, key),
+            Place::Lane { file, part, reason } => self.lane(file, part, reason, key),
         }
     }
 
-    /// The records of one keyed file of a phone lane: one for each case the lane's tool reported
-    /// for a class the file declares; or one, when this run's platform does not run the lane, when
-    /// the lane's tool reported nothing, when it reported a class that no single file of the lane
-    /// declares, or when it reported nothing of this file.
-    fn lane(&self, file: &str, reason: &str, key: &map::Key) -> Vec<TestRecord> {
+    /// The records of one key of a file of a phone lane: one for each case the lane's tool reported
+    /// that the key covers (see [`covers`]); or one, when this run's platform does not run the lane,
+    /// when the lane's tool reported nothing, when it reported a class that no single file of the
+    /// lane declares, or when it reported nothing the key covers.
+    fn lane(&self, file: &str, part: &Part, reason: &str, key: &map::Key) -> Vec<TestRecord> {
+        // What the record of a key that no case answers is called: the file, the class or the case,
+        // so that two keys of a row that cover different things stay two records.
+        let named = match part {
+            Part::File => file.to_owned(),
+            Part::Class(class) => format!("{file} {class}"),
+            Part::Case { class, name } => format!("{file} {class}.{name}"),
+        };
         let record = |test: String,
                       outcome: Outcome,
                       reason: Option<String>,
@@ -889,7 +907,7 @@ impl<'a> Resolver<'a> {
         });
         let Some((index, step)) = step else {
             return vec![record(
-                file.to_owned(),
+                named,
                 Outcome::NotRun,
                 Some(reason.to_owned()),
                 Vec::new(),
@@ -903,7 +921,7 @@ impl<'a> Resolver<'a> {
                 reason: Some(why.clone()),
             };
             vec![record(
-                file.to_owned(),
+                named.clone(),
                 Outcome::Failed,
                 Some(why),
                 vec![run],
@@ -930,12 +948,20 @@ impl<'a> Resolver<'a> {
             .map_or(&[][..], Vec::as_slice);
         let own: Vec<&lane::Case> = cases
             .iter()
-            .filter(|case| lane::declares(declared, &case.class))
+            .filter(|case| lane::declares(declared, &case.class) && covers(part, case))
             .collect();
         if own.is_empty() {
-            return failed(
-                "the lane ran, and its results hold no test of this file's classes".to_owned(),
-            );
+            return failed(match part {
+                Part::File => {
+                    "the lane ran, and its results hold no test of this file's classes".to_owned()
+                }
+                Part::Class(class) => {
+                    format!("the lane ran, and its results hold no test of the class {class}")
+                }
+                Part::Case { class, name } => {
+                    format!("the lane ran, and its results hold no case {name} of {class}")
+                }
+            });
         }
         own.into_iter()
             .map(|case| {
@@ -1451,9 +1477,10 @@ impl<'a> Resolver<'a> {
             };
             for case in step.lane.iter().flatten() {
                 let keyed_class = map.keys.values().flat_map(|places| places.keys()).any(|place| {
-                    matches!(place, Place::Lane { file, .. }
+                    matches!(place, Place::Lane { file, part, .. }
                         if own_lane(file)
-                            && map.lane_classes.get(file).is_some_and(|classes| lane::declares(classes, &case.class)))
+                            && map.lane_classes.get(file).is_some_and(|classes| lane::declares(classes, &case.class))
+                            && covers(part, case))
                 });
                 if case.outcome == LibtestOutcome::Failed && !keyed_class {
                     failed.insert(format!("step {}: {} {}", index + 1, case.class, case.name));

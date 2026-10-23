@@ -24,8 +24,10 @@
 //!
 //! In data files, a case table's `covers` field keys the tests `plan::CASE_TABLES` says run its
 //! cases. In TypeScript, `crate::typescript` states the rules. A Kotlin or Swift test file in one
-//! of `plan::LANES` keys itself as a whole, because another toolchain builds it, and owns the cases
-//! the lane's tool reports for the classes it declares.
+//! of `plan::LANES` is built by another toolchain, and `crate::lane` states the rules for its
+//! comments: one directly above a test, or inside it, keys that test; one directly above a class
+//! keys the class's tests; one before the first line of code keys the whole file; the lane's tool
+//! reports the cases that belong to each.
 //!
 //! Every other mention (a comment on product code, a script) is a reference: it is listed with the
 //! identifier, and it is never a test. Every mention of any kind is checked against the grammar,
@@ -37,6 +39,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::id::{self, Identifier, Refusal};
+use crate::lane::{self, Part, Stands};
 use crate::plan::{CaseTable, Lane, matches};
 use crate::rust_items::{
     self, Breach, Entry, FN_TRAITS, Import, KEYWORDS, Module, STANDARD_ROOTS, Sources, Visibility,
@@ -72,10 +75,12 @@ pub enum Place {
         /// Its full title.
         title: String,
     },
-    /// A file of tests another toolchain builds.
+    /// Tests of a file another toolchain builds: one test, one class or the whole file.
     Lane {
         /// The file.
         file: String,
+        /// How much of the file the key covers.
+        part: Part,
         /// Why the report does not build it.
         reason: String,
     },
@@ -101,7 +106,7 @@ pub enum Binding {
     CaseTable,
     /// Its title, or its suite's.
     Title,
-    /// A comment at the head of its file, or anywhere in a file another toolchain builds.
+    /// A comment at the head of its file.
     FileComment,
 }
 
@@ -1449,47 +1454,85 @@ fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane]) {
                 continue;
             };
             let lane = lanes.iter().find(|lane| matches(lane.files, &file));
-            let mut keyed = false;
-            for comment in crate::clike::comments(&text) {
-                for (identifier, source) in map.mentions(&comment.text, &file, comment.line) {
-                    match lane {
-                        Some(lane) => {
-                            keyed = true;
+            let reads = lane.is_some_and(|lane| lane.reads.is_some());
+            // The comments that name rows, with the identifiers each names.
+            let named: Vec<_> = crate::clike::comments(&text)
+                .into_iter()
+                .map(|comment| {
+                    let mentions = map.mentions(&comment.text, &file, comment.line);
+                    (comment, mentions)
+                })
+                .filter(|(_, mentions)| !mentions.is_empty())
+                .collect();
+            // A file of a lane the report reads is read for its classes, and when it names rows for
+            // its tests too, since that is what its comments key.
+            let classes = if reads {
+                match crate::lane::declared_classes(&file, &text) {
+                    Ok(classes) => Some(classes),
+                    Err(error) => {
+                        map.problems
+                            .push(format!("{file} cannot be read for its classes: {error}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if reads && !named.is_empty() && classes.as_ref().is_some_and(Vec::is_empty) {
+                // A file that names rows and declares no class holds no case the lane's results
+                // could name, so its rows could never read anything from them.
+                map.problems.push(format!(
+                    "{file} names rows and declares no class, so no test of the lane's results belongs to it"
+                ));
+            }
+            let declared = if classes.as_ref().is_some_and(|classes| !classes.is_empty())
+                && !named.is_empty()
+            {
+                match lane::declared(&file, &text) {
+                    Ok(declared) => Some(declared),
+                    Err(error) => {
+                        map.problems
+                            .push(format!("{file} cannot be read for its tests: {error}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            for (comment, mentions) in named {
+                let end = comment.line + comment.text.matches('\n').count();
+                let stands = match (&declared, lane) {
+                    (Some(declared), Some(_)) => declared.scope_of(comment.line, end),
+                    // A lane the report does not read has no tests to tell apart.
+                    (None, Some(_)) if !reads => Some((Part::File, Stands::Head)),
+                    _ => None,
+                };
+                for (identifier, source) in mentions {
+                    match (&stands, lane) {
+                        (Some((part, stands)), Some(lane)) => {
+                            let binding = match (part, stands) {
+                                (Part::Case { .. }, Stands::Inside) => Binding::CommentInside,
+                                (Part::Case { .. }, _) => Binding::AttachedComment,
+                                (Part::Class(_), _) => Binding::ModuleComment,
+                                (Part::File, _) => Binding::FileComment,
+                            };
                             map.key(
                                 identifier,
                                 Place::Lane {
                                     file: file.clone(),
+                                    part: part.clone(),
                                     reason: lane.reason.to_owned(),
                                 },
-                                Binding::FileComment,
+                                binding,
                                 source,
                             );
                         }
-                        None => {
-                            map.reference(identifier, source, "a comment that is not on a test")
-                        }
+                        _ => map.reference(identifier, source, "a comment that is not on a test"),
                     }
                 }
             }
-            if lane.is_some_and(|lane| lane.reads.is_some()) {
-                let classes = match crate::lane::declared_classes(&file, &text) {
-                    Ok(classes) => {
-                        // A file that names rows and declares no class holds no case the lane's
-                        // results could name, so its rows could never read anything from them.
-                        if keyed && classes.is_empty() {
-                            map.problems.push(format!(
-                                "{file} names rows and declares no class, so no test of the lane's results belongs to it"
-                            ));
-                        }
-                        classes
-                    }
-                    Err(error) => {
-                        map.problems
-                            .push(format!("{file} cannot be read for its classes: {error}"));
-                        Vec::new()
-                    }
-                };
-                map.lane_classes.insert(file, classes);
+            if reads {
+                map.lane_classes.insert(file, classes.unwrap_or_default());
             }
         }
     }
