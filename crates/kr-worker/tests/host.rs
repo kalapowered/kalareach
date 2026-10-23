@@ -2351,9 +2351,9 @@ async fn the_root_shell_runs_as_the_hosts_own_account_and_level() {
 /// there is the full one, the same whether a task asks for the least privilege or the highest, so a
 /// shell raised above its host would read the same as one that was not. Here the reading is held to
 /// what `whoami` printed for the principals a shell could run as: the full administrator the
-/// daemon runs as on that machine, the same administrator under a restricted token, and the system
-/// account. Each of the others differs from the administrator in the field a shell run above or
-/// below its host would differ in.
+/// daemon runs as on that machine, the same administrator under a restricted token, the system
+/// account, and an ordinary account. Each of the others differs from the administrator in the
+/// field a shell run above or below its host would differ in.
 #[test]
 fn the_reading_of_whoami_tells_the_principals_a_shell_could_run_as_apart() {
     fn printed(name: &str) -> Standing {
@@ -2392,6 +2392,14 @@ fn the_reading_of_whoami_tells_the_principals_a_shell_could_run_as_apart() {
     assert_eq!(system.integrity, "S-1-16-16384");
     assert_ne!(system.account, administrator.account);
     assert_ne!(system.integrity, administrator.integrity);
+
+    // An ordinary account signed in at the medium level, which holds no Administrators group at
+    // all: another account, at a lower level, with the group absent.
+    let standard = printed("standard");
+    assert_ne!(standard.account, administrator.account);
+    assert_eq!(standard.integrity, "S-1-16-8192");
+    assert_eq!(standard.administrators, None);
+    assert_ne!(standard.integrity, administrator.integrity);
 }
 
 /// What the daemon's `host.doctor` says.
