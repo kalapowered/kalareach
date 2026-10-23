@@ -22,6 +22,10 @@
 //! | KR-REQ-17.53 | `a_lease_is_asked_for_no_oftener_than_the_shortest_refresh` |
 //! | KR-REQ-17.53 | `a_chain_the_host_will_not_take_ends_the_keeper_after_a_few_tries` |
 //! | KR-REQ-17.53 | `a_second_connection_presents_the_lease_the_device_holds_and_asks_only_when_the_host_refuses_it` |
+//! | KR-REQ-17.53 | `a_token_the_service_turns_back_is_replaced_once_and_the_keeper_goes_on` |
+//! | KR-REQ-17.53 | `a_lease_and_a_stop_belong_to_the_account_that_asked` |
+//! | KR-REQ-17.53 | `a_delay_the_service_names_binds_every_connection_until_it_is_over` |
+//! | KR-REQ-17.53 | `a_lease_the_host_refuses_as_ended_the_moment_it_is_signed_is_not_asked_for_again_and_again` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -45,10 +49,12 @@ use companion_tauri::lease::LeaseDesk;
 use kr_client::Session;
 use kr_client::organisation::LeaseTimer;
 use kr_client::pairing::link::LinkError;
-use kr_client::services::NullService;
 use kr_client::services::account::{
     AccountService, AccountToken, Client, IssuedGrant, PendingAuthorisation, RefreshToken,
     SignedInAccount,
+};
+use kr_client::services::{
+    HttpDeadlines, HttpService, ManagedAccountService, managed_response_limits,
 };
 use kr_crypto::store::MemoryStore;
 use kr_protocol::account::{MembershipLease, PolicyAuthority};
@@ -67,6 +73,29 @@ use tokio::sync::{oneshot, watch};
 /// The account the device is signed in as, and the token it holds for the organisation's service.
 const ACCOUNT: &str = "ada";
 const TOKEN: &str = "ada-access-token";
+const SCOPES: [&str; 2] = ["openid", "organisation.lease"];
+
+/// The sign-in grant of `account` in the account system, and the tokens it holds for it.
+fn grant_of(account: &str) -> IssuedGrant {
+    IssuedGrant {
+        access_token: AccountToken::new(format!("{account}-access-token")).expect("a token"),
+        expires_in_seconds: 3600,
+        refresh_token: RefreshToken::new(format!("{account}-refresh-token")).expect("a token"),
+        scopes: SCOPES.map(str::to_owned).to_vec(),
+        subject: account.to_owned(),
+    }
+}
+
+/// The account system knows `account`'s grant: its token, and the refresh token that replaces it.
+fn account_system_knows(served: &Served, account: &str) {
+    let grant = format!("{account}-grant");
+    served
+        .web()
+        .issue_grant_token(&format!("{account}-access-token"), account, &grant, &SCOPES);
+    served
+        .web()
+        .issue_grant_refresh(&format!("{account}-refresh-token"), &grant);
+}
 
 /// A device that carries no sign-in: the account is signed in before the test begins.
 struct NoCarrier;
@@ -100,6 +129,8 @@ struct Signing {
     /// `foreign_chain` is set: a chain the host cannot take beside this organisation's lease.
     other: Organisation,
     foreign_chain: AtomicBool,
+    /// How far behind the host's wall clock the service's runs, in milliseconds.
+    behind_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for Signing {
@@ -117,6 +148,23 @@ impl Signing {
         kr_ipc::now_ms()
             .get()
             .saturating_add_signed(self.moved.load(Ordering::SeqCst))
+            .saturating_sub(self.behind_ms.load(Ordering::SeqCst))
+    }
+
+    /// From now on the service's clock is `by` behind the host's.
+    fn runs_behind(&self, by: Duration) {
+        self.behind_ms.store(
+            u64::try_from(by.as_millis()).expect("a short time"),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The directory has `account` as a member.
+    fn admits(&self, account: &str) {
+        self.members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(account.to_owned());
     }
 
     fn issued(&self) -> Vec<MembershipLease> {
@@ -137,14 +185,6 @@ impl Signing {
     /// From now on the service gives out another organisation's chain as this one's.
     fn gives_a_chain_the_host_cannot_take(&self) {
         self.foreign_chain.store(true, Ordering::SeqCst);
-    }
-
-    /// The directory has the member again.
-    fn takes_back(&self, account: &str) {
-        self.members
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(account.to_owned());
     }
 
     /// The directory removes the member.
@@ -281,20 +321,28 @@ impl HeldWaits {
         );
     }
 
-    /// The oldest wait the device holds has passed, and the device's clock is that much later.
+    /// The oldest wait the device still holds has passed, and the device's clock is that much
+    /// later. A wait whose connection ended is not one the device holds.
     fn passes(&self) {
-        let oldest = self
-            .held
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .1
-            .pop_front();
-        if let Some((waited, oldest)) = oldest {
+        loop {
+            let oldest = self
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .1
+                .pop_front();
+            let Some((waited, oldest)) = oldest else {
+                return;
+            };
+            if oldest.is_closed() {
+                continue;
+            }
             self.now_ms.fetch_add(
                 u64::try_from(waited.as_millis()).expect("a short wait"),
                 Ordering::SeqCst,
             );
             let _ = oldest.send(());
+            return;
         }
     }
 }
@@ -354,9 +402,7 @@ impl Rig {
             Some(format!("127.0.0.1:{port}").parse().expect("an address"));
         let fixture = Fixture::start_on(settings).await;
         let served = serve().await;
-        served
-            .web()
-            .issue_token(TOKEN, ACCOUNT, &["openid", "organisation.lease"]);
+        account_system_knows(&served, ACCOUNT);
         let signing = Arc::new(Signing {
             organisation: Mutex::new(fixture.organisation.clone()),
             moved: Arc::clone(&fixture.moved),
@@ -364,6 +410,7 @@ impl Rig {
             issued: Mutex::default(),
             other: Organisation::new(0x66, kr_ipc::now_ms().get()),
             foreign_chain: AtomicBool::new(false),
+            behind_ms: AtomicU64::new(0),
         });
         served.web().serve_organisation(
             &fixture.organisation.organisation_id.to_string(),
@@ -520,6 +567,17 @@ impl Rig {
             .to_owned()
     }
 
+    /// The person signs out and signs in as `account`, a member the account system knows.
+    async fn signs_in_as(&self, account: &str) {
+        account_system_knows(&self.served, account);
+        self.signing.admits(account);
+        let _ = self.tokens.sign_out().await;
+        self.tokens
+            .keep(grant_of(account), "a-nonce")
+            .await
+            .expect("the person signs in");
+    }
+
     /// The host stops and starts again on its tree, where it was.
     async fn restarted(self) -> Self {
         Self {
@@ -535,29 +593,31 @@ async fn signed_in_phone(
     served: &Served,
     waits: &Arc<HeldWaits>,
 ) -> (Phone, Arc<SignedInAccount>) {
-    let service: Arc<dyn AccountService> = Arc::new(NullService);
+    let origin = kr_protocol::service::GatewayOrigin::new(served.origin()).expect("an origin");
+    let http = HttpService::with(
+        origin.clone(),
+        HttpDeadlines::default(),
+        managed_response_limits(),
+    )
+    .expect("a transport to the account system");
+    let service: Arc<dyn AccountService> = Arc::new(ManagedAccountService::at_origin(
+        served.origin(),
+        Arc::new(http),
+        Client::Mobile,
+    ));
     let tokens = Arc::new(SignedInAccount::new(
         Arc::clone(&service),
         Arc::new(MemoryStore::new()),
         Client::Mobile,
     ));
     tokens
-        .keep(
-            IssuedGrant {
-                access_token: AccountToken::new(TOKEN).expect("a token"),
-                expires_in_seconds: 3600,
-                refresh_token: RefreshToken::new("ada-refresh-token").expect("a token"),
-                scopes: ["openid", "organisation.lease"].map(str::to_owned).to_vec(),
-                subject: ACCOUNT.to_owned(),
-            },
-            "a-nonce",
-        )
+        .keep(grant_of(ACCOUNT), "a-nonce")
         .await
         .expect("the device signs in");
     let account = Arc::new(Account::new(
         Arc::clone(&tokens),
         service,
-        kr_protocol::service::GatewayOrigin::new(served.origin()).expect("an origin"),
+        origin,
         Arc::new(NoCarrier),
         Arc::new(|_| {}),
     ));
@@ -828,8 +888,8 @@ async fn a_stop_that_needs_a_person_is_not_asked_again_by_every_connection() {
 
     // Once the time it is held for has passed, a connection asks again, in case the organisation
     // took the member back.
+    rig.signing.admits(ACCOUNT);
     rig.waits.time_passes(Duration::from_secs(5 * 60 + 1));
-    rig.signing.takes_back(ACCOUNT);
     rig.dials().await.expect("the member is a member again");
     assert!(rig.lease_requests() > requests, "the service was asked");
 }
@@ -978,6 +1038,136 @@ async fn a_second_connection_presents_the_lease_the_device_holds_and_asks_only_w
         .await
         .expect("the host serves the connection under the lease it was given in its place");
     assert!(rig.lease_requests() > requests, "a new lease was asked for");
+}
+
+/// KR-REQ-17.53: the service can turn back a token the device thinks is good, since a token ends in
+/// transit or on a clock that runs behind, and the person has done nothing wrong. The device
+/// replaces the token once and asks again, and goes on keeping the lease without a word to anyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_the_service_turns_back_is_replaced_once_and_the_keeper_goes_on() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let refreshed = rig.served.web().token_refreshes();
+
+    rig.served.web().expire_token(TOKEN);
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.waits.passes();
+    rig.waits.until_asked(2).await;
+
+    assert_eq!(rig.served.web().token_refreshes(), refreshed + 1);
+    assert_eq!(
+        rig.waits.asked_for()[1],
+        Duration::from_secs(300),
+        "the lease was got and the next refresh is five minutes off"
+    );
+    rig.connection(true).await;
+    rig.reads().expect("the host serves the device");
+}
+
+/// KR-REQ-17.53: the lease the device holds, and a stop it remembers, are the account's that asked.
+/// The application keeps one account object, whoever is signed in to it, so a person who signs in
+/// as another member is not served under the lease of the one before, and is not told what the one
+/// before was told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_and_a_stop_belong_to_the_account_that_asked() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+
+    // The first account is removed: its stop is remembered.
+    rig.signing.removes(ACCOUNT);
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.waits.passes();
+    rig.down_because("not a member").await;
+    let removed = rig
+        .dials()
+        .await
+        .expect_err("the removed account is not served");
+    assert!(removed.to_string().contains("not a member"), "{removed}");
+    let requests = rig.lease_requests();
+
+    // Another member signs in. The host has bound this device to the first account, and says so.
+    rig.signs_in_as("bea").await;
+    let other = rig
+        .dials()
+        .await
+        .expect_err("the host binds the device to the first");
+    assert!(
+        other.to_string().contains("account_mismatch"),
+        "the second account was asked about afresh, and the host's rule is named: {other}"
+    );
+    assert_eq!(rig.lease_requests(), requests + 1);
+}
+
+/// KR-REQ-17.53: a delay the service names holds every connection, the application's own refresh
+/// and the ones made beside it, until it is over. A lease the host refuses after a restart is not
+/// asked for in the meantime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_the_service_names_binds_every_connection_until_it_is_over() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+
+    // The refresh is told to wait an hour.
+    rig.refuses_the_next_lease(Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(3600),
+    });
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.waits.passes();
+    rig.waits.until_asked(2).await;
+    let requests = rig.lease_requests();
+
+    // The host restarts and forgets the lease it held; a connection beside the application's needs
+    // a new one, and the service has said when it may be asked.
+    let rig = rig.restarted().await;
+    let told = rig
+        .dials()
+        .await
+        .expect_err("the service asked this device to wait");
+    assert!(told.to_string().contains("wait"), "{told}");
+    assert_eq!(
+        rig.lease_requests(),
+        requests,
+        "nothing was sent before the hour was over"
+    );
+}
+
+/// KR-REQ-17.53: a lease the service has just signed that the host refuses as ended is not a lease
+/// to ask for again at once: the host's clock and the service's differ, and every new lease is
+/// refused the same way. The device tries a few times, says which rule the host named, and sends the
+/// service nothing more for a while, however many connections ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_the_host_refuses_as_ended_the_moment_it_is_signed_is_not_asked_for_again_and_again()
+ {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    rig.signing
+        .runs_behind(Duration::from_millis(30 * MINUTE_MS));
+    let rig = rig.restarted().await;
+    for tried in 2..=3 {
+        rig.waits.until_asked(tried).await;
+        rig.waits.passes();
+    }
+    rig.down_because("expired").await;
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 3,
+        "three leases were asked for, each refused, and the device stopped"
+    );
+
+    let refused = rig.dials().await.expect_err("the host refuses every lease");
+    assert!(refused.to_string().contains("expired"), "{refused}");
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 3,
+        "a stop that is held sends nothing"
+    );
 }
 
 /// The host answers what it is, to a connection that holds a lease.
