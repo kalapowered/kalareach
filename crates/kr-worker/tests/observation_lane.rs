@@ -344,17 +344,37 @@ fn kr_req_24_27_a_component_handed_private_content_on_the_connection_it_register
 
 /// KR-REQ-24.27: the same hand-over, to a binding the lane has no view of yet: the first
 /// connection, and an action accepted in privacy mode that reaches its component's call before the
-/// component is registered. The mark is kept, so the component is asked for no state.
+/// component is registered. The mark is kept, so the component is asked for no state, and none is
+/// held for it while one is held for a component that was handed nothing.
 #[test]
 fn kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked() {
     let lane = ObservationLane::new();
     let binding = BrokerBindingId::new(Uuid::from_bytes([12; 16]));
+    let unmarked = BrokerBindingId::new(Uuid::from_bytes([15; 16]));
+    let held = || Held {
+        package_digest: Digest256::from_bytes([1; 32]),
+        generation: 1,
+        state: b"state".to_vec(),
+    };
     lane.began_connection();
     lane.expose(binding, true);
     lane.set_ready(binding, lane.connection());
+    lane.set_ready(unmarked, lane.connection());
     assert!(
         lane.is_marked(binding),
         "a component handed private content before it was registered was not marked"
+    );
+    lane.hold(binding, held(), lane.privacy_epoch());
+    assert_eq!(
+        lane.held_checkpoints().0,
+        0,
+        "the state of a component that was handed private content before it was registered was held"
+    );
+    lane.hold(unmarked, held(), lane.privacy_epoch());
+    assert_eq!(
+        lane.held_checkpoints().0,
+        1,
+        "the state of a component that was handed nothing was not held"
     );
 }
 
@@ -383,12 +403,30 @@ fn kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on() 
         lane.is_marked(binding),
         "an unbinding dropped the mark of a call that had not yet reached its component"
     );
+    let held = || Held {
+        package_digest: Digest256::from_bytes([1; 32]),
+        generation: 1,
+        state: b"state".to_vec(),
+    };
+    lane.hold(binding, held(), lane.privacy_epoch());
+    assert_eq!(
+        lane.held_checkpoints().0,
+        0,
+        "the state of a component that was handed private content was held after an unbinding"
+    );
 
-    // A later connection's registration holds nothing the earlier one was handed.
+    // A later connection's registration holds nothing the earlier one was handed, so its state is
+    // held again.
     lane.all_not_ready();
     lane.began_connection();
     lane.set_ready(binding, lane.connection());
     assert!(!lane.is_marked(binding));
+    lane.hold(binding, held(), lane.privacy_epoch());
+    assert_eq!(
+        lane.held_checkpoints().0,
+        1,
+        "the state of a component registered afresh was not held"
+    );
 
     // The cleanup of bindings no longer wanted drops the marks of an earlier connection.
     lane.expose(other, true);
