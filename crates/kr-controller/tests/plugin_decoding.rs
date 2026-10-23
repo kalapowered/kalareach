@@ -319,8 +319,7 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     let lane = world.broker().observation();
     world.send(&request(31));
     approved(&world, "31").await;
-    let view = lane.view(binding(1)).expect("the component has a view");
-    assert!(!view.private_content, "{view:?}");
+    assert!(!lane.is_marked(binding(1)));
 
     let queue = world.broker().decode_queue();
     let hold = queue.hold();
@@ -339,10 +338,9 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     hold.release();
 
     approved(&world, "32").await;
-    let view = lane.view(binding(1)).expect("the component has a view");
     assert!(
-        view.private_content,
-        "the component was handed a request made in privacy mode and its view is not marked: {view:?}"
+        lane.is_marked(binding(1)),
+        "the component was handed a request made in privacy mode and is not marked"
     );
 }
 

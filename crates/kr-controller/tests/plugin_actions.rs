@@ -1097,12 +1097,7 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
         "outside privacy mode the refusal carries the component's words: {}",
         control.message
     );
-    assert!(
-        !lane
-            .view(binding())
-            .expect("the component has a view")
-            .private_content
-    );
+    assert!(!lane.is_marked(binding()));
     // A plan for another action is refused in words that name the action the component chose.
     let other = refused(&acting, &mut client, "cancel.other.action").await;
     assert!(
@@ -1125,9 +1120,7 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
     );
     assert!(private.message.contains("withheld"), "{}", private.message);
     assert!(
-        lane.view(binding())
-            .expect("the component has a view")
-            .private_content,
+        lane.is_marked(binding()),
         "the component was handed arguments in privacy mode and is not marked"
     );
 

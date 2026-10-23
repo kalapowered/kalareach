@@ -640,8 +640,10 @@ again until it starts again, since what it holds may be what it was handed. An o
 arguments of an action and a request to decode all mark it. A component holds only what it was
 handed on the connection it is registered on. A mark made on the connection a component is
 registered on stays when the component becomes ready, whichever of them made it and whether it was
-made before the component was registered or while it was; a mark made on an earlier connection
-goes, because a component registered afresh holds nothing its predecessor was handed.
+made before the component was registered or while it was, and when the binding is unbound and
+registered again on that connection, since a call that was started before can reach the new
+registration; a mark made on an earlier connection goes, because a component registered afresh holds
+nothing its predecessor was handed.
 
 The runtime's words in a fault, and in the reason a component is disabled for, are withheld from the
 report once privacy mode has been on at any time since the worker made the connection to the runtime

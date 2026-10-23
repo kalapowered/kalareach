@@ -16,7 +16,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.38 | `kr_req_11_38_what_the_lane_lost_comes_with_the_entry_and_is_older_than_it`, `kr_req_11_38_a_loss_goes_with_the_first_entry_newer_than_it` |
-//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it`, `kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on`, `kr_req_24_27_a_component_handed_private_content_on_the_connection_it_registers_on_stays_marked`, `kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked` |
+//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it`, `kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on`, `kr_req_24_27_a_component_handed_private_content_on_the_connection_it_registers_on_stays_marked`, `kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked`, `kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on` |
 
 use std::sync::Arc;
 
@@ -221,10 +221,7 @@ fn kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_af
     assert_eq!(lane.held_checkpoints().0, 1);
     lane.expose(binding, true);
     lane.hold(binding, held(b"exposed"), lane.privacy_epoch());
-    assert_eq!(
-        lane.view(binding).map(|view| view.private_content),
-        Some(true)
-    );
+    assert!(lane.is_marked(binding));
     assert_eq!(
         lane.held_checkpoints().0,
         1,
@@ -300,7 +297,7 @@ fn kr_req_24_27_a_component_handed_private_content_on_the_connection_it_register
 {
     let lane = ObservationLane::new();
     let binding = BrokerBindingId::new(Uuid::from_bytes([11; 16]));
-    let marked = |lane: &ObservationLane| lane.view(binding).map(|view| view.private_content);
+    let marked = |lane: &ObservationLane| Some(lane.is_marked(binding));
 
     // A first registration, and a component handed something made in privacy mode.
     lane.began_connection();
@@ -355,9 +352,47 @@ fn kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked()
     lane.began_connection();
     lane.expose(binding, true);
     lane.set_ready(binding, lane.connection());
-    assert_eq!(
-        lane.view(binding).map(|view| view.private_content),
-        Some(true),
+    assert!(
+        lane.is_marked(binding),
         "a component handed private content before it was registered was not marked"
     );
+}
+
+/// KR-REQ-24.27: a mark belongs to the binding and the connection, not to a view. A call that took
+/// the connection and marked the component, and was delayed, can reach a registration that is made
+/// after the binding was unbound and bound again on the same connection (a revocation that was
+/// lifted): the mark is still there. It goes when the component is registered on a later
+/// connection, and the link's cleanup of bindings it no longer wants drops the marks of an earlier
+/// connection and keeps those of this one.
+#[test]
+fn kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on() {
+    let lane = ObservationLane::new();
+    let binding = BrokerBindingId::new(Uuid::from_bytes([13; 16]));
+    let other = BrokerBindingId::new(Uuid::from_bytes([14; 16]));
+
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    // A call accepted in privacy mode took the connection and marked the component; it is delayed.
+    lane.expose(binding, true);
+    // The binding is revoked: the link unbinds it, and nothing wants it.
+    lane.forget(binding);
+    lane.forget_unwanted(&std::collections::BTreeSet::new());
+    // The revocation is lifted and the same binding is registered again on the same connection.
+    lane.set_ready(binding, lane.connection());
+    assert!(
+        lane.is_marked(binding),
+        "an unbinding dropped the mark of a call that had not yet reached its component"
+    );
+
+    // A later connection's registration holds nothing the earlier one was handed.
+    lane.all_not_ready();
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
+    assert!(!lane.is_marked(binding));
+
+    // The cleanup of bindings no longer wanted drops the marks of an earlier connection.
+    lane.expose(other, true);
+    lane.began_connection();
+    lane.forget_unwanted(&std::collections::BTreeSet::new());
+    assert!(!lane.is_marked(other));
 }

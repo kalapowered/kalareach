@@ -306,11 +306,6 @@ pub struct View {
     pub last_checkpoint_attempt: Option<Instant>,
     /// What the component last missed, in the words a person is told.
     pub loss_note: Option<String>,
-    /// Whether the component was offered something made while privacy mode was on, so that its
-    /// state may hold it. None is taken from it until it starts again.
-    pub private_content: bool,
-    /// The connection to the plugin runtime that was the link's when the latest mark was made.
-    pub marked_connection: u64,
     /// The first entry the binding may be offered: those pushed before it was made ready are older
     /// than its view.
     pub ready_from: u64,
@@ -366,6 +361,12 @@ struct Inner {
     /// How many connections to the plugin runtime the link has made: the one it holds now is this
     /// one. A component is registered on a connection and holds only what it was handed on it.
     connection: u64,
+    /// The bindings whose component was handed something made in privacy mode, or while it stood,
+    /// and the connection it was handed on. None is taken from such a component until it starts
+    /// again. A mark belongs to the binding and the connection and not to a view: a binding that is
+    /// unbound and registered again on the same connection can be reached by a call that was
+    /// started before it was unbound, and that call finds the mark.
+    marks: BTreeMap<BrokerBindingId, u64>,
 }
 
 impl Inner {
@@ -698,12 +699,18 @@ impl ObservationLane {
     pub fn set_ready(&self, binding: BrokerBindingId, connection: u64) {
         let mut inner = self.inner();
         let next = inner.next_seq;
+        // A component registered afresh on a later connection holds nothing it was handed on an
+        // earlier one.
+        if inner
+            .marks
+            .get(&binding)
+            .is_some_and(|made| *made < connection)
+        {
+            inner.marks.remove(&binding);
+        }
         let view = inner.views.entry(binding).or_default();
         view.ready = true;
         view.silent_until = None;
-        if view.marked_connection < connection {
-            view.private_content = false;
-        }
         view.silence = None;
         view.snapshot_retry = None;
         view.ready_from = next;
@@ -728,7 +735,8 @@ impl ObservationLane {
         }
     }
 
-    /// Forgets a binding: its view, and the state held for it.
+    /// Forgets a binding: its view, and the state held for it. Its mark stays: see
+    /// [`Self::forget_unwanted`].
     pub fn forget(&self, binding: BrokerBindingId) {
         let mut inner = self.inner();
         inner.views.remove(&binding);
@@ -737,8 +745,15 @@ impl ObservationLane {
 
     /// Forgets the view and the held state of every binding that is not in `wanted`: a binding that
     /// ended while the plugin runtime was lost is not unbound by anything else.
+    ///
+    /// A mark made on an earlier connection of a binding that is not wanted goes with it. One made
+    /// on this connection stays, for the binding may be registered again on it.
     pub fn forget_unwanted(&self, wanted: &std::collections::BTreeSet<BrokerBindingId>) {
         let mut inner = self.inner();
+        let connection = inner.connection;
+        inner
+            .marks
+            .retain(|binding, made| wanted.contains(binding) || *made >= connection);
         let gone: Vec<BrokerBindingId> = inner
             .views
             .keys()
@@ -888,9 +903,14 @@ impl ObservationLane {
         let mut inner = self.inner();
         inner.words_tainted = true;
         let connection = inner.connection;
-        let view = inner.views.entry(binding).or_default();
-        view.private_content = true;
-        view.marked_connection = connection;
+        inner.marks.insert(binding, connection);
+    }
+
+    /// Returns true when the binding's component was handed something made in privacy mode, or while
+    /// it stood, on the connection it is registered on.
+    #[must_use]
+    pub fn is_marked(&self, binding: BrokerBindingId) -> bool {
+        self.inner().marks.contains_key(&binding)
     }
 
     // -- checkpoints --------------------------------------------------------------------------
@@ -903,11 +923,12 @@ impl ObservationLane {
         if self.is_private() {
             return Vec::new();
         }
-        self.inner()
+        let inner = self.inner();
+        inner
             .views
             .iter()
             .filter(|(_, view)| view.ready && view.offered_since_checkpoint > 0)
-            .filter(|(_, view)| !view.private_content)
+            .filter(|(binding, _)| !inner.marks.contains_key(binding))
             .filter(|(_, view)| {
                 let quiet = view
                     .last_offer
@@ -928,12 +949,13 @@ impl ObservationLane {
         if self.is_private() {
             return None;
         }
-        self.inner()
+        let inner = self.inner();
+        inner
             .views
-            .values()
-            .filter(|view| view.ready && view.offered_since_checkpoint > 0)
-            .filter(|view| !view.private_content)
-            .map(|view| {
+            .iter()
+            .filter(|(_, view)| view.ready && view.offered_since_checkpoint > 0)
+            .filter(|(binding, _)| !inner.marks.contains_key(binding))
+            .map(|(_, view)| {
                 let quiet_at = view.last_offer.map(|at| at + QUIET_BEFORE_CHECKPOINT);
                 let old_at = view.last_checkpoint_attempt.map(|at| at + CHECKPOINT_EVERY);
                 let due = match (quiet_at, old_at) {
@@ -975,10 +997,8 @@ impl ObservationLane {
         // Read under the lock the fence takes, so that a fence is either before this or after it.
         if self.is_private()
             || self.privacy_epoch() != epoch
-            || inner
-                .views
-                .get(&binding)
-                .is_none_or(|view| view.private_content)
+            || inner.marks.contains_key(&binding)
+            || !inner.views.contains_key(&binding)
         {
             return;
         }
