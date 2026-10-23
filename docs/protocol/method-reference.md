@@ -36,7 +36,7 @@ Both calls are served by the daemon's catalogue module. [The plugin catalogue](.
 
 ## Reading sessions
 
-**`session.list`** takes an optional environment, where no environment lists every one the caller may see, and `include_closed`. It answers the sessions in display-number order, each as a session summary. A closed session is listed only when the request asks for closed ones. The daemon lists every unclosed session from its registry; a session whose worker cannot answer is listed from the registry's own row as `live`, `creating` or `closing` ([Closure](../host/README.md#closure)).
+**`session.list`** takes an optional environment and `include_closed`. This build parses the environment and does not use it: the daemon serves one environment, and a request that names another still lists this one's sessions that the caller may see. It answers the sessions in display-number order, each as a session summary. A closed session is listed only when the request asks for closed ones. The daemon lists every unclosed session from its registry; a session whose worker cannot answer is listed from the registry's own row as `live`, `creating` or `closing` ([Closure](../host/README.md#closure)).
 
 **`session.read`** takes a session identifier and answers the session's summary together with the endpoint a local client can attach to while the session runs. It also gives three members that are each null where the host does not say, and null is not the same as none or zero. The launch profile is null for a session that has closed and for a worker of a build that reported none; a live session otherwise has one. The most recent command block the session's private hooks reported is null where no hook has reported one, which is every session without a managed root integration, where the caller's grant does not reach it, and for a worker of a build that reported none. The number of `shell.launch` confirmations still waiting on the session's reader is null for a session with no managed root editor, for one that has closed and for a worker of a build that reported no count; zero is a session that could have one and has none. The worker's own answer, on its endpoint, also carries the metrics the worker has counted, left out when it has counted nothing. The daemon's answer to `session.read` carries none. A worker that has finished closing stops answering a moment before its process ends. A read that meets it then is answered from what the daemon holds, with no endpoint and none of the session's content, or is refused with `RESOURCE_UNAVAILABLE` where the daemon holds no word of an end.
 
@@ -80,7 +80,7 @@ Each of the five mutations names the binding revision it was prepared against, i
 
 ## Alerts
 
-**`alert.create`** raises one alert in a session. An alert reports and asks for nothing. The call is private IPC, made by the contact tool `send_notification` under the caller token of the agent's own verified application, and the worker serves it. It takes the session, a de-duplication identifier of 1 to 256 bytes, the text, of 1 byte to 2 KiB, a severity of `info`, `warning` or `error`, an optional label the caller gives itself, which is unverified and 1 to 128 bytes when present, and an optional link into this host's own session. The alert records the verified source beside the label. The answer is the alert, with its source, severity, link and when it was raised, and `deduplicated`, which is true when an exact repeat returned the existing alert and raised none. [The four tools](../contact/README.md#the-four-tools) describes the contact tools.
+**`alert.create`** raises one alert in a session. An alert reports and asks for nothing. The call is private IPC, made by the contact tool `send_notification` over a connection bound to the agent's own verified application, and the worker serves it. It takes the session, a de-duplication identifier of 1 to 256 bytes, the text, of 1 byte to 2 KiB, a severity of `info`, `warning` or `error`, an optional label the caller gives itself, which is unverified and 1 to 128 bytes when present, and an optional link into this host's own session. The alert records the verified source beside the label. The answer is the alert, with its source, severity, link and when it was raised, and `deduplicated`, which is true when an exact repeat returned the existing alert and raised none. A `dedup_id` that is reused with different content is refused with `ID_CONFLICT`. [The four tools](../contact/README.md#the-four-tools) describes the contact tools.
 
 ## Reading review state
 
@@ -112,7 +112,7 @@ How the daemon routes the other three reads for a paired device, and the history
 
 ## The managed service's methods
 
-Fourteen methods are answered by the managed service and by no program of this build. The host and the clients call them through the service clients in `crates/kr-client/src/services`. Every one is signed under the service credential ([The service credential](README.md#the-service-credential)), and the eight storage methods also carry the account token. The service is in the web repository.
+The Services group has eighteen methods, which the managed service answers and no program of this build does. Four are the push methods that [Push objects](README.md#push-objects) describes. The other fourteen are described here. The host and the clients call them through the service clients in `crates/kr-client/src/services`. Every one is signed under the service credential ([The service credential](README.md#the-service-credential)), and the eight storage methods also carry the account token. The service is in the web repository.
 
 ### The mailbox
 
@@ -133,7 +133,7 @@ A mailbox holds notifications, state references, action receipts, settings and d
 - `acknowledge` acknowledges one published request with the revision the host issued for it.
 - `reject` retires a record the host will not apply, with a reason: no owner authority, an unknown target, or a later request that covers it.
 - `delegate` names the keys, at most eight, that may remove the host when the host cannot.
-- `read` returns a host's feed from a position, 64 records at a time, or only its summary.
+- `read` returns a host's feed from a position, 64 records at a time, or only its summary. The host reads its whole feed. Another signer, such as an owner's device, reads only the records it published itself, and the summary.
 - `remove` removes the host, which ends the retention of everything addressed to it.
 
 Issuing a revision, acknowledging, refusing a record and naming the removal keys are the host's own, so the client refuses them under an installation credential before anything is sent. Publishing and reading need no host key, and a removal may be asked by the host or by a key the host named. A record has no expiry and is never coalesced. The service keeps it until the host acknowledges it as complete, refuses it, or is removed. An acknowledgement that reports the dispatch barrier as pending is progress, and the record stays outstanding. [The remote authority feed](../host/README.md#the-remote-authority-feed) describes the host's side.
@@ -159,9 +159,9 @@ Backup storage belongs to an account, not to the key that asks. Every storage re
 
 The answers below are the service's own and are not protocol objects, so timestamps in them are ISO 8601 strings and a byte count is a decimal string.
 
-**`storage.status`** reports the managed storage the caller's account holds.
+**`storage.status`** reports the managed storage the caller's account holds. It takes the installation and answers the principal, whether backup storage is on, the retention revision and the retention in force, the bytes and objects stored, the tombstoned ones and when the next is purged, the uploads in progress, the allowance if there is one and the service's limits (parts, read size, upload lifetime, uploads outstanding).
 
-**`storage.retention.set`** turns backup storage on or off and, when given, sets how many daily snapshots the account keeps. It is decided against the retention revision the caller last saw. A change decided against a revision the record has left changes nothing, and the refusal carries the retention as it stands.
+**`storage.retention.set`** turns backup storage on or off and, when given, sets how many daily snapshots the account keeps. It is decided against the retention revision the caller last saw. A change decided against a revision the record has left changes nothing, and the refusal carries the retention as it stands. A change that is made answers `set`, or `unchanged` when the record already held what was asked, with whether backup storage is on, the retention and the new revision.
 
 **`storage.upload.create`** reserves the declared maximum against the allowance and allocates an object key, an upload identity and an immutable part table, before any content is accepted. It takes the archive, the object, the backup generation, the declared maximum, the total size and the hash of the encrypted object. It answers with the upload identity, the bytes reserved, when the upload expires and the part table: the total, the part size, the number of parts and the length of the last. The client holds the table to its own arithmetic and refuses one whose total and part size do not give that count and last length.
 
