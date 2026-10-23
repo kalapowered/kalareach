@@ -3301,6 +3301,15 @@ async fn the_local_owner_cancels_another_actors_intent_and_a_device_does_not() {
 // KR-PERF-002, KR-REQ-10.45: the input path and the authority that fences it.
 // ---------------------------------------------------------------------------------------------
 
+/// Tells a watchdog thread to end when the case that started it ends, by any way out of it.
+struct WatchdogEnds(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WatchdogEnds {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// An application that reads nothing until a named pipe is written to, and keeps all it reads in a
 /// file.
 ///
@@ -3470,6 +3479,9 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
     // case fails naming the wait instead of waiting with it; it says so when it did, and the case
     // asserts it did not.
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whatever way the case ends, a panic before the fence stops included, the watchdog ends with
+    // it and gives up its hold on the fence, which a held fence needs for the runtime to shut down.
+    let _watchdog_ends = WatchdogEnds(Arc::clone(&done));
     let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let let_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog = {
@@ -3529,7 +3541,8 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
             accepted += written.forwarded_bytes.get() + written.held_prefix_bytes.get();
         }
         done.store(true, Ordering::Release);
-        release.send(()).expect("lets the fence go on");
+        // The watchdog may have let the fence go first, which the assertion below names.
+        let _ = release.send(());
         accepted
     };
     let (revised, accepted) = tokio::join!(revising, typing);
