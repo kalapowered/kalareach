@@ -1211,7 +1211,7 @@ pub struct Dispatch {
 ///
 /// The broker holds the dispatch this belongs to, so it holds the broker weakly.
 #[derive(Clone, Debug)]
-struct Counted {
+pub(super) struct Counted {
     broker: std::sync::Weak<Broker>,
     adapter: Adapter,
 }
@@ -1219,15 +1219,30 @@ struct Counted {
 impl Counted {
     /// The adapter a connection's package is, where it is one the product bundles.
     fn of(broker: &Arc<Broker>, connection: &crate::broker::gateway::Connection) -> Option<Self> {
-        Adapter::of_package(connection.table.plugin_id.as_str()).map(|adapter| Self {
+        Self::of_package(broker, connection.table.plugin_id.as_str())
+    }
+
+    /// The adapter a package is, as `publisher/plugin`, where it is one the product bundles.
+    pub(super) fn of_package(broker: &Arc<Broker>, package: &str) -> Option<Self> {
+        Adapter::of_package(package).map(|adapter| Self {
             broker: Arc::downgrade(broker),
             adapter,
         })
     }
 
-    fn failed(&self, outcome: MetricOutcome) {
+    pub(super) fn failed(&self, outcome: MetricOutcome) {
         if let Some(broker) = self.broker.upgrade() {
             broker.adapter_failed(self.adapter, outcome);
+        }
+    }
+
+    /// Counts a refusal that says the adapter's connection could not carry a frame the host sent.
+    ///
+    /// Only that refusal counts: one that says the frame itself was invalid shows nothing of the
+    /// adapter.
+    pub(super) fn refused(&self, refusal: &BrokerError) {
+        if matches!(refusal, BrokerError::UpstreamUnavailable { .. }) {
+            self.failed(MetricOutcome::Unavailable);
         }
     }
 }
@@ -1238,7 +1253,7 @@ impl Counted {
 /// What the worker waits for is bounded by its own deadline, and a caller that stops waiting drops
 /// what it was given. The wait for the upstream's answer and the count of an adapter that did not
 /// give one belong to the operation and not to its caller, so neither is lost with it.
-fn detached(
+pub(super) fn detached(
     work: impl std::future::Future<Output = Result<UpstreamOutcome>> + Send + 'static,
 ) -> PendingTransmission {
     match tokio::runtime::Handle::try_current() {
@@ -1467,11 +1482,24 @@ impl Dispatch {
                 self.connection
             )));
         }
-        let queued = self.upstream.queue(response.frame())?;
+        let queued = self
+            .upstream
+            .queue(response.frame())
+            .inspect_err(|refusal| {
+                if let Some(counted) = &self.counted {
+                    counted.refused(refusal);
+                }
+            })?;
         let upstream_request_id = response.upstream_request_id().clone();
         let turn_id = request.turn_id.clone();
-        Ok(PendingTransmission::carried(async move {
+        let counted = self.counted.clone();
+        // On a task of its own, as a request is: what the writer says of the answer is counted
+        // whether or not the caller is still waiting for it.
+        Ok(detached(async move {
             if let Some(refusal) = queued.delivered().await.refusal() {
+                if let Some(counted) = &counted {
+                    counted.refused(&refusal);
+                }
                 return Err(refusal);
             }
             Ok(UpstreamOutcome {

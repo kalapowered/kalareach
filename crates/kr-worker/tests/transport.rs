@@ -19,6 +19,7 @@ use kr_protocol::ids::{
     ActorId, ApplicationInstanceId, BrokerBindingId, EnvironmentId, GatewayConnectionId,
     MethodTableVersion, PluginId, PublisherId, SessionId, UpstreamMethod,
 };
+use kr_protocol::metrics::{Adapter, MetricOutcome};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::BoundEndpoint;
@@ -76,7 +77,7 @@ fn managed_for(application_instance_id: ApplicationInstanceId) -> ManagedProcess
 
 fn trust() -> DecodingTrust {
     DecodingTrust {
-        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        plugin_id: package(),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         package_digest: Digest256::from_bytes([5; 32]),
         // The reverse write is covered too, so a component that tries to interpret one is refused
@@ -118,14 +119,16 @@ fn target() -> kr_protocol::agent::AgentMutationTarget {
     }
 }
 
+/// The package the suite's connection speaks for: one the product bundles, so that what is counted
+/// of its failures is counted under its name.
 fn package() -> PluginId {
-    PluginId::new("kalareach.codex").expect("valid")
+    PluginId::new("kalareach/codex").expect("valid")
 }
 
 /// The installed package this suite's tables are pinned with and its bindings run.
 fn installed() -> kr_worker::broker::PackageIdentity {
     kr_worker::broker::PackageIdentity {
-        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        plugin_id: package(),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         package_digest: Digest256::from_bytes([5; 32]),
     }
@@ -133,7 +136,7 @@ fn installed() -> kr_worker::broker::PackageIdentity {
 
 fn table() -> DeclarativeTable {
     let mut table = DeclarativeTable {
-        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        plugin_id: package(),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         table_version: MethodTableVersion::new(1),
         upstream_protocol_version: "1".to_owned(),
@@ -366,11 +369,7 @@ fn pin_spelling(
         .pin_table(application_instance_id, installed(), table(), rich)
         .expect("the installed tables are pinned");
     broker
-        .pin_reading(
-            application_instance_id,
-            &PluginId::new("kalareach.codex").expect("valid"),
-            reading,
-        )
+        .pin_reading(application_instance_id, &package(), reading)
         .expect("what the connector spells is pinned");
 }
 
@@ -383,7 +382,7 @@ fn prepare_broker(broker: &Arc<Broker>, rich: RichMethodTable) -> GatewayConnect
         .bind_descriptor(
             binding(),
             instance(),
-            PluginId::new("kalareach.codex").expect("valid"),
+            package(),
             PublisherId::new("kalareach").expect("valid"),
             Digest256::from_bytes([5; 32]),
             BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
@@ -8590,4 +8589,158 @@ async fn kr_req_11_37_reconciliation_waits_for_answers_in_flight_and_not_for_an_
     other.owner.shutdown();
     let _ = tokio::time::timeout(LIVENESS_DEADLINE, drained).await;
     let _ = tokio::time::timeout(LIVENESS_DEADLINE, other.drained).await;
+}
+
+/// What the broker has counted of its adapters' failures, as adapter, outcome and count.
+fn adapter_failures(broker: &Broker) -> Vec<(Adapter, MetricOutcome, u64)> {
+    broker
+        .metrics()
+        .adapter_failure
+        .iter()
+        .map(|series| (series.adapter, series.outcome, series.count.get()))
+        .collect()
+}
+
+/// A permission the upstream asked for and a component interpreted, whose one decision is
+/// `decision` long, with the owner's transport the one that carries the answer. A long decision
+/// makes a long answer, which a small pipe does not take whole.
+async fn permission_to_answer(
+    broker: &Arc<Broker>,
+    owner: &Arc<Duplex>,
+    decision: &str,
+) -> kr_protocol::ids::PendingResourceId {
+    let resource_id = upstream_asks(owner, 11).await;
+    broker
+        .interpret(
+            binding(),
+            resource_id,
+            DecodedProjection {
+                schema_version: "kr-approval/1".to_owned(),
+                summary: "the agent wants to write a file".to_owned(),
+                decisions: vec![OfferedDecision {
+                    option_id: decision.to_owned(),
+                    label: "Allow".to_owned(),
+                }],
+            },
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the interpretation is accepted");
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        owner.dispatch().expect("the connection carries operations"),
+    );
+    resource_id
+}
+
+/// The answer to `resource_id` choosing `decision`, as the person's device sends it.
+fn answer_choosing(
+    resource_id: kr_protocol::ids::PendingResourceId,
+    decision: &str,
+) -> kr_protocol::agent::AgentApprovalRespondParams {
+    kr_protocol::agent::AgentApprovalRespondParams {
+        option_id: decision.to_owned(),
+        ..respond_to(resource_id)
+    }
+}
+
+/// KR-REQ-26.43: an answer the connection's byte queue refuses, while the connection is still
+/// taking frames, is one failure of its adapter, counted as unavailable.
+#[tokio::test(start_paused = true)]
+async fn kr_req_26_43_an_answer_the_byte_queue_refuses_is_an_unavailable_adapter() {
+    let broker = broker();
+    // An upstream pipe that takes almost nothing, so what is queued for it stays queued.
+    let (owner, _upstream, _client, writes) = duplex_over_sized_pipes(&broker, 64, 1 << 20);
+    tokio::spawn(writes);
+    let decision = "x".repeat(kr_protocol::broker::MAX_DECISION_TEXT_LEN);
+    let resource_id = permission_to_answer(&broker, &owner, &decision).await;
+
+    // The queue is filled with smaller and smaller frames, until less room is left than the answer
+    // needs and the connection has not stopped taking frames.
+    let mut first = 0;
+    for padding in [64 * 1024, 2048, 64, 0] {
+        let (_, refused, _) = fill_byte_queue(&owner, &"x".repeat(padding), first).await;
+        first = refused.saturating_add(1);
+    }
+    assert!(
+        !owner.stopping(),
+        "a full queue is not a stopped connection"
+    );
+    assert_eq!(adapter_failures(&broker), vec![], "nothing has failed yet");
+
+    let admitted = broker
+        .admit_approval(
+            &device(),
+            &answer_choosing(resource_id, &decision),
+            TimestampMs::new(4),
+        )
+        .expect("the answer is admitted while the connection takes frames");
+    let marked = broker
+        .mark_approval(&admitted, TimestampMs::new(4))
+        .expect("the answer's marker is written");
+    let (dispatch, request) = marked.transmission();
+    let refusal = dispatch
+        .submit(&request)
+        .expect_err("the byte queue has no room for the answer");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    let _ = marked.refused(refusal);
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)]
+    );
+}
+
+/// Hands an answer to a connection whose upstream pipe holds `pipe` bytes and nobody reads, drops
+/// what the caller waits on at once, lets the writer's deadline pass, and returns what was counted.
+async fn counted_after_the_caller_gives_up(pipe: usize) -> Vec<(Adapter, MetricOutcome, u64)> {
+    let broker = broker();
+    let (owner, _upstream, _client, writes) = duplex_over_sized_pipes(&broker, pipe, 1 << 20);
+    tokio::spawn(writes);
+    let decision = "x".repeat(kr_protocol::broker::MAX_DECISION_TEXT_LEN);
+    let resource_id = permission_to_answer(&broker, &owner, &decision).await;
+    let admitted = broker
+        .admit_approval(
+            &device(),
+            &answer_choosing(resource_id, &decision),
+            TimestampMs::new(4),
+        )
+        .expect("the answer is admitted");
+    let marked = broker
+        .mark_approval(&admitted, TimestampMs::new(4))
+        .expect("the answer's marker is written");
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch
+        .submit(&request)
+        .expect("the queue takes the answer");
+    // The caller stops waiting for what became of it, before the writer has said.
+    drop(pending);
+    drop(marked);
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![],
+        "the caller giving up counts nothing"
+    );
+    // Time passes on the paused clock until the writer's own deadline has run.
+    tokio::time::sleep(kr_worker::broker::WRITE_DEADLINE * 2).await;
+    adapter_failures(&broker)
+}
+
+/// KR-REQ-26.43: an answer the connection accepted and could not write is one failure of its
+/// adapter, counted when the writer says it did not go, though the caller that handed it over has
+/// stopped waiting. The control is an answer that was written, whose caller stopped waiting too.
+#[tokio::test(start_paused = true)]
+async fn kr_req_26_43_an_answer_that_was_not_written_is_counted_though_its_caller_gave_up() {
+    assert_eq!(
+        counted_after_the_caller_gives_up(64).await,
+        vec![(Adapter::Codex, MetricOutcome::Unavailable, 1)],
+        "the pipe held a part of the answer and the rest did not go"
+    );
+    assert_eq!(
+        counted_after_the_caller_gives_up(1 << 20).await,
+        vec![],
+        "an answer that went counts nothing, whoever waited for it"
+    );
 }

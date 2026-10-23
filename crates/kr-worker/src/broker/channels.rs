@@ -43,6 +43,7 @@ use crate::broker::bridge::{
     AdmittedBridge, BRIDGE_FRAME_DEADLINE, BridgeProcess, BridgeReader, BridgeSurface, BridgeWriter,
 };
 use crate::broker::connectors::{DECISION_SCHEMA, InstalledConnector};
+use crate::broker::duplex::{Counted, detached};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::ChannelConnection;
 use crate::broker::methods::{
@@ -147,6 +148,7 @@ pub async fn serve(
     let channel = Arc::new(ChannelDispatch {
         connection,
         queue: Mutex::new(Some(queue)),
+        counted: Counted::of_package(&broker, launch.connector.plugin_id().as_str()),
     });
     let carrying: Arc<dyn UpstreamDispatch> = channel.clone();
     // The channel's own transport, for the answers to what it relayed, and the instance's, so a
@@ -289,6 +291,8 @@ pub struct ChannelDispatch {
     connection: GatewayConnectionId,
     /// The writer's queue, until the channel is shut.
     queue: Mutex<Option<tokio::sync::mpsc::Sender<Outgoing>>>,
+    /// Where the failures of the channel's adapter are counted, when its package is a bundled one.
+    counted: Option<Counted>,
 }
 
 impl ChannelDispatch {
@@ -360,13 +364,21 @@ impl UpstreamDispatch for ChannelDispatch {
                 "only an answer is carried on a channel",
             ));
         };
+        let count = |refusal: BrokerError| {
+            if let Some(counted) = &self.counted {
+                counted.refused(&refusal);
+            }
+            refusal
+        };
         let queue = self
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .ok_or_else(|| BrokerError::UpstreamUnavailable {
-                detail: "the channel has closed".to_owned(),
+            .ok_or_else(|| {
+                count(BrokerError::UpstreamUnavailable {
+                    detail: "the channel has closed".to_owned(),
+                })
             })?;
         let (written, outcome) = tokio::sync::oneshot::channel();
         queue
@@ -374,23 +386,34 @@ impl UpstreamDispatch for ChannelDispatch {
                 frame: response.frame().to_vec(),
                 written,
             })
-            .map_err(|_| BrokerError::UpstreamUnavailable {
-                detail: "the channel's writer has closed or holds as many answers as it takes"
-                    .to_owned(),
+            .map_err(|_| {
+                count(BrokerError::UpstreamUnavailable {
+                    detail: "the channel's writer has closed or holds as many answers as it takes"
+                        .to_owned(),
+                })
             })?;
         let upstream_request_id = upstream_request_id.clone();
-        Ok(PendingTransmission::carried(async move {
-            match outcome.await {
-                Ok(Ok(())) => Ok(UpstreamOutcome {
-                    upstream_request_id: Some(upstream_request_id),
-                    turn_id: None,
-                    provenance: ActionProvenance::UpstreamTypedRpc,
-                }),
-                Ok(Err(error)) => Err(error),
-                Err(_) => Err(BrokerError::UpstreamUnavailable {
+        let counted = self.counted.clone();
+        // On a task of its own: the writer's verdict on the answer is counted whether or not the
+        // caller is still waiting for it.
+        Ok(detached(async move {
+            let refusal = match outcome.await {
+                Ok(Ok(())) => {
+                    return Ok(UpstreamOutcome {
+                        upstream_request_id: Some(upstream_request_id),
+                        turn_id: None,
+                        provenance: ActionProvenance::UpstreamTypedRpc,
+                    });
+                }
+                Ok(Err(error)) => error,
+                Err(_) => BrokerError::UpstreamUnavailable {
                     detail: "the channel closed before the answer was written".to_owned(),
-                }),
+                },
+            };
+            if let Some(counted) = &counted {
+                counted.refused(&refusal);
             }
+            Err(refusal)
         }))
     }
 }
@@ -785,6 +808,7 @@ mod tests {
         let channel = ChannelDispatch {
             connection: GatewayConnectionId::new(7),
             queue: Mutex::new(Some(queue)),
+            counted: None,
         };
         let refused = [
             (
