@@ -297,8 +297,8 @@ async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else()
 /// stand in. For enlarging a grant, trusting a repository root and granting an executable
 /// capability, which this case spends on the owner ledger by hand, the ledger spends only a
 /// confirmation that names the action's exact digest and rights. The methods that perform them
-/// (`catalogue.add` for a root, `plugin.grant` for an executable capability, a location's
-/// enlargement for a grant) have cases of their own.
+/// (`catalogue.add` for a root, `plugin.install` and `plugin.grant` for an executable capability,
+/// a location's enlargement for a grant) have cases of their own.
 /// KR-REQ-23.47, the part about the confirmation's digest: each confirmation names one action
 /// digest with its destination and rights, and one that names others does not stand in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
