@@ -414,11 +414,11 @@ enum Interruption {
 /// interruption in the middle of the `at`th question the harness asks about it, and says what the
 /// harness did, whether the interruption happened and how many questions it asked.
 ///
-/// The harness asks whether the host needs killing, which sees an ended host as the kernel
-/// describes it before its parent collects it, and then whether it has ended, until the kernel
-/// says so once. The second question is the one a parent that collects its children, or a kernel
-/// that will not answer, interrupts after the kernel has described the host and before it says
-/// whether it still runs.
+/// The harness stops the host by the identity it was started under, which asks the kernel who holds
+/// its number and not whether it runs, and then asks whether it has ended, until the kernel says so
+/// once. Each of those questions is one a parent that collects its children, or a kernel that will
+/// not answer, interrupts after the kernel has described the host and before it says whether it
+/// still runs.
 #[cfg(target_os = "linux")]
 fn end_an_exited_host(interruption: Interruption, at: u32) -> (std::thread::Result<()>, bool, u32) {
     let tree = kr_ipc::testing::TempHost::create();
@@ -494,7 +494,7 @@ fn end_an_exited_host(interruption: Interruption, at: u32) -> (std::thread::Resu
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_collected_between_the_two_readings_is_seen_to_end() {
-    let (ended, interrupted, _asked) = end_an_exited_host(Interruption::Collected, 2);
+    let (ended, interrupted, _asked) = end_an_exited_host(Interruption::Collected, 1);
 
     assert!(
         interrupted,
@@ -512,11 +512,11 @@ fn a_host_collected_between_the_two_readings_is_seen_to_end() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_the_kernel_will_not_describe_is_not_taken_for_one_that_ended() {
-    let (ended, interrupted, asked) = end_an_exited_host(Interruption::Unanswered, 2);
+    let (ended, interrupted, asked) = end_an_exited_host(Interruption::Unanswered, 1);
 
     assert!(interrupted, "the kernel did not answer the question");
     assert!(
-        asked >= 3,
+        asked >= 2,
         "the harness took the unanswered question for the end of the host"
     );
     assert!(ended.is_ok(), "and saw it end when the kernel answered");
@@ -528,9 +528,9 @@ fn a_host_the_kernel_will_not_describe_is_not_taken_for_one_that_ended() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_seen_to_end_is_not_asked_about_again() {
-    let (ended, interrupted, _asked) = end_an_exited_host(Interruption::Unanswered, 3);
+    let (ended, interrupted, _asked) = end_an_exited_host(Interruption::Unanswered, 2);
 
-    assert!(!interrupted, "the harness asked a third question");
+    assert!(!interrupted, "the harness asked a second question");
     assert!(
         ended.is_ok(),
         "the harness saw the host end and said nothing"
