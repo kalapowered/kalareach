@@ -7,11 +7,12 @@
  * layout and motion: that no version is cut at any text size, that a press answers and a reduced
  * motion setting takes the travel out of it, and that the keyboard reaches every version.
  *
- * Every screenshot goes under `/tmp`, named for the engine and the case.
+ * Every screenshot goes under the test artefact directory, named for the engine and the case.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -26,7 +27,7 @@ const WAITING = {
 } as const
 
 function shot(name: string): string {
-  return `/tmp/kr-companion-settings-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-settings-${name}-${test.info().project.name}`)
 }
 
 /** Sets the phone's text size as the web view would, before the page loads. */

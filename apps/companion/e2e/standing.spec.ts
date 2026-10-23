@@ -5,11 +5,12 @@
  * The screen keeps what it read and turns off what sends. The banner that says why enters with an
  * opacity change of 160 ms, none under a request for less motion and none after a key, takes the
  * focus only when the control the focus was on has been turned off, and stays inside the screen with
- * its buttons a finger tall at the largest size. Screenshots go to `/tmp`.
+ * its buttons a finger tall at the largest size. Screenshots go to the test artefact directory.
  */
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -131,7 +132,7 @@ for (const size of SIZES) {
       // The banner is the first thing on the screen the person reads: the shot is taken with it in view.
       await banner.scrollIntoViewIfNeeded()
       await page.screenshot({
-        path: `/tmp/kr-standing-ended-${info.project.name}-${size.name}.png`
+        path: screenshotPath(`kr-standing-ended-${info.project.name}-${size.name}`)
       })
     })
 
@@ -147,7 +148,7 @@ for (const size of SIZES) {
       await expect(banner.getByRole('button', { name: 'Back' })).toBeVisible()
       await banner.scrollIntoViewIfNeeded()
       await page.screenshot({
-        path: `/tmp/kr-standing-refused-${info.project.name}-${size.name}.png`
+        path: screenshotPath(`kr-standing-refused-${info.project.name}-${size.name}`)
       })
 
       await page.evaluate((session) => {
@@ -179,7 +180,7 @@ for (const size of SIZES) {
       )
       await expect(page.getByTestId('mobile-terminal')).toHaveCount(0)
       await page.screenshot({
-        path: `/tmp/kr-standing-no-screen-${info.project.name}-${size.name}.png`
+        path: screenshotPath(`kr-standing-no-screen-${info.project.name}-${size.name}`)
       })
     })
   })
@@ -357,7 +358,7 @@ test.describe('an earlier action sent under an earlier opening, at the largest t
     const earlier = page.getByTestId('earlier-actions')
     await expect(earlier).toContainText('Outcome unknown')
     await expect(earlier.getByTestId('earlier-opening')).toBeVisible()
-    await page.screenshot({ path: `/tmp/kr-standing-earlier-${test.info().project.name}.png` })
+    await page.screenshot({ path: screenshotPath(`kr-standing-earlier-${test.info().project.name}`) })
     expect(
       await overrunning(page, '[data-testid="earlier-actions"]'),
       'lines of the list that run past the screen or their box'

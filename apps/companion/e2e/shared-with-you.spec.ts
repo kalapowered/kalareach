@@ -7,11 +7,13 @@
  * target and can be reached, that the card an invitation opens scrolls inside itself, and that a
  * new invitation arriving above the part of the inbox a person has scrolled to moves nothing they
  * can see: the rows under their finger keep their place, in WebKit as in Chromium. Every
- * screenshot goes under `/tmp`, in a file named for the text size, the platform and the engine.
+ * screenshot goes under the test artefact directory, in a file named for the text size, the platform
+ * and the engine.
  */
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -91,7 +93,7 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
 }
 
 function shot(name: string): string {
-  return `/tmp/kr-shared-with-you-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-shared-with-you-${name}-${test.info().project.name}`)
 }
 
 /** Opens a phone's screen with the host as a guest's, holding what the test arranges. */
@@ -645,7 +647,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
     for (const control of [accept, notNow, toast.getByRole('button', { name: 'Dismiss' })]) {
       await control.click({ trial: true, timeout: 5_000 })
     }
-    await page.screenshot({ path: `/tmp/kr-shared-with-you-toast-${how.shot}-${test.info().project.name}.png` })
+    await page.screenshot({ path: screenshotPath(`kr-shared-with-you-toast-${how.shot}-${test.info().project.name}`) })
 
     // It is the card's own: inside the dialog while the card is open.
     expect(await toast.evaluate((element) => element.closest('[role="dialog"]') !== null)).toBe(true)

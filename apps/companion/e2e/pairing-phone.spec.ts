@@ -12,6 +12,7 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -38,7 +39,7 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
 }
 
 function shot(name: string): string {
-  return `/tmp/kr-pairing-phone-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-pairing-phone-${name}-${test.info().project.name}`)
 }
 
 for (const surface of ['ios', 'android'] as const) {
