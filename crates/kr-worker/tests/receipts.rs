@@ -6522,8 +6522,6 @@ fn a_revocation_this_journal_can_no_longer_count_for_is_not_answered_as_an_empty
     );
 }
 
-/// KR-REQ-09.12, 09.13: what one controller took is not what a replacement holds.
-///
 /// KR-REQ-09.12, 09.13: a fence that failed part way and ran again names nothing new, and its
 /// revision is still not an empty one.
 ///
@@ -6579,6 +6577,8 @@ fn a_fence_that_ran_again_after_failing_part_way_is_not_answered_as_one_that_nam
     );
 }
 
+/// KR-REQ-09.12, 09.13: what one controller took is not what a replacement holds.
+///
 /// The daemon keeps the names it has collected in its own memory, so a replacement starts with
 /// none of them. A journal that counted the previous controller's pages as delivered would drop
 /// names the new one has never seen and cannot ask for again.
