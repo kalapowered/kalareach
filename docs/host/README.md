@@ -3625,11 +3625,10 @@ number of receipts, the revision of each receipt that `action.read` answered to 
 request that quotes any other revision is refused although the number is right: it is a number
 anyone can write. A worker that restarted, or let the entry go for room, has not shown it, and the
 caller reads the receipt again. The bound is one for all callers. When it is reached, the oldest
-entry of the actor that holds the most goes, so an actor that reads a great many receipts makes
-room with its own entries and cannot push out what another actor was shown, and a receipt read
-again counts as read at that moment. Only the local owner and a paired device can show a receipt to
-a person, so a request through the workflow ingress never supersedes one, and a read through it
-records nothing.
+entry of the actor that holds the most goes, so an actor that reads a great many receipts gives up
+its own oldest entries first and pushes out another actor's only while that actor holds more than it
+does, and a receipt read again counts as read at that moment. Only the local owner and a paired device can show a receipt to
+a person, so a request through the workflow ingress never supersedes one.
 
 An exact duplicate of an action that kept a result is answered with that result, as it was kept,
 once the device's present authority has been checked, and does the action no second time.

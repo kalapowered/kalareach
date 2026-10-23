@@ -1786,13 +1786,15 @@ async fn reads_receipts_of_its_own(
     }
 }
 
-/// KR-REQ-23.24: what one actor reads does not take away the revision another was shown.
+/// KR-REQ-23.24: an actor that reads a great many receipts gives up its own earliest before the
+/// revision another actor, who holds fewer, was shown.
 ///
 /// A paired device is shown the uncertain outcome of its own action, and the local owner then reads
 /// more receipts than the worker remembers having shown. The device's request that supersedes the
 /// outcome is admitted all the same, and the owner's own earliest read is the one that was let go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_receipts_one_actor_reads_do_not_push_out_what_another_was_shown() {
+async fn an_actor_that_reads_a_great_many_receipts_gives_up_its_own_before_what_another_was_shown()
+{
     let host = host().await;
     let mut client = cli(&host).await;
     let mut daemon = controller_client(&host).await;
