@@ -109,7 +109,7 @@ document.
 | `question.create` | write | `local_ipc` | Create a question from a verified originating application. Source ownership never impersonates a human answer or chooses an ungranted destination. | [Agent contact: What binds a helper to a session](../contact/README.md) |
 | `question.read_own` | read | `local_ipc` | Read the questions this source created. | [Agent contact: The caller token](../contact/README.md) |
 | `question.cancel_own` | write | `local_ipc` | Cancel a question this source created. | [Agent contact: Cancellation](../contact/README.md) |
-| `alert.create` | write | `local_ipc` | Raise an alert from a verified originating application. | [Agent contact: The four tools](../contact/README.md) |
+| `alert.create` | write | `local_ipc` | Raise an alert from a verified originating application. | [Method reference: Alerts](method-reference.md) |
 
 ## Question user interface
 
@@ -144,7 +144,7 @@ document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `session.attach` | write | `local_ipc`, `paired_device` | Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well. | [Protocol: Rights and capabilities are not the same thing](README.md) |
+| `session.attach` | write | `local_ipc`, `paired_device` | Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well. | [Method reference: Attachments](method-reference.md) |
 | `session.detach` | write | `local_ipc`, `paired_device` | Detach this actor's own attachment and run geometry succession. | [Method reference: Attachments](method-reference.md) |
 | `attachment.configure` | write | `local_ipc`, `paired_device` | Withdraw or add an authorised geometry claim without displacing the current owner. | [Method reference: Attachments](method-reference.md) |
 | `attachment.viewport` | write | `local_ipc`, `paired_device` | Report this attachment's physical dimensions. It never changes the pseudoterminal. | [Host: Who owns the size](../host/README.md) |
