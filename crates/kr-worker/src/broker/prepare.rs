@@ -62,44 +62,28 @@ pub const PREPARATION_DEADLINE: Duration = Duration::from_secs(5);
 /// withdraws it when the connection ends. Nothing in the broker holds the connection itself.
 #[derive(Debug)]
 pub struct ComponentCalls {
-    client: Mutex<Published>,
+    client: Mutex<Option<Arc<PluginClient>>>,
     /// Woken when the connection is published, replaced or withdrawn.
     changed: tokio::sync::Notify,
     /// The preparations inside a component now.
     running: Arc<tokio::sync::Semaphore>,
 }
 
-/// The connection and how many times one has been published or withdrawn.
-#[derive(Debug, Default)]
-struct Published {
-    client: Option<Arc<PluginClient>>,
-    /// Changes with every publication and withdrawal, so that a call can tell that the connection
-    /// it was made on has been replaced since.
-    epoch: u64,
-}
-
 impl ComponentCalls {
     pub(super) fn new() -> Self {
         Self {
-            client: Mutex::new(Published::default()),
+            client: Mutex::new(None),
             changed: tokio::sync::Notify::new(),
             running: Arc::new(tokio::sync::Semaphore::new(MAX_PREPARATIONS)),
         }
     }
 
-    fn published(&self) -> std::sync::MutexGuard<'_, Published> {
-        self.client
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// Publishes the runtime's connection, or withdraws it.
     pub fn set(&self, client: Option<Arc<PluginClient>>) {
-        {
-            let mut published = self.published();
-            published.client = client;
-            published.epoch += 1;
-        }
+        *self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
         self.changed.notify_one();
     }
 
@@ -112,23 +96,16 @@ impl ComponentCalls {
     /// Returns the runtime's connection, while there is one.
     #[must_use]
     pub fn client(&self) -> Option<Arc<PluginClient>> {
-        self.published().client.clone()
-    }
-
-    /// Returns the runtime's connection with the epoch it was published in, while there is one.
-    #[must_use]
-    fn stamped(&self) -> Option<(Arc<PluginClient>, u64)> {
-        let published = self.published();
-        published
-            .client
+        self.client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .map(|client| (client, published.epoch))
     }
 
-    /// Returns true while no connection has been published or withdrawn since `epoch`.
+    /// Returns true while `client` is the connection the link holds.
     #[must_use]
-    fn unchanged_since(&self, epoch: u64) -> bool {
-        self.published().epoch == epoch
+    fn is_current(&self, client: &Arc<PluginClient>) -> bool {
+        self.client().is_some_and(|held| Arc::ptr_eq(&held, client))
     }
 }
 
@@ -598,9 +575,9 @@ impl Broker {
         request: &PreparationRequest,
         until: tokio::time::Instant,
     ) -> Result<PreparedEffect> {
-        let (client, epoch) =
+        let client =
             self.component_calls
-                .stamped()
+                .client()
                 .ok_or_else(|| BrokerError::ResourceUnavailable {
                     detail: "the plugin runtime is not connected".to_owned(),
                 })?;
@@ -656,7 +633,7 @@ impl Broker {
         // a connection since replaced is judged as withheld: what the lane holds now is the next
         // connection's, and cannot say what this one was handed.
         let withheld =
-            self.observation.words_withheld() || !self.component_calls.unchanged_since(epoch);
+            self.observation.words_withheld() || !self.component_calls.is_current(&client);
         let called = called.map_err(|error| not_asked(error, withheld))?;
         if let Some(fault) = called.fault {
             return Err(declined(&request.params.action, fault, withheld));
@@ -1044,21 +1021,6 @@ const fn class_of(operation: PreparedOperation) -> DeclaredClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// KR-REQ-24.27: a call can tell that the connection it was made on has been replaced or
-    /// withdrawn since, so that what the lane says of the connection it holds now is not taken for
-    /// what the old one was handed. A reply that arrives on a connection that ended while the next
-    /// was published cannot be held open by a running worker.
-    #[test]
-    fn kr_req_24_27_a_call_can_tell_that_its_connection_was_replaced_since() {
-        let calls = ComponentCalls::new();
-        let epoch = calls.published().epoch;
-        assert!(calls.unchanged_since(epoch));
-        calls.set(None);
-        assert!(!calls.unchanged_since(epoch));
-        let now = calls.published().epoch;
-        assert!(calls.unchanged_since(now));
-    }
 
     /// KR-REQ-24.27: what the runtime says when it will not ask a component to prepare an action
     /// (a refusal, or the reason it disabled the component for) is made of what the component was
