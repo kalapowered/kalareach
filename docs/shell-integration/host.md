@@ -381,7 +381,7 @@ behind them is worse off than one started without them. That covers a launch the
 an option typed for the program, a word that is the name of another subcommand, a program that is a
 script, a runtime directory too long for the socket a backend binds, and, on Windows, where no
 gateway runs, a package that declares a server. Where the backends refuse the invocation, the
-worker's diagnostics say which; a session with no command backends records nothing. A build no signed qualification record names, and a package whose table
+worker's diagnostics say which; a session with no command backends records nothing. A build the signed index does not name as a qualified build, and a package whose table
 declares no tested volatile forwarding mode, are refused later, when the launcher presents itself
 after an integrated answer, and the launcher then runs the command as typed.
 
