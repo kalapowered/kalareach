@@ -143,6 +143,11 @@ processes are doing, so the row says exactly that and nothing more, is never cou
 failures, and offers nothing to decide. The row states how long contact has been lost as plain
 elapsed time.
 
+A host that answers a visit and refuses is not a lost host. Its row is labelled "Refused", gives the
+host's own words and what the person can do about them, and is listed under Everything only. The host
+is in contact, so the row is not counted as out of contact, and nothing the host held before it
+refused stays listed.
+
 A host this phone owns can also ask its owner devices to confirm one of its own sensitive actions,
 or a device it is about to add. Those requests head the tab, above the inbox's own, and count in
 the tab's badge. Each shows its description and the time left, and a button named for the phone's

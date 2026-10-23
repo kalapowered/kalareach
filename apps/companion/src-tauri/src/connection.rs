@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::{Said as _, Session};
 use kr_protocol::ids::{BuildId, DeviceId, EnvironmentId};
@@ -194,14 +195,40 @@ impl Connection {
         })))
     }
 
+    /// A connection to a paired host for a visit: a look at a host that is not the one this device
+    /// is using, as [`Self::paired`] opens one, except that it says whether the host refused it. It
+    /// is not opened again when it ends: whoever visits opens another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Unopened::Refused`] with the host's refusal when the host answered and refused at
+    /// any step, and [`Unopened::Unreached`] with why when it could not be reached or did not
+    /// answer.
+    pub async fn visited(
+        device: &Arc<Device>,
+        host: &PairedHost,
+    ) -> std::result::Result<Self, Unopened> {
+        Self::open(device, host).await
+    }
+
     async fn paired_once(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
+        Self::open(device, host)
+            .await
+            .map_err(Unopened::into_error)
+    }
+
+    /// Opens the connection.
+    async fn open(device: &Arc<Device>, host: &PairedHost) -> std::result::Result<Self, Unopened> {
         let pairing = device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
-        let session =
-            tokio::time::timeout(CONNECT_WITHIN, pairing.link.connect_paired(host, &identity))
-                .await
-                .map_err(|_| CommandError::unavailable("the host did not answer in time"))?
-                .map_err(|error| CommandError::unavailable(error.said().into_string()))?;
+        let connecting = pairing.link.connect_paired(host, &identity);
+        let session = tokio::time::timeout(CONNECT_WITHIN, connecting)
+            .await
+            .map_err(|_| Unopened::unreached("the host did not answer in time"))?
+            .map_err(|error| match error {
+                LinkError::Refused(refusal) => Unopened::Refused(CommandError::from(refusal)),
+                other => Unopened::unreached(other.said().into_string()),
+            })?;
         let info: kr_protocol::hostinfo::HostInfoResult = tokio::time::timeout(
             CONNECT_WITHIN,
             session.read(
@@ -210,8 +237,8 @@ impl Connection {
             ),
         )
         .await
-        .map_err(|_| CommandError::unavailable("the host did not say which environment it is"))?
-        .map_err(CommandError::from)?;
+        .map_err(|_| Unopened::unreached("the host did not say which environment it is"))?
+        .map_err(Unopened::of_read)?;
         let rights = open_for_the_host(&session).await?;
         Ok(Self {
             session: Arc::new(session),
@@ -253,7 +280,7 @@ impl Connection {
 ///
 /// A host of an earlier build does not list the method and refuses it as any unlisted method is
 /// refused, so a refusal that is not a transient one says that.
-async fn open_for_the_host(session: &Session) -> Result<Vec<ActionRight>> {
+async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionRight>, Unopened> {
     use kr_protocol::scalars::Nullable;
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
@@ -268,7 +295,7 @@ async fn open_for_the_host(session: &Session) -> Result<Vec<ActionRight>> {
         ),
     )
     .await
-    .map_err(|_| CommandError::unavailable("the host did not open the connection in time"))?
+    .map_err(|_| Unopened::unreached("the host did not open the connection in time"))?
     .map_err(|error| match error {
         kr_client::ClientError::Host(refusal)
             if matches!(
@@ -277,21 +304,56 @@ async fn open_for_the_host(session: &Session) -> Result<Vec<ActionRight>> {
                     | kr_protocol::error::ErrorCode::InvalidArgument
             ) =>
         {
-            CommandError::stated(
+            Unopened::Refused(CommandError::stated(
                 refusal.code,
                 format!(
                     "{} If the host is of an earlier build than this application, update it.",
                     refusal.message
                 ),
-            )
+            ))
         }
-        other => CommandError::from(other),
+        other => Unopened::of_read(other),
     })?;
     match opened {
         SessionOpenResult::InForce { actions, .. } => Ok(actions.iter().copied().collect()),
-        SessionOpenResult::Ended { .. } => Err(CommandError::unavailable(
+        SessionOpenResult::Ended { .. } => Err(Unopened::Refused(CommandError::stated(
+            kr_protocol::error::ErrorCode::PermissionDenied,
             "the host answered that this connection has ended",
-        )),
+        ))),
+    }
+}
+
+/// Why a connection to a paired host was not opened.
+#[derive(Debug)]
+pub enum Unopened {
+    /// The host answered, and refused: it is in contact, and the refusal is its own.
+    Refused(CommandError),
+    /// The host could not be reached, did not answer in time, or failed in a way that is no
+    /// refusal of the host's.
+    Unreached(CommandError),
+}
+
+impl Unopened {
+    fn unreached(reason: impl Into<String>) -> Self {
+        Self::Unreached(CommandError::unavailable(reason))
+    }
+
+    /// What a failed read says: a refusal when the host sent an error, and otherwise that the host
+    /// was not reached.
+    #[must_use]
+    pub fn of_read(error: kr_client::ClientError) -> Self {
+        match error {
+            kr_client::ClientError::Host(_) => Self::Refused(CommandError::from(error)),
+            _ => Self::Unreached(CommandError::from(error)),
+        }
+    }
+
+    /// The failure, as a command that needed the connection answers with it.
+    #[must_use]
+    pub fn into_error(self) -> CommandError {
+        match self {
+            Self::Refused(error) | Self::Unreached(error) => error,
+        }
     }
 }
 
@@ -698,6 +760,26 @@ mod tests {
 
         let lost = serde_json::to_value(ConnectionState::unreachable("no host")).expect("encodes");
         assert_eq!(lost["rights"], serde_json::Value::Null);
+    }
+
+    /// A read that failed is the host's refusal when the host sent an error, and the host not
+    /// reached otherwise: a visit draws the first as an answer and the second as lost contact.
+    #[test]
+    fn a_failed_read_is_a_refusal_only_when_the_host_sent_the_error() {
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        let sent = kr_client::ClientError::Host(ProtocolError::new(
+            ErrorCode::StorageUnavailable,
+            "the host cannot read its store",
+        ));
+        let Unopened::Refused(refusal) = Unopened::of_read(sent) else {
+            panic!("an error the host sent is its refusal");
+        };
+        assert_eq!(refusal.code, ErrorCode::StorageUnavailable);
+        assert!(matches!(
+            Unopened::of_read(kr_client::ClientError::ConnectionEnded),
+            Unopened::Unreached(_)
+        ));
     }
 
     /// A connection says whether its host is one this device is paired with, because an

@@ -901,6 +901,45 @@ async fn a_silent_host_holds_up_no_other_hosts_confirmations() {
     silent.stop().await;
 }
 
+/// KR-REQ-13.01: one of this computer's hosts takes each connection, completes the authorised
+/// handshake and then answers nothing, holding the connection open. It holds up no other host's
+/// inbox: the visit to it ends within its bound, the other host's inbox is read, and the silent
+/// host is listed out of contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_host_holds_up_no_other_hosts_inbox() {
+    use companion_tauri::inbox::{HostInboxState, InboxDesk, VISIT_WITHIN};
+
+    let owner_keys = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner_keys).await;
+    let data = tempfile::tempdir().expect("a directory");
+    let device = owner_device(&host, &owner_keys, data.path());
+    let silent = support::SilentHost::start(&owner_keys, "a silent host").await;
+    device
+        .pairing()
+        .hosts
+        .record(silent.record.clone())
+        .expect("the silent host is recorded");
+    let desk = Arc::new(InboxDesk::default());
+
+    let visits = tokio::time::timeout(VISIT_WITHIN * 2, desk.visit(&device))
+        .await
+        .expect("the visit does not wait on the silent host past its bound");
+    silent.accepted(1).await;
+    let state_of = |name: &str| {
+        visits
+            .iter()
+            .find(|each| each.name == name)
+            .map(|each| each.state)
+    };
+    assert_eq!(visits.len(), 2);
+    assert_eq!(state_of("the test host"), Some(HostInboxState::Read));
+    assert_eq!(
+        state_of("a silent host"),
+        Some(HostInboxState::OutOfContact)
+    );
+    silent.stop().await;
+}
+
 /// A room that counts the sockets it is asked to open, and ends each before any host speaks.
 #[derive(Default)]
 struct CountingRoom {

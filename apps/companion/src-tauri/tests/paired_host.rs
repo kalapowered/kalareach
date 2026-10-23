@@ -19,6 +19,7 @@
 //! | KR-REQ-13.08 | `forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other` |
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
 //! | KR-REQ-13.01 | `the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use` |
+//! | KR-REQ-13.01 | `a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refused` |
 //! | KR-REQ-23.32 | `a_paired_devices_questions_go_through_the_host` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
@@ -604,6 +605,53 @@ async fn the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use() 
         .expect("the host is forgotten");
     let none = companion.call("inbox_hosts", json!({})).expect("a visit");
     assert_eq!(none.as_array().map(Vec::len), Some(0), "{none}");
+    first.stop().await;
+    second.stop().await;
+}
+
+/// KR-REQ-13.01: a host that answers a visit and refuses it is in contact. It is listed as having
+/// refused, with the refusal it sent, and with no moment contact was lost; the loss a host out of
+/// contact has before it refuses is gone, and a host that stops refusing is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refused() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    connection(companion, true).await;
+
+    // Out of contact first, with a moment it was lost.
+    control.unreachable(true);
+    let lost = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(lost[0]["state"], "out_of_contact", "{lost}");
+    assert!(lost[0]["lost_since_ms"].is_u64(), "{lost}");
+    assert!(lost[0]["refusal"].is_null(), "{lost}");
+
+    // The host answers and refuses: it is in contact, and the refusal is the host's own.
+    control.unreachable(false);
+    control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    let refused = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(refused.as_array().map(Vec::len), Some(1), "{refused}");
+    assert_eq!(refused[0]["state"], "refused", "{refused}");
+    assert_eq!(
+        refused[0]["refusal"]["code"], "PERMISSION_DENIED",
+        "{refused}"
+    );
+    assert!(refused[0]["lost_since_ms"].is_null(), "{refused}");
+    assert!(refused[0]["result"].is_null(), "{refused}");
+    assert_eq!(refused[0]["sessions"], json!([]), "{refused}");
+
+    // It stops refusing: its inbox is read.
+    control.refuse(None);
+    let read = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(read[0]["state"], "read", "{read}");
+    assert!(read[0]["refusal"].is_null(), "{read}");
+
     first.stop().await;
     second.stop().await;
 }
