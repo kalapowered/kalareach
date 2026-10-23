@@ -8,7 +8,11 @@ class OwnerAuthenticatorsTest {
     private val android10 = 29
     private val android11 = 30
 
-    /** KR-REQ-10.52: a phone asks a strong biometric first, and the screen lock where it can. */
+    /**
+     * KR-REQ-10.52, the paired phone's half: a phone that confirms as a separately paired owner
+     * device asks a strong biometric first and the screen lock where Android 11 allows it, and
+     * where it has neither it asks nothing.
+     */
     @Test
     fun a_strong_biometric_is_asked_with_the_screen_lock_as_its_fallback_from_android_11() {
         assertEquals(
@@ -24,7 +28,11 @@ class OwnerAuthenticatorsTest {
         )
     }
 
-    /** KR-REQ-10.52: before Android 11 nothing weaker than a strong biometric is asked. */
+    /**
+     * KR-REQ-10.52, the paired phone's half: before Android 11 nothing weaker than a strong
+     * biometric on a locked phone is asked, so a phone that cannot ask for one offers no ceremony
+     * where a weaker one would be a downgrade.
+     */
     @Test
     fun before_android_11_only_a_strong_biometric_on_a_locked_phone_is_asked() {
         assertEquals(
@@ -50,7 +58,7 @@ class OwnerAuthenticatorsTest {
         assertEquals("none", OwnerAuthenticators.kind(null))
     }
 
-    /** KR-REQ-10.52: a challenge with no time left is not waited for, and a long one is capped. */
+    /** A challenge with no time left is not waited for, and a long one is capped. */
     @Test
     fun the_wait_is_the_time_the_challenge_has_left_and_never_more_than_the_longest() {
         assertEquals(0L, OwnerAuthenticators.waitMillis(-5L))

@@ -1,15 +1,15 @@
-//! What a session's connections make its host do while nobody is using them (KR-PERF-003).
+//! What a session's connections make its host do while nobody is using them.
 //!
 //! Twenty idle sessions have to cost less than one per cent of a core between them. The control
 //! daemon holds three connections to each of them whether or not anybody is looking at the
 //! session, and a person can leave a terminal attached to one for days. A clock on every one of
 //! those connections woke each host several times in ten seconds for nothing. The one reader of a
 //! local stream that waits on silence is a process bridge's invoker, so the connection a bridge's
-//! helper makes is sent a keepalive on a clock and no other connection is.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-PERF-003 | the control daemon's three connections to a session, a command line that has attached nothing and one that has attached a terminal are sent no keepalive, while a connection a process bridge made is sent them |
+//! helper makes is sent a keepalive on a clock and no other connection is. The case here shows that
+//! the control daemon's three connections to a session, a command line that has attached nothing
+//! and one that has attached a terminal are sent no keepalive, while a connection a process bridge
+//! made is sent them; the one-per-cent figure itself is measured with the other idle figures, not
+//! asserted here.
 //!
 //! This uses a real worker service on its real endpoint and a real shell. The keepalive's period
 //! is shortened so that the case sees several of them, and what it waits for is a count of the
@@ -299,12 +299,12 @@ async fn attached(host: &Host, mut client: LocalClient) -> Raw {
     Raw::of(client)
 }
 
-/// KR-PERF-003: a connection a process bridge made is sent a keepalive on a clock, and no other is.
+/// A connection a process bridge made is sent a keepalive on a clock, and no other is.
 /// The control daemon's three connections to a session, a command line that has attached nothing
 /// and one that has a terminal attached are open before the bridge's connection is, so it being
 /// sent its eighth keepalive means each of them has had the same chances to be sent eight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_perf_003_only_a_bridges_connection_is_sent_a_keepalive() {
+async fn only_a_bridges_connection_is_sent_a_keepalive() {
     let host = host().await;
     let mut idle = vec![
         (

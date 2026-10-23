@@ -2313,7 +2313,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// KR-PERF-003: while the record needs nothing of privacy mode's tick, the tick has no period
+    /// While the record needs nothing of privacy mode's tick, the tick has no period
     /// of its own: it waits for the record to say it changed, however long that is, and begins a
     /// new period from the pass that wake makes. Otherwise it waits for its next period.
     #[tokio::test(start_paused = true)]

@@ -494,7 +494,7 @@ describe('one semantic interface on the desktop and the phones', () => {
   })
 })
 
-describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
+describe('local feedback and the receipt (KR-REQ-13.05)', () => {
   it('shows the submission as queued before the host answers and applied only on a receipt', async () => {
     const person = userEvent.setup()
     start('ios')
@@ -508,6 +508,9 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
     })
   })
 
+  // KR-ACC-012, the network change: with the host out of contact the page says so, and the text the
+  // person wrote is still in the composer exactly as they left it, so a lost connection loses no
+  // draft.
   it('leaves what was written in the composer when the host refuses it', async () => {
     const person = userEvent.setup()
     const { controls } = start('ios')
@@ -541,6 +544,9 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
     expect(screen.queryByText('Applied')).toBeNull()
   })
 
+  // KR-ACC-012, the suspension: a draft written before the system took the process away is back in
+  // the composer on the next run, kept and detached while the host does not answer, and nothing is
+  // sent again.
   it('recovers a draft written before the process was taken away', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()
