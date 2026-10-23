@@ -10,7 +10,10 @@ and signs the manifest, and the host verifies it with the same code, so a signat
 for one verifies for the other.
 
 A tree holds no link, no file with a second name, no device and no empty directory: an archive
-writes a second name as a link, and a host refuses an archive that holds one. A file is a program
+writes a second name as a link, and a host refuses an archive that holds one. `kr-release` checks
+this for the trees it reads: a file with a second name is refused where the platform reports link
+counts (macOS and Linux). The Windows archive is a ZIP of independent entries, which cannot hold a
+link. A file is a program
 when it is one of the host's programs in `bin/` (`scripts/release-programs.json` lists them) or a
 file in a shell package's own `bin/`; the file system of the machine that built the tree is not
 asked.
@@ -39,16 +42,22 @@ that forgets what a release owes its readers cannot sign one.
 
 ## Shell packages
 
-`shells/<shell>/<identity>/` holds a package as `scripts/build-shells.sh` installed it, with the
-identity record the build wrote, and `shells/<shell>/current` names the identity. For each package
-the manifest states:
+On macOS and Linux, `shells/<shell>/<identity>/` holds a package as `scripts/build-shells.sh`
+installed it, with the identity record the build wrote, and `shells/<shell>/current` names the
+identity. A Windows release is different: its `shells` member is empty, because the PowerShell
+package changes no upstream reader and carries no patch. The tree holds `shells/psreadline/` as
+plain files, with no identity directory and no `current`, and `shells/psreadline/manifest.json`
+states the qualified PowerShell and PSReadLine version ranges. The tree carries that file, so
+`files` lists its digest, and the release record cites it. For each package on macOS and Linux the
+manifest states:
 
 - `patch_revisions`: the revision of each patch, in the order they are applied. The release before
   package managers requires this member and reads a shell package by it, so every entry keeps it. It
   repeats the revisions of `patches` and is refused when it does not.
 - `upstream`: the shell's version, the upstream revision the patches apply to, the archive and its
   SHA-256 digest, from `shells/<shell>/manifest.json`.
-- `patches`: each reader patch in the order it is applied, with its own revision, the upstream
+- `patches`: each patch in the order it is applied (the reader patches and the shell's other small
+  changes, such as the Zsh patches that resolve a command and the module paths), with its own revision, the upstream
   revision it was applied to (`base_revision`, the package's own), the digest of the patch file
   and, where the patch is a published upstream change, the upstream commit it was taken from
   (`source_commit`). The two upstream revisions are kept apart: the terminfo patch of the Zsh
@@ -61,7 +70,10 @@ the manifest states:
   shell with and the startup files that hold the package's marked entry, each with where in the
   file the entry goes and the lines that open and close it.
 
-The member states what the host does and no more: the arguments, which name no option that skips or
+The patches are published in this repository, at the manifest's `commit`, in
+`shells/<shell>/patches/`; the release tree holds only the built package, and the manifest states
+each patch's digest, its own revision and the upstream revisions it is kept with. The member states
+what the host does and no more: the arguments, which name no option that skips or
 replaces a startup file of the person's (`-f`, `--no-rcs`, `--norc`, `--noprofile`, `--rcfile`,
 `--no-config`, `-N`), and the files the host puts its entry in. The order the shell reads its own
 startup files in is the shell's, and a login Bash reaches `.bashrc` only where its login file
@@ -77,9 +89,14 @@ The signed plugin index at the commit the bundled catalogue was taken from names
 whose record passed every part of the version qualification, each executable build by application,
 distribution, version, operating system, architecture and digest. The manifest lists the builds
 for its own target with the capabilities of the entry that names them. A named build opens every
-capability its release declares, and the index carries no schema hash for a build today, so the
-member is omitted until a record supplies one. The index names no build yet, so `agents` is empty.
-`kr-release` reads the index only when it is the one the bundled metadata pins.
+capability its release declares. The schema hash is the manifest's optional member `schema_hash`:
+no input fills it today. An index entry for a build (`QualifiedBuild`) has no schema member, and
+`kr-release` always leaves the hash out, even for the connectors whose qualification notes pin a
+vendor schema, so a build named in the index would reach the manifest without one. The index names
+no build yet, so `agents` is empty, and the build list covers only the `macos-aarch64` target, so
+no other target can list an agent. `kr-release` reads the index only when it is the one the bundled
+metadata pins, by `bundled-plugins.lock` and by the digest in the targets metadata; it checks no
+signature of its own on the index, and the bundled generation is the development one.
 
 ## Dependencies
 
@@ -112,7 +129,7 @@ citation too, and the record is refused until `records.json` says the new commit
 
 | Class | Cited |
 | --- | --- |
-| Vendor routes | The plugins repository's qualification notes at the commit the bundled catalogue was taken from |
+| Vendor routes | The plugins repository's qualification notes at the commit the bundled catalogue was taken from, which are the research behind the connector tables that `bundled-plugins.lock` pins. The record cites no change log, and these notes are not the specification's qualification notes |
 | Dependency and runtime revisions | `Cargo.toml`, `Cargo.lock`, the toolchain file, each shell's pins, the stack pins, the bundled catalogue's lock and the lock of stored formats |
 | Model assets | Each model profile with its model, conversion and runtime revisions and the digest of each asset |
 | Provider event schemas | The voice providers' profiles and their digests, in the web repository at a pinned commit |
@@ -120,15 +137,24 @@ citation too, and the record is refused until `records.json` says the new commit
 
 A class is recorded, unavailable or pending. A recorded class lists each record with the
 repository, revision, path and digest. A record in this checkout is read and digested when the
-record is made. A record in another repository is checked against its digest when that repository
-is at hand (`--plugins`, `--web`) and cited by it when it is not, and the record says which. An
+record is made, and carries its path and digest; the manifest's `commit` is its revision. A record in another repository is checked against its digest when that repository
+is at hand (`--plugins`, `--web`) and cited by it when it is not, and the record says which. The
+release workflows pass `--plugins` and not `--web`, so a release cites the web records without
+reading them. An
 unavailable class names the capability the release leaves off and why. A pending class is allowed
 in a run that proves the pipeline and refused in a release: `kr-release` stops a record that has
 one unless it is told it is a development run.
 
-Every capability the release enables by evidence cites the qualification records of the plugin
-that declares it. A listed build whose plugin cites none stops the record, so a release cannot
-enable a capability on no evidence. A record that is missing, or is not the one cited, stops it.
+Every capability of a listed build cites the qualification results of the plugin that declares
+it: the `qualification` list of that plugin's entry in the signed index, which holds results that
+carry a signed record as their source. A listed build whose plugin entry lists no result stops the
+record. That is the whole check: it does not match a result to the capability that cites it, it does
+not read a result's state, and it covers the capabilities of listed agent builds only. The shell
+packages, the model profiles and the voice providers are cited as pins, by digest, and not by
+evidence. A record cited in `records.json` that is missing, or is not the one cited, stops the
+record; for another repository that holds only when the repository is at hand. The index names no
+build yet, and the pipeline of the plugins repository does not yet write the results into an index
+entry, so the first build it names would stop every release until it does.
 
 ## Building and signing a release
 
