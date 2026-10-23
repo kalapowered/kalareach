@@ -303,8 +303,9 @@ pub struct Following {
     /// The group and the name the previous look found, while a program held the terminal.
     previous: Option<(i32, Option<String>)>,
     /// Whether the leader of the group the previous look found runs the command the shell
-    /// answered for. What a process runs cannot change without it starting an image again, so one
-    /// reading serves every look until the leader, the image or the command is another.
+    /// answered for. A process can replace what it runs without becoming another process or
+    /// another image, as a script does when it execs its own interpreter on another script, so a
+    /// reading serves the looks that find the same leader, image, arguments and command.
     ran: Option<(Ran, bool)>,
 }
 
@@ -314,6 +315,8 @@ pub struct Following {
 struct Ran {
     leader: u32,
     image: String,
+    /// The argument vector the leader runs with, which an exec of the same image changes.
+    arguments: Option<Vec<String>>,
     command: String,
 }
 
@@ -368,12 +371,13 @@ fn program_of(
         let reading = Ran {
             leader,
             image: image.clone(),
+            arguments: crate::broker::adoption::arguments_of(leader),
             command: typed.clone(),
         };
         let runs_it = match ran {
             Some((read, held)) if *read == reading => *held,
             _ => {
-                let held = runs(typed, &image, leader);
+                let held = runs(typed, &image, leader, reading.arguments.as_deref());
                 *ran = Some((reading, held));
                 held
             }
@@ -395,7 +399,7 @@ fn program_of(
 /// a line that names `env`), and the script is the argument after the interpreter's own, resolved
 /// where the leader works when it was given as a relative path.
 #[cfg(unix)]
-fn runs(typed: &str, image: &str, leader: u32) -> bool {
+fn runs(typed: &str, image: &str, leader: u32, arguments: Option<&[String]>) -> bool {
     let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
     let Some(script) = canonical(std::path::Path::new(typed)) else {
         return false;
@@ -407,7 +411,7 @@ fn runs(typed: &str, image: &str, leader: u32) -> bool {
     let Some(started_with) = first_line_of(&script) else {
         return false;
     };
-    let Some(arguments) = crate::broker::adoption::arguments_of(leader) else {
+    let Some(arguments) = arguments else {
         return false;
     };
     let words: Vec<&str> = started_with.split_whitespace().collect();
