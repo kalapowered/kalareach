@@ -16,7 +16,7 @@
 //!   end has followed. [`follow_evidence`] reads these when something that can change them
 //!   wakes it, never at a look at the terminal, and re-reads while a question is open because a
 //!   question can run out of time with nothing to wake it.
-//! * **The holder of the terminal**, which the adoption watch reads on its own pace. [`Following`]
+//! * **The holder of the terminal**, which the adoption watch reads on its own pace. `Following`
 //!   turns each of its looks into a [`Holder`]: the root shell, or a program with the name a person
 //!   knows it by. A program is published once two looks in a row have seen the same group, so the
 //!   shell's own image between a fork and an exec, and a command shorter than a look, never are.
