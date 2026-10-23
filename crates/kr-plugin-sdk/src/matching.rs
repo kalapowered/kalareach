@@ -298,10 +298,15 @@ impl MatchRule {
     /// `observed` names another distribution the rule is lowered the same way and not dropped,
     /// because the distribution a registry names for a platform's image need not be the one the
     /// rule names.
+    ///
+    /// `authority` names what vouches for the package's publisher: the enrolment of the repository
+    /// the package came through, which has a root of its own. A publisher's name stands for one
+    /// publisher only within one authority.
     #[must_use]
     pub fn candidate(
         &self,
         plugin_id: &PluginId,
+        authority: &str,
         path: &str,
         observed: Option<&DistributionMatch>,
     ) -> Option<Candidate> {
@@ -325,6 +330,7 @@ impl MatchRule {
         };
         Some(Candidate {
             plugin_id: plugin_id.clone(),
+            authority: authority.to_owned(),
             rule_id: self.id.to_string(),
             confidence,
             distribution_matched,
@@ -338,6 +344,9 @@ impl MatchRule {
 pub struct Candidate {
     /// The package.
     pub plugin_id: PluginId,
+    /// What vouches for the package's publisher: the enrolment of the repository it came through.
+    /// A lookup over one repository's index has one authority, and passes an empty one.
+    pub authority: String,
     /// Which of its rules recognised the application.
     pub rule_id: String,
     /// How certain that rule is.
@@ -360,8 +369,9 @@ pub enum Resolution {
     ///
     /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
     /// and among rules of one confidence a rule that names the installation location beats one
-    /// that names only the executable, so this is reached where several packages are left that
-    /// recognise the program equally well.
+    /// that names only the executable when one publisher in one repository published every
+    /// package left, so this is reached where several packages are left that recognise the
+    /// program equally well.
     Conflict(Vec<Candidate>),
 }
 
@@ -371,11 +381,13 @@ pub enum Resolution {
 /// selection is compared before confidence: a person who chose a package is not overruled by a
 /// rule that calls itself exact. Then an exact rule beats an inferred one. Of the rules left, one
 /// that matched an installation location its package names beats one that matched the executable's
-/// name alone, when one publisher published every package left: the location says which product is
-/// installed there, and the name is shared by products that are not. A package of another
-/// publisher that names a location does not take a program from a publisher's package this way, so
-/// packages of different publishers that recognise a program equally well conflict, and the person
-/// settles it. The catalogue's search and the worker's binder both decide with this and read their
+/// name alone, when one publisher published every package left, through one repository: the
+/// location says which product is installed there, and the name is shared by products that are
+/// not. A publisher's name is vouched for by the root of the repository that lists it, and two
+/// roots can list one name, so a package of another publisher, or of the same name from another
+/// repository, that names a location does not take a program from a package this way: packages of
+/// different publishers, or of one name from different repositories, that recognise a program
+/// equally well conflict, and the person settles it. The catalogue's search and the worker's binder both decide with this and read their
 /// rules with [`MatchRule::candidate`], so there is one rule wherever a running application meets
 /// the packages that recognise it.
 #[must_use]
@@ -396,12 +408,14 @@ pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resol
         .cloned()
         .collect();
     let considered = if exact.is_empty() { candidates } else { exact };
+    // The publisher in its authority: the name of a publisher stands for one publisher only within
+    // the repository whose root vouches for it.
     let publisher = |candidate: &Candidate| {
         candidate
             .plugin_id
             .as_str()
             .split_once('/')
-            .map(|(publisher, _)| publisher.to_owned())
+            .map(|(publisher, _)| (publisher.to_owned(), candidate.authority.clone()))
     };
     let located: Vec<Candidate> = considered
         .iter()
@@ -441,6 +455,7 @@ mod tests {
     fn candidate(plugin: &str, confidence: MatchConfidence) -> Candidate {
         Candidate {
             plugin_id: PluginId::new(plugin).expect("a plugin identifier"),
+            authority: String::new(),
             rule_id: "executable".to_owned(),
             confidence,
             distribution_matched: false,
@@ -552,17 +567,19 @@ mod tests {
         );
         let path = "/usr/local/bin/sample";
         // The host established nothing about where the program came from: its name is a guess.
-        let unknown = rule.candidate(&package, path, None).expect("recognised");
+        let unknown = rule
+            .candidate(&package, "", path, None)
+            .expect("recognised");
         assert_eq!(unknown.confidence, MatchConfidence::Inferred);
         assert!(!unknown.distribution_matched);
         // Established as another distribution: still recognised by name, and still a guess.
         let other = rule
-            .candidate(&package, path, Some(&npm("another")))
+            .candidate(&package, "", path, Some(&npm("another")))
             .expect("recognised");
         assert_eq!(other.confidence, MatchConfidence::Inferred);
         // Established as the rule's own, in either case of the identifier: what the rule declares.
         let own = rule
-            .candidate(&package, path, Some(&npm("@Vendor/Sample")))
+            .candidate(&package, "", path, Some(&npm("@Vendor/Sample")))
             .expect("recognised");
         assert_eq!(own.confidence, MatchConfidence::Exact);
         assert!(own.distribution_matched);
@@ -571,14 +588,14 @@ mod tests {
         let plain = named_rule("sample", &[], None, MatchConfidence::Exact);
         assert_eq!(
             plain
-                .candidate(&package, path, None)
+                .candidate(&package, "", path, None)
                 .expect("recognised")
                 .confidence,
             MatchConfidence::Inferred
         );
         // And nothing is recognised that neither the name nor the distribution recognises.
         assert!(
-            rule.candidate(&package, "/usr/local/bin/other", None)
+            rule.candidate(&package, "", "/usr/local/bin/other", None)
                 .is_none()
         );
     }
@@ -597,7 +614,7 @@ mod tests {
                 (&also_named, &by_name),
             ]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
             .collect::<Vec<_>>()
         };
         match resolve(candidates("/home/u/.tool/bin/tool"), None) {
@@ -622,7 +639,7 @@ mod tests {
         // The shipped package guesses by name, and the vendor's names a location: neither wins.
         let located = [(&shipped, &by_name), (&vendor, &at_home)]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
             .collect::<Vec<_>>();
         assert!(matches!(resolve(located, None), Resolution::Conflict(_)));
         // The vendor's package declares its name exact, and it names no distribution to establish:
@@ -630,13 +647,33 @@ mod tests {
         let bold = named_rule("tool", &[], None, MatchConfidence::Exact);
         let exact = [(&shipped, &by_name), (&vendor, &bold)]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
             .collect::<Vec<_>>();
         assert!(matches!(resolve(exact, None), Resolution::Conflict(_)));
+        // The same publisher name from another repository is not the same publisher: the name is
+        // vouched for by the root of the repository that lists it, and two roots can list one.
+        let helper = PluginId::new("kalareach/tool-helper").expect("a plugin identifier");
+        let from = |authority: &'static str| {
+            [
+                (&shipped, &by_name, "official"),
+                (&helper, &at_home, authority),
+            ]
+            .into_iter()
+            .filter_map(|(plugin, rule, authority)| rule.candidate(plugin, authority, path, None))
+            .collect::<Vec<_>>()
+        };
+        match resolve(from("official"), None) {
+            Resolution::Selected(candidate) => assert_eq!(candidate.plugin_id, helper),
+            other => panic!("one publisher in one repository: the location wins: {other:?}"),
+        }
+        assert!(matches!(
+            resolve(from("another root"), None),
+            Resolution::Conflict(_)
+        ));
         // And the person's own choice still decides.
         let chosen = [(&shipped, &by_name), (&vendor, &bold)]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
             .collect::<Vec<_>>();
         match resolve(chosen, Some(&vendor)) {
             Resolution::Selected(candidate) => assert_eq!(candidate.plugin_id, vendor),
