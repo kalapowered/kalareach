@@ -17,6 +17,29 @@ Rust is canonical. The JSON Schema comes from the Rust types, the TypeScript typ
 schema, and the WIT file is copied from the crate. Each step has a check mode, so a change on one
 side that is not carried to the other fails the build.
 
+## One contract for every application
+
+Support for an application is a package, and a package meets one contract whoever wrote it. The packages that ship with KalaReach, a vendor's and a person's own are validated, published, installed, granted and bound the same way. Core supplies the transport, process and terminal primitives, the authority checks and the standard interface components. A package's match rules make a host recognise an application, and its manifest, connector table and actions say what a binding to it may observe and do.
+
+What holds for every package, the first-party ones included:
+
+- One validator reads a package. It is `kr-plugin-sdk`, which `kr-plugin-sandbox` runs offline, which a host runs before it trusts a package, and which the catalogue pipeline in the plugins repository runs before it signs a generation.
+- A package reaches a host as an entry of a repository's signed catalogue generation, which the same client checks under the same metadata, delegation and expiry rules ([Repositories and the catalogue](catalogue.md)). The official repository is an enrolment like any other: the host enrols it with the default capability ceiling and no full offline mirror ([The generation that ships with the host](runtime.md#the-generation-that-ships-with-the-host)).
+- What a package may do is what its manifest requests, held to its repository's ceiling and granted by the owner. The host installs each bundled package enabled with an empty grant, and every capability past the repository's default ceiling stays permission-required, as it does for any package ([Capability ceiling and installation grants](runtime.md#capability-ceiling-and-installation-grants)).
+- A host recognises an application only through the match rules of the packages it admits ([Match rules](#match-rules)). The plugin runtime's sources name no application, and a test of the runtime holds that.
+
+Core is not free of application names, and these are the places that carry them. Each one adapts to a single application's own interface.
+
+| Where | Which applications | What it does |
+| --- | --- | --- |
+| The `kr-hook` forwarder | Claude Code, Gemini CLI, Qoder CLI | Accepts an invocation named for each application, and carries what that application's hooks report, and for Claude Code what its Channels server reports, to the worker that owns the session |
+| Native bridge recipes | Claude Code, Gemini CLI | Names the registration files a recipe may install and, for Claude Code, the one setting it may add. A recipe for any other application is refused |
+| `kr skill` and `agent_tools.install` | Codex, Claude Code, OpenCode, Gemini CLI, Kimi Code CLI, Qoder CLI | Knows where each agent keeps its skills and where its tool server is registered |
+| Command integrations | Gemini CLI | Permits one environment variable, `GEMINI_CLI_NO_RELAUNCH` set to `true`, and no other |
+| The host's own metrics | The eight connectors the product bundles | Counts adapter failures under a closed list of names; the failure of a package that is not one of them is counted under no name |
+
+None of these decides whether an application is recognised, whether a package may bind to it, or what a binding may do. They do bound what a package can do without a core release: a native bridge is permitted for the two applications in the second row, and the forwarder accepts the three in the first. Of the nine packages in the bundled generation, Codex, Kimi CLI, Kimi Code CLI, OpenCode and OpenCode attach are a manifest, a presentation document and a connector table, with no bridge and no forwarder. Qoder CLI adds a command integration and uses the forwarder. Claude Code and Gemini CLI add a command integration and install a native bridge.
+
 ## What a package is
 
 A directory:
