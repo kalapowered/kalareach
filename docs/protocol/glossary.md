@@ -1,7 +1,8 @@
 # Glossary
 
 The terms the protocol relies on, in alphabetical order. An identifier in parentheses is the wire
-name of the object the term names; `crates/kr-protocol/src/ids.rs` defines each one.
+name of the object the term names; `crates/kr-protocol/src/ids.rs` defines most of them, and
+`scalars.rs` defines the key types.
 [README.md](README.md) is the protocol reference and [methods.md](methods.md) the method index.
 
 **Action** (`action_id`). One submitted intent and its receipt. The action identifier is the
@@ -125,8 +126,9 @@ proof of what both sides saw, and the owner's confirmation. See
 **Prompt generation.** Which prompt the root editor is at. It advances at every primary prompt, so
 a decision taken at one prompt cannot be replayed at the next.
 
-**Receipt.** The durable record of an action's state as it moves from `received` towards
-`applied`, `refused` or `rejected`, with a revision that only increases. See [Receipt
+**Receipt.** The record of an action's state as it moves from `received` towards `applied`,
+`refused` or `rejected`, with a revision that only increases. `received` is a transient
+acknowledgement of the connection and is never durable; the record is durable from `accepted`. See [Receipt
 states](README.md#receipt-states).
 
 **Right.** One permission a grant can carry, from the action-right vocabulary in
@@ -155,8 +157,9 @@ package and claims the root editor; `native_compat` runs the stock shell named a
 it.
 
 **Stream cursor** (`stream_cursor`). A position in one event stream. A client resumes from its
-cursor; one that fell behind its stream is answered `RESYNC_REQUIRED`, takes a new snapshot and
-resumes from the snapshot's cursor.
+cursor; one that fell behind its stream is sent the `session.resync` notification (or, when it
+continues a snapshot whose copy of the state has ended, is answered `RESYNC_REQUIRED`), takes a new
+snapshot and resumes from the snapshot's cursor.
 
 **Worker.** `kr-worker`, one process per session. It owns the pseudo-terminal, the root shell, the
 terminal state, the attachments, the input lease and the session's receipt journal. Nothing the
