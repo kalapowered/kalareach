@@ -494,21 +494,22 @@ async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
     // The binding's pass over its queue is stopped before it takes anything, so that how fast the
     // component reads and how fast events are offered decide nothing: the first delivery wakes the
     // pass, the case waits until it stands, and the events after it are held by the queue alone.
-    // Each event is 64 KiB, so sixty-five of them are already more than the 4 MiB the queue holds,
-    // and the limit only ends a queue that never overflows.
+    // Each event is 64 KiB, so as many as the queue's bound holds, and one more, overflow it; the
+    // case offers twice that, and the count only ends a queue that never overflows.
     let mut stop = served
         .host
         .runtime()
         .stop_next_pump(request.binding_id)
         .expect("the binding is live");
     let filler = "z".repeat(64 * 1024);
+    let fitting = kr_plugin_sdk::limits::OBSERVATION_QUEUE_BYTES / filler.len() as u64;
     let first = client
         .deliver(request.binding_id, &components::scrape("se-0", &filler))
         .await
         .expect("the event is offered");
     assert!(
         !matches!(first, Admission::QueuedWithGap { .. }),
-        "one observation of 64 KiB overflowed a 4 MiB queue"
+        "one observation of 64 KiB overflowed the queue"
     );
     assert!(
         tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
@@ -518,7 +519,7 @@ async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
     );
     let mut told = None;
     let mut seen: std::collections::BTreeMap<&'static str, u32> = std::collections::BTreeMap::new();
-    for index in 1..=130 {
+    for index in 1..=2 * fitting {
         let admission = client
             .deliver(
                 request.binding_id,
