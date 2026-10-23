@@ -43,6 +43,13 @@
 //! suspension, as the wall clock does) between two writes of output, and a reading taken after the
 //! wall clock gained more than [`FORWARD_STEP`] on the continuous one, and every reading after it,
 //! is recorded as unproven.
+//!
+//! The comparison needs the two clocks read as one moment. The caller reads the continuous clock,
+//! then the wall clock, and [`TimeIndex::note`] reads the continuous clock a second time: a sample
+//! whose two continuous reads are far apart was taken across a suspension of the host, which would
+//! show the next sample a step that did not happen. It is recorded as unproven, compared with
+//! nothing and not made the last sample, so the next one is compared with the last that was read
+//! as one moment, over a stretch both clocks counted alike.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -77,6 +84,11 @@ const ROWS_PER_STRETCH: usize = 10_000;
 /// rate the host's time service may adjust them by ([`kr_ipc::clock::RATE_ALLOWANCE_PPM`]), before
 /// the wall clock is taken to have stepped forward.
 pub const FORWARD_STEP: Duration = Duration::from_secs(2);
+
+/// How far apart the continuous clock may read on the two sides of a wall-clock reading for the two
+/// to be taken as read at one moment. A pause of a running thread is shorter than this, and a
+/// suspension of the host is longer.
+pub const READ_TOGETHER_WITHIN: Duration = Duration::from_secs(1);
 
 /// The most rows one answer carries.
 pub const MAX_ANSWER_ROWS: usize = 2048;
@@ -165,14 +177,56 @@ impl TimeIndex {
 
     /// Notes that `len` bytes of output were written at `start`, at the wall-clock reading `now_ms`.
     ///
+    /// `boot_before_ms` is the continuous clock read just before the wall clock was. A second read
+    /// is taken here, and where the two are further apart than [`READ_TOGETHER_WITHIN`] the host
+    /// was suspended between them, so the wall-clock reading is a lower bound all the same and is
+    /// recorded unproven, compared with nothing and not made the last reading.
+    ///
     /// It takes a lock held for nothing else and does no I/O. `proven` is whether the worker could
     /// prove its wall clock when it took the reading.
-    pub fn note(&self, start: u64, len: u64, now_ms: u64, proven: bool) {
-        self.note_at(start, len, now_ms, proven, kr_ipc::clock::boot_elapsed_ms());
+    pub fn note(&self, start: u64, len: u64, now_ms: u64, proven: bool, boot_before_ms: u64) {
+        self.note_bracketed(
+            start,
+            len,
+            now_ms,
+            proven,
+            boot_before_ms,
+            kr_ipc::clock::boot_elapsed_ms(),
+        );
+    }
+
+    /// [`Self::note`] with the second read of the continuous clock given.
+    fn note_bracketed(
+        &self,
+        start: u64,
+        len: u64,
+        now_ms: u64,
+        proven: bool,
+        boot_before_ms: u64,
+        boot_after_ms: u64,
+    ) {
+        let within = u64::try_from(READ_TOGETHER_WITHIN.as_millis()).unwrap_or(u64::MAX);
+        let paired = boot_after_ms.saturating_sub(boot_before_ms) <= within;
+        self.note_read(start, len, now_ms, proven, boot_before_ms, paired);
     }
 
     /// [`Self::note`] with the reading of the continuous clock the output was written at.
+    #[cfg(test)]
     fn note_at(&self, start: u64, len: u64, now_ms: u64, proven: bool, boot_ms: u64) {
+        self.note_read(start, len, now_ms, proven, boot_ms, true);
+    }
+
+    /// Notes output read at `now_ms` on the wall clock and `boot_ms` on the continuous one, which
+    /// `paired` says were read as one moment.
+    fn note_read(
+        &self,
+        start: u64,
+        len: u64,
+        now_ms: u64,
+        proven: bool,
+        boot_ms: u64,
+        paired: bool,
+    ) {
         if len == 0 {
             return;
         }
@@ -180,19 +234,21 @@ impl TimeIndex {
         let mut state = locked(&self.inner.state);
         // A wall clock that has gained on the continuous one is taken to have stepped forward, and
         // nothing after it is proven: every later reading is late by the step.
-        if let Some((wall, boot)) = state.last {
-            let boot_gain = boot_ms.saturating_sub(boot);
-            let slack = u64::try_from(FORWARD_STEP.as_millis())
-                .unwrap_or(u64::MAX)
-                .saturating_add(
-                    boot_gain.saturating_mul(kr_ipc::clock::RATE_ALLOWANCE_PPM) / 1_000_000,
-                );
-            if now_ms.saturating_sub(wall) > boot_gain.saturating_add(slack) {
-                state.stepped_forward = true;
+        if paired {
+            if let Some((wall, boot)) = state.last {
+                let boot_gain = boot_ms.saturating_sub(boot);
+                let slack = u64::try_from(FORWARD_STEP.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(
+                        boot_gain.saturating_mul(kr_ipc::clock::RATE_ALLOWANCE_PPM) / 1_000_000,
+                    );
+                if now_ms.saturating_sub(wall) > boot_gain.saturating_add(slack) {
+                    state.stepped_forward = true;
+                }
             }
+            state.last = Some((now_ms, boot_ms));
         }
-        state.last = Some((now_ms, boot_ms));
-        let proven = proven && !state.stepped_forward;
+        let proven = proven && paired && !state.stepped_forward;
         let held = state.rows + state.closed.len() + state.in_flight;
         let full = held + 1 >= MAX_ROWS;
         // Every limit on an interval doubles for each `ROWS_PER_STRETCH` rows held.
@@ -380,6 +436,28 @@ fn cursor(value: u64) -> Result<i64, String> {
 /// The suffix of the file an index is built in before it takes its name.
 const MAKING: &str = ".new";
 
+/// Removes what a worker killed part way through making the index file at `path` left: the file it
+/// was building beside the name, and the journal SQLite keeps for it.
+///
+/// The file with the name is never one of these, and nothing else names them. A worker that makes
+/// the index again starts over, and the collection of a closed session whose worker never did
+/// removes them here.
+///
+/// # Errors
+///
+/// Returns what could not be removed.
+pub fn remove_unfinished(path: &Path) -> Result<(), String> {
+    let building = beside(path, MAKING);
+    for left in [building.clone(), beside(&building, "-journal")] {
+        match std::fs::remove_file(&left) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", left.display())),
+        }
+    }
+    Ok(())
+}
+
 /// Makes the index file at `path` whole: its directory, and the file with its schema, built beside
 /// the name and moved to it, so that a file with the name has a version in it and is never half
 /// made. A worker killed part way leaves the file it was building, which the next one starts over.
@@ -390,14 +468,8 @@ fn make(path: &Path) -> Result<(), String> {
         kr_ipc::paths::create_private_directory(directory)
             .map_err(|error| format!("the index directory could not be made: {error}"))?;
     }
+    remove_unfinished(path)?;
     let building = beside(path, MAKING);
-    for left in [building.clone(), beside(&building, "-journal")] {
-        match std::fs::remove_file(&left) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", left.display())),
-        }
-    }
     {
         let connection = kr_flush::release::open_connection(&building, None)
             .map_err(|error| describe(&error))?;
@@ -696,8 +768,8 @@ mod tests {
     #[test]
     fn output_after_a_gap_has_a_row_of_its_own_and_the_gap_has_none() {
         let (index, path, _kept) = index("gap");
-        index.note(0, 4, 1_000, true);
-        index.note(100, 4, 2_000, true);
+        index.note_at(0, 4, 1_000, true, 5_000);
+        index.note_at(100, 4, 2_000, true, 5_000);
         index.flush().expect("writes");
         let read = read(&path, 0, 200, 16).expect("reads");
         let spans: Vec<_> = read.marks.iter().map(|m| (m.from, m.to, m.at_ms)).collect();
@@ -707,9 +779,9 @@ mod tests {
     #[test]
     fn a_clock_that_steps_back_or_changes_its_standing_opens_a_new_interval() {
         let (index, path, _kept) = index("step");
-        index.note(0, 4, 5_000, true);
-        index.note(4, 4, 4_000, true);
-        index.note(8, 4, 4_001, false);
+        index.note_at(0, 4, 5_000, true, 5_000);
+        index.note_at(4, 4, 4_000, true, 5_000);
+        index.note_at(8, 4, 4_001, false, 5_000);
         index.flush().expect("writes");
         let read = read(&path, 0, 12, 16).expect("reads");
         let rows: Vec<_> = read
@@ -730,8 +802,8 @@ mod tests {
     #[test]
     fn rows_before_the_oldest_retained_cursor_are_removed_at_the_next_write() {
         let (index, path, _kept) = index("prune");
-        index.note(0, 10, 1_000, true);
-        index.note(20, 10, 2_000, true);
+        index.note_at(0, 10, 1_000, true, 5_000);
+        index.note_at(20, 10, 2_000, true, 5_000);
         index.flush().expect("writes");
         index.forget_before(10);
         index.flush().expect("writes");
@@ -744,7 +816,7 @@ mod tests {
     fn a_read_pages_by_the_limit_and_says_where_it_stopped() {
         let (index, path, _kept) = index("pages");
         for step in 0..5_u64 {
-            index.note(step * 100, 10, 1_000 + step, true);
+            index.note_at(step * 100, 10, 1_000 + step, true, 5_000);
         }
         index.flush().expect("writes");
         let first = read(&path, 0, 1_000, 2).expect("reads");
@@ -766,7 +838,7 @@ mod tests {
     #[test]
     fn discarding_removes_the_file_and_what_was_noted() {
         let (index, path, _kept) = index("discard");
-        index.note(0, 10, 1_000, true);
+        index.note_at(0, 10, 1_000, true, 5_000);
         index.flush().expect("writes");
         assert!(path.exists());
         index.discard().expect("removes");
@@ -778,7 +850,7 @@ mod tests {
     #[test]
     fn a_failed_write_keeps_the_intervals_for_the_next() {
         let (index, path, _kept) = index("retry");
-        index.note(0, 10, 1_000, true);
+        index.note_at(0, 10, 1_000, true, 5_000);
         // A directory where the file belongs: the write cannot be made.
         std::fs::create_dir_all(&path).expect("makes the way impassable");
         assert!(index.flush().is_err());
@@ -918,6 +990,37 @@ mod tests {
     }
 
     #[test]
+    fn a_host_suspended_between_the_two_reads_of_one_sample_has_not_had_its_wall_clock_stepped() {
+        let (index, path, _kept) = index("suspended-between");
+        index.note_bracketed(0, 4, 1_000, true, 5_000, 5_001);
+        // The continuous clock was read, then the wall clock, then the host slept for an hour, and
+        // the continuous clock was read again: the two reads of this sample are an hour apart.
+        let hour = 3_600_000;
+        index.note_bracketed(4, 4, 2_000, true, 5_500, 5_500 + hour);
+        // The next sample is read as one moment after the sleep, and both clocks counted it.
+        index.note_bracketed(
+            8,
+            4,
+            1_000 + hour + 2_000,
+            true,
+            5_000 + hour + 2_000,
+            5_000 + hour + 2_001,
+        );
+        index.flush().expect("writes");
+        let rows: Vec<_> = read(&path, 0, 200, 16)
+            .expect("reads")
+            .marks
+            .iter()
+            .map(|m| (m.from, m.to, m.proven))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(0, 4, true), (4, 8, false), (8, 12, true)],
+            "the sample taken across the suspension is not proven, and the next is"
+        );
+    }
+
+    #[test]
     fn a_full_index_extends_an_interval_only_while_the_clock_has_not_stepped_back_or_changed() {
         let full = || {
             let (index, path, kept) = index("full");
@@ -974,7 +1077,7 @@ mod tests {
         let directory = path.parent().expect("a directory").to_path_buf();
         std::fs::create_dir_all(&directory).expect("makes the directory");
         std::fs::write(beside(&path, MAKING), b"part of a database").expect("the leftover");
-        index.note(0, 10, 1_000, true);
+        index.note_at(0, 10, 1_000, true, 5_000);
         index.flush().expect("writes");
         assert_eq!(read(&path, 0, 10, 4).expect("reads").marks.len(), 1);
         assert!(

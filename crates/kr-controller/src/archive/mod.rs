@@ -820,6 +820,12 @@ impl ArchiveService {
     /// Applies the output bounds that belong to the session: its age, on a clock the caller can
     /// prove, and its own cap, on any clock.
     fn collect_output(&self, session_id: SessionId, now_ms: TimestampMs, into: &mut Collected) {
+        // A worker killed while it made the session's time index left the file it was building,
+        // which nothing else names, and the session has no worker to make it again.
+        into.times_left_behind = kr_worker::output_times::remove_unfinished(
+            &self.paths.session_output_times(session_id),
+        )
+        .err();
         let directory = self.paths.session_spool(session_id);
         match directory.try_exists() {
             Ok(true) => {}
@@ -858,7 +864,10 @@ impl ArchiveService {
         into.output_bytes = taken.iter().map(|eviction| eviction.bytes).sum();
         into.output_retained = Some(history.retained_bytes());
         into.output_left_behind = history.left_behind().map(str::to_owned);
-        into.times_left_behind = history.flush_times().err();
+        into.times_left_behind = history
+            .flush_times()
+            .err()
+            .or_else(|| into.times_left_behind.take());
     }
 
     /// Gives up output of a closed session so that the host-wide cap holds, and returns how many

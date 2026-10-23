@@ -418,9 +418,16 @@ impl OutputHistory {
         if self.spool.as_ref().is_some_and(Spool::awaits_boundary) {
             self.try_resume();
         }
+        let boot_before = kr_ipc::clock::boot_elapsed_ms();
         let now = kr_ipc::now_ms();
         if let Some(times) = self.times.as_ref() {
-            times.note(start, bytes.len() as u64, now.get(), self.clock_proven);
+            times.note(
+                start,
+                bytes.len() as u64,
+                now.get(),
+                self.clock_proven,
+                boot_before,
+            );
         }
         let mut owed = None;
         if let Some(spool) = self.spool.as_mut() {

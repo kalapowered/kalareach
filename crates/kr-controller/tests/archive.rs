@@ -544,6 +544,31 @@ fn a_closed_sessions_output_past_seven_days_and_receipts_past_thirty_are_collect
 }
 
 #[test]
+fn a_time_index_a_killed_worker_left_half_made_is_removed_by_the_collection() {
+    // A worker killed while it made a session's time index leaves the file it was building, which
+    // nothing else names, and the session has no worker to make it again. Collecting the closed
+    // session removes it and what SQLite kept beside it.
+    let (_temp, archive) = host();
+    let session_id = closed_session_with_history(&archive, false);
+    let index = archive.paths().session_output_times(session_id);
+    std::fs::create_dir_all(index.parent().expect("a directory")).expect("the directory");
+    let building = index.with_extension("sqlite.new");
+    let journal = index.with_extension("sqlite.new-journal");
+    std::fs::write(&building, b"half made").expect("the file being built");
+    std::fs::write(&journal, b"its journal").expect("the journal beside it");
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    let ownership = archive
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
+        .expect("ownership");
+    let collected = archive
+        .collect(&ownership, kr_ipc::now_ms(), true)
+        .expect("collects");
+    assert_eq!(collected.times_left_behind, None, "{collected:?}");
+    assert!(!building.exists(), "the file being built is gone");
+    assert!(!journal.exists(), "and so is its journal");
+}
+
+#[test]
 fn a_closed_session_inside_its_retention_keeps_everything() {
     // The control for the test above: nothing is past either period, so nothing goes.
     let (_temp, archive) = host();
