@@ -1657,8 +1657,14 @@ command the shell integration answered for when it answered for exactly one and 
 process group's leader is running it, and otherwise of the executable the leader runs, once two
 looks in a row have found the same group. The leader runs the command when it is the command's own
 file, or when the command is a script and the leader is the interpreter that the script's first line
-names, started with the script as the argument after the interpreter's own; a program that only has
-the script's path among its arguments, as `tail` has when it reads one, does not run it. A wrapper
+names, started with the script as the argument after the interpreter's own. The leader is that
+interpreter when the executable it runs is the interpreter's file, and also when its first argument
+names the same file as the script's first line does. Both are judged by device and inode, and a
+relative first argument is read from the leader's working directory. The second case is there for
+macOS, where each `#!/bin/sh` script runs as `/bin/bash` and keeps `/bin/sh` as its first argument.
+The first argument is the process's own claim, so the name it gives is for display only, and nothing
+about authority is decided from it. A program that only has the script's path among its arguments,
+as `tail` has when it reads one, does not run it. A wrapper
 that replaces itself with another program is therefore named for the program, and a program run
 through an interpreter that was given no script to name is named by the interpreter. A session that
 has closed reports no state.
