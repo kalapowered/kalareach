@@ -467,9 +467,8 @@ async fn a_call_on_a_binding_nobody_registered_is_refused() {
 // KR-REQ-11.38: the queue's overflow is reported to the worker rather than hidden.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
-    // The slow component, so that the queue's bound is what decides this rather than the
-    // scheduler: a component that answered instantly could drain the events as fast as they were
-    // offered, and then nothing would overflow and the test would be measuring the machine.
+    // A component that reads slowly, as the claim is about one that does; what decides this is the
+    // queue's bound, because the pass that would read the queue is held while it is filled.
     let Some(wasm) = components::component("slow-observe") else {
         return;
     };
@@ -492,43 +491,56 @@ async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
         .await
         .expect("the binding registers");
 
-    // Delivered concurrently, the way a worker with a busy upstream would: one acknowledgement at a
-    // time would let the component drain each event before the next arrived, and then the queue
-    // would never fill. The bound is on what the queue holds, not on how patiently it is offered.
-    let client = Arc::new(client);
-    let filler = Arc::new("z".repeat(64 * 1024));
-    let mut delivering = tokio::task::JoinSet::new();
-    for index in 0..256 {
-        let client = Arc::clone(&client);
-        let filler = Arc::clone(&filler);
-        let binding_id = request.binding_id;
-        delivering.spawn(async move {
-            client
-                .deliver(
-                    binding_id,
-                    &components::scrape(&format!("se-{index}"), &filler),
-                )
-                .await
-        });
-    }
-    let mut gapped = false;
+    // The binding's pass over its queue is stopped before it takes anything, so that how fast the
+    // component reads and how fast events are offered decide nothing: the first delivery wakes the
+    // pass, the case waits until it stands, and the events after it are held by the queue alone.
+    // Each event is 64 KiB, so sixty-five of them are already more than the 4 MiB the queue holds,
+    // and the limit only ends a queue that never overflows.
+    let mut stop = served
+        .host
+        .runtime()
+        .stop_next_pump(request.binding_id)
+        .expect("the binding is live");
+    let filler = "z".repeat(64 * 1024);
+    let first = client
+        .deliver(request.binding_id, &components::scrape("se-0", &filler))
+        .await
+        .expect("the event is offered");
+    assert!(
+        !matches!(first, Admission::QueuedWithGap { .. }),
+        "one observation of 64 KiB overflowed a 4 MiB queue"
+    );
+    assert!(
+        tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+            .await
+            .expect("the binding's pass stands at the stop"),
+        "the stop was replaced before a pass reached it"
+    );
+    let mut told = None;
     let mut seen: std::collections::BTreeMap<&'static str, u32> = std::collections::BTreeMap::new();
-    while let Some(joined) = delivering.join_next().await {
-        let admission = joined
-            .expect("the delivery ran")
+    for index in 1..=130 {
+        let admission = client
+            .deliver(
+                request.binding_id,
+                &components::scrape(&format!("se-{index}"), &filler),
+            )
+            .await
             .expect("the event is offered");
         *seen.entry(admission_name(&admission)).or_insert(0) += 1;
         if let Admission::QueuedWithGap { events, bytes } = admission {
-            assert!(events > 0);
-            assert!(bytes > 0);
-            gapped = true;
+            told = Some((events, bytes));
+            break;
         }
     }
+    stop.release();
 
-    assert!(
-        gapped,
-        "the worker was never told the observation queue overflowed; the admissions were {seen:?}"
-    );
+    let (events, bytes) = told.unwrap_or_else(|| {
+        panic!(
+            "the worker was never told the observation queue overflowed; the admissions were {seen:?}"
+        )
+    });
+    assert!(events > 0);
+    assert!(bytes > 0);
 }
 
 // KR-REQ-05.07: a binding belongs to the connection that registered it, and to nothing else.
