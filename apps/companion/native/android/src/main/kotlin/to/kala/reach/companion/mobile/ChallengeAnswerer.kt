@@ -84,25 +84,46 @@ class ChallengeAnswerer(
             is PostResult.Unreachable -> ChallengeOutcome.Retry("unreachable")
             is PostResult.Status ->
                 when {
-                    sent.code in 200..299 -> {
-                        record.mark(registrationId.orEmpty(), PendingFile.ANSWERED, null, clock())
-                        ChallengeOutcome.Answered
-                    }
+                    sent.code in 200..299 ->
+                        if (marked(registrationId, PendingFile.ANSWERED, null)) {
+                            ChallengeOutcome.Answered
+                        } else {
+                            ChallengeOutcome.Retry("record_unwritable")
+                        }
                     // The gateway answered and will not take it, or is not able to now. The second
                     // is asked again inside the deadline; the first would be refused again.
                     sent.code == 408 || sent.code == 429 || sent.code >= 500 ->
                         ChallengeOutcome.Retry("status_${sent.code}")
-                    else -> {
-                        record.mark(registrationId.orEmpty(), PendingFile.REFUSED, "gateway_${sent.code}", clock())
+                    marked(registrationId, PendingFile.REFUSED, "gateway_${sent.code}") ->
                         ChallengeOutcome.GatewayRefused(sent.code)
-                    }
+                    else -> ChallengeOutcome.Retry("record_unwritable")
                 }
         }
     }
+
+    /**
+     * Moves the record of `registrationId` to `state`. A record that cannot be written is a try
+     * that is not over: the receiver must not fail because of it, and asks again.
+     */
+    private fun marked(registrationId: String?, state: String, reason: String?): Boolean =
+        try {
+            record.mark(registrationId.orEmpty(), state, reason, clock())
+            true
+        } catch (failure: IOException) {
+            false
+        }
 }
 
 /** What became of one message. */
 sealed interface ChallengeOutcome {
+    /**
+     * Whether the registration is over with this outcome, so that a retry kept for it is no longer
+     * wanted. A message that was ignored says nothing about the registration, and a try that must be
+     * asked again is not over.
+     */
+    val settles: Boolean
+        get() = false
+
     /** The message is not a registration challenge. */
     object NotAChallenge : ChallengeOutcome
 
@@ -110,10 +131,16 @@ sealed interface ChallengeOutcome {
     data class Ignored(val reason: String) : ChallengeOutcome
 
     /** The gateway took the answer. */
-    object Answered : ChallengeOutcome
+    object Answered : ChallengeOutcome {
+        override val settles: Boolean
+            get() = true
+    }
 
     /** The gateway answered and will not take it. The record says so. */
-    data class GatewayRefused(val status: Int) : ChallengeOutcome
+    data class GatewayRefused(val status: Int) : ChallengeOutcome {
+        override val settles: Boolean
+            get() = true
+    }
 
     /** The answer did not get there, or the gateway could not take it now: ask again. */
     data class Retry(val reason: String) : ChallengeOutcome
