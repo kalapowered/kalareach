@@ -14,7 +14,7 @@ use crate::service::Controller;
 use crate::service::net::tests::{daemon, setup, started, stopped};
 
 /// Records a worker of a session whose process has ended, as an earlier boot left it.
-async fn recorded_ended_worker(
+pub(super) async fn recorded_ended_worker(
     controller: &Controller,
     temp: &kr_ipc::testing::TempHost,
 ) -> SessionId {

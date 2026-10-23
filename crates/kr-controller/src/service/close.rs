@@ -558,7 +558,10 @@ impl Controller {
     /// Section 9's recovery rules are the worker's, and a worker that crashed never ran them. They
     /// run once here instead, before anything is served: a dispatch marker with no authoritative
     /// outcome becomes `unknown`, and an accepted intent with no marker is rejected. A failure is
-    /// not a reason to leave the session open, so the closure is still written.
+    /// not a reason to leave the session open, so the closure is still written. So is a worker
+    /// confirmed gone whose published endpoint cannot be removed: ownership is refused, nothing is
+    /// recovered and nothing the session owned is stopped, and the closure is written without
+    /// either, saying that nothing but the worker's end was accounted for.
     ///
     /// Section 7's second half comes before the session identity is released: whatever the session
     /// still owns is stopped, and what this host cannot account for is recorded. A closure written
@@ -609,8 +612,42 @@ impl Controller {
             return Ok(Some(existing));
         }
         let archive = self.archive();
-        let Ok(ownership) = archive.take_ownership(session_id, display_number, identity) else {
-            return Ok(None);
+        let ownership = match archive.take_ownership(session_id, display_number, identity) {
+            Ok(ownership) => ownership,
+            // The kernel confirmed the worker is gone, and the endpoint it published could not be
+            // removed. Nothing is recovered over a socket that is still there, and what the
+            // session owned is not looked for in a journal nothing has fenced, but the session
+            // does not stay open for it: the closure says that this host saw the worker end and
+            // accounted for nothing else, and the descriptor beside it is retired at every start.
+            Err(crate::archive::OwnershipRefusal::Unfenced { .. }) => {
+                let written = self
+                    .record_final(
+                        session_id,
+                        reason,
+                        identity,
+                        &crate::archive::Fenced::nothing(session_id),
+                        true,
+                    )
+                    .await;
+                return match written {
+                    Ok(closure) => Ok(Some(closure)),
+                    // The tail of a closure retires the descriptor, which is the file that could
+                    // not be removed. The closure is recorded before the tail, and stands.
+                    Err(error) => match self.registry.lock().await.closure(session_id)? {
+                        Some(closure) => {
+                            eprintln!(
+                                "kr-controller: the descriptor of the closed session {session_id} \
+                                 could not be removed: {error}; the next start removes it"
+                            );
+                            Ok(Some(closure))
+                        }
+                        None => Err(error),
+                    },
+                };
+            }
+            // Another recovery holds the session, the worker may be running, or the lock could not
+            // be taken: the session is left for the next look at it.
+            Err(_) => return Ok(None),
         };
         // After ownership is taken, so a worker that wrote its closure in its last moments is read.
         // The store is brought forward first, under the ownership just taken: every read below

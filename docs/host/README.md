@@ -3730,7 +3730,9 @@ process that was recorded (both the identifier and the start value, because the 
 identifiers), and only a confirmed ending is death. Then it removes the worker's published endpoint
 and descriptor, and only then is anything opened. An endpoint or a descriptor that is there and
 cannot be removed refuses the ownership, because a stale socket left beside a recovered journal is
-the state the fence is for; one that is already gone is fenced. A migration of a session's journal
+the state the fence is for; one that is already gone is fenced. A crashed session that meets that
+refusal is closed all the same, with nothing recovered and nothing it owned stopped, and its closure
+says that nothing but the worker's end was accounted for. A migration of a session's journal
 is a write and takes the same lock, and when another holds it the store is left as it is and read
 as unmigrated. The offline importer holds the environment's singleton lock instead, which no daemon
 can be running under.
