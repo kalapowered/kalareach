@@ -92,6 +92,36 @@ terminal. Those terminals are qualified on the terminal matrix hosts and virtual
 this report, so the result records each one as not run, with that reason, the report names each on
 its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
+### The classes of test in the landing workflow
+
+Section 21 names a tool for each class of test and asks for the tests' screenshots to be kept in
+`KR_TEST_ARTIFACTS_DIR` and collected into the CI artifact store. The landing workflow
+(`.github/workflows/core-ci.yml`) runs each class on a hosted runner that has its tool:
+
+| Class | Job | Runner | What runs |
+| --- | --- | --- | --- |
+| Browser behaviour | `companion` | `ubuntu-24.04`, `macos-15` | Playwright, in Chromium and WebKit, over the built interface |
+| Native controls of the desktop application | `companion` | `macos-15` | `scripts/desktop-controls-macos.sh` starts the release executable and, through System Events, chooses Minimize from the Window menu and Quit from the application menu, holding each to the state the window reports |
+| The iPhone | `ios` | `macos-15` | Xcode builds the application for the iOS Simulator without signing; `simctl` boots an iPhone, and the native library's cases and the application's start run in it |
+| The Android phone | `android-app` | `ubuntu-24.04` | Gradle packages the debug application; the SDK's emulator runs the native library's cases and the application's start |
+| Windows, Linux and macOS machines | `windows`, `rust`, `macos` | `windows-2025`, `ubuntu-24.04`, `macos-15` | each platform's own tests; the Windows job also links the desktop application's release executable |
+
+A job that drives a browser, a desktop or a phone writes its screenshots under
+`KR_TEST_ARTIFACTS_DIR` and uploads that directory: `companion-evidence-<runner>` for the browser
+and the desktop controls, `test-evidence-ios` and `test-evidence-android` for the phones.
+`scripts/check-test-evidence.sh` fails the browser job when it kept no screenshot there or left one
+named `kr-*.png` in the temporary directory.
+
+Three things stay outside the hosted workflow. Peekaboo's tests of a person's own macOS desktop run
+on the machines of the people who qualify a release, because they drive that desktop and the
+permissions it has granted. Parallels virtual machines run there too, since the hosted macOS
+runners offer no nested virtualisation; the hosted Windows and Linux runners stand in for those
+platforms in the workflow. The physical devices that section 21 requires for final push,
+background-audio and network-transition acceptance are the person's own, and no workflow starts
+them. The phone jobs run the x86_64 emulator and the arm64 simulator: the other Android
+architectures and the iOS device architecture are compiled and linted by the `android` and `ios`
+jobs and are not run.
+
 ## How a test names what it proves
 
 ### The identifiers
