@@ -228,6 +228,9 @@ mod readiness {
         // SAFETY: the descriptor is a duplicate made for this wait alone, and it moves into the
         // `AsyncFd`: nothing else holds its number, so it stays open and names the same socket
         // until the `AsyncFd` drops it, and an `OwnedFd` gives the same number on every call.
+        // Nothing swaps the descriptor out through `AsyncFd::get_mut` either: the one caller,
+        // `Readiness::of`, keeps the `AsyncFd` inside the `Readiness` that `Writable` holds
+        // behind an `Arc`, so no code ever has a mutable reference to it.
         unsafe { AsyncFd::register_with_interest(descriptor, Interest::WRITABLE) }
     }
 }
