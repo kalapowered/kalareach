@@ -62,8 +62,10 @@ if ! avd="$(kr_android_avd "$sdk/emulator/emulator")"; then
 fi
 
 say "building the application and its tests for the arm64 flavour"
+# The library is the one the application's own build left under `jniLibs`: Gradle's Rust task starts
+# the Tauri command line's own session, which a direct Gradle run has not got, so it is left out.
 ( cd "$project" && ./gradlew --console=plain :app:assembleArm64Debug :app:assembleArm64DebugAndroidTest \
-    -PabiList=arm64-v8a -ParchList=arm64 -PtargetList=aarch64 ) >"$artefacts/build.log" 2>&1 \
+    -x rustBuildArm64Debug -PabiList=arm64-v8a -ParchList=arm64 -PtargetList=aarch64 ) >"$artefacts/build.log" 2>&1 \
     || { tail -30 "$artefacts/build.log"; say "the build failed; see $artefacts/build.log"; exit 2; }
 apk="$project/app/build/outputs/apk/arm64/debug/app-arm64-debug.apk"
 tests="$project/app/build/outputs/apk/androidTest/arm64/debug/app-arm64-debug-androidTest.apk"
