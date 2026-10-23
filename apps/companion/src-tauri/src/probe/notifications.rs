@@ -183,10 +183,7 @@ async fn enable<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> bool
     let end = Instant::now() + ENABLED_WITHIN;
     let mut last = String::new();
     let mut steps = Vec::<String>::new();
-    loop {
-        let Some((_, state, words)) = standing(app) else {
-            break;
-        };
+    while let Some((_, state, words)) = standing(app) {
         let line = format!("{state}: {words}");
         if line != last {
             steps.push(line.clone());
