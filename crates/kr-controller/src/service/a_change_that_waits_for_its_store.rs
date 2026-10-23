@@ -1002,6 +1002,26 @@ async fn forgotten(controller: &Controller, sessions: &[SessionId]) {
     }
 }
 
+/// Waits until the create made under `token` has reserved its session, within the liveness bound.
+async fn until_a_create_has_reserved(controller: &Controller, actor_id: &ActorId, token: Uuid) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let reserved = controller
+                .registry
+                .lock()
+                .await
+                .reservation_for_token(actor_id, token)
+                .expect("a read");
+            if reserved.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the create reserves its session");
+}
+
 /// A create request for an invisible session.
 fn create_request(environment_id: EnvironmentId) -> MutationRequest {
     request(
@@ -1092,15 +1112,21 @@ async fn a_create_whose_admission_lapses_while_it_waits_for_the_record(lapse: La
     });
     arrival(arrived).await;
 
+    let token = mutation.action_id.get();
     let creating = tokio::spawn({
         let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
         async move {
             controller
                 .session_create(&actor_id, &mutation, carried)
                 .await
         }
     });
-    tokio::time::sleep(SETTLING).await;
+    // The create has reserved its session, which it does before it waits for the record. Where it
+    // falls between that and the wait when the admission lapses changes nothing, because the
+    // admission is asked after the wait, at the launch transition; a create that meets the lapse
+    // before it has reserved anything is refused before it reserves, and shows nothing of this.
+    until_a_create_has_reserved(&controller, &actor_id, token).await;
     assert!(!creating.is_finished(), "the create waits for the record");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
