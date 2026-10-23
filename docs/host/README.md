@@ -6305,29 +6305,35 @@ stopped for a reason of this host's own, such as a record it could not write dow
 stale, as an unreachable feed does. The revocations the carrier makes do not wake it, so a pass that
 failed waits out its backoff.
 
-In every pass, before it settles a record, the host compares the revision the feed holds for it
-with the registry's. A feed that is ahead means the registry, and the policy row and its copy with
-it, is an earlier state than one this host issued: a state directory put back from a copy, or one
-that is another host's. While the feed is ahead the host refuses every grant for an ingress other
-than the owner at the machine, an organisation's and a personal one alike, with
-`PERMISSION_DENIED` saying that it is catching up with its feed, and `kr doctor` says so. It
-carries out again each request the feed shows complete and the registry does not show withdrawn,
-and it does so in every pass, whatever the two counters say: a restore that stopped after it moved
-the counter has lost the withdrawal all the same. A request the feed holds that is not shown
-complete waits until the host has caught up, and is then judged on the registry as it stands, so the
-owner is not refused for the host's being behind. When the host has read the feed through it raises
-the registry to the feed's revision in one barrier that fences the workers and withdraws every
+In every pass, before it settles a record, the host compares the revision the feed holds for it with
+the registry's. A feed that is ahead means the registry, and the policy row and its copy with it, is
+an earlier state than one this host issued: a state directory put back from a copy, or one that is
+another host's. While the feed is ahead the host refuses every grant for an ingress other than the
+owner at the machine, an organisation's and a personal one alike, with `PERMISSION_DENIED` saying
+that it is catching up with its feed, and `kr doctor` says so. It carries out again each request the
+feed shows complete and the registry does not show withdrawn, each time a pass reads the record and
+whatever the two counters say: a restore that stopped after it moved the counter has lost the
+withdrawal all the same. It does so only for a request it could have carried out, which a device
+that may manage the host signed with the key the registry holds for it and the host did not refuse,
+because the feed judges nothing and could name any request as complete. A request the feed holds
+that is not shown complete waits until the host has caught up, and is then judged on the registry as
+it stands, in a scan of its own that is the synchronisation a connection waits for, so the owner is
+not refused for the host's being behind. When the host has read the feed through it raises the
+registry to the feed's revision in one barrier that fences the workers and withdraws every
 connection admitted under the earlier state. The next revision it issues is then above everything it
 issued, and it decides again. A pass that stops before the barrier leaves the refusal in force and
-the registry behind, and the next pass does the same again; nothing is stored for it. The comparison has limits. A host that is offline or
-reads no feed cannot see a restore. A restore to a point after the last revision the host issued
-to its feed is not seen, because the feed holds only what the host issued for its requests. A
-revocation the feed no longer retains is not carried out again. The feed's number is trusted as the
-check that a grant claims a revision this host never reached trusts it: a service that names a
-number above the truth can fence the host once and move its revision up, and gains no authority by
-it. And the comparison does not rebuild the policy row. Nothing outside the host holds its
-enrolments, its exclusive-management flag, its bound or its lease records, and the feed carries
-revocations and no policy, so once the host has caught up they are the restored ones.
+the registry behind, and the next pass does the same again; nothing is stored for it. The comparison
+has limits. A host that is offline or reads no feed cannot see a restore. A restore to a point after
+the last revision the host issued to its feed is not seen, because the feed holds only what the host
+issued for its requests. A revocation the feed no longer retains is not carried out again, and
+neither is one whose issuer the restored registry does not know, which cannot be checked: a restore
+to a point before an owner was paired loses what that owner revoked, and a request of that owner
+still waiting on the feed is refused. The feed's number is trusted as the check that a grant claims
+a revision this host never reached trusts it: a service that names a number above the truth can
+fence the host once and move its revision up, and gains no authority by it. And the comparison does
+not rebuild the policy row. Nothing outside the host holds its enrolments, its exclusive-management
+flag, its bound or its lease records, and the feed carries revocations and no policy, so once the
+host has caught up they are the restored ones.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says

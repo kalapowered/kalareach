@@ -891,6 +891,67 @@ async fn a_request_the_feed_holds_while_the_host_catches_up_is_carried_out_after
         .await;
 }
 
+/// KR-REQ-24.15: a request on a page the scan has left behind is judged before the feed counts as
+/// read. A scan of more than one pass puts requests off while the host is behind, and the scan
+/// that raises the registry is not the synchronisation a connection waits for: another begins,
+/// reads the feed from the first request put off, and judges them in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_on_an_earlier_page_is_carried_out_before_the_feed_counts_as_read() {
+    let Restorable { rig, kept, .. } = a_revocation_the_registry_will_lose().await;
+    rig.until_the_carrier_is_idle().await;
+    rig.runtime().read_at_most_pages(1);
+
+    // The owner's request naming the kept device is the first of the feed that is not complete.
+    // Others follow it, enough that the feed holds a second page of 64: the feed keeps a publisher
+    // to 32 of what the host has not finished with, so strangers publish most of them.
+    let request = rig.owner_publishes(0xb3, devices(kept.1.device_id)).await;
+    let unknown = |id: u8| {
+        devices(DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [id; 16],
+        )))
+    };
+    let strangers = [
+        AuthorisationKeyPair::generate().expect("a key"),
+        AuthorisationKeyPair::generate().expect("a key"),
+    ];
+    for id in 1..=65_u8 {
+        let (key, client) = match id {
+            1..=31 => (&rig.owner.authorisation, &rig.remote),
+            32..=63 => (
+                &strangers[0],
+                &client_for(rig.served.origin(), strangers[0].clone()),
+            ),
+            _ => (
+                &strangers[1],
+                &client_for(rig.served.origin(), strangers[1].clone()),
+            ),
+        };
+        client
+            .publish(rig.feed(), &rig.signed_by(key, id, unknown(id)), None)
+            .await
+            .expect("the feed stores the request");
+    }
+
+    // The registry falls behind the feed while the host runs.
+    rusqlite::Connection::open(rig.host.tree().environment().registry_database())
+        .expect("the registry opens")
+        .execute("UPDATE environment SET authority_revision = 0", [])
+        .expect("the counter is put back");
+    rig.poll().await;
+
+    let held = rig.held(&request).await;
+    assert_eq!(
+        held.acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "the request on the first page was carried out before the feed counted as read: {held:?}"
+    );
+    rig.connects_while_a_revocation_is_held(&kept.0, &kept.1)
+        .await;
+}
+
 /// A different request under an identity the host already applied is refused as superseded once
 /// the feed has dropped the original, and nothing it names is withdrawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

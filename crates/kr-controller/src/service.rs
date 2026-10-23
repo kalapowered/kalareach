@@ -1194,6 +1194,9 @@ mod a_floor_owed_its_record;
 mod a_feed_request_written_down_before_it_takes_effect;
 
 #[cfg(test)]
+mod a_completed_request_carried_out_again;
+
+#[cfg(test)]
 mod one_fence_for_one_debt;
 
 #[cfg(test)]
