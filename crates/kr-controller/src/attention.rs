@@ -657,6 +657,9 @@ pub struct AttentionModule {
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
+    /// The clock the leases of released session text are held to: the machine's continuous clock,
+    /// which this host's own tests replace with one they move by hand.
+    release_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     /// Held for the whole of one pass over the workflow journal, so the store is that journal's one
     /// reader whoever asks for a pass.
     automation_pass: std::sync::Mutex<()>,
@@ -794,6 +797,7 @@ impl AttentionModule {
             clock_owed: AtomicBool::new(false),
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
+            release_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
             automation_pass: std::sync::Mutex::new(()),
             automation_started: std::sync::OnceLock::new(),
             privacy: std::sync::OnceLock::new(),
@@ -815,6 +819,19 @@ impl AttentionModule {
             #[cfg(test)]
             decided_on: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Holds the leases of released session text to `clock`, which the daemon names, in place of
+    /// the machine's own.
+    #[must_use]
+    pub(crate) fn on_clock(mut self, clock: Arc<dyn kr_ipc::clock::SharedClock>) -> Self {
+        self.release_clock = clock;
+        self
+    }
+
+    /// The reading of the clock the leases of released session text are held to.
+    fn release_ms(&self) -> u64 {
+        self.release_clock.boot_elapsed_ms()
     }
 
     /// Returns true when this module serves the method.
@@ -1063,7 +1080,7 @@ impl AttentionModule {
             return read.value;
         };
         let fences = self.release.read().await;
-        if ticket.holds(&fences, kr_ipc::clock::boot_elapsed_ms()) {
+        if ticket.holds(&fences, self.release_ms()) {
             read.value
         } else {
             withheld
@@ -1144,8 +1161,7 @@ impl AttentionModule {
                 let standing = ticket.standing();
                 let may_write = || {
                     (!text_held
-                        || (standing.is_some()
-                            && ticket.holds_text(&fences, kr_ipc::clock::boot_elapsed_ms())))
+                        || (standing.is_some() && ticket.holds_text(&fences, self.release_ms())))
                         && lease.is_none_or(|lease| (lease.permitted)())
                 };
                 if begun {
@@ -1281,9 +1297,7 @@ impl AttentionModule {
         write: impl FnOnce() -> T,
     ) -> Option<T> {
         let fences = self.release.read().await;
-        ticket
-            .holds(&fences, kr_ipc::clock::boot_elapsed_ms())
-            .then(write)
+        ticket.holds(&fences, self.release_ms()).then(write)
     }
 
     /// Serves one read of this group, with the session text it carries and what releasing it
@@ -3901,6 +3915,7 @@ fn refusal_to_error(error: ProtocolError) -> ControllerError {
 pub(crate) mod tests {
     use std::time::Instant;
 
+    use kr_ipc::clock::SharedClock as _;
     use kr_ipc::framed::{FrameReader, FrameWriter};
     use kr_protocol::attention::{
         AttentionApprovalSlice, AttentionHostSlice, AttentionQuestionSlice, AttentionReadResult,
@@ -4176,6 +4191,21 @@ pub(crate) mod tests {
                 kr_ipc::identity::boot_identity().expect("a boot identity"),
             )
             .expect("the store opens"),
+        )
+    }
+
+    /// A module whose leases of released text are held to `clock`, which the test moves.
+    fn module_held_to(
+        temp: &kr_ipc::testing::TempHost,
+        clock: &kr_ipc::clock::ManualSharedClock,
+    ) -> Arc<AttentionModule> {
+        Arc::new(
+            AttentionModule::open(
+                &temp.environment(),
+                kr_ipc::identity::boot_identity().expect("a boot identity"),
+            )
+            .expect("the store opens")
+            .on_clock(Arc::new(clock.clone())),
         )
     }
 
@@ -5084,6 +5114,17 @@ pub(crate) mod tests {
         temp: &kr_ipc::testing::TempHost,
         display: u64,
     ) -> (FrameWriter, FrameReader) {
+        let (writer, far) = owner_connection_raw(temp, display).await;
+        let (reader, _) = kr_ipc::framed::split(far, StreamKind::Control);
+        (writer, reader)
+    }
+
+    /// As [`owner_connection`], with the far end as the connection itself, so that a test can read
+    /// bytes of a frame before the frame is whole.
+    async fn owner_connection_raw(
+        temp: &kr_ipc::testing::TempHost,
+        display: u64,
+    ) -> (FrameWriter, kr_ipc::endpoint::Connection) {
         let endpoint = temp
             .environment()
             .worker_endpoint(DisplayNumber::new(display))
@@ -5095,8 +5136,43 @@ pub(crate) mod tests {
             .expect("connects");
         let far = accepting.await.expect("accepted");
         let (_, writer) = kr_ipc::framed::split(near, StreamKind::Control);
-        let (reader, _) = kr_ipc::framed::split(far, StreamKind::Control);
-        (writer, reader)
+        (writer, far)
+    }
+
+    /// How long a test waits for what the writer of an answer does before it calls that a failure.
+    /// Nothing is decided by it: the waits are on conditions.
+    const WRITER_LIVENESS: Duration = Duration::from_secs(60);
+
+    /// Waits until a byte of the frame being written has reached the far end of its connection,
+    /// which is when the writer has put part of it there, and takes that byte.
+    ///
+    /// The answers these cases write are larger than a connection takes whole, so the writer is
+    /// then waiting for the reader, and nothing of the rest goes until the test reads on.
+    async fn until_part_of_it_has_gone(far: &mut kr_ipc::endpoint::Connection) {
+        use tokio::io::AsyncReadExt as _;
+        let mut byte = [0_u8; 1];
+        tokio::time::timeout(WRITER_LIVENESS, far.read_exact(&mut byte))
+            .await
+            .expect("part of the answer reaches the reader")
+            .expect("part of the answer reaches the reader");
+    }
+
+    /// Reads the far end of a connection to its end, and says how many bytes came.
+    async fn read_to_the_end(mut far: kr_ipc::endpoint::Connection) -> usize {
+        use tokio::io::AsyncReadExt as _;
+        let mut rest = Vec::new();
+        tokio::time::timeout(WRITER_LIVENESS, far.read_to_end(&mut rest))
+            .await
+            .expect("the connection ends")
+            .expect("the rest is read");
+        rest.len()
+    }
+
+    /// How many bytes the answer the cases below write is, framed.
+    fn whole_answer_bytes() -> usize {
+        FrameWriter::encode(StreamKind::Control, &answer_of(900 * 1024))
+            .expect("encodes")
+            .len()
     }
 
     /// KR-REQ-24.11: a statement is applied only from the link that speaks for its session and
@@ -5259,13 +5335,14 @@ pub(crate) mod tests {
         let assembled = assembling.await.expect("the read finishes");
         assert!(!assembled.ticket.is_empty(), "the answer carries live text");
 
-        // A delivery's ticket and an answer part way to its reader, from the same session.
-        let delivery = ticket(&[closing], 0, lease_from_now().get());
+        // A delivery's ticket and an answer part way to its reader, from the same session, with
+        // leases that cannot lapse by themselves.
+        let delivery = ticket(&[closing], 0, u64::MAX);
         assert_eq!(module.release_delivery(&delivery, || 1).await, Some(1));
-        let (mut partway, mut partway_reader) = owner_connection(&temp, 2).await;
+        let (mut partway, mut partway_far) = owner_connection_raw(&temp, 2).await;
         let writing = {
             let module = Arc::clone(&module);
-            let ticket = ticket(&[closing], 0, lease_from_now().get());
+            let ticket = ticket(&[closing], 0, u64::MAX);
             tokio::spawn(async move {
                 let written = module
                     .write_released(
@@ -5282,16 +5359,15 @@ pub(crate) mod tests {
                 written
             })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        until_part_of_it_has_gone(&mut partway_far).await;
         assert!(!writing.is_finished());
 
         module
             .session_closed(&Stub { unaccounted: true }, closing)
             .await;
-        let draining =
-            tokio::spawn(async move { partway_reader.read_message::<ControlFrame>().await });
+        let draining = tokio::spawn(read_to_the_end(partway_far));
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), writing)
+            tokio::time::timeout(WRITER_LIVENESS, writing)
                 .await
                 .expect("the write stops")
                 .expect("the write finishes")
@@ -5339,6 +5415,9 @@ pub(crate) mod tests {
     /// KR-REQ-24.11: an owner's answer partly written when the barrier rises is not finished: the
     /// next transport write is refused, and the caller ends the connection, so the reader never
     /// holds the whole answer.
+    ///
+    /// The barrier rises once part of the answer has reached the reader, and the lease of the text
+    /// is one that cannot lapse by itself, so how late the writer starts decides nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_owner_answer_partly_written_when_the_barrier_rises_is_cut() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -5353,11 +5432,11 @@ pub(crate) mod tests {
             },
         )
         .await;
-        let (mut writer, mut reader) = owner_connection(&temp, 1).await;
+        let (mut writer, mut far) = owner_connection_raw(&temp, 1).await;
         let released = Released {
             frame: answer_of(900 * 1024),
             withheld: Some(withheld()),
-            ticket: ticket(&[session_id], 0, lease_from_now().get()),
+            ticket: ticket(&[session_id], 0, u64::MAX),
         };
         let writing = {
             let module = Arc::clone(&module);
@@ -5369,21 +5448,24 @@ pub(crate) mod tests {
                 written
             })
         };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        until_part_of_it_has_gone(&mut far).await;
         assert!(!writing.is_finished(), "the reader has taken part of it");
 
         fence_raised(&module, session_id).await;
-        let reading = tokio::spawn(async move { reader.read_message::<ControlFrame>().await });
-        let written = tokio::time::timeout(Duration::from_secs(5), writing)
+        let reading = tokio::spawn(read_to_the_end(far));
+        let written = tokio::time::timeout(WRITER_LIVENESS, writing)
             .await
             .expect("the write stops")
             .expect("the write finishes");
         assert!(written.is_err(), "the answer is not finished");
-        let read = tokio::time::timeout(Duration::from_secs(5), reading)
+        let received = 1 + tokio::time::timeout(WRITER_LIVENESS, reading)
             .await
             .expect("the connection ends")
             .expect("the read finishes");
-        assert!(read.is_err(), "the reader never holds the whole answer");
+        assert!(
+            received < whole_answer_bytes(),
+            "the reader never holds the whole answer: {received} bytes came"
+        );
     }
 
     async fn fence_raised(module: &AttentionModule, session_id: SessionId) {
@@ -5439,10 +5521,14 @@ pub(crate) mod tests {
 
     /// KR-REQ-24.11: a lease that ends between two transport writes of one answer stops the
     /// second, and the answer is not finished.
+    ///
+    /// The lease is held to a clock the case moves, and moves once part of the answer has reached
+    /// the reader, so how late the writer starts decides nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_lease_that_ends_part_way_through_an_answer_stops_it() {
         let temp = kr_ipc::testing::TempHost::create();
-        let module = module(&temp);
+        let clock = kr_ipc::clock::ManualSharedClock::new();
+        let module = module_held_to(&temp, &clock);
         let session_id = SessionId::new(kr_ipc::new_uuid());
         set_fence(
             &module,
@@ -5453,8 +5539,8 @@ pub(crate) mod tests {
             },
         )
         .await;
-        let (mut writer, mut reader) = owner_connection(&temp, 1).await;
-        let until = kr_ipc::clock::boot_elapsed_ms() + RELEASE_MARGIN_MS + 400;
+        let (mut writer, mut far) = owner_connection_raw(&temp, 1).await;
+        let until = clock.boot_elapsed_ms() + RELEASE_MARGIN_MS + 400;
         let writing = {
             let module = Arc::clone(&module);
             tokio::spawn(async move {
@@ -5473,15 +5559,16 @@ pub(crate) mod tests {
                 written
             })
         };
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        until_part_of_it_has_gone(&mut far).await;
         // A writer the connection would not take more from waits for room where the platform parks
         // it, so the answer is still in hand once the lease has ended. Where a waiter polls, as it
         // does on Windows, it meets the lapse at its next poll and has already stopped.
         if cfg!(unix) {
             assert!(!writing.is_finished());
         }
-        let reading = tokio::spawn(async move { reader.read_message::<ControlFrame>().await });
-        let written = tokio::time::timeout(Duration::from_secs(5), writing)
+        clock.advance(Duration::from_millis(400 + 1));
+        let reading = tokio::spawn(read_to_the_end(far));
+        let written = tokio::time::timeout(WRITER_LIVENESS, writing)
             .await
             .expect("the write stops")
             .expect("the write finishes");
@@ -5495,14 +5582,15 @@ pub(crate) mod tests {
                     ..
                 })
             ),
-            "no byte went after the lease ended: {written:?}"
+            "the answer was not finished: {written:?}"
         );
+        let received = 1 + tokio::time::timeout(WRITER_LIVENESS, reading)
+            .await
+            .expect("the connection ends")
+            .expect("the read finishes");
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), reading)
-                .await
-                .expect("the connection ends")
-                .expect("the read finishes")
-                .is_err()
+            received < whole_answer_bytes(),
+            "the reader never holds the whole answer: {received} bytes came"
         );
     }
 
@@ -5557,10 +5645,14 @@ pub(crate) mod tests {
     /// KR-REQ-24.11: a delivery send is released one transport write at a time, and only while
     /// its text's ticket holds: not once the lease has ended, not while a transition is raised,
     /// and not once a later generation is recorded.
+    ///
+    /// The lease is held to a clock the case moves, and the tickets that must hold cannot lapse
+    /// by themselves, so how long the case takes between its steps decides nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_delivery_send_is_released_only_while_its_ticket_holds() {
         let temp = kr_ipc::testing::TempHost::create();
-        let module = module(&temp);
+        let clock = kr_ipc::clock::ManualSharedClock::new();
+        let module = module_held_to(&temp, &clock);
         let session_id = SessionId::new(kr_ipc::new_uuid());
         set_fence(
             &module,
@@ -5574,13 +5666,14 @@ pub(crate) mod tests {
         let short = ticket(
             &[session_id],
             0,
-            kr_ipc::clock::boot_elapsed_ms() + RELEASE_MARGIN_MS + 300,
+            clock.boot_elapsed_ms() + RELEASE_MARGIN_MS + 300,
         );
         assert_eq!(module.release_delivery(&short, || 1).await, Some(1));
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        clock.advance(Duration::from_millis(300 + 1));
         assert_eq!(module.release_delivery(&short, || 1).await, None);
 
-        let long = ticket(&[session_id], 0, lease_from_now().get());
+        let long = ticket(&[session_id], 0, u64::MAX);
+        assert_eq!(module.release_delivery(&long, || 1).await, Some(1));
         fence_raised(&module, session_id).await;
         assert_eq!(module.release_delivery(&long, || 1).await, None);
         set_fence(
