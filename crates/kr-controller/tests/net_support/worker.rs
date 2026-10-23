@@ -274,13 +274,23 @@ impl Worker {
 
     /// As [`Self::ask`], for a question that comes with `context` to decide it by.
     pub fn ask_with_context(&self, request: &str, context: &str) -> Question {
+        self.ask_from(request, context, "/bin/agent", "an agent")
+    }
+
+    /// As [`Self::ask`], for a question asked by the program at `executable`, which gives itself
+    /// the name `label`: the worker verifies the program, and nothing verifies the name.
+    pub fn ask_as(&self, request: &str, executable: &str, label: &str) -> Question {
+        self.ask_from(request, "the release is tagged", executable, label)
+    }
+
+    fn ask_from(&self, request: &str, context: &str, executable: &str, label: &str) -> Question {
         self.service
             .questions()
             .create(
                 &kr_worker::questions::VerifiedSource {
                     process: kr_ipc::identity::current_process_start_identity()
                         .expect("a process identity"),
-                    executable: Some("/bin/agent".to_owned()),
+                    executable: Some(executable.to_owned()),
                     session_member: true,
                     ancestry: true,
                     launch_channel: true,
@@ -289,7 +299,7 @@ impl Worker {
                 &QuestionCreateParams {
                     session_id: self.session_id,
                     request_id: request.to_owned(),
-                    agent_name: Nullable::some("an agent".to_owned()),
+                    agent_name: Nullable::some(label.to_owned()),
                     context: context.to_owned(),
                     question: format!("Publish the release ({request})?"),
                     kind: QuestionKind::Confirm,

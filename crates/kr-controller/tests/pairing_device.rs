@@ -20,6 +20,11 @@
 //! | `code` | `go-code`, then `code-done` | `code.png`: a code QR naming another service, which is a listener this suite owns; `connections.txt`: how many connections that listener has taken |
 //! | `confirm` | `go-confirm`, then `confirm-cancelled`, then `confirm-go` | `challenge.txt` once the host asks; `challenge-open.txt` once the cancelled prompt left it unanswered; `confirm-result.txt` with the record of the phone's answer |
 //! | `device` | `go-device` | `device-value.txt`: the value of a second device the host asks the phone to confirm; `device-result.txt` once the phone's answer paired it |
+//! | `seed` | `go-seed` | the host's attention store given an approval, a failed command and a completed turn, and a question asked by a program whose label imitates its verified identity; `seed-result.txt` says which session they are in |
+//! | `down` | `go-down` | the host ends, and says so with `done-down`; the phone reaches nothing until `up`. It can be asked again: the suite takes `go-down` away when it is done, and the script takes `done-down` away before it asks |
+//! | `up` | `go-up` | the host starts again on the same address, with every record it kept, and says so with `done-up`; asked again as `down` is |
+//! | `sent` | `go-sent` | `sent-result.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`) |
+//! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
@@ -42,8 +47,9 @@ use image::{GrayImage, ImageFormat};
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_pairing::grants::personal_owner_grant;
-use kr_protocol::confirmation::ConfirmationSubject;
-use kr_protocol::ids::{ConfirmationId, EnvironmentId, InvitationId};
+use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionSource};
+use kr_protocol::confirmation::{ConfirmationSubject, TransferControlSubject};
+use kr_protocol::ids::{ActionId, ConfirmationId, EnvironmentId, InvitationId, SessionId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairConfirmResult,
     PairInviteParams, PairInviteResult,
@@ -52,10 +58,11 @@ use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     CodeQrPayload, NetworkHint, QrPayload, RendezvousOrigin, group_verification_value,
 };
-use kr_protocol::scalars::{Nullable, SecretBytes32};
+use kr_protocol::scalars::{Nullable, SecretBytes32, U64};
+use kr_protocol::sharing::{GrantTransferParams, GrantTransferResult, SessionRole};
 use net_support::pairing::{self as calls, Signer};
-use net_support::worker::Adopted;
-use net_support::{Device, Host};
+use net_support::worker::{Adopted, Upstream, Worker};
+use net_support::{Device, Host, Stopped, holds, on_the_session, recipient, shared_as};
 
 /// How long the script is given to take each step the suite waits for.
 const STEP: Duration = Duration::from_secs(300);
@@ -63,6 +70,9 @@ const STEP: Duration = Duration::from_secs(300);
 /// The smallest side of a QR picture, in pixels: a poster in the emulator's scene and a photo in the
 /// simulator's library are read at their own resolution.
 const PICTURE: u32 = 1024;
+
+/// The text the phone's person writes as a draft in the session, which the agent there is later sent.
+const DRAFT: &str = "Check the release notes before tagging";
 
 /// The fixture's code invitation, whose code a phone's scanner reads. Only its origin is replaced.
 const FIXTURES: &str = include_str!("../../../fixtures/pairing/codes.json");
@@ -226,11 +236,29 @@ struct Run {
     /// The name the phone reaches the other service of the `code` phase by.
     service_peer: String,
     owner: DeviceKeys,
-    host: Host,
+    /// The daemon, while it runs: a phase that ends it takes it, and a phase that starts it again
+    /// puts the new one here.
+    host: tokio::sync::RwLock<Option<Host>>,
+    /// What the daemon left when it ended, for the one that starts on its records.
+    stopped: std::sync::Mutex<Option<Stopped>>,
+    /// The port the daemon's endpoint listens on, which its next start listens on again, since a
+    /// phone's record of the host names it.
+    port: std::sync::atomic::AtomicU16,
     environment: EnvironmentId,
+    /// The sessions' workers, which outlive a daemon that ends.
+    workers: Vec<Worker>,
+    /// What the agent in the first session was sent.
+    upstream: Arc<Upstream>,
 }
 
 impl Run {
+    /// The daemon, which a phase that runs while it is down finds missing.
+    async fn host(&self) -> tokio::sync::RwLockReadGuard<'_, Host> {
+        tokio::sync::RwLockReadGuard::map(self.host.read().await, |held| {
+            held.as_ref().expect("the daemon is running")
+        })
+    }
+
     fn say(&self, file: &str, text: &str) {
         write_private(&self.directory.join(file), text.as_bytes());
     }
@@ -273,7 +301,8 @@ impl Run {
         let end = Instant::now() + STEP;
         while Instant::now() < end {
             if let Some(record) = self
-                .host
+                .host()
+                .await
                 .network()
                 .pairing()
                 .rows()
@@ -306,7 +335,7 @@ impl Run {
     /// offered as `<name>.png`, and its text, for a phase that pastes it, is the first line of
     /// `secrets-<name>.txt`; the script says it is done with `<name>-done`.
     async fn control(&self, name: &str) {
-        let mut client = self.host.client().await;
+        let mut client = self.host().await.client().await;
         let client = &mut client;
         let invited = self.invite(client).await;
         let mut payload = payload_for(&invited, &self.peer);
@@ -345,7 +374,7 @@ impl Run {
     /// A direct invitation the phone scans: the host says the value it shows and approves the phone
     /// once the script says its value matched.
     async fn direct(&self) {
-        let mut client = self.host.client().await;
+        let mut client = self.host().await.client().await;
         let client = &mut client;
         let invited = self.invite(client).await;
         let payload = payload_for(&invited, &self.peer);
@@ -419,7 +448,7 @@ impl Run {
 
     /// The host asks for the confirmation of an invitation, and the phone, an owner device, answers.
     async fn confirm(&self) {
-        let mut client = self.host.client().await;
+        let mut client = self.host().await.client().await;
         let client = &mut client;
         let grant = personal_owner_grant();
         let challenge = calls::request(
@@ -492,9 +521,234 @@ impl Run {
         );
     }
 
+    /// The host's attention store is given an approval, a failed command and finished work, on a
+    /// session no worker serves, so that their cursors meet none the daemon reads; and a program in
+    /// the session the worker serves asks a question under a name that imitates what the worker
+    /// verified. The phase ends once the host's inbox holds all four, and says which session and
+    /// question they are.
+    async fn seed(&self) {
+        let elsewhere = SessionId::new(kr_ipc::new_uuid());
+        let at = kr_ipc::now_ms();
+        let events = [
+            kr_attention::SourceEvent::new(
+                kr_attention::EventCursor::in_session(elsewhere, AttentionSource::Receipts, 1),
+                at,
+                kr_attention::EventKind::ApprovalRequested {
+                    request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
+                        .expect("an identifier"),
+                    session_id: elsewhere,
+                    summary: "Allow the agent to write notes.txt".to_owned(),
+                },
+            ),
+            kr_attention::SourceEvent::new(
+                kr_attention::EventCursor::in_session(elsewhere, AttentionSource::Receipts, 2),
+                at,
+                kr_attention::EventKind::CommandCompleted {
+                    session_id: elsewhere,
+                    command: "cargo test".to_owned(),
+                    exit_code: 101,
+                },
+            ),
+            kr_attention::SourceEvent::new(
+                kr_attention::EventCursor::in_session(elsewhere, AttentionSource::Semantic, 1),
+                at,
+                kr_attention::EventKind::TurnCompleted {
+                    session_id: elsewhere,
+                    turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("an identifier"),
+                    version: 1,
+                    change_set: None,
+                    summary: "Renamed the parser's entry points".to_owned(),
+                },
+            ),
+        ];
+        self.host()
+            .await
+            .controller()
+            .attention()
+            .observe(&events)
+            .expect("the store records the three");
+        let question = self.workers[0].ask_as(
+            "r-1",
+            "/usr/local/bin/claude",
+            "claude (verified by KalaReach)",
+        );
+        let mut client = self.host().await.client().await;
+        let end = Instant::now() + STEP;
+        let mut rules = Vec::new();
+        while Instant::now() < end {
+            let read: AttentionReadResult = client
+                .request(
+                    Method::AttentionRead,
+                    &AttentionReadParams {
+                        session_id: Nullable::null(),
+                        include_acknowledged: false,
+                        max_items: U64::new(50),
+                        after: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("the inbox reads")
+                .to_typed()
+                .expect("decodes");
+            rules = read
+                .items
+                .iter()
+                .map(|item| item.rule.as_str().to_owned())
+                .collect();
+            if [
+                "attention.pending_approval",
+                "attention.command_failed",
+                "attention.review_ready",
+                "attention.pending_input",
+            ]
+            .iter()
+            .all(|wanted| rules.iter().any(|rule| rule == wanted))
+            {
+                self.say(
+                    "seed-result.txt",
+                    &format!(
+                        "session={}\nquestion={}\n",
+                        self.workers[0].session_id, question.question_id
+                    ),
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("the host's inbox never held the four kinds: {rules:?}");
+    }
+
+    /// The daemon ends, as the host being switched off does, and keeps what it would start from.
+    async fn down(&self) {
+        let host = self
+            .host
+            .write()
+            .await
+            .take()
+            .expect("the daemon is running");
+        *self.stopped.lock().expect("the record") = Some(host.shut_down().await);
+    }
+
+    /// The daemon starts again on the records it kept and the address it had, so that the phone's
+    /// record of the host still names it, and adopts the session its worker kept.
+    async fn up(&self) {
+        let stopped = self
+            .stopped
+            .lock()
+            .expect("the record")
+            .take()
+            .expect("the daemon was ended");
+        let mut settings = stopped.settings().clone();
+        let port = self.port.load(Ordering::SeqCst);
+        settings.endpoint.bind_addr = Some(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        let host = stopped.start(settings).await;
+        let end = Instant::now() + STEP;
+        loop {
+            let mut client = host.client().await;
+            let read = client
+                .request(
+                    Method::SessionRead,
+                    &kr_protocol::session::SessionReadParams {
+                        session_id: self.workers[0].session_id,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon");
+            if read.is_ok() {
+                break;
+            }
+            assert!(Instant::now() < end, "the daemon never reached the worker");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        *self.host.write().await = Some(host);
+    }
+
+    /// The draft the phone wrote reaches the agent in the session it was written for, once, after
+    /// the host came back.
+    async fn sent(&self) {
+        let end = Instant::now() + STEP;
+        while Instant::now() < end {
+            let prompts = self.upstream.prompts();
+            if prompts.iter().any(|prompt| prompt == DRAFT) {
+                // A second send would arrive a moment after the first.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let prompts = self.upstream.prompts();
+                self.say(
+                    "sent-result.txt",
+                    &format!(
+                        "prompts={} text={}\n",
+                        prompts.iter().filter(|prompt| *prompt == DRAFT).count(),
+                        DRAFT
+                    ),
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("the agent was never sent the draft");
+    }
+
+    /// A session an owner device gave to a second device is to be handed to a third: the host asks
+    /// the phone, an owner device, to confirm the hand-over, and once it has the host sends it.
+    async fn handover(&self) {
+        let host = self.host().await;
+        let session_id = self.workers[0].session_id;
+        let (giver, giver_record) = recipient(&host, &self.owner).await;
+        let (_taker, taker_record) = recipient(&host, &self.owner).await;
+        let (shared, _giving) =
+            shared_as(&host, session_id, &giver, &giver_record, SessionRole::Owner).await;
+        let from = shared.grant.grant_id;
+        let params = GrantTransferParams {
+            session_id,
+            from_grant_id: from,
+            to_device_id: taker_record.device_id,
+        };
+        let action = ActionId::new(kr_ipc::new_uuid());
+        let mut client = host.client().await;
+        let challenge = calls::request(
+            self.environment,
+            &mut client,
+            ConfirmationSubject::TransferControl(Box::new(TransferControlSubject {
+                params: params.clone(),
+                action_id: action,
+            })),
+        )
+        .await
+        .expect("the owner asks");
+        let id = challenge.request.confirmation_id;
+        self.say("handover-asked.txt", &format!("{id:?}\n"));
+        drop(host);
+        let record = self
+            .answered(id)
+            .await
+            .expect("the phone answered the challenge");
+        let host = self.host().await;
+        let done: GrantTransferResult = client
+            .mutate(
+                Method::GrantTransfer,
+                action,
+                on_the_session(&host, session_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner's confirmation is spent")
+            .to_typed()
+            .expect("decodes");
+        self.say(
+            "handover-result.txt",
+            &format!(
+                "answered {record}\nreceiver_holds={} giver_holds={}\n",
+                u8::from(holds(&host, done.replacement.grant_id)),
+                u8::from(holds(&host, from))
+            ),
+        );
+    }
+
     /// A second device redeems an invitation, and the host asks the phone to confirm it.
     async fn device(&self) {
-        let mut client = self.host.client().await;
+        let mut client = self.host().await.client().await;
         let client = &mut client;
         let invited = self.invite(client).await;
         let device = Device::create().await;
@@ -575,13 +829,32 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         workers,
     } = Adopted::start(1).await;
     let environment = host.environment_id;
+    // An agent is in the first session, so that a prompt written on the phone has a conversation to
+    // be written for and to be sent to.
+    let upstream = Arc::new(Upstream::default());
+    workers[0].register_agent(Arc::clone(&upstream));
+    // The daemon's address is where a phone that is paired with it dials it, so it is kept for a
+    // daemon that starts again.
+    let host_port = host
+        .network()
+        .network_config()
+        .expect("the host's configuration")
+        .direct_addresses
+        .first()
+        .and_then(|hint| hint.as_str().rsplit_once(':'))
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("the host names an address to dial");
     let run = Run {
         directory: directory.clone(),
         peer,
         service_peer,
         owner,
-        host,
+        host: tokio::sync::RwLock::new(Some(host)),
+        stopped: std::sync::Mutex::new(None),
+        port: std::sync::atomic::AtomicU16::new(host_port),
         environment,
+        workers,
+        upstream,
     };
     run.say(
         "ready.json",
@@ -595,20 +868,36 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         let connections = &connections;
         async move {
             let go = run.directory.join(format!("go-{name}"));
-            while !go.exists() {
-                if Instant::now() >= end || run.directory.join("finish").exists() {
+            // The host being switched off and on is asked for more than once: those two phases take
+            // their `go-` file away when they are done, and the script takes `done-` away before it
+            // asks again.
+            let again = matches!(name, "down" | "up");
+            loop {
+                while !go.exists() {
+                    if Instant::now() >= end || run.directory.join("finish").exists() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                match name {
+                    "control" | "paste" => run.control(name).await,
+                    "direct" => run.direct().await,
+                    "code" => run.code(connections, port).await,
+                    "confirm" => run.confirm().await,
+                    "seed" => run.seed().await,
+                    "down" => run.down().await,
+                    "up" => run.up().await,
+                    "sent" => run.sent().await,
+                    "handover" => run.handover().await,
+                    _ => run.device().await,
+                }
+                if !again {
+                    run.say(&format!("done-{name}"), "done\n");
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = std::fs::remove_file(&go);
+                run.say(&format!("done-{name}"), "done\n");
             }
-            match name {
-                "control" | "paste" => run.control(name).await,
-                "direct" => run.direct().await,
-                "code" => run.code(connections, port).await,
-                "confirm" => run.confirm().await,
-                _ => run.device().await,
-            }
-            run.say(&format!("done-{name}"), "done\n");
         }
     };
     tokio::join!(
@@ -617,9 +906,15 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         phase("code"),
         phase("confirm"),
         phase("device"),
-        phase("paste")
+        phase("paste"),
+        phase("seed"),
+        phase("down"),
+        phase("up"),
+        phase("sent"),
+        phase("handover")
     );
     accepting.abort();
-    run.host.stop().await;
-    drop(workers);
+    if let Some(host) = run.host.write().await.take() {
+        host.stop().await;
+    }
 }

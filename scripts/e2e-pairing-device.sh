@@ -26,6 +26,17 @@
 #                          confirmed, and the host spends that confirmation (KR-REQ-10.52). A second
 #                          device the host asks the phone to confirm is confirmed against the value
 #                          it shows (KR-REQ-10.37)
+#   the paired host       the host is given an approval, a failed command, finished work and a question
+#                          from a program whose name imitates the one the host verified: the inbox tells
+#                          the four apart, and the question's sheet names the verified program as the
+#                          asker and the name it gave itself as its own and not verified (KR-REQ-13.01,
+#                          11.61); the tabs list the host and its session and the settings open over it
+#                          and close to it (13.09); a draft is the same text in the conversation and the
+#                          terminal and is kept when the host is switched off, the inbox says the host is
+#                          out of contact, and the host switched on again at its address is sent the
+#                          draft once (13.03, 13.13, 13.01); the host asks the phone to confirm the
+#                          hand-over of a session to another device, which the phone shows by the role
+#                          and each kind of action and confirms with its ceremony (18.15)
 #
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build slot:
 #
@@ -160,7 +171,7 @@ PY
 
 # Starts the host, which reaches the phone as `peer`, and waits until it is up.
 start_harness() { # <peer> [<peer of the other service>]
-    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=1500 \
+    KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=2400 \
         "$harness_exe" --ignored --exact a_phone_scans_pairs_and_confirms_against_a_real_host --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
@@ -182,6 +193,13 @@ required_checks=(
     "the phone is paired"
     "cancelled: no connection"
     "accepted: one connection"
+    "the inbox tells an approval, a failure, finished work and a question apart"
+    "the question names the verified program and shows the name it gave itself as unverified"
+    "the tabs list the host and its session, and the settings open over a session and close to it"
+    "the draft is the same text in both views"
+    "the inbox shows the host as out of contact above what it last read from it"
+    "the draft was kept across the views and the host being out of contact, and sent once"
+    "the hand-over is shown with the role and each kind of action it allows"
 )
 # What only one platform's run shows: the scanner has a camera on the emulator and none on the
 # simulator, and the phone's ceremony is Face ID on one and the screen lock on the other.
@@ -196,6 +214,7 @@ if [ "$platform" = android ]; then
         "the host's request is cancelled at the prompt"
         "the host's request is confirmed with the screen lock"
         "a new device is confirmed against its value"
+        "the hand-over is confirmed with the screen lock and the session changes hands"
     )
 else
     platform_checks=(
@@ -204,6 +223,7 @@ else
         "the host's request is confirmed with Face ID"
         "a new device is confirmed against its value"
         "a pasted invitation was held through the system's paste question"
+        "the hand-over is confirmed with Face ID and the session changes hands"
     )
 fi
 
@@ -292,6 +312,24 @@ judge() { # <driver output>
     case "$result" in
         "answered channel=owner_device_presence"*) say "check=the host took the phone's presence for the new device ok=1" ;;
         *) say "check=the host took the phone's presence for the new device ok=0 detail=${result:-no record}"; bad=1 ;;
+    esac
+    result="$(host_file seed-result.txt)"
+    case "$result" in
+        "session="*"question="*) say "check=the host held an approval, a failed command, finished work and a question ok=1" ;;
+        *) say "check=the host held an approval, a failed command, finished work and a question ok=0 detail=${result:-no record}"; bad=1 ;;
+    esac
+    result="$(host_file sent-result.txt)"
+    if [ "$result" = "prompts=1 text=Check the release notes before tagging" ]; then
+        say "check=the agent was sent the draft once, after the host came back ok=1"
+    else
+        say "check=the agent was sent the draft once, after the host came back ok=0 detail=${result:-no record}"
+        bad=1
+    fi
+    result="$(host_file handover-result.txt)"
+    case "$result" in
+        "answered channel=owner_device_presence"*"receiver_holds=1 giver_holds=0")
+            say "check=the host took the phone's presence for the hand-over and the session changed hands ok=1" ;;
+        *) say "check=the host took the phone's presence for the hand-over and the session changed hands ok=0 detail=${result:-no record}"; bad=1 ;;
     esac
     result="$(host_file connections.txt)"
     if [ "$result" = "1" ]; then
