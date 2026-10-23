@@ -216,18 +216,21 @@ impl std::fmt::Display for PairingStopped {
 /// How a device paces and bounds its tries to enter a code the host has not attached for yet.
 #[derive(Clone, Copy, Debug)]
 pub struct Patience {
-    /// The pause between two tries: the host's own pause before it attaches to its room again. It
-    /// paces the tries and decides nothing; a try ends the wait by not being answered `HostGone`.
+    /// The pause before the second try, and twice that before the third, and so on: the device is
+    /// given five tries for a code, and spaced so, they cover fifteen times this pause. A host that
+    /// has not attached by then is reported as never attached, with how many tries the room
+    /// answered so. The pause paces the tries and decides nothing within them: each try ends the
+    /// wait by not being answered `HostGone`.
     pub pause: Duration,
-    /// How long the tries may take altogether, which only ends a leg whose tries are never
-    /// answered.
+    /// How long all the tries may take, each attempt and each pause included, which only ends a leg
+    /// whose tries are never answered.
     pub within: Duration,
 }
 
 impl Default for Patience {
     fn default() -> Self {
         Self {
-            pause: Duration::from_secs(1),
+            pause: Duration::from_secs(2),
             within: Duration::from_secs(60),
         }
     }
@@ -497,9 +500,10 @@ impl Device {
     /// `HostGone` after the host has answered, a refusal and every other stop is the answer, as
     /// it is. The device's own budget of attempts for the code is spent by each try, so the tries
     /// end when it is ([`PairingStopped::AttemptsSpent`] is reported as
-    /// [`PairingStopped::HostNeverAttached`] when an earlier try was answered so), and
-    /// `patience.within` ends a leg whose tries are never answered at all. Every `HostGone` is
-    /// printed, on success too, with how long after the first try it came.
+    /// [`PairingStopped::HostNeverAttached`] when an earlier try was answered so), spaced by
+    /// `patience.pause` doubling, and `patience.within` ends the whole of it, an attempt that is
+    /// never answered included. Every `HostGone` is printed, on success too, with how long after
+    /// the first try it came.
     ///
     /// # Errors
     ///
@@ -513,31 +517,40 @@ impl Device {
     ) -> Result<CodeExchange, PairingStopped> {
         let started = std::time::Instant::now();
         let mut times = 0_u32;
-        loop {
-            match self.enter_code(origin, code).await {
-                Err(PairingStopped::HostNotAttached) => {
-                    times += 1;
-                    eprintln!(
-                        "the room answered the first frame of try {times} with HostGone, {:?} \
-                         after the first try: no host was attached yet",
-                        started.elapsed()
-                    );
-                    if started.elapsed() + patience.pause > patience.within {
+        let mut pause = patience.pause;
+        let tries = async {
+            loop {
+                match self.enter_code(origin, code).await {
+                    Err(PairingStopped::HostNotAttached) => {
+                        times += 1;
+                        eprintln!(
+                            "the room answered the first frame of try {times} with HostGone, \
+                             {:?} after the first try: no host was attached yet",
+                            started.elapsed()
+                        );
+                        tokio::time::sleep(pause).await;
+                        pause = pause.saturating_mul(2);
+                    }
+                    Err(PairingStopped::AttemptsSpent) if times > 0 => {
                         return Err(PairingStopped::HostNeverAttached {
                             times,
                             over: started.elapsed(),
                         });
                     }
-                    tokio::time::sleep(patience.pause).await;
+                    answered => return answered,
                 }
-                Err(PairingStopped::AttemptsSpent) if times > 0 => {
-                    return Err(PairingStopped::HostNeverAttached {
-                        times,
-                        over: started.elapsed(),
-                    });
-                }
-                answered => return answered,
             }
+        };
+        match tokio::time::timeout(patience.within, tries).await {
+            Ok(answered) => answered,
+            Err(_) if times > 0 => Err(PairingStopped::HostNeverAttached {
+                times,
+                over: started.elapsed(),
+            }),
+            Err(_) => Err(PairingStopped::Room(format!(
+                "no try was answered within {:?}",
+                patience.within
+            ))),
         }
     }
 

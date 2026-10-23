@@ -306,7 +306,13 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
     // The right code, through the same room.
     let mut exchange = runtime
         .block_on(first.enter_code_once_the_host_is_attached(&origin, &code, &Patience::default()))
-        .unwrap_or_else(|stopped| panic!("the right code: {stopped}"));
+        .unwrap_or_else(|stopped| {
+            panic!(
+                "the right code: {stopped}; the invitation: {}; the host's daemon said: {}",
+                host.kr_json(&["pair", "status", &invitation_id]),
+                host.daemon_said()
+            )
+        });
     let candidate = runtime
         .block_on(first.finish(&mut exchange))
         .unwrap_or_else(|why| panic!("pair.finish: {why}"));
