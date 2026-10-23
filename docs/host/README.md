@@ -6459,12 +6459,15 @@ it, is an earlier state than one this host issued: a state directory put back fr
 that is another host's. While the feed is ahead the host refuses every grant for an ingress other
 than the owner at the machine, an organisation's and a personal one alike, with
 `PERMISSION_DENIED` saying that it is catching up with its feed, and `kr doctor` says so. It
-carries out again each request the feed shows complete, which withdraws nothing it had already
-withdrawn, and when it has read the feed through it raises the registry to the feed's revision in
-one barrier that fences the workers and withdraws every connection admitted under the earlier
-state. The next revision it issues is then above everything it issued, and it decides again. A pass
-that stops before the barrier leaves the refusal in force and the registry behind, and the next pass
-does the same again; nothing is stored for it. The comparison has limits. A host that is offline or
+carries out again each request the feed shows complete and the registry does not show withdrawn,
+and it does so in every pass, whatever the two counters say: a restore that stopped after it moved
+the counter has lost the withdrawal all the same. A request the feed holds that is not shown
+complete waits until the host has caught up, and is then judged on the registry as it stands, so the
+owner is not refused for the host's being behind. When the host has read the feed through it raises
+the registry to the feed's revision in one barrier that fences the workers and withdraws every
+connection admitted under the earlier state. The next revision it issues is then above everything it
+issued, and it decides again. A pass that stops before the barrier leaves the refusal in force and
+the registry behind, and the next pass does the same again; nothing is stored for it. The comparison has limits. A host that is offline or
 reads no feed cannot see a restore. A restore to a point after the last revision the host issued
 to its feed is not seen, because the feed holds only what the host issued for its requests. A
 revocation the feed no longer retains is not carried out again. The feed's number is trusted as the

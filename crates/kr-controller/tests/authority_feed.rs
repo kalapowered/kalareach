@@ -820,6 +820,77 @@ async fn a_host_whose_registry_stands_at_its_feed_is_not_behind_it() {
     rig.doctor_as(&session).await.expect("the device is served");
 }
 
+/// KR-REQ-24.15: a registry whose revision stands at the feed's but which lost a withdrawal the
+/// feed shows complete is no less restored. A restore that stopped after it moved the revision, or
+/// a copy taken at a revision the host reached again by other means, leaves the counter where the
+/// feed's is and the withdrawal undone, so the host carries out again what the feed shows complete
+/// and the registry does not show done, whatever the counter says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registry_whose_revision_stands_at_the_feed_but_lost_a_withdrawal_carries_it_out_again() {
+    let Restorable {
+        rig,
+        revoked,
+        kept,
+        earlier,
+        revision,
+    } = a_revocation_the_registry_will_lose().await;
+
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute(
+                    "UPDATE environment SET authority_revision = ?1",
+                    [i64::try_from(revision.get()).expect("a small revision")],
+                )
+                .expect("the counter is moved to the feed's");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+
+    // Out before the handshake is over, or refused on its first request: never served.
+    rig.connects_while_a_revocation_is_held(&revoked.0, &revoked.1)
+        .await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the device that was not revoked is served");
+}
+
+/// KR-REQ-24.15: a request the owner published while the host catches up with its feed is judged
+/// once the host has: it is not refused for the host's being behind, which is no fault of the
+/// request, and it is not carried out on a registry the host is about to raise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_feed_holds_while_the_host_catches_up_is_carried_out_after_it_has() {
+    let Restorable {
+        rig, kept, earlier, ..
+    } = a_revocation_the_registry_will_lose().await;
+    // Published before the host stops, and read by the pass that follows the restore.
+    let request = rig.owner_publishes(0xb2, devices(kept.1.device_id)).await;
+
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+
+    let held = rig.held(&request).await;
+    assert!(
+        held.rejected.0.is_none(),
+        "the owner's request is not refused for the host's being behind: {held:?}"
+    );
+    assert_eq!(
+        held.acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "the host carried the request out: {held:?}"
+    );
+    rig.connects_while_a_revocation_is_held(&kept.0, &kept.1)
+        .await;
+}
+
 /// A different request under an identity the host already applied is refused as superseded once
 /// the feed has dropped the original, and nothing it names is withdrawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -546,9 +546,10 @@ decides which to use. If the host is running on the local computer, it will rece
 `device.revoke` method from native code. It will reply with an acknowledgement containing the state
 of its dispatch barrier. Revoking one device leaves this computer's own connection admitted. A
 revision of the whole host withdraws it: a change to the rights ceiling, to the organisation or to
-the membership leases, a start that finds a fence still owed, or a revocation that names more than
-one notice can carry. The host refuses every request on a connection it admitted before such a
-change, so the revocation is sent over a connection it admits then. If the host is any other host
+the membership leases, a start that finds a fence still owed, a host that catches up with its
+authority feed after a restore, or a revocation that names more than one notice can carry. The host
+refuses every request on a connection it admitted before such a change, so the revocation is sent
+over a connection it admits then. If the host is any other host
 that the local computer owns, it will receive the revocation over the authority feed. Native code
 signs a request using the local computer's authorisation key and publishes it to the sync service.
 The host reads the authority feed when a device connects and then again every 30 seconds. When it
