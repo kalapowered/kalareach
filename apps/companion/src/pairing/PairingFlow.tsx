@@ -784,13 +784,13 @@ function HostNotifications({
         : (row?.words ?? '')
   return (
     <div className="host-notifications" data-testid="host-notifications" data-state={state}>
-      <p
-        className="small muted"
-        data-testid="notifications-words"
-        role={state === 'needs_attention' ? undefined : 'status'}
-      >
-        {words}
-      </p>
+      {/* One live region for every state, so a change from a step to a stop is announced: a node
+          that changes its role as its words change is not. Politely, since nothing is wrong. */}
+      <div role="status">
+        <p className="small muted" data-testid="notifications-words">
+          {words}
+        </p>
+      </div>
       {state === 'off' || state === 'needs_attention' ? (
         <div className="row wrap">
           <Button
