@@ -24,6 +24,7 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,6 +66,9 @@ struct ReceiverState {
     /// How many times the system was asked, and how many times the permission was read.
     asked: usize,
     permission_reads: usize,
+    /// Whether a question about the permission is never answered, as when the application ends
+    /// in the middle of it.
+    permission_hangs: bool,
     /// The provider's token, once the provider has made one.
     token: Option<String>,
     /// Reads of the token that say there is none yet, before there is one.
@@ -88,6 +92,7 @@ impl Receiver {
                 when_asked: Permission::Granted,
                 asked: 0,
                 permission_reads: 0,
+                permission_hangs: false,
                 token: Some(token.to_owned()),
                 reads_without_a_token: 0,
                 changed: false,
@@ -115,9 +120,15 @@ impl Receiver {
 impl Native for Receiver {
     fn permission(&self) -> PushFuture<'_, Permission> {
         Box::pin(async move {
-            let mut state = self.state.lock().expect("the receiver");
-            state.permission_reads += 1;
-            Ok(state.permission)
+            let hangs = {
+                let mut state = self.state.lock().expect("the receiver");
+                state.permission_reads += 1;
+                state.permission_hangs
+            };
+            if hangs {
+                std::future::pending::<()>().await;
+            }
+            Ok(self.state.lock().expect("the receiver").permission)
         })
     }
 
@@ -365,18 +376,44 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
         pair(&phone, other, owner, &[ActionRight::SessionView]).await;
     }
     let device = phone.companion.device();
+    let registered = Arc::new(Mutex::new(Registered::default()));
+    let opened = open_over(phone.data.path(), &device, &receiver, &registered);
+    Desk {
+        desk: opened.desk,
+        receiver,
+        gateway: opened.gateway,
+        registered,
+        device,
+        clock_ahead_ms: opened.clock_ahead_ms,
+        _phone: phone,
+    }
+}
+
+/// A desk opened over the record in `data`, with a gateway of its own and a clock that can be set
+/// ahead: what the application opens each time it starts.
+struct Opened {
+    desk: Arc<PushDesk>,
+    gateway: Arc<Gateway>,
+    clock_ahead_ms: Arc<AtomicU64>,
+}
+
+fn open_over(
+    data: &Path,
+    device: &Arc<Device>,
+    receiver: &Arc<Receiver>,
+    registered: &Arc<Mutex<Registered>>,
+) -> Opened {
     let gateway = Arc::new(Gateway {
         proposed: Mutex::new(Vec::new()),
     });
-    let registered = Arc::new(Mutex::new(Registered::default()));
     let http = Arc::clone(&gateway);
     let clock_ahead_ms = Arc::new(AtomicU64::new(0));
     let ahead = Arc::clone(&clock_ahead_ms);
     let desk = PushDesk::open(
-        phone.data.path(),
-        Arc::clone(&device),
-        Arc::clone(&receiver) as Arc<dyn Native>,
-        Arc::new(HostLink(Arc::clone(&registered))),
+        data,
+        Arc::clone(device),
+        Arc::clone(receiver) as Arc<dyn Native>,
+        Arc::new(HostLink(Arc::clone(registered))),
         Wiring {
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
@@ -384,14 +421,10 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
         || {},
     )
     .expect("the desk opens");
-    Desk {
+    Opened {
         desk,
-        receiver,
         gateway,
-        registered,
-        device,
         clock_ahead_ms,
-        _phone: phone,
     }
 }
 
@@ -645,4 +678,60 @@ async fn a_look_the_application_makes_by_itself_never_asks_the_system_for_permis
         .expect("the person asks again");
     phone.until_words("off for this app").await;
     assert_eq!(asked(&phone), 2);
+}
+
+/// KR-REQ-16.16: the platform clears its note that the token changed when it is asked, so a change
+/// the application has found must not be lost with the application. Here the application ends
+/// after it has taken the change and before the run it started has written anything, and the
+/// next start registers the new token: the person is told the registration was cut short, and the
+/// look that follows a minute later registers the token the provider holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_change_found_before_the_application_ended_is_registered_at_the_next_start() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    // The provider gives another token and the application takes the change. The run it starts is
+    // held at its first question to the platform, so it writes nothing before the application ends.
+    phone.receiver.with(|state| state.permission_hangs = true);
+    phone.receiver.token_changed_to(SECOND_TOKEN);
+    phone.desk.refresh().await;
+
+    // The next start, over the same record, with a platform that no longer says the token changed.
+    let restarted_receiver = Receiver::new(SECOND_TOKEN);
+    let restarted = open_over(
+        phone._phone.data.path(),
+        &phone.device,
+        &restarted_receiver,
+        &phone.registered,
+    );
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention,
+        "the host is still shown as on with a token the gateway does not know"
+    );
+    restarted
+        .clock_ahead_ms
+        .fetch_add(2 * 60 * 1000, Ordering::SeqCst);
+    restarted.desk.refresh().await;
+    tokio::time::timeout(WATCHDOG, async {
+        while restarted.desk.view().hosts[0].state != PushState::On {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the host was registered again");
+    assert_eq!(
+        restarted
+            .gateway
+            .proposed
+            .lock()
+            .expect("the proposals")
+            .as_slice(),
+        [SECOND_TOKEN],
+        "the token the provider holds is the one registered"
+    );
 }
