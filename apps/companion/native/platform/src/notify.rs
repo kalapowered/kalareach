@@ -43,11 +43,6 @@ struct TokenAnswer {
 }
 
 #[derive(Deserialize)]
-struct ChangedAnswer {
-    changed: bool,
-}
-
-#[derive(Deserialize)]
 struct RecordAnswer {
     record: Option<PendingRegistration>,
 }
@@ -125,18 +120,6 @@ pub async fn token<R: Runtime>(app: &AppHandle<R>) -> Result<Option<String>, Pla
     call::<R, TokenAnswer>(app, "pushToken", ())
         .await
         .map(|answer| answer.token)
-}
-
-/// Whether the provider gave this installation another token since the last time this was asked.
-/// Asking clears it.
-///
-/// # Errors
-///
-/// Returns an error when the platform cannot be asked, and on a computer.
-pub async fn token_changed<R: Runtime>(app: &AppHandle<R>) -> Result<bool, PlatformError> {
-    call::<R, ChangedAnswer>(app, "pushTokenChanged", ())
-        .await
-        .map(|answer| answer.changed)
 }
 
 /// Replaces the record of the registration being waited for, which supersedes the one before.

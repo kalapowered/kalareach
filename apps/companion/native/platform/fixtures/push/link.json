@@ -11,7 +11,6 @@
     "pushPermission",
     "pushAskPermission",
     "pushToken",
-    "pushTokenChanged",
     "pushPendingSet",
     "pushPendingGet",
     "pushPendingClear",
