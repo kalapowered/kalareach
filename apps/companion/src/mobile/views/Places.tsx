@@ -137,10 +137,13 @@ export function MobileSessions({
               where: session.cwd,
               // The application in the foreground comes first, as it does in the desktop's list. A
               // stock shell is labelled wherever the session is listed.
-              detail:
-                session.shell_mode === 'native_compat'
-                  ? `${applicationName(session)} · ${describeSessionState(session.state, session.attachment_count)} · Stock shell`
-                  : `${applicationName(session)} · ${describeSessionState(session.state, session.attachment_count)}`,
+              detail: [
+                applicationName(session),
+                describeSessionState(session.state, session.attachment_count),
+                session.shell_mode === 'native_compat' ? 'Stock shell' : null
+              ]
+                .filter((part) => part !== null)
+                .join(' · '),
               tone: session.state === 'live' ? 'success' : session.state === 'closed' ? 'muted' : 'warning'
             }))
           })

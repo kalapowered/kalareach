@@ -3821,6 +3821,7 @@ function sessions(): SessionListResult {
     sessions: [
       {
         ...base,
+        application: 'Claude Code',
         application_state: 'awaiting_approval',
         attachment_count: '2',
         cwd: '/Users/rs/work/kalareach',
@@ -3830,6 +3831,7 @@ function sessions(): SessionListResult {
       },
       {
         ...base,
+        application: 'Codex',
         application_state: 'agent_busy',
         attachment_count: '1',
         cwd: '/Users/rs/work/kalareach-web',

@@ -65,13 +65,17 @@ export function freshnessNote(described: Described | undefined): string | null {
 }
 
 /**
- * The application in the foreground of a session, in words: a root shell at its prompt is the
- * shell, and anything else the host reports is an agent.
+ * The application in the foreground of a session, in words, or null when there is none to name.
+ *
+ * The host names the application it sees in the foreground, and a root shell at its prompt is the
+ * shell. A closed session has no foreground and so no application. A program the host knows no name
+ * for has none shown: the host's silence is not turned into a guess about what is running.
  */
-export function applicationName(session: SessionListResult['sessions'][number]): 'Shell' | 'Agent' {
-  return session.application_state === null || session.application_state === 'shell_ready'
-    ? 'Shell'
-    : 'Agent'
+export function applicationName(session: SessionListResult['sessions'][number]): string | null {
+  if (session.state === 'closed') return null
+  const named = session.application?.trim() ?? ''
+  if (named.length > 0) return named
+  return session.application_state === 'shell_ready' ? 'Shell' : null
 }
 
 /** A directory's own name: its last component, which every host can say of a session. */
