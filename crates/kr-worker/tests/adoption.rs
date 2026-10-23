@@ -12,7 +12,6 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise equally well is adopted by neither, and the one left is selected; a package with no connector table adopts and binds what it recognises |
-//! | KR-REQ-12.24 | a package of another publisher does not take a program from a shipped package by naming it, by a rule that declares itself exact or by one that names a location |
 
 #![cfg(unix)]
 
