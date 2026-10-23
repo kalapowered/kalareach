@@ -95,7 +95,7 @@ wait_for() {
     until "$@"; do
         if [ $(($(date +%s) - started)) -gt "$deadline" ]; then
             printf 'android-app-launch: FAIL: gave up waiting for %s\n' "$what" >&2
-            [ -z "${last_reason:-}" ] || printf 'android-app-launch: the last attempt said: %s\n' "$last_reason" >&2
+            [ -z "${mount_answers:-}" ] || printf 'android-app-launch: the page check answered:%s\n' "$mount_answers" >&2
             exit 1
         fi
         sleep 1
@@ -180,11 +180,17 @@ say "page title: $title"
 # document that loaded and whose script failed has a title and an address and nothing in its root.
 # The page is asked, over the debugging protocol on the forwarded port (a WebSocket, which Python's
 # own library has no client for: the handshake and one text frame each way are written here),
-# whether its root has children and its body has text. The whole exchange, the listing, the
-# handshake and every frame read, has one deadline of 20 seconds, so that a page that keeps sending
-# events cannot hold a single attempt past the wait that calls it.
+# whether its root has children and its body has text. One connection is kept for the whole wait and
+# asked once a second, because the web view's debugging socket takes a connection that ends without
+# a closing frame badly, and a page that is still starting is asked again and not reconnected to.
+# The wait is the one the other waits have, and the whole exchange has that deadline, so a page that
+# keeps sending events cannot hold it past its end. Every distinct answer of a failed wait is
+# printed.
+mount_answers=""
+started_at=$(date +%s)
 interface_mounted() {
-    last_reason="$(python3 -I - "$port" 2>&1 << 'PYTHON'
+    local answer status
+    answer="$(python3 -I - "$port" "$deadline" 2>&1 << 'PYTHON'
 import base64
 import json
 import os
@@ -195,7 +201,7 @@ import time
 import urllib.request
 
 port = int(sys.argv[1])
-limit = time.monotonic() + 20
+limit = time.monotonic() + int(sys.argv[2])
 
 
 def refuse(reason):
@@ -206,8 +212,18 @@ def refuse(reason):
 def remaining():
     left = limit - time.monotonic()
     if left <= 0:
-        raise OSError("the exchange ran out of time")
+        raise OSError("the wait ran out of time")
     return left
+
+
+def mask_frame(opcode, payload):
+    mask = os.urandom(4)
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    if len(payload) < 126:
+        header = bytes([0x80 | opcode, 0x80 | len(payload)])
+    else:
+        header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", len(payload))
+    return header + mask + masked
 
 
 # The forwarded port is on this machine: no proxy, whatever the machine's settings say.
@@ -230,6 +246,7 @@ expression = (
     " return JSON.stringify({ children: root ? root.childElementCount : -1,"
     " text: document.body ? document.body.innerText.trim().length : 0 }); })()"
 )
+last = "the page was not asked"
 try:
     connection = socket.create_connection(("127.0.0.1", port), timeout=remaining())
     key = base64.b64encode(os.urandom(16)).decode()
@@ -250,18 +267,6 @@ try:
     if not head.startswith(b"HTTP/1.1 101"):
         refuse(f"the handshake was answered {head[:200]!r}")
 
-    payload = json.dumps(
-        {"id": 1, "method": "Runtime.evaluate", "params": {"expression": expression, "returnByValue": True}}
-    ).encode()
-    mask = os.urandom(4)
-    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-    if len(payload) < 126:
-        header = bytes([0x81, 0x80 | len(payload)])
-    else:
-        header = bytes([0x81, 0x80 | 126]) + struct.pack(">H", len(payload))
-    connection.settimeout(remaining())
-    connection.sendall(header + mask + masked)
-
     def take(count):
         global buffer
         while len(buffer) < count:
@@ -273,30 +278,46 @@ try:
         taken, buffer = buffer[:count], buffer[count:]
         return taken
 
+    asked = 0
     while True:
-        first, second = take(2)
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack(">H", take(2))[0]
-        elif length == 127:
-            length = struct.unpack(">Q", take(8))[0]
-        frame = take(length)
-        if first & 0x0F != 1:
-            continue
-        message = json.loads(frame)
-        if message.get("id") != 1:
-            continue
+        asked += 1
+        payload = json.dumps(
+            {"id": asked, "method": "Runtime.evaluate", "params": {"expression": expression, "returnByValue": True}}
+        ).encode()
+        connection.settimeout(remaining())
+        connection.sendall(mask_frame(1, payload))
+        while True:
+            first, second = take(2)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", take(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", take(8))[0]
+            frame = take(length)
+            if first & 0x0F != 1:
+                continue
+            message = json.loads(frame)
+            if message.get("id") == asked:
+                break
         answer = message.get("result", {}).get("result", {})
         if "value" not in answer:
             refuse(f"the page answered {json.dumps(message)[:300]}")
         value = json.loads(answer["value"])
         if value["children"] > 0 and value["text"] > 0:
+            connection.sendall(mask_frame(8, struct.pack(">H", 1000)))
             sys.exit(0)
-        refuse(f"the page's root holds {value['children']} elements and its body {value['text']} characters of text")
+        last = f"the page's root held {value['children']} elements and its body {value['text']} characters of text"
+        time.sleep(min(1, remaining()))
 except (OSError, ValueError, KeyError, TypeError) as error:
-    refuse(f"the debugging exchange failed: {type(error).__name__}: {error}")
+    refuse(f"the debugging exchange failed: {type(error).__name__}: {error}; the last answer: {last}")
 PYTHON
 )"
+    status=$?
+    case "$mount_answers" in
+        *"$answer"*) ;;
+        *) mount_answers="$mount_answers $(($(date +%s) - started_at))s: $answer;" ;;
+    esac
+    return "$status"
 }
 wait_for "the interface to have drawn into the document's root" interface_mounted
 
