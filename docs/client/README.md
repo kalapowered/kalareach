@@ -1337,17 +1337,44 @@ key (`POST /api/account/organisations/{id}/lease`, with the account's token for 
 .../policy-authority`). `ServiceClients::membership_leases` holds it and counts under account login.
 
 `organisation::LeaseKeeper` uses it. It presents the lease to the host with `membership.present` as
-the first thing on a connection, because the host refuses a device whose grant answers to an
-organisation every other method until it holds a lease, and no lease survives a host's restart. It
-then asks again on the interval the service advises, held between one and five minutes, so a renewal
+the first thing on a connection made through `HostLink::connect_paired`, because the host refuses a
+device whose grant answers to an organisation every other method until it holds a lease, and no
+lease survives a host's restart. The application's own connection to the host keeps the lease: it
+asks again on the interval the service advises, held between one and five minutes, so a renewal
 reaches the host before the lease it replaces ends. A lease signed by a key revision the keeper has
 not carried before travels with the chain of keys.
 
+The keeper holds the lease the host last took. A connection made beside the application's own (the
+pairing's confirmation, an owner's confirmation, the settings listing) presents that lease again,
+and the service is asked for another only when the host refuses it, as a host does that restarted or
+whose clock has passed the lease's end. The standing links the companion opens to a host's sessions
+use `connect_paired_transport`, present nothing, and rely on the lease the application's own
+connection keeps. The companion keeps one keeper for each host, and makes another when the
+organisation, the device's key or the account differs, or when the person forgets the host.
+
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
-service answers. A lease that has ended, or that the host installed before its restart, is asked for
-again at once. A service that is down, a host clock in doubt and a delay the service names are waited
-out. The keeper stops, and says why (`LeaseStop`), when the account is not signed in or is not a
-member, or when the host refuses the lease for a reason only an administrator can change.
+service answers. A lease that has ended, that the host installed before its restart, or that a newer
+lease replaced, is asked for again at once. A service that is down, a host clock in doubt and a delay
+the service names are waited out, and no failure makes the keeper ask the service more than once a
+minute while it keeps a lease. A delay of more than ten seconds is not waited out inside a
+connection, which is given twenty: the connection ends with `LeaseStop::Later` and the delay. A
+chain the host does not accept, and a token the service rejects, are tried three times before the
+keeper stops, because nothing says whether time mends them; the token source renews a token as it
+nears its end and has no renewal on demand. The keeper stops, and says why (`LeaseStop`), when no
+account is signed in (`SignIn`), when the service no longer takes the sign-in (`TokenRefused`), when
+the account is not a member, or when the host refuses the lease for a reason only an administrator
+can change.
+
+A stop is remembered, so that a device the organisation removed does not send a request at every
+reconnect: the service allows an account a hundred and twenty lease requests an hour, shared with its
+other devices. After a stop that an administrator mends (`NotAMember`, `Refused`, `Unusable`) a
+connection fails at once with the same stop and sends nothing for five minutes; after `TokenRefused`
+or `Unreachable` for a minute; after `Later` for the delay the service named, an hour at most.
+`SignIn` and the end of a connection are not remembered: the first made no request, and the second
+needs none.
+
+A personal grant on an exclusively managed host needs a lease too and names no organisation, so the
+keeper does not serve it. The host's local owner presents with `kr organisation present`.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of

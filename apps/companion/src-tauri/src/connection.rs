@@ -496,10 +496,12 @@ pub async fn keep<R, A, F>(
                 if let Some(first) = first.take() {
                     let _ = first.send(());
                 }
-                // The lease is kept for as long as the connection lasts. When something only a
-                // person can mend stops it, the connection says so and ends, and the next attempt
-                // presents the lease first and says the same until it is mended.
-                let refresh = leased.and_then(|host| {
+                // The lease is kept for as long as the connection lasts, in this task: when the
+                // person chooses another host or forgets this one, the task ends and the lease is
+                // no longer kept. When something only a person can mend stops it, the connection
+                // says so and ends, and the next attempt presents the lease first and says the
+                // same until it is mended.
+                let leased = leased.and_then(|host| {
                     let device = state.device().ok()?;
                     let desk = device.leases()?.clone();
                     let key = *device
@@ -508,26 +510,35 @@ pub async fn keep<R, A, F>(
                         .paired_identity(host.device_id)
                         .authorisation
                         .public();
-                    let (app, session) = (app.clone(), Arc::clone(&session));
-                    Some(tauri::async_runtime::spawn(async move {
-                        let stopped = desk.keep(&session, &host, key).await;
-                        if let Some(stopped) = stopped
-                            && stopped != LeaseStop::ConnectionEnded
-                        {
-                            let state = app.state::<AppState>();
-                            if state.disconnected_for(choice, stopped.to_string()) {
-                                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
-                            }
-                            session.close();
-                        }
-                    }))
+                    Some((desk, host, key))
                 });
                 // A connection that did not last is not a recovery: a host that accepts and then
                 // closes is waited for as one that does not answer.
                 backoff.connected();
-                forward_events(app.clone(), session, environment_id, events).await;
-                if let Some(refresh) = refresh {
-                    refresh.abort();
+                let ended =
+                    forward_events(app.clone(), Arc::clone(&session), environment_id, events);
+                tokio::pin!(ended);
+                if let Some((desk, host, key)) = leased {
+                    let kept = desk.keep(&session, &host, key);
+                    tokio::select! {
+                        () = &mut ended => {}
+                        stopped = kept => {
+                            if let Some(stopped) = stopped {
+                                // A connection whose lease is not kept is let go, so the next one
+                                // presents it first. One the host ended needs no word to the person.
+                                if stopped != LeaseStop::ConnectionEnded
+                                    && state.disconnected_for(choice, stopped.to_string())
+                                {
+                                    let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                                }
+                                session.close();
+                            }
+                            // The connection is closed or closing, and ends the way any does.
+                            ended.await;
+                        }
+                    }
+                } else {
+                    ended.await;
                 }
             }
             Attempt::Failed(error) => {

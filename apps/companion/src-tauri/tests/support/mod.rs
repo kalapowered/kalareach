@@ -1144,6 +1144,15 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         })
     }
 
+    fn present_membership<'a>(
+        &'a self,
+        session: &'a kr_client::session::Session,
+        host: &'a kr_client::pairing::paired::PairedHost,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+    ) -> kr_client::pairing::BoxFuture<'a, Result<(), kr_client::pairing::link::LinkError>> {
+        self.own.present_membership(session, host, identity)
+    }
+
     fn hold<'a>(
         &'a self,
         network: &'a kr_protocol::pairing::NetworkConfig,

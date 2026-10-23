@@ -732,7 +732,7 @@ impl Pairing {
             }
             // Whether the host bound the finish is unknown; asking is how to find out, on a
             // connection of its own.
-            Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+            Err(LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Membership(_)) => {
                 drop(preauth);
                 drop(connection);
                 return self.await_approval(pending, None, progress).await;
@@ -903,7 +903,11 @@ impl Pairing {
                             answered = Some(Err(LinkError::Refused(refusal)));
                         }
                         // The look took time, so the next step is planned from when it ended.
-                        Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+                        Err(
+                            LinkError::Lost(_)
+                            | LinkError::Configuration(_)
+                            | LinkError::Membership(_),
+                        ) => {
                             looked = true;
                             continue;
                         }
@@ -953,7 +957,9 @@ impl Pairing {
                         Shown::protocol(&refusal),
                     ));
                 }
-                Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+                Err(
+                    LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Membership(_),
+                ) => {
                     // The connection is gone; it is let go of before the wait, not after.
                     drop(held.take());
                     fresh_failed = 0;
@@ -1655,7 +1661,7 @@ fn step_failed(error: &PairingError, tries: Option<u32>) -> PairingFailure {
 fn link_failed(error: &LinkError, tries: Option<u32>) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, false),
-        LinkError::Lost(_) => FailureKind::HostUnreachable,
+        LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
         LinkError::Configuration(_) => FailureKind::DidNotFinish,
     };
     PairingFailure::new(kind, error.said()).with_tries(tries)
