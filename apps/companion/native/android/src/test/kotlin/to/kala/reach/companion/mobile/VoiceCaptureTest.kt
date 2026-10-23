@@ -10,8 +10,8 @@ import org.junit.Test
  * What the microphone's state means for authority.
  *
  * KR-REQ-15.36 and KR-ACC-014: muted or unavailable capture is displayed, and a claim that
- * unreceived speech authorised an action is rejected. KR-REQ-15.13: an action that needs a
- * confirmation on the unlocked screen does not proceed without one.
+ * unreceived speech authorised an action is rejected. The gate also refuses an action that needs
+ * a confirmation on the unlocked screen while the phone holds none.
  */
 class VoiceCaptureTest {
     private val notCapturing = listOf(
@@ -64,8 +64,10 @@ class VoiceCaptureTest {
     }
 
     /**
-     * KR-REQ-15.13: the five unlocked-screen classes need the confirmation, and an open microphone
-     * is not a substitute for it.
+     * KR-REQ-15.13, the need for a confirmation: the five unlocked-screen classes need the
+     * confirmation, and an open microphone is not a substitute for it. The gate takes the
+     * confirmation as held or not held, so the signature over the action hash is not shown here: the
+     * ceremony tests show it.
      */
     @Test
     fun an_unlocked_screen_action_needs_its_confirmation() {
