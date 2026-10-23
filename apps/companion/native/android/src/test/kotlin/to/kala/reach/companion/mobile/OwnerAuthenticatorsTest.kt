@@ -8,7 +8,13 @@ class OwnerAuthenticatorsTest {
     private val android10 = 29
     private val android11 = 30
 
-    /** A phone asks a strong biometric first, and the screen lock where it can. */
+    /**
+     * KR-REQ-10.06, the ceremony the phone asks for: a strong biometric first, with the screen lock
+     * as its fallback from Android 11, the screen lock alone on a phone with no strong biometric,
+     * and nothing on a phone with neither. Not shown here: the ceremony running, a synthesised
+     * desktop click refused as proof of presence, and the host recording the verification and the
+     * challenge's consumption.
+     */
     @Test
     fun a_strong_biometric_is_asked_with_the_screen_lock_as_its_fallback_from_android_11() {
         assertEquals(
@@ -24,7 +30,13 @@ class OwnerAuthenticatorsTest {
         )
     }
 
-    /** Before Android 11 nothing weaker than a strong biometric is asked. */
+    /**
+     * KR-REQ-10.06, the ceremony the phone asks for before Android 11: only a strong biometric on a
+     * locked phone. The screen lock alone is not asked, since naming it would admit weak biometrics,
+     * and a strong biometric on a phone with no lock is not asked either. Not shown here: the
+     * ceremony running, a synthesised desktop click refused as proof of presence, and the host
+     * recording the verification and the challenge's consumption.
+     */
     @Test
     fun before_android_11_only_a_strong_biometric_on_a_locked_phone_is_asked() {
         assertEquals(
