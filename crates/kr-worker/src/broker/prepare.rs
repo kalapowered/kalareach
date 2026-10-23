@@ -1056,7 +1056,8 @@ mod tests {
         assert!(calls.unchanged_since(epoch));
         calls.set(None);
         assert!(!calls.unchanged_since(epoch));
-        assert!(calls.unchanged_since(calls.published().epoch));
+        let now = calls.published().epoch;
+        assert!(calls.unchanged_since(now));
     }
 
     /// KR-REQ-24.27: what the runtime says when it will not ask a component to prepare an action
