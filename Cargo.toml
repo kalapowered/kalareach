@@ -264,7 +264,7 @@ tokio-util = "=0.7.18"
 # The rendezvous room's WebSocket. The client opens it on a TLS stream it has already verified, and
 # `ring` is the digest provider every other TLS user here is built on.
 tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "getrandom", "ring"] }
-tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.3", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
 # Where a text can be cut without cutting a character a person sees: the end of a generated
 # activity line that ran out of room.
