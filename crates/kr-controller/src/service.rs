@@ -1110,12 +1110,6 @@ impl Controller {
         &self.backup
     }
 
-    /// The managed service clients this daemon holds.
-    #[must_use]
-    pub const fn service_clients(&self) -> &kr_client::services::ServiceClients {
-        &self.clients
-    }
-
     /// What carries the backup outbox to the managed storage service, when this host selects one.
     #[must_use]
     pub const fn backup_runtime(&self) -> Option<&crate::backup::runtime::BackupRuntime> {

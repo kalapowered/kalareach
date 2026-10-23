@@ -1,11 +1,14 @@
-//! The managed service clients this daemon holds for its whole life.
+//! The managed service clients this daemon holds for its whole life, built in one place.
 //!
 //! One function builds them, from the configuration document the daemon read when it started, the
-//! host's account and the host's keys: the account the host signs in with, the relay lease
-//! service, the storage and backup manifest clients its carrier uploads through, and the managed
-//! inference broker. Each module that calls a service takes its client from the set this builds,
-//! and `kr doctor` says which of them the set holds. A fork that points a service at its own
-//! infrastructure changes this function and nothing else.
+//! host's account and the host's keys: the storage and backup manifest clients its carrier uploads
+//! through, the relay lease service, and the managed inference broker. The carrier, the relay lease
+//! keeper and the voice actions take their client from the set, and `kr doctor` says which of the
+//! four services a host can hold the set has a client of. The account slot is a view of the account
+//! the host signs in with, which keeps a client of its own for its sign-in, and the clients of the
+//! authority feed, the mailbox and delivery are built where those start, from their own
+//! configuration. A fork that points one of the services at its own infrastructure changes this
+//! function.
 //!
 //! What stays out is a client that fixes a signer or an account for one operation: the owner's
 //! setup of the backups signs the bundle with a key made for that write and enrols the writer with

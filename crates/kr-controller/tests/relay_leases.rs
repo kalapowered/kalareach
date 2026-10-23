@@ -853,7 +853,7 @@ async fn an_allowance_that_is_spent_is_shown_to_the_owner_and_asked_again() {
     assert_eq!(shown.status, DoctorStatus::Warning);
     assert!(shown.detail().contains("allowance"), "{}", shown.detail());
     // Entitlement explains what a call is answered and decides nothing else: the host still holds
-    // its lease client, and the account says nothing of it.
+    // its lease client, whatever the account's entitlement says.
     let services = rig.check_named("managed-services").await;
     assert!(
         services.detail().contains("relay leases: configured"),
