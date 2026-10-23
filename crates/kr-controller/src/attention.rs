@@ -5146,8 +5146,10 @@ pub(crate) mod tests {
     /// Waits until a byte of the frame being written has reached the far end of its connection,
     /// which is when the writer has put part of it there, and takes that byte.
     ///
-    /// The answers these cases write are larger than a connection takes whole, so the writer is
-    /// then waiting for the reader, and nothing of the rest goes until the test reads on.
+    /// One byte shows that the writer has started and can no longer withdraw the frame. That it is
+    /// then waiting for the reader rests on the answers these cases write being larger than what a
+    /// connection takes whole at its default buffer sizes, which the cases do not set: each checks
+    /// at the end, by the bytes that came, that the reader never held the whole answer.
     async fn until_part_of_it_has_gone(far: &mut kr_ipc::endpoint::Connection) {
         use tokio::io::AsyncReadExt as _;
         let mut byte = [0_u8; 1];
@@ -5374,7 +5376,11 @@ pub(crate) mod tests {
                 .is_err(),
             "the rest of the answer does not go"
         );
-        let _ = draining.await;
+        let received = 1 + draining.await.expect("the read finishes");
+        assert!(
+            received < whole_answer_bytes(),
+            "the reader never holds the whole answer: {received} bytes came"
+        );
         assert_eq!(module.release_delivery(&delivery, || 1).await, None);
         let (mut whole, mut whole_reader) = owner_connection(&temp, 3).await;
         module
@@ -5560,12 +5566,9 @@ pub(crate) mod tests {
             })
         };
         until_part_of_it_has_gone(&mut far).await;
-        // A writer the connection would not take more from waits for room where the platform parks
-        // it, so the answer is still in hand once the lease has ended. Where a waiter polls, as it
-        // does on Windows, it meets the lapse at its next poll and has already stopped.
-        if cfg!(unix) {
-            assert!(!writing.is_finished());
-        }
+        // The lease still holds, and the connection takes no more than it has room for, so the
+        // writer is waiting for the reader with the answer unfinished.
+        assert!(!writing.is_finished());
         clock.advance(Duration::from_millis(400 + 1));
         let reading = tokio::spawn(read_to_the_end(far));
         let written = tokio::time::timeout(WRITER_LIVENESS, writing)
