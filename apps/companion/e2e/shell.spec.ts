@@ -6,11 +6,12 @@
  * What a component test cannot hold is layout at the largest text size and in a face as wide as the
  * Linux runner's, and a message that has to fit the screen it is said on.
  *
- * Every screenshot goes under `/tmp`, named for the engine and the case.
+ * Every screenshot goes under the test artefact directory, named for the engine and the case.
  */
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The Linux runner draws the page in DejaVu Sans, which sets about a tenth more text across a line. */
@@ -20,7 +21,7 @@ const WIDE_FACE = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !import
 const REPLACED = /connection to this computer was replaced/
 
 function shot(name: string): string {
-  return `/tmp/kr-companion-shell-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-shell-${name}-${test.info().project.name}`)
 }
 
 /** Sets the text size as the desktop shell does, by the size the root is drawn at, before the page loads. */

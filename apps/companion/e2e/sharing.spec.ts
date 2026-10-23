@@ -6,10 +6,12 @@
  * target and reachable from the keyboard, where focus goes after a row is made or taken away,
  * that the screen's preview scrolls on both axes inside its own box, and that what opens when a
  * choice calls for it moves only as far as reduced motion allows. Every screenshot goes under
- * `/tmp`, in a file named for the text size and the engine it was taken in.
+ * the test artefact directory, in a file named for the text size and the engine it was taken in.
  */
 
 import { expect, test, type Page } from '@playwright/test'
+
+import { screenshotPath } from './evidence'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
@@ -37,7 +39,7 @@ async function withTextSize(page: Page, size: string): Promise<void> {
 }
 
 function shot(name: string): string {
-  return `/tmp/kr-companion-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-${name}-${test.info().project.name}`)
 }
 
 /**

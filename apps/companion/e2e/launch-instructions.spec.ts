@@ -7,12 +7,13 @@
  * test cannot: that the whole command is drawn inside the window, wrapped where it has to be, at the
  * default text size and the largest, on a wide window and on a narrow one.
  *
- * Every screenshot goes under `/tmp` and is named for the requirement row it evidences.
+ * Every screenshot goes under the test artefact directory and is named for the requirement row it evidences.
  */
 
 import { expect, test, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -84,7 +85,7 @@ for (const [width, height] of [
 
       // The whole section, as a person sees it, rather than whatever part of it the window shows.
       await surface.screenshot({
-        path: `/tmp/kr-companion-launch-instructions-powershell-${size}-${width}-07.21-${test.info().project.name}.png`
+        path: screenshotPath(`kr-companion-launch-instructions-powershell-${size}-${width}-07.21-${test.info().project.name}`)
       })
     })
   }
