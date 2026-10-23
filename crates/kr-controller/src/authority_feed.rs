@@ -215,6 +215,8 @@ struct Shared {
     scan_cursor: AtomicU64,
     /// Whether a record the scan met so far is not settled yet.
     scan_unfinished: AtomicBool,
+    /// Whether a record the scan met so far was put off because the host is behind its feed.
+    scan_put_off: AtomicBool,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
     /// How many passes have finished, for whatever waits on one.
@@ -279,6 +281,7 @@ impl FeedRuntime {
                 settled_through: AtomicU64::new(0),
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
+                scan_put_off: AtomicBool::new(false),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
                 passes: tokio::sync::watch::channel(0).0,
@@ -624,7 +627,9 @@ enum Pass {
     Read,
     /// The feed was read, and something it holds is not settled yet: a barrier still running.
     Unfinished,
-    /// The feed was read as far as a pass reads, and the scan goes on at once where this stopped.
+    /// The feed was read as far as a pass reads, and the scan goes on at once where this stopped;
+    /// or it was read through while the host caught up with it, and a new scan begins at once to
+    /// judge what that put off.
     More,
     /// The feed answered that this host was removed from it.
     Removed,
@@ -663,6 +668,7 @@ async fn pass(
     let resumed = shared.scan_cursor.load(Ordering::SeqCst);
     let starting = resumed == 0;
     let mut unfinished = shared.scan_unfinished.load(Ordering::SeqCst);
+    let mut put_off = !starting && shared.scan_put_off.load(Ordering::SeqCst);
     let mut cursor = if starting {
         shared.settled_through.load(Ordering::SeqCst)
     } else {
@@ -673,7 +679,6 @@ async fn pass(
     let mut latest = None;
     let mut read_through = false;
     let mut compared = false;
-    let mut put_off = Vec::new();
     for _ in 0..shared.most_pages.load(Ordering::SeqCst) {
         let state = shared
             .client
@@ -706,10 +711,10 @@ async fn pass(
                 }
             } else {
                 contiguous = false;
-                // While the host is behind its feed, a record that is not settled is one put off,
-                // and it is settled below once the host has caught up.
+                // While the host is behind its feed, a record that is not settled is one put off:
+                // the scan that follows the catch-up judges it, in the order the feed holds it.
                 if controller.policy().behind_its_feed() {
-                    put_off.push(record.clone());
+                    put_off = true;
                 } else {
                     unfinished = true;
                 }
@@ -726,6 +731,7 @@ async fn pass(
         shared.settled_through.store(through, Ordering::SeqCst);
     }
     shared.scan_unfinished.store(unfinished, Ordering::SeqCst);
+    shared.scan_put_off.store(put_off, Ordering::SeqCst);
     if !read_through {
         // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
         // as read, the bounded offline validity is not extended from it, and nothing waits for
@@ -737,7 +743,8 @@ async fn pass(
     }
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
-    if let Some(mut latest) = latest {
+    shared.scan_put_off.store(false, Ordering::SeqCst);
+    if let Some(latest) = latest {
         // A registry found behind the feed is raised to the feed's revision, in one barrier, before
         // the feed is called read: until then what the host decides stands on an earlier state.
         if controller.policy().behind_its_feed() {
@@ -746,12 +753,12 @@ async fn pass(
                 .await
                 .map_err(Stopped::local)?;
             shared.observed().catching_up = false;
-            // What was put off is judged now, on the registry as it stands, and numbered above
-            // everything the host has issued.
-            for record in &put_off {
-                if !settle(shared, controller, record, &mut latest).await? {
-                    unfinished = true;
-                }
+            // What was put off is judged by the scan that begins now, on the registry as it
+            // stands, in the order the feed holds it and numbered above everything the host has
+            // issued. This scan is no synchronisation: a connection that waits for one waits for
+            // that scan, and so is not served before those requests are carried out.
+            if put_off {
+                return Ok(Pass::More);
             }
         }
         name_owners(shared, controller, &latest).await?;

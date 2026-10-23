@@ -544,10 +544,12 @@ impl Controller {
     /// not show withdrawn: a registry restored to a state from before it was carried out, or put
     /// back to one whose counter stands at the feed's, has lost it.
     ///
-    /// The request is the owner's own, checked against the owner's key as a request read for the
-    /// first time is; a request whose issuer the registry does not know cannot be checked, and is
-    /// not carried out. What is already withdrawn is left alone, so a request the registry shows
-    /// done raises no barrier, and carrying one out twice is carrying it out once.
+    /// The feed is not trusted to say that this host approved a request, so only a request this host
+    /// could have carried out is: one the issuer signed with the key the registry holds for it,
+    /// whose pairing grant holds the right to manage this host, and which this host did not refuse.
+    /// A request whose issuer the registry does not know cannot be checked, and is not carried out.
+    /// What is already withdrawn is left alone, so a request the registry shows done raises no
+    /// barrier, and carrying one out twice is carrying it out once.
     ///
     /// # Errors
     ///
@@ -561,8 +563,12 @@ impl Controller {
         let Some(issuer) = self.devices.record_for_device(request.issuer_device_id)? else {
             return Ok(());
         };
-        if kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
-            .is_err()
+        if !issuer.grant.actions.contains(&ActionRight::HostManage)
+            || kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
+                .is_err()
+            || self
+                .authority_feed_record(request.request_id)
+                .is_some_and(|noted| noted.is_refused_by(host))
         {
             return Ok(());
         }
