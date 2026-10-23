@@ -5,32 +5,14 @@
 
 use std::time::{Duration, Instant};
 
-use kr_ipc::identity::ProcessState;
+use kr_ipc::identity::{ProcessState, Stop, stop_process};
 use kr_protocol::identity::ProcessStartIdentity;
 
-/// Ends a process by the identity it was started under, after checking that it is still that
-/// process.
+/// Ends a process by the identity it was started under, and no other: the product's own stop holds
+/// the process by something other than its number while it checks and signals, so a number that
+/// passes to a different process meanwhile is left alone.
 pub fn kill(process: &ProcessStartIdentity) {
-    if kr_ipc::identity::process_state(process) != ProcessState::Running {
-        return;
-    }
-    let pid = process.pid.get();
-    #[cfg(unix)]
-    {
-        let pid =
-            rustix::process::Pid::from_raw(i32::try_from(pid).expect("a pid")).expect("a process");
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
-    #[cfg(windows)]
-    {
-        let system =
-            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
-                .join("System32")
-                .join("taskkill.exe");
-        let _ = std::process::Command::new(system)
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output();
-    }
+    let _ = stop_process(process, Stop::Kill);
 }
 
 /// Ends `hosts` and waits until each has been read as ended, or `deadline` passes, and says which
@@ -39,9 +21,8 @@ pub fn kill(process: &ProcessStartIdentity) {
 /// A host that has been read as ended is ended: the system numbers a process once, and a later
 /// reading of the same process can meet the moment its parent collects it, which the reader does
 /// not call an end. So each host is asked until it answers once that it has ended, and is not asked
-/// again. A host the system could not be asked about (a reading that was not an answer) is ended
-/// again once it answers: ending a host is decided from a reading, and a reading that fails once
-/// must not leave a host running.
+/// again. A host that is read as still there is stopped again: a stop the system did not carry out
+/// (it did not answer, or the reading of the host failed once) must not leave a host running.
 #[must_use]
 pub fn end_hosts(hosts: &[ProcessStartIdentity], deadline: Instant) -> Vec<String> {
     for host in hosts {
