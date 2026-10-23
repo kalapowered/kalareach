@@ -63,9 +63,11 @@ class KalaReachMessagingService : FirebaseMessagingService() {
 
     private fun answer(challenge: PushMessage.Challenge) {
         // The scheduler is handed the answer as a safety net before it is posted, so a process the
-        // system ends in the middle of the post leaves a try behind; a challenge that did not get to
-        // the gateway is then asked again inside the time the record gives it, and every other
-        // outcome is final and takes the safety net back.
+        // system ends in the middle of the post leaves a try behind. A challenge that did not get to
+        // the gateway is asked again inside the time the record gives it, and the safety net is kept
+        // (made again here when the scheduler could not save it before the post). Only an outcome
+        // that ends the registration takes it back: a message that was ignored says nothing about
+        // the registration, and a net that is no longer wanted finds nothing left to do.
         val outcome =
             Challenges.answerer(applicationContext) {
                     ChallengeWorker.schedule(applicationContext, challenge.data)
@@ -73,8 +75,9 @@ class KalaReachMessagingService : FirebaseMessagingService() {
                 .answer(challenge.data)
         // What became of it, by kind and never by content: nothing of the message or the key.
         Log.i(TAG, "challenge: ${describe(outcome)}")
-        if (outcome !is ChallengeOutcome.Retry) {
-            ChallengeWorker.cancel(applicationContext, challenge.data)
+        when {
+            outcome is ChallengeOutcome.Retry -> ChallengeWorker.schedule(applicationContext, challenge.data)
+            outcome.settles -> ChallengeWorker.cancel(applicationContext, challenge.data)
         }
     }
 

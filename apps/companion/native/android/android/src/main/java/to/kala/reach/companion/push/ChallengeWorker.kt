@@ -40,26 +40,39 @@ class ChallengeWorker(context: Context, parameters: WorkerParameters) :
 
         private fun name(data: Map<String, String>) = "challenge-" + data["kr_registration_id"].orEmpty()
 
+        /** How long the receiver waits for the scheduler to say it has kept the safety net. */
+        private const val KEPT_WITHIN_SECONDS = 10L
+
         /**
          * Hands a challenge's data to the scheduler as the safety net of the receiver's own try: it
          * runs when the device has a network, and decides afresh from the record, so a registration
          * the receiver answered has nothing left for it to do. One per registration.
+         *
+         * Returns once the scheduler has saved the work, since a process the system ends right after
+         * the call leaves nothing behind otherwise, and says whether it did.
          */
-        fun schedule(context: Context, data: Map<String, String>) {
-            WorkManager.getInstance(context)
-                .enqueueUniqueWork(
-                    name(data),
-                    ExistingWorkPolicy.KEEP,
-                    OneTimeWorkRequestBuilder<ChallengeWorker>()
-                        .setInitialDelay(AFTER_SECONDS, TimeUnit.SECONDS)
-                        .setConstraints(
-                            Constraints.Builder()
-                                .setRequiredNetworkType(NetworkType.CONNECTED)
-                                .build()
-                        )
-                        .setInputData(Data.Builder().putAll(data.mapValues { it.value }).build())
-                        .build()
-                )
+        fun schedule(context: Context, data: Map<String, String>): Boolean {
+            val operation =
+                WorkManager.getInstance(context)
+                    .enqueueUniqueWork(
+                        name(data),
+                        ExistingWorkPolicy.KEEP,
+                        OneTimeWorkRequestBuilder<ChallengeWorker>()
+                            .setInitialDelay(AFTER_SECONDS, TimeUnit.SECONDS)
+                            .setConstraints(
+                                Constraints.Builder()
+                                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                                    .build()
+                            )
+                            .setInputData(Data.Builder().putAll(data.mapValues { it.value }).build())
+                            .build()
+                    )
+            return try {
+                operation.result.get(KEPT_WITHIN_SECONDS, TimeUnit.SECONDS)
+                true
+            } catch (failure: Exception) {
+                false
+            }
         }
 
         /** Takes the safety net back once the receiver has settled the registration itself. */
