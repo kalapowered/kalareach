@@ -2497,7 +2497,7 @@ pub async fn push_refresh(state: State<'_, AppState>) -> Result<crate::push::Pus
     let Some(desk) = state.push() else {
         return Ok(unavailable_push_view());
     };
-    Ok(desk.refresh().await)
+    desk.refresh().await
 }
 
 /// The screen a tap on a notification opened the application on, once.

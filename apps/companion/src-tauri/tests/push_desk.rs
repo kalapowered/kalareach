@@ -19,7 +19,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,11 +63,12 @@ struct ReceiverState {
     /// Whether a question about the permission is never answered, as when the application ends
     /// in the middle of it.
     permission_hangs: bool,
+    /// Whether the question about the permission ends the task that asked it.
+    permission_panics: bool,
     /// The provider's token, once the provider has made one.
     token: Option<String>,
     /// Reads of the token that say there is none yet, before there is one.
     reads_without_a_token: usize,
-    changed: bool,
     pending: Option<PendingRegistration>,
     reads_of_pending: usize,
     /// Whether the challenge is answered when it has been waited for, or held until released.
@@ -87,9 +88,9 @@ impl Receiver {
                 asked: 0,
                 permission_reads: 0,
                 permission_hangs: false,
+                permission_panics: false,
                 token: Some(token.to_owned()),
                 reads_without_a_token: 0,
-                changed: false,
                 pending: None,
                 reads_of_pending: 0,
                 answering: true,
@@ -103,22 +104,21 @@ impl Receiver {
         change(&mut self.state.lock().expect("the receiver"));
     }
 
-    fn token_changed_to(&self, token: &str) {
-        self.with(|state| {
-            state.token = Some(token.to_owned());
-            state.changed = true;
-        });
+    /// The provider gives the installation `token`.
+    fn token_is(&self, token: &str) {
+        self.with(|state| state.token = Some(token.to_owned()));
     }
 }
 
 impl Native for Receiver {
     fn permission(&self) -> PushFuture<'_, Permission> {
         Box::pin(async move {
-            let hangs = {
+            let (hangs, panics) = {
                 let mut state = self.state.lock().expect("the receiver");
                 state.permission_reads += 1;
-                state.permission_hangs
+                (state.permission_hangs, state.permission_panics)
             };
+            assert!(!panics, "the task that asked about the permission ends");
             if hangs {
                 std::future::pending::<()>().await;
             }
@@ -145,14 +145,6 @@ impl Native for Receiver {
                 return Ok(None);
             }
             Ok(state.token.clone())
-        })
-    }
-
-    fn token_changed(&self) -> PushFuture<'_, bool> {
-        Box::pin(async move {
-            Ok(std::mem::take(
-                &mut self.state.lock().expect("the receiver").changed,
-            ))
         })
     }
 
@@ -310,6 +302,9 @@ struct Desk {
     device: Arc<Device>,
     /// What the desk's clock is ahead of the real one, so that a test can let time pass.
     clock_ahead_ms: Arc<AtomicU64>,
+    /// Whether the application ends at its next page callback: the callback is the product's own
+    /// seam, at a point with no wait in it where a process can end.
+    ends: Arc<AtomicBool>,
     /// Kept so the phone's records outlive the test.
     _phone: support::Phone,
 }
@@ -340,28 +335,60 @@ impl Desk {
 
     /// Waits until `holds` says of the hosts' states what is wanted.
     async fn until(&self, holds: impl Fn(&[PushState]) -> bool) -> Vec<PushState> {
-        tokio::time::timeout(WATCHDOG, async {
-            loop {
-                let states: Vec<PushState> =
-                    self.view().hosts.iter().map(|host| host.state).collect();
-                if holds(&states) {
-                    return states;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "the hosts did not come to the state wanted: {:?}",
-                self.view()
-                    .hosts
-                    .iter()
-                    .map(|host| (host.state, host.words.clone()))
-                    .collect::<Vec<_>>()
-            )
-        })
+        states_until(&self.desk, holds).await
     }
+
+    /// Lets a minute and more pass for the desk's clock.
+    fn let_time_pass(&self) {
+        self.clock_ahead_ms
+            .fetch_add(2 * 60 * 1000, Ordering::SeqCst);
+    }
+}
+
+/// Waits until `holds` says of the hosts' states what is wanted.
+async fn states_until(desk: &PushDesk, holds: impl Fn(&[PushState]) -> bool) -> Vec<PushState> {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let states: Vec<PushState> = desk.view().hosts.iter().map(|host| host.state).collect();
+            if holds(&states) {
+                return states;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the hosts did not come to the state wanted: {:?}",
+            desk.view()
+                .hosts
+                .iter()
+                .map(|host| (host.state, host.words.clone()))
+                .collect::<Vec<_>>()
+        )
+    })
+}
+
+/// Waits until `holds`, which is a condition of what the scripts have recorded.
+async fn eventually(what: &str, holds: impl Fn() -> bool) {
+    tokio::time::timeout(WATCHDOG, async {
+        while !holds() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("it never came about: {what}"));
+}
+
+/// What the gateway was proposed, in order.
+fn proposed(gateway: &Gateway) -> Vec<String> {
+    gateway.proposed.lock().expect("the proposals").clone()
+}
+
+/// A look at where notifications stand, as the application makes at its start, when it comes to the
+/// front and when the network changes.
+async fn look(desk: &Arc<PushDesk>) {
+    desk.refresh().await.expect("a look");
 }
 
 async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> Desk {
@@ -371,7 +398,14 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
     }
     let device = phone.companion.device();
     let registered = Arc::new(Mutex::new(Registered::default()));
-    let opened = open_over(phone.data.path(), &device, &receiver, &registered);
+    let ends = Arc::new(AtomicBool::new(false));
+    let opened = open_over(
+        phone.data.path(),
+        &device,
+        &receiver,
+        &registered,
+        Arc::clone(&ends),
+    );
     Desk {
         desk: opened.desk,
         receiver,
@@ -379,6 +413,7 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
         registered,
         device,
         clock_ahead_ms: opened.clock_ahead_ms,
+        ends,
         _phone: phone,
     }
 }
@@ -391,11 +426,20 @@ struct Opened {
     clock_ahead_ms: Arc<AtomicU64>,
 }
 
+impl Opened {
+    /// Lets a minute and more pass for the desk's clock.
+    fn let_time_pass(&self) {
+        self.clock_ahead_ms
+            .fetch_add(2 * 60 * 1000, Ordering::SeqCst);
+    }
+}
+
 fn open_over(
     data: &Path,
     device: &Arc<Device>,
     receiver: &Arc<Receiver>,
     registered: &Arc<Mutex<Registered>>,
+    ends: Arc<AtomicBool>,
 ) -> Opened {
     let gateway = Arc::new(Gateway {
         proposed: Mutex::new(Vec::new()),
@@ -412,7 +456,7 @@ fn open_over(
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
         },
-        || {},
+        move || assert!(!ends.load(Ordering::SeqCst), "the application ends"),
     )
     .expect("the desk opens");
     Opened {
@@ -592,8 +636,8 @@ async fn a_token_that_changes_while_a_host_registers_is_registered_again_when_th
     })
     .await
     .expect("the first token was proposed");
-    phone.receiver.token_changed_to(SECOND_TOKEN);
-    phone.desk.refresh().await;
+    phone.receiver.token_is(SECOND_TOKEN);
+    look(&phone.desk).await;
 
     // The challenge is answered; the run ends, and the new token is what the host is registered with.
     phone.receiver.with(|state| state.answering = true);
@@ -661,10 +705,8 @@ async fn a_look_the_application_makes_by_itself_never_asks_the_system_for_permis
     assert_eq!(asked(&phone), 1, "the person's own choice asked the system");
 
     // Time passes, and the application looks again by itself.
-    phone
-        .clock_ahead_ms
-        .fetch_add(2 * 60 * 1000, Ordering::SeqCst);
-    phone.desk.refresh().await;
+    phone.let_time_pass();
+    look(&phone.desk).await;
     phone.until_words("not allowed for this app yet").await;
     assert_eq!(
         asked(&phone),
@@ -681,13 +723,13 @@ async fn a_look_the_application_makes_by_itself_never_asks_the_system_for_permis
     assert_eq!(asked(&phone), 2);
 }
 
-/// KR-REQ-16.16: the platform clears its note that the token changed when it is asked, so a change
-/// the application has found must not be lost with the application. Here the application ends
-/// after it has taken the change and before the run it started has written anything, and the
-/// next start registers the new token: the person is told the registration was cut short, and the
-/// look that follows a minute later registers the token the provider holds.
+/// KR-REQ-16.16: a token the provider gave while the application was not running is registered at
+/// the next look. A host is on only while the digest its registration proposed is the digest of the
+/// token the provider holds, so what the application missed is found by comparing and does not
+/// depend on anything the platform remembered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_token_change_found_before_the_application_ended_is_registered_at_the_next_start() {
+async fn a_token_the_provider_gave_while_the_application_was_not_running_is_registered_at_the_next_look()
+ {
     let owner = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
@@ -695,44 +737,333 @@ async fn a_token_change_found_before_the_application_ended_is_registered_at_the_
     phone.desk.enable(&reference).expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
-    // The provider gives another token and the application takes the change. The run it starts is
-    // held at its first question to the platform, so it writes nothing before the application ends.
-    phone.receiver.with(|state| state.permission_hangs = true);
-    phone.receiver.token_changed_to(SECOND_TOKEN);
-    phone.desk.refresh().await;
-
-    // The next start, over the same record, with a platform that no longer says the token changed.
-    let restarted_receiver = Receiver::new(SECOND_TOKEN);
+    // The application ends, and the provider gives another token while it is gone.
     let restarted = open_over(
         phone._phone.data.path(),
         &phone.device,
-        &restarted_receiver,
+        &Receiver::new(SECOND_TOKEN),
         &phone.registered,
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(restarted.desk.view().hosts[0].state, PushState::On);
+    look(&restarted.desk).await;
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    assert_eq!(
+        proposed(&restarted.gateway),
+        [SECOND_TOKEN],
+        "the token the provider holds is the one registered"
+    );
+}
+
+/// KR-REQ-16.16: a change found while a host's run is under way is not lost when the application
+/// ends. The run that proposed the old token ends well, and the host does not become on with it: it
+/// stays working while the run goes round again, so an application that ends in the repeat's first
+/// question to the platform leaves the host needing the retry, and the next start registers the
+/// token the provider holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_found_while_a_run_is_under_way_is_not_lost_when_the_application_ends() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    receiver.with(|state| state.answering = false);
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the first token was proposed", || {
+        proposed(&phone.gateway) == [FIRST_TOKEN]
+    })
+    .await;
+
+    // The provider gives another token and the application looks. Then the challenge is answered,
+    // and the run is held at the first question of its repeat.
+    phone.receiver.token_is(SECOND_TOKEN);
+    look(&phone.desk).await;
+    let reads = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .permission_reads;
+    phone.receiver.with(|state| {
+        state.permission_hangs = true;
+        state.answering = true;
+    });
+    eventually("the run went round again", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .permission_reads
+            > reads
+    })
+    .await;
+
+    let restarted = open_over(
+        phone._phone.data.path(),
+        &phone.device,
+        &Receiver::new(SECOND_TOKEN),
+        &phone.registered,
+        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(
         restarted.desk.view().hosts[0].state,
         PushState::NeedsAttention,
-        "the host is still shown as on with a token the gateway does not know"
+        "the host is on with the token the run proposed, which the provider no longer holds"
     );
-    restarted
-        .clock_ahead_ms
-        .fetch_add(2 * 60 * 1000, Ordering::SeqCst);
-    restarted.desk.refresh().await;
-    tokio::time::timeout(WATCHDOG, async {
-        while restarted.desk.view().hosts[0].state != PushState::On {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the host was registered again");
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    assert_eq!(proposed(&restarted.gateway), [SECOND_TOKEN]);
+}
+
+/// KR-REQ-16.16: two hosts are on, the provider gives another token, and the application ends in
+/// the look that found it, right after that look has written what it found and before anything
+/// else. Both hosts are then marked, as one write, and the next start registers both with the token
+/// the provider holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_application_ending_in_the_look_that_found_a_new_token_loses_it_for_neither_host() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
+    for reference in phone.references() {
+        phone.desk.enable(&reference).expect("the person asks");
+    }
+    phone
+        .until(|states| states == [PushState::On, PushState::On])
+        .await;
+
+    phone.receiver.token_is(SECOND_TOKEN);
+    phone.ends.store(true, Ordering::SeqCst);
+    let desk = Arc::clone(&phone.desk);
+    let outcome = tokio::spawn(async move { desk.refresh().await }).await;
+    assert!(
+        outcome.is_err_and(|error| error.is_panic()),
+        "the look ended where the application does"
+    );
+
+    let restarted = open_over(
+        phone._phone.data.path(),
+        &phone.device,
+        &Receiver::new(SECOND_TOKEN),
+        &phone.registered,
+        Arc::new(AtomicBool::new(false)),
+    );
     assert_eq!(
         restarted
-            .gateway
-            .proposed
-            .lock()
-            .expect("the proposals")
-            .as_slice(),
-        [SECOND_TOKEN],
-        "the token the provider holds is the one registered"
+            .desk
+            .view()
+            .hosts
+            .iter()
+            .map(|each| each.state)
+            .collect::<Vec<_>>(),
+        [PushState::NeedsAttention, PushState::NeedsAttention],
+        "a host is still shown as on with a token the gateway does not know"
     );
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    states_until(&restarted.desk, |states| {
+        states == [PushState::On, PushState::On]
+    })
+    .await;
+    assert_eq!(
+        proposed(&restarted.gateway),
+        [SECOND_TOKEN, SECOND_TOKEN],
+        "each host registered the token the provider holds"
+    );
+}
+
+/// A token that changes and changes back before any look is the token each registration proposed,
+/// so there is nothing to register and nothing is marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_that_changed_and_changed_back_is_not_registered_again() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    phone.receiver.token_is(SECOND_TOKEN);
+    phone.receiver.token_is(FIRST_TOKEN);
+    look(&phone.desk).await;
+    // A host that a look marks is working before the look returns.
+    assert_eq!(phone.view().hosts[0].state, PushState::On);
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+}
+
+/// A run that proposed one token while the provider has gone back to the other is not the
+/// registration of the token it holds: the host does not become on with it, and the run goes round
+/// again with the token it holds now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_that_changed_back_while_a_run_proposed_the_other_is_registered_again() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(SECOND_TOKEN);
+    receiver.with(|state| state.answering = false);
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the other token was proposed", || {
+        proposed(&phone.gateway) == [SECOND_TOKEN]
+    })
+    .await;
+
+    phone.receiver.token_is(FIRST_TOKEN);
+    phone.receiver.with(|state| state.answering = true);
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(proposed(&phone.gateway), [SECOND_TOKEN, FIRST_TOKEN]);
+}
+
+/// A record written before the digest was kept has none, and is registered again at the next look:
+/// a host is on only while a digest says which token it proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_with_no_digest_is_registered_again_at_the_next_look() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    // The record as an earlier build wrote it.
+    let file = phone._phone.data.path().join("push").join("push.json");
+    let mut record: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("a record");
+    for kept in record["hosts"].as_object_mut().expect("hosts").values_mut() {
+        assert!(
+            kept.as_object_mut()
+                .expect("a host")
+                .remove("registered")
+                .is_some(),
+            "the record keeps the digest of the token it proposed"
+        );
+    }
+    std::fs::write(&file, serde_json::to_vec(&record).expect("a record")).expect("written");
+
+    let restarted = open_over(
+        phone._phone.data.path(),
+        &phone.device,
+        &Receiver::new(FIRST_TOKEN),
+        &phone.registered,
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(restarted.desk.view().hosts[0].state, PushState::On);
+    look(&restarted.desk).await;
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    assert_eq!(proposed(&restarted.gateway), [FIRST_TOKEN]);
+    let kept = std::fs::read_to_string(&file).expect("the record");
+    assert!(kept.contains("\"registered\""), "{kept}");
+}
+
+/// A host that is forgotten while its run is under way is not made again by that run, and a host
+/// paired again is taken up afresh: the old run holds no claim, so it hands nothing to the host and
+/// writes nothing, and the new run registers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_its_run_is_waiting_is_not_made_again_by_that_run() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    receiver.with(|state| state.answering = false);
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the token was proposed", || {
+        proposed(&phone.gateway) == [FIRST_TOKEN]
+    })
+    .await;
+
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .remove(0);
+    phone.desk.forgotten(paired.host_device_id);
+    assert_eq!(phone.view().hosts[0].state, PushState::Off);
+    // Paired again, the person turns it on, and the challenge of the old run is answered.
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    phone.receiver.with(|state| state.answering = true);
+    phone.until(|states| states == [PushState::On]).await;
+
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN, FIRST_TOKEN],
+        "the host was taken up afresh"
+    );
+    assert_eq!(
+        phone
+            .registered
+            .lock()
+            .expect("what was handed")
+            .handed
+            .len(),
+        1,
+        "the run of the forgotten host handed nothing to the host"
+    );
+}
+
+/// A run whose task ends without finishing, as a panic ends it, does not leave the host showing
+/// that it is working for ever: it leaves the retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_that_ends_without_finishing_leaves_the_retry_and_not_working() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    receiver.with(|state| state.permission_panics = true);
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+}
+
+/// A list of paired hosts that cannot be read is an error and not an empty list: a look on it
+/// marks nothing, and the next look, once it can be read, registers the token the provider holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_of_paired_hosts_that_cannot_be_read_marks_nothing() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    phone.receiver.token_is(SECOND_TOKEN);
+    let file = find(phone._phone.data.path(), "hosts.json").expect("the paired hosts' file");
+    let kept = std::fs::read(&file).expect("the paired hosts");
+    std::fs::write(&file, b"{ not a list").expect("spoiled");
+    assert!(
+        phone.desk.refresh().await.is_err(),
+        "a list that cannot be read is no list"
+    );
+    std::fs::write(&file, kept).expect("mended");
+
+    look(&phone.desk).await;
+    phone.until(|states| states == [PushState::On]).await;
+    eventually("the token was registered", || {
+        proposed(&phone.gateway) == [FIRST_TOKEN, SECOND_TOKEN]
+    })
+    .await;
+}
+
+/// The file called `name` under `directory`, wherever the phone keeps it.
+fn find(directory: &Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(directory).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|each| each == name) {
+            return Some(path);
+        }
+    }
+    None
 }

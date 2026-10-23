@@ -29,10 +29,10 @@ protocol LimitedKeyWriting {
     func write(recipientKeyID: String, seed: Data) -> Bool
 }
 
-/// The token the provider gave this installation, and whether it changed since it was last asked.
+/// The token the provider gave this installation. Whether a registration still names it is the
+/// application's to compare, by the token's digest, each time it looks.
 final class PushTokenStore {
     static let tokenKey = "to.kala.reach.push.token"
-    static let changedKey = "to.kala.reach.push.token-changed"
 
     private let defaults: UserDefaults
 
@@ -40,19 +40,11 @@ final class PushTokenStore {
 
     func token() -> String? { defaults.string(forKey: Self.tokenKey) }
 
-    /// Keeps a token the provider gave, and notes that it changed when it is not the one held.
+    /// Keeps a token the provider gave, replacing the one held.
     func given(_ token: String) {
         if defaults.string(forKey: Self.tokenKey) != token {
             defaults.set(token, forKey: Self.tokenKey)
-            defaults.set(true, forKey: Self.changedKey)
         }
-    }
-
-    /// Whether the token changed since this was last asked. Asking clears it.
-    func takeChanged() -> Bool {
-        let changed = defaults.bool(forKey: Self.changedKey)
-        if changed { defaults.set(false, forKey: Self.changedKey) }
-        return changed
     }
 }
 
@@ -145,8 +137,6 @@ public final class PushAdapter: NSObject {
             }
         case "pushToken":
             answer(["token": tokens.token() ?? NSNull()])
-        case "pushTokenChanged":
-            answer(["changed": tokens.takeChanged()])
         case "pushPendingSet":
             guard let record, let kept = args["record"] as? [String: Any],
                 let text = Self.text(kept), (try? record.write(text)) != nil

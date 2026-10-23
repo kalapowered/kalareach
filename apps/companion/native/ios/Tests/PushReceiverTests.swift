@@ -322,17 +322,13 @@ final class PushAdapterTests: XCTestCase {
         XCTAssertEqual(answer(refused, "pushAskPermission")?["state"] as? String, "denied")
     }
 
-    func testATokenAndItsChangeAreKeptAndTheChangeIsReadOnce() {
+    func testATokenIsKeptAndReplacedByTheOneTheProviderGivesNext() {
         let held = adapter()
         XCTAssertTrue(answer(held, "pushToken")?["token"] is NSNull)
         PushTokenStore(defaults: defaults).given("t-1")
         XCTAssertEqual(answer(held, "pushToken")?["token"] as? String, "t-1")
-        XCTAssertEqual(answer(held, "pushTokenChanged")?["changed"] as? Bool, true)
-        XCTAssertEqual(answer(held, "pushTokenChanged")?["changed"] as? Bool, false)
-        PushTokenStore(defaults: defaults).given("t-1")
-        XCTAssertEqual(answer(held, "pushTokenChanged")?["changed"] as? Bool, false, "the same token is no change")
         PushTokenStore(defaults: defaults).given("t-2")
-        XCTAssertEqual(answer(held, "pushTokenChanged")?["changed"] as? Bool, true)
+        XCTAssertEqual(answer(held, "pushToken")?["token"] as? String, "t-2")
     }
 
     func testThePendingRecordIsKeptReadAsItStandsAndRemoved() {

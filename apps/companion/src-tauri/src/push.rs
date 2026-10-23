@@ -19,17 +19,21 @@
 //!
 //! `push/push.json` under the application's data directory holds, per paired host, whether the
 //! person asked, the authorisation identifier this phone issued for that host (so asking again
-//! issues under the same identifier and the host keeps one authorisation), and the last outcome in
-//! words. It holds no token, no key and no credential. The credential exists in memory between the
-//! gateway's issue and the host's answer and is never kept: a registration whose answer was lost is
-//! made again under a new action with a fresh credential, which is what the host expects.
+//! issues under the same identifier and the host keeps one authorisation), the digest of the token
+//! its last registration proposed, and the last outcome in words. It holds no token, no key and no
+//! credential. The credential exists in memory between the gateway's issue and the host's answer
+//! and is never kept: a registration whose answer was lost is made again under a new action with a
+//! fresh credential, which is what the host expects.
 //!
 //! # What repeats
 //!
 //! Each step is safe to repeat, so a restart, a lost answer or a changed token is mended by doing
 //! the sequence again for the host that asked: the same installation key, the same authorisation
-//! identifier, a new action. A person who is asked for permission and says no is told so, and the
-//! sequence is tried again the next time the application is in front, never in a loop.
+//! identifier, a new action. A change of the token is found by comparing, not by being told: a host
+//! is on only while the digest its registration proposed is the digest of the token the provider
+//! holds, and each look compares the two, so no exit of the application can lose a change. A
+//! person who is asked for permission and says no is told so, and the sequence is tried again the
+//! next time the application is in front, never in a loop.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -50,6 +54,7 @@ use kr_protocol::push::{
     DevicePushRegisterParams, DevicePushRegisterResult, PushPlatform, PushRegistrationProposal,
     PushSenderIssueRequest, RegistrationToken, token_digest,
 };
+use kr_protocol::scalars::Digest256;
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +122,11 @@ struct HostPush {
     settings: bool,
     /// When the phase was set, in UTC milliseconds.
     updated_ms: u64,
+    /// The digest of the token this phone's last registration for this host proposed. A host is on
+    /// only while this is the digest of the token the provider holds. A record that has none
+    /// (written before it was kept) is registered again at the next look.
+    #[serde(default)]
+    registered: Option<Digest256>,
 }
 
 /// What is kept on disk.
@@ -196,8 +206,6 @@ pub trait Native: Send + Sync {
     fn ask_permission(&self) -> PushFuture<'_, Permission>;
     /// The registration token the provider gave this installation.
     fn token(&self) -> PushFuture<'_, Option<String>>;
-    /// Whether the token changed since this was last asked.
-    fn token_changed(&self) -> PushFuture<'_, bool>;
     /// Replaces the record of the registration being waited for.
     fn pending_set<'a>(&'a self, record: &'a PendingRegistration) -> PushFuture<'a, ()>;
     /// The record of the registration being waited for, as it stands now.
@@ -266,22 +274,72 @@ pub struct PushDesk {
     registrar: Arc<dyn Registrar>,
     wiring: Wiring,
     origin: GatewayOrigin,
-    record: Mutex<Record>,
-    /// The hosts a sequence is running for, so there is one at a time for each.
-    running: Mutex<BTreeSet<DeviceId>>,
-    /// The hosts whose person has just chosen to turn notifications on: the one thing that may put
-    /// the system's permission question in front of them. A run takes its host out when it reaches
-    /// the question, and out again when it ends, so a look the application makes by itself never
-    /// asks.
-    asking: Mutex<BTreeSet<DeviceId>>,
-    /// The hosts whose registration is out of date: the token changed after the run that made it
-    /// read the token. A host stays here until a run has read the token that now stands.
-    stale: Mutex<BTreeSet<DeviceId>>,
+    /// Everything the desk changes together, so that a look, the start of a run and the end of one
+    /// are each made under one hold: no look finds a host working that no run owns, or on while a
+    /// run is still ending it.
+    state: Mutex<State>,
     /// Held from the moment a registration is written until its challenge is answered. The phone
     /// keeps one record of the registration it waits for, and the gateway one pending attempt, so a
-    /// second host's registration would replace the first's: they go one at a time.
+    /// second host's registration would replace the first's: they go one at a time. Never awaited
+    /// while `state` is held.
     registering: tokio::sync::Mutex<()>,
     changed: Box<dyn Fn() + Send + Sync>,
+}
+
+/// What the desk changes together.
+struct State {
+    record: Record,
+    /// The hosts a run is taking up, each by the number its claim was given: a run writes only
+    /// while its host is still held under its own number, so the run of a host that was forgotten
+    /// writes nothing, and a host paired again is claimed afresh.
+    running: BTreeMap<DeviceId, u64>,
+    /// The hosts whose person has just chosen to turn notifications on: the one thing that may put
+    /// the system's permission question in front of them. A run takes its host out when it reaches
+    /// the question, and out again whenever it ends or goes round again, so a look the application
+    /// makes by itself never asks.
+    asking: BTreeSet<DeviceId>,
+    /// The number the next claim is given.
+    next_run: u64,
+}
+
+impl State {
+    /// Takes the right to run the sequence for `host`, which is refused while a run holds it.
+    fn claim(&mut self, host: DeviceId) -> Option<u64> {
+        if self.running.contains_key(&host) {
+            return None;
+        }
+        self.next_run += 1;
+        self.running.insert(host, self.next_run);
+        Some(self.next_run)
+    }
+
+    /// Whether `run` still holds `host`.
+    fn holds(&self, host: DeviceId, run: u64) -> bool {
+        self.running.get(&host) == Some(&run)
+    }
+}
+
+/// Ends a run's claim when its task ends without having reached its own end, as a panic does: the
+/// host would otherwise show working for ever, with no run behind it.
+struct RunGuard {
+    desk: Arc<PushDesk>,
+    host: DeviceId,
+    run: u64,
+    armed: bool,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.desk.stopped(
+                self.host,
+                self.run,
+                &"Turning on notifications was interrupted. Try again."
+                    .to_owned()
+                    .into(),
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for PushDesk {
@@ -332,10 +390,12 @@ impl PushDesk {
             registrar,
             wiring,
             origin,
-            record: Mutex::new(record),
-            running: Mutex::new(BTreeSet::new()),
-            asking: Mutex::new(BTreeSet::new()),
-            stale: Mutex::new(BTreeSet::new()),
+            state: Mutex::new(State {
+                record,
+                running: BTreeMap::new(),
+                asking: BTreeSet::new(),
+                next_run: 0,
+            }),
             registering: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
         }))
@@ -344,7 +404,7 @@ impl PushDesk {
     /// What the page is shown: each paired host and where its notifications stand.
     #[must_use]
     pub fn view(&self) -> PushView {
-        let record = lock(&self.record);
+        let state = lock(&self.state);
         let hosts = self
             .device
             .pairing()
@@ -354,7 +414,7 @@ impl PushDesk {
             .iter()
             .rev()
             .map(|host| {
-                let kept = record.hosts.get(&host.host_device_id.to_string());
+                let kept = state.record.hosts.get(&host.host_device_id.to_string());
                 HostPushView {
                     reference: reference_of(host),
                     state: match kept.map(|kept| kept.phase) {
@@ -387,66 +447,107 @@ impl PushDesk {
             .device
             .host_by_reference(reference)
             .ok_or_else(crate::hosts::unknown_host)?;
-        lock(&self.asking).insert(host.host_device_id);
-        // The state says "working" only for a host a run is now taking up: a run that is ending
-        // has said what it has to say, and a second one would be refused after the words changed.
-        if self.claim(&host) {
-            self.set(&host, Phase::Working, "Asking for permission.", None);
-            self.spawn_run(host);
+        let now = (self.wiring.clock)();
+        let run = {
+            let mut state = lock(&self.state);
+            state.asking.insert(host.host_device_id);
+            // The state says "working" only for a host a run is now taking up: a run that is
+            // ending has said what it has to say.
+            let run = state.claim(host.host_device_id);
+            if run.is_some() {
+                Self::mark(
+                    &mut state,
+                    host.host_device_id,
+                    Phase::Working,
+                    "Asking for permission.",
+                    false,
+                    now,
+                );
+                self.keep(&state.record);
+            }
+            run
+        };
+        if let Some(run) = run {
+            (self.changed)();
+            self.spawn_run(host, run);
         }
         Ok(self.view())
     }
 
     /// Looks again at where notifications stand, and mends what a change since the last look
-    /// needs: a token that changed is registered again, for every host that asked, and a try that
-    /// stopped for the person is tried again once the person has had time to act.
+    /// needs: a host whose registration proposed another token than the provider holds now is
+    /// registered again, and a try that stopped for the person is tried again once the person has
+    /// had time to act.
     ///
-    /// A token that changed is remembered for each host until a run has read it, so a host whose
-    /// run was under way at the time registers again when that run ends.
+    /// A change of the token is found by comparing the digest each host's registration proposed,
+    /// which the record keeps, with the digest of the token the provider holds, so what a look finds
+    /// does not depend on anything the platform remembers or on the application having been running
+    /// when the token changed. A host whose record has no digest is registered again.
     ///
-    /// Asking the platform whether the token changed clears what it keeps, so a change it reports
-    /// is kept here before anything else is waited for: each host that is on is written down as
-    /// working at once, and a start that finds a host working knows the run that was to register it
-    /// was cut short, and offers the person its retry. A change that is only remembered in memory
-    /// would be lost with the process, and the host would stay on with a token the gateway does not
-    /// know.
-    pub async fn refresh(self: &Arc<Self>) -> PushView {
-        let changed = self.native.token_changed().await.unwrap_or(false);
+    /// The check, the claim of each due host and the write of what is marked are made under one
+    /// hold, so a host is never marked working without a run behind it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the paired hosts cannot be read: a list that cannot be read is
+    /// not an empty one, and nothing is marked on it.
+    pub async fn refresh(self: &Arc<Self>) -> Result<PushView> {
+        let hosts = self.device.pairing().hosts.list().map_err(|error| {
+            tracing::warn!(%error, "the paired hosts could not be read for a look at notifications");
+            CommandError::local_failure("the paired hosts could not be read")
+        })?;
+        let current = self.current_digest().await;
         let now = (self.wiring.clock)();
-        let due: Vec<(PairedHost, bool)> = {
-            let record = lock(&self.record);
-            let mut stale = lock(&self.stale);
-            self.device
-                .pairing()
-                .hosts
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|host| {
-                    let kept = record.hosts.get(&host.host_device_id.to_string())?;
-                    let is_due = match kept.phase {
-                        Phase::On | Phase::Working => {
-                            if changed {
-                                stale.insert(host.host_device_id);
-                            }
-                            kept.phase == Phase::On && stale.contains(&host.host_device_id)
-                        }
-                        Phase::Attention => now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS),
-                    };
-                    is_due.then_some((host, kept.phase == Phase::On))
-                })
-                .collect()
+        let claimed: Vec<(PairedHost, u64)> = {
+            let mut state = lock(&self.state);
+            let mut claimed = Vec::new();
+            let mut marked = false;
+            for host in hosts {
+                let id = host.host_device_id;
+                let Some(kept) = state.record.hosts.get(&id.to_string()) else {
+                    continue;
+                };
+                let (due, was_on) = match kept.phase {
+                    Phase::On => (
+                        current.is_some_and(|digest| kept.registered != Some(digest)),
+                        true,
+                    ),
+                    Phase::Working => (false, false),
+                    Phase::Attention => {
+                        (now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS), false)
+                    }
+                };
+                if !due {
+                    continue;
+                }
+                let Some(run) = state.claim(id) else {
+                    continue;
+                };
+                if was_on {
+                    Self::mark(
+                        &mut state,
+                        id,
+                        Phase::Working,
+                        "Registering this phone again.",
+                        false,
+                        now,
+                    );
+                    marked = true;
+                }
+                claimed.push((host, run));
+            }
+            if marked {
+                self.keep(&state.record);
+            }
+            claimed
         };
-        for (host, was_on) in due {
-            if was_on {
-                // Written to disk before the run is spawned or anything is awaited.
-                self.set(&host, Phase::Working, "Registering this phone again.", None);
-            }
-            if self.claim(&host) {
-                self.spawn_run(host);
-            }
+        if !claimed.is_empty() {
+            (self.changed)();
         }
-        self.view()
+        for (host, run) in claimed {
+            self.spawn_run(host, run);
+        }
+        Ok(self.view())
     }
 
     /// The screen a tap on a notification opened the application on, once.
@@ -454,65 +555,168 @@ impl PushDesk {
         self.native.route().await.unwrap_or(None)
     }
 
-    /// Forgets what is kept of `host`, as the person forgetting the host does.
+    /// Forgets what is kept of `host`, as the person forgetting the host does. A run that is
+    /// taking the host up loses its claim with it, writes nothing more and ends.
     pub fn forgotten(&self, host: DeviceId) {
-        lock(&self.stale).remove(&host);
-        let mut record = lock(&self.record);
-        if record.hosts.remove(&host.to_string()).is_some() {
-            self.keep(&record);
+        {
+            let mut state = lock(&self.state);
+            state.running.remove(&host);
+            state.asking.remove(&host);
+            if state.record.hosts.remove(&host.to_string()).is_some() {
+                self.keep(&state.record);
+            }
         }
-        drop(record);
         (self.changed)();
     }
 
-    /// Takes the right to run the sequence for `host`, which is refused while one is running for it.
-    fn claim(&self, host: &PairedHost) -> bool {
-        lock(&self.running).insert(host.host_device_id)
-    }
-
-    /// Runs the sequence for `host`, whose right to run it is held, and runs it again when it ends
-    /// well and the token changed while it ran.
-    fn spawn_run(self: &Arc<Self>, host: PairedHost) {
+    /// Runs the sequence for `host`, which `run` holds, and runs it again for as long as the token
+    /// the provider holds is not the one the registration just made proposed.
+    fn spawn_run(self: &Arc<Self>, host: PairedHost, run: u64) {
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
+            let mut guard = RunGuard {
+                desk: Arc::clone(&desk),
+                host: host.host_device_id,
+                run,
+                armed: true,
+            };
             loop {
-                let ended_well = match desk.sequence(&host).await {
-                    Ok(()) => {
-                        desk.set(
-                            &host,
-                            Phase::On,
-                            "Notifications are on for this host.",
-                            None,
-                        );
-                        true
+                match desk.sequence(&host, run).await {
+                    Ok(registered) => {
+                        let current = desk.current_digest().await;
+                        if !desk.registered(host.host_device_id, run, registered, current) {
+                            break;
+                        }
                     }
                     Err(stop) => {
-                        desk.set_stopped(&host, &stop);
-                        // What stopped it decides when it is tried again, with the token as it
-                        // stands then.
-                        lock(&desk.stale).remove(&host.host_device_id);
-                        false
+                        desk.stopped(host.host_device_id, run, &stop);
+                        break;
                     }
-                };
-                lock(&desk.asking).remove(&host.host_device_id);
-                lock(&desk.running).remove(&host.host_device_id);
-                let again = ended_well
-                    && lock(&desk.stale).contains(&host.host_device_id)
-                    && lock(&desk.running).insert(host.host_device_id);
-                if !again {
-                    break;
                 }
             }
+            guard.armed = false;
         });
     }
 
-    /// The whole sequence for one host: permission, token, proposal, the challenge, the
-    /// authorisation, the host. Every failure is words for the person.
+    /// What a run does when its registration is made: the host is on when the token it proposed is
+    /// the one the provider holds, and the run goes round again when it is not. Returns whether it
+    /// goes round again. A run that no longer holds its host writes nothing.
+    fn registered(
+        &self,
+        host: DeviceId,
+        run: u64,
+        registered: Digest256,
+        current: Option<Digest256>,
+    ) -> bool {
+        let now = (self.wiring.clock)();
+        {
+            let mut state = lock(&self.state);
+            if !state.holds(host, run) {
+                return false;
+            }
+            state.asking.remove(&host);
+            if current.is_some_and(|digest| digest != registered) {
+                // The record already says working, and the repeat reads the token as it stands.
+                return true;
+            }
+            state.running.remove(&host);
+            let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
+                return false;
+            };
+            kept.phase = Phase::On;
+            "Notifications are on for this host.".clone_into(&mut kept.words);
+            kept.settings = false;
+            kept.updated_ms = now;
+            kept.registered = Some(registered);
+            self.keep(&state.record);
+        }
+        (self.changed)();
+        false
+    }
+
+    /// What a run does when its sequence stopped: the host needs the person, for the reason it
+    /// gives. A run that no longer holds its host writes nothing.
+    fn stopped(&self, host: DeviceId, run: u64, stop: &Stop) {
+        let now = (self.wiring.clock)();
+        {
+            let mut state = lock(&self.state);
+            if !state.holds(host, run) {
+                return;
+            }
+            state.running.remove(&host);
+            state.asking.remove(&host);
+            let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
+                return;
+            };
+            kept.phase = Phase::Attention;
+            kept.words.clone_from(&stop.words);
+            kept.settings = stop.settings;
+            kept.updated_ms = now;
+            self.keep(&state.record);
+        }
+        (self.changed)();
+    }
+
+    /// Records where a host stands, without writing it.
+    fn mark(
+        state: &mut State,
+        host: DeviceId,
+        phase: Phase,
+        words: &str,
+        settings: bool,
+        now: u64,
+    ) {
+        let entry = state
+            .record
+            .hosts
+            .entry(host.to_string())
+            .or_insert_with(|| HostPush {
+                sender_record_id: None,
+                phase,
+                words: String::new(),
+                settings: false,
+                updated_ms: now,
+                registered: None,
+            });
+        entry.phase = phase;
+        entry.words = words.to_owned();
+        entry.settings = settings;
+        entry.updated_ms = now;
+    }
+
+    /// Says where a host's notifications stand while `run` holds it: working, in `words`. It keeps
+    /// that and tells the page, and says whether it did: a run that no longer holds its host (the
+    /// host was forgotten) writes nothing.
+    fn working(&self, host: DeviceId, run: u64, words: &str) -> bool {
+        let now = (self.wiring.clock)();
+        {
+            let mut state = lock(&self.state);
+            if !state.holds(host, run) || !state.record.hosts.contains_key(&host.to_string()) {
+                return false;
+            }
+            Self::mark(&mut state, host, Phase::Working, words, false, now);
+            self.keep(&state.record);
+        }
+        (self.changed)();
+        true
+    }
+
+    /// The digest of the token the provider holds now, when it holds one.
+    async fn current_digest(&self) -> Option<Digest256> {
+        let token = self.token().await.ok().flatten()?;
+        RegistrationToken::new(token)
+            .ok()
+            .map(|token| token_digest(&token))
+    }
+
+    /// The whole sequence for one host, for the run that holds it: permission, token, proposal, the
+    /// challenge, the authorisation, the host. Every failure is words for the person. When it
+    /// succeeds it says which token it proposed, by its digest.
     ///
     /// # Errors
     ///
     /// Returns the words for whatever stopped it.
-    pub async fn sequence(&self, host: &PairedHost) -> std::result::Result<(), Stop> {
+    async fn sequence(&self, host: &PairedHost, run: u64) -> std::result::Result<Digest256, Stop> {
         let native = &self.native;
         let mut permission = native
             .permission()
@@ -523,7 +727,7 @@ impl PushDesk {
             // look the application makes by itself, at its start, when it comes to the front or when
             // the network changes, must not put a dialog on a screen the person chose for something
             // else.
-            if !lock(&self.asking).remove(&host.host_device_id) {
+            if !lock(&self.state).asking.remove(&host.host_device_id) {
                 return Err(Stop {
                     words: "Notifications are not allowed for this app yet. Choose Try again, and \
                             the system will ask."
@@ -531,7 +735,7 @@ impl PushDesk {
                     settings: false,
                 });
             }
-            self.set(host, Phase::Working, "Asking for permission.", None);
+            self.working(host.host_device_id, run, "Asking for permission.");
             permission = native
                 .ask_permission()
                 .await
@@ -548,16 +752,14 @@ impl PushDesk {
         }
         // One registration at a time for the whole phone, until its challenge is answered. The
         // token is read once the turn has come, so that it is the one that stands then.
-        self.set(
-            host,
-            Phase::Working,
+        if !self.working(
+            host.host_device_id,
+            run,
             "Waiting for the notification service.",
-            None,
-        );
+        ) {
+            return Err(forgotten_host());
+        }
         let one_at_a_time = self.registering.lock().await;
-        // A change of the token after this point is a new one: the flag is cleared before the token
-        // is read, so that no change is lost between the two.
-        lock(&self.stale).remove(&host.host_device_id);
         let Some(token) = self.token_within(TOKEN_WITHIN).await? else {
             return Err(
                 "This phone has no notification token yet. Try again in a moment."
@@ -638,8 +840,12 @@ impl PushDesk {
                 .to_owned()
                 .into());
         }
-        self.set(host, Phase::Working, "Telling the host.", None);
-        let sender_record_id = self.sender_record_for(host);
+        if !self.working(host.host_device_id, run, "Telling the host.") {
+            return Err(forgotten_host());
+        }
+        let Some(sender_record_id) = self.sender_record_for(host, Some(run)) else {
+            return Err(forgotten_host());
+        };
         let issued = gateway
             .issue(PushSenderIssueRequest {
                 host_endpoint_key: host.host_endpoint_id,
@@ -681,7 +887,7 @@ impl PushDesk {
             .limited_key(keys.notification_preview.key_id().as_bytes(), seed.expose())
             .await
             .map_err(|_| "This phone could not file its preview key.".to_owned())?;
-        Ok(())
+        Ok(pending.token_digest)
     }
 
     /// The gateway's origin: the managed service's, and in a debug build the one a device run named.
@@ -773,7 +979,9 @@ impl PushDesk {
             .issue(PushSenderIssueRequest {
                 host_endpoint_key: host.host_endpoint_id,
                 host_signing_key: host.host_keys.authorisation,
-                sender_record_id: self.sender_record_for(host),
+                sender_record_id: self
+                    .sender_record_for(host, None)
+                    .ok_or_else(|| "This phone is no longer paired with that host.".to_owned())?,
             })
             .await
             .map_err(|error| gateway_words(&error))?;
@@ -781,76 +989,36 @@ impl PushDesk {
     }
 
     /// The authorisation identifier for `host`: the one issued before, or a new one, kept at once.
-    fn sender_record_for(&self, host: &PairedHost) -> PushSenderRecordId {
-        let mut record = lock(&self.record);
-        let key = host.host_device_id.to_string();
-        let held = record
+    ///
+    /// For a run, the identifier is given only while the run still holds the host; a run that
+    /// lost it (the host was forgotten) gets none, and never makes the host's record again.
+    fn sender_record_for(&self, host: &PairedHost, run: Option<u64>) -> Option<PushSenderRecordId> {
+        let mut state = lock(&self.state);
+        let id = host.host_device_id;
+        if run.is_some_and(|run| !state.holds(id, run)) {
+            return None;
+        }
+        let key = id.to_string();
+        let held = state
+            .record
             .hosts
             .get(&key)
             .and_then(|kept| kept.sender_record_id);
-        let id = held.unwrap_or_else(|| PushSenderRecordId::new(kr_ipc::new_uuid()));
+        let sender = held.unwrap_or_else(|| PushSenderRecordId::new(kr_ipc::new_uuid()));
         if held.is_none() {
             let now = (self.wiring.clock)();
-            let entry = record.hosts.entry(key).or_insert_with(|| HostPush {
+            let entry = state.record.hosts.entry(key).or_insert_with(|| HostPush {
                 sender_record_id: None,
                 phase: Phase::Working,
                 words: String::new(),
                 settings: false,
                 updated_ms: now,
+                registered: None,
             });
-            entry.sender_record_id = Some(id);
-            self.keep(&record);
+            entry.sender_record_id = Some(sender);
+            self.keep(&state.record);
         }
-        id
-    }
-
-    /// Sets where a host's notifications stand, keeps it and tells the page.
-    fn set(
-        &self,
-        host: &PairedHost,
-        phase: Phase,
-        words: &str,
-        sender: Option<PushSenderRecordId>,
-    ) {
-        self.set_with(host, phase, words, false, sender);
-    }
-
-    /// Sets a host's notifications to stopped, for the reason a sequence ended with.
-    fn set_stopped(&self, host: &PairedHost, stop: &Stop) {
-        self.set_with(host, Phase::Attention, &stop.words, stop.settings, None);
-    }
-
-    fn set_with(
-        &self,
-        host: &PairedHost,
-        phase: Phase,
-        words: &str,
-        settings: bool,
-        sender: Option<PushSenderRecordId>,
-    ) {
-        let now = (self.wiring.clock)();
-        {
-            let mut record = lock(&self.record);
-            let entry = record
-                .hosts
-                .entry(host.host_device_id.to_string())
-                .or_insert_with(|| HostPush {
-                    sender_record_id: None,
-                    phase,
-                    words: String::new(),
-                    settings: false,
-                    updated_ms: now,
-                });
-            entry.phase = phase;
-            entry.words = words.to_owned();
-            entry.settings = settings;
-            entry.updated_ms = now;
-            if sender.is_some() {
-                entry.sender_record_id = sender;
-            }
-            self.keep(&record);
-        }
-        (self.changed)();
+        Some(sender)
     }
 
     /// Writes the record whole. A failure is logged and not raised: what the person sees is the
@@ -912,6 +1080,12 @@ fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
     record
 }
 
+fn forgotten_host() -> Stop {
+    "This phone is no longer paired with that host."
+        .to_owned()
+        .into()
+}
+
 fn unreachable_native() -> String {
     "This phone could not be asked about notifications.".to_owned()
 }
@@ -966,14 +1140,6 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
     fn token(&self) -> PushFuture<'_, Option<String>> {
         Box::pin(async move {
             companion_platform::notify::token(&self.0)
-                .await
-                .map_err(said)
-        })
-    }
-
-    fn token_changed(&self) -> PushFuture<'_, bool> {
-        Box::pin(async move {
-            companion_platform::notify::token_changed(&self.0)
                 .await
                 .map_err(said)
         })
@@ -1114,6 +1280,7 @@ mod tests {
             words: "words".to_owned(),
             settings,
             updated_ms: 7,
+            registered: None,
         }
     }
 

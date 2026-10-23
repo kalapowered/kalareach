@@ -10,7 +10,7 @@ import java.io.File
  * the same way, from here.
  */
 object PushStores {
-    /** The preferences file the registration token and its flags are kept in. */
+    /** The preferences file the registration token is kept in. */
     const val TOKEN_STORE = "to.kala.reach.push"
 
     /** The current registration token. */
@@ -18,9 +18,6 @@ object PushStores {
 
     /** When the token was given, in milliseconds. */
     const val TOKEN_AT_KEY = "registration_token_at_ms"
-
-    /** Whether the token changed since the application last looked. */
-    const val TOKEN_CHANGED_KEY = "registration_token_changed"
 
     /** The file the pending registration is kept in, in the application's no-backup directory. */
     const val PENDING_FILE = "push-pending.json"

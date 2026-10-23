@@ -337,15 +337,6 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("token", token ?: JSONObject.NULL))
     }
 
-    /** Whether the token changed since the application last asked, and clears that. */
-    @Command
-    fun pushTokenChanged(invoke: Invoke) {
-        val preferences = activity.getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
-        val changed = preferences.getBoolean(PushStores.TOKEN_CHANGED_KEY, false)
-        if (changed) preferences.edit().putBoolean(PushStores.TOKEN_CHANGED_KEY, false).apply()
-        invoke.resolve(JSObject().put("changed", changed))
-    }
-
     @Command
     fun pushPendingSet(invoke: Invoke) {
         val record = invoke.getArgs().optJSONObject("record")
