@@ -52,15 +52,32 @@ private struct RustChallengeCrypto: ChallengeCrypto {
     }
 }
 
+/// Refuses every redirect: the answer is signed for the address the record names, and a redirect would
+/// send the same signed body to another one.
+private final class NoRedirects: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 /// One POST over the platform's own connection.
 private struct SessionPost: GatewayPost {
+    private static let session = URLSession(
+        configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
+
     func post(url: String, body: Data, then: @escaping (PostResult) -> Void) {
         guard let address = URL(string: url) else { return then(.unreachable) }
         var request = URLRequest(url: address, timeoutInterval: 8)
         request.httpMethod = "POST"
         request.httpBody = body
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        Self.session.dataTask(with: request) { _, response, error in
             if let http = response as? HTTPURLResponse, error == nil {
                 then(.status(http.statusCode))
             } else {
