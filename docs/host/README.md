@@ -5615,7 +5615,7 @@ back to the start of time, are served the whole log as before.
 Two limits remain. The cursors count the whole log and a subject's version counts the versions
 before the moment, so a device can tell how many changes preceded the first it was shown; a
 numbering that begins at the device's own history needs a base the store keeps for each viewer, and
-the store's format does not carry one yet. And a device is not told when retention took changes
+the store's format carries none. And a device is not told when retention took changes
 inside its reach, which is more than a thousand since its history began: that is a limit of
 completeness and not a disclosure.
 
