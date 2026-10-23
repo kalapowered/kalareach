@@ -1,8 +1,9 @@
 # Signing the Windows release
 
 Every Windows executable and PowerShell package KalaReach publishes is signed and timestamped before
-it leaves the runner that built it, and a run that cannot prove that of every artefact publishes
-nothing at all.
+it is published, and a run that cannot prove that of every artefact publishes nothing at all. The
+build job uploads unsigned trees; the `release` job, behind its environment, downloads them, signs
+them and checks every signature before anything is published.
 
 The production signing key lives inside Azure Artifact Signing, in hardware security modules that
 will not give it up, and what comes back over the wire is a signature. No copy of the private key
@@ -247,7 +248,8 @@ or tag from which the workflow was dispatched, but `inputs.ref` allows checking 
 or branch for the build. The environment protection ensures that a human reviewer must approve the
 `release` job, but GitHub environment policies do not constrain `inputs.ref`. For that reason, the `gate`
 job resolves the full 40-character commit SHA to job outputs and the GitHub Step Summary; the `release`
-job asserts that its checkout matches `needs.gate.outputs.commit`; and the human reviewer in
+job checks out exactly that commit by its identifier, and the build job asserts that its checkout
+matches it; and the human reviewer in
 `release-signing` must inspect that exact commit SHA in the step summary before approving deployment.
 
 The three identifiers the login needs are repository variables, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`
