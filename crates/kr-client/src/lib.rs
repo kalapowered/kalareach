@@ -58,6 +58,7 @@ pub mod encoder;
 pub mod error;
 pub mod ipc;
 pub mod mailbox_reader;
+pub mod organisation;
 pub mod pairing;
 // The module documents itself. A doc comment here as well would be joined to its own, and the links
 // in that would then be read from this crate's root, where they name nothing.
