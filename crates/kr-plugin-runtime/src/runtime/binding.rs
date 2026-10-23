@@ -982,9 +982,10 @@ impl BindingHandle {
     /// for the tests of what the queue does while the component has not yet read it: the
     /// component's speed against the producer's decides nothing once the pass is held.
     ///
-    /// Observations offered while the pass stands are held in the queue, and the pass that goes on
-    /// when the stop is released finds them all. Call it before the offer that wakes the pass, and
-    /// release the stop before [`Self::stop`], which waits for the pass.
+    /// Observations offered while the pass stands are held in the queue up to its bound, and the
+    /// pass that goes on when the stop is released finds what the queue still holds and the gap
+    /// that stands for the rest. Call it before the offer that wakes the pass, and release the
+    /// stop before [`Self::stop`], which waits for the pass.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn stop_next_pump(&self) -> PumpStop {
@@ -1266,11 +1267,14 @@ pub struct PumpStop {
 #[cfg(feature = "testing")]
 impl PumpStop {
     /// Waits until the pass has stopped, which is the point the stop is acknowledged at: the pass
-    /// has been woken, and nothing has left the queue.
-    pub async fn reached(&mut self) {
-        // The sender lives in the binding's slot or in the pass that stands. It drops unsent only
-        // if the binding ends first, and then there is no pass to wait for.
-        let _ = self.acknowledged.wait_for(|reached| *reached).await;
+    /// has been woken, and nothing has left the queue. Says whether a pass stopped: a later stop
+    /// that replaced this one before a pass reached it ends the wait with `false`.
+    ///
+    /// A pass that is never woken, or a binding that ends before it, leaves the wait without an
+    /// end, because the binding's handle keeps the stop until it is dropped: a caller that must
+    /// not hang bounds the wait.
+    pub async fn reached(&mut self) -> bool {
+        self.acknowledged.wait_for(|reached| *reached).await.is_ok()
     }
 
     /// Lets the pass go on.
