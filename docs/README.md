@@ -10,7 +10,7 @@ The protocol and the connection:
 | Document | What it covers |
 | --- | --- |
 | [protocol/README.md](protocol/README.md) | The protocol reference: KR-CBOR-1, version negotiation, framing, envelopes, receipt states, relay leases, error codes, the method and authority table, the root integration, and the account, service-credential and push objects |
-| [protocol/methods.md](protocol/methods.md) | Every method in the registry, generated from it, with its effect, its ingress, its summary and the section that describes it where one does |
+| [protocol/methods.md](protocol/methods.md) | Every method in the registry, generated from it, with its effect, its ingress, its summary and the section that describes it |
 | [protocol/method-reference.md](protocol/method-reference.md) | What the calls that no other guide describes take, answer and refuse: host and environment reads, pins, session reads, attachments, interrupts, the agent calls, review, actions, events and history, and the managed service's methods |
 | [protocol/glossary.md](protocol/glossary.md) | The terms the protocol relies on |
 | [transport/README.md](transport/README.md) | How a client reaches a host: endpoint configuration and self-hosting, the connection handshake, streams, reconnection, actor envelopes, action windows and the remote dispatch lease |

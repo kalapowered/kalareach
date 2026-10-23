@@ -9,22 +9,22 @@ Each row gives the method's effect, the ingress classes that may reach it and th
 summary. The complete authority entry of every method is in
 [`packages/protocol/schema/method-authority.json`](../../packages/protocol/schema/method-authority.json),
 and [the method and authority table](README.md#the-method-and-authority-table) explains its fields.
-The last column names the section that describes what the method does, where one does, and
-links to its document.
+The last column names the section that describes what the method does and links to its
+document.
 
 ## Host and environment
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits, configured services and where privacy mode stands. |  |
-| `environment.list` | read | `local_ipc`, `paired_device` | The environments this actor's grant admits. |  |
+| `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits, configured services and where privacy mode stands. | [Method reference: Host and environment reads](method-reference.md) |
+| `environment.list` | read | `local_ipc`, `paired_device` | The environments this actor's grant admits. | [Method reference: Host and environment reads](method-reference.md) |
 | `environment.capabilities` | read | `local_ipc`, `paired_device` | What one environment can currently do. Capability evidence, never authority. | [Platforms: What may be done on a desktop](../host/platforms.md) |
 | `environment.capabilities.check` | write | `local_ipc` | Perform the disclosed desktop checks in a session's own worker, at the host itself: read a file the person authorised, take a screen image, find an accessible element and start an application. They run once, after the person has been shown what each one does, and the answer says that they are running. Their findings reach `environment.capabilities`, which never performs them. | [Platforms: What may be done on a desktop](../host/platforms.md) |
-| `host.doctor` | read | `local_ipc`, `paired_device` | Host diagnostics with credentials redacted. |  |
-| `environment.enrol` | write | `local_ipc` | Record an enrolled WSL, container, SSH or paired environment: its platform identity, its operating-system user and the absolute path of the helper installed there. |  |
-| `environment.forget` | write | `local_ipc` | Remove one enrolled environment and its cached inventory row. |  |
-| `environment.inventory` | read | `local_ipc` | The owner-approved cached inventory of enrolled environments. It reports what was last observed and starts nothing. |  |
-| `environment.refresh` | write | `local_ipc` | Observe one enrolled environment now, and start it when the request asks for that. |  |
+| `host.doctor` | read | `local_ipc`, `paired_device` | Host diagnostics with credentials redacted. | [Method reference: Host and environment reads](method-reference.md) |
+| `environment.enrol` | write | `local_ipc` | Record an enrolled WSL, container, SSH or paired environment: its platform identity, its operating-system user and the absolute path of the helper installed there. | [Host: The enrolled environments, and the cached inventory](../host/README.md) |
+| `environment.forget` | write | `local_ipc` | Remove one enrolled environment and its cached inventory row. | [Method reference: Forgetting an environment](method-reference.md) |
+| `environment.inventory` | read | `local_ipc` | The owner-approved cached inventory of enrolled environments. It reports what was last observed and starts nothing. | [Host: The enrolled environments, and the cached inventory](../host/README.md) |
+| `environment.refresh` | write | `local_ipc` | Observe one enrolled environment now, and start it when the request asks for that. | [Host: The enrolled environments, and the cached inventory](../host/README.md) |
 | `delivery.destination.configure` | write | `local_ipc` | Create or replace an external notification destination: a webhook, Slack, Discord, Telegram or email, with where it sends, whether it deduplicates by an identifier, and the grant whose authority the content is intersected with. The grant has to stand, a paired device's identifier is not one a destination takes, and a service that sends with a credential is configured with it in the request, or with one kept earlier with delivery.destination.secret.set. | [Delivery: Configuring and removing a destination](../delivery/README.md) |
 | `delivery.destination.remove` | write | `local_ipc` | Remove a notification destination, and the credential kept for it. What was queued for it and not sent is taken back, and the answer says how much, and how many attempts were under way and can still arrive. Removing a paired device's destination ends its delivery and owes the gateway a revocation of the device's authorisation, as unpairing does, without unpairing the device. | [Delivery: Configuring and removing a destination](../delivery/README.md) |
 | `delivery.destination.list` | read | `local_ipc` | List the notification destinations that have a rule: a paired device's and the ones the owner configured, each with where it sends, the grant it is told under and whether it is in force. A removed destination is not listed. It carries no credential kept in the secret store, and does not say whether one is kept. A webhook's address is given without its query and fragment, but its path is given as it was configured, and a path can carry a token its owner put there. | [Delivery: Configuring and removing a destination](../delivery/README.md) |
@@ -67,30 +67,30 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `device.list` | read | `local_ipc`, `paired_device` | Paired devices, their key purposes, when each pairing ends, and how the authority feed stands. |  |
-| `device.revoke` | write | `local_ipc` | Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer. |  |
+| `device.list` | read | `local_ipc`, `paired_device` | Paired devices, their key purposes, when each pairing ends, and how the authority feed stands. | [Host: Grants, sharing and revocation](../host/README.md) |
+| `device.revoke` | write | `local_ipc` | Revoke a device. Completion requires the per-worker dispatch barrier, not a lease timer. | [Host: Revocation](../host/README.md) |
 | `device.preview_key.update` | write | `paired_device` | Rotate this device's own notification-preview key through its paired proof. | [Delivery: What travels, and what does not](../delivery/README.md) |
 | `device.push.register` | write | `paired_device` | Hand this host the delivery credential this device's installation was issued for it, so the host can notify this device. The host asks the gateway whether it takes the credential's bearer and holds the authorisation for the host's own key before it keeps anything. | [Delivery: A paired device becomes a destination](../delivery/README.md) |
-| `device.keys.complete` | write | `paired_device` | Declare this device's own four public keys once, signed by the authorisation key its pairing recorded, so the host keeps every key it binds. |  |
+| `device.keys.complete` | write | `paired_device` | Declare this device's own four public keys once, signed by the authorisation key its pairing recorded, so the host keeps every key it binds. | [Method reference: Completing a device's keys](method-reference.md) |
 
 ## Plugin catalogues
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `catalogue.list` | read | `local_ipc`, `paired_device` | Configured plugin catalogues, their roots, generations and budgets. |  |
+| `catalogue.list` | read | `local_ipc`, `paired_device` | Configured plugin catalogues, their roots, generations and budgets. | [Host: The plugin catalogue](../host/README.md) |
 | `catalogue.add` | write | `local_ipc`, `paired_device` | Trust a new catalogue root. A new root always requires fresh owner confirmation. | [Plugin catalogue: Enrolment comes first](../plugins/catalogue.md) |
 | `catalogue.sync` | write | `local_ipc`, `paired_device` | Synchronise a catalogue generation within its verified trust ceiling. | [Plugin catalogue: What a sync does](../plugins/catalogue.md) |
-| `catalogue.pin` | write | `local_ipc`, `paired_device` | Pin a catalogue to an exact generation. |  |
+| `catalogue.pin` | write | `local_ipc`, `paired_device` | Pin a catalogue to an exact generation. | [Method reference: Pinning a repository or a package](method-reference.md) |
 | `catalogue.remove` | write | `local_ipc`, `paired_device` | Remove a catalogue and stop trusting its root. | [Plugin catalogue: Enrolment comes first](../plugins/catalogue.md) |
 
 ## Plugins
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `plugin.list` | read | `local_ipc`, `paired_device` | Installed plugins, their pinned packages and their enabled state. |  |
+| `plugin.list` | read | `local_ipc`, `paired_device` | Installed plugins, their pinned packages and their enabled state. | [Host: The plugin catalogue](../host/README.md) |
 | `plugin.install` | write | `local_ipc`, `paired_device` | Install a verified package inside the repository's trust ceiling. | [Plugin catalogue: Two activations, each atomic on its own](../plugins/catalogue.md) |
-| `plugin.remove` | write | `local_ipc`, `paired_device` | Remove an installed plugin from an environment. |  |
-| `plugin.pin` | write | `local_ipc`, `paired_device` | Pin a plugin to an exact package hash. |  |
+| `plugin.remove` | write | `local_ipc`, `paired_device` | Remove an installed plugin from an environment. | [Host: The plugin catalogue](../host/README.md) |
+| `plugin.pin` | write | `local_ipc`, `paired_device` | Pin a plugin to an exact package hash. | [Method reference: Pinning a repository or a package](method-reference.md) |
 | `plugin.enable` | write | `local_ipc`, `paired_device` | Enable an installed plugin in an environment. | [Plugin catalogue: Matching, enabling and binding](../plugins/catalogue.md) |
 | `plugin.disable` | write | `local_ipc`, `paired_device` | Disable an installed plugin without removing it. | [Plugin catalogue: Matching, enabling and binding](../plugins/catalogue.md) |
 | `plugin.grant` | write | `local_ipc`, `paired_device` | Grant a plugin capability. Executable and native-bridge capabilities need confirmation. | [Plugin catalogue: Capabilities and qualification](../plugins/catalogue.md) |
@@ -131,13 +131,13 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `session.list` | read | `local_ipc`, `paired_device`, `workflow` | List the sessions this actor may observe. |  |
-| `session.create` | write | `local_ipc`, `paired_device`, `workflow` | Create a session. Deduplication happens in the controller before a worker exists. |  |
-| `session.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one session's filtered metadata and current state. |  |
+| `session.list` | read | `local_ipc`, `paired_device`, `workflow` | List the sessions this actor may observe. | [Method reference: Reading sessions](method-reference.md) |
+| `session.create` | write | `local_ipc`, `paired_device`, `workflow` | Create a session. Deduplication happens in the controller before a worker exists. | [Host: Creating a session](../host/README.md) |
+| `session.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one session's filtered metadata and current state. | [Method reference: Reading sessions](method-reference.md) |
 | `session.open` | read | `paired_device` | Open a paired connection for one session under one grant, or for the host alone. The connection then refuses a request for another session or under another grant, or, opened for the host, serves the host's own reads and no worker; the answer carries the rights the host decided the open with, or says the share has ended. | [Host: Grants, sharing and revocation](../host/README.md) |
-| `session.close` | write | `local_ipc`, `paired_device`, `workflow` | Close a session and hand its final metadata to the archive service. |  |
-| `session.describe` | read | `local_ipc`, `paired_device`, `workflow` | An authorised read of filtered session metadata, not arbitrary model control. |  |
-| `session.rename` | write | `local_ipc`, `paired_device`, `workflow` | Set a session's pinned label. |  |
+| `session.close` | write | `local_ipc`, `paired_device`, `workflow` | Close a session and hand its final metadata to the archive service. | [Host: Closure](../host/README.md) |
+| `session.describe` | read | `local_ipc`, `paired_device`, `workflow` | An authorised read of filtered session metadata, not arbitrary model control. | [Host: Session names and descriptions](../host/README.md) |
+| `session.rename` | write | `local_ipc`, `paired_device`, `workflow` | Set a session's pinned label. | [Host: Session names and descriptions](../host/README.md) |
 | `session.screen.preview` | read | `local_ipc` | The text of the visible lines of the screen showing now, as a viewer holding a history scope would first see it, for the issuer of a share to be shown before it exists. It reaches neither the buffer that is not showing nor scrollback, and the host's own owner is the only caller. | [Host: Grants, sharing and revocation](../host/README.md) |
 
 ## Attachments
@@ -145,21 +145,21 @@ links to its document.
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `session.attach` | write | `local_ipc`, `paired_device` | Attach in semantic or terminal mode. A geometry claim needs terminal.geometry as well. | [Protocol: Rights and capabilities are not the same thing](README.md) |
-| `session.detach` | write | `local_ipc`, `paired_device` | Detach this actor's own attachment and run geometry succession. |  |
-| `attachment.configure` | write | `local_ipc`, `paired_device` | Withdraw or add an authorised geometry claim without displacing the current owner. |  |
-| `attachment.viewport` | write | `local_ipc`, `paired_device` | Report this attachment's physical dimensions. It never changes the pseudoterminal. |  |
-| `terminal.resize` | write | `local_ipc`, `paired_device` | Resize the pseudoterminal. Only the current geometry owner at the current epoch may. |  |
-| `terminal.geometry.transfer` | write | `local_ipc`, `paired_device` | Hand geometry ownership to another eligible attachment. |  |
-| `terminal.palette.set` | write | `local_ipc`, `paired_device` | Set the session palette. |  |
+| `session.detach` | write | `local_ipc`, `paired_device` | Detach this actor's own attachment and run geometry succession. | [Method reference: Attachments](method-reference.md) |
+| `attachment.configure` | write | `local_ipc`, `paired_device` | Withdraw or add an authorised geometry claim without displacing the current owner. | [Method reference: Attachments](method-reference.md) |
+| `attachment.viewport` | write | `local_ipc`, `paired_device` | Report this attachment's physical dimensions. It never changes the pseudoterminal. | [Host: Who owns the size](../host/README.md) |
+| `terminal.resize` | write | `local_ipc`, `paired_device` | Resize the pseudoterminal. Only the current geometry owner at the current epoch may. | [Host: Who owns the size](../host/README.md) |
+| `terminal.geometry.transfer` | write | `local_ipc`, `paired_device` | Hand geometry ownership to another eligible attachment. | [Host: Who owns the size](../host/README.md) |
+| `terminal.palette.set` | write | `local_ipc`, `paired_device` | Set the session palette. | [Method reference: The terminal palette](method-reference.md) |
 
 ## Input
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `input.acquire` | write | `local_ipc`, `paired_device` | Acquire the input lease explicitly. There is no implicit remote acquisition. |  |
-| `input.release` | write | `local_ipc`, `paired_device` | Release the input lease this actor holds. |  |
-| `input.interrupt` | write | `local_ipc`, `paired_device` | Send an interrupt under the current lease. |  |
-| `input.write` | write | `local_ipc`, `paired_device` | Write ordered raw input under the current lease epoch and input sequence. Unsent or ambiguously delivered keystrokes are discarded, never replayed. |  |
+| `input.acquire` | write | `local_ipc`, `paired_device` | Acquire the input lease explicitly. There is no implicit remote acquisition. | [Host: Who may type](../host/README.md) |
+| `input.release` | write | `local_ipc`, `paired_device` | Release the input lease this actor holds. | [Host: Who may type](../host/README.md) |
+| `input.interrupt` | write | `local_ipc`, `paired_device` | Send an interrupt under the current lease. | [Method reference: Interrupting the foreground](method-reference.md) |
+| `input.write` | write | `local_ipc`, `paired_device` | Write ordered raw input under the current lease epoch and input sequence. Unsent or ambiguously delivered keystrokes are discarded, never replayed. | [Host: Who may type](../host/README.md) |
 
 ## Root integration
 
@@ -181,20 +181,20 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `agent.capabilities` | read | `local_ipc`, `paired_device`, `workflow` | What the bound agent can currently do, with its capability evidence. |  |
-| `agent.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | A filtered snapshot of the bound agent's shared state. |  |
-| `agent.commands` | read | `local_ipc`, `paired_device`, `workflow` | The commands the bound agent advertises. |  |
-| `agent.approval.inspect` | read | `local_ipc`, `paired_device` | What an installed decoder read of one approval request and the decisions it offered, with the request's original bytes and where it stands now. It records what the decoder said, not that the decoder read the request correctly. |  |
+| `agent.capabilities` | read | `local_ipc`, `paired_device`, `workflow` | What the bound agent can currently do, with its capability evidence. | [Method reference: The agent methods](method-reference.md) |
+| `agent.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | A filtered snapshot of the bound agent's shared state. | [Method reference: The agent methods](method-reference.md) |
+| `agent.commands` | read | `local_ipc`, `paired_device`, `workflow` | The commands the bound agent advertises. | [Method reference: The agent methods](method-reference.md) |
+| `agent.approval.inspect` | read | `local_ipc`, `paired_device` | What an installed decoder read of one approval request and the decisions it offered, with the request's original bytes and where it stands now. It records what the decoder said, not that the decoder read the request correctly. | [Method reference: The agent methods](method-reference.md) |
 
 ## Agent mutations
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `agent.prompt.submit` | write | `local_ipc`, `paired_device`, `workflow` | Submit a prompt. Applied means upstream admission, not task completion. |  |
-| `agent.prompt.queue` | write | `local_ipc`, `paired_device`, `workflow` | Queue a prompt behind the current turn. |  |
-| `agent.turn.steer` | write | `local_ipc`, `paired_device`, `workflow` | Steer the current turn where the upstream agent supports it. |  |
-| `agent.turn.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel the current turn using its typed request and current turn identifier. |  |
-| `agent.approval.respond` | write | `local_ipc`, `paired_device` | Answer an upstream approval request at its exact revision and pending state. |  |
+| `agent.prompt.submit` | write | `local_ipc`, `paired_device`, `workflow` | Submit a prompt. Applied means upstream admission, not task completion. | [Method reference: The agent methods](method-reference.md) |
+| `agent.prompt.queue` | write | `local_ipc`, `paired_device`, `workflow` | Queue a prompt behind the current turn. | [Method reference: The agent methods](method-reference.md) |
+| `agent.turn.steer` | write | `local_ipc`, `paired_device`, `workflow` | Steer the current turn where the upstream agent supports it. | [Method reference: The agent methods](method-reference.md) |
+| `agent.turn.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel the current turn using its typed request and current turn identifier. | [Method reference: The agent methods](method-reference.md) |
+| `agent.approval.respond` | write | `local_ipc`, `paired_device` | Answer an upstream approval request at its exact revision and pending state. | [Method reference: The agent methods](method-reference.md) |
 
 ## Drafts and media
 
@@ -250,19 +250,19 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `review.read` | read | `local_ipc`, `paired_device` | Read review state bound to exact change-set versions. |  |
-| `review.acknowledge` | write | `local_ipc`, `paired_device` | Acknowledge review of one version. It affects only this actor and mutates no code. |  |
-| `attention.read` | read | `local_ipc`, `paired_device` | Read the attention inbox for this actor's scope. |  |
-| `attention.acknowledge` | write | `local_ipc`, `paired_device` | Acknowledge an attention item for this actor only. |  |
-| `attention.quiet_hours` | write | `local_ipc`, `paired_device` | Set or clear the quiet-hours window. It defers audible delivery and drops nothing. |  |
-| `visit.acknowledge` | write | `local_ipc`, `paired_device` | Record this actor's visit so changed-since-last-visit stays per actor. |  |
-| `visit.changed` | read | `local_ipc`, `paired_device` | What changed since this actor's last visit, with omitted history stated as a gap. |  |
+| `review.read` | read | `local_ipc`, `paired_device` | Read review state bound to exact change-set versions. | [Method reference: Reading review state](method-reference.md) |
+| `review.acknowledge` | write | `local_ipc`, `paired_device` | Acknowledge review of one version. It affects only this actor and mutates no code. | [Host: Review, and what it does not do](../host/README.md) |
+| `attention.read` | read | `local_ipc`, `paired_device` | Read the attention inbox for this actor's scope. | [Host: What a caller is served](../host/README.md) |
+| `attention.acknowledge` | write | `local_ipc`, `paired_device` | Acknowledge an attention item for this actor only. | [Host: Acknowledgement](../host/README.md) |
+| `attention.quiet_hours` | write | `local_ipc`, `paired_device` | Set or clear the quiet-hours window. It defers audible delivery and drops nothing. | [Method reference: Quiet hours and visits](method-reference.md) |
+| `visit.acknowledge` | write | `local_ipc`, `paired_device` | Record this actor's visit so changed-since-last-visit stays per actor. | [Method reference: Quiet hours and visits](method-reference.md) |
+| `visit.changed` | read | `local_ipc`, `paired_device` | What changed since this actor's last visit, with omitted history stated as a gap. | [Host: Changed since a visit](../host/README.md) |
 
 ## Pending action control
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `action.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel an undispatched intent atomically. After a dispatch marker, cancellation is a separate upstream action with its own receipt. |  |
+| `action.cancel` | write | `local_ipc`, `paired_device`, `workflow` | Cancel an undispatched intent atomically. After a dispatch marker, cancellation is a separate upstream action with its own receipt. | [Method reference: Reading and cancelling an action](method-reference.md) |
 
 ## Owner confirmation
 
@@ -277,19 +277,19 @@ links to its document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `events.subscribe` | read | `local_ipc`, `paired_device`, `workflow` | Subscribe to an event stream from a cursor. |  |
-| `events.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED. |  |
-| `agent.instances` | read | `local_ipc`, `paired_device` | Read a session's live agent instances and the requests of theirs that wait on a person, without the screen, the geometry, the input lease or the attachments. |  |
-| `history.page` | read | `local_ipc`, `paired_device`, `workflow` | Page retained history. A history request never creates a worker. |  |
-| `action.read` | read | `local_ipc`, `paired_device`, `workflow` | Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session. |  |
+| `events.subscribe` | read | `local_ipc`, `paired_device`, `workflow` | Subscribe to an event stream from a cursor. | [Method reference: Events, snapshots and history](method-reference.md) |
+| `events.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED. | [Method reference: Events, snapshots and history](method-reference.md) |
+| `agent.instances` | read | `local_ipc`, `paired_device` | Read a session's live agent instances and the requests of theirs that wait on a person, without the screen, the geometry, the input lease or the attachments. | [Method reference: Events, snapshots and history](method-reference.md) |
+| `history.page` | read | `local_ipc`, `paired_device`, `workflow` | Page retained history. A history request never creates a worker. | [Method reference: Events, snapshots and history](method-reference.md) |
+| `action.read` | read | `local_ipc`, `paired_device`, `workflow` | Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session. | [Method reference: Reading and cancelling an action](method-reference.md) |
 
 ## Sharing
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `grant.create` | write | `local_ipc`, `paired_device` | Delegate a narrower grant. Persistent enlargement requires owner confirmation. | [Pairing: Grants](../pairing/README.md) |
-| `grant.revoke` | write | `local_ipc`, `paired_device` | Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier. |  |
-| `grant.list` | read | `local_ipc`, `paired_device` | List grants this issuer may see, with their revisions and expiry. |  |
+| `grant.revoke` | write | `local_ipc`, `paired_device` | Revoke a grant and its descendants. Completion uses the per-worker dispatch barrier. | [Host: Revocation](../host/README.md) |
+| `grant.list` | read | `local_ipc`, `paired_device` | List grants this issuer may see, with their revisions and expiry. | [Host: Grants, sharing and revocation](../host/README.md) |
 | `grant.redeem` | write | `paired_device` | Redeem a session invitation, once, and activate the grant it carries. Only the device the invitation names redeems it, and a withdrawn, expired or already redeemed invitation activates nothing. The answer is the grant and carries no session text. | [Pairing: Grants](../pairing/README.md) |
 | `grant.held` | read | `paired_device` | List what is offered to this device and what it holds, a page at a time: the invitations that name it and the active shares of sessions still open. The device asking is the one the connection authenticated as, and the answer carries none of the text the issuer was shown. | [Pairing: Grants](../pairing/README.md) |
 | `grant.transfer` | write | `local_ipc` | Hand a session's control to another paired device: the receiving device is given an active grant over the session and the transferring device's grant is revoked with its descendants, in one commit. The person at this machine asks for it, and it spends the owner confirmation an owner device recorded for exactly this transfer, once. | [Pairing: Grants](../pairing/README.md) |
@@ -302,20 +302,20 @@ links to its document.
 | `push.sender.issue` | write | `service_client` | Issue a host-scoped delivery credential for one installation. | [Protocol: Push objects](README.md) |
 | `push.sender.renew` | write | `service_client` | Renew a delivery credential without changing destination, host key or rate policy. | [Protocol: Push objects](README.md) |
 | `push.sender.revoke` | write | `service_client` | Revoke a sender authorisation. A revoked record cannot renew. | [Protocol: Push objects](README.md) |
-| `mailbox.read` | read | `service_client` | Read encrypted mailbox envelopes. The service never sees their plaintext. |  |
-| `mailbox.deliver` | write | `service_client` | Place one sealed envelope in a recipient's mailbox. The service stores the routing record and the ciphertext and never a plaintext field. |  |
-| `mailbox.acknowledge` | write | `service_client` | Acknowledge mailbox items the recipient has stored durably, so the service may remove them. The replay identifiers outlive the items. |  |
-| `authority.sync` | write | `service_client` | Exchange signed revocation requests and host acknowledgements. Only the host issues its own ordered revisions, and it rejects an older revision. |  |
-| `sync.compare_exchange` | write | `service_client` | Publish encrypted settings, draft state or the recovery bundle under a compare-and-exchange generation. |  |
-| `backup.manifest` | write | `service_client` | Publish or fetch a backup generation manifest. Writer authority is verified. |  |
-| `storage.status` | read | `service_client` | Report what managed storage this account holds, what is awaiting deletion and the retention recorded for it. |  |
-| `storage.retention.set` | write | `service_client` | Turn managed backup storage on or off and record the number of daily snapshots the account's backups keep, within the bounds the service publishes. It is off until this is asked for. A change decided against a revision the record has left changes nothing and is answered with the retention as it stands. |  |
-| `storage.upload.create` | write | `service_client` | Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists. |  |
-| `storage.upload.part` | write | `service_client` | Upload one part. The service reads at most the declared length plus one byte and refuses an oversized or wrong-hash body before it writes the part's content. |  |
-| `storage.upload.complete` | write | `service_client` | Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave. |  |
-| `storage.upload.abort` | write | `service_client` | Abandon the upload. New parts and completions are fenced first, then the content stored for the upload is removed, and the hold is given back only once that removal is confirmed. The upload's record stays. |  |
-| `storage.object.read` | read | `service_client` | Read a bounded range of one stored object's ciphertext. The service holds no key for it. |  |
-| `storage.object.delete` | write | `service_client` | Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released. |  |
+| `mailbox.read` | read | `service_client` | Read encrypted mailbox envelopes. The service never sees their plaintext. | [Method reference: The mailbox](method-reference.md) |
+| `mailbox.deliver` | write | `service_client` | Place one sealed envelope in a recipient's mailbox. The service stores the routing record and the ciphertext and never a plaintext field. | [Method reference: The mailbox](method-reference.md) |
+| `mailbox.acknowledge` | write | `service_client` | Acknowledge mailbox items the recipient has stored durably, so the service may remove them. The replay identifiers outlive the items. | [Method reference: The mailbox](method-reference.md) |
+| `authority.sync` | write | `service_client` | Exchange signed revocation requests and host acknowledgements. Only the host issues its own ordered revisions, and it rejects an older revision. | [Method reference: The authority feed](method-reference.md) |
+| `sync.compare_exchange` | write | `service_client` | Publish encrypted settings, draft state or the recovery bundle under a compare-and-exchange generation. | [Method reference: Settings sync](method-reference.md) |
+| `backup.manifest` | write | `service_client` | Publish or fetch a backup generation manifest. Writer authority is verified. | [Method reference: The backup manifest](method-reference.md) |
+| `storage.status` | read | `service_client` | Report what managed storage this account holds, what is awaiting deletion and the retention recorded for it. | [Method reference: Managed storage](method-reference.md) |
+| `storage.retention.set` | write | `service_client` | Turn managed backup storage on or off and record the number of daily snapshots the account's backups keep, within the bounds the service publishes. It is off until this is asked for. A change decided against a revision the record has left changes nothing and is answered with the retention as it stands. | [Method reference: Managed storage](method-reference.md) |
+| `storage.upload.create` | write | `service_client` | Reserve the declared maximum and allocate one random object key, upload identifier and immutable part table. No content is accepted before all of that exists. | [Method reference: Managed storage](method-reference.md) |
+| `storage.upload.part` | write | `service_client` | Upload one part. The service reads at most the declared length plus one byte and refuses an oversized or wrong-hash body before it writes the part's content. | [Method reference: Managed storage](method-reference.md) |
+| `storage.upload.complete` | write | `service_client` | Complete the upload. The service verifies every part size and the total, settles the hold as stored bytes, and answers a repeat with the result it already gave. | [Method reference: Managed storage](method-reference.md) |
+| `storage.upload.abort` | write | `service_client` | Abandon the upload. New parts and completions are fenced first, then the content stored for the upload is removed, and the hold is given back only once that removal is confirmed. The upload's record stays. | [Method reference: Managed storage](method-reference.md) |
+| `storage.object.read` | read | `service_client` | Read a bounded range of one stored object's ciphertext. The service holds no key for it. | [Method reference: Managed storage](method-reference.md) |
+| `storage.object.delete` | write | `service_client` | Delete one stored object. It becomes a tombstone for the published window before the ciphertext is removed and the allowance released. | [Method reference: Managed storage](method-reference.md) |
 
 ## Voice
 
