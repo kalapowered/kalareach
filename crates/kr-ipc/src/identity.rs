@@ -4474,8 +4474,8 @@ mod tests {
     #[test]
     fn a_failed_query_is_never_a_process_that_has_gone() {
         // What a guard that asks whether a recorded worker is still running is told: neither
-        // running nor ended. A session guard refuses on this answer, as it does on any reading it
-        // could not take, rather than passing over the worker.
+        // running nor ended. Recovery keeps the worker's slot on this answer, rather than taking
+        // it for an end.
         let recorded = current_process_start_identity().expect("the kernel answers");
         let pid = std::process::id();
         assert!(
@@ -4644,8 +4644,7 @@ mod tests {
             matches!(unread, ProcessQuery::CannotEstablish(ref error) if error.to_string().contains("Access is denied")),
             "a failed reading is not an absent process: {unread:?}"
         );
-        // Carried through to what a session guard asks, the failed reading refuses rather than
-        // passing over the worker it was asked about.
+        // Carried through to what a guard asks, the failed reading is neither running nor ended.
         let recorded = match windows_answer(pid, WindowsReading::Created(started), now) {
             ProcessQuery::Present(identity) => identity,
             other => panic!("a creation time is a start value: {other:?}"),

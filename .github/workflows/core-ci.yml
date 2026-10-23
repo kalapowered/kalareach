@@ -661,10 +661,10 @@ jobs:
       # `/bin/sh` this platform has not got. The host tests that start a real worker run under
       # `cargo test`, whose own job kills its members on close and forbids breakaway: their daemon
       # starts each worker through the environment's scheduled task, as the shipping daemon does,
-      # whose starter creates it, so the worker is never in that job. Three of those tests are held
-      # back on this platform: two need the worker's rendezvous to complete here, which it does not
-      # yet, and one uses a POSIX shell binary this platform has not got. Each gives its reason in
-      # its ignore attribute in `crates/kr-worker/tests/host.rs`.
+      # whose starter creates it, so the worker is never in that job. Four of those tests are held
+      # back on this platform: three need the worker's rendezvous to complete here, which it does
+      # not yet, and one uses a POSIX shell binary this platform has not got. Each gives its reason
+      # in its ignore attribute in `crates/kr-worker/tests/host.rs`.
       #
       # What this runner cannot do at all is qualify a console interactively. The pseudo-console
       # tests open a console of their own and drive it, which works here; what needs a real machine
