@@ -1911,8 +1911,10 @@ impl AttentionModule {
                 }) {
                     return Err(unknown_subject(&params.subject));
                 }
-                let state = store
-                    .review_state(actor, &Viewer::Owner, &params.subject)
+                // Read as the caller reads, so the version of a subject outside its reach is not
+                // told to it by a refusal that names the version it is at.
+                let state = caller
+                    .view(|viewer| store.review_state(actor, viewer, &params.subject))
                     .map_err(refusal)?
                     .ok_or_else(|| unknown_subject(&params.subject))?;
                 if params.version.get() > state.current_version.get() {
@@ -2044,6 +2046,7 @@ impl AttentionModule {
                                     Unperformed::Refused(refusal_to_error(refused))
                                 })?;
                             Mutation::Visit {
+                                viewer,
                                 session_id: params.session_id,
                                 cursor: params.acknowledged_cursor.get(),
                                 views: params.views,
@@ -4486,7 +4489,7 @@ pub(crate) mod tests {
             .module
             .store()
             .expect("the store")
-            .acknowledge_visit(&owner(), world.session_id, 1, Vec::new())
+            .acknowledge_visit(&owner(), &Viewer::Owner, world.session_id, 1, Vec::new())
             .expect("the visit is recorded");
         go.send(()).expect("the read goes on");
         let served: VisitChangedResult = reading

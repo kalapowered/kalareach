@@ -391,7 +391,7 @@ impl AsOwner for Attention {
         cursor: u64,
         views: Vec<LogViewState>,
     ) -> kr_attention::Result<VisitAcknowledgeResult> {
-        self.acknowledge_visit(actor, session(1), cursor, views)
+        self.acknowledge_visit(actor, &Viewer::Owner, session(1), cursor, views)
     }
 
     fn changed_as(
@@ -1802,8 +1802,276 @@ fn a_change_the_viewer_does_not_reach_at_the_end_of_the_log_leaves_nothing_more_
         .expect("the store is this owner's");
     assert_eq!(
         page.result.to_cursor.get(),
-        all.to_cursor,
-        "and the view ends where the whole log does"
+        6,
+        "and the view ends after the last change it was shown"
+    );
+    assert!(
+        page.result.to_cursor.get() < all.to_cursor,
+        "not where the whole log does, which counts a change it may not be told of"
+    );
+}
+
+/// A device that sees session 1, whose history reaches back to `history_from_ms`.
+fn device_from(admits: &dyn Fn(SessionId) -> bool, history_from_ms: u64) -> Viewer<'_> {
+    Viewer::Device(DeviceScope {
+        grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([1; 16])),
+        session_view: true,
+        automation_manage: false,
+        host_manage: false,
+        admits_session: admits,
+        history_from_ms,
+    })
+}
+
+/// KR-REQ-10.49: a viewer whose history starts after every change the log holds is told nothing of
+/// the log: its position stays where it is, and the view does not say where the log ends.
+#[test]
+fn a_viewer_whose_history_starts_after_every_change_is_not_told_where_the_log_ends() {
+    let mut attention = engine();
+    for (sequence, version) in [(1_u64, 1_u64), (2, 2), (3, 3)] {
+        attention
+            .apply(
+                &turn_completed(sequence, 1_000 * sequence, version),
+                reading(0),
+            )
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let late = device_from(&admits_one, NOON + 10_000);
+    let page = attention
+        .changed(&phone, &late, session(1), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert!(page.result.changes.is_empty());
+    assert!(!page.result.more);
+    assert_eq!(
+        page.result.to_cursor.get(),
+        page.result.from_cursor.get(),
+        "the position is the viewer's own, and not the number of changes the log has held"
+    );
+    let owner = attention
+        .changed_as(&phone, 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert_eq!(owner.to_cursor, 6, "the owner is carried to the end");
+}
+
+/// KR-REQ-10.49: a range the host could not read, and a range retention took, are not dated, so a
+/// viewer whose history has a bound is shown neither, and the owner is shown both.
+#[test]
+fn a_viewer_with_a_bound_is_shown_no_range_that_went_missing() {
+    let mut attention = engine();
+    attention
+        .apply(&turn_completed(1, 1_000, 1), reading(0))
+        .expect("the store records the decision");
+    // Semantic sequences two to eight were evicted before the host could read them.
+    attention
+        .apply(&turn_completed(9, 9_000, 2), reading(120_000))
+        .expect("the store records the decision");
+    // And more changes than the log retains, so that retention takes the oldest.
+    for sequence in 10..(10 + 600) {
+        attention
+            .apply(
+                &turn_completed(sequence, 9_000 + sequence, 3),
+                reading(120_000 + sequence),
+            )
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let bounded = attention
+        .changed(
+            &phone,
+            &device_from(&admits_one, NOON + 9_500),
+            session(1),
+            100,
+            0,
+            Content::Narrowed,
+        )
+        .expect("the store is this owner's");
+    assert!(
+        bounded.result.omitted.is_empty(),
+        "{:?}",
+        bounded.result.omitted
+    );
+    let whole = attention
+        .changed(
+            &phone,
+            &device_from(&admits_one, 0),
+            session(1),
+            100,
+            0,
+            Content::Narrowed,
+        )
+        .expect("the store is this owner's");
+    assert!(
+        whole
+            .result
+            .omitted
+            .iter()
+            .any(|gap| gap.source == AttentionSource::Semantic),
+        "a device whose history reaches every moment is shown what went missing: {:?}",
+        whole.result.omitted
+    );
+    let owner = attention
+        .changed_as(&phone, 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert!(
+        owner
+            .omitted
+            .iter()
+            .any(|gap| gap.from_sequence == U64::new(2)),
+        "the owner is shown the range the host could not read: {:?}",
+        owner.omitted
+    );
+}
+
+/// KR-REQ-10.49: a page of one change is followed by `more` while a change the viewer reaches
+/// follows, and by none once it does not.
+#[test]
+fn more_is_true_only_while_a_change_the_viewer_reaches_follows() {
+    let mut attention = engine();
+    for (sequence, version, at_ms) in [(1_u64, 1_u64, 3_000_u64), (2, 2, 4_000), (3, 3, 500)] {
+        attention
+            .apply(&turn_completed(sequence, at_ms, version), reading(0))
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let viewer = device_from(&admits_one, NOON + 2_000);
+    let mut pages = Vec::new();
+    loop {
+        let page = attention
+            .changed(&phone, &viewer, session(1), 1, 0, Content::Narrowed)
+            .expect("the store is this owner's");
+        let next = page.result.to_cursor.get();
+        let more = page.result.more;
+        pages.push((page.result.changes.len(), more));
+        attention
+            .acknowledge_visit(&phone, &viewer, session(1), next, Vec::new())
+            .expect("the store records the visit");
+        if !more {
+            break;
+        }
+        assert!(pages.len() < 10, "the pages end: {pages:?}");
+    }
+    assert_eq!(pages, vec![(1, true), (1, true), (1, true), (1, false)]);
+}
+
+/// KR-REQ-10.49: a position a viewer with a bound acknowledges is stored no further than the last
+/// change it may be shown, so the next view does not give it where the log ends.
+#[test]
+fn an_acknowledgement_by_a_viewer_with_a_bound_is_stored_no_further_than_it_was_shown() {
+    let mut attention = engine();
+    for (sequence, version, at_ms) in [(1_u64, 1_u64, 3_000_u64), (2, 2, 4_000), (3, 3, 500)] {
+        attention
+            .apply(&turn_completed(sequence, at_ms, version), reading(0))
+            .expect("the store records the decision");
+    }
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let viewer = device_from(&admits_one, NOON + 2_000);
+    let stored = attention
+        .acknowledge_visit(&phone, &viewer, session(1), u64::MAX, Vec::new())
+        .expect("the store records the visit");
+    assert_eq!(
+        stored.acknowledged_cursor.get(),
+        4,
+        "after the last change it may be shown, and not at the end of the log, which is 6"
+    );
+    let next = attention
+        .changed(&phone, &viewer, session(1), 100, 0, Content::Narrowed)
+        .expect("the store is this owner's");
+    assert_eq!(next.result.from_cursor.get(), 4);
+
+    // A viewer that reaches every moment is stored where it says, up to the end of the log.
+    let everyone = actor("device:tablet");
+    let stored = attention
+        .acknowledge_visit(
+            &everyone,
+            &device_from(&admits_one, 0),
+            session(1),
+            u64::MAX,
+            Vec::new(),
+        )
+        .expect("the store records the visit");
+    assert_eq!(stored.acknowledged_cursor.get(), 6);
+}
+
+/// KR-REQ-10.49: a review subject whose current version was recorded before a viewer's history
+/// starts is answered as one the store never held, by a read and by an acknowledgement alike.
+#[test]
+fn a_review_subject_recorded_before_the_viewers_history_is_answered_as_one_never_held() {
+    let turn = |sequence: u64, at_ms: u64, name: &str, version: u64| {
+        event(
+            AttentionSource::Semantic,
+            sequence,
+            at_ms,
+            EventKind::TurnCompleted {
+                session_id: session(1),
+                turn_id: AgentTurnId::new(name).expect("an identifier"),
+                version,
+                change_set: None,
+                summary: "rewrote the parser".to_owned(),
+            },
+        )
+    };
+    let mut attention = engine();
+    for (sequence, at_ms, name, version) in [
+        (1_u64, 1_000_u64, "before", 1_u64),
+        (2, 3_000, "after", 1),
+        (3, 1_500, "moved", 1),
+        (4, 3_500, "moved", 2),
+    ] {
+        attention
+            .apply(&turn(sequence, at_ms, name, version), reading(0))
+            .expect("the store records the decision");
+    }
+    let subject = |name: &str| ReviewSubject::CompletedTurn {
+        session_id: session(1),
+        turn_id: AgentTurnId::new(name).expect("an identifier"),
+    };
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let viewer = device_from(&admits_one, NOON + 2_000);
+
+    let listed = attention
+        .review_states(&phone, &viewer, Some(session(1)), None, MAX_REVIEW_SUBJECTS)
+        .expect("a page that starts at the oldest is never a continuation")
+        .0;
+    let names: Vec<_> = listed.iter().map(|state| state.subject.clone()).collect();
+    assert_eq!(names, vec![subject("after"), subject("moved")]);
+    assert_eq!(
+        listed[1].current_version.get(),
+        2,
+        "a subject with versions before and after the bound is at the version in reach"
+    );
+    assert!(
+        attention
+            .review_state(&phone, &viewer, &subject("before"))
+            .expect("the store is this owner's")
+            .is_none()
+    );
+    assert!(matches!(
+        attention.acknowledge_review(&phone, &viewer, &subject("before"), 99, reading(0)),
+        Err(kr_attention::Error::UnknownReviewSubject { .. })
+    ));
+    attention
+        .acknowledge_review(&phone, &viewer, &subject("after"), 1, reading(0))
+        .expect("a subject in reach is acknowledged");
+    assert!(matches!(
+        attention.review_states(
+            &phone,
+            &viewer,
+            Some(session(1)),
+            Some(&subject("before")),
+            MAX_REVIEW_SUBJECTS
+        ),
+        Err(kr_attention::Error::UnknownContinuation { .. })
+    ));
+    assert_eq!(
+        review_states(&attention, "local:501", session(1)).len(),
+        3,
+        "the owner is shown all of them"
     );
 }
 

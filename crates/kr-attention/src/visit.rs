@@ -148,6 +148,20 @@ pub struct SummarySource {
     pub changes: Vec<Change>,
 }
 
+/// How far back a reader's history reaches into a session's change log.
+///
+/// The log's cursors count every change the host recorded, and a change is dated by the moment the
+/// host recorded it. A reader whose history starts at a moment is shown the changes from then on,
+/// and is told nothing of what lies before it: not a range that retention took, nor a gap in a
+/// source, nor where the log ends when nothing it may be shown follows.
+#[derive(Clone, Copy)]
+pub struct Reach<'a> {
+    /// Whether a change recorded at this moment is within the reader's history.
+    pub reaches: &'a dyn Fn(TimestampMs) -> bool,
+    /// Whether every moment is, so that nothing lies outside what the reader may be shown.
+    pub every_moment: bool,
+}
+
 /// One session's change log, the visits into it and the log views beside them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionLog {
@@ -273,10 +287,22 @@ impl SessionLog {
         cursor: u64,
         views: Vec<LogViewState>,
         revision: u64,
+        reach: Reach<'_>,
     ) -> Visit {
-        let next_cursor = self.next_cursor;
+        // How far a visit can have got. A reader whose history has a bound is not told where the
+        // log ends, so what it stores, and is given back as its position, is no further than the
+        // last change it may be shown.
+        let limit = if reach.every_moment {
+            self.next_cursor
+        } else {
+            self.log
+                .iter()
+                .rev()
+                .find(|change| (reach.reaches)(change.at_ms))
+                .map_or(0, |change| change.cursor.saturating_add(1))
+        };
         let visit = self.visits.entry(actor.clone()).or_default();
-        visit.cursor = visit.cursor.max(cursor.min(next_cursor));
+        visit.cursor = visit.cursor.max(cursor.min(limit));
         visit.revision = revision;
         for view in views {
             // A view identifier and a filter are the client's own text, and the host writes both
@@ -339,18 +365,25 @@ impl SessionLog {
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
-        reaches: &dyn Fn(TimestampMs) -> bool,
+        reach: Reach<'_>,
     ) -> Changed {
+        let reaches = reach.reaches;
         let visit = self.visits.get(actor);
         let from = visit.map_or(0, |visit| visit.cursor);
         let limit = usize::try_from(max_changes.clamp(1, MAX_VISIT_CHANGES)).unwrap_or(1);
-        let mut omitted: Vec<AttentionGap> = self
-            .omitted
-            .iter()
-            .filter(|held| held.at_cursor >= from)
-            .map(|held| held.gap)
-            .collect();
-        if from < self.oldest_cursor {
+        // Neither a range retention took nor a gap in a source is dated, so a reader whose history
+        // has a bound is shown none: a gap noticed late can describe records from before its
+        // history, and nothing dates what retention took.
+        let mut omitted: Vec<AttentionGap> = if reach.every_moment {
+            self.omitted
+                .iter()
+                .filter(|held| held.at_cursor >= from)
+                .map(|held| held.gap)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if reach.every_moment && from < self.oldest_cursor {
             omitted.push(AttentionGap {
                 source: AttentionSource::Semantic,
                 session_id: Nullable::some(session_id),
@@ -367,26 +400,34 @@ impl SessionLog {
             .take(limit)
             .map(|change| (change.to_wire(), change.text.record()))
             .collect();
-        let mut to_cursor = changes
-            .last()
-            .map_or(self.next_cursor.max(start), |(change, _)| {
-                change.cursor.get().saturating_add(1)
-            });
-        // Changes after the page that the reader does not reach are not something more to ask for:
-        // the view goes past them, so that the next one does not come back empty.
-        if !self
-            .log
-            .iter()
-            .any(|change| change.cursor >= to_cursor && reaches(change.at_ms))
-        {
-            to_cursor = self.next_cursor.max(start);
-        }
+        // Where the page ends. A reader that may be shown every change is carried to the end of
+        // the log, past what is no longer retained. A reader whose history has a bound is carried
+        // only past the changes it was shown, because the end of the log counts changes it may not
+        // be told of.
+        let to_cursor = if reach.every_moment {
+            changes
+                .last()
+                .map_or(self.next_cursor.max(start), |(change, _)| {
+                    change.cursor.get().saturating_add(1)
+                })
+        } else {
+            changes
+                .last()
+                .map_or(from, |(change, _)| change.cursor.get().saturating_add(1))
+        };
+        let more = if reach.every_moment {
+            self.next_cursor > to_cursor
+        } else {
+            self.log
+                .iter()
+                .any(|change| change.cursor >= to_cursor && reaches(change.at_ms))
+        };
         Changed {
             from_cursor: from,
             to_cursor,
             changes,
             omitted,
-            more: self.next_cursor > to_cursor,
+            more,
             views: Self::retained_views(visit, oldest_output_cursor),
         }
     }
@@ -519,20 +560,21 @@ impl Visits {
         cursor: u64,
         views: Vec<LogViewState>,
         revision: u64,
+        reach: Reach<'_>,
     ) -> Visit {
         self.sessions
             .entry(session_id)
             .or_default()
-            .acknowledge(actor, cursor, views, revision)
+            .acknowledge(actor, cursor, views, revision, reach)
     }
 
     /// Answers what changed in one session since one actor's last visit to it.
     ///
     /// `oldest_output_cursor` is the oldest output the host can still replay, which is what decides
-    /// whether a retained log view can still be served from where it was left. `reaches` says
-    /// whether the reader's history reaches back to the moment a change was recorded: a change it
-    /// does not reach is not in the answer and does not take a place in a page, and the cursors of
-    /// the answer cover it.
+    /// whether a retained log view can still be served from where it was left. `reach` says how far
+    /// back the reader's history reaches ([`Reach`]): a change it does not reach is not in the
+    /// answer and does not take a place in a page, and neither the ranges that went missing nor
+    /// where the log ends are told to a reader whose history has a bound.
     #[must_use]
     pub fn changed_since(
         &self,
@@ -540,7 +582,7 @@ impl Visits {
         session_id: SessionId,
         max_changes: u64,
         oldest_output_cursor: u64,
-        reaches: &dyn Fn(TimestampMs) -> bool,
+        reach: Reach<'_>,
     ) -> Changed {
         self.sessions.get(&session_id).map_or_else(
             || {
@@ -549,18 +591,10 @@ impl Visits {
                     actor,
                     max_changes,
                     oldest_output_cursor,
-                    reaches,
+                    reach,
                 )
             },
-            |log| {
-                log.changed_since(
-                    session_id,
-                    actor,
-                    max_changes,
-                    oldest_output_cursor,
-                    reaches,
-                )
-            },
+            |log| log.changed_since(session_id, actor, max_changes, oldest_output_cursor, reach),
         )
     }
 

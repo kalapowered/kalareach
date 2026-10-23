@@ -5602,8 +5602,20 @@ outright. An attention item is not a history page, so it is narrowed rather than
 that did not arrive over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either. The changed-since-last-visit view holds only the changes the host recorded
-at or after the moment the caller's history reaches back to; the cursors still cover the others,
-so the next view starts where this one ended.
+at or after the moment the caller's history reaches back to. Its cursors end after the last change
+it was shown, never at the end of the log, and it names no range that went missing: neither a range
+retention took nor a gap in a source has a date, so a caller whose history has a bound is told of
+none. A review subject whose current version was recorded before that moment is answered as one the
+host does not hold, by a read and by an acknowledgement alike, and an acknowledged position is kept
+no further than the last change the caller may be shown. The owner, and a device whose grant reaches
+back to the start of time, are served the whole log as before.
+
+Two limits remain. The cursors count the whole log and a subject's version counts the versions
+before the moment, so a device can tell how many changes preceded the first it was shown; a
+numbering that begins at the device's own history needs a base the store keeps for each viewer, and
+the store's format does not carry one yet. And a device is not told when retention took changes
+inside its reach, which is more than a thousand since its history began: that is a limit of
+completeness and not a disclosure.
 
 An item's key carries none of that text either. A key has to be derived rather than allocated, so
 that rebuilding the inbox from the retained events lands on the items it had before, and it travels

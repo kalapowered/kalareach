@@ -1613,6 +1613,68 @@ async fn a_device_under_a_grant_with_no_cursor_is_shown_what_is_first_seen_after
     host.stop().await;
 }
 
+/// KR-REQ-10.49: a review subject whose current version was recorded before a device's pairing is
+/// answered to that device as one the host never held: its review read does not list it, and an
+/// acknowledgement of it, whatever version it names, is told no more than that the host holds no
+/// such subject. The owner's reads are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_review_subject_recorded_before_a_devices_pairing_is_answered_to_it_as_one_never_held() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (turn, subject) = completed_turn(session_id);
+    host.controller()
+        .attention()
+        .observe(&[turn])
+        .expect("the store records the turn");
+    let (_phone, device) =
+        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
+
+    let reviews: ReviewReadResult = device
+        .read(
+            Method::ReviewRead,
+            &ReviewReadParams {
+                session_id: Nullable::null(),
+                subject: Nullable::null(),
+                max_reviews: U64::new(50),
+                after: Nullable::null(),
+            },
+        )
+        .await
+        .expect("a device's review read is served");
+    assert!(
+        reviews.reviews.iter().all(|state| state.subject != subject),
+        "{reviews:?}"
+    );
+    let refused = device_mutation::<ReviewAcknowledgeResult>(
+        &device,
+        session_target(&host, session_id),
+        Method::ReviewAcknowledge,
+        &ReviewAcknowledgeParams {
+            session_id,
+            subject: subject.clone(),
+            version: U64::new(99),
+        },
+    )
+    .await
+    .expect_err("a subject from before the device's history is not one it may acknowledge");
+    assert_eq!(refused.code(), ErrorCode::InvalidArgument);
+    assert!(
+        !refused.to_string().contains("version"),
+        "the refusal does not say what version the host holds: {refused}"
+    );
+
+    let mut control = host.client().await;
+    assert!(
+        owner_reviews(&mut control, session_id)
+            .await
+            .iter()
+            .any(|state| state.subject == subject),
+        "the owner is shown it"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-23.45: a device whose grant carries `host.manage` and no `session.view` sees none of a
 /// session's items, an acknowledgement naming one is stale, and it may set the quiet hours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

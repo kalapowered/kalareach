@@ -255,12 +255,29 @@ impl Reviews {
             .iter()
             .filter(|(_, held)| {
                 let owner = subject_session(&held.subject);
-                session.is_none_or(|session_id| owner == session_id) && viewer.sees_session(owner)
+                session.is_none_or(|session_id| owner == session_id)
+                    && viewer.sees_session(owner)
+                    && viewer.reaches(Some(held.at_ms))
             })
             .map(|(key, held)| (held.sequence, key.clone()))
             .collect();
         keys.sort();
         keys.into_iter().map(|(_, key)| key).collect()
+    }
+
+    /// Returns whether this caller may be shown a subject: it may see the session the subject
+    /// belongs to, and its history reaches back to the moment the subject's current version was
+    /// recorded.
+    ///
+    /// A subject the store does not hold is not one the caller may be shown, and is answered as
+    /// such, so that a caller learns nothing of what exists beyond its reach.
+    #[must_use]
+    pub fn shows(&self, viewer: &crate::scope::Viewer<'_>, subject: &ReviewSubject) -> bool {
+        viewer.sees_session(subject_session(subject))
+            && self
+                .subjects
+                .get(&subject_key(subject))
+                .is_some_and(|held| viewer.reaches(Some(held.at_ms)))
     }
 
     /// Returns every subject the host holds a version of.
