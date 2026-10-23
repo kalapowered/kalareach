@@ -10,6 +10,10 @@ on:
         description: "Run the macOS jobs (macos, macos-demonstrations, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
+      ios:
+        description: "Run the ios job, which builds the application for the iOS Simulator and starts it. It is part of the macOS jobs, so a run with them on has it; this switch runs it alone, in a manual run with the macOS jobs turned off. A push or a pull request always runs it."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -1659,6 +1663,327 @@ jobs:
         with:
           primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+
+  # The companion on an Android phone, as a person gets it: the debug application packaged for the
+  # two architectures an emulator and a phone run, the packaged classes and identifiers read back,
+  # and then the application started on an emulator, with the native library's own cases run there
+  # beside it. The job above lints Rust and builds nothing, and the unit tests of the phone's
+  # Kotlin run in the nightly report; a library that links but does not load, a plugin the system
+  # cannot instantiate and a page that never opens all pass those. The emulator is the Android SDK's
+  # own, started with the hardware acceleration a hosted Linux runner offers.
+  #
+  # No cache is saved: the repository's caches are at their limit, and a cache saved here would
+  # take the room of one every other job restores. The job's time is the cost of that.
+  android-app:
+    name: android-app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # The runner arrives with toolchains this project never uses; the Android SDK stays, with the
+      # emulator and a system image to be added to it.
+      - name: Free the disk the build needs
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      # No package cache: the job saves none (see the job's comment), and the packages come from the
+      # registry.
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          package-manager-cache: false
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      # The architectures the universal package carries: the phone's, and the emulator's.
+      - name: Install the Android targets
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+
+      # The NDK the application's Gradle project pins is not on the runner's image, whose NDKs are
+      # others. The emulator and the system image are the device the application is started on:
+      # Android 16 with Google Play and 16 KB memory pages, the device the project's own scripts
+      # use. The versions installed are printed, since the SDK manager is given no pin for the
+      # emulator and the image.
+      - name: Install the Android NDK, the emulator and a system image
+        timeout-minutes: 20
+        run: |
+          manager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$manager" ]; then
+            echo "::error::the runner's Android SDK has no command-line tools at $manager"
+            exit 1
+          fi
+          yes | "$manager" --licenses > "$RUNNER_TEMP/sdkmanager.log"
+          yes | "$manager" --install "ndk;28.2.13676358" "emulator" \
+            "system-images;android-36;google_apis_playstore_ps16k;x86_64" >> "$RUNNER_TEMP/sdkmanager.log"
+          tail -n 5 "$RUNNER_TEMP/sdkmanager.log"
+          "$manager" --list_installed | grep -E 'ndk;28|emulator|system-images'
+          {
+            echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.2.13676358"
+            echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.2.13676358"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The package is built the way a person builds it, and the script reads it back: the classes
+      # the system resolves by name, among them the Tauri plugin, and the application identifier in
+      # the manifest, the code and the libraries.
+      - name: Build the debug application
+        timeout-minutes: 60
+        run: pnpm -C apps/companion android --debug --apk --target aarch64 x86_64
+
+      # GitHub's documented way to give a hosted Linux runner's user the virtual machine device.
+      - name: Let the emulator use the runner's virtual machine device
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      # One step, so that the emulator lives as long as what runs on it: the native library's cases
+      # on the x86-64 architecture the emulator runs, then the application started and looked at.
+      # Both run whatever the other did, and the log of the device is kept either way.
+      - name: Run the native library and start the application on the emulator
+        timeout-minutes: 30
+        run: |
+          set -uo pipefail
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          mkdir -p "$KR_TEST_ARTIFACTS_DIR/android-app"
+          avd=kalareach-ci
+          # The device is made where the emulator looks for it: the tools take their own place for
+          # it from the SDK's settings unless it is named.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd --force --name "$avd" \
+            --package "system-images;android-36;google_apis_playstore_ps16k;x86_64" --device pixel
+          # The application and the libraries it unpacks are more than the default data partition.
+          config="$ANDROID_AVD_HOME/$avd.avd/config.ini"
+          if [ ! -f "$config" ]; then
+            echo "::error::the virtual device has no configuration file at $config"
+            exit 1
+          fi
+          sed -i '/^disk\.dataPartition\.size=/d' "$config"
+          echo "disk.dataPartition.size=8192M" >> "$config"
+          "$ANDROID_HOME/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot \
+            -gpu swiftshader_indirect -accel on > "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log" 2>&1 &
+          emulator=$!
+          trap 'kill "$emulator" 2> /dev/null || true' EXIT
+          serial="emulator-5554"
+          started=$SECONDS
+          until [ "$(adb -s "$serial" shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; do
+            if ! kill -0 "$emulator" 2> /dev/null; then
+              echo "::error::the emulator ended before it finished starting"
+              tail -n 40 "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log"
+              exit 1
+            fi
+            if [ $((SECONDS - started)) -gt 600 ]; then
+              echo "::error::the emulator did not finish starting"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "the emulator finished starting after $((SECONDS - started)) seconds"
+          failed=0
+          bash scripts/native-library-tests.sh android --serial "$serial" || failed=1
+          bash scripts/android-app-launch.sh \
+            apps/companion/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk \
+            "$KR_TEST_ARTIFACTS_DIR/android-app/launch.png" --serial "$serial" || failed=1
+          adb -s "$serial" logcat -d -b all > "$KR_TEST_ARTIFACTS_DIR/android-app/logcat.txt" || true
+          exit "$failed"
+
+      # What a cache of this job would hold, which the job saves none of: the target directory, the
+      # registries and the package store as the disk report lists them, and Gradle's home.
+      - name: What the build left on the disk
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          bash scripts/disk-report.sh report "what the build left"
+          du -sh "$HOME/.gradle" || true
+
+      # The screenshot of the started application, and the logs of the device.
+      - name: Keep the Android evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-android
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+  # The companion on an iPhone, with no signing identity: the library linted for the device
+  # architecture, the application built for the simulator with its Swift plugin, read back, and
+  # then started in an iPhone simulator, with the native library's own cases run there beside it.
+  # Nothing here holds a certificate, a profile or a secret. It runs in parallel with the other
+  # macOS jobs and is the fifth of them in a run, so a run holds five hosted macOS runners at once.
+  #
+  # As the Android job, it saves no cache, and its time is the cost of that.
+  ios:
+    name: ios
+    # Skipped, and shown as skipped, only in a manual run that turns off both the macOS jobs and this one.
+    if: github.event_name != 'workflow_dispatch' || inputs.macos || inputs.ios
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: What the disk holds
+        continue-on-error: true
+        timeout-minutes: 5
+        run: bash scripts/disk-report.sh begin "the image as it arrives"
+
+      # The tvOS, watchOS and visionOS runtimes are used by nothing here; the iOS ones stay.
+      - name: Free the disk the build needs
+        continue-on-error: true
+        timeout-minutes: 8
+        run: bash scripts/free-simulator-runtimes.sh --keep-ios
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      # No package cache: the job saves none (see the job's comment), and the packages come from the
+      # registry.
+      - name: Install Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          package-manager-cache: false
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      # The device architecture is linted, and the simulator's is built and run.
+      - name: Install the iOS targets
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      # The runner's default Xcode is older than the Swift the application's code needs. The choice
+      # is the one the phone unit tests make, and the version is printed. It is also made the
+      # system's, because the build below starts Xcode through a program that passes this job's
+      # environment on only in part.
+      - name: Choose the newest Xcode
+        run: |
+          . scripts/lib/xcode.sh
+          kr_select_xcode
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcode-select --print-path
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # What Xcode's build gives the Swift package it builds from the Rust side is the application's
+      # minimum system, which a lint outside Xcode has to be given the same way.
+      - name: Lint the companion's Rust for the iPhone
+        timeout-minutes: 40
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        run: cargo clippy --locked --lib -p companion-tauri --target aarch64-apple-ios -- -D warnings
+
+      # The application as a person builds it for a simulator: the interface, the Rust library and
+      # the Swift plugin, linked into KalaReach.app. A simulator build is signed ad hoc, "Sign to
+      # Run Locally", which needs no identity, certificate or profile, and none is here. The
+      # project's local settings file, which the repository ignores and the build reads when it
+      # exists, gives the build two things a developer's machine has and this runner has not: the
+      # one architecture this runner's simulator runs, because the notification extension would
+      # otherwise be built for two and the identifier check reads one, and the Apple team's prefix
+      # (read from the Xcode project, which names it: it is an identifier and not a credential),
+      # which the keychain groups of the application and the extension begin with, and `CI`, which
+      # Xcode hands to the build phase that starts pnpm. That phase runs without this runner's
+      # environment, and pnpm run there without `CI` took the packages installed under it for
+      # packages installed under other settings, and stopped to ask a terminal that is not there
+      # before it removed them.
+      - name: Build the application for the simulator
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          team="$(sed -n 's/^ *DEVELOPMENT_TEAM: *\([A-Z0-9]\{10\}\) *$/\1/p' apps/companion/src-tauri/gen/apple/project.yml)"
+          if [ "$(printf '%s\n' "$team" | wc -l | tr -d ' ')" != 1 ] || [ -z "$team" ]; then
+            echo "::error::the Xcode project does not name one Apple team"
+            exit 1
+          fi
+          printf 'ARCHS = arm64\nAppIdentifierPrefix = %s.\nCI = true\n' "$team" > apps/companion/src-tauri/gen/apple/Local.xcconfig
+          pnpm -C apps/companion tauri ios build --debug --ci --target aarch64-sim
+
+      - name: Read the built application back
+        run: |
+          set -euo pipefail
+          app="$(find apps/companion/src-tauri/gen/apple/build -name KalaReach.app -type d -not -path '*.xcarchive/*' | head -n 1)"
+          if [ -z "$app" ]; then
+            echo "::error::the build left no KalaReach.app"
+            exit 1
+          fi
+          echo "KR_IOS_APP=$PWD/$app" >> "$GITHUB_ENV"
+          node apps/companion/scripts/identifiers.mjs --ios "$app"
+
+      # The newest iOS runtime the image has, and an iPhone on it that this job makes and removes.
+      - name: Boot an iPhone simulator
+        run: |
+          set -euo pipefail
+          runtime="$(xcrun simctl list runtimes available -j | python3 -I -c '
+          import json
+          import sys
+
+          found = [r for r in json.load(sys.stdin)["runtimes"] if r.get("platform") == "iOS" and r.get("isAvailable")]
+          print(max(found, key=lambda r: tuple(int(p) for p in r["version"].split(".")))["identifier"])
+          ')"
+          udid="$(xcrun simctl create kalareach-ci com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro "$runtime")"
+          echo "KR_SIMULATOR=$udid" >> "$GITHUB_ENV"
+          echo "simulator $udid on $runtime"
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b > /dev/null
+          xcrun simctl list devices booted
+
+      # The same cases as on the emulator, on the architecture the simulator runs.
+      - name: Run the native library in the simulator
+        timeout-minutes: 30
+        run: bash scripts/native-library-tests.sh ios --udid "$KR_SIMULATOR"
+
+      - name: Start the application in the simulator
+        run: bash scripts/ios-app-launch.sh "$KR_IOS_APP" "$KR_SIMULATOR" "$KR_TEST_ARTIFACTS_DIR/ios-app/launch.png"
+
+      - name: Shut the simulator down
+        if: ${{ always() && env.KR_SIMULATOR != '' }}
+        continue-on-error: true
+        run: |
+          xcrun simctl shutdown "$KR_SIMULATOR"
+          xcrun simctl delete "$KR_SIMULATOR"
+
+      - name: Keep the iOS evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-ios
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh end "what the disk has left"
 
   companion:
     name: companion
