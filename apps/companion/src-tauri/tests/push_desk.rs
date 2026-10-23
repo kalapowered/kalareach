@@ -9,14 +9,8 @@
 //! gateway and of what a host takes is shown there; what these hold is the order and the keys the
 //! application's core uses, and what it hands its registrar.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-16.08 | `a_host_the_person_asked_for_is_handed_the_credential_the_gateway_issued` |
-//! | KR-REQ-16.11 | `the_key_filed_for_the_notification_extension_is_the_preview_key_the_host_was_told_of` |
-//! | KR-REQ-16.06 | `two_hosts_that_ask_together_register_one_after_the_other` |
-//! | KR-REQ-16.16 | `a_token_that_changes_while_a_host_registers_is_registered_again_when_that_run_ends` |
-//! | KR-REQ-16.06 | `a_token_that_arrives_a_moment_after_the_permission_is_waited_for` |
-//! | KR-REQ-16.06 | `a_look_the_application_makes_by_itself_never_asks_the_system_for_permission` |
+//! Each case names the requirement row its own assertions show, in its own comment. The cases
+//! that name none hold a defect that happened and can happen again.
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -533,9 +527,9 @@ async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_hos
     );
 }
 
-/// KR-REQ-16.06: the phone keeps one record of the registration it waits for and the gateway one
+/// KR-REQ-16.08: the phone keeps one record of the registration it waits for and the gateway one
 /// pending attempt, so two hosts asked together are registered one after the other. Neither is told
-/// that a newer registration replaced it, and both end up on.
+/// that a newer registration replaced it, and each is handed the credential the gateway issued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_hosts_that_ask_together_register_one_after_the_other() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -562,6 +556,13 @@ async fn two_hosts_that_ask_together_register_one_after_the_other() {
     let handed = phone.registered.lock().expect("what was handed");
     let hosts: BTreeSet<_> = handed.handed.iter().map(|each| each.0).collect();
     assert_eq!(hosts.len(), 2, "each host was handed a credential");
+    for each in &handed.handed {
+        assert_eq!(
+            each.1["sender_record_id"],
+            vectors()["records"]["sender_record"]["binding"]["sender_record_id"],
+            "the credential the gateway issued"
+        );
+    }
 }
 
 /// KR-REQ-16.16: a token the system changes while a host is registering is not lost. The run that
@@ -615,8 +616,8 @@ async fn a_token_that_changes_while_a_host_registers_is_registered_again_when_th
     );
 }
 
-/// KR-REQ-16.06: the provider makes a registration token a moment after the person agrees, so the
-/// sequence waits for it and does not stop with "no token yet" at the first look.
+/// The provider makes a registration token a moment after the person agrees, so the sequence waits
+/// for it and does not stop with "no token yet" at the first look.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_that_arrives_a_moment_after_the_permission_is_waited_for() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -638,7 +639,7 @@ async fn a_token_that_arrives_a_moment_after_the_permission_is_waited_for() {
     );
 }
 
-/// KR-REQ-16.06: the system's permission question is asked when the person chooses to turn
+/// The system's permission question is asked when the person chooses to turn
 /// notifications on, and by nothing else. A person who refused once leaves the permission unread
 /// as granted or denied on some phones, and the look the application makes at its start, when it
 /// comes to the front or when the network changes finds a host that stopped for it: that look
