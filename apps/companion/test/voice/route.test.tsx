@@ -663,8 +663,11 @@ describe('while a call is running', () => {
     const ending = await screen.findByRole('heading', { name: 'Ending a voice session' })
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
-    // The control that was pressed is gone, and focus goes to the words that say what follows.
-    expect(ending).toHaveFocus()
+    // The control that was pressed is gone, and focus goes to the words that say what follows. It
+    // goes there once the screen that shows them has been drawn, so the case waits for it.
+    await waitFor(() => {
+      expect(ending).toHaveFocus()
+    })
     // The call is not said to be closed: the device is still asking the host, and says so itself.
     expect(screen.queryByText(/This device's call is closed/)).not.toBeInTheDocument()
 
@@ -677,7 +680,9 @@ describe('while a call is running', () => {
     await waitForChoice()
     expect(screen.getByText(/did not confirm that it withdrew the call's grant/)).toBeInTheDocument()
     // The control that was pressed is gone, and focus goes to what replaced it.
-    expect(screen.getByRole('heading', { name: 'Start a voice session' })).toHaveFocus()
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Start a voice session' })).toHaveFocus()
+    })
   })
 
   // A setup the screen watched is over when the device says so, in the device's words.
