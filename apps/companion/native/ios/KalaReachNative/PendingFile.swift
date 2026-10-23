@@ -29,9 +29,26 @@ final class PendingFile {
     static let fileName = "push-pending.json"
 
     private let url: URL
-    private let lock = NSLock()
+    /// One lock for every reader of this file in the process, whichever instance it holds: the
+    /// receiver and the application each make their own.
+    private let lock: NSLock
 
-    init(url: URL) { self.url = url }
+    private static var locks: [String: NSLock] = [:]
+    private static let locksGuard = NSLock()
+
+    init(url: URL) {
+        self.url = url
+        Self.locksGuard.lock()
+        defer { Self.locksGuard.unlock() }
+        let key = url.standardizedFileURL.path
+        if let held = Self.locks[key] {
+            lock = held
+        } else {
+            let made = NSLock()
+            Self.locks[key] = made
+            lock = made
+        }
+    }
 
     /// The record in the application's data directory.
     static func inApplicationSupport() -> PendingFile? {
@@ -75,13 +92,18 @@ final class PendingFile {
         }
     }
 
-    /// Moves a record that is still `pending` to `state`, with the reason when there is one. False
-    /// when there is no such record: one that was replaced or has expired is left alone.
+    /// Moves the record of registration `registrationId` to `state`, with the reason when there is
+    /// one, if that record is still `pending`. False when the record is another registration's (a try
+    /// that outlived its registration must not move its replacement), when there is none, and when
+    /// it has expired: it is then left alone.
     @discardableResult
-    func mark(state: String, reason: String?, nowMilliseconds: UInt64) -> Bool {
+    func mark(registrationId: String, state: String, reason: String?, nowMilliseconds: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard var record = load(), (record["state"] as? String) == Self.pending else { return false }
+        guard var record = load(),
+            (record["registration_id"] as? String) == registrationId,
+            (record["state"] as? String) == Self.pending
+        else { return false }
         if nowMilliseconds >= deadline(of: record) {
             record["state"] = Self.expired
             try? store(record)
