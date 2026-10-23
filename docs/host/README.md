@@ -796,7 +796,7 @@ and `disable` edit the host's list, and the change reaches the sessions created 
 `kr doctor` reports each package the list names, with its state, and each integration an admitted
 release declares: what a new session gets of it and why, the mode its command runs in, the flags
 and variables it adds, and the executable the daemon's own search path resolves the command to,
-with the version a signed qualification record gives that executable. An installed release the
+with the version the signed index gives that executable's digest. An installed release the
 admissions leave out is reported only where the list names it, and where the admissions cannot be
 computed each listed package is reported as `unknown`. An integration a new session would be
 launched without for its size is reported as `too_large`. One answer carries at most 256 reports
@@ -6716,7 +6716,7 @@ integration is enabled, is served by the worker as follows. The worker answers t
 with the integration's flags and a backend, and the shell runs the installation's launcher in front
 of the program. The typed vector has no option and, if it has a first word, one the package lists,
 and the program is not a script; otherwise the worker answers with a bypass and the command runs as
-typed. When the launcher presents itself, a signed qualification record has to name the program's
+typed. When the launcher presents itself, the signed index has to name the program's build as a qualified
 build, the package's table has to be qualified for its version, and the table has to declare a
 tested volatile forwarding mode, or the launch fails and the launcher runs the command as typed.
 The worker starts the server, which is its own child on pipes, in a process group of its own, in
@@ -7282,7 +7282,7 @@ bound by then was bound by its own call's report and stays bound.
 An admitted channel is served by this host for as long as it is open, on a gateway connection of its
 own kind, and only the launched application's own: its starter must be the process the launch
 registered, an instance has one channel open at a time, and the connector's table must be qualified
-for the version a signed qualification record names for the executable the launch hashed. What it
+for the version the signed index names, as a qualified build, for the executable the launch hashed. What it
 relays goes through the same native admission as any upstream request and is recorded as a pending
 resource with its source frame; whether that can be answered is decided by the decoding trust and
 the arbitration above, as for any connection. A frame its table does not route towards this host
