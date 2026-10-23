@@ -264,10 +264,12 @@ impl<L: Link> PageSource for Pages<'_, L> {
     /// Asks the daemon when the output between two cursors was written.
     ///
     /// A daemon of a release before the times were kept does not list the method, and refuses it as
-    /// it refuses any method it does not list: `PERMISSION_DENIED`. The same session has just been
-    /// paged by `history.page`, which asks for the same right over the same ingress, so a refusal of
-    /// this read after that page was answered is a daemon that does not know it, and its output
-    /// carries no time. Any other refusal is the daemon's own and is returned as it is.
+    /// it refuses any method it does not list: `PERMISSION_DENIED`. A grant that has lost its right
+    /// is refused with the same code. The two are told apart by asking for the same session's
+    /// output once more, which asks for the same right: where that is answered, the daemon does not
+    /// know the method, and its output carries no time; where it is refused too, the refusal is the
+    /// daemon's own and is returned as it is; where the page fails for another reason, that failure
+    /// is returned. Any other refusal of this read is returned as it is.
     async fn times(&mut self, from_cursor: u64, to_cursor: u64) -> Result<HistoryTimesResult> {
         let params = HistoryTimesParams {
             session_id: self.session_id,
@@ -275,16 +277,29 @@ impl<L: Link> PageSource for Pages<'_, L> {
             to_cursor: U64::new(to_cursor),
         };
         match self.link.request(Method::HistoryTimes, &params).await? {
-            Err(refusal) if refusal.code == ErrorCode::PermissionDenied => Ok(HistoryTimesResult {
-                intervals: Vec::new(),
-                next_cursor: U64::new(to_cursor),
-                complete: true,
-                unavailable: Nullable::some(
-                    "the daemon of this environment is of a release that does not record \
-                         when output is produced"
-                        .to_owned(),
-                ),
-            }),
+            Err(refusal) if refusal.code == ErrorCode::PermissionDenied => {
+                match page(self.link, self.session_id, from_cursor, 1).await {
+                    Ok(_) => Ok(HistoryTimesResult {
+                        intervals: Vec::new(),
+                        next_cursor: U64::new(to_cursor),
+                        complete: true,
+                        unavailable: Nullable::some(
+                            "the daemon of this environment is of a release that does not record \
+                             when output is produced"
+                                .to_owned(),
+                        ),
+                    }),
+                    // The page is refused for the same reason: the refusal is the grant's, and it
+                    // is the daemon's own.
+                    Err(CliError::Refused(asked_again))
+                        if asked_again.code == ErrorCode::PermissionDenied =>
+                    {
+                        decode(Err(refusal))
+                    }
+                    // Anything else the page met is what went wrong, and says so itself.
+                    Err(other) => Err(other),
+                }
+            }
             answer => decode(answer),
         }
     }
