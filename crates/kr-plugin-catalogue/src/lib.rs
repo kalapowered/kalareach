@@ -3418,6 +3418,10 @@ mod tests {
 
     /// A kept root that resets the role floors says so until a verified checkpoint is published,
     /// and the working copy the next verification starts from leaves those floors out.
+    ///
+    /// KR-REQ-11.07, the root progress a verification keeps: the rotated root the client verified
+    /// is recorded with the reset it owes, a later root that changes nothing does not clear it, and
+    /// only the sync that publishes a verified checkpoint settles it.
     #[tokio::test]
     async fn a_reset_kept_with_a_root_is_owed_until_a_checkpoint_is_published() {
         let home = tempfile::tempdir().expect("a temporary directory");
@@ -3821,6 +3825,11 @@ mod tests {
     /// from one generation or the other, and floors no lower than before. After a restart, a replay
     /// of the generation before is refused exactly where a floor moved on, and the new generation
     /// is accepted whatever the stop left.
+    ///
+    /// KR-REQ-11.07, the checkpoint of trusted metadata: a publication interrupted after any of its
+    /// five documents leaves each document whole and the timestamp and snapshot floors at the
+    /// version before or the version after, never below, and a replay of the generation before is
+    /// refused as untrusted exactly where a floor moved on.
     #[tokio::test]
     async fn a_publication_stopped_after_any_document_keeps_its_floors_and_refuses_a_rollback() {
         use crate::test_support::{Generation, GenerationSpec, copy_tree};
@@ -3893,6 +3902,11 @@ mod tests {
     /// restart, the next sync accepts the lower versions the new key signs, and a replay of the
     /// generation before the rotation, signed with the key the new root no longer trusts, is
     /// refused.
+    ///
+    /// KR-REQ-11.07, a timestamp key rotation through the qualified client: the rotated root is
+    /// kept and its reset stays owed after a failed or interrupted publication and a restart, the
+    /// lower versions the new timestamp key signs are accepted, and the generation before the
+    /// rotation, signed by the key the new root no longer trusts, is refused as untrusted.
     #[tokio::test]
     async fn a_partial_key_change_stays_owed_until_a_whole_checkpoint_settles_it() {
         use crate::test_support::{Generation, GenerationSpec, KeySet, TestKey, copy_tree};
