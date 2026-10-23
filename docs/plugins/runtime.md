@@ -1088,7 +1088,7 @@ exists.
 | `metadata.match`, `presentation.declarative`, `broker.semantic_events` | Within default ceiling (enrolment already permits) |
 | `terminal.stream`, `terminal.transcript_tail`, `process.observe`, `upstream.action` | Explicit repository or installation grant |
 | `terminal.input`, `filesystem.read`, `network.outbound`, `approval.decode`, `approval.respond` | Explicit installation grant required (repository ceiling cannot satisfy) |
-| `native_bridge.install` | Confirmed installation grant (owner confirmation required) |
+| `native_bridge.install`, `command_integration.launch`, `launch.probe` | Confirmed installation grant (owner confirmation of that exact release, on every release) |
 
 The specification's "package or repository grant" names the ceiling's source, and the stricter check
 never grants more than either. An increase over what the previous installation held also requires an

@@ -19,27 +19,29 @@ side that is not carried to the other fails the build.
 
 ## One contract for every application
 
-Support for an application is a package, and a package meets one contract whoever wrote it. The packages that ship with KalaReach, a vendor's and a person's own are validated, published, installed, granted and bound the same way. Core supplies the transport, process and terminal primitives, the authority checks and the standard interface components. A package's match rules make a host recognise an application, and its manifest, connector table and actions say what a binding to it may observe and do.
+Support for an application is a package, and a package meets one contract whoever wrote it. The packages that ship with KalaReach, a vendor's and a person's own are validated, published, granted and bound the same way, and installed the same way but for the seeded installation of the bundled packages, described below. Core supplies the transport, process and terminal primitives, the authority checks and the standard interface components. A package's match rules make a host recognise an application, and its manifest, connector table and actions say what a binding to it may observe and do.
 
 What holds for every package, the first-party ones included:
 
 - One validator reads a package. It is `kr-plugin-sdk`, which `kr-plugin-sandbox` runs offline, which a host runs before it trusts a package, and which the catalogue pipeline in the plugins repository runs before it signs a generation.
-- A package reaches a host as an entry of a repository's signed catalogue generation, which the same client checks under the same metadata, delegation and expiry rules ([Repositories and the catalogue](catalogue.md)). The official repository is an enrolment like any other: the host enrols it with the default capability ceiling and no full offline mirror ([The generation that ships with the host](runtime.md#the-generation-that-ships-with-the-host)).
-- What a package may do is what its manifest requests, held to its repository's ceiling and granted by the owner. The host installs each bundled package enabled with an empty grant, and every capability past the repository's default ceiling stays permission-required, as it does for any package ([Capability ceiling and installation grants](runtime.md#capability-ceiling-and-installation-grants)).
-- A host recognises an application only through the match rules of the packages it admits ([Match rules](#match-rules)). The plugin runtime's sources name no application, and a test of the runtime holds that.
+- A package reaches a host as an entry of a repository's signed catalogue generation, which the same client checks under the same metadata and delegation rules ([Repositories and the catalogue](catalogue.md)). The official repository is an enrolment like any other: the host enrols it with the default capability ceiling and no full offline mirror. Only the generation compiled into the host arrives differently, as the next section says.
+- What a package may do is what its manifest requests, held to its repository's ceiling and granted by the owner. A bundled package is installed enabled with an empty grant, and every capability past the repository's default ceiling stays permission-required, as it does for any package ([Capability ceiling and installation grants](runtime.md#capability-ceiling-and-installation-grants)).
+- A host recognises an application only through the match rules of the packages it admits ([Match rules](#match-rules)). The plugin runtime's sources name no application. A test of that crate holds it by reading the crate's own sources for twelve application names as whole words; it says nothing of the rest of core, which the table below lists.
 
-Core is not free of application names, and these are the places that carry them. Each one adapts to a single application's own interface.
+The generation compiled into the host differs from a repository's in how it arrives and not in what its packages may do. At every start the daemon seeds the catalogue from it without any action of the owner. It enrols the official repository against a root that the build trusts by key identifiers it commits, activates the generation once with expiry waived, installs each bundled package enabled with an empty grant (so the one ordinary rule it skips is that every capability past the ceiling be granted before an install, because the seed grants nothing), and serves the bundle's payloads from its own bytes. A shipped build commits no production root key yet, so it seeds nothing; a build with debug assertions seeds only when it is started with `--seed` ([Seeding](runtime.md#seeding)).
+
+Core is not free of application names. These are the places that carry them.
 
 | Where | Which applications | What it does |
 | --- | --- | --- |
-| The `kr-hook` forwarder | Claude Code, Gemini CLI, Qoder CLI | Accepts an invocation named for each application, and carries what that application's hooks report, and for Claude Code what its Channels server reports, to the worker that owns the session |
-| Native bridge recipes | Claude Code, Gemini CLI | Names the registration files a recipe may install and, for Claude Code, the one setting it may add. A recipe for any other application is refused |
-| `kr skill` and `agent_tools.install` | Codex, Claude Code, OpenCode, Gemini CLI, Kimi Code CLI, Qoder CLI | Knows where each agent keeps its skills and where its tool server is registered |
+| The `kr-hook` forwarder | Claude Code, Gemini CLI, Qoder CLI | Accepts an invocation named for each application. Holds a compiled table of that application's hook events and turns each into an observation (a thread started, ended or continued, a tool finished or failed, a notification), including whether a `compact` source continues a thread, which Claude Code and Qoder CLI do and Gemini CLI does not. For Claude Code it also ends the Channels server itself, passing only the notifications it names and a verdict of `allow` or `deny` only for a request it relayed. The worker and the host admit the forwarder only for a package whose plugin name is that application's, under any publisher |
+| Native bridge recipes | Claude Code, Gemini CLI | Names the registration files a recipe may install and their shapes, the forwarder command form and, for Claude Code, the one setting it may add. It names an application directory for Claude Code only (`.claude` in the account's home), so a recipe for Gemini CLI, or for any other application, is refused before anything is written |
+| `kr skill` and `agent_tools.install` | Codex, Claude Code, OpenCode, Gemini CLI, Kimi Code CLI, Qoder CLI | Knows where each agent keeps its skills and where its tool server is registered, from a closed list of six |
 | Command integrations | Gemini CLI | Permits one environment variable, `GEMINI_CLI_NO_RELAUNCH` set to `true`, and no other |
-| The bundled generation | The nine packages the product bundles | Embeds the official repository's signed catalogue generation as files compiled into the host, so that a fresh installation with no network recognises and presents an application; the packages in it are data, enrolled and held to the same ceiling as any repository's ([The generation that ships with the host](runtime.md#the-generation-that-ships-with-the-host)) |
-| The host's own metrics | The eight connectors the product bundles | Counts adapter failures under a closed list of names; the failure of a package that is not one of them is counted under no name |
+| The bundled generation | The nine packages it holds | Embeds the official repository's signed generation as files compiled into the host, so that a host with no network can recognise and present an application once it seeds. The packages are data, held to the same ceiling as any repository's |
+| The host's own metrics | The eight connectors the product bundles | Counts adapter failures under a closed list of eight names, matched on the `kalareach/` publisher prefix; the failure of any other package, a vendor's package for the same application included, is not counted |
 
-None of these decides whether an application is recognised, whether a package may bind to it, or what a binding may do. They do bound what a package can do without a core release: a native bridge is permitted for the two applications in the second row, and the forwarder accepts the three in the first. Of the nine packages in the bundled generation, Codex, Kimi CLI, Kimi Code CLI, OpenCode and OpenCode attach are a manifest, a presentation document and a connector table, with no bridge and no forwarder. Qoder CLI adds a command integration and uses the forwarder. Claude Code and Gemini CLI add a command integration and install a native bridge. The ninth, `example-declarative`, is a manifest and a presentation document that recognise an example agent and have no connector table, no bridge and no forwarder.
+None of these is read when a host matches a program to a package or grants a capability to one, and none of them lists the applications the host supports: a host admits any application whose package a repository it trusts publishes. They do decide what a package can do without a core release: a native bridge can be applied for Claude Code only, the forwarder accepts the three names in the first row and only from packages of those names, and the contact skill and tool server cover the six agents in the third. The Claude Code recipe needs a qualified build of Claude Code's executable in the signed index to give it a version, and no index names one yet, so the recipe is refused for want of a version until one does. Of the nine packages in the bundled generation, Codex, Kimi CLI, Kimi Code CLI, OpenCode and OpenCode attach are a manifest, a presentation document and a connector table, with no bridge and no forwarder. Qoder CLI adds a command integration and uses the forwarder. Claude Code adds a command integration and a native bridge. Gemini CLI adds a command integration and declares a native bridge that this host refuses, as the second row says. The ninth, `example-declarative`, is a manifest and a presentation document that recognise an example agent and have no connector table, no bridge and no forwarder. Each package also carries a README and fixtures.
 
 ## What a package is
 
@@ -60,8 +62,9 @@ not declare itself: its digest and its length live in the catalogue index entry 
 which is what lets a host pin one hash and get the whole package.
 
 Most packages ship no Wasm. Match rules, a document and declarative controls are a complete
-package, and that is the point: a vendor can add detection, semantic events and commands without a
-core or companion-app release.
+package, and that is the point: a vendor can add detection, semantic events and commands, in the
+action forms this host carries ([Implementations](#implementations)), without a core or companion-app
+release.
 
 Check a package with the offline validator:
 
@@ -452,14 +455,18 @@ and a package supplies no quoting of its own.
 An implementation that cannot produce the class its action declares is a finding, as is one that
 names a component the package does not ship or a method its connector table does not route.
 
-This host carries three of the forms today. A `decision_destination` action is admitted as the
+This host carries four of the forms today. A `decision_destination` action is admitted as the
 answer it is and written on the connection its request arrived on. A `presentation` action is
 admitted on `session.view` and answered with its receipt, and nothing more: no token is issued, no
 plan is asked for and nothing leaves the host, so its result names the action and carries no
 upstream result. A `component` action is prepared by the package's component and carried out as the
 plan the host validated, in two passes
-([An action a component prepares](runtime.md#an-action-a-component-prepares)). Every other action is
-refused as `UNSUPPORTED_CAPABILITY` before anything is marked.
+([An action a component prepares](runtime.md#an-action-a-component-prepares)). An `upstream_cancel`
+action that the package's component does not prepare is carried out by the host itself, with the
+declaration as the plan: the action token is issued and spent, the checks of a component's plan
+apply, and the cancellation is written with the thread and the turn the admission read. Every other
+action, an `upstream_method` and a `terminal_text` among them, is refused as `UNSUPPORTED_CAPABILITY`
+before anything is marked.
 
 How a package with no component answers an approval, from the connector table to the call, is in
 [Answering approvals from a declarative package](sdk.md).
@@ -798,6 +805,10 @@ An entry adds these to the manifest it came from:
 - A revocation record when the release has one. A revoked release stops new bindings. An active
   binding gets a warning and follows the administrator's explicit disable policy; it does not change
   under a live request.
+
+The index also names each publisher, with a `first_party` flag that says whether the publisher ships
+with KalaReach. The flag is a label for a person to read: no host code reads it to decide what a
+package may do.
 
 The index renders as canonical JSON: entries sorted by publisher, plugin name and version, object
 keys sorted, no insignificant whitespace, one trailing newline. The same inputs produce the same

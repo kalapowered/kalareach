@@ -40,7 +40,9 @@ Each repository keeps its own root. An enterprise or vendor repository that adop
 band is not verified against the official one, and adopting a second root never widens the first.
 
 Adopting a root is the owner's decision, and so is enlarging what a repository's packages may do
-without a further grant. Re-anchoring an existing repository is two deliberate acts, `catalogue.remove`
+without a further grant. The one root a host adopts without the owner is the bundled generation's:
+the build trusts it by committed key identifiers and enrols the official repository at start, and
+that enrolment widens nothing past the default ceiling ([Seeding](runtime.md#seeding)). Re-anchoring an existing repository is two deliberate acts, `catalogue.remove`
 and `catalogue.add`, so a root never changes underneath a repository somebody is already using.
 
 A version-control location is refused at enrolment, by name. A branch moves, and a repository whose
