@@ -1051,12 +1051,33 @@ pub mod fixture {
         stem: &str,
         confidence: kr_plugin_sdk::matching::MatchConfidence,
     ) -> std::io::Result<ConnectorSource> {
+        declarative_package_with(root, plugin_name, |manifest| {
+            manifest["match_rules"][0]["executable"]["file_stem"] = serde_json::json!(stem);
+            manifest["match_rules"][0]["confidence"] =
+                serde_json::to_value(confidence).expect("a confidence encodes");
+        })
+    }
+
+    /// Writes the example declarative package as [`declarative_package`] does, named `plugin_name`,
+    /// after `edit` has changed its manifest: another publisher, another rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns what writing a file returned.
+    ///
+    /// # Panics
+    ///
+    /// When the committed manifest is not the example's, which a change to the fixture would make
+    /// it.
+    pub fn declarative_package_with(
+        root: &Path,
+        plugin_name: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> std::io::Result<ConnectorSource> {
         let mut manifest: serde_json::Value =
             serde_json::from_slice(DECLARATIVE[0].1).expect("the committed manifest is JSON");
         manifest["plugin_name"] = serde_json::json!(plugin_name);
-        manifest["match_rules"][0]["executable"]["file_stem"] = serde_json::json!(stem);
-        manifest["match_rules"][0]["confidence"] =
-            serde_json::to_value(confidence).expect("a confidence encodes");
+        edit(&mut manifest);
         let manifest = serde_json::to_string_pretty(&manifest).expect("a manifest encodes");
         let digest = PayloadDigest::of(manifest.as_bytes());
         let directory = root.join("packages").join(digest.to_string());

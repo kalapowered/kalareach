@@ -108,6 +108,16 @@ A rule states its own confidence. An `exact` rule identifies the application by 
 cannot be coincidence, such as a bundle identifier. An `inferred` rule is a reasonable guess from a
 name on disk, and it is presented as a guess. Neither overrides a selection the user made.
 
+A rule is exact only for a program whose distribution the host has established as the one the rule
+names. A host that has established none, as the worker has not for a program it finds running,
+reads every rule as `inferred`, whatever the rule declares: a name on disk says nothing about which
+product is installed. Where several packages recognise a program equally well, a rule that also
+names the installation location, by the path segments the program's directory ends with, outranks
+one that names only the executable, when one publisher published all the packages left. Two products
+of one publisher that share a command name are told apart this way, while both packages are
+admitted. Packages of different publishers that recognise a program equally well are a conflict,
+and neither is bound.
+
 ### Command integration
 
 `command_integration` states what the package's command integration does when a person runs the

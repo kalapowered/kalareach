@@ -116,30 +116,13 @@ impl<'a> MatchIndex<'a> {
             if !entry.accepts_new_bindings() {
                 continue;
             }
-            for rule in &entry.match_rules {
-                let executable_matched = rule.executable.matches_path(&observation.executable_path);
-                let distribution_matched = match (
-                    rule.distribution.0.as_ref(),
+            candidates.extend(entry.match_rules.iter().filter_map(|rule| {
+                rule.candidate(
+                    &entry.plugin_id,
+                    &observation.executable_path,
                     observation.distribution.as_ref(),
-                ) {
-                    (Some(declared), Some(observed)) => {
-                        declared.registry() == observed.registry()
-                            && declared
-                                .identifier()
-                                .eq_ignore_ascii_case(observed.identifier())
-                    }
-                    _ => false,
-                };
-                if !executable_matched && !distribution_matched {
-                    continue;
-                }
-                candidates.push(Candidate {
-                    plugin_id: entry.plugin_id.clone(),
-                    rule_id: rule.id.to_string(),
-                    confidence: rule.confidence,
-                    distribution_matched,
-                });
-            }
+                )
+            }));
         }
         candidates.sort_by(|left, right| {
             left.plugin_id
@@ -315,23 +298,41 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_rule_beats_an_inferred_one() {
+    fn an_exact_rule_beats_an_inferred_one_only_for_an_established_distribution() {
+        let mut named = rule("b", "sampletool", MatchConfidence::Exact);
+        named.distribution = Nullable(Some(DistributionMatch::Npm {
+            package: "@vendor/sampletool".to_owned(),
+        }));
         let catalogue = index(vec![
             entry(
                 "guess",
                 vec![rule("a", "sampletool", MatchConfidence::Inferred)],
             ),
-            entry(
-                "exact",
-                vec![rule("b", "sampletool", MatchConfidence::Exact)],
-            ),
+            entry("exact", vec![named]),
         ]);
         let lookup = MatchIndex::build(&catalogue);
-        let found = lookup.candidates(&Observation {
-            executable_path: "/usr/local/bin/sampletool.EXE".to_owned(),
+        let path = "/usr/local/bin/sampletool.EXE".to_owned();
+
+        // Nothing established where the program came from: both packages guess by its name.
+        let by_name = lookup.candidates(&Observation {
+            executable_path: path.clone(),
             distribution: None,
         });
-        match resolve(found, None) {
+        assert!(
+            by_name
+                .iter()
+                .all(|candidate| candidate.confidence == MatchConfidence::Inferred)
+        );
+        assert!(matches!(resolve(by_name, None), Resolution::Conflict(_)));
+
+        // Established as the npm package the rule names: the exact rule is exact, and wins.
+        let established = lookup.candidates(&Observation {
+            executable_path: path,
+            distribution: Some(DistributionMatch::Npm {
+                package: "@vendor/sampletool".to_owned(),
+            }),
+        });
+        match resolve(established, None) {
             Resolution::Selected(candidate) => {
                 assert_eq!(candidate.confidence, MatchConfidence::Exact);
                 assert_eq!(candidate.plugin_id, catalogue.entries[1].plugin_id);

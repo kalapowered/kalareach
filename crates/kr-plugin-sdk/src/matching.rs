@@ -285,6 +285,54 @@ pub struct MatchRule {
     pub confidence: MatchConfidence,
 }
 
+impl MatchRule {
+    /// Returns the candidate this rule makes of the package `plugin_id` for a program at `path`,
+    /// where it recognises one.
+    ///
+    /// This is the one place a rule's confidence and rank are decided, for the catalogue's lookup
+    /// and the worker's binder alike. A rule is exact only for a program whose distribution the
+    /// host established as the one the rule names (`observed`). A name and a location on disk say
+    /// nothing about which product is installed, so a program recognised by them alone is
+    /// recognised as a guess, whatever confidence the rule declares. A host that established no
+    /// distribution passes `None`, and every rule then recognises as an inferred one does. Where
+    /// `observed` names another distribution the rule is lowered the same way and not dropped,
+    /// because the distribution a registry names for a platform's image need not be the one the
+    /// rule names.
+    #[must_use]
+    pub fn candidate(
+        &self,
+        plugin_id: &PluginId,
+        path: &str,
+        observed: Option<&DistributionMatch>,
+    ) -> Option<Candidate> {
+        let executable_matched = self.executable.matches_path(path);
+        let distribution_matched = match (self.distribution.0.as_ref(), observed) {
+            (Some(declared), Some(observed)) => {
+                declared.registry() == observed.registry()
+                    && declared
+                        .identifier()
+                        .eq_ignore_ascii_case(observed.identifier())
+            }
+            _ => false,
+        };
+        if !executable_matched && !distribution_matched {
+            return None;
+        }
+        let confidence = if distribution_matched {
+            self.confidence
+        } else {
+            MatchConfidence::Inferred
+        };
+        Some(Candidate {
+            plugin_id: plugin_id.clone(),
+            rule_id: self.id.to_string(),
+            confidence,
+            distribution_matched,
+            located: executable_matched && !self.executable.path_suffix.is_empty(),
+        })
+    }
+}
+
 /// One package whose rules recognise what is running.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
@@ -296,6 +344,9 @@ pub struct Candidate {
     pub confidence: MatchConfidence,
     /// Whether the distribution was compared as well as the executable.
     pub distribution_matched: bool,
+    /// Whether the rule recognised the program by an installation location it names, as well as
+    /// by the executable's name.
+    pub located: bool,
 }
 
 /// What matching decided.
@@ -308,8 +359,9 @@ pub enum Resolution {
     /// Several packages recognised it, and the person decides.
     ///
     /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
-    /// so an inferred match reaches this only where nothing matched exactly and more than one
-    /// package guessed from a name on disk.
+    /// and among rules of one confidence a rule that names the installation location beats one
+    /// that names only the executable, so this is reached where several packages are left that
+    /// recognise the program equally well.
     Conflict(Vec<Candidate>),
 }
 
@@ -317,8 +369,15 @@ pub enum Resolution {
 ///
 /// An explicit selection wins outright. That is the rule section 11 states, and it is why the
 /// selection is compared before confidence: a person who chose a package is not overruled by a
-/// rule that calls itself exact. The catalogue's search and the worker's binder both decide with
-/// this, so there is one rule wherever a running application meets the packages that recognise it.
+/// rule that calls itself exact. Then an exact rule beats an inferred one. Of the rules left, one
+/// that matched an installation location its package names beats one that matched the executable's
+/// name alone, when one publisher published every package left: the location says which product is
+/// installed there, and the name is shared by products that are not. A package of another
+/// publisher that names a location does not take a program from a publisher's package this way, so
+/// packages of different publishers that recognise a program equally well conflict, and the person
+/// settles it. The catalogue's search and the worker's binder both decide with this and read their
+/// rules with [`MatchRule::candidate`], so there is one rule wherever a running application meets
+/// the packages that recognise it.
 #[must_use]
 pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resolution {
     if candidates.is_empty() {
@@ -337,6 +396,27 @@ pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resol
         .cloned()
         .collect();
     let considered = if exact.is_empty() { candidates } else { exact };
+    let publisher = |candidate: &Candidate| {
+        candidate
+            .plugin_id
+            .as_str()
+            .split_once('/')
+            .map(|(publisher, _)| publisher.to_owned())
+    };
+    let located: Vec<Candidate> = considered
+        .iter()
+        .filter(|candidate| candidate.located)
+        .cloned()
+        .collect();
+    let one_publisher = considered
+        .first()
+        .map(publisher)
+        .is_some_and(|first| first.is_some() && considered.iter().all(|c| publisher(c) == first));
+    let considered = if located.is_empty() || !one_publisher {
+        considered
+    } else {
+        located
+    };
 
     let mut distinct: Vec<&Candidate> = Vec::new();
     for candidate in &considered {
@@ -364,6 +444,7 @@ mod tests {
             rule_id: "executable".to_owned(),
             confidence,
             distribution_matched: false,
+            located: false,
         }
     }
 
@@ -437,6 +518,130 @@ mod tests {
         assert!(!scoped.matches_path("/home/u/project/node_modules/claude"));
         assert!(!scoped.matches_path("/home/u/my_node_modules/.bin/claude"));
         assert!(!scoped.matches_path("claude"));
+    }
+
+    fn named_rule(
+        stem: &str,
+        suffix: &[&str],
+        distribution: Option<DistributionMatch>,
+        confidence: MatchConfidence,
+    ) -> MatchRule {
+        MatchRule {
+            id: PluginName::new("rule").expect("a rule identifier"),
+            executable: ExecutableMatch {
+                file_stem: stem.to_owned(),
+                path_suffix: suffix.iter().map(|s| (*s).to_owned()).collect(),
+                version_range: Nullable(None),
+            },
+            distribution: Nullable(distribution),
+            confidence,
+        }
+    }
+
+    #[test]
+    fn a_rule_is_exact_only_for_a_program_of_the_distribution_it_names() {
+        let package = PluginId::new("kalareach/sample").expect("a plugin identifier");
+        let npm = |name: &str| DistributionMatch::Npm {
+            package: name.to_owned(),
+        };
+        let rule = named_rule(
+            "sample",
+            &[],
+            Some(npm("@vendor/sample")),
+            MatchConfidence::Exact,
+        );
+        let path = "/usr/local/bin/sample";
+        // The host established nothing about where the program came from: its name is a guess.
+        let unknown = rule.candidate(&package, path, None).expect("recognised");
+        assert_eq!(unknown.confidence, MatchConfidence::Inferred);
+        assert!(!unknown.distribution_matched);
+        // Established as another distribution: still recognised by name, and still a guess.
+        let other = rule
+            .candidate(&package, path, Some(&npm("another")))
+            .expect("recognised");
+        assert_eq!(other.confidence, MatchConfidence::Inferred);
+        // Established as the rule's own, in either case of the identifier: what the rule declares.
+        let own = rule
+            .candidate(&package, path, Some(&npm("@Vendor/Sample")))
+            .expect("recognised");
+        assert_eq!(own.confidence, MatchConfidence::Exact);
+        assert!(own.distribution_matched);
+        // A rule that names no distribution has nothing to establish, so a name alone is a guess
+        // whatever it declares: it does not outrank a package that is honest about guessing.
+        let plain = named_rule("sample", &[], None, MatchConfidence::Exact);
+        assert_eq!(
+            plain
+                .candidate(&package, path, None)
+                .expect("recognised")
+                .confidence,
+            MatchConfidence::Inferred
+        );
+        // And nothing is recognised that neither the name nor the distribution recognises.
+        assert!(
+            rule.candidate(&package, "/usr/local/bin/other", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_rule_that_names_the_installation_location_beats_a_rule_that_names_only_the_executable() {
+        let located = PluginId::new("kalareach/located").expect("a plugin identifier");
+        let named = PluginId::new("kalareach/named").expect("a plugin identifier");
+        let also_named = PluginId::new("kalareach/also-named").expect("a plugin identifier");
+        let at_home = named_rule("tool", &[".tool", "bin"], None, MatchConfidence::Inferred);
+        let by_name = named_rule("tool", &[], None, MatchConfidence::Inferred);
+        let candidates = |path: &str| {
+            [
+                (&located, &at_home),
+                (&named, &by_name),
+                (&also_named, &by_name),
+            ]
+            .into_iter()
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .collect::<Vec<_>>()
+        };
+        match resolve(candidates("/home/u/.tool/bin/tool"), None) {
+            Resolution::Selected(chosen) => assert_eq!(chosen.plugin_id, located),
+            other => panic!("the location should win: {other:?}"),
+        }
+        // Where the location is not the program's, only the name is known, and the two packages
+        // that claim it equally are for the person to decide between.
+        assert!(matches!(
+            resolve(candidates("/opt/bin/tool"), None),
+            Resolution::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn a_package_of_another_publisher_does_not_take_a_program_by_naming_it() {
+        let shipped = PluginId::new("kalareach/tool").expect("a plugin identifier");
+        let vendor = PluginId::new("example-vendor/tool").expect("a plugin identifier");
+        let path = "/home/u/.tool/bin/tool";
+        let by_name = named_rule("tool", &[], None, MatchConfidence::Inferred);
+        let at_home = named_rule("tool", &[".tool", "bin"], None, MatchConfidence::Inferred);
+        // The shipped package guesses by name, and the vendor's names a location: neither wins.
+        let located = [(&shipped, &by_name), (&vendor, &at_home)]
+            .into_iter()
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .collect::<Vec<_>>();
+        assert!(matches!(resolve(located, None), Resolution::Conflict(_)));
+        // The vendor's package declares its name exact, and it names no distribution to establish:
+        // it is a guess like the shipped package's, so the two still conflict.
+        let bold = named_rule("tool", &[], None, MatchConfidence::Exact);
+        let exact = [(&shipped, &by_name), (&vendor, &bold)]
+            .into_iter()
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .collect::<Vec<_>>();
+        assert!(matches!(resolve(exact, None), Resolution::Conflict(_)));
+        // And the person's own choice still decides.
+        let chosen = [(&shipped, &by_name), (&vendor, &bold)]
+            .into_iter()
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, path, None))
+            .collect::<Vec<_>>();
+        match resolve(chosen, Some(&vendor)) {
+            Resolution::Selected(candidate) => assert_eq!(candidate.plugin_id, vendor),
+            other => panic!("the selection should win: {other:?}"),
+        }
     }
 
     #[test]
