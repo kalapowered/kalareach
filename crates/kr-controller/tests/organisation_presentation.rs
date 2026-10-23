@@ -376,7 +376,10 @@ async fn a_lease_a_rule_refuses_installs_nothing_and_names_the_rule() {
             .await
             .expect_err(name);
         assert!(denied(&error), "{name}: {error:?}");
-        assert!(error.message.contains(rule.name()), "{name}: {error:?}");
+        assert!(
+            error.message.ends_with(&format!("({})", rule.name())),
+            "{name}: the member's client reads the rule from the end of the message: {error:?}"
+        );
     }
     read_host_info(&raw)
         .await

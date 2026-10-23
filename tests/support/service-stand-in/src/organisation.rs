@@ -96,48 +96,48 @@ pub(crate) fn answer(
     else {
         return refusal(401, "UNAUTHENTICATED", "Sign in to continue.");
     };
-    let Some(authority) = organisations.held.get(organisation) else {
-        return refusal(
-            403,
-            "FORBIDDEN",
-            "This account is not a member of that organisation.",
-        );
-    };
-    match tail {
-        "lease" => {
-            let Some(device_key) = read_request(body) else {
+    // The Worker reads a lease request's body before it asks whether the account is a member, so a
+    // request that is both malformed and from a stranger is answered as malformed.
+    let requested = match tail {
+        "lease" => match read_request(body) {
+            Some(device_key) => Some(device_key),
+            None => {
                 return refusal(
                     400,
                     "INVALID_REQUEST",
                     "A lease request names the device it is for as device_key: the unpadded \
                      base64url of its 32-byte authorisation key.",
                 );
-            };
-            authority.lease(account, &device_key).map_or_else(
-                || {
-                    refusal(
-                        403,
-                        "FORBIDDEN",
-                        "This account is not a member of that organisation.",
-                    )
-                },
-                |lease| {
+            }
+        },
+        _ => None,
+    };
+    let not_a_member = || {
+        refusal(
+            403,
+            "FORBIDDEN",
+            "This account is not a member of that organisation.",
+        )
+    };
+    let Some(authority) = organisations.held.get(organisation) else {
+        return not_a_member();
+    };
+    match (tail, requested) {
+        ("lease", Some(device_key)) => {
+            authority
+                .lease(account, &device_key)
+                .map_or_else(not_a_member, |lease| {
                     ok(&serde_json::json!({
                         "lease": lease,
                         "refreshAfterSeconds": REFRESH_AFTER_SECONDS,
                     }))
-                },
-            )
+                })
         }
-        "policy-authority" => {
+        ("policy-authority", _) => {
             if authority.is_member(account) {
                 ok(&serde_json::to_value(authority.authority()).expect("a chain"))
             } else {
-                refusal(
-                    403,
-                    "FORBIDDEN",
-                    "This account is not a member of that organisation.",
-                )
+                not_a_member()
             }
         }
         _ => refusal(404, "NOT_FOUND", "There is nothing at that address."),
