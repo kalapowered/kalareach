@@ -63,6 +63,11 @@ export interface FakeQuestions {
   revise(questionId: string, change: Partial<Pick<Question, 'question' | 'context'>>): void
   /** The session ends, and its questions with it. */
   endSession(sessionId: string): void
+  /**
+   * What the program that asked says it is called: a label it supplied, which nothing verified, and
+   * which the worker carries beside the identity it did verify.
+   */
+  callItself(questionId: string, label: string | null): void
   /** Every answer the worker was sent, in order. */
   readonly sent: readonly QuestionAnswerParams[]
   /** Makes the worker unreachable, so an answer is kept, or reachable again. */
@@ -184,6 +189,13 @@ export class ScriptedQuestions implements FakeQuestions {
       ...question,
       ...change,
       revision: String(BigInt(question.revision) + 1n)
+    }))
+  }
+
+  callItself(questionId: string, label: string | null): void {
+    this.#replace(questionId, (question) => ({
+      ...question,
+      source: { ...question.source, agent_label: label }
     }))
   }
 
