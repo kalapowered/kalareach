@@ -56,7 +56,9 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
-use kr_protocol::rendezvous::{ClientFrame, ServiceFrame, decode_message, encode_message};
+use kr_protocol::rendezvous::{
+    ClientFrame, CloseReason, ServiceFrame, decode_message, encode_message,
+};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, DurationMs, EndpointKey, Nullable};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{self, CandidateConnection, LocalIdentity};
@@ -167,6 +169,20 @@ pub enum PairingStopped {
     },
     /// The room ended the attempt.
     Room(String),
+    /// The room closed the candidate with `HostGone` at the first frame it relayed, before the host
+    /// had answered anything: no frame of this attempt can have reached a host, and the attempt
+    /// cost the invitation nothing.
+    HostNotAttached,
+    /// The room said `HostGone` to the first frame of every attempt this device made within its
+    /// patience, or its budget for the code ran out between two such answers.
+    HostNeverAttached {
+        /// How many attempts the room answered so.
+        times: u32,
+        /// How long the attempts took, from the first to the last answer.
+        over: Duration,
+    },
+    /// This device's budget of attempts for the code is spent.
+    AttemptsSpent,
     /// This device's own state machine refused a step.
     Local(String),
 }
@@ -180,7 +196,39 @@ impl std::fmt::Display for PairingStopped {
                 code.as_str()
             ),
             Self::Room(why) => write!(formatter, "the room ended the attempt: {why}"),
+            Self::HostNotAttached => formatter.write_str(
+                "the room ended the attempt: the room closed the socket (HostGone) at the first \
+                 frame, before the host had answered anything",
+            ),
+            Self::HostNeverAttached { times, over } => write!(
+                formatter,
+                "the room closed the socket (HostGone) at the first frame of {times} attempts \
+                 over {over:?}: no host was attached to carry it",
+            ),
+            Self::AttemptsSpent => {
+                formatter.write_str("the device's attempts for this code are spent")
+            }
             Self::Local(why) => write!(formatter, "the device refused a step: {why}"),
+        }
+    }
+}
+
+/// How a device paces and bounds its tries to enter a code the host has not attached for yet.
+#[derive(Clone, Copy, Debug)]
+pub struct Patience {
+    /// The pause between two tries: the host's own pause before it attaches to its room again. It
+    /// paces the tries and decides nothing; a try ends the wait by not being answered `HostGone`.
+    pub pause: Duration,
+    /// How long the tries may take altogether, which only ends a leg whose tries are never
+    /// answered.
+    pub within: Duration,
+}
+
+impl Default for Patience {
+    fn default() -> Self {
+        Self {
+            pause: Duration::from_secs(1),
+            within: Duration::from_secs(60),
         }
     }
 }
@@ -206,6 +254,8 @@ pub struct Device {
     unpaired: LocalIdentity,
     budget: DurableClientBudgetStore,
     clock: HostPairingClock,
+    /// The certificate roots the room is verified against, when a test runs the room itself.
+    room_tls: Option<Arc<tokio_rustls::rustls::ClientConfig>>,
 }
 
 impl std::fmt::Debug for Device {
@@ -258,7 +308,16 @@ impl Device {
             unpaired,
             budget,
             clock,
+            room_tls: None,
         }
+    }
+
+    /// This device, dialling rooms through `tls`'s roots instead of the platform's trust store: for
+    /// a room a test runs on loopback behind a certificate authority it issues.
+    #[must_use]
+    pub fn trusting(mut self, tls: Arc<tokio_rustls::rustls::ClientConfig>) -> Self {
+        self.room_tls = Some(tls);
+        self
     }
 
     /// The name this device declares.
@@ -302,9 +361,10 @@ impl Device {
         code: &str,
     ) -> Result<CodeExchange, PairingStopped> {
         let entered = EnteredCode::parse(code).map_err(|error| local(&error))?;
-        let mut socket = CandidateSocket::open(origin, entered.locator())
-            .await
-            .map_err(PairingStopped::Room)?;
+        let mut socket =
+            CandidateSocket::open_trusting(origin, entered.locator(), self.room_tls.as_ref())
+                .await
+                .map_err(PairingStopped::Room)?;
         let ServiceFrame::Record {
             invitation_id,
             expires_at_ms,
@@ -322,7 +382,11 @@ impl Device {
             ClientAttempt::start(&self.budget, &self.clock, &lookup, origin, &entered)
                 .map_err(|error| local(&error))?;
         let attempt_id = admission.attempt_id;
-        let mut exchange = Exchange { socket, attempt_id };
+        let mut exchange = Exchange {
+            socket,
+            attempt_id,
+            heard_the_host: false,
+        };
         exchange
             .socket
             .send(&ClientFrame::Attempt { attempt_id })
@@ -422,6 +486,59 @@ impl Device {
             invitation_id: host_bundle.bundle.invitation_id,
             host: host_bundle.bundle,
         })
+    }
+
+    /// [`Self::enter_code`], entered again while the room answers the attempt's first frame with
+    /// `HostGone`: the host reserved the code's locator and attaches to its room in a task of its
+    /// own, so a candidate that enters the code at once can reach the room before the host has.
+    ///
+    /// Only that answer is repeated, and only at the first frame ([`PairingStopped::HostNotAttached`]):
+    /// nothing of such an attempt reached a host, so it cost the invitation no confirmation. A
+    /// `HostGone` after the host has answered, a refusal and every other stop is the answer, as
+    /// it is. The device's own budget of attempts for the code is spent by each try, so the tries
+    /// end when it is ([`PairingStopped::AttemptsSpent`] is reported as
+    /// [`PairingStopped::HostNeverAttached`] when an earlier try was answered so), and
+    /// `patience.within` ends a leg whose tries are never answered at all. Every `HostGone` is
+    /// printed, on success too, with how long after the first try it came.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::enter_code`], and [`PairingStopped::HostNeverAttached`] once the tries are spent
+    /// or `patience.within` has passed while the room kept saying that no host was attached.
+    pub async fn enter_code_once_the_host_is_attached(
+        &self,
+        origin: &RendezvousOrigin,
+        code: &str,
+        patience: &Patience,
+    ) -> Result<CodeExchange, PairingStopped> {
+        let started = std::time::Instant::now();
+        let mut times = 0_u32;
+        loop {
+            match self.enter_code(origin, code).await {
+                Err(PairingStopped::HostNotAttached) => {
+                    times += 1;
+                    eprintln!(
+                        "the room answered the first frame of try {times} with HostGone, {:?} \
+                         after the first try: no host was attached yet",
+                        started.elapsed()
+                    );
+                    if started.elapsed() + patience.pause > patience.within {
+                        return Err(PairingStopped::HostNeverAttached {
+                            times,
+                            over: started.elapsed(),
+                        });
+                    }
+                    tokio::time::sleep(patience.pause).await;
+                }
+                Err(PairingStopped::AttemptsSpent) if times > 0 => {
+                    return Err(PairingStopped::HostNeverAttached {
+                        times,
+                        over: started.elapsed(),
+                    });
+                }
+                answered => return answered,
+            }
+        }
     }
 
     /// Binds a code exchange's transcript to both live endpoints with `pair.finish` over iroh.
@@ -992,6 +1109,9 @@ impl LivePeer for Pinned {
 struct Exchange {
     socket: CandidateSocket,
     attempt_id: kr_protocol::ids::AttemptId,
+    /// Whether a frame the host sent has come back yet. A room that says `HostGone` before one has
+    /// is saying that nothing of this attempt reached a host.
+    heard_the_host: bool,
 }
 
 impl Exchange {
@@ -1008,11 +1128,19 @@ impl Exchange {
 
     async fn receive(&mut self) -> Result<RendezvousMessage, PairingStopped> {
         loop {
-            match self.socket.next(FRAME_DEADLINE).await.map_err(room)? {
+            let frame = match self.socket.next(FRAME_DEADLINE).await {
+                Ok(frame) => frame,
+                Err(Stopped::Closed(CloseReason::HostGone)) if !self.heard_the_host => {
+                    return Err(PairingStopped::HostNotAttached);
+                }
+                Err(stopped) => return Err(room(stopped)),
+            };
+            match frame {
                 ServiceFrame::Relay {
                     attempt_id,
                     payload,
                 } if attempt_id == self.attempt_id => {
+                    self.heard_the_host = true;
                     let message =
                         decode_message(payload.as_slice()).map_err(PairingStopped::Room)?;
                     if let RendezvousMessage::Refused {
@@ -1044,7 +1172,10 @@ fn room(stopped: Stopped) -> PairingStopped {
 }
 
 fn local(error: &kr_pairing::PairingError) -> PairingStopped {
-    PairingStopped::Local(error.to_string())
+    match error {
+        kr_pairing::PairingError::ClientAttemptsExhausted => PairingStopped::AttemptsSpent,
+        other => PairingStopped::Local(other.to_string()),
+    }
 }
 
 /// Where a device dials a host, from the endpoint and the hints its authenticated material names.
