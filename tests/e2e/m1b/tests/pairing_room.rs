@@ -39,6 +39,8 @@ enum Meets {
     NoHost,
     /// A host answers, with a message that is not the one the device waits for.
     AHostThatAnswers,
+    /// The frame is relayed to a host that never answers, and nothing comes back.
+    ASilentHost,
 }
 
 /// A room whose n-th connection meets `script[n]`, or the last of it once the script is spent, and
@@ -92,6 +94,7 @@ async fn candidate(stream: room_tls::Stream, meets: Meets) {
             continue;
         };
         let reply = match meets {
+            Meets::ASilentHost => continue,
             Meets::NoHost => ServiceFrame::Closed {
                 reason: CloseReason::HostGone,
             },
@@ -197,5 +200,30 @@ async fn a_room_that_never_has_a_host_ends_the_tries_when_the_devices_attempts_a
     assert!(
         matches!(stopped, PairingStopped::HostNeverAttached { times: 5, .. }),
         "five attempts are all a code is given: {stopped}"
+    );
+}
+
+/// The tries end at the device's patience even when an attempt is never answered: a room that
+/// relays the first frame to a host that says nothing holds the attempt for as long as the device
+/// waits for a frame, which is longer than the whole of the patience.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tries_that_are_never_answered_end_at_the_patience_and_say_so() {
+    let authority = room_tls::Authority::new("a room's authority");
+    let (origin, _connections) = room(&authority, vec![Meets::ASilentHost]).await;
+    let directory = tempfile::tempdir().expect("a directory");
+    let device = device_trusting(&authority, directory.path()).await;
+    let patience = Patience {
+        pause: Duration::from_millis(10),
+        within: Duration::from_millis(500),
+    };
+
+    let stopped = device
+        .enter_code_once_the_host_is_attached(&origin, CODE, &patience)
+        .await
+        .expect_err("a host that never answers ends no try");
+
+    assert!(
+        matches!(&stopped, PairingStopped::Room(why) if why.contains("no try was answered")),
+        "the patience ended the tries and said so: {stopped}"
     );
 }
