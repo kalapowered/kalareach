@@ -43,12 +43,16 @@ class KalaReachMessagingService : FirebaseMessagingService() {
         // asked for it: a service that registered on its own would be binding a destination
         // nobody proved they own. Whether a registration still names it is the application's to
         // compare each time it looks, by the token's digest. It is written before this returns, so
-        // that a process the system ends right after still holds the token the provider gave.
-        getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
-            .edit()
-            .putString(PushStores.TOKEN_KEY, token)
-            .putLong(PushStores.TOKEN_AT_KEY, System.currentTimeMillis())
-            .commit()
+        // that a process the system ends right after still holds the token the provider gave; a
+        // write that fails is said in the log (no token in the line), since only this callback
+        // hears the provider give a token on this platform.
+        val written =
+            getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PushStores.TOKEN_KEY, token)
+                .putLong(PushStores.TOKEN_AT_KEY, System.currentTimeMillis())
+                .commit()
+        if (!written) Log.w(TAG, "the registration token could not be kept")
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
