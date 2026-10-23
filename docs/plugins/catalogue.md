@@ -322,8 +322,9 @@ is admitted.
 A binding records the hash it was made against and stays on it. An upgrade moves the installation
 and leaves every live binding where it is, because a running process was qualified against the bytes
 it bound to and not against the bytes that arrived afterwards. The binding also records the release
-and the repository it came through, and the program it was made for with the version the program's
-signed record named then; a later record for the same program changes no live binding's version.
+and the repository it came through, and the program it was made for with the version the signed index's qualified
+build for that program named then; a later index for the same program changes no live binding's
+version.
 
 What a binding may do follows its installation. A grant the owner withdraws reaches every live
 binding of the package, on every release it holds, and the next action that needs it is refused. A
@@ -476,10 +477,10 @@ allowlist, and each time the daemon starts, each package's bridge is brought to 
 installation wants. The method's answer and receipt say what the catalogue did and are never changed
 by the recipe.
 
-A recipe is applied only where a signed record names the application's executable. The version check
-below reads the builds the release's entry in the repository's signed index names for this host's
-operating system and architecture, each an executable's SHA-256 digest with its version. Records
-arrive with a synchronisation, so every package's bridge is followed after every sync as well as
+A recipe is applied only where the signed index names the application's executable as a qualified
+build. The version check below reads the builds the release's entry in the repository's signed index
+names for this host's operating system and architecture, each an executable's SHA-256 digest with
+its version. Qualified builds arrive with a synchronisation, so every package's bridge is followed after every sync as well as
 after every plugin change. A release whose entry names no build for this host's operating system and
 architecture gives the version check no record to read, so its recipe is refused and nothing is
 written. The package's journal records why, and the check runs again after every plugin change,
