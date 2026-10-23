@@ -148,12 +148,12 @@ impl Native for Receiver {
             let mut state = self.state.lock().expect("the receiver");
             state.reads_of_pending += 1;
             // The receiver answers a challenge the gateway sent once it has been waited for.
-            if state.answering && state.reads_of_pending >= READS_BEFORE_THE_ANSWER {
-                if let Some(held) = state.pending.as_mut() {
-                    if held.state == PendingState::Pending {
-                        held.state = PendingState::Answered;
-                    }
-                }
+            if state.answering
+                && state.reads_of_pending >= READS_BEFORE_THE_ANSWER
+                && let Some(held) = state.pending.as_mut()
+                && held.state == PendingState::Pending
+            {
+                held.state = PendingState::Answered;
             }
             Ok(state.pending.clone())
         })
