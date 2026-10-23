@@ -598,6 +598,10 @@ async fn kr_req_12_07_a_launch_without_room_for_an_integration_is_named_for_the_
 /// that say when the declaration applies. The digest the owner's device checks covers it. The
 /// control is a grant that does not hold the integration, which has no such reading and a digest
 /// of its own.
+///
+/// KR-REQ-02.09, the part about granting an executable capability: the confirmation the owner is
+/// asked for when an installation grants a command integration is the host's own description of
+/// that installation, and the digest the owner's device checks is the digest of what it is shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_07_the_owner_confirms_an_integration_with_its_servers_arguments_in_view() {
     use kr_protocol::catalogue::PluginInstallParams;

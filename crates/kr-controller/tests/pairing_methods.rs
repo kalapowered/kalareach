@@ -288,15 +288,17 @@ async fn the_bootstrap_confirms_the_first_owner_and_the_clock_and_nothing_else()
 /// KR-REQ-10.05: every sensitive action needs a fresh owner confirmation naming exactly it, spent
 /// once. Issuing an invitation needs one naming its exact grant; confirming a device needs one
 /// naming exactly that candidate, which an issuing confirmation or the invitation's own answer is
-/// not; the clock needs its own; and the three actions no method performs yet are answered for
-/// their exact description and nothing else. Enlarging persistent authority is pairing a personal
-/// owner grant, which needs both of its own.
+/// not; the clock needs its own; and enlarging a grant, trusting a repository root and granting an
+/// executable capability are answered for their exact description and nothing else. Enlarging
+/// persistent authority is pairing a personal owner grant, which needs both of its own.
 /// KR-REQ-02.09, the part about the owner operations: issuing an invitation and
 /// confirming a device, which this host serves, each fail with `OWNER_CONFIRMATION_REQUIRED` until an owner device has
 /// confirmed exactly them, and a confirmation for other rights or for another action does not
 /// stand in. For enlarging a grant, trusting a repository root and granting an executable
-/// capability, which no method performs yet, the owner ledger spends only a confirmation that names
-/// the action's exact digest and rights.
+/// capability, which this case spends on the owner ledger by hand, the ledger spends only a
+/// confirmation that names the action's exact digest and rights. The methods that perform them
+/// (`catalogue.add` for a root, `plugin.grant` for an executable capability, a location's
+/// enlargement for a grant) have cases of their own.
 /// KR-REQ-23.47, the part about the confirmation's digest: each confirmation names one action
 /// digest with its destination and rights, and one that names others does not stand in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -438,8 +440,9 @@ async fn every_sensitive_action_needs_a_fresh_confirmation_naming_it() {
         "spent once"
     );
 
-    // The three actions no method performs yet: each is answered for its exact description, and
-    // only an effect whose own expectation matches it spends it, once.
+    // Enlarging a grant, trusting a repository root and granting an executable capability: each is
+    // answered for its exact description, and only an effect whose own expectation matches it
+    // spends it, once.
     let pairing = host.network().pairing();
     for action in [
         SensitiveAction::EnlargeGrant,
