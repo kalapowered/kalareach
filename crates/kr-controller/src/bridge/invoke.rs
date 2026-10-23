@@ -2074,6 +2074,67 @@ mod tests {
         (directory, opening)
     }
 
+    /// The window a helper's last frame renews, which says the stream's reader has taken every
+    /// frame the helper wrote before it.
+    #[cfg(unix)]
+    const READ_THROUGH: &str = "w-read-through";
+
+    /// As [`writing`], with a renewal of [`READ_THROUGH`] after the last of `frames`.
+    ///
+    /// The reader keeps a renewed window outside the queue and outside the ceiling, in the order
+    /// it takes frames in, so the window names [`READ_THROUGH`] only once every frame before the
+    /// renewal has been held or dropped.
+    #[cfg(unix)]
+    fn writing_through(frames: &[BridgeFrame], then: &str) -> (tempfile::TempDir, Opening) {
+        let mut written = frames.to_vec();
+        written.push(renewed(READ_THROUGH));
+        writing(&written, then)
+    }
+
+    /// How long a case waits for something its stream's reader does before it calls that a failure.
+    /// Nothing is decided by it: the waits are on conditions.
+    #[cfg(unix)]
+    const READER_LIVENESS: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Waits until the reader of `stream` has taken every frame the helper wrote
+    /// ([`writing_through`]).
+    ///
+    /// Nothing more can arrive once the reader is through, so what is held is all there will be.
+    /// The bound ends only a reader that never gets there.
+    #[cfg(unix)]
+    async fn until_read_through(stream: &BridgeStream) {
+        tokio::time::timeout(READER_LIVENESS, async {
+            while stream.action_window().action_window_id.as_str() != READ_THROUGH {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the reader did not take every frame the helper wrote: {:?}",
+                stream.shared.lock().ended
+            )
+        });
+    }
+
+    /// Waits until the reader of `stream` is through, and then takes every frame it holds, in order:
+    /// reading what is there decides nothing by how long it takes.
+    #[cfg(unix)]
+    async fn held_once_read_through(stream: &mut BridgeStream) -> Vec<ControlFrame> {
+        until_read_through(stream).await;
+        let held = stream.shared.lock().frames.len();
+        let mut frames = Vec::new();
+        for _ in 0..held {
+            frames.push(
+                tokio::time::timeout(READER_LIVENESS, stream.recv())
+                    .await
+                    .expect("a held frame is delivered")
+                    .expect("a held frame is delivered"),
+            );
+        }
+        frames
+    }
+
     #[cfg(unix)]
     fn notification(sequence: u64) -> BridgeFrame {
         BridgeFrame::Control(Box::new(ControlFrame::Notification(
@@ -2339,7 +2400,7 @@ mod tests {
     async fn a_caller_that_falls_behind_is_told_to_take_the_view_again_rather_than_ended() {
         // Four output frames and an answer between them. Room for the answer and two of them.
         let answer = answer_to(5);
-        let (_directory, opening) = writing(
+        let (_directory, opening) = writing_through(
             &[
                 BridgeFrame::HelloAck(Box::new(acknowledgement())),
                 notification(1),
@@ -2356,25 +2417,20 @@ mod tests {
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(SILENCE_LIMIT, ceiling);
-        // Nobody reads while they arrive.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Nobody reads while they arrive: the caller looks only once the reader has taken them all.
+        until_read_through(&stream).await;
         assert!(
             stream.shared.lock().bytes <= ceiling,
             "what is held stays within the bound"
         );
         // The answer is what the caller is owed, whatever else was dropped.
         let response = stream
-            .response(RequestId::new(5), std::time::Duration::from_secs(5))
+            .response(RequestId::new(5), std::time::Duration::from_secs(60))
             .await
             .expect("an answer is never dropped");
         assert_eq!(response.request_id, RequestId::new(5));
         // The view is replaced by one marker, and what arrived after it is still there.
-        let mut types = Vec::new();
-        while let Ok(Ok(ControlFrame::Notification(held))) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
-        {
-            types.push((held.event_type.as_str().to_owned(), held.sequence.get()));
-        }
+        let types = view_read(&mut stream).await;
         let resyncs = types
             .iter()
             .filter(|(event, _)| event == "session.resync")
@@ -2399,16 +2455,19 @@ mod tests {
             .await;
     }
 
-    /// What a stream's caller reads of the view, as (event, sequence), until nothing more comes.
+    /// What a stream's caller reads of the view, as (event, sequence), once the reader is through.
     #[cfg(unix)]
     async fn view_read(stream: &mut BridgeStream) -> Vec<(String, u64)> {
-        let mut types = Vec::new();
-        while let Ok(Ok(ControlFrame::Notification(held))) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
-        {
-            types.push((held.event_type.as_str().to_owned(), held.sequence.get()));
-        }
-        types
+        held_once_read_through(stream)
+            .await
+            .into_iter()
+            .filter_map(|frame| match frame {
+                ControlFrame::Notification(held) => {
+                    Some((held.event_type.as_str().to_owned(), held.sequence.get()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// A caller that asked for a new subscription ignores the old stream and waits for the frame
@@ -2418,7 +2477,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_second_overflow_never_drops_the_frame_that_opens_the_new_stream() {
-        let (_directory, opening) = writing(
+        let (_directory, opening) = writing_through(
             &[
                 BridgeFrame::HelloAck(Box::new(acknowledgement())),
                 notification(7),
@@ -2436,7 +2495,6 @@ mod tests {
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(SILENCE_LIMIT, ceiling);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let types = view_read(&mut stream).await;
         // The caller is waiting for the new stream: what it reads of the old one, a marker among it,
         // is ignored, and the opening is what it takes for the new stream's beginning.
@@ -2480,30 +2538,29 @@ mod tests {
         let mut frames = vec![BridgeFrame::HelloAck(Box::new(acknowledgement()))];
         frames.extend(answers.clone());
         frames.extend((0..200).map(|_| notification(0)));
-        let (_directory, opening) = writing(&frames, "exec sleep 600");
+        let (_directory, opening) = writing_through(&frames, "exec sleep 600");
         let mut stream = opening
             .launch()
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        until_read_through(&stream).await;
         let held = stream.shared.lock().frames.len();
         assert!(
             held <= 2 + 1 + 1,
             "two answers, one opening and one marker are all that are held, not {held}"
         );
-        let mut taken = Vec::new();
-        while let Ok(Ok(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
-        {
-            taken.push(match frame {
+        let taken: Vec<String> = held_once_read_through(&mut stream)
+            .await
+            .into_iter()
+            .map(|frame| match frame {
                 ControlFrame::Notification(held) => {
                     format!("{} {}", held.event_type.as_str(), held.sequence.get())
                 }
                 ControlFrame::Response(_) => "response".to_owned(),
                 other => format!("{other:?}"),
-            });
-        }
+            })
+            .collect();
         assert_eq!(
             taken,
             [
@@ -2563,25 +2620,23 @@ mod tests {
         frames.extend(answers.clone());
         frames.push(notification(3));
         frames.push(notification(4));
-        let (_directory, opening) = writing(&frames, "exec sleep 600");
+        let (_directory, opening) = writing_through(&frames, "exec sleep 600");
         let mut stream = opening
             .launch()
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let mut taken = Vec::new();
-        while let Ok(Ok(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
-        {
-            taken.push(match frame {
+        let taken: Vec<String> = held_once_read_through(&mut stream)
+            .await
+            .into_iter()
+            .map(|frame| match frame {
                 ControlFrame::Notification(held) => {
                     format!("{} {}", held.event_type.as_str(), held.sequence.get())
                 }
                 ControlFrame::Response(_) => "response".to_owned(),
                 other => format!("{other:?}"),
-            });
-        }
+            })
+            .collect();
         assert_eq!(
             taken,
             ["response", "response", "session.resync 3"],
@@ -2608,6 +2663,16 @@ mod tests {
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
+        // Nobody reads while they arrive: the caller looks only once the reader has ended the
+        // stream, as it does on the answer that does not fit. A caller that read as they came
+        // would make room for the third.
+        tokio::time::timeout(READER_LIVENESS, async {
+            while stream.shared.lock().ended.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the reader ends the stream on the answer that does not fit");
         let mut taken = 0;
         let ended = loop {
             match stream.recv().await {
