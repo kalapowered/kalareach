@@ -7,11 +7,12 @@
  * size and in a face as wide as the Linux runner's, and that the switch is reached and pressed
  * from the keyboard alone.
  *
- * Every screenshot goes under `/tmp`, named for the engine and the case.
+ * Every screenshot goes under the test artefact directory, named for the engine and the case.
  */
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { brokenWords, overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -47,7 +48,7 @@ const KEPT = {
 } as const
 
 function shot(name: string): string {
-  return `/tmp/kr-companion-drafts-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-drafts-${name}-${test.info().project.name}`)
 }
 
 /** Sets the phone's text size as the web view would, before the page loads. */
