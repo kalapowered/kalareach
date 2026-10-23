@@ -5,9 +5,10 @@
 Commands, each given the adb program, the emulator's serial and a screenshot directory:
 
   tap <words>
-      Opens the notification shade, taps the notification that shows those words and waits for the
-      application to come to the front on its Attention tab. The words are the host's generic alert,
-      so a notification that carried any of the question's text would not be found. Prints
+      Leaves the application on its Hosts screen in the background (`PUSH-ON-HOSTS`), opens the
+      notification shade, taps the notification that shows those words and waits for the page's own
+      heading to say Attention: the tap moved it there. The words are the host's generic alert, so a
+      notification that carried any of the question's text would not be found. Prints
       `PUSH-TAPPED <what the screen shows>`.
 
   choose <words of the question> <Yes|No> [blind]
@@ -19,8 +20,8 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       once the host has answered>`.
 
   observe
-      Waits until the page no longer offers the question to send and says that nothing is waiting or
-      that the question is no longer waiting. Prints `PUSH-ENDED <what the screen shows>`.
+      Waits until the page says that the question was answered by someone else, with what the person
+      had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
 `blind` is for the first sheet the application opens over the Attention screen, which the web view
 does not always hand over to `uiautomator`: when the choice or the button is not on the screen, it
@@ -49,12 +50,48 @@ def texts(phone: Phone) -> str:
     return " | ".join(each["label"] for each in phone.screen() if each["label"])[:3000]
 
 
+def seen_within(phone: Phone, wanted, seconds: float) -> dict | None:
+    """The first node `wanted` accepts that the screen shows within `seconds`, or None."""
+    end = time.monotonic() + seconds
+    while True:
+        node = phone.find(wanted)
+        if node is not None or time.monotonic() >= end:
+            return node
+        time.sleep(0.4)
+
+
+APPLICATION = "to.kala.reach"
+
+
+def on_screen(nodes: list[dict], heading: str) -> bool:
+    """Whether the screen's heading, the page's own title and not a tab's label, says `heading`."""
+    return any(each["class"].endswith("TextView") and each["label"] == heading for each in nodes)
+
+
+def leave_on_hosts(phone: Phone) -> None:
+    """Brings the application to the front, shows its Hosts screen and leaves it there, in the
+    background, as a person who has gone to another screen and then away is. A tap on the
+    notification is then shown to move the page to Attention, and not to open on it by default."""
+    phone.run("shell", "am", "start", "-n", f"{APPLICATION}/.MainActivity")
+    tab = seen_within(phone, lambda each: each == "Hosts", 10)
+    if tab is None:
+        # A sheet from an earlier question is over the screen: the system's back key closes it.
+        phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+        tab = phone.wait(lambda each: each == "Hosts", "the Hosts tab", 60)
+    phone.tap(tab)
+    phone.wait_screen(lambda nodes: on_screen(nodes, "Hosts"), "the Hosts screen", 45)
+    phone.run("shell", "input", "keyevent", "KEYCODE_HOME")
+    print("PUSH-ON-HOSTS the application was left on its Hosts screen", flush=True)
+
+
 def tap_notification(phone: Phone, words: str) -> None:
+    leave_on_hosts(phone)
     phone.run("shell", "cmd", "statusbar", "expand-notifications")
     node = phone.wait(lambda each: words in each, f"the notification that shows {words!r}", 45)
     phone.shot("notification")
     phone.tap(node)
-    phone.wait(lambda each: each.startswith("Attention"), "the application's Attention tab", 45)
+    # The page is on the Attention screen because the tap moved it there: the heading is the page's.
+    phone.wait_screen(lambda nodes: on_screen(nodes, "Attention"), "the Attention screen the tap opens", 45)
     phone.shot("tapped")
     print(f"PUSH-TAPPED {texts(phone)}", flush=True)
 
@@ -70,16 +107,6 @@ SHEET_SEND = (280, 1940)
 
 def tap_at(phone: Phone, place: tuple[int, int]) -> None:
     phone.run("shell", "input", "tap", str(place[0]), str(place[1]))
-
-
-def seen_within(phone: Phone, wanted, seconds: float) -> dict | None:
-    """The first node `wanted` accepts that the screen shows within `seconds`, or None."""
-    end = time.monotonic() + seconds
-    while True:
-        node = phone.find(wanted)
-        if node is not None or time.monotonic() >= end:
-            return node
-        time.sleep(0.4)
 
 
 def choose(phone: Phone, words: str, choice: str, blind: bool) -> None:
@@ -121,16 +148,18 @@ def send(phone: Phone, blind: bool) -> None:
 
 
 def observe(phone: Phone) -> None:
-    """Waits for the page to stop offering a question that was answered at the host."""
-    phone.wait_screen(
-        lambda nodes: not any(each["label"] == "Send answer" for each in nodes)
-        and any(
-            each["label"].startswith(("No longer waiting", "Nothing needs you right now")) for each in nodes
-        ),
-        "the page to stop offering the question",
-        60,
-        nudging=True,
-    )
+    """Waits for the page to say that a question the person had chosen an answer to, and had not
+    sent, was answered by someone else, and to offer nothing to send."""
+    def said(nodes: list[dict]) -> bool:
+        labels = [each["label"] for each in nodes]
+        return (
+            not any(label == "Send answer" for label in labels)
+            and any(label.lower() == "no longer waiting" for label in labels)
+            and any("answered by someone else" in label for label in labels)
+            and any(label.startswith("You had chosen") for label in labels)
+        )
+
+    phone.wait_screen(said, "the page to say the question was answered by someone else", 60, nudging=True)
     phone.shot("ended")
     print(f"PUSH-ENDED {texts(phone)}", flush=True)
 
