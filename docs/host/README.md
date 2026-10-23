@@ -5939,7 +5939,7 @@ a grant is written, and the grant carries no role afterwards. Only controller an
 carries the notice explaining that an answer, including free text, is input the agent may act on
 under its own permissions.
 
-**A grant's consequences are stated in the host's words, and no label promises a boundary the
+**A grant's consequences are stated in the host's words, and the host states no boundary the
 upstream does not enforce.** A grant that carries `terminal.input` types into the session's shell
 as the shell's user, so it exposes that user's account: no file rule, repository label or other
 selector on a grant limits what a command typed through the terminal does. A prompt, an approval or
@@ -5955,12 +5955,20 @@ and states each in fixed words that a surface may translate and may not soften:
 | `environment_writes` | `files.upload`, `files.apply_diff`, `project.create`, `workspace.manage`, `changeset.create` | This recipient can change files and repositories in this environment. |
 | `delegation` | `session.share` | This recipient can pass on what it holds, narrowed but never enlarged, to somebody else. |
 
-The issuer is shown the sentences before the grant exists, and the request names the notices it
-accepted; `grant.create` is refused when they are not the set the grant carries, so a surface that
-showed a softer set cannot get the grant written. The recipient is shown the same consequences,
+The issuer's surface shows the sentences before the grant exists, and the request names the notices
+it accepted; `grant.create` is refused when they are not the set the grant carries. The host
+compares the identifiers and cannot see the words a surface displayed, so a surface that names a
+smaller or a larger set cannot get the grant written, and the words themselves come from the
+protocol's table, which the companion takes them from. The recipient is shown the same consequences,
 addressed to it, when it opens the invitation. A role's name promises nothing. The default viewer
 carries no notice, a viewer invited to answer the agent's questions carries `agent_permissions`, and
 the notices follow the actions and not the label.
+
+Restricted typed collaboration would be offered only where the upstream and the broker both enforce
+the boundary it states, and this host offers none today. A question always keeps its free-text
+option, so an answer is never limited to the choices listed; an approval and an answer carry the
+same notice as a prompt; a plugin action needs the rights of the class it declares, and no role or
+option limits a recipient to a typed form.
 
 **An issuer is shown what it is sharing.** The preview is computed by the same code that writes the
 grant, and an invitation that names a question, an approval or the live screen is refused unless
