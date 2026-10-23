@@ -256,8 +256,9 @@ the list though: a release that stops carrying a program is refused by every hos
 release was built with that program in its list.
 
 A release that carries no update channel root can be installed with `kr host install`, which takes
-the release's own word for what it is, and a host whose current release carries none has no key to
-check any other release against: `kr host update` refuses every archive there, and says so.
+the release's own word for what it is, and a host whose current release carries none, and that
+recorded none at an earlier switch, has no key to check any other release against: `kr host update`
+refuses every archive there, and says so.
 
 ## The handover
 

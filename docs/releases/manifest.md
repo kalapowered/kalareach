@@ -11,9 +11,11 @@ for one verifies for the other.
 
 A tree holds no link, no file with a second name, no device and no empty directory: an archive
 writes a second name as a link, and a host refuses an archive that holds one. `kr-release` checks
-this for the trees it reads: a file with a second name is refused where the platform reports link
-counts (macOS and Linux). The Windows archive is a ZIP of independent entries, which cannot hold a
-link. A file is a program
+this for the trees it reads: a link and a device are refused wherever it runs, and a file with a
+second name is refused when `kr-release` is built for a platform that reports link counts (macOS
+and Linux), for every file but `release.json`. The Windows archive is a ZIP that
+`scripts/pack-release-zip.py` writes as independent entries, after it refuses a link, an empty
+directory and anything that is not a regular file, so it holds no link. A file is a program
 when it is one of the host's programs in `bin/` (`scripts/release-programs.json` lists them) or a
 file in a shell package's own `bin/`; the file system of the machine that built the tree is not
 asked.
@@ -36,7 +38,7 @@ A reader reads past a member it does not know, and the signature covers the mani
 member a later release adds is checked by the host that reads past it. A reader also takes a
 manifest that lacks what a later release added, since `kr host rollback` and the helpers' pins read
 the manifest of an earlier release: `agents`, `dependencies` and the members of a shell entry beyond
-its `shell`, `identity` and `patch_revisions` may be absent. The rest is required. `kr-release`
+its `shell`, `identity` and `patch_revisions` may be absent. The rest is required, except `reads_through` of a store entry. `kr-release`
 writes every member and refuses to sign a `release.json` that is not what the tree makes, so a tool
 that forgets what a release owes its readers cannot sign one.
 
@@ -76,7 +78,7 @@ each patch's digest, its own revision and the upstream revisions it is kept with
 what the host does and no more: the arguments, which name no option that skips or
 replaces a startup file of the person's (`-f`, `--no-rcs`, `--norc`, `--noprofile`, `-noprofile`,
 `--rcfile`, `--init-file`, `--no-config`, `-N`; the check compares without regard to case, except
-for `-N`, and also refuses each of them with `=` and a value), and the files the host puts its entry in. The order the shell reads its own
+for `-N`, which it compares exactly, and also refuses each of the others with `=` and a value), and the files the host puts its entry in. The order the shell reads its own
 startup files in is the shell's, and a login Bash reaches `.bashrc` only where its login file
 sources it, which is why the host also puts an entry in the first login file. A person who moves a
 startup directory moves the entry with it, and the location says so in the shell's own words
@@ -94,7 +96,8 @@ capability its release declares. The schema hash is the manifest's optional memb
 no input fills it today. An index entry for a build (`QualifiedBuild`) has no schema member, and
 `kr-release` always leaves the hash out, even for the connectors whose qualification notes pin a
 vendor schema, so a build named in the index would reach the manifest without one. The index names
-no build yet, so `agents` is empty, and the build list covers only the `macos-aarch64` target, so
+no build yet, so `agents` is empty, and the plugins repository's build list, `fixtures/agents/builds.json`,
+covers only the `macos-aarch64` target, so
 no other target can list an agent. `kr-release` reads the index only when it is the one the bundled
 metadata pins, by `bundled-plugins.lock` and by the digest in the targets metadata; it checks no
 signature of its own on the index, and the bundled generation is the development one.
@@ -147,15 +150,20 @@ in a run that proves the pipeline and refused in a release: `kr-release` stops a
 one unless it is told it is a development run.
 
 Every capability of a listed build cites the qualification results of the plugin that declares
-it: the `qualification` list of that plugin's entry in the signed index, which holds results that
-carry a signed record as their source. A listed build whose plugin entry lists no result stops the
-record. That is the whole check: it does not match a result to the capability that cites it, it does
-not read a result's state, and it covers the capabilities of listed agent builds only. The shell
-packages, the model profiles and the voice providers are cited as pins, by digest, and not by
-evidence. A record cited in `records.json` that is missing, or is not the one cited, stops the
+it: the `qualification` list of the plugin's entry in the signed index. The record reads the results
+by plugin identifier and not by release or build, so when the index holds two entries of one plugin,
+the last in the index's order supplies the results that every build of that plugin cites. It refuses
+an index in which a result claims `qualified_available` or has a source other than `signed_record`.
+Those are the only conditions on a result: a result in any other state, `not_tested` and
+`incompatible` included, counts as evidence, no result is matched to the capability that cites it,
+and a capability entry names its plugin, version and application but not the build. A listed build
+whose plugin cites no result stops the record for the build's platform. The check covers the
+capabilities of listed agent builds only. The shell packages, the model profiles and the voice
+providers are cited as pins, by digest, and not by evidence. A record cited in `records.json` that is missing, or is not the one cited, stops the
 record; for another repository that holds only when the repository is at hand. The index names no
 build yet, and the pipeline of the plugins repository does not yet write the results into an index
-entry, so the first build it names would stop every release until it does.
+entry, so the first build it names would stop the release record of that build's platform until it
+does.
 
 ## Building and signing a release
 
