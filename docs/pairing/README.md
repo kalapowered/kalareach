@@ -283,6 +283,16 @@ screen lock alone where no strong biometric is set up. A phone that cannot ask o
 the request and offers no way to confirm it. One request is confirmed at a time, and an iPhone that
 leaves the front drops the request unanswered (`docs/companion/README.md`).
 
+The line names every kind of action the grant allows, and a dialog's line is short. When the list
+does not fit, a set of rights that is exactly one role's default set (`SessionRole::default_actions`,
+the table a role's grant is written from) is said by the role: "who may act as the session's controller
+for 2 hours". A role's name stands for every right the role holds, as "manage the host as an owner"
+stands for host management, and the request's sheet lists each kind of action beside the line. A set
+that is one right more or one right fewer than a role's has no role to be said by. It is listed, and
+when the list still does not fit the request has no line, is not offered to the ceremony and is not
+confirmed (`a_set_one_right_off_a_roles_is_listed_and_where_that_does_not_fit_has_no_line` in
+`crates/kr-client/src/pairing/owner.rs`).
+
 Nothing falls back when that owner is gone. A host whose owner devices are all revoked, with no
 enrolled presence signer and no terminal, refuses every confirmation: the terminal bootstrap stays
 over because the host has had an owner, a former owner device's proof no longer answers, the
