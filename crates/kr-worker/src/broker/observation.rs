@@ -892,10 +892,10 @@ impl ObservationLane {
     /// connection, so that privacy mode having stood on it is not the only way it can be handed
     /// something made in privacy mode.
     ///
-    /// The mark belongs to the connection the link holds when it is made, and the caller takes that
-    /// connection before it calls, so it is the connection the content goes on. A binding that has
-    /// no view yet gets one, so that a hand-over that comes before the component is registered is
-    /// marked too; the link forgets the views of bindings it no longer wants.
+    /// The call writes only to the per-binding marks and gives the binding no view. The mark carries
+    /// the connection the lane holds when it is made, so a caller that holds an older connection
+    /// stamps the newer one. A hand-over that comes before the component is registered is marked
+    /// too, and the mark stays when the binding's view is forgotten ([`Self::forget`]).
     pub fn expose(&self, binding: BrokerBindingId, made_in_privacy: bool) {
         if !(made_in_privacy || self.private.load(Ordering::Acquire)) {
             return;

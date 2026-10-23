@@ -318,7 +318,7 @@ fn kr_req_24_27_a_component_handed_private_content_on_the_connection_it_register
 
     // An action accepted in privacy mode is handed over on the new connection before the component
     // is registered on it, which the link does after it has published the connection: the mark is
-    // made on a view that is there from an earlier registration, and then the registration begins.
+    // made, and then the registration begins.
     lane.all_not_ready();
     lane.began_connection();
     lane.expose(binding, true);
