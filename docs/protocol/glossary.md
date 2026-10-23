@@ -65,7 +65,8 @@ epoch and exactly one originating attachment. See [The root
 integration](README.md#the-root-integration).
 
 **Effect.** Whether a method reads state or changes it: `read` or `write`. A write sent to a host
-arrives as a mutation and carries an action, raw input excepted. A method of the `Services` group is
+arrives as a mutation and carries an action, raw input and the unpaired peer's `pair.redeem` and
+`pair.finish`, which are plain requests, excepted. A method of the `Services` group is
 sent to a service as a signed service request instead; see [The service
 credential](README.md#the-service-credential).
 
