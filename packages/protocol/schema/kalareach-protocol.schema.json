@@ -22081,7 +22081,7 @@
       "oneOf": [
         {
           "const": "host.info",
-          "description": "Host build identity, protocol limits, configured services and where privacy mode stands.",
+          "description": "Host build and boot identity, protocol version, session count and admission limit, the defaults for a new session, sleep inhibition, the machine group and where privacy mode stands.",
           "type": "string"
         },
         {

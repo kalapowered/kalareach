@@ -16,7 +16,7 @@ document.
 
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
-| `host.info` | read | `local_ipc`, `paired_device` | Host build identity, protocol limits, configured services and where privacy mode stands. | [Method reference: Host and environment reads](method-reference.md) |
+| `host.info` | read | `local_ipc`, `paired_device` | Host build and boot identity, protocol version, session count and admission limit, the defaults for a new session, sleep inhibition, the machine group and where privacy mode stands. | [Method reference: Host and environment reads](method-reference.md) |
 | `environment.list` | read | `local_ipc`, `paired_device` | The environments this actor's grant admits. | [Method reference: Host and environment reads](method-reference.md) |
 | `environment.capabilities` | read | `local_ipc`, `paired_device` | What one environment can currently do. Capability evidence, never authority. | [Platforms: What may be done on a desktop](../host/platforms.md) |
 | `environment.capabilities.check` | write | `local_ipc` | Perform the disclosed desktop checks in a session's own worker, at the host itself: read a file the person authorised, take a screen image, find an accessible element and start an application. They run once, after the person has been shown what each one does, and the answer says that they are running. Their findings reach `environment.capabilities`, which never performs them. | [Platforms: What may be done on a desktop](../host/platforms.md) |
@@ -271,7 +271,7 @@ document.
 | `owner.confirmation.request` | write | `local_ipc`, `paired_device` | Start a confirmation ceremony bound to one single-use action digest. | [Pairing: Owner confirmation](../pairing/README.md) |
 | `owner.confirmation.pending` | read | `local_ipc`, `paired_device` | The confirmation challenges an owner can still answer, each with the exact action it approves, so a separately paired owner device can approve what the local owner asked. | [Pairing: Owner confirmation](../pairing/README.md) |
 | `owner.confirmation.complete` | write | `local_ipc`, `paired_device` | Complete the ceremony with a protected user-verification context. A click that desktop automation can synthesise is not that proof. | [Pairing: Owner confirmation](../pairing/README.md) |
-| `host.clock.establish` | write | `local_ipc`, `paired_device` | Trust this host's wall clock again, on an owner confirmation that names exactly that: it ends the host-wide distrust of the clock, the holds that follow from it and a lost clock continuity, in one step, and never revives an object that already expired. | [Pairing: Owner confirmation](../pairing/README.md) |
+| `host.clock.establish` | write | `local_ipc`, `paired_device` | Trust this host's wall clock again, on an owner confirmation that names exactly that: it ends the host-wide distrust of the clock, the holds that follow from it and a lost clock continuity, in one step, and never revives an object that already expired. | [Host: The host time contract](../host/README.md) |
 
 ## State recovery
 
