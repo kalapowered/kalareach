@@ -3410,7 +3410,10 @@ first, and a device that does not present another is refused every read and muta
 while its connection stays up. A connection that carries a running subscription is closed at the
 first batch the lease no longer allows, and the device connects again and presents a lease. The
 member's client refreshes every five minutes, so a renewal reaches the host about ten minutes
-before the lease it replaces ends.
+before the lease it replaces ends. `kr-client` does this in `organisation::LeaseKeeper`: it presents
+the lease as the first thing on a connection, since the host refuses the device everything else until
+it holds one, and again on the first connection after every restart of the host, because no lease
+survives one.
 
 The organisation's chain may travel beside the lease. The host follows a newer one before it judges
 the lease, so a lease signed by a revision the host has not heard of is accepted with the chain that

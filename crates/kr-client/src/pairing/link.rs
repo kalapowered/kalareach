@@ -35,7 +35,7 @@ use kr_protocol::pairing::{NetworkConfig, PairFinishRequest};
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
-use kr_protocol::scalars::EndpointKey;
+use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{CandidateConnection, LocalIdentity};
 use kr_transport::scheduler::SendLimits;
@@ -135,6 +135,22 @@ pub trait Preauth: Send {
     ) -> BoxFuture<'a, Result<PairStatusResult, LinkError>>;
 }
 
+/// What gives a host the membership lease a member's device needs on a connection to it.
+pub trait MembershipPresenter: Send + Sync + std::fmt::Debug {
+    /// Presents the lease `host`'s grant needs, as the first thing on `session`, which proves
+    /// `device_key`, or does nothing for a host whose grant answers to no organisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host holds no lease and will not without a person or a new connection.
+    fn present<'a>(
+        &'a self,
+        session: &'a Session,
+        host: &'a PairedHost,
+        device_key: AuthorisationKey,
+    ) -> BoxFuture<'a, Result<(), LinkError>>;
+}
+
 /// Everything the pairing flows ask of the network.
 pub trait HostLink: Send + Sync {
     /// Dials `endpoint` through the endpoint for `network`, with that configuration's hints.
@@ -167,7 +183,8 @@ pub trait HostLink: Send + Sync {
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
 
     /// Connects to a paired host as the device it became, and starts a session on the
-    /// connection.
+    /// connection, which holds whatever the host needs of this device before it answers anything
+    /// else on it ([`Self::present_membership`]).
     fn connect_paired<'a>(
         &'a self,
         host: &'a PairedHost,
@@ -175,8 +192,34 @@ pub trait HostLink: Send + Sync {
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
         Box::pin(async move {
             let transport = self.connect_paired_transport(host, identity).await?;
-            Session::start(transport).map_err(|error| LinkError::lost(error.said()))
+            let session =
+                Session::start(transport).map_err(|error| LinkError::lost(error.said()))?;
+            if let Err(error) = self.present_membership(&session, host, identity).await {
+                session.close();
+                return Err(error);
+            }
+            Ok(session)
         })
+    }
+
+    /// Gives the host what it needs of this device before it will answer anything else on
+    /// `session`, the first thing done on a connection to a paired host.
+    ///
+    /// A device whose grant answers to an organisation is refused every other method until the host
+    /// holds a membership lease the organisation signed for it, and no lease survives a host's
+    /// restart. A link that holds the account the lease is asked for with presents it here. The
+    /// default asks for nothing: a host whose grant answers to no organisation needs none.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host holds no lease and will not without a person or a new connection.
+    fn present_membership<'a>(
+        &'a self,
+        _session: &'a Session,
+        _host: &'a PairedHost,
+        _identity: &'a LocalIdentity,
+    ) -> BoxFuture<'a, Result<(), LinkError>> {
+        Box::pin(async { Ok(()) })
     }
 
     /// Holds the endpoint for `network`, so nothing this device does for another host closes it,
@@ -523,6 +566,7 @@ impl EndpointPool {
 pub struct IrohLink {
     pool: Arc<EndpointPool>,
     admissions: Option<Arc<PairingAdmissions>>,
+    membership: Option<Arc<dyn MembershipPresenter>>,
 }
 
 impl IrohLink {
@@ -532,7 +576,16 @@ impl IrohLink {
         Self {
             pool,
             admissions: None,
+            membership: None,
         }
+    }
+
+    /// The same link, giving a host the membership lease its grant needs through `presenter` as the
+    /// first thing on every connection to it as a paired device.
+    #[must_use]
+    pub fn presenting_membership(mut self, presenter: Arc<dyn MembershipPresenter>) -> Self {
+        self.membership = Some(presenter);
+        self
     }
 
     /// The same link, asking the managed service for an admission to reach a host through a relay
@@ -596,6 +649,18 @@ impl HostLink for IrohLink {
             let surface = kr_transport::handshake::connect_unpaired(connection, identity).await?;
             Ok(Box::new(Unpaired(surface)) as Box<dyn Preauth>)
         })
+    }
+
+    fn present_membership<'a>(
+        &'a self,
+        session: &'a Session,
+        host: &'a PairedHost,
+        identity: &'a LocalIdentity,
+    ) -> BoxFuture<'a, Result<(), LinkError>> {
+        match &self.membership {
+            Some(presenter) => presenter.present(session, host, *identity.authorisation.public()),
+            None => Box::pin(async { Ok(()) }),
+        }
     }
 
     fn connect_paired_transport<'a>(
