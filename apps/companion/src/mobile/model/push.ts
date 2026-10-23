@@ -2,9 +2,9 @@
  * Where a phone's notifications stand, for the screen that shows them.
  *
  * Native code does the work: it asks the system, asks the notification service, answers its
- * challenge and hands the host what it needs. This holds what it last said and asks it to look again
- * whenever the application comes to the front, because a person who left to change the system's
- * notification setting comes back to the screen they left.
+ * challenge and hands the host what it needs. This holds what it last said. The application looks
+ * again whenever it comes to the front, on whichever screen (`MobileApp`), and what that finds
+ * arrives here as a change.
  */
 
 import { useCallback, useEffect, useState } from 'react'
@@ -22,13 +22,8 @@ export interface Notifications {
   readonly openSettings: () => Promise<void>
 }
 
-/**
- * Follows where notifications stand.
- *
- * `resumed` is how many times the application has come to the front: each one is a look, so a
- * permission the person changed in the system's settings is seen on the screen they return to.
- */
-export function useNotifications(resumed: number): Notifications {
+/** Follows where notifications stand. */
+export function useNotifications(): Notifications {
   const { port } = useApp()
   const [view, setView] = useState<PushView | null>(null)
 
@@ -53,17 +48,6 @@ export function useNotifications(resumed: number): Notifications {
       stop?.()
     }
   }, [port])
-
-  // A look each time the application is in front again, and once at the start.
-  useEffect(() => {
-    let watching = true
-    port.pushRefresh().then((next) => {
-      if (watching) setView(next)
-    }).catch(() => undefined)
-    return () => {
-      watching = false
-    }
-  }, [port, resumed])
 
   const enable = useCallback(
     async (reference: string) => {
