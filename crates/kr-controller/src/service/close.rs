@@ -85,6 +85,20 @@ pub(crate) fn read_close_answer(
     Ok((encode(&receipt)?, None))
 }
 
+/// What this host knows of a worker's end when it records the closure of the worker's session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Death {
+    /// The kernel confirmed the worker ended. A closure the worker wrote for itself in its journal
+    /// is read, and stands.
+    Confirmed,
+    /// The kernel confirmed the worker ended, and its published endpoint could not be removed. The
+    /// worker's journal is not read for a closure of its own, and the closure written says what
+    /// was not done.
+    ConfirmedBeforeAFence,
+    /// The kernel did not confirm it, or the closure is written over a boot that ended it.
+    Unconfirmed,
+}
+
 impl Controller {
     /// Tells every worker holding a close for this action that the caller has its acceptance.
     ///
@@ -405,7 +419,7 @@ impl Controller {
                             reason,
                             &worker.process_identity,
                             &crate::archive::Fenced::nothing(session_id),
-                            true,
+                            Death::Confirmed,
                         )
                         .await
                         .map(Some)
@@ -558,7 +572,10 @@ impl Controller {
     /// Section 9's recovery rules are the worker's, and a worker that crashed never ran them. They
     /// run once here instead, before anything is served: a dispatch marker with no authoritative
     /// outcome becomes `unknown`, and an accepted intent with no marker is rejected. A failure is
-    /// not a reason to leave the session open, so the closure is still written.
+    /// not a reason to leave the session open, so the closure is still written. So is a worker
+    /// confirmed gone whose published endpoint cannot be removed: ownership is refused, nothing is
+    /// recovered, no store is opened and nothing the session owned is stopped, and the closure
+    /// records the worker's end and lists the refusal among what could not be accounted for.
     ///
     /// Section 7's second half comes before the session identity is released: whatever the session
     /// still owns is stopped, and what this host cannot account for is recorded. A closure written
@@ -609,8 +626,62 @@ impl Controller {
             return Ok(Some(existing));
         }
         let archive = self.archive();
-        let Ok(ownership) = archive.take_ownership(session_id, display_number, identity) else {
-            return Ok(None);
+        let from_an_earlier_boot = self
+            .left_by_an_earlier_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&session_id);
+        let ownership = match archive.take_ownership(session_id, display_number, identity) {
+            Ok(ownership) => ownership,
+            // The kernel confirmed the worker is gone, and the endpoint it published could not be
+            // removed. Nothing is recovered, nothing the session owned is looked for or stopped,
+            // and the worker's journal is not read for a closure of its own, because the fence
+            // that opens the stores to this host has not been made. The session does not stay
+            // open for it: the closure says that this host saw the worker end and lists what it
+            // did not do among what it could not account for, and the session stays registered as
+            // a writer, as one whose processes were not accounted for is, until the daemon next
+            // starts. The descriptor beside the closure is retired at every start. A worker of an
+            // earlier boot owned nothing that outlived the boot, and has nothing to list.
+            Err(crate::archive::OwnershipRefusal::Unfenced { detail, .. }) => {
+                let fenced = if from_an_earlier_boot {
+                    crate::archive::Fenced::nothing(session_id)
+                } else {
+                    // At a start, this runs before the sessions found alive are registered, and
+                    // a closed session is not among them.
+                    let holds = Arc::clone(self.project().service().holds());
+                    if !holds.has_session(session_id) {
+                        holds.adopt_session(session_id, kr_project::holds::SessionPlace::Unknown);
+                    }
+                    crate::archive::Fenced::unfenced(session_id, &detail)
+                };
+                let written = self
+                    .record_final(
+                        session_id,
+                        reason,
+                        identity,
+                        &fenced,
+                        Death::ConfirmedBeforeAFence,
+                    )
+                    .await;
+                return match written {
+                    Ok(closure) => Ok(Some(closure)),
+                    // The tail of a closure retires the descriptor, which is the file that could
+                    // not be removed. The closure is recorded before the tail, and stands.
+                    Err(error) => match self.registry.lock().await.closure(session_id)? {
+                        Some(closure) => {
+                            eprintln!(
+                                "kr-controller: the descriptor of the closed session {session_id} \
+                                 could not be removed: {error}; the next start removes it"
+                            );
+                            Ok(Some(closure))
+                        }
+                        None => Err(error),
+                    },
+                };
+            }
+            // Another recovery holds the session, the worker may be running, or the lock could not
+            // be taken: the session is left for the next look at it.
+            Err(_) => return Ok(None),
         };
         // After ownership is taken, so a worker that wrote its closure in its last moments is read.
         // The store is brought forward first, under the ownership just taken: every read below
@@ -618,7 +689,9 @@ impl Controller {
         archive.bring_forward_owned(&ownership);
         let own_closure = self.recovered_closure(session_id).is_some();
         let _ = archive.recover_journal(&ownership);
-        let fenced = if own_closure {
+        // A worker of an earlier boot went with it, and so did everything it owned: there is
+        // nothing to stop, as at the start that found it.
+        let fenced = if own_closure || from_an_earlier_boot {
             crate::archive::Fenced::nothing(session_id)
         } else {
             let unit = self
@@ -632,7 +705,7 @@ impl Controller {
             archive.fence_owned(&ownership, unit.as_deref()).await
         };
         let closure = self
-            .record_final(session_id, reason, identity, &fenced, true)
+            .record_final(session_id, reason, identity, &fenced, Death::Confirmed)
             .await?;
         Ok(Some(closure))
     }
@@ -709,8 +782,9 @@ impl Controller {
         reason: ClosureReason,
         identity: &kr_protocol::identity::ProcessStartIdentity,
         fenced: &crate::archive::Fenced,
-        death_validated: bool,
+        death: Death,
     ) -> Result<ClosureRecord> {
+        let death_validated = death != Death::Unconfirmed;
         let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
             return Ok(existing);
@@ -720,11 +794,13 @@ impl Controller {
         // written from outside knows none of those.
         //
         // The worker's own journal is read only where the caller established that the worker
-        // ended. Writing this closure removes both the registry's worker row and the published
-        // descriptor, which are the two things a later read asks about, so a closure written over
-        // an unconfirmed death has to carry that fact itself - see `surviving` below - and must
-        // not open the store on the way.
-        if death_validated && let Some(recovered) = self.recovered_closure(session_id) {
+        // ended and has not been told to leave it ([`Death::Confirmed`]). Writing this closure
+        // removes both the registry's worker row and the published descriptor, which are the two
+        // things a later read asks about, so a closure written over an unconfirmed death has to
+        // carry that fact itself - see `surviving` below - and must not open the store on the way.
+        if death == Death::Confirmed
+            && let Some(recovered) = self.recovered_closure(session_id)
+        {
             self.write_closure(&recovered).await?;
             return Ok(recovered);
         }
