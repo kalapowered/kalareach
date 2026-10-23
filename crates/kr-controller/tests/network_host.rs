@@ -424,6 +424,111 @@ async fn a_paired_device_is_refused_the_revocation_of_a_device_and_the_owner_is_
     host.stop().await;
 }
 
+/// KR-REQ-23.27, KR-REQ-10.45: `device.revoke` through the daemon, with a worker inside a dispatch
+/// transition, is answered as pending with that worker named and the reason, and the fence the
+/// worker makes afterwards completes it: asking again answers a barrier that holds, with the
+/// undispatched action the revoked device had in the worker named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_revocation_is_pending_for_a_held_worker_until_the_worker_fences() {
+    let net_support::worker::Adopted {
+        host,
+        owner,
+        workers,
+    } = net_support::worker::Adopted::start(1).await;
+    let worker = &workers[0];
+    let (_device, record) = net_support::recipient(&host, &owner).await;
+    worker.seed_undispatched_intents(
+        &kr_transport::listener::device_principal(&record.device_id),
+        1,
+    );
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(
+            Method::DeviceRevoke,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &DeviceRevokeParams {
+                device_id: record.device_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+
+    let boundary = worker.hold_the_dispatch_boundary().await;
+    let pending: RevocationResult = typed(
+        &client
+            .repeat(&mutation)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner revokes the device"),
+    );
+    let waited_for = pending
+        .barrier
+        .workers
+        .iter()
+        .find(|reported| reported.session_id == worker.session_id)
+        .expect("the worker is in the barrier");
+    assert!(!pending.barrier.holds(), "{:?}", pending.barrier);
+    assert_eq!(pending.barrier.pending(), vec![worker.session_id]);
+    assert!(
+        waited_for.detail.contains("has not acknowledged revision"),
+        "the status says what the revocation waits for: {:?}",
+        waited_for.detail
+    );
+    boundary.release();
+    worker.service.fence_what_is_owed_for_tests();
+
+    // The device is revoked already, so asking again under a new action withdraws nothing and
+    // advances no revision: it reports the barrier as it stands, and the fence the worker made
+    // is what it holds on.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let done = loop {
+        let again: RevocationResult = typed(
+            &client
+                .mutate(
+                    Method::DeviceRevoke,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host.environment_id),
+                    &DeviceRevokeParams {
+                        device_id: record.device_id,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("the revocation is answered"),
+        );
+        if again.barrier.holds() {
+            break again;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the revocation never held: {:?}",
+            again.barrier
+        );
+        tokio::task::yield_now().await;
+    };
+    assert_eq!(done.authority_revision, pending.authority_revision);
+    let fenced = done
+        .barrier
+        .workers
+        .iter()
+        .find(|reported| reported.session_id == worker.session_id)
+        .expect("the worker is in the barrier");
+    assert_eq!(
+        fenced.state,
+        kr_protocol::action::BarrierState::Acknowledged,
+        "{fenced:?}"
+    );
+    assert_eq!(
+        fenced.rejected_actions.len(),
+        1,
+        "the action the device had in the worker is named: {fenced:?}"
+    );
+    drop(client);
+    host.stop().await;
+    drop(workers);
+}
+
 /// Every file under `directory`, in a stable order; nothing when it does not exist.
 fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
