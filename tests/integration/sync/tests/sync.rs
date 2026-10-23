@@ -31,6 +31,19 @@
 //! deployment: `the_lost_answer_leg_takes_no_503_for_an_accepted_write` and
 //! `the_lost_answer_leg_sends_a_declined_write_again_until_it_is_accepted`.
 //!
+//! # A request the service asks to be sent again
+//!
+//! A deployment under load answers `SERVICE_UNAVAILABLE` with a delay when it could not finish a
+//! request, and the client reports it as `SERVICE_CAPACITY` once its own single resend of a request
+//! that is safe to repeat is answered the same way. That answer says nothing about the rule a leg
+//! holds the service to, so every call a leg makes, through a device and straight to the service,
+//! and every request that gives back what the leg took, is sent again after the time the answer
+//! names, for as long as the service keeps asking, up to a deadline that only ends a call that is
+//! never answered. Three checks hold that to a stand-in that asks twice in a row, with no
+//! deployment: `a_publication_the_service_asks_to_be_sent_again_goes_again_after_the_time_it_names`,
+//! `a_query_the_service_asks_to_be_sent_again_goes_again_after_the_time_it_names` and
+//! `the_cleanup_of_a_leg_goes_on_through_requests_the_service_asks_to_be_sent_again`.
+//!
 //! # What a leg leaves
 //!
 //! Each leg gives back what the service lets it give back, whether it passed or failed. Every
@@ -56,8 +69,8 @@ use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::signed::SignedService;
 use kr_client::services::sync::{MAX_SYNC_REQUEST_BYTES, ManagedSyncService, SYNC_EXCHANGE_PATH};
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncComparison, SyncExchanged, SyncFetched, SyncPosition,
+    SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     CollectionSealer, MemoryCollectionKeys, Published, Resolutions, SettingValue, SyncBody,
@@ -65,13 +78,13 @@ use kr_client::sync::{
     sync_collection,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{DeviceId, SessionId, SyncObjectId};
+use kr_protocol::ids::{DeviceId, SessionId, SyncConflictId, SyncObjectId};
 use kr_protocol::mailbox::mailbox_size_bucket;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::service::GatewayOrigin;
 use kr_protocol::sync::{SealedSyncObject, SyncObjectKind};
-use kr_sync_integration::{Deployment, RunKey, fresh_uuid, now_ms, proved};
+use kr_sync_integration::{Deployment, RunKey, following_the_retry, fresh_uuid, now_ms, proved};
 
 /* -------------------------------------------------------------------------- */
 /* Where each request goes                                                     */
@@ -184,6 +197,99 @@ impl ServiceHttp for Recording {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The service a leg asks                                                      */
+/* -------------------------------------------------------------------------- */
+
+/// The settings-sync service, each call of which follows the retry an answer names.
+///
+/// The client sends a request that is safe to repeat once more by itself and gives its caller the
+/// second answer. The service says `SERVICE_UNAVAILABLE` whenever it could not finish a request yet
+/// and asks for the same one again after a delay, so a leg that takes that answer for its result
+/// decides by the load the service is under and not by the rule it holds the service to. Every
+/// call here is one the service answers the same way when it is made again: an exchange by its
+/// request identity, a status query, a fence and a comparison by the state they read, and the drop
+/// of a copy by the copy being gone. So a repeat cannot do a thing twice, and the call is made
+/// again only after the wait. Whatever the service answers that is not such a request is the answer.
+#[derive(Debug)]
+struct Following {
+    inner: ManagedSyncService,
+}
+
+impl Following {
+    /// [`ManagedSyncService::compare`].
+    async fn compare(
+        &self,
+        collection: &str,
+        with_copies: bool,
+        after: Option<u64>,
+    ) -> kr_client::Result<SyncComparison> {
+        following_the_retry("the comparison", || {
+            self.inner.compare(collection, with_copies, after)
+        })
+        .await
+    }
+}
+
+impl SyncBackupService for Following {
+    fn compare_exchange<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncExchanged> {
+        Box::pin(following_the_retry("the exchange", move || {
+            self.inner
+                .compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+        }))
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
+        Box::pin(following_the_retry("the status query", move || {
+            self.inner.request_status(collection, request_id)
+        }))
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
+        Box::pin(following_the_retry("the fence", move || {
+            self.inner.fence_request(
+                collection,
+                request_id,
+                first_signed_at_ms,
+                last_signed_at_ms,
+            )
+        }))
+    }
+
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
+        Box::pin(following_the_retry("the fetch", move || {
+            self.inner.fetch(collection)
+        }))
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        collection: &'a str,
+        retained: SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        Box::pin(following_the_retry("the resolution", move || {
+            self.inner.resolve(collection, retained)
+        }))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* One leg's devices                                                           */
 /* -------------------------------------------------------------------------- */
 
@@ -195,7 +301,7 @@ struct Run {
     transport: Arc<Recording>,
     reached: Arc<Reached>,
     /// The service client every device of the leg shares, over the recording transport.
-    service: Arc<ManagedSyncService>,
+    service: Arc<Following>,
     /// The collection key the leg's objects are sealed under: drawn for the run, held in memory.
     sealer: Arc<CollectionSealer>,
     /// Where the leg's devices keep their stores, on this machine's own disk.
@@ -222,11 +328,13 @@ impl Run {
             lose_the_next_answer: AtomicBool::new(false),
             lost: Mutex::new(None),
         });
-        let service = Arc::new(ManagedSyncService::new(
-            deployment.origin().clone(),
-            Arc::clone(&transport) as Arc<dyn ServiceHttp>,
-            Arc::clone(&key) as Arc<dyn ServiceSigner>,
-        ));
+        let service = Arc::new(Following {
+            inner: ManagedSyncService::new(
+                deployment.origin().clone(),
+                Arc::clone(&transport) as Arc<dyn ServiceHttp>,
+                Arc::clone(&key) as Arc<dyn ServiceSigner>,
+            ),
+        });
         let keys = Arc::new(MemoryCollectionKeys::new());
         let key_name = fresh_uuid().to_string();
         keys.draw(&key_name, 1)
@@ -337,19 +445,26 @@ fn ended(answer: &serde_json::Value, identity: &str) -> Result<(), String> {
     }
 }
 
-/// Sends one settings-sync request as it is written.
+/// Sends one settings-sync request as it is written, again after the time an answer names when the
+/// service asks for that.
+///
+/// Every request the cleanup makes leaves the same state when it is made again: a fence is answered
+/// the same twice, a comparison and a drop of copies read or empty what they name, and a removal
+/// that already ran meets a revision it did not expect and loses, after which the next pass reads
+/// the collection as it stands.
 async fn sync_call(
     signed: &SignedService,
     body: &serde_json::Value,
 ) -> kr_client::Result<serde_json::Value> {
-    signed
-        .call(
+    following_the_retry("the cleanup's request", || {
+        signed.call(
             SYNC_EXCHANGE_PATH,
             Method::SyncCompareExchange,
             body,
             MAX_SYNC_REQUEST_BYTES,
         )
-        .await
+    })
+    .await
 }
 
 /// Empties one collection, or says why it is not empty.
@@ -1436,4 +1551,154 @@ async fn the_lost_answer_leg_sends_a_declined_write_again_until_it_is_accepted()
     assert_eq!(exchanges.len(), 2);
     one_request(&exchanges);
     assert_eq!(client.outstanding().expect("a count"), 1);
+}
+
+/* -------------------------------------------------------------------------- */
+/* The legs follow a retry, against a stand-in                                 */
+/* -------------------------------------------------------------------------- */
+
+/// A stand-in settings-sync service, and a run whose requests go to it alone.
+async fn stood_in() -> (kr_service_stand_in::Served, Run, SyncClient, SyncObjectId) {
+    let served = kr_service_stand_in::serve().await;
+    let origin = GatewayOrigin::new(served.origin().to_owned()).expect("a loopback origin");
+    let deployment = Deployment::at(origin);
+    let transport = deployment.transport();
+    let run = Run::over(deployment, transport);
+    let (client, object_id) = one_object(&run);
+    (served, run, client, object_id)
+}
+
+/// Has the stand-in answer the next two requests that carry `member` by asking for them to be sent
+/// again at once.
+///
+/// The client sends a request that is safe to repeat once more by itself, so a service that asks
+/// twice in a row gives the leg its second `SERVICE_CAPACITY`, which is what a busy deployment gave
+/// the legs that failed on it.
+fn ask_twice(served: &kr_service_stand_in::Served, member: &'static str) {
+    for nth in [1, 2] {
+        served.web().fail_with_member(
+            SYNC_EXCHANGE_PATH,
+            member,
+            nth,
+            kr_service_stand_in::Moment::Refuse {
+                status: 503,
+                code: "SERVICE_UNAVAILABLE",
+                retry_after_seconds: Some(0),
+            },
+        );
+    }
+}
+
+/// How many requests carrying `member` the stand-in was sent.
+fn sent_with(served: &kr_service_stand_in::Served, member: &str) -> usize {
+    served
+        .web()
+        .arrived()
+        .iter()
+        .filter(|arrived| arrived.body.get(member).is_some())
+        .count()
+}
+
+/// KR-REQ-20.13: a publication the service answers by asking to be sent again goes again after the
+/// time the answer names, as one request, and the device settles it from the answer to that.
+#[tokio::test]
+async fn a_publication_the_service_asks_to_be_sent_again_goes_again_after_the_time_it_names() {
+    let (served, run, client, object_id) = stood_in().await;
+    ask_twice(&served, "exchange");
+
+    let Published::Accepted { .. } = client
+        .publish(object_id, now())
+        .await
+        .expect("the publication follows the retry")
+    else {
+        panic!("the first write of an object the service has never held is accepted")
+    };
+    assert_eq!(
+        sent_with(&served, "exchange"),
+        3,
+        "the client sent it again once by itself and the leg once more"
+    );
+    assert_eq!(
+        run.reached.identities.lock().expect("the identities").len(),
+        1,
+        "every send presented one identity"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+}
+
+/// KR-REQ-20.13: a status query, a comparison and a fence that the service answers by asking to be
+/// sent again go again after the time the answer names.
+#[tokio::test]
+async fn a_query_the_service_asks_to_be_sent_again_goes_again_after_the_time_it_names() {
+    for member in ["status", "compare", "fence"] {
+        let (served, run, client, object_id) = stood_in().await;
+        let collection = sync_collection(SyncObjectKind::Settings, object_id);
+        let Published::Accepted { position } =
+            client.publish(object_id, now()).await.expect("published")
+        else {
+            panic!("the first write of an object the service has never held is accepted")
+        };
+        let identity = run
+            .reached
+            .identities
+            .lock()
+            .expect("the identities")
+            .keys()
+            .next()
+            .and_then(|identity| identity.parse::<Uuid>().ok())
+            .expect("the identity the write presented");
+        ask_twice(&served, member);
+
+        match member {
+            "status" => assert_eq!(
+                run.service
+                    .request_status(&collection, identity)
+                    .await
+                    .expect("the status query follows the retry"),
+                SyncRequestStatus::Applied { position }
+            ),
+            "compare" => assert_eq!(
+                run.service
+                    .compare(&collection, false, None)
+                    .await
+                    .expect("the comparison follows the retry")
+                    .objects
+                    .len(),
+                1
+            ),
+            _ => {
+                let at = now_ms();
+                assert_eq!(
+                    run.service
+                        .fence_request(&collection, identity, at, at)
+                        .await
+                        .expect("the fence follows the retry"),
+                    SyncRequestFence::Applied { position },
+                    "a request that ran is answered with its receipt"
+                );
+            }
+        }
+        assert_eq!(
+            sent_with(&served, member),
+            3,
+            "{member}: asked twice, answered at the third send"
+        );
+    }
+}
+
+/// KR-REQ-20.13: the request that gives back what a leg took goes again after the time a refusal
+/// names, whichever of its requests the service asked to be sent again.
+#[tokio::test]
+async fn the_cleanup_of_a_leg_goes_on_through_requests_the_service_asks_to_be_sent_again() {
+    for member in ["fence", "compare", "exchange"] {
+        let (served, run, client, object_id) = stood_in().await;
+        client.publish(object_id, now()).await.expect("published");
+        ask_twice(&served, member);
+
+        assert_eq!(
+            run.clear().await,
+            Vec::<String>::new(),
+            "{member}: the cleanup follows the retry and gives back what the leg took"
+        );
+    }
 }
