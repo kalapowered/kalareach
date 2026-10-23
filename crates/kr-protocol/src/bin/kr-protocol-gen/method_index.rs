@@ -276,8 +276,8 @@ pub(crate) const fn described_in(method: Method) -> Section {
 
         Method::OwnerConfirmationRequest
         | Method::OwnerConfirmationPending
-        | Method::OwnerConfirmationComplete
-        | Method::HostClockEstablish => at(PAIRING, "Owner confirmation"),
+        | Method::OwnerConfirmationComplete => at(PAIRING, "Owner confirmation"),
+        Method::HostClockEstablish => at(HOST, "The host time contract"),
 
         Method::EventsSubscribe
         | Method::EventsSnapshot
