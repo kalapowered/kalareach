@@ -1316,6 +1316,35 @@ jobs:
           rustup target add aarch64-pc-windows-msvc
           cargo check --locked -p kr-ipc -p kr-worker -p kr-controller -p kr-cli -p kr-term -p kr-project --target aarch64-pc-windows-msvc
 
+      # The desktop application itself, built and linked the way it is shipped: the interface's
+      # production bundle, and the feature that makes the executable serve it from inside itself.
+      # The compile above lints this platform's code and links nothing of the application. The
+      # build is the first leg's because the second is the longer.
+      - name: Install pnpm
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          cache: pnpm
+
+      - name: Build the desktop application
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm -C apps/companion build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked -p companion-tauri --release --features custom-protocol
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $executable = Get-Item target/release/kalareach-companion.exe -ErrorAction Stop
+          "$($executable.FullName): $($executable.Length) bytes"
+
       # Whatever the tests wrote to the artefact directory, kept whether the run passed or not: a
       # failure on this platform is the only evidence of how it failed here. A run whose tests
       # wrote nothing there keeps nothing.
