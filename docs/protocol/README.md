@@ -585,6 +585,11 @@ Reading the fields:
   `workspace.read`. It is not a universal prerequisite:
   pairing presents a transcript proof, a service method presents a service credential, and a
   private-IPC method presents its caller token, none of which involve a grant.
+- The entries of `sync.compare_exchange` and `backup.manifest` list only the service credential. The
+  requests of those methods that touch an account's recovery bundle, and a backup generation's
+  publication, also carry the account token for `backup.write`, as [the service
+  credential](#the-service-credential) describes; the entry does not record that, and neither entry
+  names the collection or archive it addresses as its resource (it says `mailbox`).
 - `required_rights` is an intersection, not a choice. An entry with a condition other than `always`
   applies only when that condition holds, which is how `session.attach` requires `terminal.geometry`
   just for a geometry claim, and how `pair.status` accepts either the candidate's transcript proof
