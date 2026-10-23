@@ -31,12 +31,12 @@ import { pathToFileURL } from 'node:url'
 /**
  * The classes a packaged application must define, by these exact names.
  *
- * Both are entry points the system itself resolves by name: the first from the manifest, the
- * second from the work request the receiver enqueues. That is what makes them safe to demand of
- * every build. A release build may rename or remove a class that only other code reaches, so
- * naming the keystore reader or a decision class here would fail a release artefact that is
- * perfectly correct. Between them the two cover the tree: neither exists at all unless the module
- * compiled it.
+ * Each is an entry point something resolves by name: the first from the manifest, the second from
+ * the work request the receiver enqueues, the third by Tauri from the plugin's class name. That is
+ * what makes them safe to demand of every build. A release build may rename or remove a class that
+ * only other code reaches, so naming the keystore reader or a decision class here would fail a
+ * release artefact that is perfectly correct. Between them they cover both trees: none exists at all unless the module that
+ * holds it compiled it.
  *
  * `--list` prints everything the artefact carries of the hand-written packages, which is what to
  * read when a name is in question.
@@ -45,7 +45,10 @@ const REQUIRED = [
   // The service the system starts when a push arrives, declared in the manifest.
   'to.kala.reach.companion.push.KalaReachMessagingService',
   // The work the message callback hands to the platform's scheduler.
-  'to.kala.reach.companion.push.PreviewWorker'
+  'to.kala.reach.companion.push.PreviewWorker',
+  // The plugin Tauri instantiates by its class name, which the library's consumer rules keep: it
+  // carries the native commands the interface calls, and is in no package this check lists.
+  'to.kala.reach.platform.PlatformPlugin'
 ]
 
 /** The packages whose classes are listed by `--list`. */

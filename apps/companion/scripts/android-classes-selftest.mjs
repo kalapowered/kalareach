@@ -23,7 +23,8 @@ import { definedStrings, missingFrom, packagesOf, requestFrom } from './android-
 
 const PRESENT = [
   'to.kala.reach.companion.push.KalaReachMessagingService',
-  'to.kala.reach.companion.push.PreviewWorker'
+  'to.kala.reach.companion.push.PreviewWorker',
+  'to.kala.reach.platform.PlatformPlugin'
 ]
 
 /**
@@ -106,7 +107,7 @@ expect(
     filler,
     { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]], referenced: [PRESENT[1]] }) }
   ]),
-  PRESENT[1]
+  PRESENT.slice(1).join(', ')
 )
 expect(
   'an archive comment holding the end-of-directory signature is still read',
@@ -142,7 +143,13 @@ expect(
   'an application missing the worker is named, not passed',
   'partial.apk',
   zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
-  PRESENT[1]
+  PRESENT.slice(1).join(', ')
+)
+expect(
+  'an application missing only the platform plugin is named, not passed',
+  'no-plugin.apk',
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: PRESENT.slice(0, 2) }) }]),
+  PRESENT[2]
 )
 expect(
   'a dex layout this does not read is refused rather than guessed at',
