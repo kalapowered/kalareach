@@ -65,6 +65,9 @@ mkdir -p "${artefacts:?}" "${shots:?}" "${cache:?}"
 app_id=to.kala.reach
 log="$artefacts/run.log"
 : >"${log:?}"
+# The messages' outcomes are this run's alone: the judge keeps the last line of each message, and a
+# message this run never sent must not be judged on an earlier run's.
+: >"${artefacts:?}/challenge-outcomes.txt"
 # What the harness and the gateway hold lives on the internal disk, for this run.
 harness="$(mktemp -d "${TMPDIR:-/tmp}/kr-push-device.XXXXXX")"
 gateway_state="$harness/gateway"
@@ -238,6 +241,7 @@ judge() {
     python3 - "$harness/report.json" "$artefacts" "$platform" <<'PY'
 import json
 import os
+import re
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -357,7 +361,7 @@ late_seen = report.get("late_observe_step") or ""
 late_chosen = report.get("late_step") or ""
 say("a second question answered at the host while the person had chosen Yes and not sent it: the phone says it was answered by someone else and what the person had chosen, and offers nothing to send (09.21)",
     report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen
-    and "answered by someone else" in late_seen and "You had chosen" in late_seen and "Send answer" not in late_seen
+    and "answered by someone else" in late_seen and re.search(r"You had chosen( \| )?Yes", late_seen) and "Send answer" not in late_seen
     and "still offered" not in late_seen
     and ("PUSH-CHOSEN" in late_chosen or "chosen" in late_chosen),
     late_seen[:300].replace("\n", " "))
