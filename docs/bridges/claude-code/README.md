@@ -157,7 +157,7 @@ endpoint, credential, launch record and registration.
 
 The worker also checks what Claude Code's process runs. When it establishes the backend it opens
 the executable the shell found, once, reads its identity, hashes it with SHA-256, and takes the
-version a signed qualification record names for that digest. It reads no version from anything
+version the signed index names, as a qualified build, for that digest. It reads no version from anything
 beside the executable, such as a `package.json`, which can change before or after the binary does.
 A script is refused, because its running image is its interpreter. Then, for every bridge that
 authenticates, it checks that the process runs what was hashed. On Linux that is the file
@@ -359,8 +359,8 @@ is not relayed, and the terminal's own dialog answers it.
 
 The worker serves the channel of the launch's own Claude Code and no other. The channel's starter,
 read from the kernel's parent link and checked by start identity, must be the process the launch
-registered, and a launch has one channel open at a time. The channel is served only when a signed
-qualification record names a version for the digest of the executable the launch hashed, and the
+registered, and a launch has one channel open at a time. The channel is served only when the signed
+index names a qualified build with a version for the digest of the executable the launch hashed, and the
 connector's table is qualified for that version. Any other channel is closed, and Claude Code's own
 dialog answers.
 
