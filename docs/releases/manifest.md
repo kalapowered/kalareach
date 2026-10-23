@@ -29,7 +29,7 @@ asked.
 | `shells` | What each shell package is made of | The package in the tree and the repository's pins for the shell (below) |
 | `agents` | The executable builds of supported agents the release is qualified against, with the capabilities each opens | The bundled signed plugin index (below) |
 | `dependencies` | The cryptographic libraries the release is built with, as resolved | `Cargo.toml` and `Cargo.lock` (below) |
-| `stores` | Every store the programs read, with the version each writes and the lowest it brings forward | `stored-formats.lock` |
+| `stores` | Every store the programs read, with the version each writes, the lowest it brings forward and, for a store that has one, the newest version above its own that it reads without writing | `stored-formats.lock` |
 | `files` | Every file but the manifest, with its length, SHA-256 digest and whether it is a program | The tree |
 
 A reader reads past a member it does not know, and the signature covers the manifest whole, so a
@@ -74,8 +74,9 @@ The patches are published in this repository, at the manifest's `commit`, in
 `shells/<shell>/patches/`; the release tree holds only the built package, and the manifest states
 each patch's digest, its own revision and the upstream revisions it is kept with. The member states
 what the host does and no more: the arguments, which name no option that skips or
-replaces a startup file of the person's (`-f`, `--no-rcs`, `--norc`, `--noprofile`, `--rcfile`,
-`--no-config`, `-N`), and the files the host puts its entry in. The order the shell reads its own
+replaces a startup file of the person's (`-f`, `--no-rcs`, `--norc`, `--noprofile`, `-noprofile`,
+`--rcfile`, `--init-file`, `--no-config`, `-N`; the check compares without regard to case, except
+for `-N`, and also refuses each of them with `=` and a value), and the files the host puts its entry in. The order the shell reads its own
 startup files in is the shell's, and a login Bash reaches `.bashrc` only where its login file
 sources it, which is why the host also puts an entry in the first login file. A person who moves a
 startup directory moves the entry with it, and the location says so in the shell's own words
@@ -85,8 +86,8 @@ through its startup files and holds the order they ran in, which the member does
 
 ## Agents
 
-The signed plugin index at the commit the bundled catalogue was taken from names, for an entry
-whose record passed every part of the version qualification, each executable build by application,
+The signed plugin index at the commit the bundled catalogue was taken from names, for a release
+whose qualification record passed every part of the version qualification, each executable build by application,
 distribution, version, operating system, architecture and digest. The manifest lists the builds
 for its own target with the capabilities of the entry that names them. A named build opens every
 capability its release declares. The schema hash is the manifest's optional member `schema_hash`:
@@ -159,10 +160,12 @@ entry, so the first build it names would stop every release until it does.
 ## Building and signing a release
 
 ```sh
-kr-release record   --tree T --checkout C --target TRIPLE [--plugins DIR] [--web DIR]
+kr-release record   --tree T --checkout C --target TRIPLE [--plugins DIR] [--web DIR] [--development]
 kr-release manifest --tree T --checkout C --release R --sequence N --commit SHA --target TRIPLE --floor macos=14.0
-kr-release sign     --tree T --checkout C --key KEY... [--plugins DIR] [--web DIR]
+kr-release check    --tree T --checkout C [--plugins DIR] [--web DIR] [--development]
+kr-release sign     --tree T --checkout C --key KEY... [--plugins DIR] [--web DIR] [--development]
 kr-release verify   --tree T --root ROOT
+kr-release dev-keys --out DIR [--signers N]
 ```
 
 The tree is complete, and every step that changes a file has run, before the manifest is written:
@@ -171,10 +174,12 @@ manifest again, refuses a `release.json` that is not what the tree makes, and si
 key. The channel's root names the keys that may sign and how many must; a release signed by one
 key of a two-key threshold, or by one key described twice, does not verify. A release key is an
 Ed25519 key of 32 bytes, the one spelling of a key; a root that names a key of another kind or
-size, or one key under two identifiers in a role, is refused. `verify` is a host's own check of a release:
-the signatures against the root, then every file against the manifest.
+size, or one key under two identifiers in a role, is refused. `check` refuses a tree whose `release.json` is not what the tree now makes, without signing.
+`--development` lets the record keep a pending class, which a release does not. `verify` is a host's
+own check of a release: the signatures against the root, then every file against the manifest.
 
-`kr-release dev-keys --out DIR` makes a root and the keys for it. A run that proves the pipeline
+`kr-release dev-keys --out DIR` makes a root and the keys for it (`--signers N` sets how many keys
+must sign and how many are made, two by default). A run that proves the pipeline
 signs with those and throws them away with the run; the channel's own keys are in hardware and on
 offline media, never in a tree, an archive or a repository.
 
