@@ -95,6 +95,7 @@ wait_for() {
     until "$@"; do
         if [ $(($(date +%s) - started)) -gt "$deadline" ]; then
             printf 'android-app-launch: FAIL: gave up waiting for %s\n' "$what" >&2
+            [ -z "${last_reason:-}" ] || printf 'android-app-launch: the last attempt said: %s\n' "$last_reason" >&2
             exit 1
         fi
         sleep 1
@@ -183,7 +184,7 @@ say "page title: $title"
 # handshake and every frame read, has one deadline of 20 seconds, so that a page that keeps sending
 # events cannot hold a single attempt past the wait that calls it.
 interface_mounted() {
-    python3 -I - "$port" << 'PYTHON'
+    last_reason="$(python3 -I - "$port" 2>&1 << 'PYTHON'
 import base64
 import json
 import os
@@ -197,6 +198,11 @@ port = int(sys.argv[1])
 limit = time.monotonic() + 20
 
 
+def refuse(reason):
+    print(reason)
+    sys.exit(1)
+
+
 def remaining():
     left = limit - time.monotonic()
     if left <= 0:
@@ -208,10 +214,16 @@ def remaining():
 direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
     with direct.open(f"http://127.0.0.1:{port}/json", timeout=remaining()) as listing:
-        pages = [p for p in json.load(listing) if p.get("type") == "page" and "://tauri.localhost" in p.get("url", "")]
+        entries = json.load(listing)
+except (OSError, ValueError) as error:
+    refuse(f"the page list could not be read: {type(error).__name__}: {error}")
+pages = [p for p in entries if p.get("type") == "page" and "://tauri.localhost" in p.get("url", "")]
+if not pages:
+    refuse(f"no page of the application's protocol is listed: {json.dumps(entries)[:300]}")
+try:
     path = "/" + pages[0]["webSocketDebuggerUrl"].split("/", 3)[3]
-except (OSError, ValueError, IndexError, KeyError):
-    sys.exit(1)
+except (KeyError, IndexError):
+    refuse(f"the page names no debugging address: {json.dumps(pages[0])[:300]}")
 
 expression = (
     "(() => { const root = document.getElementById('root');"
@@ -232,11 +244,11 @@ try:
         connection.settimeout(remaining())
         chunk = connection.recv(4096)
         if not chunk:
-            sys.exit(1)
+            refuse(f"the connection closed during the handshake after {buffer[:200]!r}")
         buffer += chunk
     head, _, buffer = buffer.partition(b"\r\n\r\n")
     if not head.startswith(b"HTTP/1.1 101"):
-        sys.exit(1)
+        refuse(f"the handshake was answered {head[:200]!r}")
 
     payload = json.dumps(
         {"id": 1, "method": "Runtime.evaluate", "params": {"expression": expression, "returnByValue": True}}
@@ -274,11 +286,17 @@ try:
         message = json.loads(frame)
         if message.get("id") != 1:
             continue
-        value = json.loads(message["result"]["result"]["value"])
-        sys.exit(0 if value["children"] > 0 and value["text"] > 0 else 1)
-except (OSError, ValueError, KeyError, TypeError):
-    sys.exit(1)
+        answer = message.get("result", {}).get("result", {})
+        if "value" not in answer:
+            refuse(f"the page answered {json.dumps(message)[:300]}")
+        value = json.loads(answer["value"])
+        if value["children"] > 0 and value["text"] > 0:
+            sys.exit(0)
+        refuse(f"the page's root holds {value['children']} elements and its body {value['text']} characters of text")
+except (OSError, ValueError, KeyError, TypeError) as error:
+    refuse(f"the debugging exchange failed: {type(error).__name__}: {error}")
 PYTHON
+)"
 }
 wait_for "the interface to have drawn into the document's root" interface_mounted
 
