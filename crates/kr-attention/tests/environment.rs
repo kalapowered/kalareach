@@ -2689,3 +2689,24 @@ fn a_release_leaves_a_decision_nothing_recorded_a_time_for_without_one() {
         }
     }
 }
+
+/// KR-REQ-09.07: a store that cannot be looked for is not read as one that holds nothing. A store
+/// that is not there holds no record, and a path that cannot be read is another answer.
+#[test]
+fn a_store_that_cannot_be_looked_for_is_not_read_as_one_that_holds_nothing() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let owner = actor("local:1000");
+    assert!(
+        !Attention::holds_action(directory.path().join("absent.sqlite3"), &owner, "action")
+            .expect("a store that is not there holds none")
+    );
+
+    // A file where the store's directory should be: the path cannot be read, though nothing is
+    // there either.
+    let file = directory.path().join("a-file");
+    std::fs::write(&file, b"not a directory").expect("a file");
+    assert!(
+        Attention::holds_action(file.join("attention.sqlite3"), &owner, "action").is_err(),
+        "a path that cannot be read is not a store that holds nothing"
+    );
+}
