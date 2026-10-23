@@ -2760,6 +2760,10 @@ async fn installed_requests(host: &Host) -> usize {
 /// consumed once: without one it is refused, one for another package hash or another grant is
 /// refused, its own installs, and spending it a second time is refused. None of the refusals
 /// changes the installation.
+///
+/// KR-REQ-02.09, the part about enlarging what an installation may do: the installation that
+/// widens is refused with `OwnerConfirmationRequired` until the owner has confirmed exactly it, and
+/// a confirmation for another package or another grant does not stand in.
 #[tokio::test]
 async fn kr_req_10_05_and_11_11_an_installation_that_widens_is_the_owners_confirmed_decision() {
     let host = host();
