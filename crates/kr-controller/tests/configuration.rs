@@ -3103,16 +3103,14 @@ async fn evidence_revision(
         .expect("this host publishes capability records")
 }
 
-/// A process that does nothing for two minutes, for a test to end: the one a recorded worker that
-/// cannot be reached still has running. It starts in a directory on the internal disk, never the
-/// workspace this test was built in.
+/// A process that does nothing until its test ends it: the one a recorded worker that cannot be
+/// reached still has running. It waits for its standard input to close, which happens when the
+/// test ends it or drops its handle (a test that panics leaves nothing behind), so how long a run
+/// takes decides nothing about whether the worker is still there. It starts in a directory on the
+/// internal disk, never the workspace this test was built in.
 fn a_process_that_waits() -> std::process::Child {
     #[cfg(unix)]
-    let mut command = {
-        let mut command = std::process::Command::new("/bin/sleep");
-        command.arg("120");
-        command
-    };
+    let mut command = std::process::Command::new("/bin/cat");
     #[cfg(windows)]
     let mut command = {
         let mut command = std::process::Command::new(kr_worker::testing::powershell());
@@ -3121,12 +3119,15 @@ fn a_process_that_waits() -> std::process::Child {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Start-Sleep -Seconds 120",
+            "[Console]::In.ReadToEnd() | Out-Null",
         ]);
         command
     };
     command
         .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("a process this daemon can be told about")
 }
