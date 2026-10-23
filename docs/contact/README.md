@@ -218,8 +218,9 @@ applied to something else.
 ## Installing the skill
 
 `kr skill install --agent <agent> --scope <user|project> [--project-dir <path>]` writes the skill
-package and registers the tool server. `kr skill status` reports what is installed and what has
-changed since; `kr skill remove` undoes exactly what the installation recorded.
+package and registers the tool server, through `agent_tools.install`. `kr skill status` reports what
+is installed and what has changed since, through `agent_tools.status`; `kr skill remove` undoes
+exactly what the installation recorded, through `agent_tools.remove`.
 
 The agents are `codex`, `claude-code`, `opencode`, `gemini-cli`, `kimi-code-cli` and `qoder-cli`.
 `manifest.json` in the skill package lists, for each one, where the skill goes at each scope, which
