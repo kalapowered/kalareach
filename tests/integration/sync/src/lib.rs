@@ -120,6 +120,12 @@ impl Deployment {
         )
     }
 
+    /// An authority-feed client signing as `who`, whose calls follow the retry the service names.
+    #[must_use]
+    pub fn following_authority_feed(&self, who: &Arc<RunKey>) -> FeedClient {
+        FeedClient::following(self.authority_feed(who))
+    }
+
     /// A mailbox client signing as `who`.
     #[must_use]
     pub fn mailbox(&self, who: &Arc<RunKey>) -> MailboxClient {
@@ -128,6 +134,176 @@ impl Deployment {
             self.transport(),
             Arc::clone(who) as Arc<_>,
         )
+    }
+}
+
+/// The longest one call waits through answers that ask it to try again.
+///
+/// It only ends a call that is never answered: each wait is the time the answer named, and the call
+/// goes on for as long as the service keeps asking, up to this.
+pub const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// How long a retryable answer asks the caller to wait, or nothing when the answer is not one.
+///
+/// An answer is retryable when its code is one the protocol calls transient, and the wait is what
+/// the client's own retry policy makes of it for a request that is not known to be safe to repeat
+/// without being asked: the delay the service named, or the policy's backoff where it named none.
+pub fn retry_after(error: &kr_client::ClientError) -> Option<std::time::Duration> {
+    if error.code().retry_category() != kr_protocol::error::RetryCategory::Transient {
+        return None;
+    }
+    error
+        .decision(kr_client::retry::RequestClass::Dispatchable)
+        .delay()
+}
+
+/// Sends `send` again, after the time the service names, for as long as it answers that it could
+/// not finish the request and asks to be sent it again, and gives the first answer that is not one.
+///
+/// The service's own words for such an answer are "send it again shortly": the call did not
+/// finish, and sent again under a fresh signature it is carried out then. Each call a leg makes to
+/// the feed is one whose repeat the service answers the same way as the call: a publication by its
+/// request identifier and digest, a revision by its number and digest, an acknowledgement by the
+/// statement it makes, a refusal and a removal by the state they leave. So a repeat cannot do a
+/// thing twice. The call is made again only after the wait, and the whole of it ends at
+/// [`RETRY_DEADLINE`], which only ends a call that is never answered.
+///
+/// # Errors
+///
+/// Returns the answer that is not a request to send again, or the last such answer once
+/// [`RETRY_DEADLINE`] has passed.
+pub async fn following_the_retry<T, Call, Pending>(
+    what: &str,
+    mut send: Call,
+) -> kr_client::Result<T>
+where
+    Call: FnMut() -> Pending,
+    Pending: std::future::Future<Output = kr_client::Result<T>>,
+{
+    let started = tokio::time::Instant::now();
+    loop {
+        match send().await {
+            Err(asked) if started.elapsed() < RETRY_DEADLINE => {
+                let Some(wait) = retry_after(&asked) else {
+                    return Err(asked);
+                };
+                eprintln!("{what} was asked to be sent again after {wait:?}: {asked}");
+                tokio::time::sleep(wait).await;
+            }
+            answered => return answered,
+        }
+    }
+}
+
+/// An authority-feed client whose calls follow a retry the service names ([`following_the_retry`]).
+///
+/// The legs hold their feed clients as this, so a leg that asks the feed for anything is not ended
+/// by the service saying it could not finish yet. It has the calls the legs make, with the
+/// client's own signatures; a call it has no method for is made on [`Self::raw`].
+#[derive(Clone, Debug)]
+pub struct FeedClient {
+    inner: AuthorityFeedClient,
+}
+
+impl FeedClient {
+    /// Follows retries for `inner`.
+    #[must_use]
+    pub const fn following(inner: AuthorityFeedClient) -> Self {
+        Self { inner }
+    }
+
+    /// The client itself, whose first answer is the answer.
+    #[must_use]
+    pub const fn raw(&self) -> &AuthorityFeedClient {
+        &self.inner
+    }
+
+    /// [`AuthorityFeedClient::publish`].
+    ///
+    /// # Errors
+    ///
+    /// As the client's, once a retryable answer is not repeated any more.
+    pub async fn publish(
+        &self,
+        host_key_id: kr_protocol::scalars::KeyId,
+        request: &kr_protocol::pairing::RevocationRequest,
+        announce: Option<&kr_client::services::authority::FeedAnnouncement>,
+    ) -> kr_client::Result<AuthorityFeedState> {
+        following_the_retry("the publication", || {
+            self.inner.publish(host_key_id, request, announce)
+        })
+        .await
+    }
+
+    /// [`AuthorityFeedClient::revise`].
+    ///
+    /// # Errors
+    ///
+    /// As the client's, once a retryable answer is not repeated any more.
+    pub async fn revise(
+        &self,
+        revision: &kr_protocol::pairing::AuthorityRevisionRecord,
+        announce: Option<&kr_client::services::authority::FeedAnnouncement>,
+    ) -> kr_client::Result<AuthorityFeedState> {
+        following_the_retry("the revision", || self.inner.revise(revision, announce)).await
+    }
+
+    /// [`AuthorityFeedClient::acknowledge`].
+    ///
+    /// # Errors
+    ///
+    /// As the client's, once a retryable answer is not repeated any more.
+    pub async fn acknowledge(
+        &self,
+        acknowledgement: &kr_protocol::pairing::RevocationAcknowledgement,
+        announce: Option<&kr_client::services::authority::FeedAnnouncement>,
+    ) -> kr_client::Result<AuthorityFeedState> {
+        following_the_retry("the acknowledgement", || {
+            self.inner.acknowledge(acknowledgement, announce)
+        })
+        .await
+    }
+
+    /// [`AuthorityFeedClient::reject`].
+    ///
+    /// # Errors
+    ///
+    /// As the client's, once a retryable answer is not repeated any more.
+    pub async fn reject(
+        &self,
+        request_id: kr_protocol::ids::RevocationRequestId,
+        reason: kr_client::services::authority::RejectionReason,
+    ) -> kr_client::Result<AuthorityFeedState> {
+        following_the_retry("the refusal", || self.inner.reject(request_id, reason)).await
+    }
+
+    /// [`AuthorityFeedClient::read`].
+    ///
+    /// # Errors
+    ///
+    /// As the client's, once a retryable answer is not repeated any more.
+    pub async fn read(
+        &self,
+        host_key_id: kr_protocol::scalars::KeyId,
+        after_sequence: Option<u64>,
+        summary_only: bool,
+    ) -> kr_client::Result<AuthorityFeedState> {
+        following_the_retry("the read", || {
+            self.inner.read(host_key_id, after_sequence, summary_only)
+        })
+        .await
+    }
+
+    /// [`AuthorityFeedClient::remove`].
+    ///
+    /// # Errors
+    ///
+    /// As the client's, once a retryable answer is not repeated any more.
+    pub async fn remove(
+        &self,
+        host_key_id: kr_protocol::scalars::KeyId,
+    ) -> kr_client::Result<AuthorityFeedState> {
+        following_the_retry("the removal", || self.inner.remove(host_key_id)).await
     }
 }
 

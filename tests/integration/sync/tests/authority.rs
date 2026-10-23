@@ -25,8 +25,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use kr_client::services::authority::{
-    AUTHORITY_SYNC_PATH, AuthorityFeedClient, FeedAnnouncement, MAX_AUTHORITY_REQUEST_BYTES,
-    RejectionReason, announcement_expiry,
+    AUTHORITY_SYNC_PATH, FeedAnnouncement, MAX_AUTHORITY_REQUEST_BYTES, RejectionReason,
+    announcement_expiry,
 };
 use kr_client::services::http::ExchangePhase;
 use kr_client::services::signed::SignedService;
@@ -46,7 +46,8 @@ use kr_protocol::pairing::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Bytes, CanonicalSet, KeyId, Nullable, TimestampMs};
 use kr_sync_integration::{
-    Deployment, RunKey, SilentService, authority_feed_left, fresh_uuid, now_ms, proved,
+    Deployment, FeedClient, RETRY_DEADLINE, RunKey, SilentService, authority_feed_left, fresh_uuid,
+    now_ms, proved, retry_after,
 };
 
 /// One run's feed: a host that owns it, and a remote owner that publishes to it.
@@ -57,8 +58,10 @@ struct Feed {
     deployment: Deployment,
     owner: Arc<RunKey>,
     host: Arc<RunKey>,
-    owner_client: AuthorityFeedClient,
-    host_client: AuthorityFeedClient,
+    /// Both clients follow a retry the service names: a call the service could not finish yet is
+    /// sent again after the time it names, so no leg ends on that answer.
+    owner_client: FeedClient,
+    host_client: FeedClient,
     /// The host's mailbox, which is where an announcement about this feed goes, and the owner's
     /// stored-envelope key, which is what seals one.
     ///
@@ -86,8 +89,8 @@ impl Feed {
         let owner = RunKey::installation();
         let host = RunKey::host();
         Self {
-            owner_client: deployment.authority_feed(&owner),
-            host_client: deployment.authority_feed(&host),
+            owner_client: deployment.following_authority_feed(&owner),
+            host_client: deployment.following_authority_feed(&host),
             deployment,
             owner,
             host,
@@ -145,7 +148,7 @@ impl Feed {
     /// answer that nothing settles is the deployment failing, and the leg fails with it.
     async fn publish_settled(
         &self,
-        client: &AuthorityFeedClient,
+        client: &FeedClient,
         request: &RevocationRequest,
     ) -> kr_client::Result<kr_client::services::AuthorityFeedState> {
         match client.publish(self.address(), request, None).await {
@@ -202,10 +205,12 @@ impl Feed {
     /// so the leg fails with it. The service answers a resend from the record it holds, or stores
     /// the request, and places the announcement; a first request whose announcement arrived after
     /// all leaves the same item waiting, and the resend then reports it as a duplicate. The
-    /// caller accepts a duplicate only when this says it sent again.
+    /// caller accepts a duplicate only when this says it sent again. An answer that asks to be sent
+    /// again is the third: the request is sent again after the time the answer names, and that
+    /// counts as having sent it again.
     async fn publish_announcing(
         &self,
-        client: &AuthorityFeedClient,
+        client: &FeedClient,
         request: &RevocationRequest,
         announcement: &FeedAnnouncement,
     ) -> kr_client::Result<(kr_client::services::AuthorityFeedState, bool)> {
@@ -214,15 +219,26 @@ impl Feed {
                 announced.mailbox == kr_client::services::AnnouncementPlacement::Declined
             })
         };
-        let (mut after_unknown, mut after_decline) = (false, false);
+        let (mut after_unknown, mut after_decline, mut after_asking) = (false, false, false);
+        let started = tokio::time::Instant::now();
         loop {
             match client
+                .raw()
                 .publish(self.address(), request, Some(announcement))
                 .await
             {
                 Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown && !after_unknown => {
                     after_unknown = true;
                     eprintln!("the publication was answered as unknown: {unknown}");
+                }
+                Err(asked)
+                    if started.elapsed() < RETRY_DEADLINE && retry_after(&asked).is_some() =>
+                {
+                    let wait = retry_after(&asked).unwrap_or_default();
+                    after_asking = true;
+                    eprintln!("the publication was asked to be sent again after {wait:?}: {asked}");
+                    tokio::time::sleep(wait).await;
+                    continue;
                 }
                 Ok(state) if declined(&state) && !after_decline => {
                     after_decline = true;
@@ -234,7 +250,8 @@ impl Feed {
                     eprintln!("the announcement was declined: {why}");
                 }
                 answered => {
-                    return answered.map(|state| (state, after_unknown || after_decline));
+                    return answered
+                        .map(|state| (state, after_unknown || after_decline || after_asking));
                 }
             }
             // The service asks for the feed to be read after an unknown answer, and before any
@@ -330,8 +347,20 @@ impl Feed {
     /// It is how a leg gives back what it took: the records addressed to this host are dropped and
     /// the feed keeps a removed host, the revisions that host issued and the nonces it has not yet
     /// forgotten.
+    ///
+    /// The first change a leg makes to its feed is the first request the feed's own object has been
+    /// asked, and when the object did not answer in time the service says it is not known whether
+    /// the change took effect. The feed is read before the removal is sent again, as for every
+    /// other change; a removal sent again to a feed that was removed leaves it removed.
     async fn remove_host(&self) -> kr_client::Result<kr_client::services::AuthorityFeedState> {
-        self.host_client.remove(self.address()).await
+        match self.host_client.remove(self.address()).await {
+            Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown => {
+                eprintln!("the removal was answered as unknown, so the feed is read: {unknown}");
+                self.host_client.read(self.address(), None, true).await?;
+                self.host_client.remove(self.address()).await
+            }
+            answered => answered,
+        }
     }
 
     /// The announcement one leg places in the host's mailbox, and the record that it changed.
@@ -567,7 +596,7 @@ async fn kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_i
         // the key its request names. What it does not hold is owner authority on this host.
         let stranger = RunKey::installation();
         let published = feed.revocation_from(&stranger);
-        feed.publish_settled(&feed.deployment.authority_feed(&stranger), &published)
+        feed.publish_settled(&feed.deployment.following_authority_feed(&stranger), &published)
             .await
             .expect("the service stores what the key that signed it published");
 
@@ -1150,6 +1179,64 @@ async fn a_first_revision_answered_as_unknown_is_read_back_before_it_is_sent_aga
             served.web().requests_to(AUTHORITY_SYNC_PATH),
             reaching,
             "stored {stored}: the revision was sent again only when the feed did not hold it"
+        );
+    }
+}
+
+/// A publication answered as unknown is read back before it is sent again, and that read can be
+/// answered "send it again shortly": the service could not finish it yet. The leg sends the read
+/// again after the time the answer names, which the client's own single resend of a read does not
+/// outlast when the feed's object stays unanswered, and only then decides from the feed whether the
+/// publication is sent again.
+#[tokio::test]
+async fn a_publication_answered_as_unknown_is_read_back_through_answers_that_ask_to_be_sent_again()
+{
+    use kr_service_stand_in::Moment;
+
+    let again = Moment::Refuse {
+        status: 503,
+        code: "SERVICE_UNAVAILABLE",
+        retry_after_seconds: Some(1),
+    };
+    for (stored, fault, reaching) in [
+        (
+            false,
+            Moment::Refuse {
+                status: 504,
+                code: "OUTCOME_UNKNOWN",
+                retry_after_seconds: None,
+            },
+            5,
+        ),
+        (true, Moment::ActedAndUnknown, 4),
+    ] {
+        let served = kr_service_stand_in::serve().await;
+        let origin = kr_protocol::service::GatewayOrigin::new(served.origin().to_owned())
+            .expect("a loopback origin");
+        let feed = Feed::on(Deployment::at(origin));
+        served.web().fail(AUTHORITY_SYNC_PATH, 1, fault);
+        // The client sends a read again once by itself, so the second answer is the first read's
+        // answer, and the leg's own wait is what the third read meets.
+        served
+            .web()
+            .fail_with_member(AUTHORITY_SYNC_PATH, "read", 1, again);
+        served
+            .web()
+            .fail_with_member(AUTHORITY_SYNC_PATH, "read", 2, again);
+
+        let request = feed.revocation();
+        let state = feed
+            .publish_settled(&feed.owner_client, &request)
+            .await
+            .unwrap_or_else(|error| panic!("stored {stored}: the publication is settled: {error}"));
+        assert!(
+            state.record(request.request_id).is_some(),
+            "stored {stored}: the feed holds the request"
+        );
+        assert_eq!(
+            served.web().requests_to(AUTHORITY_SYNC_PATH),
+            reaching,
+            "stored {stored}: the publication was sent again only when the feed did not hold it"
         );
     }
 }
