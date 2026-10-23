@@ -1469,10 +1469,14 @@ impl Controller {
     /// A restart loses what this daemon had collected: the pages it had half collected, and the
     /// report a repeat of a revocation reads. The worker keeps a revocation's names until a daemon
     /// has taken them all, and a replacement controller has taken none, so it still holds them
-    /// for the newest [`kr_worker::journal::MAX_HELD_REVOCATIONS`] revocations. Each of those is
-    /// asked for from the start. The answers carry into no result: each opens a report of its own,
-    /// which a repeat of that revocation reads, and the pages that follow the first are collected
-    /// by the evidence pass. A revision older than those answers as it was first given.
+    /// for the newest [`kr_worker::journal::MAX_HELD_REVOCATIONS`] revocations. The first page is
+    /// asked for each of the revisions at or below the one the registry holds the worker as having
+    /// acknowledged, that many at most. The answers carry into no result: each opens a report of
+    /// its own, which a repeat of that revocation reads, and the pages that follow the first are
+    /// collected by the evidence pass. The daemon keeps a report for
+    /// [`crate::authority::MAX_HELD_FENCE_REPORTS`] revisions of a worker in all, so the older of
+    /// these go first when the start's own announcement has read more. A revision older than those
+    /// answers as it was first given.
     pub(super) fn recover_what_workers_hold(
         self: &Arc<Self>,
         workers: Vec<(SessionId, AuthorityRevision)>,

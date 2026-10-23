@@ -378,11 +378,11 @@ struct WorkerFences {
     /// revision is above what an acknowledged announcement took in, says that some revisions may
     /// not be read: it may have read it.
     unfollowed_through: Option<AuthorityRevision>,
-    /// Whether a registry of an earlier run recorded this worker, and no announcement of this run
-    /// has been recorded for it yet. What the earlier run announced is not in memory, so the
-    /// revisions between what the worker acknowledged and the first this run announces may have
-    /// been fenced by the worker alone, and the first announcement takes them in
-    /// ([`Self::announce`]).
+    /// Whether a registry of an earlier run showed this worker behind a fence that run still
+    /// owed, and no announcement of this run has been recorded for it yet. What the earlier run
+    /// announced is not in memory, so the revisions between what the worker acknowledged and the
+    /// first this run announces may have been fenced by the worker alone, and the first
+    /// announcement takes them in ([`Self::announce`]).
     recovered: bool,
 }
 
@@ -464,9 +464,10 @@ impl WorkerFences {
     /// (`Carries::unread`) rather than reading less in silence.
     ///
     /// `held` is the revision the worker last acknowledged, as the registry recorded it. For a
-    /// worker a registry of an earlier run recorded, the first announcement also reads the
-    /// revisions after `held` and before it, which the earlier run may have announced and which
-    /// the worker may have fenced by itself: this daemon holds nothing of what it was told.
+    /// worker marked as recovered ([`AuthorityBarrier::recovered`]), the first announcement also
+    /// reads the revisions after `held` and before it, which the earlier run may have announced
+    /// and which the worker may have fenced by itself: this daemon holds nothing of what it was
+    /// told.
     fn announce(&mut self, held: AuthorityRevision, notices: &[AuthorityRevision]) {
         if std::mem::take(&mut self.recovered)
             && let Some(first) = notices.first()
@@ -1031,10 +1032,12 @@ impl AuthorityBarrier {
             .announce(held, notices);
     }
 
-    /// Marks the workers a registry of an earlier run recorded, which this daemon has been told
-    /// nothing of: the first announcement to each reads the revisions between what it
-    /// acknowledged and that announcement ([`WorkerFences::announce`]). A worker made in this run
-    /// is not marked, because everything announced to it is in memory.
+    /// Marks the workers a registry of an earlier run showed behind a fence that run still owed,
+    /// which this daemon has been told nothing of: the first announcement to each reads the
+    /// revisions between what it acknowledged and that announcement
+    /// ([`WorkerFences::announce`]). A worker made in this run is not marked, because everything
+    /// announced to it is in memory, and neither is one that run saw acknowledge everything it
+    /// owed.
     pub fn recovered(&self, workers: impl IntoIterator<Item = SessionId>) {
         let _order = self.ordered();
         let mut fences = self.lock();

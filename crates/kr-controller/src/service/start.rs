@@ -400,10 +400,8 @@ impl Controller {
         let recorded_revision = capability_revision(&paths);
         let started_at_ms = kr_ipc::now_ms();
         let authority_revision = registry.authority_revision()?;
-        // The workers an earlier run recorded, with the revision each last acknowledged. This run
-        // remembers nothing of what that run announced to them, so the barrier is told which they
-        // are ([`crate::authority::AuthorityBarrier::recovered`]), and what they still hold of the
-        // revisions they acknowledged is read back once the start is done
+        // The workers an earlier run recorded, with the revision each last acknowledged. What they
+        // still hold of the revisions they acknowledged is read back once the start is done
         // ([`Controller::recover_what_workers_hold`]).
         let recorded_workers: Vec<(
             kr_protocol::ids::SessionId,
@@ -412,6 +410,17 @@ impl Controller {
             .workers()?
             .into_iter()
             .map(|worker| (worker.session_id, worker.acknowledged_revision))
+            .collect();
+        // This run remembers nothing of what that run announced to them. A worker may have fenced
+        // a revision by itself only when the registry shows that revision still owed to it: one the
+        // earlier run saw every worker acknowledge left nothing unread, and a worker made after the
+        // revisions that passed was told none of them. So the barrier is told only of the workers
+        // behind a fence that is owed ([`crate::authority::AuthorityBarrier::recovered`]).
+        let owed = registry.fence_owed()?;
+        let behind_an_owed_fence: Vec<kr_protocol::ids::SessionId> = recorded_workers
+            .iter()
+            .filter(|(_, held)| owed.is_some_and(|owed| *held < owed))
+            .map(|(session_id, _)| *session_id)
             .collect();
         let transfer =
             Arc::new(crate::transfer::TransferModule::open(&setup.paths, wall.clone()).await?);
@@ -1107,7 +1116,7 @@ impl Controller {
             leases: {
                 let leases =
                     crate::authority::AuthorityBarrier::new(generation, authority_revision);
-                leases.recovered(recorded_workers.iter().map(|(session_id, _)| *session_id));
+                leases.recovered(behind_an_owed_fence);
                 leases
             },
             identifiers_performing: Default::default(),

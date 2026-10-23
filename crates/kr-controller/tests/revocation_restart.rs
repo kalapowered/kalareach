@@ -347,6 +347,53 @@ async fn a_restarted_daemon_reads_the_newest_revisions_of_a_long_gap_and_says_th
     drop(workers);
 }
 
+/// KR-REQ-10.45, 09.13: a worker made after revisions advanced is read for the revision in force and
+/// no earlier one when the daemon restarts, because it was told none of the earlier revisions and
+/// owed no fence for them.
+///
+/// The registry holds nothing for the worker, as for one that acknowledged nothing, but no fence
+/// was owed when the daemon stopped, so nothing the worker could have fenced alone is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that_passed() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    for _ in 0..3 {
+        host.controller()
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded");
+    }
+    let stopped = host.shut_down().await;
+    let worker = Worker::start_reserved(stopped.tree(), 1).await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let adopted = Adopted {
+        host,
+        owner,
+        workers: vec![worker],
+    };
+    adopted.until_adopted(&adopted.workers[0]).await;
+
+    adopted
+        .host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the revocation is recorded");
+    let barrier = until_the_revision_holds(&adopted.host).await;
+    let reported = barrier
+        .workers
+        .iter()
+        .find(|reported| reported.session_id == adopted.workers[0].session_id)
+        .expect("the worker is in the barrier");
+    assert!(
+        reported.detail.is_empty(),
+        "the result says nothing of revisions the worker was never told: {:?}",
+        reported.detail
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-10.45, 09.13: a restarted daemon collects the names a revocation left owing, which the
 /// repeat of that revocation then carries.
 ///
