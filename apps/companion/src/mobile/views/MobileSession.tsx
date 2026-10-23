@@ -64,6 +64,7 @@ import {
   failed,
   type Submission
 } from '../../model/receipts'
+import { supersessionFor } from '../../model/receipt-reads'
 import { useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
@@ -177,7 +178,7 @@ export function MobileSession({
   /** Whether the host is in contact, or null before the shell's first answer. */
   readonly connected: boolean | null
 }): ReactNode {
-  const { port, say, drafts: book, paths, openings } = useApp()
+  const { port, say, drafts: book, paths, openings, receiptReads } = useApp()
   const camera = useCameraControl(port, say)
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
@@ -648,7 +649,7 @@ export function MobileSession({
   }
 
   const send = useCallback(
-    (text: string) => {
+    (text: string, anyway = false) => {
       const now = Date.now()
       // The opening this send is made under. Its answer may come after the screen has opened the
       // session again, and then it settles its own record and nothing the new opening shows.
@@ -690,6 +691,16 @@ export function MobileSession({
       // What the person wrote goes to the conversation they wrote it for, at the binding revision
       // they wrote it at: the host refuses it if that conversation has moved on since.
       const { applicationInstanceId: instance, agentBindingRevision: revision } = draft.target
+      // A person who checked sends a prompt past an outcome nobody could establish as an explicit
+      // later request: it names the earlier action and the revision of its record they were shown.
+      // With nothing of that kind to name it names nothing, and the host decides.
+      const quote = anyway
+        ? supersessionFor(
+            lifecycle.state.submissions.filter((each) => isForSession(each.localId, sessionId)),
+            receiptReads,
+            draft.target
+          )
+        : null
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
@@ -710,7 +721,8 @@ export function MobileSession({
             draft_id: null,
             text
           },
-          opening
+          opening,
+          quote ?? undefined
         )
       })
         .then((answer) => {
@@ -754,6 +766,9 @@ export function MobileSession({
             end('refused')
             return
           }
+          // A refusal of the earlier result's quote says the host's record is not what was shown:
+          // it is read again at once, so the person sees what it says now.
+          if (anyway && failureCode(failure) === 'DRAFT_CONFLICT') receiptReads.askAgain(sessionId)
           lifecycle.setSubmissions((current) =>
             current.map((each) =>
               each.localId === submission.localId
@@ -774,7 +789,7 @@ export function MobileSession({
           if (stillHere()) setBusyUnder(null)
         })
     },
-    [draft, lifecycle, book, port, say, sessionId, openings]
+    [draft, lifecycle, book, port, say, sessionId, openings, receiptReads]
   )
 
 
@@ -889,7 +904,7 @@ export function MobileSession({
         disabled={!submittable(draft) || !submitOffer.offered || busy}
         style={{ minBlockSize: target }}
         onClick={() => {
-          send(draft.text)
+          send(draft.text, true)
         }}
       >
         {SEND_ANYWAY_WORDS}

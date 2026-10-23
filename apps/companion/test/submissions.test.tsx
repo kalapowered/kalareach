@@ -18,6 +18,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import { FakeDraftStore } from '../src/host/fake-drafts'
 import type { HostPort, Settled } from '../src/host/port'
+import type { Supersession } from '../src/model/receipt-reads'
 import { MobileApp } from '../src/mobile/MobileApp'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -27,8 +28,8 @@ const ANOTHER_ACTION = '00000000-0000-4000-8000-00000000abce'
 
 afterEach(cleanup)
 
-/** A receipt of a prompt's action, at the state the host last recorded. */
-function receiptAt(state: Receipt['state'], action = ACTION): Receipt {
+/** A receipt of a prompt's action, at the state and revision the host last recorded. */
+function receiptAt(state: Receipt['state'], action = ACTION, revision = '1'): Receipt {
   return {
     action_id: action,
     actor_id: 'owner:local',
@@ -37,7 +38,7 @@ function receiptAt(state: Receipt['state'], action = ACTION): Receipt {
     method_version: 1,
     payload_digest: '0'.repeat(64),
     reason: null,
-    revision: '1',
+    revision,
     state,
     updated_at_ms: '0',
     accepted_deadline_ms: null
@@ -50,10 +51,17 @@ const UNCONFIRMED: Settled<AgentMutationResult> = { receipt: null, value: null, 
 /** The answer of a host that has the request and is not done with it. */
 const WITH_THE_HOST: Settled<AgentMutationResult> = { receipt: receiptAt('dispatching'), value: null, action_id: ACTION }
 
+/** What a send comes to: the host's answer, or a refusal. */
+type Given = Settled<AgentMutationResult> | Error
+
 /** What the host recorded of the actions: one state for all, or a state for each action named. */
 interface Recorded {
   state: Receipt['state']
   byAction?: Record<string, Receipt['state']>
+  /** The revision the host's record stands at; the first by default. */
+  revision?: string
+  /** True when the host cannot be asked what it recorded. */
+  unreadable?: boolean
 }
 
 /**
@@ -62,21 +70,28 @@ interface Recorded {
  */
 function answering(
   port: HostPort,
-  answer: Settled<AgentMutationResult> | ((attempt: number) => Settled<AgentMutationResult>),
+  answer: Given | ((attempt: number) => Given),
   recorded: Recorded,
   reads: string[] = [],
-  sent: unknown[] = []
+  sent: unknown[] = [],
+  quotes: (Supersession | undefined)[] = []
 ): HostPort {
   return {
     ...port,
-    composerSubmit: (params) => {
+    composerSubmit: (params, _opening, supersedes) => {
       sent.push(params)
-      return Promise.resolve(typeof answer === 'function' ? answer(sent.length) : answer)
+      quotes.push(supersedes)
+      const given = typeof answer === 'function' ? answer(sent.length) : answer
+      return given instanceof Error ? Promise.reject(given) : Promise.resolve(given)
     },
     actionRead: (params) => {
       reads.push(params.action_id)
+      if (recorded.unreadable === true) return Promise.reject(new Error('the host did not answer'))
       const state = recorded.byAction?.[params.action_id] ?? recorded.state
-      return Promise.resolve({ receipt: receiptAt(state, params.action_id), result: null })
+      return Promise.resolve({
+        receipt: receiptAt(state, params.action_id, recorded.revision),
+        result: null
+      })
     }
   }
 }
@@ -112,16 +127,17 @@ async function flush(): Promise<void> {
 describe('on the desktop', () => {
   /** The desktop's conversation over a device's drafts, with the person's text sent once. */
   async function sentOnce(
-    answer: Settled<AgentMutationResult> | ((attempt: number) => Settled<AgentMutationResult>),
+    answer: Given | ((attempt: number) => Given),
     recorded: Recorded,
     reads: string[] = [],
-    sent: unknown[] = []
+    sent: unknown[] = [],
+    quotes: (Supersession | undefined)[] = []
   ) {
     const device = new FakeDraftStore()
     const host = fakeHost({ drafts: device })
     render(
       <AppProvider
-        port={answering(host.port, answer, recorded, reads, sent)}
+        port={answering(host.port, answer, recorded, reads, sent, quotes)}
         initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
       >
         <App />
@@ -494,6 +510,103 @@ describe('on the desktop', () => {
       expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
     })
 
+    it('names the earlier action and the revision it read when the person sends anyway', async () => {
+      const recorded: Recorded = {
+        state: 'unknown',
+        revision: '3',
+        byAction: { [ANOTHER_ACTION]: 'dispatching' }
+      }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+
+      // The record is read, and the person is shown it as unknown: that is what they checked.
+      await waitFor(
+        () => {
+          expect(reads).toContain(ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      expect(quotes[0]).toBeUndefined()
+      expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+    })
+
+    it('names nothing when the earlier record could not be read, and leaves the refusal to the host', async () => {
+      const recorded: Recorded = { state: 'unknown', unreadable: true }
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(answers, recorded, [], [], quotes)
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      expect(quotes[1]).toBeUndefined()
+    })
+
+    it('names nothing when the host holds the earlier action as only dispatching', async () => {
+      // The page keeps an outcome it was told nobody knows as unknown until the host says it is
+      // final; the host's own record says it still has the action, which stands in no prompt's way.
+      const recorded: Recorded = { state: 'dispatching', revision: '2' }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(answers, recorded, reads, [], quotes)
+      await waitFor(
+        () => {
+          expect(reads).toContain(ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      expect(quotes[1]).toBeUndefined()
+    })
+
+    it('reads the earlier record again at once when the host refuses the quote, so the next press quotes what it says now', async () => {
+      const refused = Object.assign(new Error('the earlier result has not been shown'), {
+        code: 'DRAFT_CONFLICT',
+        message: 'the earlier result has not been shown',
+        user_action: 'retry'
+      })
+      const recorded: Recorded = { state: 'unknown', revision: '3' }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(
+        (attempt) => (attempt === 1 ? UNCONFIRMED : attempt === 2 ? refused : UNCONFIRMED),
+        recorded,
+        reads,
+        [],
+        quotes
+      )
+      await waitFor(
+        () => {
+          expect(reads).toContain(ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      // The host's record moved on while the page held the revision it had read.
+      recorded.revision = '4'
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
+      })
+      expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+      // The refusal is the host's word that the record is not what was shown, and the page reads it
+      // again at once: the next press quotes the revision that is there now.
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(3)
+      })
+      expect(quotes[2]).toEqual({ action_id: ACTION, revision: '4' })
+    })
+
     it('is not offered a way past while the host merely has the action', async () => {
       const recorded = { state: 'dispatching' as Receipt['state'] }
       await sentOnce(WITH_THE_HOST, recorded)
@@ -643,15 +756,16 @@ describe('on the desktop', () => {
 describe('on the phone', () => {
   /** The phone's session screen, with the person's text sent once. */
   async function sentOnce(
-    answer: Settled<AgentMutationResult> | ((attempt: number) => Settled<AgentMutationResult>),
+    answer: Given | ((attempt: number) => Given),
     recorded: Recorded,
     reads: string[] = [],
-    sent: unknown[] = []
+    sent: unknown[] = [],
+    quotes: (Supersession | undefined)[] = []
   ) {
     const device = new FakeDraftStore()
     const host = fakeHost({ drafts: device })
     render(
-      <AppProvider port={answering(host.port, answer, recorded, reads, sent)}>
+      <AppProvider port={answering(host.port, answer, recorded, reads, sent, quotes)}>
         <MobileApp surface="ios" storage={null} />
       </AppProvider>
     )
@@ -745,6 +859,63 @@ describe('on the phone', () => {
     expect(within(earlier).getByText('run the migration')).toBeInTheDocument()
     expect(screen.getByText(/One action has no confirmed outcome yet/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
+  it('names the earlier action and the revision it read when the person sends anyway', async () => {
+    const recorded: Recorded = {
+      state: 'unknown',
+      revision: '3',
+      byAction: { [ANOTHER_ACTION]: 'applied' }
+    }
+    const reads: string[] = []
+    const quotes: (Supersession | undefined)[] = []
+    const second: Settled<AgentMutationResult> = {
+      receipt: receiptAt('dispatching', ANOTHER_ACTION),
+      value: null,
+      action_id: ANOTHER_ACTION
+    }
+    const { person } = await sentOnce(
+      (attempt) => (attempt === 1 ? UNCONFIRMED : second),
+      recorded,
+      reads,
+      [],
+      quotes
+    )
+    await waitFor(
+      () => {
+        expect(reads).toContain(ACTION)
+      },
+      { timeout: 3_000 }
+    )
+    await flush()
+    await person.click(await screen.findByRole('button', { name: 'I checked; send anyway' }))
+    await waitFor(() => {
+      expect(quotes).toHaveLength(2)
+    })
+    expect(quotes[0]).toBeUndefined()
+    expect(quotes[1]).toEqual({ action_id: ACTION, revision: '3' })
+  })
+
+  it('names nothing when the earlier record could not be read', async () => {
+    const recorded: Recorded = { state: 'unknown', unreadable: true }
+    const quotes: (Supersession | undefined)[] = []
+    const second: Settled<AgentMutationResult> = {
+      receipt: receiptAt('dispatching', ANOTHER_ACTION),
+      value: null,
+      action_id: ANOTHER_ACTION
+    }
+    const { person } = await sentOnce(
+      (attempt) => (attempt === 1 ? UNCONFIRMED : second),
+      recorded,
+      [],
+      [],
+      quotes
+    )
+    await person.click(await screen.findByRole('button', { name: 'I checked; send anyway' }))
+    await waitFor(() => {
+      expect(quotes).toHaveLength(2)
+    })
+    expect(quotes[1]).toBeUndefined()
   })
 
   it('is not offered a way past while the host merely has the action', async () => {
