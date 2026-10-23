@@ -384,8 +384,8 @@ the record is about, its state, where the answer came from, the exact package ha
 digest of the signed qualification profile it came from where one did, what makes it stale, what a
 person is told when the capability is not available, and when it was established. Evidence describes
 feasibility and never creates authority. An action still checks its grant and rechecks the record's
-revision on its own. The read needs no right, because what it describes is what this environment
-already runs.
+revision on its own. The read needs no right beyond the scoped read authority of its grant, because what it describes is
+what this environment already runs.
 
 A repository ceiling stops thousands of passive downloads from becoming thousands of permission
 prompts. Past the default, each decision is somebody's and they are not interchangeable.
@@ -401,7 +401,8 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 A grant names only capabilities the package asks for. An installation that may do anything the
 installation it replaces could not, or, with nothing to replace, anything its repository's ceiling
 does not permit by itself, carries the owner's confirmation of that exact installation, and so does
-every release that installs a native bridge or declares a command integration. What the replaced
+every release that installs a native bridge, declares a command integration or asks for
+`launch.probe`, which runs the application's own executable. What the replaced
 installation could do is read under the ceiling it was installed under, so a move to a repository
 that permits more is an increase too. The confirmation names the repository and its ceiling, as
 `catalogue.list` reports them, the release, the package hash, the grant and, where the grant holds a
