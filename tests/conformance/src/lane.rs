@@ -330,6 +330,130 @@ pub fn agree_with_exit(exit: Option<i32>, cases: &[Case]) -> Result<(), String> 
 /// and strings are blanked, so a class after the place it went wrong could be missed, or a class
 /// is declared whose name is in backticks or on the next line.
 pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String> {
+    Ok(scan(file, source, false)?
+        .classes
+        .into_iter()
+        .map(|class| class.name)
+        .collect())
+}
+
+/// What a source file declares, for the keys its comments carry: its classes, the tests of those
+/// classes, and where the lines of each are. Lines count from 1.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Declared {
+    /// The classes at the top level, as [`declared_classes`] names them.
+    pub classes: Vec<DeclaredClass>,
+    /// The tests of those classes, in the order the file declares them.
+    pub tests: Vec<DeclaredTest>,
+    /// The line of the first thing in the file that is code, or 0 for a file with none: a comment
+    /// before it heads the file.
+    first_code: usize,
+    /// For each line, whether it holds a comment and nothing else.
+    comment_only: Vec<bool>,
+}
+
+/// A class at the top level of a source file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredClass {
+    /// Its name, as [`declared_classes`] gives it.
+    pub name: String,
+    /// The first line of its declaration, the attributes above `class` included.
+    pub first: usize,
+    /// The line its body closes on.
+    pub last: usize,
+}
+
+/// A test function of a class, as the tool that runs it names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredTest {
+    /// The class that holds it, named as [`DeclaredClass`] names it.
+    pub class: String,
+    /// Its name as the tool reports the case: a Kotlin function's name (the text between the
+    /// backticks of a quoted one), a Swift method's name with the `()` Xcode puts after it.
+    pub name: String,
+    /// The first line of its declaration, the attributes above it included.
+    pub first: usize,
+    /// The line its body closes on.
+    pub last: usize,
+}
+
+/// How much of a source file a key covers.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Part {
+    /// One test: the class that holds it, and its name as the tool reports the case.
+    Case {
+        /// The class, named as [`DeclaredClass`] names it.
+        class: String,
+        /// The case's name, as [`DeclaredTest`] gives it.
+        name: String,
+    },
+    /// Every test of one class.
+    Class(String),
+    /// Every test of every class the file declares.
+    File,
+}
+
+/// Where a comment stands, which is what makes it key what it keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stands {
+    /// Directly above the declaration it keys, with nothing but comments between.
+    Above,
+    /// Inside the body of the test it keys.
+    Inside,
+    /// Before the first line of code of the file.
+    Head,
+}
+
+impl Declared {
+    /// What the comment on lines `first` to `last` keys, and how it stands to it, or nothing when
+    /// it keys no test.
+    ///
+    /// * a comment inside the body of a test, or directly above its declaration (the attributes
+    ///   included), keys that test;
+    /// * a comment directly above a class keys every test of the class;
+    /// * a comment before the first line of code keys every test of the file;
+    /// * any other comment, in a class between its tests or in a helper, keys nothing.
+    ///
+    /// "Directly above" allows other comments between and no blank line.
+    #[must_use]
+    pub fn scope_of(&self, first: usize, last: usize) -> Option<(Part, Stands)> {
+        let case = |test: &DeclaredTest| Part::Case {
+            class: test.class.clone(),
+            name: test.name.clone(),
+        };
+        if let Some(test) = self
+            .tests
+            .iter()
+            .find(|test| test.first <= first && last <= test.last)
+        {
+            return Some((case(test), Stands::Inside));
+        }
+        if let Some(test) = self
+            .tests
+            .iter()
+            .find(|test| self.directly_above(last, test.first))
+        {
+            return Some((case(test), Stands::Above));
+        }
+        if let Some(class) = self
+            .classes
+            .iter()
+            .find(|class| self.directly_above(last, class.first))
+        {
+            return Some((Part::Class(class.name.clone()), Stands::Above));
+        }
+        (self.first_code != 0 && last < self.first_code).then_some((Part::File, Stands::Head))
+    }
+
+    /// Whether only comments lie between line `last` and the declaration that starts on `target`.
+    fn directly_above(&self, last: usize, target: usize) -> bool {
+        last < target
+            && (last + 1..target).all(|line| self.comment_only.get(line - 1).copied() == Some(true))
+    }
+}
+
+/// Reads the classes of a source file, and with `tests` its test functions.
+fn scan(file: &str, source: &str, tests: bool) -> Result<Declared, String> {
     const MODIFIERS: &[&str] = &[
         "public",
         "private",
@@ -357,83 +481,312 @@ pub fn declared_classes(file: &str, source: &str) -> Result<Vec<String>, String>
     const NOT_CLASSES: &[&str] = &["func", "var", "let", "init", "subscript", "deinit"];
     let swift = file.ends_with(".swift");
     let masked = mask(source, swift);
+    let originals: Vec<Vec<char>> = source.lines().map(|line| line.chars().collect()).collect();
+    let mut declared = Declared::default();
     let mut package = String::new();
-    let mut found = Vec::new();
     let mut depth = 0_i64;
-    for (number, line) in masked.lines().enumerate() {
+    // The class whose body is open, the test whose body is open and whether its first brace has
+    // been seen, and the first line of the attributes waiting for the declaration they belong to.
+    let mut open_class: Option<usize> = None;
+    let mut open_test: Option<(usize, bool)> = None;
+    let mut class_attributes: Option<usize> = None;
+    let mut test_attributes: Option<usize> = None;
+    let mut test_attribute = false;
+    for (index, line) in masked.lines().enumerate() {
+        let number = index + 1;
+        let chars: Vec<char> = line.chars().collect();
+        let blank = chars.iter().all(|c| c.is_whitespace());
+        declared.comment_only.push(
+            blank
+                && originals
+                    .get(index)
+                    .is_some_and(|original| original.iter().any(|c| !c.is_whitespace())),
+        );
+        if !blank && declared.first_code == 0 {
+            declared.first_code = number;
+        }
         let at_top = depth == 0;
-        for c in line.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth < 0 {
+        let in_class_body = depth == 1 && open_class.is_some() && open_test.is_none();
+        if tests {
+            if swift {
+                if line.trim_start().starts_with("import") && has_word(&chars, "Testing") {
+                    return Err(format!(
+                        "line {number} imports the Swift Testing framework, which this reading does not follow"
+                    ));
+                }
+                if annotation_names(&chars, "Test") {
+                    return Err(format!(
+                        "line {number} declares a Swift Testing test, which this reading does not follow"
+                    ));
+                }
+            } else if !in_class_body && open_test.is_none() && annotation_names(&chars, "Test") {
                 return Err(format!(
-                    "a brace on line {} closes what was never opened",
-                    number + 1
+                    "line {number} declares a test outside the body of a top-level class, which this reading does not follow"
                 ));
             }
         }
-        let line = line.trim();
-        if !at_top || line.is_empty() {
-            continue;
-        }
-        if !swift && let Some(rest) = line.strip_prefix("package ") {
-            package = rest.trim().trim_end_matches(';').trim().to_owned();
-            continue;
-        }
-        let mut words = line.split_whitespace();
-        // Attributes are modifiers too, and one may carry arguments with spaces in them.
-        let mut parentheses = 0_i32;
-        let mut declared = None;
-        while let Some(word) = words.next() {
-            // A quoted name after an annotation's `@` is part of the annotation; the masker leaves
-            // its closing backtick as a word of its own.
-            if parentheses > 0 || word.starts_with('@') || word.starts_with('`') {
-                parentheses += i32::try_from(word.matches('(').count()).unwrap_or(0)
-                    - i32::try_from(word.matches(')').count()).unwrap_or(0);
-                continue;
+        let trimmed = line.trim();
+        if tests && in_class_body {
+            let attribute_line = trimmed.starts_with('@');
+            if attribute_line {
+                test_attributes.get_or_insert(number);
             }
-            if MODIFIERS.contains(&word) {
-                continue;
-            }
-            if word == "class" {
-                declared = Some(
-                    words
-                        .next()
-                        .map(|name| {
-                            name.chars()
-                                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default(),
-                );
-            }
-            break;
-        }
-        // A class name in backticks is blanked with the other quoted identifiers, which leaves a
-        // backtick where the name was, so what follows `class` is no name: the file cannot be read.
-        if declared.as_ref().is_some_and(String::is_empty) {
-            return Err(format!(
-                "line {} declares a class whose name cannot be read",
-                number + 1
-            ));
-        }
-        if let Some(name) =
-            declared.filter(|name| !name.is_empty() && !NOT_CLASSES.contains(&name.as_str()))
-        {
-            found.push(if swift || package.is_empty() {
-                name
+            let class = open_class.map(|class| declared.classes[class].name.clone());
+            if swift {
+                let swift_test = find_word(&chars, "func").and_then(|at| {
+                    let before: String = chars[..at].iter().collect();
+                    let skipped = before
+                        .split_whitespace()
+                        .any(|word| word == "static" || word == "class");
+                    (!skipped).then(|| swift_test_name(&chars, at)).flatten()
+                });
+                if let Some(name) = swift_test {
+                    declared.tests.push(DeclaredTest {
+                        class: class.unwrap_or_default(),
+                        name,
+                        first: test_attributes.take().unwrap_or(number),
+                        last: number,
+                    });
+                    open_test = Some((declared.tests.len() - 1, false));
+                } else if find_word(&chars, "func").is_some() || (!attribute_line && !blank) {
+                    test_attributes = None;
+                }
             } else {
-                format!("{package}.{name}")
-            });
+                if annotation_names(&chars, "Test") {
+                    test_attribute = true;
+                }
+                if let Some(at) = find_word(&chars, "fun") {
+                    if test_attribute {
+                        let name =
+                            kotlin_name(originals.get(index).map_or(&[][..], Vec::as_slice), at)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "line {number} declares a test whose name cannot be read"
+                                    )
+                                })?;
+                        declared.tests.push(DeclaredTest {
+                            class: class.unwrap_or_default(),
+                            name,
+                            first: test_attributes.take().unwrap_or(number),
+                            last: number,
+                        });
+                        open_test = Some((declared.tests.len() - 1, false));
+                    }
+                    test_attributes = None;
+                    test_attribute = false;
+                } else if !attribute_line && !blank {
+                    test_attributes = None;
+                    test_attribute = false;
+                }
+            }
+        }
+        if at_top && !blank {
+            if let Some(class) =
+                class_declared(trimmed, swift, MODIFIERS, NOT_CLASSES, &mut package, number)?
+            {
+                declared.classes.push(DeclaredClass {
+                    name: class,
+                    first: class_attributes.take().unwrap_or(number),
+                    last: number,
+                });
+                open_class = Some(declared.classes.len() - 1);
+            } else if trimmed.starts_with('@') {
+                class_attributes.get_or_insert(number);
+            } else {
+                class_attributes = None;
+            }
+        }
+        for c in &chars {
+            match c {
+                '{' => {
+                    depth += 1;
+                    if depth == 2
+                        && let Some((_, opened)) = open_test.as_mut()
+                    {
+                        *opened = true;
+                    }
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(format!(
+                            "a brace on line {number} closes what was never opened"
+                        ));
+                    }
+                    if depth == 1
+                        && let Some((at, true)) = open_test
+                    {
+                        declared.tests[at].last = number;
+                        open_test = None;
+                    }
+                    if depth == 0
+                        && let Some(at) = open_class.take()
+                    {
+                        declared.classes[at].last = number;
+                    }
+                }
+                _ => {}
+            }
         }
     }
     if depth != 0 {
         return Err(format!("the file ends with braces still open ({depth})"));
     }
-    Ok(found)
+    Ok(declared)
+}
+
+/// The class a top-level line declares, if it declares one, with the package qualification a
+/// Kotlin or Java class takes. A `package` line is taken for the qualification of what follows.
+fn class_declared(
+    line: &str,
+    swift: bool,
+    modifiers: &[&str],
+    not_classes: &[&str],
+    package: &mut String,
+    number: usize,
+) -> Result<Option<String>, String> {
+    if !swift && let Some(rest) = line.strip_prefix("package ") {
+        *package = rest.trim().trim_end_matches(';').trim().to_owned();
+        return Ok(None);
+    }
+    let mut words = line.split_whitespace();
+    // Attributes are modifiers too, and one may carry arguments with spaces in them.
+    let mut parentheses = 0_i32;
+    let mut declared = None;
+    while let Some(word) = words.next() {
+        // A quoted name after an annotation's `@` is part of the annotation; the masker leaves
+        // its closing backtick as a word of its own.
+        if parentheses > 0 || word.starts_with('@') || word.starts_with('`') {
+            parentheses += i32::try_from(word.matches('(').count()).unwrap_or(0)
+                - i32::try_from(word.matches(')').count()).unwrap_or(0);
+            continue;
+        }
+        if modifiers.contains(&word) {
+            continue;
+        }
+        if word == "class" {
+            declared = Some(
+                words
+                    .next()
+                    .map(|name| {
+                        name.chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        break;
+    }
+    // A class name in backticks is blanked with the other quoted identifiers, which leaves a
+    // backtick where the name was, so what follows `class` is no name: the file cannot be read.
+    if declared.as_ref().is_some_and(String::is_empty) {
+        return Err(format!(
+            "line {number} declares a class whose name cannot be read"
+        ));
+    }
+    Ok(declared
+        .filter(|name| !name.is_empty() && !not_classes.contains(&name.as_str()))
+        .map(|name| {
+            if swift || package.is_empty() {
+                name
+            } else {
+                format!("{package}.{name}")
+            }
+        }))
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Where `word` stands in `chars` as a word of its own, if it does.
+fn find_word(chars: &[char], word: &str) -> Option<usize> {
+    let word: Vec<char> = word.chars().collect();
+    (0..chars.len().saturating_sub(word.len() - 1)).find(|&at| {
+        chars[at..].starts_with(&word)
+            && (at == 0 || !is_word(chars[at - 1]))
+            && chars.get(at + word.len()).is_none_or(|c| !is_word(*c))
+    })
+}
+
+fn has_word(chars: &[char], word: &str) -> bool {
+    find_word(chars, word).is_some()
+}
+
+/// Whether an attribute in `chars` is named `name`, qualified or not (`@Test`, `@org.junit.Test`).
+fn annotation_names(chars: &[char], name: &str) -> bool {
+    let mut at = 0;
+    while at < chars.len() {
+        if chars[at] != '@' {
+            at += 1;
+            continue;
+        }
+        let mut end = at + 1;
+        while end < chars.len() && (is_word(chars[end]) || chars[end] == '.') {
+            end += 1;
+        }
+        let path: String = chars[at + 1..end].iter().collect();
+        if path.rsplit('.').next() == Some(name) {
+            return true;
+        }
+        at = end.max(at + 1);
+    }
+    false
+}
+
+/// The name of the Kotlin function whose `fun` stands at `at` in the line as written: the word
+/// after it, or the text between the backticks of a quoted name.
+fn kotlin_name(original: &[char], at: usize) -> Option<String> {
+    let mut i = at + 3;
+    while original.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    let name: String = if original.get(i) == Some(&'`') {
+        original[i + 1..]
+            .iter()
+            .take_while(|c| **c != '`')
+            .collect()
+    } else {
+        original
+            .get(i..)?
+            .iter()
+            .take_while(|c| is_word(**c))
+            .collect()
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// The name Xcode gives a Swift test method whose `func` stands at `at`: a method whose name
+/// begins with `test` and takes nothing is a case, and the tool prints `()` after its name.
+fn swift_test_name(chars: &[char], at: usize) -> Option<String> {
+    let skip = |mut i: usize| {
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let start = skip(at + 4);
+    let mut end = start;
+    while chars.get(end).is_some_and(|c| is_word(*c)) {
+        end += 1;
+    }
+    let name: String = chars[start..end].iter().collect();
+    let open = skip(end);
+    let close = skip(open + 1);
+    (name.starts_with("test") && chars.get(open) == Some(&'(') && chars.get(close) == Some(&')'))
+        .then(|| format!("{name}()"))
+}
+
+/// Reads a source file for its classes and its tests.
+///
+/// # Errors
+///
+/// Returns that the file cannot be read, as [`declared_classes`] states it, or that it declares a
+/// test this reading does not follow: a Kotlin test anywhere but in the body of a top-level class,
+/// a test whose name is not readable, or a Swift Testing test.
+pub fn declared(file: &str, source: &str) -> Result<Declared, String> {
+    scan(file, source, true)
 }
 
 /// The source with every comment, string, character literal and quoted identifier blanked out, each
@@ -789,6 +1142,169 @@ mod tests {
         assert!(declares(&declared, "p.Outer"));
         assert!(declares(&declared, "p.Outer$Inner"));
         assert!(!declares(&declared, "p.OuterOther"));
+    }
+
+    /// What the first comment of `source` keys: its first and last line go to `scope_of`.
+    fn keyed_by_comment_at(file: &str, source: &str, line: usize) -> Option<(Part, Stands)> {
+        let declared = declared(file, source).expect("readable");
+        let comment = crate::clike::comments(source)
+            .into_iter()
+            .find(|comment| comment.line == line)
+            .expect("a comment starts on that line");
+        declared.scope_of(
+            comment.line,
+            comment.line + comment.text.matches('\n').count(),
+        )
+    }
+
+    fn case(class: &str, name: &str) -> Part {
+        Part::Case {
+            class: class.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    const KOTLIN: &str = "package p\n\nimport org.junit.Test\n\n/** The class's own words. */\nclass AuthenticatorsTest {\n    private val helper = 1\n\n    /** A key on a case. */\n    @Test\n    fun the_first_case() {\n        // A remark inside it.\n        assertEquals(1, 1)\n    }\n\n    // Not above a case: a blank line stands between.\n\n    @Test\n    fun `the second case, with spaces`() {\n    }\n}\n";
+
+    #[test]
+    fn a_comment_above_a_kotlin_test_keys_that_test_and_no_other() {
+        let declared = declared("A.kt", KOTLIN).expect("readable");
+        let class = "p.AuthenticatorsTest";
+        assert_eq!(
+            declared
+                .tests
+                .iter()
+                .map(|test| (
+                    test.class.as_str(),
+                    test.name.as_str(),
+                    test.first,
+                    test.last
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (class, "the_first_case", 10, 14),
+                (class, "the second case, with spaces", 18, 20),
+            ]
+        );
+        // The KDoc above `@Test`, and a remark inside the body, key the first case alone.
+        assert_eq!(
+            keyed_by_comment_at("A.kt", KOTLIN, 9),
+            Some((case(class, "the_first_case"), Stands::Above))
+        );
+        assert_eq!(
+            keyed_by_comment_at("A.kt", KOTLIN, 12),
+            Some((case(class, "the_first_case"), Stands::Inside))
+        );
+        // A comment a blank line away from the next case keys nothing.
+        assert_eq!(keyed_by_comment_at("A.kt", KOTLIN, 16), None);
+    }
+
+    #[test]
+    fn a_comment_above_a_class_keys_the_tests_of_that_class() {
+        assert_eq!(
+            keyed_by_comment_at("A.kt", KOTLIN, 5),
+            Some((
+                Part::Class("p.AuthenticatorsTest".to_owned()),
+                Stands::Above
+            ))
+        );
+    }
+
+    #[test]
+    fn a_comment_before_the_first_line_of_code_keys_the_whole_file() {
+        let swift = "//\n//  Voice.swift\n//  KR-REQ-15.36: the head of the file.\n\nimport XCTest\n\nfinal class VoiceTests: XCTestCase {\n    /// KR-REQ-15.34: on a case.\n    func testOne() {}\n}\n";
+        assert_eq!(
+            keyed_by_comment_at("A.swift", swift, 1),
+            Some((Part::File, Stands::Head))
+        );
+        assert_eq!(
+            keyed_by_comment_at("A.swift", swift, 8),
+            Some((case("VoiceTests", "testOne()"), Stands::Above))
+        );
+        // A header with nothing between it and the class is the class's.
+        let adjacent = "// The class.\nfinal class A: XCTestCase {\n    func testOne() {}\n}\n";
+        assert_eq!(
+            keyed_by_comment_at("A.swift", adjacent, 1),
+            Some((Part::Class("A".to_owned()), Stands::Above))
+        );
+    }
+
+    #[test]
+    fn a_file_with_no_comment_is_read_for_its_tests_and_keys_nothing() {
+        let kotlin = "package p\n\nimport org.junit.Test\n\nclass A {\n    @Test fun one() {}\n    @Test\n    fun two() {\n    }\n    fun helper() {}\n}\n";
+        let read = declared("A.kt", kotlin).expect("readable");
+        assert_eq!(
+            read.tests
+                .iter()
+                .map(|test| test.name.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!((read.tests[0].first, read.tests[0].last), (6, 6));
+        assert_eq!((read.tests[1].first, read.tests[1].last), (7, 9));
+        assert!(crate::clike::comments(kotlin).is_empty());
+        assert_eq!(declared("A.kt", "").expect("readable"), Declared::default());
+    }
+
+    #[test]
+    fn a_swift_test_is_a_method_named_test_that_takes_nothing() {
+        let swift = "import XCTest\n\n@MainActor\nfinal class A: XCTestCase {\n    @MainActor\n    func testOne() async throws {\n    }\n    func testWithAnArgument(_ x: Int) {}\n    func helper() {}\n    static func testStatic() {}\n    override func setUp() {}\n}\n\nfinal class B: XCTestCase {\n    func testTwo() {}\n}\n";
+        let read = declared("A.swift", swift).expect("readable");
+        assert_eq!(
+            read.classes
+                .iter()
+                .map(|class| (class.name.as_str(), class.first, class.last))
+                .collect::<Vec<_>>(),
+            [("A", 3, 12), ("B", 14, 16)]
+        );
+        assert_eq!(
+            read.tests
+                .iter()
+                .map(|test| (
+                    test.class.as_str(),
+                    test.name.as_str(),
+                    test.first,
+                    test.last
+                ))
+                .collect::<Vec<_>>(),
+            [("A", "testOne()", 5, 7), ("B", "testTwo()", 15, 15)]
+        );
+    }
+
+    #[test]
+    fn a_signature_over_several_lines_has_its_body_where_the_braces_say() {
+        let kotlin = "class A {\n    @Test\n    @Ignore(\"later\")\n    fun one(\n        a: Int,\n    ) {\n        val x = \"}\"\n        // }\n    }\n    @Test fun two() { }\n}\n";
+        let read = declared("A.kt", kotlin).expect("readable");
+        assert_eq!(
+            read.tests
+                .iter()
+                .map(|test| (test.name.as_str(), test.first, test.last))
+                .collect::<Vec<_>>(),
+            [("one", 2, 9), ("two", 10, 10)]
+        );
+    }
+
+    #[test]
+    fn a_test_this_reading_does_not_follow_stops_it() {
+        // A test in a nested class, a test outside any class, a name that cannot be read, and the
+        // Swift Testing framework.
+        let nested = "class A {\n    class Inner {\n        @Test fun one() {}\n    }\n}\n";
+        assert!(declared("A.kt", nested).is_err());
+        assert!(declared("A.kt", "@Test fun top() {}\n").is_err());
+        assert!(declared("A.kt", "class A {\n    @Test fun `` () {}\n}\n").is_err());
+        assert!(declared("A.swift", "import Testing\n\nstruct A {}\n").is_err());
+        assert!(declared("A.swift", "final class A {\n    @Test func one() {}\n}\n").is_err());
+        // The classes of such a file are still read.
+        assert_eq!(declared_classes("A.kt", nested).expect("readable"), ["A"]);
+    }
+
+    #[test]
+    fn an_attribute_counts_by_its_last_name_and_a_remark_about_one_does_not() {
+        let line = |text: &str| text.chars().collect::<Vec<_>>();
+        assert!(annotation_names(&line("@Test"), "Test"));
+        assert!(annotation_names(&line("@org.junit.Test fun a()"), "Test"));
+        assert!(!annotation_names(&line("@TestFactory"), "Test"));
+        assert!(!annotation_names(&line("@Ignore(\"Test\")"), "Test"));
     }
 
     #[test]
