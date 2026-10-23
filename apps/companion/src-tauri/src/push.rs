@@ -83,6 +83,11 @@ const LOOK_EVERY: Duration = Duration::from_millis(500);
 /// How long a sequence waits for the provider's registration token once the person has agreed.
 const TOKEN_WITHIN: Duration = Duration::from_secs(20);
 
+/// How long a registration is held waiting for its challenge to be answered: the time the record
+/// gives the challenge and a margin, so that one native call that never returns cannot keep every
+/// other host from registering.
+const CHALLENGE_WAIT: Duration = Duration::from_millis(CHALLENGE_WITHIN_MS + 30_000);
+
 /// The soonest the same host is tried again after a try that needed the person: asking the system
 /// or the gateway again at every foreground would be a loop with a person in it.
 const RETRY_AFTER_MS: u64 = 60 * 1000;
@@ -264,6 +269,11 @@ pub struct PushDesk {
     record: Mutex<Record>,
     /// The hosts a sequence is running for, so there is one at a time for each.
     running: Mutex<BTreeSet<DeviceId>>,
+    /// The hosts whose person has just chosen to turn notifications on: the one thing that may put
+    /// the system's permission question in front of them. A run takes its host out when it reaches
+    /// the question, and out again when it ends, so a look the application makes by itself never
+    /// asks.
+    asking: Mutex<BTreeSet<DeviceId>>,
     /// The hosts whose registration is out of date: the token changed after the run that made it
     /// read the token. A host stays here until a run has read the token that now stands.
     stale: Mutex<BTreeSet<DeviceId>>,
@@ -324,6 +334,7 @@ impl PushDesk {
             origin,
             record: Mutex::new(record),
             running: Mutex::new(BTreeSet::new()),
+            asking: Mutex::new(BTreeSet::new()),
             stale: Mutex::new(BTreeSet::new()),
             registering: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
@@ -376,8 +387,13 @@ impl PushDesk {
             .device
             .host_by_reference(reference)
             .ok_or_else(crate::hosts::unknown_host)?;
-        self.set(&host, Phase::Working, "Asking for permission.", None);
-        self.start(host);
+        lock(&self.asking).insert(host.host_device_id);
+        // The state says "working" only for a host a run is now taking up: a run that is ending
+        // has said what it has to say, and a second one would be refused after the words changed.
+        if self.claim(&host) {
+            self.set(&host, Phase::Working, "Asking for permission.", None);
+            self.spawn_run(host);
+        }
         Ok(self.view())
     }
 
@@ -416,7 +432,9 @@ impl PushDesk {
                 .collect()
         };
         for host in due {
-            self.start(host);
+            if self.claim(&host) {
+                self.spawn_run(host);
+            }
         }
         self.view()
     }
@@ -437,12 +455,14 @@ impl PushDesk {
         (self.changed)();
     }
 
-    /// Starts the sequence for `host` unless one is running for it, and runs it again when it ends
+    /// Takes the right to run the sequence for `host`, which is refused while one is running for it.
+    fn claim(&self, host: &PairedHost) -> bool {
+        lock(&self.running).insert(host.host_device_id)
+    }
+
+    /// Runs the sequence for `host`, whose right to run it is held, and runs it again when it ends
     /// well and the token changed while it ran.
-    fn start(self: &Arc<Self>, host: PairedHost) {
-        if !lock(&self.running).insert(host.host_device_id) {
-            return;
-        }
+    fn spawn_run(self: &Arc<Self>, host: PairedHost) {
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             loop {
@@ -464,6 +484,7 @@ impl PushDesk {
                         false
                     }
                 };
+                lock(&desk.asking).remove(&host.host_device_id);
                 lock(&desk.running).remove(&host.host_device_id);
                 let again = ended_well
                     && lock(&desk.stale).contains(&host.host_device_id)
@@ -488,6 +509,18 @@ impl PushDesk {
             .await
             .map_err(|_| unreachable_native())?;
         if permission == Permission::Unknown {
+            // Only the person's own choice to turn notifications on asks the system's question: a
+            // look the application makes by itself, at its start, when it comes to the front or when
+            // the network changes, must not put a dialog on a screen the person chose for something
+            // else.
+            if !lock(&self.asking).remove(&host.host_device_id) {
+                return Err(Stop {
+                    words: "Notifications are not allowed for this app yet. Choose Try again, and \
+                            the system will ask."
+                        .to_owned(),
+                    settings: false,
+                });
+            }
             self.set(host, Phase::Working, "Asking for permission.", None);
             permission = native
                 .ask_permission()
@@ -503,23 +536,8 @@ impl PushDesk {
                 settings: true,
             });
         }
-        let Some(token) = self.token_within(TOKEN_WITHIN).await? else {
-            return Err(
-                "This phone has no notification token yet. Try again in a moment."
-                    .to_owned()
-                    .into(),
-            );
-        };
-        // The run has read the token that stands: a change after this is a new one.
-        lock(&self.stale).remove(&host.host_device_id);
-        let origin = self.gateway_origin();
-        let signer = Arc::new(InstallationSigner::new(
-            self.device.identity().keys.authorisation.clone(),
-        ));
-        let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
-        let gateway = PushGateway::new(origin.clone(), http, signer.clone());
-
-        // One registration at a time for the whole phone, until its challenge is answered.
+        // One registration at a time for the whole phone, until its challenge is answered. The
+        // token is read once the turn has come, so that it is the one that stands then.
         self.set(
             host,
             Phase::Working,
@@ -527,6 +545,23 @@ impl PushDesk {
             None,
         );
         let one_at_a_time = self.registering.lock().await;
+        // A change of the token after this point is a new one: the flag is cleared before the token
+        // is read, so that no change is lost between the two.
+        lock(&self.stale).remove(&host.host_device_id);
+        let Some(token) = self.token_within(TOKEN_WITHIN).await? else {
+            return Err(
+                "This phone has no notification token yet. Try again in a moment."
+                    .to_owned()
+                    .into(),
+            );
+        };
+        let origin = self.gateway_origin();
+        let signer = Arc::new(InstallationSigner::new(
+            self.device.identity().keys.authorisation.clone(),
+        ));
+        let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
+        let gateway = PushGateway::new(origin.clone(), http, signer.clone());
+
         // The record is written before the token is proposed, so a challenge that arrives before the
         // gateway's answer to the proposal is the challenge of a registration the receiver knows.
         let registration_token = RegistrationToken::new(token).map_err(|_| {
@@ -572,7 +607,14 @@ impl PushDesk {
             }
             Registration::Active { .. } => {}
         }
-        self.await_challenge(&pending).await?;
+        match tokio::time::timeout(CHALLENGE_WAIT, self.await_challenge(&pending)).await {
+            Ok(settled) => settled?,
+            Err(_) => {
+                return Err("The challenge did not arrive in time. Try again."
+                    .to_owned()
+                    .into());
+            }
+        }
         drop(one_at_a_time);
 
         // The host is the one the person chose. A phone that was unpaired or forgot the host
