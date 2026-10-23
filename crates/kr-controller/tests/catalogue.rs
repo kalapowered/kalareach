@@ -5522,8 +5522,8 @@ mod native_bridges {
     /// The Claude Code package of the bridge generation, written into `directory` as the package
     /// of an outside vendor: another publisher, a repository of its own, and its own labels for
     /// the decisions its protocol table offers. Its manifest names the digest and size of the
-    /// connector table that changed. The package keeps the name `claude-code`, because the host
-    /// takes a registration's application to be the package's own name.
+    /// connector table that changed. The package has a name of its own under the vendor, not the
+    /// application's: it is Claude Code's bridge because its recipe declares Claude Code.
     #[cfg(unix)]
     fn vendor_package(directory: &Path) {
         copy_tree(
@@ -5542,11 +5542,12 @@ mod native_bridges {
         };
 
         let mut table = read("connector.json");
-        table["plugin_id"] = serde_json::json!("example-vendor/claude-code");
+        table["plugin_id"] = serde_json::json!("example-vendor/claude-code-bridge");
         let table_bytes = write("connector.json", &table);
 
         let mut manifest = read("plugin.json");
         manifest["publisher_id"] = serde_json::json!("example-vendor");
+        manifest["plugin_name"] = serde_json::json!("claude-code-bridge");
         manifest["source"]["repository"] =
             serde_json::json!("https://vendor.example/claude-code-bridge");
         let answer = manifest["actions"]
@@ -5581,10 +5582,10 @@ mod native_bridges {
     /// offers under the vendor's own labels, which its manifest declares and its table maps.
     ///
     /// What the package is: Claude Code's package of the bridge generation republished under
-    /// another publisher, so the bridge files are the same bytes. It stays a Claude Code package
-    /// because the host places a native bridge only for the applications it has a layout for
-    /// (Claude Code and Gemini CLI), and takes a registration's application to be the package's
-    /// own name. The reader runs in the test process; no worker is started.
+    /// another publisher and another name, so the bridge files are the same bytes. It is a Claude
+    /// Code bridge because its recipe declares Claude Code, an application the host has a layout
+    /// for (Claude Code and Gemini CLI), and its registration starts the forwarder for that
+    /// application. The reader runs in the test process; no worker is started.
     ///
     /// Not shown here: the transport the application is given, which the core makes and a worker
     /// serves and which no package supplies.
@@ -5624,7 +5625,7 @@ mod native_bridges {
         }
 
         let vendor_plugin =
-            PluginId::new("example-vendor/claude-code").expect("a plugin identifier");
+            PluginId::new("example-vendor/claude-code-bridge").expect("a plugin identifier");
         let statement = serde_json::from_slice::<serde_json::Value>(
             &std::fs::read(package.join("plugin.json")).expect("a manifest"),
         )

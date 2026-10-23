@@ -473,7 +473,11 @@ that writes nothing:
   as the steps below describe;
 - the application is one whose directory this host knows: Claude Code's is `.claude` in the
   account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set;
-- the forwarder the registration is expected to start is the `kr-hook` beside the daemon;
+- the forwarder the registration is expected to start is the `kr-hook` beside the daemon, and it
+  starts it for the application the recipe declares: a package of any publisher and any name
+  places a bridge for an application this host names a bridge for and knows the directory of
+  (today Claude Code), and a registration for an application other than the one the recipe
+  declares is refused;
 - every step the recipe installs has the removal that undoes it, and every file it installs is the
   bytes its recipe names;
 - every executable the package's match rules name on the daemon's search path is read, never run,

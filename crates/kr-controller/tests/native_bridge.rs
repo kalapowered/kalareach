@@ -291,6 +291,38 @@ impl Site {
         }
     }
 
+    /// A release whose registration files start the forwarder for `application` instead of Claude
+    /// Code, with its own package named `name` and a recipe that names the digests of its files.
+    fn release_registering(&self, name: &str, application: &str) -> BridgeTarget {
+        let mut recipe = serde_json::to_string(&recipe()).expect("the recipe encodes");
+        for (file, digest) in [
+            ("mcp-servers.json", SERVERS_DIGEST),
+            ("hooks.json", HOOKS_DIGEST),
+        ] {
+            let bytes = String::from_utf8(pinned(file))
+                .expect("text")
+                .replace("\"claude-code\"", &format!("\"{application}\""))
+                .into_bytes();
+            recipe = recipe.replace(digest, &PayloadDigest::of(&bytes).to_string());
+            let path = self.package(name).join("bridge").join(file);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a package");
+            std::fs::write(path, bytes).expect("a package file");
+        }
+        let path = self.package(name).join("bridge/plugin-manifest.json");
+        std::fs::write(path, pinned("plugin-manifest.json")).expect("a package file");
+        BridgeTarget {
+            plugin_id: plugin(),
+            package_digest: PayloadDigest::of(name.as_bytes()),
+            package_dir: self.package(name),
+            recipe: serde_json::from_str(&recipe).expect("a recipe"),
+            match_rules: match_rules(),
+            qualified: vec![QualifiedExecutable {
+                digest: hex_digest(EXECUTABLE),
+                version: "2.1.278".to_owned(),
+            }],
+        }
+    }
+
     /// Everything under the application's directory.
     fn tree(&self) -> BTreeMap<String, Node> {
         snapshot(&self.application())
@@ -1125,15 +1157,19 @@ fn a_version_no_signed_record_establishes_is_refused() {
     }
 }
 
-/// The registration a recipe installs starts the forwarder for its own package's application and
-/// for no other: a package whose registration names another package's application is refused
-/// before anything is written, and the package the registration names is applied.
+/// KR-REQ-11.44: a bridge is placed for the application its package declares, whoever publishes
+/// the package and whatever it is called, and the registration it installs starts the forwarder
+/// for that application and for no other. A package under another name that declares Claude Code
+/// and registers Claude Code's forwarder is applied; one that declares Claude Code and registers
+/// the forwarder for Gemini CLI is refused before anything is written, naming both; and one that
+/// declares an application this host knows no directory for is refused by name.
 #[cfg(unix)]
 #[test]
-fn a_registration_for_another_packages_application_is_refused() {
+fn a_bridge_is_placed_for_the_application_its_package_declares_and_for_no_other() {
+    let another = PluginId::new("example-vendor/claude-code-bridge").expect("a plugin identifier");
+
+    // Declares Claude Code, registers Claude Code: applied, though the package has another name.
     let site = Site::new();
-    let before = site.tree();
-    let another = PluginId::new("kalareach/another-agent").expect("a plugin identifier");
     let target = BridgeTarget {
         plugin_id: another.clone(),
         ..site.release()
@@ -1142,18 +1178,40 @@ fn a_registration_for_another_packages_application_is_refused() {
         .bridges()
         .reconcile(&another, Some(&target))
         .expect("reconciles");
-    let reason = refused(&settled);
-    assert!(
-        reason.contains("claude-code") && reason.contains("kalareach/another-agent"),
-        "{reason}"
-    );
-    assert_eq!(site.tree(), before, "nothing was written");
+    assert_eq!(settled, Settled::Applied);
 
+    // Declares Claude Code, registers the forwarder for Gemini CLI.
+    let site = Site::new();
+    let before = site.tree();
+    let target = BridgeTarget {
+        plugin_id: another.clone(),
+        ..site.release_registering("gemini", "gemini-cli")
+    };
     let settled = site
         .bridges()
-        .reconcile(&plugin(), Some(&site.release()))
+        .reconcile(&another, Some(&target))
         .expect("reconciles");
-    assert_eq!(settled, Settled::Applied);
+    let reason = refused(&settled);
+    assert!(reason.contains("gemini-cli"), "{reason}");
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    // Declares an application this host knows no directory for.
+    let site = Site::new();
+    let before = site.tree();
+    let mut recipe = serde_json::to_value(recipe()).expect("the recipe encodes");
+    recipe["application"] = serde_json::json!("Amp");
+    let target = BridgeTarget {
+        plugin_id: another.clone(),
+        recipe: serde_json::from_value(recipe).expect("a recipe"),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&another, Some(&target))
+        .expect("reconciles");
+    let reason = refused(&settled);
+    assert!(reason.contains("Amp"), "{reason}");
+    assert_eq!(site.tree(), before, "nothing was written");
 }
 
 /// What the refusal of a configuration key this host does not permit a bridge to add says.
