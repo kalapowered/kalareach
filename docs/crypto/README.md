@@ -4,7 +4,12 @@
 maintained implementation, plus the rules that make those implementations hard to misuse. The same
 holds for the whole tree: no crate, package or application writes a cipher, a hash, a signature
 scheme, a key exchange or a password-authenticated key exchange of its own. A crate that needs one
-calls a maintained library, and the libraries are the ones below.
+calls a maintained library, and the libraries are the ones below. Two exceptions exist and neither is
+a cipher, a signature scheme, a key exchange or a PAKE. Each managed shell package compiles
+`kr_bridge_crypto.c`, a SHA-256 and an HMAC-SHA-256 of its own, written from FIPS 180-4 and RFC 2104,
+with which the bridge computes its bootstrap proof; the worker verifies that proof with the RustCrypto
+HMAC. And two HMAC keys of the attention and delivery stores are made from random UUIDs through
+`getrandom`, not from `kr-crypto`.
 
 | What | Implementation |
 | --- | --- |
@@ -19,6 +24,10 @@ calls a maintained library, and the libraries are the ones below.
 | The media path of a voice call | DTLS-SRTP in the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
 | Secrets at rest | the operating system's credential store through the `keyring` crate on a desktop, and on a phone the Keychain on iOS and the Keystore on Android through the companion's platform services |
 | The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
+| The shell bridges' bootstrap proof | The shell packages' own `kr_bridge_crypto.c` (SHA-256 and HMAC-SHA-256, as above) for Bash, Fish and Zsh, and .NET's `HMACSHA256` and `SHA256` in the PowerShell bridge |
+| The release tool's keys and signatures | `aws-lc-rs` and `tough`'s signing, with `SystemRandom` for a development key |
+| Secret files on Android and previews on a phone | Android's `SecureRandom`, AES-256-GCM under an Android Keystore key, AndroidX encrypted preferences (AES-SIV and AES-GCM), Java `MessageDigest`; CryptoKit on iOS for hashes |
+| Primitives inside the libraries above | `keyring`'s Linux store uses the `secret-service` crate with its own Diffie-Hellman exchange and AES-128-CBC; iroh brings `blake3`, `ed25519-dalek`, `curve25519-dalek` and RustCrypto `aes-gcm`. No Rust source of the workspace calls any of them |
 | Digests in the TypeScript packages | the platform's WebCrypto, and Node's own crypto module for the hashes, HMAC, HKDF and Ed25519 signatures that the tests recompute |
 
 ## The unsafe boundary

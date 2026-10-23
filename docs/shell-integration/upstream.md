@@ -51,7 +51,7 @@ already running: a session keeps the package identity it started with until it e
 
 ## A package that cannot meet its target
 
-A package whose fourteen days pass without a requalified build is flagged in the triage record
+The flag is a row of this register: no host, CLI or companion code reads it, and none of them tells a person that a package is past its target. A package whose fourteen days pass without a requalified build is flagged in the triage record
 below, and the flag names the choices rather than leaving a stale package as a silent default. The
 choices are:
 
@@ -67,7 +67,7 @@ Each is an explicit selection. Nothing falls back on its own.
 ## Triage record
 
 `assessment` says what the change is and whether the pinned release already carries it.
-`status` is one of `released` (a requalified package is published, and the assessment names the
+`Date` is the day the assessment was made. The first assessments (2026-09-20) were made when this register was started, so they count their target from that day and say nothing about when the upstream advisory was published or fixed. `status` is one of `released` (a requalified package is published, and the assessment names the
 identity it was published under), `scheduled` (inside its target date), `flagged` (past its target
 date, with the choices above) or `not-affected`.
 
