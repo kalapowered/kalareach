@@ -430,7 +430,22 @@ fn runs(typed: &str, image: &str, leader: u32) -> bool {
         }
         1
     } else {
-        if running.is_none() || canonical(interpreter) != running {
+        // The system starts the interpreter with its own path as the first argument. The image
+        // that runs is that file, or the program the system starts in its place: macOS's
+        // `/bin/sh` starts the shell the machine selects, and keeps its own path as the first
+        // argument. The first argument is the process's own claim, so it names a program for
+        // display and never decides anything of authority.
+        let image_is_it = same_file(interpreter, std::path::Path::new(image));
+        let named_it = arguments.first().is_some_and(|first| {
+            let first = std::path::Path::new(first);
+            if first.is_absolute() {
+                same_file(interpreter, first)
+            } else {
+                working_directory_of(leader)
+                    .is_some_and(|directory| same_file(interpreter, &directory.join(first)))
+            }
+        });
+        if !(image_is_it || named_it) {
             return false;
         }
         // Linux gives the interpreter the rest of the line as one argument; macOS gives it each
@@ -456,6 +471,17 @@ fn runs(typed: &str, image: &str, leader: u32) -> bool {
         directory.join(given)
     };
     canonical(&given).is_some_and(|given| given == script)
+}
+
+/// Whether two paths name the same file, by the device and the file number each leads to.
+#[cfg(unix)]
+fn same_file(first: &std::path::Path, second: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    match (std::fs::metadata(first), std::fs::metadata(second)) {
+        (Ok(first), Ok(second)) => first.dev() == second.dev() && first.ino() == second.ino(),
+        _ => false,
+    }
 }
 
 /// Returns the first line of a script after its `#!`, when it has one.
