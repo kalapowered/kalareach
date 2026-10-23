@@ -269,6 +269,8 @@ struct State {
     mailboxes: BTreeMap<String, crate::mailbox::Mailbox>,
     /// The relay control plane's authorisations and leases.
     relay: crate::relay::Relay,
+    /// The organisations the service signs membership leases for.
+    organisations: crate::organisation::Organisations,
     /// The sign-in grant each refresh token the account system holds belongs to.
     refreshes: BTreeMap<String, String>,
     /// How many refreshes the account system has answered.
@@ -384,6 +386,19 @@ impl ServiceWeb {
     /// The time on the service's clock, in UTC milliseconds.
     fn now(&self) -> u64 {
         now_ms().saturating_sub(self.behind_ms.load(Ordering::SeqCst))
+    }
+
+    /// The service signs membership leases for the organisation `organisation` with `authority`.
+    pub fn serve_organisation(
+        &self,
+        organisation: &str,
+        authority: std::sync::Arc<dyn crate::organisation::OrganisationAuthority>,
+    ) {
+        self.state
+            .lock()
+            .expect("the state")
+            .organisations
+            .serve(organisation, authority);
     }
 
     /// The service issues `token` to `account`, carrying `scopes`.
@@ -1102,6 +1117,18 @@ impl ServiceWeb {
         content: Option<&[u8]>,
         part_write_fails: bool,
     ) -> ServiceHttpAnswer {
+        // An organisation's two routes are proven by an account's bearer token and carry no signed
+        // request, so they are read apart from the registry's methods.
+        if crate::organisation::is_organisation_route(path) {
+            let state = self.state.lock().expect("the state");
+            return crate::organisation::answer(
+                &state.organisations,
+                &state.tokens,
+                path,
+                &document["body"],
+                token,
+            );
+        }
         // The relay's two routes carry a credential the protocol's method registry does not list
         // yet, so they are read by the relay's own check.
         if path == "/api/relay/lease" || path == "/api/relay/lease/revoke" {

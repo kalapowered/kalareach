@@ -111,7 +111,16 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
     let carries_content = received
         .header("content-type")
         .is_some_and(|kind| kind.starts_with("application/octet-stream"));
-    let parsed = if carries_content {
+    let parsed = if crate::organisation::is_organisation_route(&received.path) {
+        // Proven by the account's bearer token alone: the body is the request, and a read has none.
+        if received.body.is_empty() {
+            Ok(serde_json::json!({ "body": serde_json::Value::Null }))
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&received.body)
+                .map(|body| serde_json::json!({ "body": body }))
+                .map_err(|_| ())
+        }
+    } else if carries_content {
         received
             .header("kr-service-request")
             .map(document_of)
