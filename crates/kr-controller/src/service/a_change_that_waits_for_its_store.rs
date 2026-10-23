@@ -799,7 +799,7 @@ async fn until(what: &str, condition: impl Fn() -> bool) {
     }
 }
 
-/// KR-PERF-003: the tick of a daemon that has never had privacy mode on settles into waiting for
+/// The tick of a daemon that has never had privacy mode on settles into waiting for
 /// its record, with no period of its own, and turning privacy mode on ends that wait and puts
 /// the tick on its period: its notices and retries are the tick's, and a tick left waiting would
 /// leave them unsent.
@@ -827,7 +827,7 @@ async fn an_idle_daemon_s_privacy_tick_waits_for_its_record_until_privacy_mode_i
     );
 }
 
-/// KR-REQ-24.27, KR-PERF-003: privacy mode's tick waits while the record needs nothing of it, so
+/// KR-REQ-24.27: privacy mode's tick waits while the record needs nothing of it, so
 /// the record's view of the sessions can be one that has gone stale: it still counts a session as
 /// running that has since closed. Turning privacy mode on brings that view up to date first, on
 /// the registry's evidence and without telling a worker anything, so the closed session does not

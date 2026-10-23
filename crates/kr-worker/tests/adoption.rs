@@ -12,7 +12,6 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
-//! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
 
@@ -930,11 +929,11 @@ fn monotonic() -> Duration {
     )
 }
 
-/// KR-PERF-003 and KR-REQ-12.07: a session nothing is happening in does not read its terminal's
+/// KR-REQ-12.07: a session nothing is happening in does not read its terminal's
 /// foreground on every interval. The watch looks often while the root shell starts and after the
 /// session's own input and output, and less and less often the longer nothing happens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_perf_003_an_idle_session_does_not_read_its_foreground_on_every_interval() {
+async fn an_idle_session_does_not_read_its_foreground_on_every_interval() {
     let setup = Setup::new();
     let mut typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     // With the producer of the session's application following every look, which adds no read.

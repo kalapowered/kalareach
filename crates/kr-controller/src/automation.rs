@@ -3288,7 +3288,7 @@ mod tests {
         )
     }
 
-    /// KR-PERF-003: a dispatcher with nothing to do keeps no timer. Its first passes settle what
+    /// A dispatcher with nothing to do keeps no timer. Its first passes settle what
     /// the journal's own registration writes; after that, hours of waiting run none.
     #[tokio::test(start_paused = true)]
     async fn an_idle_dispatcher_runs_no_pass_while_the_journal_does_not_change() {
@@ -3382,7 +3382,7 @@ mod tests {
         task.abort();
     }
 
-    /// KR-PERF-003: a running run whose revision the journal does not hold cannot be executed, and
+    /// A running run whose revision the journal does not hold cannot be executed, and
     /// every pass finds it again. That is not a reason for a pass to follow itself: the dispatcher
     /// goes idle as it would with nothing to do.
     #[tokio::test(start_paused = true)]
@@ -3482,7 +3482,7 @@ mod tests {
         task.abort();
     }
 
-    /// KR-PERF-003: a pass that writes and then fails, every time, is made once in each interval.
+    /// A pass that writes and then fails, every time, is made once in each interval.
     /// The trigger refuses the dispatcher's subscription after its consumer's row is written, so
     /// each pass counts a change in the journal and fails with it rolled back, and the change it
     /// counted is the signal the pass waits on. Taking the cause away with no write to the journal

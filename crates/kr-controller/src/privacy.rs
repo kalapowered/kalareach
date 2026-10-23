@@ -3044,7 +3044,7 @@ mod tests {
         assert_eq!(host.backup.fenced_at().expect("a read"), None);
     }
 
-    /// KR-PERF-003: a record that has never been on, with nothing owed and no launch under way,
+    /// A record that has never been on, with nothing owed and no launch under way,
     /// needs nothing of the daemon's tick, and says when that stops being so: a launch it is told
     /// of and privacy mode turned on each raise its signal, and the record is not dormant again
     /// until the launch is over, or ever once privacy mode has been on.

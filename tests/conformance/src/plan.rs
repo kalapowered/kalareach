@@ -1961,14 +1961,6 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
-        package: "kr-worker",
-        target: "--test performance",
-        cases: &["input_through_real_workers_while_a_session_prints"],
-        runs: Runs::ByHand {
-            why: "it is a measurement run by hand with the worker program under test",
-        },
-    },
-    IgnoredRun {
         package: "kr-controller",
         target: "--test network_input",
         cases: &["remote_input_forwarding_latency"],
