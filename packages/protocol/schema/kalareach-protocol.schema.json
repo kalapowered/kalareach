@@ -25226,7 +25226,7 @@
               "type": "null"
             }
           ],
-          "description": "The key a bootstrap proof is signed with.\n\nPresent only for the `local_bootstrap_terminal` channel, which a host accepts only while it\nhas no owner, only from local IPC and only for establishing its first owner or its clock.\nThe key proves possession and nothing else: the evidence is the local caller at an\ninteractive terminal outside a KalaReach session."
+          "description": "The key a bootstrap proof is signed with.\n\nPresent only for the `local_bootstrap_terminal` channel, which a host accepts only from local\nIPC, and only while it has no owner, for establishing its first owner or its clock, or, once\nit has an owner, for the one challenge that ends exclusive organisation management when no\nowner device is left that could confirm. The key proves possession and nothing else: the\nevidence is the local caller at an interactive terminal outside a KalaReach session."
         },
         "proof": {
           "$ref": "#/$defs/OwnerConfirmationProof",
