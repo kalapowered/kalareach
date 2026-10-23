@@ -1,9 +1,6 @@
 //
-//  Tests for the unlocked-screen ceremony on iOS.
-//
-//  KR-REQ-15.13: an action that needs a confirmation on the unlocked screen does not proceed without one.
-//  The signature must cover the action hash, a confirmation for one action must not authorise another,
-//  and no provider text or model statement can produce one.
+//  Tests for the unlocked-screen ceremony on iOS: the confirmation the phone signs over an action's
+//  hash, what verifies it, and what the ceremony refuses.
 //
 
 import CryptoKit
@@ -45,7 +42,8 @@ final class VoiceCeremonyTests: XCTestCase {
         )
     }
 
-    /// Tests that the ceremony verifies owner presence and produces a valid signature over the action digest.
+    /// KR-REQ-15.13, the client-signed confirmation: the ceremony verifies owner presence and
+    /// produces a signature over the action digest that verifies with the paired key.
     func testSignatureCoversActionHashAndVerifies() async throws {
         let key = Curve25519.Signing.PrivateKey()
         let challenge = sampleChallenge()
@@ -71,7 +69,8 @@ final class VoiceCeremonyTests: XCTestCase {
         }
     }
 
-    /// Tampering with the action digest causes verification failure.
+    /// KR-REQ-15.13, the signature covers the action hash: a proof checked against a digest other
+    /// than the one it was signed over is refused.
     func testTamperedActionDigestIsRefused() async throws {
         let key = Curve25519.Signing.PrivateKey()
         let challenge = sampleChallenge()
@@ -100,7 +99,8 @@ final class VoiceCeremonyTests: XCTestCase {
         }
     }
 
-    /// Confirmation for one action cannot authorize another action.
+    /// KR-REQ-15.13, the confirmation is for one action: a proof signed for one action is refused
+    /// as the confirmation of another.
     func testConfirmationForOneActionDoesNotAuthorizeAnother() async throws {
         let key = Curve25519.Signing.PrivateKey()
         let challenge = sampleChallenge(action: "apply_diff")
@@ -126,7 +126,8 @@ final class VoiceCeremonyTests: XCTestCase {
         }
     }
 
-    /// Model speech or provider text cannot produce a valid confirmation proof without the paired key.
+    /// KR-REQ-15.13, only the paired key signs it: a proof signed with any other key is refused, so
+    /// model speech or provider text cannot produce a valid confirmation proof without the paired key.
     func testProviderTextCannotProduceConfirmationProof() async throws {
         let pairedKey = Curve25519.Signing.PrivateKey()
         let imposterKey = Curve25519.Signing.PrivateKey()
@@ -197,7 +198,8 @@ final class VoiceCeremonyTests: XCTestCase {
 
     // MARK: - The cross-language vector
 
-    /// The exact bytes the host signs, for one fixed challenge.
+    /// KR-REQ-15.13, the bytes the client signs: the signing input of one fixed challenge, which
+    /// holds the action digest, is the exact bytes the host signs.
     ///
     /// The same two constants are asserted by the shared protocol's own tests
     /// (`crates/kr-protocol/tests/voice_confirmation_vectors.rs`), against its own encoder, and by
