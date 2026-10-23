@@ -240,8 +240,8 @@ or description host information.
 
 ## A voice session is not a terminal session
 
-It has its own identity and its own end. Stopping a voice session names the terminal sessions it
-reached and closes none of them; nothing in the coordinator can close one without an unlocked-screen
+It has its own identity and its own end. Stopping a voice session, with `voice.stop`, names the
+terminal sessions it reached and closes none of them; nothing in the coordinator can close one without an unlocked-screen
 confirmation of its own. Voice can stop while the agent keeps working.
 
 A stop that names a voice session the host holds no record of is refused with the code for an
