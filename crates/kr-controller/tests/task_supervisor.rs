@@ -422,9 +422,13 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
     let host = TempHost::create();
     leave(&host, Left::Worker, &stale);
     leave(&host, Left::Claimed, &elsewhere.identity);
-    start_daemon(&host)
+    let refused = start_daemon(&host)
         .await
         .expect_err("a record of an ended process does not hide a record of a live one");
+    assert!(
+        refused.contains(&format!("in session {}", elsewhere.session)),
+        "the refusal names the session the work is in: {refused}"
+    );
 
     // What runs in this daemon's own session is its to take over.
     let here = std::process::Command::new(system("PING.EXE"))
@@ -458,12 +462,13 @@ async fn a_daemon_does_not_take_over_work_that_runs_in_another_login_session() {
     let _ = here.0.kill();
 }
 
-/// KR-REQ-07.58: a recorded process the kernel will not describe is not work in another session.
-/// The processes of an environment are created by a task of the account that runs its daemon,
-/// which can open them, so a recorded number that this account cannot open belongs to another
-/// account's process by now, and a daemon that refused to start for it could not be cleared by
-/// anything but a restart of the machine. The kernel's answer for the number it never describes,
-/// the system idle process's, is the same "not established" that a refused access gives.
+/// KR-REQ-07.58: a recorded process the kernel will not describe, that this account cannot read
+/// either, is not work in another session. The processes of an environment are created by a task
+/// of the account that runs its daemon, which can open them, so a recorded number that this
+/// account cannot open belongs to another account's process by now, and a daemon that refused to
+/// start for it could not be cleared by anything but a restart of the machine. The reader gives the
+/// system idle process's number, which it never asks the kernel about, the same "not established"
+/// that a refused access gives, and the process cannot be opened either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_recorded_process_the_kernel_will_not_describe_is_not_work_in_another_session() {
     use kr_ipc::identity::{ProcessState, process_state};
