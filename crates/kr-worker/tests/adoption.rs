@@ -12,7 +12,7 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
-//! | KR-REQ-03.27 | the program holding the terminal is the session's application, named as a person knows it, with no state of its own while it runs, and the shell at its prompt is not an application; a program that is another until it execs takes the name it has after the exec; the command the shell integration answered for the line names it when it answered for one and the leader is running it |
+//! | KR-REQ-03.27 | the program holding the terminal is the session's application, named as a person knows it, in the session's summary, with no state of its own while it runs, and the shell at its prompt is not an application; a program that is another until it execs takes the name it has after the exec; the command the shell integration answered for the line names it when it answered for one and the leader is running it |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
@@ -1168,6 +1168,11 @@ async fn kr_req_03_27_the_program_holding_the_terminal_is_the_application_until_
     let program = application_where(&mut published, |held| held.name.is_some()).await;
     assert_eq!(program.name.as_deref(), Some("claude"));
     assert_eq!(program.state, None);
+    assert_eq!(
+        typing.runtime.session().summary().application.as_deref(),
+        Some("claude"),
+        "the session's summary names the program that holds the terminal"
+    );
 
     let pid = std::fs::read_to_string(&running)
         .expect("the program says it is running")
@@ -1181,6 +1186,11 @@ async fn kr_req_03_27_the_program_holding_the_terminal_is_the_application_until_
     );
     let back = application_where(&mut published, |held| held.name.is_none()).await;
     assert_eq!(back.state, Some(ApplicationState::ShellReady));
+    assert_eq!(
+        typing.runtime.session().summary().application,
+        None,
+        "and names none once the prompt is back"
+    );
     assert_eq!(
         typing.runtime.session().summary().application_state.0,
         Some(ApplicationState::ShellReady),

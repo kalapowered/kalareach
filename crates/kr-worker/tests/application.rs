@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-03.27 | an approval a connector's table answers and a binding interpreted is the application's state until it is settled, and one nothing interpreted never is; an open question is, until it is answered or cancelled; a turn the connector's table names is, until it ends; an approval outranks a question and a question outranks a turn; and a session that has closed describes nothing |
+//! | KR-REQ-03.27 | an approval a connector's table answers and a binding interpreted is the application's state until it is settled, and one nothing interpreted never is; an open question is, until it is answered or cancelled; a turn the connector's table names is, until it ends; an approval outranks a question and a question outranks a turn; and a session that has closed describes nothing, and names no application |
 
 #![cfg(unix)]
 
@@ -269,6 +269,27 @@ impl World {
         self.runtime.session().summary().application_state.0
     }
 
+    /// The name the session's summary shows now for its foreground application.
+    fn name(&self) -> Option<String> {
+        self.runtime.session().summary().application
+    }
+
+    /// Waits until the session's summary names `expected`, which it must do within [`LIVENESS`].
+    async fn names(&self, expected: Option<&str>) {
+        let deadline = tokio::time::Instant::now() + LIVENESS;
+        loop {
+            let held = self.name();
+            if held.as_deref() == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session names {expected:?}, and named {held:?} for {LIVENESS:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Waits until the session's summary shows `expected`, which it must do within [`LIVENESS`].
     async fn shows(&self, expected: Option<ApplicationState>) {
         let deadline = tokio::time::Instant::now() + LIVENESS;
@@ -482,6 +503,13 @@ async fn kr_req_03_27_a_closed_session_describes_nothing() {
     let world = World::new().await;
     let _question = world.ask("req-1");
     world.shows(Some(ApplicationState::AwaitingInput)).await;
+    world
+        .service
+        .application()
+        .observe_holder(kr_worker::application::Holder::Program(Some(
+            "claude".to_owned(),
+        )));
+    world.names(Some("claude")).await;
 
     let (_, gate) = world
         .runtime
@@ -491,6 +519,7 @@ async fn kr_req_03_27_a_closed_session_describes_nothing() {
         .await
         .expect("the session closes");
     world.shows(None).await;
+    world.names(None).await;
 
     world
         .service
@@ -499,9 +528,20 @@ async fn kr_req_03_27_a_closed_session_describes_nothing() {
             approval_pending: true,
             ..kr_worker::application::Evidence::default()
         });
+    world
+        .service
+        .application()
+        .observe_holder(kr_worker::application::Holder::Program(Some(
+            "other".to_owned(),
+        )));
     assert_eq!(
         world.state(),
         None,
         "a session that closed shows no state however the worker's evidence changes"
+    );
+    assert_eq!(
+        world.name(),
+        None,
+        "and names no application whatever holds its terminal"
     );
 }

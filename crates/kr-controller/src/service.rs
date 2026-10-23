@@ -1298,6 +1298,10 @@ mod a_worker_the_host_tells;
 #[cfg(test)]
 mod a_create_whose_session_closed;
 
+/// A session that closed, described from the journal its worker left.
+#[cfg(test)]
+mod a_closed_session_read_back;
+
 /// A descriptor write that the task waiting for it stops waiting for.
 #[cfg(test)]
 mod a_write_that_outlives_its_daemon;
