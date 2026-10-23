@@ -43,6 +43,13 @@
 //! suspension, as the wall clock does) between two writes of output, and a reading taken after the
 //! wall clock gained more than [`FORWARD_STEP`] on the continuous one, and every reading after it,
 //! is recorded as unproven.
+//!
+//! The comparison needs the two clocks read as one moment. A host suspended between the two reads
+//! of one sample would show the next sample a step that did not happen, so the caller reads the
+//! continuous clock on both sides of the wall clock ([`read_together`]), and a sample whose reads
+//! are far apart is noted as unproven without being compared ([`TimeIndex::note_unpaired`]). The
+//! next sample is compared with the last that was read together, over a stretch both clocks counted
+//! alike.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -78,8 +85,22 @@ const ROWS_PER_STRETCH: usize = 10_000;
 /// the wall clock is taken to have stepped forward.
 pub const FORWARD_STEP: Duration = Duration::from_secs(2);
 
+/// How far apart the continuous clock may read on the two sides of a wall-clock reading for the two
+/// to be taken as read at one moment. A pause of a running thread is shorter than this, and a
+/// suspension of the host is longer.
+pub const READ_TOGETHER_WITHIN: Duration = Duration::from_secs(1);
+
 /// The most rows one answer carries.
 pub const MAX_ANSWER_ROWS: usize = 2048;
+
+/// Whether the continuous clock, read now, is within [`READ_TOGETHER_WITHIN`] of `before_ms`, its
+/// reading from before a wall-clock reading was taken: no suspension of the host came between that
+/// reading and this one.
+#[must_use]
+pub fn read_together(before_ms: u64) -> bool {
+    kr_ipc::clock::boot_elapsed_ms().saturating_sub(before_ms)
+        <= u64::try_from(READ_TOGETHER_WITHIN.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// One interval of the output, and the instant its first byte was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,8 +192,40 @@ impl TimeIndex {
         self.note_at(start, len, now_ms, proven, kr_ipc::clock::boot_elapsed_ms());
     }
 
+    /// Notes output as [`Self::note`] does, for a wall-clock reading that was not read together with
+    /// the continuous clock ([`read_together`]) because the host was suspended between the two.
+    ///
+    /// The reading is a lower bound all the same, and it is recorded unproven: the host cannot say
+    /// that the wall clock had not stepped forward at that moment. It is not compared with the last
+    /// reading and does not become the last, so a suspension is not read, at the next output, as a
+    /// step of the wall clock.
+    pub fn note_unpaired(&self, start: u64, len: u64, now_ms: u64) {
+        self.note_read(
+            start,
+            len,
+            now_ms,
+            false,
+            kr_ipc::clock::boot_elapsed_ms(),
+            false,
+        );
+    }
+
     /// [`Self::note`] with the reading of the continuous clock the output was written at.
     fn note_at(&self, start: u64, len: u64, now_ms: u64, proven: bool, boot_ms: u64) {
+        self.note_read(start, len, now_ms, proven, boot_ms, true);
+    }
+
+    /// Notes output read at `now_ms` on the wall clock and `boot_ms` on the continuous one, which
+    /// `paired` says were read as one moment.
+    fn note_read(
+        &self,
+        start: u64,
+        len: u64,
+        now_ms: u64,
+        proven: bool,
+        boot_ms: u64,
+        paired: bool,
+    ) {
         if len == 0 {
             return;
         }
@@ -180,19 +233,21 @@ impl TimeIndex {
         let mut state = locked(&self.inner.state);
         // A wall clock that has gained on the continuous one is taken to have stepped forward, and
         // nothing after it is proven: every later reading is late by the step.
-        if let Some((wall, boot)) = state.last {
-            let boot_gain = boot_ms.saturating_sub(boot);
-            let slack = u64::try_from(FORWARD_STEP.as_millis())
-                .unwrap_or(u64::MAX)
-                .saturating_add(
-                    boot_gain.saturating_mul(kr_ipc::clock::RATE_ALLOWANCE_PPM) / 1_000_000,
-                );
-            if now_ms.saturating_sub(wall) > boot_gain.saturating_add(slack) {
-                state.stepped_forward = true;
+        if paired {
+            if let Some((wall, boot)) = state.last {
+                let boot_gain = boot_ms.saturating_sub(boot);
+                let slack = u64::try_from(FORWARD_STEP.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(
+                        boot_gain.saturating_mul(kr_ipc::clock::RATE_ALLOWANCE_PPM) / 1_000_000,
+                    );
+                if now_ms.saturating_sub(wall) > boot_gain.saturating_add(slack) {
+                    state.stepped_forward = true;
+                }
             }
+            state.last = Some((now_ms, boot_ms));
         }
-        state.last = Some((now_ms, boot_ms));
-        let proven = proven && !state.stepped_forward;
+        let proven = proven && paired && !state.stepped_forward;
         let held = state.rows + state.closed.len() + state.in_flight;
         let full = held + 1 >= MAX_ROWS;
         // Every limit on an interval doubles for each `ROWS_PER_STRETCH` rows held.
@@ -380,6 +435,28 @@ fn cursor(value: u64) -> Result<i64, String> {
 /// The suffix of the file an index is built in before it takes its name.
 const MAKING: &str = ".new";
 
+/// Removes what a worker killed part way through making the index file at `path` left: the file it
+/// was building beside the name, and the journal SQLite keeps for it.
+///
+/// The file with the name is never one of these, and nothing else names them. A worker that makes
+/// the index again starts over, and the collection of a closed session whose worker never did
+/// removes them here.
+///
+/// # Errors
+///
+/// Returns what could not be removed.
+pub fn remove_unfinished(path: &Path) -> Result<(), String> {
+    let building = beside(path, MAKING);
+    for left in [building.clone(), beside(&building, "-journal")] {
+        match std::fs::remove_file(&left) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", left.display())),
+        }
+    }
+    Ok(())
+}
+
 /// Makes the index file at `path` whole: its directory, and the file with its schema, built beside
 /// the name and moved to it, so that a file with the name has a version in it and is never half
 /// made. A worker killed part way leaves the file it was building, which the next one starts over.
@@ -390,14 +467,8 @@ fn make(path: &Path) -> Result<(), String> {
         kr_ipc::paths::create_private_directory(directory)
             .map_err(|error| format!("the index directory could not be made: {error}"))?;
     }
+    remove_unfinished(path)?;
     let building = beside(path, MAKING);
-    for left in [building.clone(), beside(&building, "-journal")] {
-        match std::fs::remove_file(&left) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", left.display())),
-        }
-    }
     {
         let connection = kr_flush::release::open_connection(&building, None)
             .map_err(|error| describe(&error))?;
@@ -915,6 +986,30 @@ mod tests {
             .map(|m| m.proven)
             .collect();
         assert_eq!(proven, vec![true, true]);
+    }
+
+    #[test]
+    fn a_host_suspended_between_the_two_reads_of_one_sample_has_not_had_its_wall_clock_stepped() {
+        let (index, path, _kept) = index("suspended-between");
+        index.note_at(0, 4, 1_000, true, 5_000);
+        // The wall clock was read, the host slept for an hour, and the continuous clock was read:
+        // the two readings of this sample are an hour apart, and it is noted unpaired.
+        let hour = 3_600_000;
+        index.note_read(4, 4, 2_000, true, 5_000 + hour + 1_000, false);
+        // The next sample is read together, after the sleep, and both clocks counted it.
+        index.note_at(8, 4, 1_000 + hour + 2_000, true, 5_000 + hour + 2_000);
+        index.flush().expect("writes");
+        let rows: Vec<_> = read(&path, 0, 200, 16)
+            .expect("reads")
+            .marks
+            .iter()
+            .map(|m| (m.from, m.to, m.proven))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(0, 4, true), (4, 8, false), (8, 12, true)],
+            "the sample that could not be read together is not proven, and the next is"
+        );
     }
 
     #[test]

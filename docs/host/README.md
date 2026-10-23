@@ -3681,7 +3681,10 @@ than two seconds on the host's continuous clock since the worker's last write of
 continuous clock counts a suspension as the wall clock does, so a host that slept gains nothing on
 it. A step forward makes every later reading late by the step, which is the direction a reader
 cannot accept, so the first write of output after one, and every write after it for as long as
-the worker runs, is recorded as unproven. Privacy mode takes the record away and keeps this.
+the worker runs, is recorded as unproven. Privacy mode takes the record away and keeps this. A write
+whose wall-clock reading was taken more than a second apart from the continuous one, because the host
+was suspended between the two, is recorded as unproven and compared with nothing, so a suspension
+is not read as a step.
 
 An interval closes when the wall clock steps back or changes its standing, when it has lasted two
 seconds, or when it has lasted a tenth of a second and holds 256 bytes; the duration is measured on
@@ -3699,7 +3702,9 @@ left, before the closure is recorded: a reader that finds the closure finds the 
 up to it. A crash loses the rows since the last write, and the bytes they described read as having
 no time. The file is `output-times/<session>.sqlite` in the environment's state directory, a store
 of its own at version 1 that the stored-formats lock lists. It is built under another name and moved
-to its own when its schema is in it, so a file with the name always holds a version. It is beside the
+to its own when its schema is in it, so a file with the name always holds a version. A worker killed
+while it builds leaves that file under the other name; the next worker to build removes it, and so
+does the archive's collection of a closed session. It is beside the
 spool and not in it, so nothing that lists or measures a spool meets it. Privacy mode removes it
 with the output, and nothing is recorded while retention is off. Eviction removes the rows of output that went, at the next
 write, and the archive's collection does the same for a closed session.
