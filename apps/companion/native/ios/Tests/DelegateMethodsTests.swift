@@ -7,6 +7,7 @@
 //  from them, so then none is added and the caller is told which are taken.
 //
 
+import UIKit
 import XCTest
 
 /// A delegate that answers none of the methods.
@@ -94,7 +95,7 @@ final class DelegateMethodsTests: XCTestCase {
         XCTAssertEqual(messages.value, ["abc"])
         XCTAssertEqual(results.value, [], "the system is not answered before the handler is done")
         finishing.value?()
-        XCTAssertEqual(results.value, [1], "and is then told there was new data")
+        XCTAssertEqual(results.value, [UIBackgroundFetchResult.newData.rawValue], "and is then told there was new data")
     }
 
     func testAClassThatAnswersOneItselfGetsNeitherAndKeepsItsOwn() {

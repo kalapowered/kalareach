@@ -39,7 +39,16 @@ enum PushStartup {
                 NSLog("KalaReach: Firebase skipped, %@", reason)
             case .configureFirebase:
                 FirebaseApp.configure()
-                PushRegistration.shared.onTokenUsable = { Messaging.messaging().apnsToken = $0 }
+                PushRegistration.shared.onTokenUsable = { apns in
+                    Messaging.messaging().apnsToken = apns
+                    // The person has agreed and Firebase has the APNs token, so it may make this
+                    // installation's registration token now, which it did not before. It arrives at
+                    // the delegate below and is kept; asking for it as well makes it come at once.
+                    Messaging.messaging().isAutoInitEnabled = true
+                    Messaging.messaging().token { token, _ in
+                        if let token { PushTokenStore().given(token) }
+                    }
+                }
                 Messaging.messaging().delegate = PushTokens.shared
                 Messaging.messaging().token { token, _ in
                     if let token { PushTokenStore().given(token) }

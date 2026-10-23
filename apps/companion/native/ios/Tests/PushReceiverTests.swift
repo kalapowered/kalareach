@@ -10,6 +10,7 @@
 import XCTest
 
 final class PendingFileTests: XCTestCase {
+    private static let registration = "2e749a03-c158-4d62-a019-6f3bd784215c"
     private let now: UInt64 = 1_763_000_000_000
     private var directory: URL!
 
@@ -26,7 +27,7 @@ final class PendingFileTests: XCTestCase {
 
     private func record(deadline: UInt64, state: String = "pending") -> String {
         let object: [String: Any] = [
-            "registration_id": "2e749a03-c158-4d62-a019-6f3bd784215c",
+            "registration_id": Self.registration,
             "token_digest": "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ",
             "gateway_origin": "https://reach.kala.to",
             "platform": "ios",
@@ -51,27 +52,40 @@ final class PendingFileTests: XCTestCase {
         XCTAssertEqual(state(file(), at: now), "expired", "and it stays so for every later reader")
     }
 
+    func testATryThatOutlivedItsRegistrationCannotMoveItsReplacement() throws {
+        let kept = file()
+        try kept.write(record(deadline: now + 60_000))
+        let other = "9a0f4c2e-6b1d-4c53-8e8a-7d1f2b3c4d5e"
+        let replacement = record(deadline: now + 60_000).replacingOccurrences(of: Self.registration, with: other)
+        // The later registration replaces the record while the earlier one's post is in flight.
+        try file().write(replacement)
+        XCTAssertFalse(kept.mark(registrationId: Self.registration, state: PendingFile.refused, reason: "gateway_403", nowMilliseconds: now))
+        XCTAssertEqual(state(kept), "pending")
+        XCTAssertTrue(kept.mark(registrationId: other, state: PendingFile.answered, reason: nil, nowMilliseconds: now))
+        XCTAssertEqual(state(kept), "answered")
+    }
+
     func testOnlyAPendingRecordMovesAndAReplacedOrExpiredOneIsLeftAlone() throws {
         let kept = file()
         try kept.write(record(deadline: now + 60_000))
-        XCTAssertTrue(kept.mark(state: PendingFile.answered, reason: nil, nowMilliseconds: now))
+        XCTAssertTrue(kept.mark(registrationId: Self.registration, state: PendingFile.answered, reason: nil, nowMilliseconds: now))
         XCTAssertEqual(state(kept), "answered")
-        XCTAssertFalse(kept.mark(state: PendingFile.refused, reason: "late", nowMilliseconds: now))
+        XCTAssertFalse(kept.mark(registrationId: Self.registration, state: PendingFile.refused, reason: "late", nowMilliseconds: now))
         XCTAssertEqual(state(kept), "answered")
 
         try kept.write(record(deadline: now + 1))
-        XCTAssertFalse(kept.mark(state: PendingFile.answered, reason: nil, nowMilliseconds: now + 1))
+        XCTAssertFalse(kept.mark(registrationId: Self.registration, state: PendingFile.answered, reason: nil, nowMilliseconds: now + 1))
         XCTAssertEqual(state(kept, at: now + 1), "expired")
 
         try kept.clear()
         XCTAssertNil(kept.read(nowMilliseconds: now))
-        XCTAssertFalse(kept.mark(state: PendingFile.answered, reason: nil, nowMilliseconds: now))
+        XCTAssertFalse(kept.mark(registrationId: Self.registration, state: PendingFile.answered, reason: nil, nowMilliseconds: now))
     }
 
     func testANewRegistrationReplacesTheOldOneWhole() throws {
         let kept = file()
         try kept.write(record(deadline: now + 60_000))
-        kept.mark(state: PendingFile.refused, reason: "gateway_403", nowMilliseconds: now)
+        kept.mark(registrationId: Self.registration, state: PendingFile.refused, reason: "gateway_403", nowMilliseconds: now)
         try kept.write(record(deadline: now + 120_000))
         let text = try XCTUnwrap(kept.read(nowMilliseconds: now))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
@@ -277,6 +291,27 @@ final class PushAdapterTests: XCTestCase {
             adapter().run(command, "{}") { _, answered, _ in code = answered }
             XCTAssertNotEqual(code, "unavailable", "\(command) is a command the adapter takes")
         }
+    }
+
+    func testEveryPermissionTheSystemIsReadForIsToldToTheRegistrationAsItIs() {
+        var told: [PushPermission] = []
+        func adapter(_ permissions: Permissions) -> PushAdapter {
+            PushAdapter(
+                permissions: permissions,
+                tokens: PushTokenStore(defaults: defaults),
+                record: PendingFile(url: directory.appendingPathComponent("pending.json")),
+                keys: Keys(),
+                route: NotificationRoute(),
+                clock: { self.now },
+                permissionRead: { told.append($0) }
+            )
+        }
+        // A person who refused and then agreed in the system's settings is read as agreed, so the
+        // registration goes on without asking again.
+        XCTAssertEqual(answer(adapter(Permissions(current: .refused, afterAsking: .refused)), "pushPermission")?["state"] as? String, "denied")
+        XCTAssertEqual(answer(adapter(Permissions(current: .granted, afterAsking: .granted)), "pushPermission")?["state"] as? String, "granted")
+        XCTAssertEqual(answer(adapter(Permissions(current: .unknown, afterAsking: .granted)), "pushAskPermission")?["state"] as? String, "granted")
+        XCTAssertEqual(told, [.refused, .granted, .granted])
     }
 
     func testThePermissionIsReadWithoutAskingAndAskedOnlyWhenTheCommandSaysSo() {
