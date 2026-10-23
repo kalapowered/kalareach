@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="to.kala.reach.companion.mobile.VoiceCeremonyTest" tests="10" skipped="0" failures="0" errors="0" timestamp="2026-10-23T03:33:45.293Z" hostname="runner" time="0.059">
+  <properties/>
+  <testcase name="the_encoder_writes_the_hosts_bytes_at_every_boundary" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.022"/>
+  <testcase name="tampered_action_digest_is_refused" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.026"/>
+  <testcase name="signature_covers_action_hash_and_verifies" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.006"/>
+  <testcase name="expired_challenge_is_refused" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.001"/>
+  <testcase name="a_negative_deadline_is_not_a_challenge" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.0"/>
+  <testcase name="signing_input_matches_the_cross_language_vector" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.0"/>
+  <testcase name="unverified_presence_refuses_signing" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.001"/>
+  <testcase name="confirmation_for_one_action_does_not_authorize_another" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.001"/>
+  <testcase name="signer_key_identifier_matches_the_cross_language_vector" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.0"/>
+  <testcase name="provider_text_cannot_produce_confirmation_proof" classname="to.kala.reach.companion.mobile.VoiceCeremonyTest" time="0.001"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

@@ -321,9 +321,11 @@ belongs to the file of the class around it (a JVM reports it as `Outer$Inner`).
 The report stops before it runs anything when it cannot read a file of these lanes: its braces do
 not balance once comments and strings are blanked, it declares a class whose name is in backticks or
 on the next line, it names a row and declares no class, or it names a row and declares a test this
-reading does not follow (a Kotlin test outside the body of a top-level class, a name it cannot read,
-or a Swift Testing test). A key whose test, or class, the lane's results do not hold is failed, not
-left to the other cases of the file. A case the lane reports that no file of the lane declares, or
+reading does not follow: a Kotlin test outside the body of a top-level class, with a body that is
+not a block, with a name it cannot read or with an attribute no function follows (a Java file), a
+Swift test method outside a top-level class (in an extension) or with its parentheses over two
+lines, or a Swift Testing test. A key whose test or class the lane's results do not hold is failed,
+not left to the other cases of the file. A case the lane reports that no file of the lane declares, or
 that two declare, is a problem of the result, and it fails every key of its lane: a result that
 cannot be given to one file cannot be given to any row. That holds whichever way the reading of the
 sources went wrong, with one limit. A class that the reading misses in its own file and lists in
@@ -343,13 +345,13 @@ test suite states. A suite recorded as failed has to have a failed case under it
 twice is refused, and so is a result the report does not know (`unknown`). The tool's exit status
 has to agree with the failed cases. An expected failure is a failure of its case, with that as the
 reason, and does not count against the exit status, which Xcode leaves at 0 for it. Results that
-fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
+fail a check fail the lane's step and every key of the lane. A skipped case is not run, never
 passed.
 
 In the report of a platform that does not run a lane, the tests its files key are shown as not run,
 with the platform that does: one record for each key, a test, a class or a file. In a report that
-does, a key whose test or class the results do not name is failed: the lane ran, and nothing it
-keys ran with it. The record of each case has the command
+does, a key whose test, class or file the results hold no case of is failed: the lane ran, and
+nothing it keys ran with it. The record of each case has the command
 that runs it alone, which is the script with the tool's own filter after `--`. A Playwright test is
 keyed as any TypeScript test is, and shown as not built with the lane's reason.
 

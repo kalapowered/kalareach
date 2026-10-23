@@ -492,6 +492,9 @@ fn scan(file: &str, source: &str, tests: bool) -> Result<Declared, String> {
     let mut class_attributes: Option<usize> = None;
     let mut test_attributes: Option<usize> = None;
     let mut test_attribute = false;
+    // The parentheses an attribute's arguments, or a test's signature, have left open.
+    let mut attribute_parens = 0_i32;
+    let mut signature_parens = 0_i32;
     for (index, line) in masked.lines().enumerate() {
         let number = index + 1;
         let chars: Vec<char> = line.chars().collect();
@@ -526,32 +529,67 @@ fn scan(file: &str, source: &str, tests: bool) -> Result<Declared, String> {
             }
         }
         let trimmed = line.trim();
-        if tests && in_class_body {
-            let attribute_line = trimmed.starts_with('@');
-            if attribute_line {
-                test_attributes.get_or_insert(number);
+        // A test whose body has not opened yet may only go on with its signature. Another
+        // declaration reached first means it has no block body (an expression body, say), and the
+        // braces that follow could not be given to the test they belong to.
+        if tests && depth == 1 && matches!(open_test, Some((_, false))) {
+            let declaration = if swift {
+                has_word(&chars, "func")
+            } else {
+                has_word(&chars, "fun") || annotation_names(&chars, "Test")
+            };
+            if declaration && signature_parens <= 0 {
+                return Err(format!(
+                    "line {number} comes before the body of the test above it opens, which this reading does not follow"
+                ));
             }
+        }
+        if tests && in_class_body {
             let class = open_class.map(|class| declared.classes[class].name.clone());
-            if swift {
-                let swift_test = find_word(&chars, "func").and_then(|at| {
+            let attribute_line = trimmed.starts_with('@');
+            let property =
+                has_word(&chars, "val") || has_word(&chars, "var") || has_word(&chars, "let");
+            if attribute_parens > 0 {
+                // The arguments of an attribute go on over this line.
+                attribute_parens += parens(&chars);
+            } else if swift {
+                if attribute_line {
+                    test_attributes.get_or_insert(number);
+                }
+                let func = find_word(&chars, "func");
+                let swift_test = func.and_then(|at| {
                     let before: String = chars[..at].iter().collect();
                     let skipped = before
                         .split_whitespace()
                         .any(|word| word == "static" || word == "class");
-                    (!skipped).then(|| swift_test_name(&chars, at)).flatten()
+                    (!skipped).then(|| swift_test_name(&chars, at))
                 });
-                if let Some(name) = swift_test {
-                    declared.tests.push(DeclaredTest {
-                        class: class.unwrap_or_default(),
-                        name,
-                        first: test_attributes.take().unwrap_or(number),
-                        last: number,
-                    });
-                    open_test = Some((declared.tests.len() - 1, false));
-                } else if find_word(&chars, "func").is_some() || (!attribute_line && !blank) {
-                    test_attributes = None;
+                match swift_test {
+                    Some(SwiftTest::Case(name)) => {
+                        declared.tests.push(DeclaredTest {
+                            class: class.unwrap_or_default(),
+                            name,
+                            first: test_attributes.take().unwrap_or(number),
+                            last: number,
+                        });
+                        open_test = Some((declared.tests.len() - 1, false));
+                        signature_parens = 0;
+                    }
+                    Some(SwiftTest::Unclear) => {
+                        return Err(format!(
+                            "line {number} declares a test method whose signature goes over several lines, which this reading does not follow"
+                        ));
+                    }
+                    Some(SwiftTest::NotACase) | None => {
+                        if func.is_some() || property || (!attribute_line && !blank) {
+                            test_attributes = None;
+                        }
+                    }
                 }
             } else {
+                if attribute_line {
+                    test_attributes.get_or_insert(number);
+                }
                 if annotation_names(&chars, "Test") {
                     test_attribute = true;
                 }
@@ -571,14 +609,47 @@ fn scan(file: &str, source: &str, tests: bool) -> Result<Declared, String> {
                             last: number,
                         });
                         open_test = Some((declared.tests.len() - 1, false));
+                        signature_parens = 0;
                     }
                     test_attributes = None;
                     test_attribute = false;
-                } else if !attribute_line && !blank {
+                } else if property
+                    || (!attribute_line
+                        && (has_word(&chars, "class") || has_word(&chars, "object")))
+                {
+                    if test_attribute {
+                        return Err(format!(
+                            "line {number} declares something other than a function after a test attribute, which this reading does not follow"
+                        ));
+                    }
                     test_attributes = None;
-                    test_attribute = false;
+                } else if attribute_line {
+                    attribute_parens = parens(&chars).max(0);
+                } else if !blank {
+                    if test_attribute {
+                        return Err(format!(
+                            "line {number} follows a test attribute and declares no function, which this reading does not follow"
+                        ));
+                    }
+                    test_attributes = None;
                 }
             }
+        }
+        if tests
+            && swift
+            && depth == 1
+            && open_class.is_none()
+            && open_test.is_none()
+            && find_word(&chars, "func").is_some_and(|at| {
+                matches!(
+                    swift_test_name(&chars, at),
+                    SwiftTest::Case(_) | SwiftTest::Unclear
+                )
+            })
+        {
+            return Err(format!(
+                "line {number} declares a test method outside the body of a top-level class, which this reading does not follow"
+            ));
         }
         if at_top && !blank {
             if let Some(class) =
@@ -598,9 +669,12 @@ fn scan(file: &str, source: &str, tests: bool) -> Result<Declared, String> {
         }
         for c in &chars {
             match c {
+                '(' if depth == 1 && matches!(open_test, Some((_, false))) => signature_parens += 1,
+                ')' if depth == 1 && matches!(open_test, Some((_, false))) => signature_parens -= 1,
                 '{' => {
                     depth += 1;
                     if depth == 2
+                        && signature_parens <= 0
                         && let Some((_, opened)) = open_test.as_mut()
                     {
                         *opened = true;
@@ -611,6 +685,11 @@ fn scan(file: &str, source: &str, tests: bool) -> Result<Declared, String> {
                     if depth < 0 {
                         return Err(format!(
                             "a brace on line {number} closes what was never opened"
+                        ));
+                    }
+                    if depth == 0 && matches!(open_test, Some((_, false))) {
+                        return Err(format!(
+                            "the class ends on line {number} before the body of its last test opens, which this reading does not follow"
                         ));
                     }
                     if depth == 1
@@ -757,9 +836,19 @@ fn kotlin_name(original: &[char], at: usize) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The name Xcode gives a Swift test method whose `func` stands at `at`: a method whose name
-/// begins with `test` and takes nothing is a case, and the tool prints `()` after its name.
-fn swift_test_name(chars: &[char], at: usize) -> Option<String> {
+/// What a Swift `func` is to the tool that runs the tests of a class.
+#[derive(Debug, PartialEq, Eq)]
+enum SwiftTest {
+    /// A test: its name begins with `test` and it takes nothing. The tool prints `()` after it.
+    Case(String),
+    /// Not a test: another name, or arguments, which the tool never runs.
+    NotACase,
+    /// A test method whose parameters start on one line and end on another.
+    Unclear,
+}
+
+/// Reads the Swift method whose `func` stands at `at`.
+fn swift_test_name(chars: &[char], at: usize) -> SwiftTest {
     let skip = |mut i: usize| {
         while chars.get(i).is_some_and(|c| c.is_whitespace()) {
             i += 1;
@@ -772,10 +861,28 @@ fn swift_test_name(chars: &[char], at: usize) -> Option<String> {
         end += 1;
     }
     let name: String = chars[start..end].iter().collect();
+    if !name.starts_with("test") {
+        return SwiftTest::NotACase;
+    }
     let open = skip(end);
+    if chars.get(open) != Some(&'(') {
+        return SwiftTest::NotACase;
+    }
     let close = skip(open + 1);
-    (name.starts_with("test") && chars.get(open) == Some(&'(') && chars.get(close) == Some(&')'))
-        .then(|| format!("{name}()"))
+    match chars.get(close) {
+        Some(')') => SwiftTest::Case(format!("{name}()")),
+        None => SwiftTest::Unclear,
+        Some(_) => SwiftTest::NotACase,
+    }
+}
+
+/// The parentheses a line opens and does not close.
+fn parens(chars: &[char]) -> i32 {
+    chars.iter().fold(0, |depth, c| match c {
+        '(' => depth + 1,
+        ')' => depth - 1,
+        _ => depth,
+    })
 }
 
 /// Reads a source file for its classes and its tests.
@@ -1296,6 +1403,83 @@ mod tests {
         assert!(declared("A.swift", "final class A {\n    @Test func one() {}\n}\n").is_err());
         // The classes of such a file are still read.
         assert_eq!(declared_classes("A.kt", nested).expect("readable"), ["A"]);
+    }
+
+    #[test]
+    fn a_test_without_a_block_body_stops_the_reading_and_never_lends_its_end_to_the_next() {
+        // An expression body has no brace of its own, so the next test's braces would have been
+        // taken for its.
+        let expression = "class A {\n    @Test fun zero() {\n    }\n\n    @Test fun one() = assertEquals(1, 1)\n}\n\nclass B {\n    /** KR-REQ-15.35: about three. */\n    @Test fun three() {\n        assertEquals(3, 3)\n    }\n}\n";
+        let error = declared("A.kt", expression).expect_err("no block body");
+        assert!(error.contains("line 6"), "{error}");
+        // The same test followed by another in the same class.
+        let followed = "class A {\n    @Test fun one() = assertEquals(1, 1)\n\n    /** A remark. */\n    @Test fun two() {\n    }\n}\n";
+        let error = declared("A.kt", followed).expect_err("no block body");
+        assert!(error.contains("line 5"), "{error}");
+        // A signature over several lines, with a lambda for a default value, has its body where the
+        // braces after the parentheses say.
+        let signature = "class A {\n    @Test fun one(\n        run: () -> Unit = { },\n    ) {\n        assertEquals(1, 1)\n    }\n    @Test fun two() {\n    }\n}\n";
+        let read = declared("A.kt", signature).expect("readable");
+        assert_eq!(
+            read.tests
+                .iter()
+                .map(|test| (test.name.as_str(), test.first, test.last))
+                .collect::<Vec<_>>(),
+            [("one", 2, 6), ("two", 7, 8)]
+        );
+    }
+
+    #[test]
+    fn an_attribute_over_several_lines_and_a_property_with_one_are_told_apart() {
+        // The arguments of `@Test` go over three lines and the function comes after them.
+        let multiline = "class A {\n    /** KR-REQ-15.35: about one. */\n    @Test(\n        expected = IllegalStateException::class\n    )\n    fun one() {\n    }\n}\n";
+        let read = declared("A.kt", multiline).expect("readable");
+        assert_eq!(
+            read.tests
+                .iter()
+                .map(|test| (test.name.as_str(), test.first, test.last))
+                .collect::<Vec<_>>(),
+            [("one", 3, 7)]
+        );
+        // A property with an attribute is not an attribute of the test below it.
+        let property = "class A {\n    /** A remark about the folder. */\n    @get:Rule val folder = 1\n    @Test fun one() {\n    }\n}\n";
+        let read = declared("A.kt", property).expect("readable");
+        assert_eq!((read.tests[0].first, read.tests[0].last), (4, 5));
+        assert!(read.scope_of(2, 2).is_none());
+        // A test attribute with no function after it, as in a Java file, stops the reading.
+        let java = "class A {\n    @Test\n    public void one() {\n    }\n}\n";
+        assert!(declared("A.java", java).is_err());
+        assert!(declared("A.kt", "class A {\n    @Test\n    val x = 1\n}\n").is_err());
+    }
+
+    #[test]
+    fn a_swift_test_method_the_reading_cannot_place_stops_it() {
+        // In an extension, which declares no class of its own.
+        let extension = "final class A: XCTestCase {\n    func testOne() {}\n}\n\nextension A {\n    func testTwo() {}\n}\n";
+        let error = declared("A.swift", extension).expect_err("a test in an extension");
+        assert!(error.contains("line 6"), "{error}");
+        // With its parentheses over two lines.
+        assert!(
+            declared(
+                "A.swift",
+                "final class A: XCTestCase {\n    func testOne(\n    ) {}\n}\n"
+            )
+            .is_err()
+        );
+        // A method the tool does not run as a test is none, whatever its name.
+        let read = declared(
+            "A.swift",
+            "final class A: XCTestCase {\n    func testWith(_ x: Int) {}\n    func testOne() {}\n}\n",
+        )
+        .expect("readable");
+        assert_eq!(read.tests.len(), 1);
+        // A property with an attribute is not an attribute of the test below it.
+        let read = declared(
+            "A.swift",
+            "final class A: XCTestCase {\n    // About x.\n    @MainActor var x = 1\n    func testOne() {}\n}\n",
+        )
+        .expect("readable");
+        assert_eq!(read.tests[0].first, 4);
     }
 
     #[test]
