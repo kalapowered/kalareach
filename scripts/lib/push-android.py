@@ -23,10 +23,10 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       Waits until the page says that the question was answered by someone else, with what the person
       had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
-`blind` is for the first sheet the application opens over the Attention screen, which the web view
-does not always hand over to `uiautomator`: when the choice or the button is not on the screen, it
-is pressed where the form draws it (`SHEET_CHOICES`, `SHEET_SEND`) and the run's own checks, the
-worker's ledger and the page's words afterwards, say whether the answer was made.
+`blind` is for a sheet the application opens over the Attention screen, which the web view does not
+always hand over to `uiautomator`: when the choice or the button is not on the screen, it is pressed
+where the form draws it (`SHEET_CHOICES`, `SHEET_SEND`) and the run's own checks, the worker's
+ledger and the page's words afterwards, say whether the answer was made.
 
 It reads the application through `uiautomator`, which names the page's own buttons and texts, and
 drives it with taps at the centre of what it names, as `pairing-android.py` does, whose `Phone` it
@@ -108,10 +108,11 @@ def tap_notification(phone: Phone, words: str) -> None:
     print(f"PUSH-TAPPED {texts(phone)}", flush=True)
 
 
-# Where the first question's form puts its choices and its button when the sheet over the Attention
-# screen has just opened, on the emulator this script is run on (1080 by 2400 pixels at its normal
-# font size). The web view does not always hand over the tree of a sheet that has just opened, and
-# a sheet it has not handed over cannot be read, so the first press is made at the place the form is
+# Where a question's form puts its choices and its button when the sheet over the Attention screen
+# has just opened, on the emulator this script is run on (1080 by 2400 pixels at its normal font
+# size). The sheet grows upward from the foot of the screen, so the form's lines above the choices
+# do not move them. The web view does not always hand over the tree of a sheet that has just opened,
+# and a sheet it has not handed over cannot be read, so the press is made at the place the form is
 # drawn; the screen is read again afterwards, since the press changes the page.
 SHEET_CHOICES = {"yes": (180, 1514), "no": (180, 1646)}
 SHEET_SEND = (280, 1940)
