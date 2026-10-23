@@ -2701,12 +2701,14 @@ fn a_store_that_cannot_be_looked_for_is_not_read_as_one_that_holds_nothing() {
             .expect("a store that is not there holds none")
     );
 
-    // A file where the store's directory should be: the path cannot be read, though nothing is
-    // there either.
-    let file = directory.path().join("a-file");
-    std::fs::write(&file, b"not a directory").expect("a file");
+    // A name no platform can look up: the path cannot be read, though nothing is there either.
     assert!(
-        Attention::holds_action(file.join("attention.sqlite3"), &owner, "action").is_err(),
-        "a path that cannot be read is not a store that holds nothing"
+        Attention::holds_action(
+            directory.path().join("attention\0.sqlite3"),
+            &owner,
+            "action"
+        )
+        .is_err(),
+        "a path that cannot be looked for is not a store that holds nothing"
     );
 }
