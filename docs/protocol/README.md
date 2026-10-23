@@ -6,7 +6,8 @@ this repository implements. Transport, pairing cryptography and storage are sepa
 
 [methods.md](methods.md) lists every method in the registry, generated from it, with its effect,
 its ingress, its summary and the section that describes it where one does.
-[glossary.md](glossary.md) defines the terms the protocol relies on.
+[method-reference.md](method-reference.md) describes the methods that none of the other guides
+describes. [glossary.md](glossary.md) defines the terms the protocol relies on.
 
 Four pieces make it up:
 
