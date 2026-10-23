@@ -69,8 +69,8 @@ use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::signed::SignedService;
 use kr_client::services::sync::{MAX_SYNC_REQUEST_BYTES, ManagedSyncService, SYNC_EXCHANGE_PATH};
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncComparison, SyncExchanged, SyncFetched, SyncPosition,
-    SyncRequestFence, SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncComparison, SyncDispatch, SyncExchanged, SyncFetched,
+    SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     CollectionSealer, MemoryCollectionKeys, Published, Resolutions, SettingValue, SyncBody,
@@ -242,6 +242,27 @@ impl SyncBackupService for Following {
         Box::pin(following_the_retry("the exchange", move || {
             self.inner
                 .compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+        }))
+    }
+
+    /// The client knows which of its refusals were made before anything left, and says so: that
+    /// answer passes through as it is, since a request that never left is not asked to be sent again.
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(following_the_retry("the exchange", move || {
+            self.inner.compare_exchange_dispatched(
+                collection,
+                request_id,
+                signed_at_ms,
+                expected,
+                ciphertext,
+            )
         }))
     }
 

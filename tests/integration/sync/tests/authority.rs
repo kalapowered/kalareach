@@ -46,8 +46,8 @@ use kr_protocol::pairing::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Bytes, CanonicalSet, KeyId, Nullable, TimestampMs};
 use kr_sync_integration::{
-    Deployment, FeedClient, RETRY_DEADLINE, RunKey, SilentService, authority_feed_left, fresh_uuid,
-    now_ms, proved, retry_after,
+    Deployment, FeedClient, RunKey, SilentService, authority_feed_left, following_the_retry,
+    fresh_uuid, now_ms, proved,
 };
 
 /// One run's feed: a host that owns it, and a remote owner that publishes to it.
@@ -220,25 +220,22 @@ impl Feed {
             })
         };
         let (mut after_unknown, mut after_decline, mut after_asking) = (false, false, false);
-        let started = tokio::time::Instant::now();
         loop {
-            match client
-                .raw()
-                .publish(self.address(), request, Some(announcement))
-                .await
-            {
+            // An answer that asks to be sent again is followed by the same rule as every other
+            // call, and counts as having sent the request again.
+            let mut sends = 0_u32;
+            let answer = following_the_retry("the publication", || {
+                sends += 1;
+                client
+                    .raw()
+                    .publish(self.address(), request, Some(announcement))
+            })
+            .await;
+            after_asking |= sends > 1;
+            match answer {
                 Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown && !after_unknown => {
                     after_unknown = true;
                     eprintln!("the publication was answered as unknown: {unknown}");
-                }
-                Err(asked)
-                    if started.elapsed() < RETRY_DEADLINE && retry_after(&asked).is_some() =>
-                {
-                    let wait = retry_after(&asked).unwrap_or_default();
-                    after_asking = true;
-                    eprintln!("the publication was asked to be sent again after {wait:?}: {asked}");
-                    tokio::time::sleep(wait).await;
-                    continue;
                 }
                 Ok(state) if declined(&state) && !after_decline => {
                     after_decline = true;
@@ -1239,4 +1236,37 @@ async fn a_publication_answered_as_unknown_is_read_back_through_answers_that_ask
             "stored {stored}: the publication was sent again only when the feed did not hold it"
         );
     }
+}
+
+/// An answer that asks for a wait past the call's deadline is that call's answer: the wait is not
+/// made and the request is not sent again, so a deployment that asks for ten minutes ends the leg
+/// at once with the answer it gave.
+#[tokio::test]
+async fn an_answer_that_asks_for_a_wait_past_the_deadline_is_the_calls_answer() {
+    let served = kr_service_stand_in::serve().await;
+    let origin = kr_protocol::service::GatewayOrigin::new(served.origin().to_owned())
+        .expect("a loopback origin");
+    let feed = Feed::on(Deployment::at(origin));
+    served.web().fail_with_member(
+        AUTHORITY_SYNC_PATH,
+        "read",
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(600),
+        },
+    );
+
+    let asked = feed
+        .owner_client
+        .read(feed.address(), None, false)
+        .await
+        .expect_err("the answer asked for a wait the call does not make");
+    assert_eq!(asked.code(), ErrorCode::ServiceCapacity, "{asked}");
+    assert_eq!(
+        served.web().requests_to(AUTHORITY_SYNC_PATH),
+        1,
+        "the request was not sent again"
+    );
 }
