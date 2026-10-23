@@ -300,11 +300,15 @@ the manifest the package hash names.
 
 Match rules are indexed by executable file stem and by distribution, so recognising a running
 application is a lookup rather than a scan of every rule in the catalogue. An explicit selection
-wins a conflict outright; an exact rule beats an inferred one; two exact rules are a conflict the
-person settles, not one the host settles for them. A worker applies the same rule. A program the
-command integration launched is bound to the connector its command resolved. A program found running
-that the integration did not launch is bound to the one admitted package that recognises it, which
-need not have a connector table, and one that two packages recognise exactly is adopted by neither.
+wins a conflict outright; an exact rule beats an inferred one; of the rules left, one that matched
+an installation location the package names beats one that matched only the executable's name, when
+one publisher published all the packages left; equal rules are a conflict the person settles, not
+one the host settles for them. A rule is exact only for a program whose distribution the host has
+established as the one it names, which the worker does not for a program it finds running, so there
+every rule counts as inferred. A worker applies the same rule. A program the command integration
+launched is bound to the connector its command resolved. A program found running that the
+integration did not launch is bound to the one admitted package that recognises it, which need not
+have a connector table, and one that two packages recognise equally well is adopted by neither.
 An instance nothing recognised when it started is bound once a package that recognises its program
 is admitted.
 

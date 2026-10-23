@@ -11,7 +11,8 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
-//! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
+//! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise equally well is adopted by neither, and the one left is selected; a package with no connector table adopts and binds what it recognises |
+//! | KR-REQ-12.24 | a package of another publisher does not take a program from a shipped package by naming it, by a rule that declares itself exact or by one that names a location |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
@@ -378,12 +379,14 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
     );
 }
 
-/// KR-REQ-11.13: a program two admitted packages both recognise exactly is adopted by neither,
+/// KR-REQ-11.13: a program two admitted packages both recognise equally well is adopted by neither,
 /// because the software development kit's rule selects neither and the host does not pick one on
-/// their behalf. With one of them no longer admitted, the one left is selected over a package that
-/// only infers the program, and the program is adopted and bound to it.
+/// their behalf. A rule that declares itself exact recognises a program found running no better
+/// than an inferred one does: the worker has not established where the program came from, so a name
+/// on disk is a guess whatever the rule declares. With one of the packages no longer admitted, the
+/// one left is selected, and the program is adopted and bound to it.
 #[test]
-fn kr_req_11_13_a_program_two_packages_recognise_exactly_is_adopted_by_neither() {
+fn kr_req_11_13_a_program_two_packages_recognise_equally_well_is_adopted_by_neither() {
     let setup = Setup::with(fixture::COMMAND, |store, bin| {
         vec![
             fixture::claude_code_package(store, &bin.join("kr-hook")).expect("the package"),
@@ -417,19 +420,15 @@ fn kr_req_11_13_a_program_two_packages_recognise_exactly_is_adopted_by_neither()
     while std::time::Instant::now() < looking {
         assert!(
             setup.adoptions.look(&foreground).is_empty(),
-            "two exact matches adopt nothing"
+            "equal matches adopt nothing"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(setup.broker.live_bindings().is_empty());
 
-    setup.admit_only(2, &[0, 1]);
+    setup.admit_only(2, &[1]);
     let told = setup.adopt(&foreground);
-    assert_eq!(
-        told.len(),
-        1,
-        "adopted once one exact match is left: {told:?}"
-    );
+    assert_eq!(told.len(), 1, "adopted once one match is left: {told:?}");
     assert_eq!(
         told[0]
             .plugin_id
@@ -437,13 +436,63 @@ fn kr_req_11_13_a_program_two_packages_recognise_exactly_is_adopted_by_neither()
             .map(ToString::to_string)
             .as_deref(),
         Some("kalareach/claude-one"),
-        "an exact rule is selected over an inferred one"
+        "the package left is the one selected"
     );
     assert_eq!(
         setup.bound_to(told[0].application_instance_id),
         Some(setup.packages[1].package_digest)
     );
     started.end();
+}
+
+/// KR-REQ-12.24, KR-REQ-11.13: a package of another publisher does not take a program from a
+/// package the repository ships by naming it. Whether its rule declares itself exact or names an
+/// installation location the shipped package's rule does not, the worker finds the two equally good
+/// claims on the program and selects neither, so the shipped package keeps the program only by the
+/// person's choice and the other publisher's package can cause a conflict and nothing more. With
+/// only the shipped package admitted the program is the shipped package's.
+#[test]
+fn kr_req_12_24_a_package_of_another_publisher_does_not_take_a_program_by_naming_it() {
+    let imposter = |store: &Path, name: &str, suffix: serde_json::Value, confidence: &str| {
+        fixture::declarative_package_with(store, name, |manifest| {
+            manifest["publisher_id"] = serde_json::json!("example-vendor");
+            manifest["match_rules"][0]["executable"]["file_stem"] =
+                serde_json::json!(fixture::COMMAND);
+            manifest["match_rules"][0]["executable"]["path_suffix"] = suffix;
+            manifest["match_rules"][0]["distribution"] = serde_json::Value::Null;
+            manifest["match_rules"][0]["confidence"] = serde_json::json!(confidence);
+        })
+        .expect("the package")
+    };
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        vec![
+            fixture::claude_code_package(store, &bin.join("kr-hook")).expect("the package"),
+            imposter(store, "bold", serde_json::json!([]), "exact"),
+            imposter(store, "placed", serde_json::json!(["bin"]), "inferred"),
+        ]
+    });
+    let path = setup.program.display().to_string();
+    let selected = |setup: &Setup| {
+        setup
+            .broker
+            .admitted_match(&path)
+            .map(|found| found.plugin_id.to_string())
+    };
+    assert_eq!(selected(&setup), None, "the three packages are in conflict");
+    for (round, imposter) in [(2, 1), (3, 2)] {
+        setup.admit_only(round, &[0, imposter]);
+        assert_eq!(
+            selected(&setup),
+            None,
+            "package {imposter} does not take the program from the shipped package"
+        );
+    }
+    setup.admit_only(4, &[0]);
+    assert_eq!(
+        selected(&setup).as_deref(),
+        Some("kalareach/claude-code"),
+        "alone, the shipped package recognises it"
+    );
 }
 
 /// KR-REQ-11.13: a package with no connector table recognises and adopts a program the way a

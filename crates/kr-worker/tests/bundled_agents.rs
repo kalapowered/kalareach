@@ -182,9 +182,15 @@ impl Setup {
     /// Places the stand-in as `command` and starts it as this process's own child, in a process
     /// group of its own, with the arguments the integration decided it runs with.
     fn typed(&self, command: &str, arguments: &[String]) -> (Typed, PathBuf) {
-        let bin = self.host.root().join("bin");
-        std::fs::create_dir_all(&bin).expect("a bin directory");
-        let program = bin.join(command);
+        self.typed_at(&format!("bin/{command}"), arguments)
+    }
+
+    /// Places the stand-in at `relative` under the host's tree and starts it as [`Self::typed`]
+    /// does.
+    fn typed_at(&self, relative: &str, arguments: &[String]) -> (Typed, PathBuf) {
+        let program = self.host.root().join(relative);
+        std::fs::create_dir_all(program.parent().expect("a directory to place it in"))
+            .expect("a directory for the program");
         kr_ipc::testing::place_program(
             &std::env::current_exe().expect("this test's own binary"),
             &program,
@@ -293,10 +299,8 @@ fn each_agent_name_typed_under_the_default_configuration_is_run_as_typed() {
 /// bundled adapter, which holds the observation the ceiling gives it and no right to act. Nothing
 /// of the adapter changes the program, its name or its arguments.
 ///
-/// Not claimed: OpenCode and Kimi Code CLI. The bundled repository ships two adapters that
-/// recognise `opencode` exactly and two that recognise `kimi`, and the worker adopts a program
-/// that two adapters recognise exactly by neither, so what it makes of those two commands is a
-/// fault of the catalogue and is not asserted here.
+/// Not claimed here: OpenCode and Kimi Code CLI, whose profiles share a command name; the cases
+/// below say what the worker makes of each.
 #[test]
 fn the_bundled_agents_with_one_adapter_that_recognises_them_run_as_typed_and_are_found_as_native_terminals()
  {
@@ -403,5 +407,79 @@ fn the_bundled_agents_with_one_adapter_that_recognises_them_run_as_typed_and_are
                 "{command}: no control surface the ceiling does not give: {acting:?}"
             );
         }
+    }
+}
+
+/// KR-REQ-12.21, KR-REQ-12.24: two products share the command `kimi`, and the worker tells them
+/// apart by where the program is installed, which is the evidence it has before it chooses a
+/// protocol. The program kimi.com's installer puts in `~/.kimi-code/bin` is found running as a
+/// native terminal instance of `kalareach/kimi-code-cli`; a `kimi` anywhere else is recognised by
+/// the name of two profiles that name no distribution the worker establishes, and is bound to
+/// neither.
+///
+/// Not claimed: MoonshotAI's `kimi-cli`, which a PyPI installation starts as a script under its
+/// interpreter, so the program the worker finds is the interpreter and no package recognises it.
+#[test]
+fn the_kimi_distribution_is_told_by_its_installation_location() {
+    let setup = Setup::new();
+    let (line, resolution) = decided("kimi");
+    let Resolution::Bypassed {
+        arguments, reason, ..
+    } = resolution
+    else {
+        panic!("kimi is run as typed under the default configuration");
+    };
+    assert_eq!(arguments, line, "the vector as typed");
+
+    let (typed, program) = setup.typed_at(".kimi-code/bin/kimi", &arguments[1..]);
+    let told = setup.adopt(&foreground(&typed, &program, reason));
+    assert_eq!(
+        told.len(),
+        1,
+        "the kimi.com build is found running: {told:?}"
+    );
+    assert_eq!(
+        told[0].mode,
+        IntegrationMode::NativeTerminal,
+        "the native terminal is the default"
+    );
+    assert_eq!(
+        told[0].plugin_id.as_ref().map(ToString::to_string),
+        Some("kalareach/kimi-code-cli".to_owned()),
+        "the profile of the distribution installed there"
+    );
+    let bound = setup
+        .broker
+        .live_bindings()
+        .into_iter()
+        .find(|live| live.application_instance_id == told[0].application_instance_id)
+        .expect("it is bound to its profile");
+    assert_eq!(
+        bound.release.package_digest,
+        setup.digest_of("kimi-code-cli"),
+        "bound to the shipped kimi-code-cli"
+    );
+
+    // Control: the same name anywhere else is claimed equally by both profiles, so neither is
+    // chosen for it. The terminal is all such a program has.
+    let elsewhere = setup.host.root().join("bin/kimi").display().to_string();
+    assert!(
+        setup.broker.admitted_match(&elsewhere).is_none(),
+        "a kimi outside the installation location is bound to no profile"
+    );
+}
+
+/// KR-REQ-12.19, KR-REQ-12.24: the two OpenCode profiles recognise one program identically, and the
+/// worker chooses neither for it: which API family a build serves is not told by its name, its
+/// version or its location.
+#[test]
+fn an_opencode_program_is_bound_to_neither_of_its_two_profiles() {
+    let setup = Setup::new();
+    for relative in ["bin/opencode", ".opencode/bin/opencode"] {
+        let path = setup.host.root().join(relative).display().to_string();
+        assert!(
+            setup.broker.admitted_match(&path).is_none(),
+            "{relative}: both profiles claim it equally"
+        );
     }
 }
