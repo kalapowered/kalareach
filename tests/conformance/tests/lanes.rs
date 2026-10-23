@@ -321,6 +321,54 @@ fn a_key_the_lane_ran_and_reported_nothing_of_is_failed_and_never_not_run() {
 }
 
 #[test]
+fn a_comment_above_a_case_keys_that_case_and_not_the_others_of_its_file() {
+    // OwnerAuthenticatorsTest.kt has four cases, and the comments above two of them name the row.
+    // The results are those Gradle wrote for the file.
+    let map = map_of(&fixtures().join("lanes"));
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    let document = assemble(
+        Platform::Linux,
+        &map,
+        &[executed(step(Platform::Linux), 0, Ok(junit("junit")))],
+    );
+    assert!(document.passed(), "{:?}", document.problems);
+    assert_eq!(
+        counts(&document, "KR-REQ-10.52"),
+        (Verdict::Passed, 2, 0, 0)
+    );
+    let named: Vec<&str> = document.identifiers["KR-REQ-10.52"]
+        .tests
+        .iter()
+        .map(|test| test.test.as_str())
+        .collect();
+    assert!(named.iter().all(|test| test.ends_with(
+        "OwnerAuthenticatorsTest.a_strong_biometric_is_asked_with_the_screen_lock_as_its_fallback_from_android_11"
+    ) || test.ends_with(
+        "OwnerAuthenticatorsTest.before_android_11_only_a_strong_biometric_on_a_locked_phone_is_asked"
+    )), "{named:?}");
+    // A case of the file that no comment names for the row does not fail it; it fails the run, and
+    // is listed among the failures outside any row.
+    let mut cases = junit("junit");
+    cases
+        .iter_mut()
+        .find(|case| case.name.starts_with("the_wait_is_the_time"))
+        .expect("a case of the file")
+        .outcome = LibtestOutcome::Failed;
+    let document = assemble(
+        Platform::Linux,
+        &map,
+        &[executed(step(Platform::Linux), 1, Ok(cases))],
+    );
+    assert!(!document.passed());
+    assert_eq!(
+        document.identifiers["KR-REQ-10.52"].verdict,
+        Verdict::Passed
+    );
+    assert_eq!(document.failures_outside_identifiers.len(), 1);
+    assert!(document.failures_outside_identifiers[0].contains("the_wait_is_the_time"));
+}
+
+#[test]
 fn a_case_the_lane_did_not_report_fails_the_rows_its_comment_names() {
     // The comment above a case names a case the tool never reported, as when the source reading
     // took a function for a test that the tool does not run. The row fails; it is not left to the
@@ -548,7 +596,7 @@ fn a_selection_without_the_phones_group_leaves_the_lane_files_out() {
     );
     assert!(document.identifiers.is_empty());
     let document = assemble(Platform::Linux, &map, &[]);
-    assert_eq!(document.identifiers.len(), 5);
+    assert_eq!(document.identifiers.len(), 6);
 }
 
 #[test]
