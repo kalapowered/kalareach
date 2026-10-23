@@ -113,10 +113,11 @@ names. A host that has established none, as the worker has not for a program it 
 reads every rule as `inferred`, whatever the rule declares: a name on disk says nothing about which
 product is installed. Where several packages recognise a program equally well, a rule that also
 names the installation location, by the path segments the program's directory ends with, outranks
-one that names only the executable, when one publisher published all the packages left. Two products
-of one publisher that share a command name are told apart this way, while both packages are
-admitted. Packages of different publishers that recognise a program equally well are a conflict,
-and neither is bound.
+one that names only the executable, when one publisher published all the packages left through one
+repository. Two products of one publisher that share a command name are told apart this way, while
+both packages are admitted. Packages of different publishers, or of one publisher's name from
+different repositories (each has a root of its own), that recognise a program equally well are a
+conflict, and neither is bound.
 
 ### Command integration
 

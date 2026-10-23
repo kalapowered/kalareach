@@ -71,18 +71,21 @@ pub(super) struct Admitted {
 
 impl Admitted {
     /// Returns the admitted package the software development kit's rule selects for a program at
-    /// `path`, with no selection made: an exact rule wins over an inferred one, a rule that names
-    /// the installation location over one that names only the executable, and a conflict selects
-    /// nothing.
+    /// `path`, with no selection made. The worker reads every rule as a guess, so a rule that names
+    /// the installation location outranks one that names only the executable, among the packages of
+    /// one publisher through one repository, and equal claims select nothing.
     fn selected_for(&self, path: &str) -> Option<Digest256> {
         let mut found: Vec<(Candidate, Digest256)> = Vec::new();
-        for (digest, (_, read)) in &self.packages {
+        for (digest, (package, read)) in &self.packages {
             let manifest = read.manifest();
             let plugin_id = manifest.plugin_id();
             for rule in &manifest.match_rules {
-                // The worker establishes no distribution for a program it finds running, so a rule
-                // that names one recognises the program by its name and location as a guess.
-                if let Some(candidate) = rule.candidate(&plugin_id, path, None) {
+                // The worker establishes no distribution for a program it finds running, so every
+                // rule recognises the program by its name and location as a guess. A publisher is
+                // vouched for by the enrolment of the repository the package came through.
+                if let Some(candidate) =
+                    rule.candidate(&plugin_id, &package.origin.enrolment_key, path, None)
+                {
                     found.push((candidate, *digest));
                 }
             }
@@ -309,8 +312,9 @@ impl Broker {
     }
 
     /// Returns the admitted package the software development kit's rule selects for a program at
-    /// `path`, and the frame that admits it: an exact rule beats an inferred one, and two packages
-    /// that both recognise it exactly select none.
+    /// `path`, and the frame that admits it: of the packages that recognise it the one whose rule
+    /// names the installation location is selected, among the packages of one publisher through
+    /// one repository, and packages that recognise it equally well select none.
     #[must_use]
     pub fn admitted_match(&self, path: &str) -> Option<AdmittedMatch> {
         let state = self.state();

@@ -1161,7 +1161,7 @@ fn a_version_no_signed_record_establishes_is_refused() {
 /// the package and whatever it is called, and the registration it installs starts the forwarder
 /// for that application and for no other. A package under another name that declares Claude Code
 /// and registers Claude Code's forwarder is applied; one that declares Claude Code and registers
-/// the forwarder for Gemini CLI is refused before anything is written, naming both; and one that
+/// the forwarder for Gemini CLI is refused before anything is written, naming Gemini CLI; and one that
 /// declares an application this host knows no directory for is refused by name.
 #[cfg(unix)]
 #[test]

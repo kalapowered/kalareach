@@ -116,9 +116,11 @@ impl<'a> MatchIndex<'a> {
             if !entry.accepts_new_bindings() {
                 continue;
             }
+            // An index is one repository's, so every entry has the one authority.
             candidates.extend(entry.match_rules.iter().filter_map(|rule| {
                 rule.candidate(
                     &entry.plugin_id,
+                    "",
                     &observation.executable_path,
                     observation.distribution.as_ref(),
                 )
