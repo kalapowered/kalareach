@@ -13,6 +13,8 @@
 #   * the application installs and its process runs on the simulator;
 #   * the web view's content process runs for it, which the system starts for the page the shell
 #     opens;
+#   * the screen shows the page: below the status bar it is more than a blank field, which is what
+#     the simulator shows until the page has loaded and drawn;
 #   * the system wrote no crash report for the application;
 #
 # and then saves a screenshot of the simulator's screen to the path given. Each wait ends when its
@@ -101,15 +103,51 @@ jobs_of_simulator() { xcrun simctl spawn "$udid" launchctl list 2> /dev/null; }
 app_runs() { jobs_of_simulator | awk -v id="UIKitApplication:$bundle_id" 'index($3, id) == 1 && $1 != "-" { found = 1 } END { exit !found }'; }
 wait_for "the application's process" app_runs
 
-content_runs() {
-    local jobs
-    jobs="$(jobs_of_simulator)"
-    case "$jobs" in
-        *com.apple.WebKit.WebContent*) return 0 ;;
-    esac
-    return 1
-}
+# The simulator's processes are processes of this machine, children of the simulator's own launchd:
+# the web view's content process is one of those children, as the application is.
+simulator_pid="$(ps -axo pid=,command= | awk -v udid="$udid" 'index($0, "launchd_sim") && index($0, "Devices/" udid "/") { print $1; exit }')"
+[ -n "$simulator_pid" ] || fail "no launchd_sim of the simulator $udid runs on this machine"
+content_runs() { ps -axo ppid=,command= | awk -v parent="$simulator_pid" '$1 == parent && index($0, "com.apple.WebKit.WebContent") { found = 1 } END { exit !found }'; }
 wait_for "the web view's content process" content_runs
+
+# A screenshot of the simulator, reduced by the system's own image tool to a bitmap the check can
+# read without a library: the page is drawn when more than half a percent of what lies below the
+# status bar differs from the colour that covers most of it.
+work="$(mktemp -d "${TMPDIR:-/tmp}/kr-ios-launch-screen.XXXXXX")"
+trap 'rm -f "${marker:?}"; rm -rf "${work:?}"; cleanup' EXIT
+screen_shows_the_page() {
+    xcrun simctl io "$udid" screenshot --type=png "$work/screen.png" > /dev/null 2>&1 || return 1
+    sips -Z 200 "$work/screen.png" --out "$work/screen.bmp" -s format bmp > /dev/null 2>&1 || return 1
+    python3 -I - "$work/screen.bmp" << 'PYTHON'
+import collections
+import struct
+import sys
+
+data = open(sys.argv[1], "rb").read()
+offset = struct.unpack_from("<I", data, 10)[0]
+width, height = struct.unpack_from("<ii", data, 18)
+bits = struct.unpack_from("<H", data, 28)[0]
+if bits not in (24, 32) or width <= 0 or height == 0:
+    sys.exit(1)
+step = bits // 8
+stride = (width * step + 3) // 4 * 4
+rows = abs(height)
+# Rows are stored bottom-up for a positive height: the status bar is the last 12 percent of them.
+pixels = []
+for row in range(rows):
+    stored = rows - 1 - row if height > 0 else row
+    if row < rows * 12 // 100:
+        continue
+    line = data[offset + stored * stride : offset + stored * stride + width * step]
+    pixels.extend(tuple(line[i : i + 3]) for i in range(0, len(line), step))
+if not pixels:
+    sys.exit(1)
+common = collections.Counter(pixels).most_common(1)[0][0]
+different = sum(1 for pixel in pixels if max(abs(a - b) for a, b in zip(pixel, common)) > 30)
+sys.exit(0 if different * 200 > len(pixels) else 1)
+PYTHON
+}
+wait_for "the screen to show the page" screen_shows_the_page
 
 crashes="$(find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 \( -name 'KalaReach*' -o -name 'companion*' \) -newer "$marker" 2> /dev/null)"
 [ -z "$crashes" ] || fail "the system wrote a crash report for the application: $crashes"

@@ -18,8 +18,7 @@
 #             simulator is named by its identifier, never by "booted", so a second simulator cannot
 #             change the target.
 #
-# The device is the caller's: this boots nothing and shuts nothing down. Locally, run it inside
-# `scripts/../lead-scripts/with-device.sh`'s lease with a device that command started.
+# The device is the caller's: this boots nothing and shuts nothing down.
 #
 # What runs, each case counted:
 #
