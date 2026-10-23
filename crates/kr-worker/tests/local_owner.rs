@@ -3307,6 +3307,10 @@ async fn the_local_owner_cancels_another_actors_intent_and_a_device_does_not() {
 /// Until it reads, what the worker hands the terminal waits in the kernel's small buffer and in
 /// the worker's own queue, and the part in the queue is what a fence of the lease discards. Every
 /// byte typed is then either in the file or counted as discarded.
+///
+/// It sets its terminal raw first and says so, and [`LateReader::start`] returns once it has: a
+/// terminal that is not raw yet holds what is typed to a line, and a line has room for only so many
+/// bytes, so what does not fit is dropped by the kernel and is neither kept nor counted.
 struct LateReader {
     _kept: tempfile::TempDir,
     received: std::path::PathBuf,
@@ -3319,18 +3323,26 @@ impl LateReader {
         let kept = tempfile::tempdir().expect("a directory for what the application keeps");
         let received = kept.path().join("received");
         let trigger = kept.path().join("trigger");
+        let ready = kept.path().join("ready");
         let made = std::process::Command::new("mkfifo")
             .arg(&trigger)
             .status()
             .expect("mkfifo runs");
         assert!(made.success(), "the trigger is made");
         let script = format!(
-            "stty raw -echo; cat {} >/dev/null; exec {} {}",
+            "stty raw -echo && : > {}; cat {} >/dev/null; exec {} {}",
+            kr_worker::testing::shell_quoted(&ready),
             kr_worker::testing::shell_quoted(&trigger),
             common::KEEPS_WHAT_IT_READS,
             kr_worker::testing::shell_quoted(&received)
         );
         let typing = Typing::start_with(&script).await;
+        within("the application to set its terminal raw", async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
         Self {
             _kept: kept,
             received,
@@ -3454,17 +3466,21 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
 
     let (arrived, release) = wired.service.stall_next_fence();
     // A regression leaves the fence holding what the keystrokes wait for. A thread of its own lets
-    // the fence go after a while, so that the case fails naming the wait instead of waiting with it.
+    // the fence go once the case has waited its liveness bound, so that the case fails naming the
+    // wait instead of waiting with it; it says so when it did, and the case asserts it did not.
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let let_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog = {
-        let (release, done) = (release.clone(), Arc::clone(&done));
+        let (release, done, let_go) = (release.clone(), Arc::clone(&done), Arc::clone(&let_go));
         std::thread::spawn(move || {
-            for _ in 0..1_000 {
+            let started = std::time::Instant::now();
+            while started.elapsed() < LIVENESS_DEADLINE {
                 if done.load(Ordering::Acquire) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            let_go.store(true, Ordering::Release);
             let _ = release.send(());
         })
     };
@@ -3478,7 +3494,7 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
         let mut accepted = 0_u64;
         for sequence in 0..BLOCKS {
             let written = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
+                LIVENESS_DEADLINE,
                 wired.type_for(
                     &mut phone,
                     2,
@@ -3502,6 +3518,11 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
     };
     let (revised, accepted) = tokio::join!(revising, typing);
     watchdog.join().expect("the watchdog ends");
+    assert!(
+        !let_go.load(Ordering::Acquire),
+        "the keystrokes were accepted while the fence held the session, not after the watchdog \
+         let it go"
+    );
     let () = revised;
     assert_eq!(
         accepted,
@@ -3537,7 +3558,7 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
         .discarded_bytes
         .get();
     starts_reading(trigger).await;
-    within("every byte to be kept or counted", async {
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
         loop {
             let delivered = kept(&received) as u64;
             if delivered + discarded == accepted {
@@ -3551,7 +3572,14 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "every byte to be kept or counted within {LIVENESS_DEADLINE:?}: {} kept, {discarded} \
+             discarded and {accepted} accepted",
+            kept(&received)
+        )
+    });
     assert!(
         discarded > 0,
         "the case is about bytes the application had not read, and none was left"
