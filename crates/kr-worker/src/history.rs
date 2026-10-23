@@ -2906,14 +2906,21 @@ mod tests {
         // The session is gone. What reads its output reads its times from the file.
         let read = crate::output_times::read(&times, 0, 24, 16).expect("the times");
         assert!(read.complete);
-        let first = read.marks.first().expect("a time for the output");
-        assert_eq!((first.from, first.to), (0, 24), "one burst is one interval");
-        assert!(first.proven);
-        assert!(
-            (before..=after).contains(&first.at_ms),
-            "{} is not in {before}..={after}",
-            first.at_ms
-        );
+        // How many intervals the two appends make depends on the time between them, which this
+        // does not control: an interval closes after two seconds. What does not depend on it is
+        // that the intervals cover every byte, one after the other, each timed inside the run.
+        let mut covered = 0;
+        for mark in &read.marks {
+            assert_eq!(mark.from, covered, "the intervals leave no byte untimed");
+            covered = mark.to;
+            assert!(mark.proven);
+            assert!(
+                (before..=after).contains(&mark.at_ms),
+                "{} is not in {before}..={after}",
+                mark.at_ms
+            );
+        }
+        assert_eq!(covered, 24, "the intervals cover all the output");
         std::fs::remove_dir_all(
             spool
                 .parent()
