@@ -16,10 +16,17 @@
 
 #[cfg(unix)]
 pub mod acting;
+mod ended;
 #[cfg(unix)]
 pub mod observing;
 
 use std::path::{Path, PathBuf};
+
+#[allow(
+    unused_imports,
+    reason = "each suite that includes this harness uses the part of it that it needs"
+)]
+pub use ended::{end_hosts, kill};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +35,6 @@ use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, Wor
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
-use kr_ipc::identity::ProcessState;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -202,30 +208,6 @@ pub fn platform_supervisor(
     }
 }
 
-/// Ends a process by the identity it was started under, after checking that it is still that
-/// process.
-pub fn kill(process: &ProcessStartIdentity) {
-    if kr_ipc::identity::process_state(process) != ProcessState::Running {
-        return;
-    }
-    let pid = process.pid.get();
-    #[cfg(unix)]
-    {
-        let pid =
-            rustix::process::Pid::from_raw(i32::try_from(pid).expect("a pid")).expect("a process");
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
-    #[cfg(windows)]
-    {
-        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
-            .join("System32")
-            .join("taskkill.exe");
-        let _ = std::process::Command::new(system)
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output();
-    }
-}
-
 /// Asks `check` until it answers, or the patience runs out.
 pub async fn until<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
 where
@@ -271,40 +253,8 @@ impl Drop for HostEnding {
         {
             hosts.push(published.process_start_identity);
         }
-        for host in &hosts {
-            kill(host);
-        }
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        // A host that has been read as ended is ended: the system numbers a process once, and a
-        // later reading of the same process can meet the moment its parent collects it, which the
-        // reader does not call an end. So each host is asked until it answers once that it has
-        // ended, and is not asked again.
-        let mut ended = vec![false; hosts.len()];
-        loop {
-            for (host, ended) in hosts.iter().zip(ended.iter_mut()) {
-                *ended = *ended || kr_ipc::identity::process_state(host) == ProcessState::Ended;
-            }
-            if ended.iter().all(|ended| *ended) || std::time::Instant::now() >= deadline {
-                break;
-            }
-            // A host the system could not be asked about is killed again once it answers.
-            for (host, _) in hosts.iter().zip(&ended).filter(|(_, ended)| !**ended) {
-                kill(host);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let running: Vec<String> = hosts
-            .iter()
-            .zip(&ended)
-            .filter(|(_, ended)| !**ended)
-            .map(|(host, _)| {
-                format!(
-                    "{}: {:?}",
-                    host.pid.get(),
-                    kr_ipc::identity::process_state(host)
-                )
-            })
-            .collect();
+        let running = end_hosts(&hosts, deadline);
         let jobs = self.environment.jobs_dir();
         let mut left = Vec::new();
         for label in labels {
