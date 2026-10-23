@@ -49,6 +49,11 @@ published. That is the thing the metadata exists to replace.
 
 ## What a sync does
 
+`catalogue.sync` synchronises one enrolled repository. It takes the environment and the repository,
+and answers the generation now active, how many entries its index carries, how many bytes the index
+is, how many payloads a full mirror fetched and the vendor delegations the generation carries. A
+sync does this:
+
 1. Fetch and verify root, timestamp, snapshot and targets metadata with the `tough` client, against
    the root this host adopted. It is the same exact release the publishing pipeline signs with, so
    the end that writes a generation and the end that reads one cannot drift into two readings of
@@ -284,7 +289,9 @@ Downloading the whole catalogue does not activate every module. Four separate fa
 a package runs against an application:
 
 - it is **installed** here, at one exact package hash;
-- it is **enabled** here, which is a separate decision from installing it;
+- it is **enabled** here, which is a separate decision from installing it, made with
+  `plugin.enable` and undone with `plugin.disable`, each of which takes the environment and the
+  package and answers the installation as it now stands;
 - it is **admitted**: supported on this host's operating system and architecture, whole in the
   store, within the package limits in force, and not revoked by its repository;
 - its declarative rules **recognise** what is running.
