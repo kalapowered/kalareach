@@ -1391,7 +1391,18 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
         !matches!(first, Admission::QueuedWithGap { .. }),
         "one observation of 64 KiB overflowed a 4 MiB queue"
     );
-    stop.reached().await;
+    assert!(
+        handle.queued_bytes() <= OBSERVATION_QUEUE_BYTES,
+        "the queue holds {} bytes, over its {OBSERVATION_QUEUE_BYTES} byte bound",
+        handle.queued_bytes()
+    );
+    // The wait ends when the pass stands. The bound only ends a pass that never comes.
+    assert!(
+        tokio::time::timeout(core::time::Duration::from_secs(60), stop.reached())
+            .await
+            .expect("the binding's pass stands at the stop"),
+        "the stop was replaced before a pass reached it"
+    );
     let mut gapped = false;
     for index in 1..=130 {
         let admission =
