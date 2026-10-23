@@ -260,9 +260,10 @@ fn listing_of(
 /// What the host on this computer lists of its devices, asked over the connection this application
 /// holds to it.
 ///
-/// A revocation withdraws the connections the host admitted before it, and the host answers every
-/// request on one with a refusal that says to open a new connection. It does not close it, so a
-/// connection that is held and not asked for what it is refused goes on being refused. When the
+/// A revision of the whole host withdraws the connections the host admitted before it, and the
+/// host answers every request on one with a refusal that says to open a new connection. A
+/// revocation of one device is not such a revision. The host does not close a withdrawn connection,
+/// so a connection that is held and not asked for what it is refused goes on being refused. When the
 /// host refuses this connection, it is asked again over another; when that lists, the refused
 /// connection was withdrawn, and `replace` puts the other in its place and ends it. A connection
 /// that has ended, because a caller held a copy of one that was replaced, is asked about the same
