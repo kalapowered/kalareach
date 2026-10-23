@@ -1735,6 +1735,36 @@ impl Registry {
         self.authority_revision()
     }
 
+    /// Advances the environment's authority revision to `floor`, or one past where it stands when
+    /// that is higher, and records the fence it owes.
+    ///
+    /// For a registry found behind the revision this host has issued to its feed: the numbers up to
+    /// the feed's belong to revocations this registry has no record of, so the next one it issues is
+    /// above them. One statement writes the revision and the debt, as
+    /// [`Self::advance_authority_revision`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
+    pub fn advance_authority_revision_to(
+        &mut self,
+        floor: AuthorityRevision,
+    ) -> Result<AuthorityRevision> {
+        self.connection
+            .execute(
+                "UPDATE environment
+                    SET authority_revision  = MAX(authority_revision + 1, ?2),
+                        fence_owed_revision = MAX(authority_revision + 1, ?2)
+                  WHERE environment_id = ?1",
+                params![
+                    self.environment_id.get().as_bytes().as_slice(),
+                    i64::try_from(floor.get()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        self.authority_revision()
+    }
+
     /// Returns the revision whose fence this environment still owes, when it owes one.
     ///
     /// The durable answer to "has every worker acknowledged the authority this host withdrew". It

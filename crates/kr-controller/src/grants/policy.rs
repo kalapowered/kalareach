@@ -716,6 +716,13 @@ pub struct HostPolicy {
     /// It is a fact about the feed and not a setting the owner chose, so it is not written with the
     /// policy: the feed's own record keeps it, and the daemon sets it here when it starts.
     feed_removed: bool,
+    /// True while the authority feed this host reads holds a revision above the registry's, so that
+    /// the registry, and the policy and its mirror with it, is an earlier state than one this host
+    /// issued.
+    ///
+    /// It is a fact found by comparing the feed with the registry and is not written with the
+    /// policy: the comparison is made again at every start and every pass of the feed.
+    behind_its_feed: bool,
 }
 
 /// The offline cell a policy starts with, before the daemon has anchored anything: a bound that has
@@ -763,6 +770,7 @@ impl HostPolicy {
             offline_cell: offline_cell(None),
             utc_floor: Arc::new(UtcFloor::default()),
             feed_removed: false,
+            behind_its_feed: false,
         }
     }
 
@@ -1224,6 +1232,7 @@ impl HostPolicy {
             offline_cell: offline_cell(stored.offline.0.as_ref()),
             utc_floor,
             feed_removed: false,
+            behind_its_feed: false,
         }
     }
 
@@ -1241,6 +1250,21 @@ impl HostPolicy {
     #[must_use]
     pub const fn feed_removed(&self) -> bool {
         self.feed_removed
+    }
+
+    /// Records whether the feed this host reads holds a revision above the registry's.
+    ///
+    /// While it does, every grant is refused for an ingress other than the owner at this machine:
+    /// a policy the registry restored is an earlier state than one this host issued, and what the
+    /// host would decide on it is not what it decided before.
+    pub const fn set_behind_its_feed(&mut self, behind: bool) {
+        self.behind_its_feed = behind;
+    }
+
+    /// Whether the feed this host reads holds a revision above the registry's.
+    #[must_use]
+    pub const fn behind_its_feed(&self) -> bool {
+        self.behind_its_feed
     }
 
     /// Chooses a bounded offline-validity policy for personal remote access.
@@ -1330,6 +1354,10 @@ impl HostPolicy {
         request: &AccessRequest,
         now_ms: u64,
     ) -> std::result::Result<PolicyIntersection, Refusal> {
+        // The person at this machine is never locked out by the feed, as the feed's removal keeps.
+        if self.behind_its_feed && request.ingress != ActorIngress::LocalIpc {
+            return Err(Refusal::BehindItsFeed);
+        }
         match grant.organisation.as_ref() {
             Some(requirement) => {
                 if self.feed_removed {

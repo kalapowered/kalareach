@@ -624,6 +624,202 @@ async fn a_host_that_stops_between_carrying_a_request_out_and_acknowledging_it_f
     drop(served);
 }
 
+/// A copy of the registry as it stands, taken while the daemon runs: the earlier state a registry
+/// is put back to.
+fn a_copy_of_the_registry(host: &Host, name: &str) -> std::path::PathBuf {
+    let registry = host.tree().environment().registry_database();
+    let copy = registry.with_file_name(name);
+    rusqlite::Connection::open(registry)
+        .expect("the registry opens")
+        .execute("VACUUM INTO ?1", [copy.display().to_string()])
+        .expect("the registry is copied");
+    copy
+}
+
+/// Puts a copy of the registry back where the registry stands, with the host stopped.
+fn put_the_registry_back(tree: &kr_ipc::testing::TempHost, copy: &std::path::Path) {
+    let registry = tree.environment().registry_database();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = registry.clone().into_os_string();
+        name.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(name));
+    }
+    std::fs::copy(copy, &registry).expect("the copy is put back");
+}
+
+/// Two devices paired, a copy of the registry taken, and the first revoked from the remote owner's
+/// feed, carried out and acknowledged as complete: the state a restore of the copy goes back past.
+struct Restorable {
+    rig: Rig,
+    revoked: (Device, kr_controller::service::net::devices::DeviceRecord),
+    kept: (Device, kr_controller::service::net::devices::DeviceRecord),
+    earlier: std::path::PathBuf,
+    revision: kr_protocol::ids::AuthorityRevision,
+}
+
+async fn a_revocation_the_registry_will_lose() -> Restorable {
+    let rig = Rig::start().await;
+    let revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-earlier.sqlite3");
+    let request = rig
+        .owner_publishes(0xb1, devices(revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+    let held = rig.held(&request).await;
+    let acknowledged = held.acknowledgement.0.as_ref().expect("acknowledged");
+    assert_eq!(acknowledged.completion, RevocationCompletion::Complete);
+    let revision = acknowledged.authority_revision;
+    Restorable {
+        rig,
+        revoked,
+        kept,
+        earlier,
+        revision,
+    }
+}
+
+/// KR-REQ-24.15: a registry put back to an earlier state, together with everything else of the
+/// host's that it holds, is found behind the feed, which still holds the revision the host issued.
+/// The host carries out again what the feed shows complete, raises the registry to the feed's
+/// revision in one barrier, and then decides again: the device that was revoked is refused, the one
+/// that was not is served, and the next revocation is numbered above everything the host issued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registry_put_back_to_an_earlier_state_is_raised_to_the_feed_and_carries_out_what_it_lost()
+ {
+    let Restorable {
+        rig,
+        revoked,
+        kept,
+        earlier,
+        revision,
+    } = a_revocation_the_registry_will_lose().await;
+
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+
+    assert!(
+        rig.host
+            .controller()
+            .authority_revision()
+            .await
+            .expect("a revision")
+            >= revision,
+        "the registry is raised to the revision the feed holds"
+    );
+    // Out before the handshake is over, or refused on its first request: never served.
+    rig.connects_while_a_revocation_is_held(&revoked.0, &revoked.1)
+        .await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the device that was not revoked is served");
+    let shown = rig.shown().await;
+    assert!(
+        shown
+            .check
+            .is_some_and(|check| !check.detail().contains("catching up")),
+        "the host has caught up"
+    );
+}
+
+/// KR-REQ-24.15: a host that cannot finish catching up with its feed refuses every remote grant
+/// while it cannot, says so, and decides again at the pass that does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pass_does() {
+    let Restorable {
+        rig, kept, earlier, ..
+    } = a_revocation_the_registry_will_lose().await;
+
+    // The restored registry refuses to move its revision, as one that cannot be written does.
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute_batch(
+                    "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision
+                         ON environment BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+                )
+                .expect("the fault is in place");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+
+    let shown = rig.shown().await;
+    assert!(
+        shown
+            .check
+            .is_some_and(|check| check.detail().contains("catching up")),
+        "the host says it is catching up"
+    );
+    let outcome = match paired_dial(&rig.host, &kept.0, &kept.1).try_dial().await {
+        Ok(transport) => {
+            let session =
+                kr_client::session::Session::start(Arc::new(transport)).expect("a session");
+            within("the host answers", rig.doctor_as(&session))
+                .await
+                .map(|_| ())
+        }
+        Err(error) => Err(error),
+    };
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("catching up")),
+        "a device is refused, and told why, while the host is behind its feed: {outcome:?}"
+    );
+
+    // The fault clears, and the pass that follows finishes what the first could not.
+    rusqlite::Connection::open(rig.host.tree().environment().registry_database())
+        .expect("the registry opens")
+        .execute_batch("DROP TRIGGER refuse_revision;")
+        .expect("the fault is cleared");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    rig.timer.release_held();
+    within("a pass finishes", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    rig.until_the_carrier_is_idle().await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the device is served once the host has caught up");
+}
+
+/// KR-REQ-24.15: a host whose registry stands at the feed's revision is not behind, and refuses
+/// nothing for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_whose_registry_stands_at_its_feed_is_not_behind_it() {
+    let Restorable {
+        rig,
+        kept,
+        revision,
+        ..
+    } = a_revocation_the_registry_will_lose().await;
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+    assert_eq!(
+        rig.host
+            .controller()
+            .authority_revision()
+            .await
+            .expect("a revision"),
+        revision,
+        "nothing moved the registry"
+    );
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session).await.expect("the device is served");
+}
+
 /// A different request under an identity the host already applied is refused as superseded once
 /// the feed has dropped the original, and nothing it names is withdrawn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

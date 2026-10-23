@@ -166,6 +166,10 @@ pub enum Refusal {
     /// lease, and personal remote access under a bounded offline-validity policy or on a host that
     /// is exclusively organisation-managed.
     AuthorityFeedRemoved,
+    /// The authority feed this host reads holds a revision above the registry's, so this host is
+    /// catching up with revocations its records do not have, and refuses every grant but the
+    /// owner's at this machine until it has.
+    BehindItsFeed,
     /// The decision reads this host's clock, and the clock floor it would stand on is owed its
     /// record, so it is not taken until the floor is written down
     /// ([`policy::UtcFloor::bound`]).
@@ -256,6 +260,11 @@ impl Refusal {
                 "the authority feed this host reads was removed, so grants that rest on it are \
                  refused until the owner acts at the host, by pointing `authority.origin` in its \
                  configuration document at another feed or at none"
+                    .to_owned()
+            }
+            Self::BehindItsFeed => {
+                "this host is catching up with its authority feed, which holds revocations its own \
+                 records do not, so it refuses remote access until it has"
                     .to_owned()
             }
             Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => FLOOR_UNRECORDED.to_owned(),

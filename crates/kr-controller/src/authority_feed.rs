@@ -177,6 +177,9 @@ struct Observed {
     /// Whether the host could not issue a revision because the feed holds a higher one than the
     /// registry has reached.
     unissued: bool,
+    /// Whether the feed holds a revision above the registry's, so that this host is catching up
+    /// with it and refuses every grant but the owner's at this machine until it has.
+    catching_up: bool,
     /// How many owners are paired beyond the keys the feed takes.
     unnamed_owners: usize,
 }
@@ -463,6 +466,15 @@ impl FeedRuntime {
                     None,
                 )
             };
+        let detail = if observed.catching_up {
+            detail.stated(
+                "; the feed holds a revision above this host's own records, so this host is \
+                 catching up with it and refuses every grant but the owner's at this machine until \
+                 it has",
+            )
+        } else {
+            detail
+        };
         let detail = if observed.unissued {
             detail.stated(
                 "; the feed holds a revision this host has not reached, so it cannot issue its own",
@@ -660,6 +672,7 @@ async fn pass(
     let mut contiguous = starting;
     let mut latest = None;
     let mut read_through = false;
+    let mut compared = false;
     for _ in 0..shared.most_pages.load(Ordering::SeqCst) {
         let state = shared
             .client
@@ -675,6 +688,16 @@ async fn pass(
             return Ok(Pass::Removed);
         }
         let mut now = Latest::of(&state);
+        // The feed's revision for this host, against the registry's, before a record is settled: a
+        // registry restored to an earlier state is behind a revision this host issued.
+        if !compared {
+            compared = true;
+            let behind = controller
+                .authority_feed_behind(now.revision)
+                .await
+                .map_err(Stopped::local)?;
+            shared.observed().catching_up = behind;
+        }
         for record in &state.records {
             if settle(shared, controller, record, &mut now).await? {
                 if contiguous {
@@ -708,6 +731,15 @@ async fn pass(
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
     if let Some(latest) = latest {
+        // A registry found behind the feed is raised to the feed's revision, in one barrier, before
+        // the feed is called read: until then what the host decides stands on an earlier state.
+        if controller.policy().behind_its_feed() {
+            controller
+                .authority_feed_caught_up(latest.revision)
+                .await
+                .map_err(Stopped::local)?;
+            shared.observed().catching_up = false;
+        }
         name_owners(shared, controller, &latest).await?;
     }
     controller.authority_feed_synchronised();
@@ -764,6 +796,15 @@ async fn settle(
     if let Some(held) = record.acknowledgement.0.as_ref()
         && held.completion == RevocationCompletion::Complete
     {
+        // A registry restored to an earlier state has lost what this host carried out for the
+        // request, which the feed still shows complete: it is carried out again, and carrying it
+        // out twice is carrying it out once.
+        if controller.policy().behind_its_feed() {
+            controller
+                .replay_feed_request(request)
+                .await
+                .map_err(Stopped::local)?;
+        }
         controller.authority_feed_settled(id, shared.host_device_id);
         return Ok(true);
     }
