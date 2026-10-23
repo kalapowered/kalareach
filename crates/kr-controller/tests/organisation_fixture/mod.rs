@@ -63,6 +63,15 @@ impl Fixture {
         Self::start_unenrolled_under(None).await
     }
 
+    /// Starts a daemon on the network settings `settings`, with an owner device and enrolled in
+    /// the organisation: a suite that restarts it and has it come back at the address it had names
+    /// that address.
+    pub async fn start_on(settings: kr_controller::service::net::config::NetworkSettings) -> Self {
+        let mut fixture = Self::start_unenrolled_with(None, 0, Some(settings)).await;
+        fixture.enrol().await;
+        fixture
+    }
+
     /// Starts a daemon that reads `document` as its configuration, with an owner device and
     /// enrolled in the organisation.
     pub async fn start_under(document: &ConfigurationDocument) -> Self {
@@ -92,13 +101,24 @@ impl Fixture {
         document: Option<&ConfigurationDocument>,
         offset: i64,
     ) -> Self {
+        Self::start_unenrolled_with(document, offset, None).await
+    }
+
+    async fn start_unenrolled_with(
+        document: Option<&ConfigurationDocument>,
+        offset: i64,
+        settings: Option<kr_controller::service::net::config::NetworkSettings>,
+    ) -> Self {
         let owner = DeviceKeys::generate().expect("keys");
         let continuous = ManualClock::new();
         let moved = Arc::new(AtomicI64::new(offset));
         let clocks = clocks_over(&continuous, &moved);
-        let host = match document {
-            Some(document) => Host::start_with_document_clocks(&owner, document, clocks).await,
-            None => Host::start_on_clocks(&owner, clocks).await,
+        let host = match (document, settings) {
+            (Some(document), _) => Host::start_with_document_clocks(&owner, document, clocks).await,
+            (None, Some(settings)) => {
+                Host::start_on_clocks_with_settings(&owner, clocks, settings).await
+            }
+            (None, None) => Host::start_on_clocks(&owner, clocks).await,
         };
         let now = kr_ipc::now_ms().get();
         let mut organisation = Organisation::new(0x21, now - 2 * DAY_MS);

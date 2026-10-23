@@ -39,6 +39,7 @@ pub mod error;
 pub mod export;
 pub mod hosts;
 pub mod inbox;
+pub mod lease;
 pub mod links;
 pub mod mailbox;
 pub mod owner;

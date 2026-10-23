@@ -38,6 +38,7 @@ pub const MINUTE_MS: u64 = 60 * 1000;
 pub const LEASE_MS: u64 = MEMBERSHIP_LEASE_MAX_LIFETIME_MS;
 
 /// An organisation's policy-signing authority, with the private half of every revision.
+#[derive(Clone)]
 pub struct Organisation {
     /// The organisation.
     pub organisation_id: OrganisationId,

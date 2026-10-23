@@ -218,6 +218,9 @@ pub struct Parts {
     /// The managed service this computer asks for an admission to reach a host through one of the
     /// service's relays before it has paired with it, when it asks any.
     pub managed: Option<ManagedService>,
+    /// What gives a host the membership lease this computer's grant on it needs, when it has any
+    /// such grant to hold.
+    pub leases: Option<crate::lease::LeaseDesk>,
 }
 
 /// The managed service a device asks to admit it through a relay, and how it reaches it.
@@ -267,6 +270,7 @@ impl Parts {
                 origin,
                 http: Arc::new(http),
             }),
+            leases: None,
         })
     }
 }
