@@ -11,6 +11,7 @@
 //! | KR-REQ-19.08 | the `kr_req_19_08_` tests here |
 //! | KR-REQ-23.24 | `kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_the_quote_of_what_was_read` |
 //! | KR-REQ-13.13 | `kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows_its_conversation_only_when_retargeted` |
+//! | KR-REQ-01.01 | `kr_req_01_01_a_phone_that_exited_finds_the_session_it_left_and_attaches_again` |
 
 #![cfg(unix)]
 
@@ -1293,6 +1294,114 @@ async fn kr_req_19_08_a_phone_draws_a_paired_hosts_terminal_and_types_into_it() 
         gone.is_ok(),
         "the daemon shows no attachment once the view is closed"
     );
+    adopted.stop().await;
+}
+
+/// KR-REQ-01.01: a session outlives the client that attached to it, and the companion's own screens
+/// attach again. A phone types a line into a paired host's session and exits: its view, its screen
+/// and its connection end, and the host's worker keeps the session and shows no attachment. The
+/// application then starts again over the same records and secrets, reaches the host it chose
+/// before, finds the session live, and its terminal view draws the line it left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_01_01_a_phone_that_exited_finds_the_session_it_left_and_attaches_again() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[
+            ActionRight::SessionView,
+            ActionRight::TerminalInput,
+            ActionRight::AgentPrompt,
+        ]),
+    )
+    .await;
+    let first = &phone.companion;
+    open(first, session, None, "first-run").expect("the session opens");
+    let view = open_view(first, session, "first-run", 11).expect("the view opens");
+    first
+        .state_where(11, |state| state["state"] == "showing")
+        .await;
+    first
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "take", "number": 1 } }),
+        )
+        .expect("the take is taken");
+    first
+        .state_where(11, |state| state["control"]["state"] == "controlling")
+        .await;
+    first
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "text", "take": 1, "text": "left-before-the-exit" } }),
+        )
+        .expect("the text is taken");
+    first
+        .state_where(11, |state| {
+            text_of(state)
+                .iter()
+                .any(|line| line.contains("left-before-the-exit"))
+        })
+        .await;
+
+    // The client exits: its view, its screen's link and its connection to the host all end, and it
+    // reaches the host no more.
+    control.unreachable(true);
+    first
+        .call("terminal_view_close", json!({ "view": view }))
+        .expect("the view closes");
+    leave(first, session, "first-run");
+    let (_, _, main) = first
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_snapshot()
+        .expect("a connection");
+    main.close();
+    tokio::time::timeout(WATCHDOG, async {
+        while worker.attachments() != 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host shows no attachment once the client has gone");
+
+    // The application starts again over the same records and secrets, and takes the host up.
+    let again = Companion::start(
+        phone.data.path(),
+        support::parts(Arc::clone(&phone.secrets), Arc::clone(&phone.room)),
+        Arc::new(support::NoOwner),
+        support::StubIntake::holding("", false),
+    );
+    companion_tauri::hosts::resume(again.app.handle());
+    connected(&again).await;
+
+    // The session is still the host's, live, and the screen attaches to it again.
+    let listed = again
+        .call(
+            "session_list",
+            json!({ "params": { "environment_id": null, "include_closed": false } }),
+        )
+        .expect("the host lists its sessions");
+    let sessions = listed["sessions"].as_array().expect("sessions");
+    assert!(
+        sessions
+            .iter()
+            .any(|each| each["session_id"] == session.to_string() && each["state"] == "live"),
+        "{listed}"
+    );
+    open(&again, session, None, "second-run").expect("the session opens again");
+    open_view(&again, session, "second-run", 11).expect("the view opens again");
+    again
+        .state_where(11, |state| {
+            text_of(state)
+                .iter()
+                .any(|line| line.contains("left-before-the-exit"))
+        })
+        .await;
+    assert_eq!(worker.attachments(), 1, "the new view's attachment alone");
     adopted.stop().await;
 }
 
