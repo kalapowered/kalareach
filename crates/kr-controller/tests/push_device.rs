@@ -705,6 +705,12 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         json!(answered_by_the_phone),
     );
     report.insert(
+        "answer_is_yes".to_owned(),
+        json!(record.as_ref().is_some_and(|record| {
+            record.answer == kr_protocol::question::QuestionAnswer::Decision { decided: true }
+        })),
+    );
+    report.insert(
         "answer_is_the_paired_devices".to_owned(),
         json!(
             record
@@ -990,6 +996,12 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         *states.entry(format!("{:?}", record.state)).or_default() += 1;
     }
     report.insert("burst_states".to_owned(), json!(states));
+    // The allowance a destination has until a plan gives it another: what the host accepts of a
+    // burst is that many, and the rest collapses into one update.
+    report.insert(
+        "burst_policy_burst".to_owned(),
+        json!(kr_protocol::push::FREE_PUSH_BURST),
+    );
     report.insert("burst_at_rest".to_owned(), json!(at_rest));
     report.insert(
         "burst_details".to_owned(),
