@@ -375,6 +375,18 @@ policy it holds.
 
 ## Capabilities and qualification
 
+`plugin.capabilities` reads where one installed package stands. It takes the environment and the
+package, and it answers the installation as `plugin.list` shows it, then two lists. The first has one
+entry for each capability the package asks for: the capability, who has to permit it, whether it is
+permitted as things stand, and the reason the package gave for needing it. The second has the
+evidence the host holds for each: the capability and its version, the revision of the record, what
+the record is about, its state, where the answer came from, the exact package hash it is about, the
+digest of the signed qualification profile it came from where one did, what makes it stale, what a
+person is told when the capability is not available, and when it was established. Evidence describes
+feasibility and never creates authority. An action still checks its grant and rechecks the record's
+revision on its own. The read needs no right, because what it describes is what this environment
+already runs.
+
 A repository ceiling stops thousands of passive downloads from becoming thousands of permission
 prompts. Past the default, each decision is somebody's and they are not interchangeable.
 
