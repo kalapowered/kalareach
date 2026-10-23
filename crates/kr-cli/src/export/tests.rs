@@ -41,8 +41,11 @@ enum Step {
 /// after every page that holds output and which no case scripts step by step.
 enum Times {
     /// A daemon of a release that does not list the method: it refuses as it refuses any method it
-    /// does not list.
+    /// does not list, and answers a page asked after the refusal.
     Unlisted,
+    /// A daemon whose grant has lost its right: it refuses the method with the same code, and a
+    /// page asked after the refusal as well.
+    Withdrawn,
     /// A daemon that records times: the intervals, as first cursor, cursor after the last byte and
     /// wall-clock reading.
     Recorded(Vec<(u64, u64, u64)>),
@@ -57,6 +60,9 @@ struct Scripted {
     steps: VecDeque<Step>,
     asked: Vec<(Method, ParamsValue)>,
     times: Times,
+    /// Whether the last question about when output was written was refused, so that the next page
+    /// asked is the export asking again what it was just refused, and not a page of the output.
+    refused_times: bool,
 }
 
 impl Scripted {
@@ -65,6 +71,7 @@ impl Scripted {
             steps: steps.into(),
             asked: Vec::new(),
             times: Times::Unlisted,
+            refused_times: false,
         }
     }
 
@@ -122,11 +129,34 @@ impl Link for Scripted {
         params: &T,
     ) -> Result<Answer> {
         let encoded = ParamsValue::from_typed(params).expect("parameters encode");
+        // The one-byte page asked straight after a refusal of the times, to tell a daemon that does
+        // not list the method from a grant that lost its right, is not a page of the output. The
+        // export asks for pages of at least eight kilobytes, and one more byte only once it has
+        // stopped, so a page of one byte right after a refusal is that question.
+        if method == Method::HistoryPage {
+            let verifying = std::mem::take(&mut self.refused_times)
+                && encoded
+                    .to_typed::<HistoryPageParams>()
+                    .is_ok_and(|asked| asked.max_bytes.get() == 1);
+            if verifying {
+                return Ok(match self.times {
+                    Times::Withdrawn => Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this grant no longer holds the right",
+                    )),
+                    _ => match end(0) {
+                        Step::Ok(_, answer) => Ok(answer),
+                        Step::Refuses(..) => unreachable!("a page that is answered"),
+                    },
+                });
+            }
+        }
         self.asked.push((method, encoded.clone()));
         if method == Method::HistoryTimes {
             let asked: HistoryTimesParams = encoded.to_typed().expect("times parameters");
+            self.refused_times = matches!(self.times, Times::Unlisted | Times::Withdrawn);
             return Ok(match &self.times {
-                Times::Unlisted => Err(ProtocolError::new(
+                Times::Unlisted | Times::Withdrawn => Err(ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "the method is not in the registry",
                 )),
@@ -1371,6 +1401,36 @@ async fn a_daemon_that_does_not_record_times_gives_a_file_without_them_and_no_re
         .await
         .expect_err("a refusal of its own is the answer");
     assert!(matches!(failed, CliError::Refused(_)), "{failed}");
+}
+
+/// KR-REQ-25.25: a refusal of the times that is the refusal of the grant is not read as a daemon
+/// that does not know the method. The read is asked of the daemon again as a page of the same
+/// session, and where that is refused too the refusal is the answer, whatever the export would have
+/// asked next.
+#[tokio::test]
+async fn a_grant_that_lost_its_right_is_not_read_as_a_daemon_of_an_earlier_release() {
+    let mut daemon = Scripted::new(Vec::new()).with_times(Times::Withdrawn);
+    let refused = Pages {
+        link: &mut daemon,
+        session_id: session_id(),
+    }
+    .times(0, 3)
+    .await
+    .expect_err("the grant's refusal is the answer");
+    assert!(
+        matches!(&refused, CliError::Refused(refusal) if refusal.code == ErrorCode::PermissionDenied),
+        "{refused}"
+    );
+
+    let mut daemon = Scripted::new(Vec::new()).with_times(Times::Unlisted);
+    let unlisted = Pages {
+        link: &mut daemon,
+        session_id: session_id(),
+    }
+    .times(0, 3)
+    .await
+    .expect("a daemon that does not know the method gives none");
+    assert!(unlisted.unavailable.0.is_some(), "{unlisted:?}");
 }
 
 /// A daemon that has the session and no record of its times says so, and the file names the host's
