@@ -120,7 +120,7 @@ const IDLE_SESSION_BYTES: usize = 4 * 1024 * 1024;
 /// subscriber's queue, so a view costs a few kibibytes rather than a screen.
 const IDLE_VIEW_BYTES: usize = 16 * 1024;
 
-/// KR-PERF-003: an idle session and an installed view hold what they are supposed to hold.
+/// An idle session and an installed view hold what they are supposed to hold.
 #[test]
 fn an_idle_session_and_an_installed_view_hold_what_they_are_supposed_to() {
     let (engine, session) = held_by(|| {

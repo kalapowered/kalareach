@@ -1046,7 +1046,7 @@ mod tests {
         );
     }
 
-    /// KR-PERF-003: a session's worker holds a scheduler thread per processor up to four, and no
+    /// A session's worker holds a scheduler thread per processor up to four, and no
     /// more on a larger host, so a worker's scheduler threads do not grow with the host.
     #[test]
     fn a_workers_runtime_has_a_scheduler_thread_per_processor_up_to_four() {

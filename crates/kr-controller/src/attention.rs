@@ -6864,7 +6864,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// KR-PERF-003: a complete page that carries no record, from a session whose origin has no
+    /// A complete page that carries no record, from a session whose origin has no
     /// timer, is neither written to the store nor does it wake the maintenance loop: an idle
     /// session's worker answers its held request with one every thirty seconds, and each of them
     /// used to commit twice and make the loop commit a third time. The control is the same
@@ -6951,7 +6951,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// KR-PERF-003: a store that another process has taken is still found by the page that comes
+    /// A store that another process has taken is still found by the page that comes
     /// after the taking and stops the link, as it was before an empty page was taken without a
     /// write: the quiet path does not read a store it cannot read as one with nothing to decide.
     #[tokio::test(flavor = "multi_thread")]
@@ -7125,7 +7125,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// KR-PERF-003: the store's reading of the workflow journal keeps no timer, and the one pass it
+    /// The store's reading of the workflow journal keeps no timer, and the one pass it
     /// makes when it starts is the only one while the journal brings no attention record: not for
     /// the registration that pass writes, and not for what another reader of the journal writes
     /// (a second consumer's registration). Every pass reads the host's clock, so a pass nothing
@@ -7148,7 +7148,7 @@ pub(crate) mod tests {
         assert_eq!(passes(), 1, "a change that brings no record made no pass");
     }
 
-    /// KR-PERF-003: a pass over the workflow journal that writes and then fails, every time, is
+    /// A pass over the workflow journal that writes and then fails, every time, is
     /// made once in each interval, and when the cause is taken away without a write to the journal
     /// the next try finds it. The trigger refuses the store's subscription after its consumer's row
     /// is written, so each pass counts a change in the journal and fails with it rolled back, and
@@ -7261,7 +7261,7 @@ pub(crate) mod tests {
         assert_eq!(items(&module), 1, "the pause is in the inbox");
     }
 
-    /// KR-PERF-003: the store reads the workflow journal's records on the journal's signal and has
+    /// The store reads the workflow journal's records on the journal's signal and has
     /// no deadline of its own for them. That rests on one property of what those records raise,
     /// which this holds for the records the journal writes: once the store has read them and
     /// certified the environment, none of the environment's items waits for a time, whether the

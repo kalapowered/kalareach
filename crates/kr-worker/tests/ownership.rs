@@ -13,7 +13,6 @@
 //! | --- | --- |
 //! | KR-REQ-07.60 | the observation records the root shell, a job, a job that called `setsid`, and a process the worker adopted when its parent exited, and not a process of the worker's own; a process adopted while the observation runs, and one left in the session after the root shell has gone, are found too |
 //! | KR-REQ-07.66 | the worker's own close hangs up on what it recorded and, after the grace period, ends what ignored the hangup, each through the hold the platform gives on the recorded process |
-//! | KR-PERF-003 | an idle session's observation reads no process outside the worker's own tree, so what it costs does not grow with the processes on the host |
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
@@ -305,11 +304,11 @@ fn kr_req_07_60_an_observation_made_on_a_copy_does_not_undo_a_newer_one_when_put
     tree.end();
 }
 
-/// KR-PERF-003: an idle session's observation reads nothing about any process outside the worker's
+/// An idle session's observation reads nothing about any process outside the worker's
 /// own tree. Every session asks it on each idle sweep, so a reading that went through every process
 /// on the host would cost each session as much as the host had processes.
 #[test]
-fn kr_perf_003_an_idle_sessions_observation_reads_no_process_outside_its_own_tree() {
+fn an_idle_sessions_observation_reads_no_process_outside_its_own_tree() {
     let _turn = turn();
     let mut tree = Tree::start(KINDS, 3);
     // The worker, the root shell and what the root shell started are this worker's tree; nothing
