@@ -553,6 +553,10 @@ impl Device {
             let _ = std::fs::remove_file(&self.use_file);
         }
         lock(&self.contact).remove(&host);
+        // A lease kept for a host this computer forgot is not one a later pairing with it may reuse.
+        if let Some(leases) = &self.leases {
+            leases.forget(host);
+        }
         (self.changed)();
         Ok(was_in_use)
     }

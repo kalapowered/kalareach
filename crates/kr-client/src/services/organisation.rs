@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_protocol::account::{MembershipLease, PolicyAuthority};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::OrganisationId;
 use kr_protocol::scalars::{AuthorisationKey, to_base64url};
 use serde::Deserialize;
@@ -26,6 +27,7 @@ use super::relay::ServiceHttp;
 use super::signed::{Repeat, data_or_refusal, unreadable_answer};
 use super::{ServiceFuture, unconfigured};
 use crate::error::{ClientError, Result};
+use crate::retry::UserAction;
 use crate::shown::Shown;
 
 /// What the organisation's service signed for a device, and when to ask again.
@@ -132,8 +134,29 @@ impl ManagedMembershipLeaseService {
     }
 
     /// The `authorization` header value a request carries.
+    ///
+    /// An account that is not signed in, whose sign-in has ended, or whose sign-in was not granted
+    /// the lease scope has no token to ask with, and asking for the sign-in again is what mends
+    /// each. The token source says so as a failure of this device's own, which this turns into the
+    /// refusal that names the action; a failure to read or renew a token stays as it was.
     async fn authorisation(&self) -> Result<String> {
-        let token = self.tokens.token(LEASE_SCOPE).await?;
+        let token = match self.tokens.token(LEASE_SCOPE).await {
+            Ok(token) => token,
+            Err(ClientError::Host(refusal))
+                if matches!(
+                    refusal.code,
+                    ErrorCode::HostNotConfigured | ErrorCode::PermissionDenied
+                ) =>
+            {
+                return Err(ClientError::Refused {
+                    error: refusal,
+                    retry_after_seconds: None,
+                    action: UserAction::SignIn,
+                    service_code: None,
+                });
+            }
+            Err(other) => return Err(other),
+        };
         // The one place the token is read. It goes into a header value and nowhere else.
         Ok(format!("Bearer {}", token.expose()))
     }

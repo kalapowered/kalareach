@@ -57,13 +57,18 @@ use crate::transport::{ControlTransport, NetworkTransport};
 
 /// Why a call to a host did not answer.
 ///
-/// What it says is the host's own refusal, through [`Shown::protocol`], or which of the other two
-/// it was. The text those two carry is not said: this library puts only what a reducer decided
-/// there, and anything else that builds one can put any text there.
+/// What it says is the host's own refusal or the membership failure, through [`Shown::protocol`],
+/// or which of the other two it was. The text those two carry is not said: this library puts only
+/// what a reducer decided there, and anything else that builds one can put any text there.
 #[derive(Clone, PartialEq, Eq)]
 pub enum LinkError {
     /// The host answered with a refusal of its own.
     Refused(ProtocolError),
+    /// The device could not give the host the membership lease it needs on a connection, and the
+    /// host was not asked: the organisation's service or this device's own account said no. It is
+    /// no word of the host's, so a caller that reads a refusal as the host's decision about what
+    /// it asked does not read this as one.
+    Membership(ProtocolError),
     /// The host could not be reached, or the connection to it ended.
     Lost(String),
     /// The network configuration a host gave could not be used.
@@ -85,6 +90,7 @@ impl Said for LinkError {
                 error.code,
                 Shown::protocol(error)
             ),
+            Self::Membership(error) => Shown::protocol(error),
             Self::Lost(_) => Shown::said("the host could not be reached"),
             Self::Configuration(_) => {
                 Shown::said("the host's network configuration cannot be used")
@@ -245,7 +251,8 @@ pub trait HostLink: Send + Sync {
     /// A device whose grant answers to an organisation is refused every other method until the host
     /// holds a membership lease the organisation signed for it, and no lease survives a host's
     /// restart. A link that holds the account the lease is asked for with presents it here. The
-    /// default asks for nothing: a host whose grant answers to no organisation needs none.
+    /// default asks for nothing: a host whose grant answers to no organisation needs none. A link
+    /// that wraps another forwards this call, or the connections it makes present no lease.
     ///
     /// # Errors
     ///

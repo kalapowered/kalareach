@@ -184,7 +184,7 @@ impl Pairing {
             }
             // Whether the host locked the invitation is unknown; asking is how to find out, on a
             // connection of its own.
-            Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+            Err(LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Membership(_)) => {
                 drop(preauth);
                 drop(connection);
                 return self.await_approval(pending, None, progress).await;
@@ -205,7 +205,7 @@ impl Pairing {
 fn reached(error: &LinkError) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, true),
-        LinkError::Lost(_) => FailureKind::HostUnreachable,
+        LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
         LinkError::Configuration(_) => FailureKind::NotAnInvitation,
     };
     PairingFailure::new(kind, error.said())
