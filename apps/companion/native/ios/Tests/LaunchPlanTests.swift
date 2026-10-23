@@ -125,4 +125,14 @@ final class LaunchPlanTests: XCTestCase {
         let later = try XCTUnwrap(UNAuthorizationStatus(rawValue: 99))
         XCTAssertEqual(PushPermission(status: later), .unknown)
     }
+
+    func testTheDelegatesAreTheActionsASetupBeforeTheLaunchEndsCarriesOut() {
+        let plan = LaunchPlan.decide(debugMode: nil, firebase: .usable, permission: .unknown)
+        XCTAssertEqual(plan.filter(\.setsADelegate), [.addDelegateMethods, .hearNotificationTaps])
+        XCTAssertEqual(
+            LaunchPlan.decide(debugMode: nil, firebase: .unusable("no file"), permission: .granted).filter(\.setsADelegate),
+            [.addDelegateMethods, .hearNotificationTaps],
+            "whatever Firebase does and whatever the person answered"
+        )
+    }
 }

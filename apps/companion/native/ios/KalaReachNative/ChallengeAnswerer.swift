@@ -69,9 +69,13 @@ final class ChallengeAnswerer {
     func answer(_ data: [String: String], then done: @escaping (ChallengeOutcome) -> Void) {
         let now = clock()
         var input: [String: Any] = ["data": data, "now_ms": now]
-        input["pending"] = record.read(nowMilliseconds: now)
+        let pending = record.read(nowMilliseconds: now)
             .flatMap { $0.data(using: .utf8) }
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull()
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) }
+        input["pending"] = pending ?? NSNull()
+        // The registration this answer is for: the one the decision is made against, so that what
+        // becomes of the answer is written to that registration's record and to no later one.
+        let registrationId = ((pending as? [String: Any])?["registration_id"] as? String) ?? ""
         guard
             let body = try? JSONSerialization.data(withJSONObject: input),
             let text = String(data: body, encoding: .utf8),
@@ -97,14 +101,14 @@ final class ChallengeAnswerer {
             case .unreachable:
                 done(.retry("unreachable"))
             case .status(let code) where (200...299).contains(code):
-                record.mark(state: PendingFile.answered, reason: nil, nowMilliseconds: clock())
+                record.mark(registrationId: registrationId, state: PendingFile.answered, reason: nil, nowMilliseconds: clock())
                 done(.answered)
             // The gateway answered and will not take it, or is not able to now. The second is
             // asked again inside the deadline; the first would be refused again.
             case .status(let code) where code == 408 || code == 429 || code >= 500:
                 done(.retry("status_\(code)"))
             case .status(let code):
-                record.mark(state: PendingFile.refused, reason: "gateway_\(code)", nowMilliseconds: clock())
+                record.mark(registrationId: registrationId, state: PendingFile.refused, reason: "gateway_\(code)", nowMilliseconds: clock())
                 done(.gatewayRefused(code))
             }
         }
