@@ -4,7 +4,8 @@
  * Every host, every session, one list. The kinds are told apart three ways at once, because one way
  * is never enough: a word, a tone, and the sentence underneath. A host that cannot be reached is
  * drawn as exactly that, is never counted among the failures, and says in so many words that its
- * sessions may still be running.
+ * sessions may still be running. A host that answers and refuses is another thing: it is in contact,
+ * it said no, and its row gives the host's words and what the person can do about them.
  *
  * The host in use is read with the page's own reads; every other host this phone is paired with is
  * visited by native code (`useOtherHosts`), and its rows are named by the host they are from. What
@@ -24,7 +25,7 @@ import type { AttentionReadResult } from '@kalareach/protocol'
 import { Banner, Button, Sheet } from '../../components/ui'
 import { readOnCadence } from '../../app/cadence'
 import { useApp } from '../../app/state'
-import { failureMessage, watch, type Watch } from '../../host/port'
+import { failureMessage, watch, type HostError, type Watch } from '../../host/port'
 import {
   addCounts,
   ATTENTION_READ_CADENCE_MS,
@@ -37,6 +38,7 @@ import {
   order,
   orderAcrossHosts,
   readWholeInbox,
+  refusalWords,
   type AttentionCounts,
   type AttentionFilter,
   type HostedRow,
@@ -85,6 +87,13 @@ interface Contact {
   readonly sinceMs: number | null
   /** When the rows listed for this host were read, while any are. */
   readonly rowsReadAtMs: number | null
+}
+
+/** A host that answered and refused to show its inbox, as the inbox draws it. */
+interface Refusal {
+  readonly host: HostTag
+  /** What the host refused with. */
+  readonly refusal: HostError | null
 }
 
 /** No counts. */
@@ -248,6 +257,19 @@ export function Inbox({
     return lost
   }, [connection, inUseName, inUse, here, others.hosts, others.lastRead])
 
+  // The hosts that answered and refused: they are in contact, so they are not among the hosts out
+  // of contact, and nothing of what they held before is listed.
+  const refusals = useMemo<readonly Refusal[]>(
+    () =>
+      (others.hosts ?? [])
+        .filter((visit) => visit.state === 'refused')
+        .map((visit) => ({
+          host: { reference: visit.reference, name: visit.name },
+          refusal: visit.refusal
+        })),
+    [others.hosts]
+  )
+
   const counts = useMemo(() => {
     let total = here === null ? NOTHING : count(here.result)
     for (const visit of others.hosts ?? []) {
@@ -264,6 +286,8 @@ export function Inbox({
   const notes = useMemo(() => (here ? inboxNotes(here.result) : []), [here])
   const shown = chosen === 'all' ? hosted : hosted.filter((each) => each.row.kind === chosen)
   const showContacts = chosen === 'all' || chosen === 'disconnected'
+  // A refusal is no kind of item, so it is listed with everything and under no other filter.
+  const showRefusals = chosen === 'all' && refusals.length > 0
   const whereOf = (entry: HostedRow): string => {
     const sessionId = entry.row.item.session_id
     const named = several ? `${entry.host.name} · ` : ''
@@ -364,7 +388,31 @@ export function Inbox({
         </ul>
       ) : null}
 
-      {shown.length === 0 && !(showContacts && contacts.length > 0) ? (
+      {showRefusals ? (
+        <ul className="m-list" data-testid="inbox-refusals">
+          {refusals.map((each) => (
+            <li key={each.host.reference}>
+              <div
+                className="m-row"
+                data-tone="warning"
+                data-kind="refused"
+                data-host={each.host.name}
+                data-testid="inbox-refusal"
+                style={{ minBlockSize: target }}
+              >
+                <span className="m-row-head">
+                  <span className="m-row-kind">Refused</span>
+                  <span className="m-row-where">{each.host.name}</span>
+                </span>
+                <span className="m-row-title">{each.host.name} refused to show its inbox</span>
+                <span className="m-row-detail">{refusalWords(each.refusal)}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      {shown.length === 0 && !(showContacts && contacts.length > 0) && !showRefusals ? (
         <p className="m-empty">
           {here !== null ? emptyMessage(chosen) : 'Reading the inbox…'}
         </p>

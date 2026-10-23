@@ -17,7 +17,7 @@ import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
-import type { HostInbox, HostRow } from '../../src/host/port'
+import type { HostError, HostInbox, HostRow } from '../../src/host/port'
 import { MobileApp } from '../../src/mobile/MobileApp'
 
 afterEach(() => {
@@ -81,6 +81,7 @@ function laptopRead(): HostInbox {
     state: 'read',
     read_at_ms: Date.now(),
     lost_since_ms: null,
+    refusal: null,
     result: inboxOf([
       item({
         key: 'attention.pending_approval|~laptop-1',
@@ -106,6 +107,21 @@ function lostLaptop(sinceMs: number): HostInbox {
     state: 'out_of_contact',
     read_at_ms: null,
     lost_since_ms: sinceMs,
+    refusal: null,
+    result: null,
+    sessions: []
+  }
+}
+
+/** What a visit finds of the laptop when it answers and refuses: the host is in contact. */
+function refusingLaptop(refusal: HostError): HostInbox {
+  return {
+    reference: LAPTOP.reference,
+    name: 'laptop',
+    state: 'refused',
+    read_at_ms: null,
+    lost_since_ms: null,
+    refusal,
     result: null,
     sessions: []
   }
@@ -170,6 +186,60 @@ describe('the inbox of a phone paired with two hosts', () => {
     // It is counted as out of contact and not among the failures.
     expect(screen.getByRole('button', { name: /^Out of contact \(\d+\)$/ })).toBeInTheDocument()
     expect(contact).not.toHaveAttribute('data-kind', 'failed_action')
+  })
+
+  // KR-REQ-13.01: a host that answers and refuses is not out of contact. It is drawn as having
+  // refused, in the host's words and with what the person can do, and is never counted as lost.
+  it('draws a host that refused the visit as having refused, not as out of contact', async () => {
+    const { controls } = start()
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(2)
+    })
+    // The count of hosts out of contact, as it stands while the laptop answers: the host in use
+    // lists one of its own.
+    const outBefore = screen.getByRole('button', { name: /^Out of contact \(/ }).textContent
+    controls.setInboxHosts([
+      refusingLaptop({
+        code: 'PERMISSION_DENIED',
+        message: 'this device is no longer paired with this host',
+        user_action: 'pair_again'
+      })
+    ])
+    readNow()
+    const refusal = await screen.findByTestId('inbox-refusal')
+    expect(refusal).toHaveAttribute('data-kind', 'refused')
+    expect(refusal).toHaveAttribute('data-host', 'laptop')
+    expect(refusal).toHaveTextContent('laptop refused to show its inbox')
+    // The host's own words, and what the person can do about them.
+    expect(refusal).toHaveTextContent('this device is no longer paired with this host')
+    expect(refusal).toHaveTextContent('Pair this device with the host again.')
+    // The host answered: the row says so, and does not say that contact is gone.
+    expect(refusal).not.toHaveTextContent(/No contact/)
+    expect(screen.queryByTestId('inbox-contact')).toBeNull()
+    expect(refusal).toHaveTextContent('may still be running')
+    // Not counted as out of contact, and not among the failures. What the host held before it
+    // refused is not listed: the host decided this phone is not shown its inbox.
+    expect(screen.getByRole('button', { name: /^Out of contact \(/ }).textContent).toBe(outBefore)
+    expect(refusal).not.toHaveAttribute('data-kind', 'failed_action')
+    expect(rowsOf('laptop')).toHaveLength(0)
+  })
+
+  it('stops drawing the refusal once the host shows its inbox again', async () => {
+    const { controls } = start()
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(2)
+    })
+    controls.setInboxHosts([
+      refusingLaptop({ code: 'PERMISSION_DENIED', message: 'not for this device', user_action: 'nothing' })
+    ])
+    readNow()
+    await screen.findByTestId('inbox-refusal')
+    controls.setInboxHosts([laptopRead()])
+    readNow()
+    await waitFor(() => {
+      expect(screen.queryByTestId('inbox-refusal')).toBeNull()
+    })
+    expect(rowsOf('laptop')).toHaveLength(2)
   })
 
   it('draws the host in use as out of contact when it stops answering, and shows no generic failure', async () => {

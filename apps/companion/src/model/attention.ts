@@ -15,7 +15,7 @@
 
 import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
-import { failureCode } from '../host/port'
+import { failureCode, failureMessage, type HostError } from '../host/port'
 
 /**
  * How long after one read of the inbox the next starts while it is shown.
@@ -262,6 +262,15 @@ export function contactWords(sinceMs: number | null, nowMs: number): string {
   const lost =
     sinceMs === null ? 'No contact.' : `No contact for ${describeElapsed(nowMs - sinceMs)}.`
   return `${lost} Its sessions may still be running; nothing here says they are not.`
+}
+
+/**
+ * What the inbox says of a host that answered and refused to show its inbox: the host's own words
+ * and what the person can do, then that this is not lost contact and says nothing of its sessions.
+ */
+export function refusalWords(refusal: HostError | null): string {
+  const said = refusal === null ? 'It did not say why.' : failureMessage(refusal)
+  return `${said} It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not.`
 }
 
 /** The counts of two inboxes together. */

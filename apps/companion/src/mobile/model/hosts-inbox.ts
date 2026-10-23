@@ -3,9 +3,9 @@
  *
  * The inbox is one across hosts. The host in use is read with the page's own reads; every other host
  * this phone is paired with is visited by native code over a connection of its own, and what each
- * said arrives here whole: its inbox and its sessions' numbers, or that this phone is out of contact
- * with it and since when. The visits are read on a cadence while the inbox is shown, and nowhere
- * else, so nothing is asked of a host the person is not looking at.
+ * said arrives here whole: its inbox and its sessions' numbers, that it answered and refused, or that
+ * this phone is out of contact with it and since when. The visits are read on a cadence while the
+ * inbox is shown, and nowhere else, so nothing is asked of a host the person is not looking at.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -68,11 +68,17 @@ export function useOtherHosts(): OtherHosts {
           if (!live) return
           setHosts(visits)
           // A host this phone no longer visits keeps nothing; one that answered replaces what was
-          // kept of it; one that did not leaves it as it was.
+          // kept of it; one that did not answer leaves it as it was; one that refused took its
+          // inbox back, and nothing of it is kept.
           setLastRead((held) => {
             const next = new Map<string, HostInbox>()
             for (const each of visits) {
-              const kept = each.state === 'read' ? each : held.get(each.reference)
+              const kept =
+                each.state === 'read'
+                  ? each
+                  : each.state === 'refused'
+                    ? undefined
+                    : held.get(each.reference)
               if (kept !== undefined) next.set(each.reference, kept)
             }
             return next

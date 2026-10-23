@@ -662,12 +662,17 @@ export interface HostInbox {
   readonly reference: string
   /** The name the host gives people. */
   readonly name: string
-  /** `read` when the host answered; `out_of_contact` when it could not be reached or did not answer. */
-  readonly state: 'read' | 'out_of_contact'
+  /**
+   * `read` when the host answered with its inbox; `refused` when it answered and refused, which is
+   * contact and not its loss; `out_of_contact` when it could not be reached or did not answer.
+   */
+  readonly state: 'read' | 'refused' | 'out_of_contact'
   /** When the inbox was read, by this device's clock. */
   readonly read_at_ms: number | null
   /** Since when this device has not been in contact with the host, by its own clock. */
   readonly lost_since_ms: number | null
+  /** What the host refused with, when it did: the shape of any host failure. */
+  readonly refusal: HostError | null
   /** The host's inbox, when it was read. */
   readonly result: AttentionReadResult | null
   /** The host's sessions by number, when its inbox was read. */
@@ -1903,7 +1908,8 @@ export interface HostPort {
   /**
    * The inbox of each paired host that is not the one in use, each read over a connection of its
    * own, all at once: the inbox is one across hosts. A host that cannot be reached is listed as
-   * out of contact with the moment this device lost it, and holds up no other.
+   * out of contact with the moment this device lost it, and holds up no other. A host that answers
+   * and refuses is listed as having refused, with its refusal: it is in contact.
    */
   inboxHosts(): Promise<readonly HostInbox[]>
 
