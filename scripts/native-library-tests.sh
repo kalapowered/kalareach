@@ -162,9 +162,11 @@ case "$platform" in
         . "$root/scripts/lib/xcode.sh"
         command -v xcrun > /dev/null 2>&1 || die "xcrun is needed and is not on the path"
         kr_select_xcode
-        if ! xcrun simctl list devices booted | grep -q "$udid"; then
-            die "no simulator with the identifier $udid is booted"
-        fi
+        booted="$(xcrun simctl list devices booted)"
+        case "$booted" in
+            *"$udid"*) ;;
+            *) die "no simulator with the identifier $udid is booted" ;;
+        esac
         device="$udid"
         say "device: simulator $udid, $(xcodebuild -version | paste -sd' ' -)"
         ;;

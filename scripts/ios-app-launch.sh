@@ -42,7 +42,11 @@ udid="${2:-}"
 screenshot="${3:-}"
 [ -d "$app" ] && [ -n "$udid" ] && [ -n "$screenshot" ] || die "usage: ios-app-launch.sh <KalaReach.app> <simulator identifier> <screenshot.png>"
 command -v xcrun > /dev/null 2>&1 || die "xcrun is needed and is not on the path"
-xcrun simctl list devices booted | grep -q "$udid" || die "no simulator with the identifier $udid is booted"
+booted="$(xcrun simctl list devices booted)"
+case "$booted" in
+    *"$udid"*) ;;
+    *) die "no simulator with the identifier $udid is booted" ;;
+esac
 
 installed=0
 cleanup() {
@@ -68,12 +72,15 @@ wait_for() {
 # The plugin's entry point is a symbol of one of the application's Mach-O files: the executable
 # itself, or the debug library a debug build keeps its code in.
 has_plugin_entry() {
-    local file
+    local file symbols
     while IFS= read -r file; do
-        if nm -gU "$file" 2> /dev/null | grep -q 'init_plugin_companion_platform'; then
-            say "plugin entry point: init_plugin_companion_platform in ${file#"$app"/}"
-            return 0
-        fi
+        symbols="$(nm -gU "$file" 2> /dev/null || true)"
+        case "$symbols" in
+            *init_plugin_companion_platform*)
+                say "plugin entry point: init_plugin_companion_platform in ${file#"$app"/}"
+                return 0
+                ;;
+        esac
     done < <(find "$app" -type f \( -name '*.dylib' -o -perm -u+x \) 2> /dev/null)
     return 1
 }
@@ -94,7 +101,14 @@ jobs_of_simulator() { xcrun simctl spawn "$udid" launchctl list 2> /dev/null; }
 app_runs() { jobs_of_simulator | awk -v id="UIKitApplication:$bundle_id" 'index($3, id) == 1 && $1 != "-" { found = 1 } END { exit !found }'; }
 wait_for "the application's process" app_runs
 
-content_runs() { jobs_of_simulator | grep -q 'com\.apple\.WebKit\.WebContent' ; }
+content_runs() {
+    local jobs
+    jobs="$(jobs_of_simulator)"
+    case "$jobs" in
+        *com.apple.WebKit.WebContent*) return 0 ;;
+    esac
+    return 1
+}
 wait_for "the web view's content process" content_runs
 
 crashes="$(find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 \( -name 'KalaReach*' -o -name 'companion*' \) -newer "$marker" 2> /dev/null)"

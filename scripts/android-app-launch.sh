@@ -104,7 +104,7 @@ say "ok: the application installed"
 
 dev logcat -b all -c
 started="$(dev shell am start -W -n "$activity" | tr -d '\r')"
-printf '%s\n' "$started" | grep -q '^Status: ok' || { printf 'android-app-launch: FAIL: the main activity did not start:\n%s\n' "$started" >&2; exit 1; }
+grep -q '^Status: ok' <<< "$started" || { printf 'android-app-launch: FAIL: the main activity did not start:\n%s\n' "$started" >&2; exit 1; }
 say "ok: the main activity started"
 
 pid=""
@@ -161,9 +161,10 @@ for page in pages:
 wait_for "the web view to list a page with a title, served by the application's own protocol" page_has_title
 say "page title: $title"
 
-if dev logcat -d -b all 2> /dev/null | tr -d '\r' | grep -E 'FATAL EXCEPTION|Fatal signal' | grep -q .; then
+log="$(dev logcat -d -b all 2> /dev/null | tr -d '\r')"
+if grep -E -q 'FATAL EXCEPTION|Fatal signal' <<< "$log"; then
     echo "android-app-launch: FAIL: the system logged a fatal exception or signal:" >&2
-    dev logcat -d -b all 2> /dev/null | tr -d '\r' | grep -E -A8 'FATAL EXCEPTION|Fatal signal' | head -40 >&2
+    grep -E -A8 'FATAL EXCEPTION|Fatal signal' <<< "$log" | head -40 >&2
     exit 1
 fi
 say "ok: no fatal exception or signal in the log"

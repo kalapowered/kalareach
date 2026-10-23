@@ -1753,10 +1753,13 @@ jobs:
             echo "::error::the runner's Android SDK has no command-line tools at $manager"
             exit 1
           fi
+          # The image's command-line tools are older than the repository the packages come from.
+          yes | "$manager" --install "cmdline-tools;latest" > "$RUNNER_TEMP/sdkmanager.log"
+          yes | "$manager" --licenses >> "$RUNNER_TEMP/sdkmanager.log"
           yes | "$manager" --install "ndk;28.2.13676358" "emulator" \
-            "system-images;android-36;google_apis_playstore_ps16k;x86_64" > "$RUNNER_TEMP/sdkmanager.log"
+            "system-images;android-36;google_apis_playstore_ps16k;x86_64" >> "$RUNNER_TEMP/sdkmanager.log"
           tail -n 5 "$RUNNER_TEMP/sdkmanager.log"
-          "$manager" --list_installed | grep -E 'ndk;28|emulator|system-images'
+          "$manager" --list_installed | grep -E 'cmdline-tools|ndk;28|emulator|system-images'
           {
             echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
             echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
@@ -1903,15 +1906,25 @@ jobs:
         run: cargo clippy --locked --lib -p companion-tauri --target aarch64-apple-ios -- -D warnings
 
       # The application as a person builds it for a simulator: the interface, the Rust library and
-      # the Swift plugin, linked into KalaReach.app. No signing is asked for or available. The
+      # the Swift plugin, linked into KalaReach.app. A simulator build is signed ad hoc, "Sign to
+      # Run Locally", which needs no identity, certificate or profile, and none is here. The
       # project's local settings file, which the repository ignores and the build reads when it
-      # exists, limits the build to the architecture this runner's simulator runs: the notification
-      # extension would otherwise be built for two, and the identifier check reads one.
+      # exists, gives the build two things a developer's machine has and this runner has not: the
+      # one architecture this runner's simulator runs, because the notification extension would
+      # otherwise be built for two and the identifier check reads one, and the Apple team's prefix
+      # (read from the Xcode project, which names it: it is an identifier and not a credential),
+      # which the keychain groups of the application and the extension begin with.
       - name: Build the application for the simulator
         timeout-minutes: 60
         run: |
-          printf 'ARCHS = arm64\n' > apps/companion/src-tauri/gen/apple/Local.xcconfig
-          pnpm -C apps/companion tauri ios build --debug --ci --no-sign --target aarch64-sim
+          set -euo pipefail
+          team="$(sed -n 's/^ *DEVELOPMENT_TEAM: *\([A-Z0-9]\{10\}\) *$/\1/p' apps/companion/src-tauri/gen/apple/project.yml)"
+          if [ "$(printf '%s\n' "$team" | wc -l | tr -d ' ')" != 1 ] || [ -z "$team" ]; then
+            echo "::error::the Xcode project does not name one Apple team"
+            exit 1
+          fi
+          printf 'ARCHS = arm64\nAppIdentifierPrefix = %s.\n' "$team" > apps/companion/src-tauri/gen/apple/Local.xcconfig
+          pnpm -C apps/companion tauri ios build --debug --ci --target aarch64-sim
 
       - name: Read the built application back
         run: |
