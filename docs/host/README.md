@@ -3608,11 +3608,13 @@ text a caller chose, so no line of terminal output, prompt, key or file name can
   clipboard write it refused, are not counted as parse faults.
 * `adapter` is one of the agent connectors the product bundles. A package that is not one of them
   is counted under no name. `outcome` is `unavailable` when the adapter's connection could not take
-  a frame the host sent, or when the plugin runtime could not run its component, counted once for
-  each outage however often the runtime is asked again, and when the runtime stops running the
-  component for good in an outage that was not counted yet; it is `timeout` when the adapter took a
-  request and did not answer it in time, counted at the adapter's deadline whether or not the
-  caller is still waiting.
+  a frame the host sent, a request of the host's or the answer the host prepared to one of the
+  adapter's approval requests, whether the connection refused the frame or the frame did not go,
+  counted when the connection says so whether or not the caller is still waiting; or when the
+  plugin runtime could not run its component, counted once for each outage however often the
+  runtime is asked again, and when the runtime stops running the component for good in an outage
+  that was not counted yet; it is `timeout` when the adapter took a request and did not answer it
+  in time, counted at the adapter's deadline whether or not the caller is still waiting.
 * `environment` is `production` for a build that runs from a release in the install store and
   `development` for any other. A host never reports `staging`, which is a deployment of the
   service.
