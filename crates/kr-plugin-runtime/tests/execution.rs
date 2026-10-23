@@ -1379,30 +1379,38 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
         .await
         .expect("the component instantiates");
 
-    // Filling the queue faster than the component drains it. Each event is 64 KiB, so sixty-five
-    // of them are already more than the 4 MiB the queue holds. Events are offered until the queue
-    // says it overflowed: how many that takes depends on how fast the component reads and how
-    // fast this thread runs, so the count decides nothing, and the limit only ends a queue that
-    // never overflows.
+    // Filling the queue while the component has read nothing from it. The first observation wakes
+    // the binding's pass over the queue, which is stopped before it takes anything; once the stop
+    // is acknowledged, how fast the component reads and how fast this thread offers decide
+    // nothing. Each event is 64 KiB, so sixty-five of them are already more than the 4 MiB the
+    // queue holds, and the limit only ends a queue that never overflows.
     let filler = "y".repeat(64 * 1024);
-    let mut offered = 0_u32;
-    loop {
+    let mut stop = handle.stop_next_pump();
+    let first = handle.enqueue_observation(components::scrape("se-0", &filler));
+    assert!(
+        !matches!(first, Admission::QueuedWithGap { .. }),
+        "one observation of 64 KiB overflowed a 4 MiB queue"
+    );
+    stop.reached().await;
+    let mut gapped = false;
+    for index in 1..=130 {
         let admission =
-            handle.enqueue_observation(components::scrape(&format!("se-{offered}"), &filler));
-        offered += 1;
+            handle.enqueue_observation(components::scrape(&format!("se-{index}"), &filler));
         assert!(
             handle.queued_bytes() <= OBSERVATION_QUEUE_BYTES,
             "the queue holds {} bytes, over its {OBSERVATION_QUEUE_BYTES} byte bound",
             handle.queued_bytes()
         );
         if matches!(admission, Admission::QueuedWithGap { .. }) {
+            gapped = true;
             break;
         }
-        assert!(
-            offered < 100_000,
-            "{offered} observations of 64 KiB did not overflow a 4 MiB queue"
-        );
     }
+    assert!(
+        gapped,
+        "a hundred and thirty 64 KiB observations did not overflow a 4 MiB queue"
+    );
+    stop.release();
 
     // The gap is reported, and a snapshot follows it.
     let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
