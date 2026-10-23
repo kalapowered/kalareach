@@ -380,7 +380,45 @@ pnpm -C apps/companion test:privacy-manifest
 # The manifest the packaged application was built from.
 cat apps/companion/src-tauri/gen/android/app/build/intermediates/packaged_manifests/\
 universalDebug/processUniversalDebugManifestForPackage/AndroidManifest.xml
+
+# The native library's own cases, run on a device that is already running: the crate `kr-crypto`
+# builds libsodium from source for each target, and these build its tests for the device's
+# architecture and run them there. Android takes the serial of an emulator (x86_64-linux-android by
+# default; KR_ANDROID_TARGET names another the device runs) and iOS a booted simulator's identifier.
+# Neither takes a device it is not given: the first one listed may be someone else's.
+scripts/native-library-tests.sh android --serial <serial>
+scripts/native-library-tests.sh ios --udid <simulator identifier>
+
+# The debug application installed on a running device, started, and looked at; each script waits
+# for conditions, not for a time, and saves a screenshot.
+scripts/android-app-launch.sh path/to/app-universal-debug.apk screenshot.png --serial <serial>
+scripts/ios-app-launch.sh path/to/KalaReach.app <simulator identifier> screenshot.png
 ```
+
+`scripts/android-app-launch.sh` checks that the application installs and its main activity starts;
+that its process has native code of the package mapped (the Rust library, which the package stores
+uncompressed and the system maps from the package); that the web view lists the interface's own
+document, titled `KalaReach` and served by the application's own protocol (`tauri.localhost`); that
+the document's root holds what the interface drew and the page has text on it, which it asks the
+web view over its debugging protocol; that the screen shows the page; and that the log holds no
+fatal exception or signal for the application's process.
+
+`scripts/ios-app-launch.sh` checks that the built application defines the Swift plugin's entry
+point (`init_plugin_companion_platform`); that the application runs in the simulator and that a web
+content process which was not there before the launch is running; that the screen shows the page and
+that the system's text recognition reads the labels of the interface's tab bar off it; and that the
+system wrote no crash report for the application in that simulator.
+
+Both scripts uninstall a copy of the application that is already on the device before they install
+it, with its data, and again when they end.
+
+The `android-app` and `ios` jobs of the landing workflow build the debug application and then run
+the library's cases and the matching script on the hosted runner: in an x86_64 Android emulator
+(Android 16 with Google Play and 16 KB pages) and in an arm64 iPhone simulator. They keep the
+screenshots with the run's evidence (`test-evidence-android`, `test-evidence-ios`), and the `ios` job
+builds with no signing identity, certificate or profile. The `android` job and the `ios` job compile
+and lint the phone's other architectures and do not run them; the emulator exercises libsodium's
+x86_64 code paths.
 
 `scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only
 what it started, and changes a device's settings only on one it started itself. A platform that is
