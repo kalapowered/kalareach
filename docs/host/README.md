@@ -1346,10 +1346,12 @@ a ceiling is `catalogue.remove` and then `catalogue.add`, two deliberate acts wi
 the second. A sync verifies inside the ceiling the enrolment already has and refuses a generation
 that would need more.
 Granting a capability is `plugin.grant`, confirmed the same way and bound to the package digest and
-the capabilities it is about. An install that carries a grant wider than the installation it replaces
-held, or wider than its repository's ceiling permits, carries the owner's confirmation of that exact
-installation, and so does every release that installs a native bridge or declares a command
-integration; one without it is refused and the refusal names the method that decision belongs to.
+the capabilities it is about. An install carries the owner's confirmation of that exact installation
+when what it may do exceeds what the installation it replaces could do, read under the ceiling that
+installation was installed under, or, with nothing to replace, exceeds what its repository's ceiling
+permits by itself. So does every release that installs a native bridge, declares a command
+integration or asks for `launch.probe`. An install that needs the confirmation and lacks it is
+refused. `docs/plugins/catalogue.md` states the rule in full.
 
 A terminal asks for the same two decisions without holding an owner key. It asks
 `owner.confirmation.request` for a challenge naming the `catalogue_add` or `plugin_install` subject,
