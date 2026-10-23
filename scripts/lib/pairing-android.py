@@ -486,6 +486,300 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
         phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
 
 
+# The text the person writes as a draft in the session, which the host's agent is later sent.
+DRAFT = "Check the release notes before tagging"
+
+
+def start_on(phone: Phone, tab: str) -> None:
+    """Starts the application afresh on the shell and opens the tab named `tab`."""
+    phone.run("shell", "am", "force-stop", APP)
+    phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+    phone.wait(lambda each: each.startswith(tab), f"the shell's {tab} tab", 90)
+    open_tab(phone, tab)
+
+
+def open_tab(phone: Phone, tab: str) -> None:
+    """Opens the tab named `tab`; the bar over it names it too. A tap that lands while the shell
+    settles is made again."""
+    for _ in range(3):
+        phone.tap(phone.wait(lambda each: each.startswith(tab) and len(each) < 60, f"the {tab} tab"))
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            if phone.find(lambda each: each == tab) is not None:
+                return
+            time.sleep(0.4)
+    phone.give_up(f"the {tab} tab never opened")
+
+
+def composer_of(phone: Phone) -> dict | None:
+    """The field a message is written in."""
+    return next((node for node in phone.screen() if node["class"] == "android.widget.EditText"), None)
+
+
+def composer_text(phone: Phone) -> str:
+    field = composer_of(phone)
+    return "" if field is None or field["label"] == "Message this session" else field["label"]
+
+
+def hide_keyboard(phone: Phone) -> None:
+    """Puts the software keyboard away, when it is up: a Back with no keyboard would leave the
+    session."""
+    for _ in range(3):
+        shown = phone.run("shell", "dumpsys", "input_method").stdout.decode("utf-8", "replace")
+        if "mInputShown=true" not in shown:
+            return
+        phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+        time.sleep(0.8)
+
+
+def open_the_session(phone: Phone) -> None:
+    """Opens the host's first session from the Sessions tab, as a person does."""
+    open_tab(phone, "Sessions")
+    phone.tap(phone.wait(lambda each: "Session 1" in each and not each.startswith(("Sessions", "Attention")), "the host's session in the list", 90))
+    phone.wait(lambda each: each == "Message this session" or each == DRAFT, "the composer", 60)
+
+
+def switch_view(phone: Phone, name: str) -> None:
+    """Chooses the Conversation or the Terminal view and waits until the pane shows it: the
+    conversation of a session with no entries says so, and the terminal's pane does not."""
+    phone.press(name)
+    empty = "Nothing in this conversation yet."
+
+    def shows(nodes: list[dict]) -> bool:
+        said = any(each["label"] == empty for each in nodes)
+        return said if name == "Conversation" else not said and any(each["label"] == name for each in nodes)
+
+    phone.wait_screen(shows, f"the {name} view", 30)
+
+
+def wait_after_touch(phone: Phone, wanted, what: str, timeout: float = 60, at: tuple[float, float] = (0.2, 0.3)) -> None:
+    """Waits for text the page drew over the screen the tree was last read for: a sheet opened over
+    the inbox, or a row that appeared in it.
+
+    The web view hands its accessibility tree over a piece at a time, and what the page draws after
+    the screen was first read can be missing from it while it is on the screen, as content drawn
+    after the first read is (`Phone.wait_screen`). A touch on text that does nothing, at `at` (a
+    fraction of the width and of the height), has the web view send what it holds; the tab switch
+    `nudging` makes would close a sheet and remount the inbox."""
+    size = re.findall(r"(\d+)x(\d+)", phone.run("shell", "wm", "size").stdout.decode("utf-8", "replace"))
+    if not size:
+        phone.give_up("the display's size could not be read")
+    width, height = (int(each) for each in size[-1])
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if phone.find(wanted) is not None:
+            return
+        phone.run("shell", "input", "tap", str(int(width * at[0])), str(int(height * at[1])))
+        time.sleep(1.5)
+    phone.give_up(f"timed out waiting for {what}")
+
+
+def ask_host(directory: Path, phase: str, timeout: float) -> None:
+    """Asks the host to be switched off or on and waits until it says it has been. The host takes the
+    request away when it is done, so a later request is a new one."""
+    (directory / f"done-{phase}").unlink(missing_ok=True)
+    touch(directory, f"go-{phase}")
+    wait_for_file(directory, f"done-{phase}", timeout)
+
+
+def paired_host_used(phone: Phone, directory: Path) -> None:
+    """The paired host as a person uses it: the inbox tells four kinds apart and a question names
+    who asked (13.01, 11.61); the tabs and the settings over a session are walked (13.09); a draft
+    is carried across the views and across the host being out of contact (13.03, 13.13, 13.01); and
+    the host asks the phone to confirm a hand-over of a session (18.15)."""
+    start_on(phone, "Attention")
+    touch(directory, "go-seed")
+    wait_for_file(directory, "seed-result.txt", 120)
+    # A paired device is given the host's own words for each item and none of a session's text.
+    for kind, text in (
+        ("Waiting for you", "An approval is waiting for you"),
+        ("Did not finish", "A command ended with a failure"),
+        ("Ready to review", "Finished work is ready to review"),
+        ("Waiting for you", "A question is waiting for an answer"),
+    ):
+        phone.wait(
+            lambda each, kind=kind, text=text: each.startswith(f"{kind}. ") and text in each,
+            f'a "{kind}" row holding "{text}"',
+            120,
+            nudging=True,
+        )
+    phone.shot("attention-four-kinds")
+    say("the inbox tells an approval, a failure, finished work and a question apart")
+    phone.tap(phone.wait(lambda each: each.startswith("Waiting for you. ") and "A question is waiting for an answer" in each, "the question's row"))
+    wait_after_touch(phone, lambda each: each.startswith("Asked by"), "the asker of the question")
+    # The identity is the program the host verified, and the name it gave itself comes after it, said
+    # not to be verified. The page draws them as parts of one line, which the screen reader's tree
+    # may give as one text or as several, so the texts are read in order as one line.
+    line = " ".join(node["label"] for node in phone.screen() if node["label"])
+    asked = re.search(
+        r"Asked by\s+claude\s+\(\s*process \d+\s*\)\s*\u00b7\s*calls itself\s*\u201c\s*claude \(verified by KalaReach\)\s*\u201d\s*\(not verified\)",
+        line,
+    )
+    if asked is None:
+        phone.give_up("the question does not name the verified program as the asker and its own name as unverified")
+    if phone.find(lambda each: each == "/usr/local/bin/claude") is None:
+        phone.give_up("the verified path is not shown")
+    phone.shot("question-identity")
+    say("the question names the verified program and shows the name it gave itself as unverified")
+    wait_after_touch(phone, lambda each: each == "Close item", "the control that closes the question's sheet")
+    phone.press("Close item")
+
+    # The host is switched off: the inbox says so in so many words, keeps what it last read from
+    # the host beneath, said to be from then, and shows no failure.
+    ask_host(directory, "down", 120)
+    # Touched at the bar's title, which does nothing: a round trip to another tab would remount the
+    # inbox, which reads again from nothing, and a touch on the list could open a row.
+    wait_after_touch(
+        phone, lambda each: "is out of contact" in each, "the inbox to say the host is out of contact", 120, at=(0.5, 0.07)
+    )
+    # The row is one node whose text is its parts one after another.
+    if phone.find(lambda each: "No contact for" in each or "No contact." in each) is None:
+        phone.give_up("the inbox does not say how long")
+    if phone.find(lambda each: "may still be running" in each) is None:
+        phone.give_up("the inbox does not say the sessions may still be running")
+    if phone.find(lambda each: "What is listed here from it was read" in each) is None:
+        phone.give_up("the rows it last read are not said to be from that read")
+    if phone.find(lambda each: each.startswith("Waiting for you. An approval is waiting for you")) is None:
+        phone.give_up("the rows last read were dropped")
+    if phone.find(lambda each: each == "The inbox could not be read") is not None:
+        phone.give_up("the inbox says it failed")
+    # The question's sheet is closed by now. A touch on the page behind a sheet that is still up
+    # closes it, as the title bar does, so the photograph is of the inbox and nothing over it.
+    for _ in range(4):
+        if phone.find(lambda each: each == "Close item") is None:
+            break
+        phone.press("Close item")
+        time.sleep(1.5)
+    else:
+        phone.give_up("the question's sheet did not close")
+    phone.shot("inbox-host-out-of-contact")
+    say("the inbox shows the host as out of contact above what it last read from it")
+    ask_host(directory, "up", 180)
+    phone.wait_gone(lambda each: "is out of contact" in each, "the host out of contact", 180)
+
+    start_on(phone, "Hosts")
+    phone.wait(lambda each: each == "In use", "the host in use", 60)
+    phone.shot("tab-hosts")
+    open_the_session(phone)
+    phone.shot("tab-sessions-open-session")
+    # The bar's control is an icon the tree can lack until the web view is touched on the bar's title.
+    wait_after_touch(phone, lambda each: each == "Settings", "the Settings control", at=(0.5, 0.07))
+    phone.press("Settings")
+    wait_after_touch(phone, lambda each: each == "The session behind this keeps running.", "the settings over the session")
+    phone.shot("settings-over-the-session")
+    wait_after_touch(phone, lambda each: each == "Close settings", "the control that closes the settings")
+    phone.press("Close settings")
+    # What is drawn afresh reaches the tree late, and what is gone can stay in it: a touch on the
+    # bar's title has the web view send what it holds, and the control is pressed again if the sheet
+    # is still there then.
+    for attempt in range(4):
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            phone.run("shell", "input", "tap", "540", "168")
+            time.sleep(1.5)
+            if phone.find(lambda each: each == "The session behind this keeps running.") is None:
+                break
+        else:
+            phone.press("Close settings")
+            continue
+        break
+    else:
+        phone.give_up("the settings did not close")
+    if composer_of(phone) is None:
+        phone.give_up("the session is not where it was once the settings closed")
+    phone.shot("settings-closed")
+    say("the tabs list the host and its session, and the settings open over a session and close to it")
+
+    # A draft is the same text in both views of the session.
+    for _ in range(3):
+        # The settings sheet closes with an animation and the tree can still hold it: it is looked
+        # at again, and closed again if it is still up, before the field is touched.
+        if phone.find(lambda each: each == "Close settings") is not None:
+            phone.press("Close settings")
+            time.sleep(2)
+            continue
+        phone.tap(composer_of(phone))
+        phone.run("shell", "input", "text", DRAFT.replace(" ", "%s"))
+        end = time.monotonic() + 10
+        while time.monotonic() < end and phone.find(lambda each: each == DRAFT) is None:
+            time.sleep(0.5)
+        if phone.find(lambda each: each == DRAFT) is not None:
+            break
+    phone.wait_screen(lambda nodes: any(each["label"] == DRAFT for each in nodes), "the composer to hold the draft", 30)
+    hide_keyboard(phone)
+    switch_view(phone, "Terminal")
+    phone.wait_screen(lambda nodes: any(each["label"] == DRAFT for each in nodes), "the draft in the terminal view", 30)
+    phone.shot("draft-terminal-view")
+    switch_view(phone, "Conversation")
+    phone.wait_screen(lambda nodes: any(each["label"] == DRAFT for each in nodes), "the draft in the conversation view", 30)
+    phone.shot("draft-conversation-view")
+    say("the draft is the same text in both views")
+
+    # The host stops answering: the draft stays, and the session says so.
+    ask_host(directory, "down", 120)
+    lost = "Not in contact with this host. The draft is kept here."
+    phone.wait(lambda each: each == lost, "the words for a draft that lost its host", 90)
+    if composer_text(phone) != DRAFT:
+        phone.give_up("the draft was changed when the host stopped answering")
+    send = phone.find(lambda each: each == "Send")
+    if send is None or send["enabled"]:
+        phone.give_up("a draft that lost its host can be sent")
+    phone.shot("draft-host-out-of-contact")
+
+    # The person leaves the session, the host is switched on again at the same address while they
+    # are elsewhere, and the draft is bound to its conversation again and is sent there.
+    # The system's back leaves the session as the bar's control does; the control is an icon the
+    # tree can lack.
+    phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+    wait_after_touch(
+        phone, lambda each: each == "No host is being reached.", "the sessions list, which says no host is reached", 30, at=(0.5, 0.07)
+    )
+    ask_host(directory, "up", 180)
+    open_the_session(phone)
+    phone.wait_screen(
+        lambda nodes: not any(each["label"] == lost for each in nodes)
+        and any(each["label"] == "Send" and each["enabled"] for each in nodes),
+        "the draft to be bound again",
+        180,
+    )
+    if composer_text(phone) != DRAFT:
+        phone.give_up("the draft was changed while the host was out of contact")
+    phone.shot("draft-host-back")
+    phone.press("Send")
+    touch(directory, "go-sent")
+    wait_for_file(directory, "sent-result.txt", 90)
+    if read(directory, "sent-result.txt") != f"prompts=1 text={DRAFT}":
+        raise SystemExit(f"the agent was not sent the draft once: {read(directory, 'sent-result.txt')}")
+    say("the draft was kept across the views and the host being out of contact, and sent once")
+
+    # The host asks the owner to confirm a hand-over of the session to another device.
+    confirm = "Confirm with your screen lock"
+    try:
+        start_on(phone, "Attention")
+        touch(directory, "go-handover")
+        wait_for_file(directory, "handover-asked.txt", 120)
+        phone.wait(lambda each: each == "Hand control of a session to another device", "the hand-over", 120, nudging=True)
+        phone.wait(lambda each: "who may act as the session's owner for" in each, "the role the receiving device is given", 30)
+        phone.wait(lambda each: each == "Allows", "what the hand-over allows", 30)
+        phone.wait(lambda each: "share sessions with others" in each, "the kinds of action listed", 30)
+        # The phone is given its screen lock while the request is listed, and the button appears
+        # named for it; the photograph shows the request with the button a person would press.
+        phone.run("shell", "locksettings", "set-pin", SCREEN_LOCK_PIN)
+        phone.wait(lambda each: each == confirm, "the button that confirms the hand-over", 60, nudging=True)
+        phone.shot("handover-sheet")
+        say("the hand-over is shown with the role and each kind of action it allows")
+        phone.tap(phone.wait(lambda each: each == confirm, "the button that confirms the hand-over", 60, nudging=True))
+        enter_screen_lock(phone)
+        phone.wait(lambda each: each.startswith("Confirmed."), "the words for a confirmed request", 60)
+        wait_for_file(directory, "handover-result.txt", 120)
+        if not read(directory, "handover-result.txt").endswith("receiver_holds=1 giver_holds=0"):
+            raise SystemExit(f"the hand-over did not move the session: {read(directory, 'handover-result.txt')}")
+        phone.shot("handover-confirmed")
+        say("the hand-over is confirmed with the screen lock and the session changes hands")
+    finally:
+        phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
+
+
 def picker_on_a_paired_phone(phone: Phone) -> None:
     """The attachment picker on a phone paired with a host, with the camera refused for good.
 
@@ -629,6 +923,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     wait_for_file(directory, "done-code")
     picker_on_a_paired_phone(phone)
     owner_confirmations(phone, directory)
+    paired_host_used(phone, directory)
 
 
 # ---- The release build's verified TLS ----------------------------------------------------------
