@@ -1726,6 +1726,9 @@ async fn catalogue_mutations_are_retained_and_prevent_duplicate_execution() {
 /// KR-REQ-07.47: a `catalogue.add` that presents no proof spends, once, the answer an owner device
 /// recorded for exactly this enrolment; without one it is refused as needing the owner, and an
 /// answer recorded for another enrolment is not spent on it.
+///
+/// KR-REQ-02.09, the part about trusting a new repository root: `catalogue.add` enrols a root, and
+/// without an answer for exactly that enrolment it is refused with `OwnerConfirmationRequired`.
 #[tokio::test]
 async fn a_catalogue_add_with_no_proof_spends_the_answer_recorded_for_exactly_it() {
     let host = host();

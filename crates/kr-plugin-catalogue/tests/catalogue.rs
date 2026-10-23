@@ -161,6 +161,10 @@ async fn kr_req_11_07_a_generation_verifies_through_the_qualified_client() {
 
 /// KR-REQ-25.21: metadata signed by a root this host did not adopt is refused, and nothing is
 /// activated, so a catalogue record is trusted only when its signature verifies.
+///
+/// KR-REQ-18.06, the registry's signature: the adapter registry is this signed catalogue, and the
+/// sync of one whose metadata does not verify under the root the host adopted ends in
+/// `RepositoryUntrusted`, with no index activated for the repository.
 #[tokio::test]
 async fn kr_req_11_07_metadata_signed_by_another_root_is_refused() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -2090,6 +2094,10 @@ fn passive_and(more: &[PluginCapability]) -> Vec<PluginCapability> {
 /// confirmation, and not without it: a grant that names the bridge is not enough on its own, and
 /// without a grant the refusal names the bridge. Every release of a bridge is the owner's decision,
 /// so installing the same one again needs the confirmation again.
+///
+/// KR-REQ-02.09, the part about granting a native-bridge capability: the installation is refused
+/// with `OwnerConfirmationRequired` until the owner has confirmed this package and this grant, and
+/// installing the same release again is refused again.
 #[tokio::test]
 async fn kr_req_11_11_a_first_native_bridge_installs_with_the_owners_confirmation() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -2627,6 +2635,10 @@ async fn kr_req_11_11_a_command_integration_is_granted_only_by_installing_it() {
 /// the installation stays on the release it was on without it: a release that newly asks for
 /// something its repository's ceiling already permits, and one granted something past the
 /// ceiling, are both increases.
+///
+/// KR-REQ-02.09, the part about enlarging what an installation may do: each increase is refused
+/// with `OwnerConfirmationRequired` without the owner's confirmation, leaving the installation on
+/// the release it was on, and installs with it.
 #[tokio::test]
 async fn kr_req_11_11_an_increase_installs_with_the_owners_confirmation() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -2742,6 +2754,10 @@ async fn kr_req_11_11_an_increase_installs_with_the_owners_confirmation() {
 /// installation could not do that under the repository it came from: what it could do is read
 /// under the ceiling it was installed under, never the new one. The move installs with the owner's
 /// confirmation and not without it.
+///
+/// KR-REQ-02.09, the part about enlarging what an installation may do: a first installation past
+/// its ceiling, and a move to the wider repository, are each refused with
+/// `OwnerConfirmationRequired` unless the owner confirmed them.
 #[tokio::test]
 async fn kr_req_11_11_a_move_to_a_wider_repository_is_an_increase_the_owner_confirms() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -6702,6 +6718,10 @@ fn the_development_fixture_names_the_commit_it_was_copied_from() {
 // Enrolment: the owner's decisions, and a branch that is never update authority
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-02.09, the part about trusting a new repository root and enlarging what it may grant:
+/// enrolling a root, and widening an enrolment's ceiling, are each refused with
+/// `OwnerConfirmationRequired` unless the owner confirmed them, and each goes through with the
+/// confirmation.
 #[test]
 fn kr_req_11_11_a_wider_ceiling_or_a_new_root_is_the_owners_decision() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -7167,6 +7187,11 @@ fn checkpoint_of(catalogue: &Catalogue) -> std::collections::BTreeMap<String, Ve
 /// floor only where it still verifies under the current root, and the reset recorded with the kept
 /// root drops the floors from the working copy for a key change the client would otherwise not see.
 /// A second floor of this host's own, compared whatever the keys, refuses these versions.
+///
+/// KR-REQ-11.07, a root rotation through the qualified client: metadata whose timestamp and
+/// snapshot are at versions below the ones the old keys reached verifies under the rotated root,
+/// and the newer generation is accepted, after the sync that kept the rotated root failed and the
+/// catalogue was opened again.
 #[tokio::test]
 async fn lower_role_versions_under_new_keys_are_accepted_after_a_failed_sync_and_a_restart() {
     let home = tempfile::tempdir().expect("a temporary directory");

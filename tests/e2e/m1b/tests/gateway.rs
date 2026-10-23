@@ -1973,6 +1973,12 @@ fn kr_req_12_08_a_device_steers_cancels_and_prompts_through_what_the_released_pa
 /// success; the host's receipt for the action says `unknown`; and the person's terminal route
 /// carries on, since the shell is back at its prompt and runs what is typed there.
 ///
+/// KR-REQ-11.36, the part about an unknown request: the prompt is not sent to a hidden second
+/// backend or replayed after the server ended (the server's request log holds the terminal's turn
+/// and the prompt, two `turn/start` requests and no third), and the caller is told its outcome is
+/// unknown, which the receipt `unknown` repeats. `UPSTREAM_UNAVAILABLE` for a typed caller is not
+/// shown here.
+///
 /// Not claimed: Windows, where no gateway runs.
 #[test]
 fn a_prompt_whose_server_dies_under_it_is_an_outcome_nobody_can_establish() {
