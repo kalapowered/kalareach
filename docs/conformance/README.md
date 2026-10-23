@@ -322,9 +322,9 @@ The report stops before it runs anything when it cannot read a file of these lan
 not balance once comments and strings are blanked, it declares a class whose name is in backticks or
 on the next line, it names a row and declares no class, or it names a row and declares a test this
 reading does not follow: a Kotlin test outside the body of a top-level class, with a body that is
-not a block, with a name it cannot read or with an attribute no function follows (a Java file), a
-Swift test method outside a top-level class (in an extension) or with its parentheses over two
-lines, or a Swift Testing test. A key whose test or class the lane's results do not hold is failed,
+not a block (an expression body, or another declaration before any block), with a name it cannot
+read or with an attribute no function follows (a Java file), a Swift test method in an extension or
+with its parentheses over two lines, or a Swift Testing test. A key whose test or class the lane's results do not hold is failed,
 not left to the other cases of the file. A case the lane reports that no file of the lane declares, or
 that two declare, is a problem of the result, and it fails every key of its lane: a result that
 cannot be given to one file cannot be given to any row. That holds whichever way the reading of the
