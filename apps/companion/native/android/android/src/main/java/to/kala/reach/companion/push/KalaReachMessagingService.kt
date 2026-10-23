@@ -41,14 +41,14 @@ class KalaReachMessagingService : FirebaseMessagingService() {
         // The token is this device's destination. It is kept where the application will find it,
         // and the registration with the gateway is the application's to make, after the person
         // asked for it: a service that registered on its own would be binding a destination
-        // nobody proved they own. That the token changed is kept too, so the application repeats
-        // the registration it has.
+        // nobody proved they own. Whether a registration still names it is the application's to
+        // compare each time it looks, by the token's digest. It is written before this returns, so
+        // that a process the system ends right after still holds the token the provider gave.
         getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
             .edit()
             .putString(PushStores.TOKEN_KEY, token)
             .putLong(PushStores.TOKEN_AT_KEY, System.currentTimeMillis())
-            .putBoolean(PushStores.TOKEN_CHANGED_KEY, true)
-            .apply()
+            .commit()
     }
 
     override fun onMessageReceived(message: RemoteMessage) {

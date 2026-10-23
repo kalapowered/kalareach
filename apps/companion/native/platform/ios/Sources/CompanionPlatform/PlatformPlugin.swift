@@ -444,7 +444,6 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   @objc public func pushPermission(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushAskPermission(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushToken(_ invoke: Invoke) { forwardPush(invoke) }
-  @objc public func pushTokenChanged(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushPendingSet(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushPendingGet(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushPendingClear(_ invoke: Invoke) { forwardPush(invoke) }
