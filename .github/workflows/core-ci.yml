@@ -2098,28 +2098,46 @@ jobs:
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
         run: pnpm -C apps/companion e2e
 
+      # Section 21 collects the tests' screenshots into the run's evidence. A run that drove the
+      # interface and kept no picture of it, or whose pictures went to the runner's temporary
+      # directory and were lost with it, is a failure here and not an empty upload.
+      - name: The screenshots are in the evidence directory
+        run: bash scripts/check-test-evidence.sh "$KR_TEST_ARTIFACTS_DIR" companion-screenshots
+
       - name: What the disk holds after the browsers' run
         if: ${{ !cancelled() && runner.os == 'macOS' }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the browsers' run"
 
+      # The desktop application itself, compiled the way it is shipped: the production bundle, and
+      # the feature that makes the binary serve it from inside itself rather than from a
+      # development server.
+      - name: Build the desktop application
+        id: desktop-build
+        run: |
+          pnpm -C apps/companion build
+          cargo build --locked -p companion-tauri --release --features custom-protocol
+
+      # The operating system's own part of the application, which a browser test cannot reach: the
+      # window the shell opens and the menu bar it gives the application, operated through the
+      # accessibility interface of the hosted runner's desktop and held to the state the window
+      # reports. The built executable is the one that was just linked, so a build that failed leaves
+      # nothing to operate and the failure is the build's alone.
+      - name: Operate the desktop application's native window controls
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.desktop-build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: bash scripts/desktop-controls-macos.sh target/release/kalareach-companion "$KR_TEST_ARTIFACTS_DIR/desktop-controls/window.png"
+
       # The figures, the traces and the screenshots the run produced, kept whether it passed or not.
+      # A run that kept nothing fails: the guard above names the pictures a browser run must leave.
       - name: Keep the end-to-end evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: companion-evidence-${{ matrix.os }}
           path: /tmp/kr-test-artifacts
-          if-no-files-found: ignore
-
-      # The desktop application itself, compiled the way it is shipped: the production bundle, and
-      # the feature that makes the binary serve it from inside itself rather than from a
-      # development server.
-      - name: Build the desktop application
-        run: |
-          pnpm -C apps/companion build
-          cargo build --locked -p companion-tauri --release --features custom-protocol
+          if-no-files-found: error
 
       - name: What the disk has left
         if: ${{ !cancelled() && runner.os == 'macOS' }}
