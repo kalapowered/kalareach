@@ -482,6 +482,12 @@ mod tests {
 
     /// The steady reading a budget counts on is measured from one origin, so readings taken a
     /// fraction of a millisecond apart, however many, add up to the time that passed.
+    ///
+    /// The case reads until 20 ms have passed and a thousand readings were taken, so how many a
+    /// thread that was off the CPU managed in the time decides nothing. It then compares what the
+    /// steady clock moved with the time that passed, as the machine's monotonic clock measured it
+    /// up to a moment before the last reading: the clock moved at least that, whole milliseconds
+    /// being counted on both sides, and it fails for readings that lose the time before them.
     #[test]
     fn the_steady_reading_loses_no_time_however_often_it_is_read() {
         use crate::push::{Clock, SystemClock};
@@ -490,17 +496,17 @@ mod tests {
         let started = std::time::Instant::now();
         let mut last = first;
         let mut readings = 0_u64;
-        while started.elapsed() < std::time::Duration::from_millis(20) {
+        while started.elapsed() < std::time::Duration::from_millis(20) || readings < 1_000 {
             let reading = SystemClock.steady_ms();
             assert!(reading >= last, "a steady reading never goes back");
             last = reading;
             readings += 1;
         }
+        let passed = u64::try_from(started.elapsed().as_millis()).expect("milliseconds");
         let end = SystemClock.steady_ms();
-        assert!(readings > 20, "read more often than once a millisecond");
         assert!(
-            end - first >= 19,
-            "20 ms passed and the steady clock moved {} ms",
+            end - first >= passed,
+            "{passed} ms passed and the steady clock moved {} ms",
             end - first
         );
     }
