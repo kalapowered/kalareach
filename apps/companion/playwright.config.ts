@@ -1,23 +1,23 @@
 import { defineConfig, devices } from '@playwright/test'
 
+import { ARTEFACTS } from './e2e/evidence.ts'
 import { HARNESS_PORT } from './e2e/served.ts'
 
 // Section 27 puts every test artefact in one platform-resolved directory. The harness build is
 // served by `vite preview`; the application under test is the same bundle the desktop shell loads,
 // with the fake host in place of a paired one. `scripts/e2e.mjs` serves both bundles, each on a port
 // the system gave its server, and runs this configuration with those ports.
-const artefacts = process.env.KR_TEST_ARTIFACTS_DIR ?? '/tmp/kr-test-artifacts'
 
 export default defineConfig({
   testDir: './e2e',
-  outputDir: `${artefacts}/companion-e2e`,
+  outputDir: `${ARTEFACTS}/companion-e2e`,
   // One at a time. Several of these measure layout, a gesture or a scroll position, and workers
   // competing for the same cores measure the machine rather than the interface.
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: 0,
   workers: 1,
-  reporter: [['list'], ['html', { outputFolder: `${artefacts}/companion-e2e-report`, open: 'never' }]],
+  reporter: [['list'], ['html', { outputFolder: `${ARTEFACTS}/companion-e2e-report`, open: 'never' }]],
   use: {
     baseURL: `http://localhost:${HARNESS_PORT}`,
     trace: 'retain-on-failure',

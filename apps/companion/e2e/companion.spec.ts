@@ -6,7 +6,7 @@
  * terminal's cells, the sheet's gesture, the colour modes, and the scroll position that decides
  * whether the view is following.
  *
- * Every screenshot goes under `/tmp`, and each one is named for the requirement row it closes.
+ * Every screenshot goes under the test artefact directory, and each one is named for the requirement row it closes.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
@@ -15,11 +15,12 @@ import { RECORD_VERSION, SUBMISSIONS_KEY } from '../src/mobile/model/store'
 import type { Submission } from '../src/model/receipts'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
-  return `/tmp/kr-companion-${name}.png`
+  return screenshotPath(`kr-companion-${name}`)
 }
 
 /**
