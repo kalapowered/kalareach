@@ -12,7 +12,6 @@
 //! | --- | --- |
 //! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
 //! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise exactly is adopted by neither, and an exact rule is selected over an inferred one; a package with no connector table adopts and binds what it recognises |
-//! | KR-REQ-03.27 | the program holding the terminal is the session's application, named as a person knows it, in the session's summary, with no state of its own while it runs, and the shell at its prompt is not an application; a program that is another until it execs takes the name it has after the exec; the command the shell integration answered for the line names it when it answered for one and the leader is running it |
 //! | KR-PERF-003 | a session nothing is happening in reads its terminal's foreground on no more than one interval in four, less often the longer it stays quiet, before and after its own traffic, and after an adopted program has ended |
 
 #![cfg(unix)]
@@ -1123,13 +1122,12 @@ async fn application_where(
         .clone()
 }
 
-/// KR-REQ-03.27: the program the root shell runs from a typed line is the session's application
+/// The program the root shell runs from a typed line is the session's application
 /// for as long as it holds the terminal, named as a person knows it and with no state of its own
 /// (the worker does not know what it is doing), and the root shell at its prompt is no
 /// application and is ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_the_program_holding_the_terminal_is_the_application_until_the_prompt_returns()
-{
+async fn the_program_holding_the_terminal_is_the_application_until_the_prompt_returns() {
     use kr_protocol::session::ApplicationState;
 
     let setup = Setup::new();
@@ -1205,11 +1203,11 @@ async fn kr_req_03_27_the_program_holding_the_terminal_is_the_application_until_
     typing.close().await;
 }
 
-/// KR-REQ-03.27: a program that is a wrapper until it execs is named for what it is when each look
+/// A program that is a wrapper until it execs is named for what it is when each look
 /// finds it, and the name follows the exec: the application is the wrapper while it runs and the
 /// program once it has replaced it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_a_wrapper_that_execs_the_program_names_the_program_after_the_exec() {
+async fn a_wrapper_that_execs_the_program_names_the_program_after_the_exec() {
     let setup = Setup::new();
     let go = setup.host.root().join("go");
     let shell = job_shell(
@@ -1259,7 +1257,7 @@ fn script(path: &Path, body: &str) {
         .expect("the script can run");
 }
 
-/// KR-REQ-03.27: when the shell's integration answered for exactly one command of the line and
+/// When the shell's integration answered for exactly one command of the line and
 /// the foreground program is running it, as the interpreter a script names runs the script it is
 /// given, that command names the application and not the interpreter. Only that shows it: a
 /// program that merely reads the script, or that has replaced the command, is named for its own
@@ -1271,7 +1269,7 @@ fn script(path: &Path, body: &str) {
 /// which is enough to name a program for display and for the sleep demand's reason, and decides
 /// nothing of authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_program_that_runs_it() {
+async fn the_command_the_integration_answered_for_names_the_program_that_runs_it() {
     use kr_worker::application::Following;
 
     let setup = Setup::new();

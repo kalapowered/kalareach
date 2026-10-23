@@ -1234,10 +1234,9 @@ fn a_command_sessions_marker_is_kept_apart_from_the_summary_an_earlier_release_r
         .expect("removes the journal's directory");
 }
 
-/// KR-REQ-13.10, KR-REQ-26.10: the journal of a session with a foreground application holds the
-/// session's summary in the form a release that does not know the application reads, and the
-/// application in a row of its own, which this build reads back into the summary. The row goes when
-/// the application does.
+/// The journal of a session with a foreground application holds the session's summary in the form
+/// a release that does not know the application reads, and the application in a row of its own,
+/// which this build reads back into the summary. The row goes when the application does.
 #[test]
 fn an_applications_name_is_kept_apart_from_the_summary_an_earlier_release_reads() {
     let path = journal_path("application");

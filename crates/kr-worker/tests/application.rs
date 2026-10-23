@@ -6,10 +6,6 @@
 //! read back from the session's summary, which is what the control daemon reads when it decides
 //! whether the host is kept awake. No foreground watch runs here, so everything a case sees comes
 //! from what the broker and the question ledger hold.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-03.27 | an approval a connector's table answers and a binding interpreted is the application's state until it is settled, and one nothing interpreted never is; an open question is, until it is answered or cancelled; a turn the connector's table names is, until it ends; an approval outranks a question and a question outranks a turn; and a session that has closed describes nothing, and names no application |
 
 #![cfg(unix)]
 
@@ -428,12 +424,12 @@ const STARTED: &str =
 const COMPLETED: &str =
     r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-7"}}}"#;
 
-/// KR-REQ-03.27: an approval the connector's table answers, and a binding interpreted, is the
+/// An approval the connector's table answers, and a binding interpreted, is the
 /// application's state until it is settled; the state is back to the prompt's once the server
 /// clears it. A reverse request nothing interpreted never is: it is an opaque request, not an
 /// approval a person can decide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_an_approval_is_the_applications_state_until_it_is_settled() {
+async fn an_approval_is_the_applications_state_until_it_is_settled() {
     let world = World::new().await;
     world.shows(Some(ApplicationState::ShellReady)).await;
 
@@ -460,10 +456,10 @@ async fn kr_req_03_27_an_approval_is_the_applications_state_until_it_is_settled(
     world.shows(Some(ApplicationState::ShellReady)).await;
 }
 
-/// KR-REQ-03.27: an open question is the application's state until it is answered, cancelled or
+/// An open question is the application's state until it is answered, cancelled or
 /// expired, with nothing but the question ledger having changed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_an_open_question_is_the_applications_state_until_it_is_withdrawn() {
+async fn an_open_question_is_the_applications_state_until_it_is_withdrawn() {
     let world = World::new().await;
     let question = world.ask("req-1");
     world.shows(Some(ApplicationState::AwaitingInput)).await;
@@ -471,10 +467,10 @@ async fn kr_req_03_27_an_open_question_is_the_applications_state_until_it_is_wit
     world.shows(Some(ApplicationState::ShellReady)).await;
 }
 
-/// KR-REQ-03.27: a turn the connector's table names is the application's state until it ends; an
+/// A turn the connector's table names is the application's state until it ends; an
 /// open question outranks it and an approval outranks both, and each gives way to the next.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_a_running_turn_is_busy_and_gives_way_to_what_waits_for_a_person() {
+async fn a_running_turn_is_busy_and_gives_way_to_what_waits_for_a_person() {
     let mut world = World::new().await;
     world.terminal_selects("thread-1").await;
     world.shows(Some(ApplicationState::ShellReady)).await;
@@ -496,10 +492,10 @@ async fn kr_req_03_27_a_running_turn_is_busy_and_gives_way_to_what_waits_for_a_p
     world.shows(Some(ApplicationState::ShellReady)).await;
 }
 
-/// KR-REQ-03.27: a session that has closed describes nothing, and nothing the worker learns
+/// A session that has closed describes nothing, and nothing the worker learns
 /// afterwards describes it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_a_closed_session_describes_nothing() {
+async fn a_closed_session_describes_nothing() {
     let world = World::new().await;
     let _question = world.ask("req-1");
     world.shows(Some(ApplicationState::AwaitingInput)).await;

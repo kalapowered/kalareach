@@ -50,11 +50,11 @@ fn closure(session_id: SessionId) -> ClosureRecord {
     }
 }
 
-/// KR-REQ-03.27: a session that has closed names no application, though the journal its worker
+/// A session that has closed names no application, though the journal its worker
 /// left still holds the one it named while a program held the terminal. The rest of what the
 /// worker wrote is what a person is shown: the directory the summary names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kr_req_03_27_a_closed_session_read_back_from_its_journal_names_no_application() {
+async fn a_closed_session_read_back_from_its_journal_names_no_application() {
     let temp = kr_ipc::testing::TempHost::create();
     let controller = super::net::tests::daemon(&temp).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
