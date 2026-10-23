@@ -69,8 +69,8 @@ use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::signed::SignedService;
 use kr_client::services::sync::{MAX_SYNC_REQUEST_BYTES, ManagedSyncService, SYNC_EXCHANGE_PATH};
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncComparison, SyncDispatch, SyncExchanged, SyncFetched,
-    SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncComparison, SyncExchanged, SyncFetched, SyncPosition,
+    SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     CollectionSealer, MemoryCollectionKeys, Published, Resolutions, SettingValue, SyncBody,
@@ -210,6 +210,10 @@ impl ServiceHttp for Recording {
 /// request identity, a status query, a fence and a comparison by the state they read, and the drop
 /// of a copy by the copy being gone. So a repeat cannot do a thing twice, and the call is made
 /// again only after the wait. Whatever the service answers that is not such a request is the answer.
+///
+/// The default of `compare_exchange_dispatched` stays: it counts every failure as one of a request
+/// that may have left, which is the safe direction when a later send of the call can be the one
+/// that is refused before anything leaves.
 #[derive(Debug)]
 struct Following {
     inner: ManagedSyncService,
@@ -242,27 +246,6 @@ impl SyncBackupService for Following {
         Box::pin(following_the_retry("the exchange", move || {
             self.inner
                 .compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
-        }))
-    }
-
-    /// The client knows which of its refusals were made before anything left, and says so: that
-    /// answer passes through as it is, since a request that never left is not asked to be sent again.
-    fn compare_exchange_dispatched<'a>(
-        &'a self,
-        collection: &'a str,
-        request_id: Uuid,
-        signed_at_ms: u64,
-        expected: Option<SyncPosition>,
-        ciphertext: &'a [u8],
-    ) -> ServiceFuture<'a, SyncDispatch> {
-        Box::pin(following_the_retry("the exchange", move || {
-            self.inner.compare_exchange_dispatched(
-                collection,
-                request_id,
-                signed_at_ms,
-                expected,
-                ciphertext,
-            )
         }))
     }
 
