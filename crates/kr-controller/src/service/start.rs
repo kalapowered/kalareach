@@ -400,6 +400,19 @@ impl Controller {
         let recorded_revision = capability_revision(&paths);
         let started_at_ms = kr_ipc::now_ms();
         let authority_revision = registry.authority_revision()?;
+        // The workers an earlier run recorded, with the revision each last acknowledged. This run
+        // remembers nothing of what that run announced to them, so the barrier is told which they
+        // are ([`crate::authority::AuthorityBarrier::recovered`]), and what they still hold of the
+        // revisions they acknowledged is read back once the start is done
+        // ([`Controller::recover_what_workers_hold`]).
+        let recorded_workers: Vec<(
+            kr_protocol::ids::SessionId,
+            kr_protocol::ids::AuthorityRevision,
+        )> = registry
+            .workers()?
+            .into_iter()
+            .map(|worker| (worker.session_id, worker.acknowledged_revision))
+            .collect();
         let transfer =
             Arc::new(crate::transfer::TransferModule::open(&setup.paths, wall.clone()).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
@@ -1048,6 +1061,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             evidence_pages_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
             #[cfg(feature = "testing")]
+            read_back: std::sync::Mutex::new(None),
+            #[cfg(feature = "testing")]
             announcements_sent: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),
@@ -1089,7 +1104,12 @@ impl Controller {
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
             shared_clock,
-            leases: crate::authority::AuthorityBarrier::new(generation, authority_revision),
+            leases: {
+                let leases =
+                    crate::authority::AuthorityBarrier::new(generation, authority_revision);
+                leases.recovered(recorded_workers.iter().map(|(session_id, _)| *session_id));
+                leases
+            },
             clock,
             wall,
             network: std::sync::OnceLock::new(),
@@ -1276,6 +1296,7 @@ impl Controller {
             );
         }
         controller.start_debt_pass(passes);
+        controller.recover_what_workers_hold(recorded_workers);
         // A document this environment has not accepted is put through acceptance here rather than
         // left for whoever reads next. What it owes can include fencing dispatch, and work must not
         // be dispatched under an authority that a document already written on this disk withdrew.

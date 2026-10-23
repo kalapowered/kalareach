@@ -524,6 +524,10 @@ pub struct Controller {
     /// shipped build.
     #[cfg(feature = "testing")]
     evidence_pages_limit: std::sync::atomic::AtomicUsize,
+    /// The task that reads back what the workers an earlier run recorded still hold, for this
+    /// host's own tests to wait for. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    read_back: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Every announcement of an authority revision this daemon has sent to a worker, in the order
     /// it sent them, for this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -961,6 +965,20 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Waits until the task that read back what the workers an earlier run recorded still hold
+    /// has ended, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub async fn what_workers_hold_is_read_back_for_tests(&self) {
+        let task = self
+            .read_back
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     /// Records an announcement of an authority revision as this daemon sends it, for this host's

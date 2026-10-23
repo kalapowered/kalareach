@@ -53,6 +53,22 @@ fn now() -> TimestampMs {
     kr_ipc::now_ms()
 }
 
+/// A worker's dispatch boundary, held until it is released ([`Worker::hold_the_dispatch_boundary`]).
+pub struct HeldBoundary {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldBoundary {
+    /// Lets the boundary go.
+    pub fn release(mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the holding thread finishes");
+        }
+    }
+}
+
 /// A worker for one session, in this process, on an environment tree a daemon of it serves.
 pub struct Worker {
     pub service: Arc<WorkerService>,
@@ -238,6 +254,56 @@ impl Worker {
     /// The session's runtime, for a suite that stops the journal's next commit.
     pub fn runtime(&self) -> &Arc<SessionRuntime> {
         &self._runtime
+    }
+
+    /// Accepts `count` intents from `actor` that the worker never dispatches, so that a fence for
+    /// a revocation takes them back and names them.
+    pub fn seed_undispatched_intents(&self, actor: &kr_protocol::ids::ActorId, count: usize) {
+        let mut session = self._runtime.session();
+        let journal = session.journal_mut().expect("a journal");
+        for index in 0..count {
+            let mut bytes = [0_u8; 16];
+            bytes[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            let now_ms = now();
+            journal
+                .accept(&kr_worker::journal::Submission {
+                    actor_id: actor.clone(),
+                    action_id: kr_protocol::ids::ActionId::new(Uuid::from_bytes(bytes)),
+                    method: Method::AgentApprovalRespond.into(),
+                    method_version: kr_protocol::method::MethodVersion::V1,
+                    payload_digest: Digest256::from_bytes(
+                        [u8::try_from(index % 251).unwrap_or(0); 32],
+                    ),
+                    subject_digest: Digest256::from_bytes([0xa5; 32]),
+                    intent: vec![0xa0],
+                    accepted_deadline_ms: Some(TimestampMs::new(now_ms.get() + 120_000)),
+                    now_ms,
+                })
+                .expect("an admitted intent");
+        }
+    }
+
+    /// Takes the worker's dispatch boundary and holds it on a thread of its own until it is
+    /// released: what an announcement of an authority revision meets while a mutation, a
+    /// generation another link presents or a maintenance pass is inside it. The announcement is
+    /// refused, not waited for.
+    pub async fn hold_the_dispatch_boundary(&self) -> HeldBoundary {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
+        let service = Arc::clone(&self.service);
+        let thread = std::thread::spawn(move || {
+            let _boundary = service.hold_the_dispatch_boundary();
+            let _ = held.send(());
+            // Held until the test lets it go, or until the test ends without doing so.
+            let _ = wait.recv();
+        });
+        confirmed
+            .await
+            .expect("the holder ended without holding the boundary");
+        HeldBoundary {
+            release: Some(release),
+            thread: Some(thread),
+        }
     }
 
     /// How many attachments the session holds now.

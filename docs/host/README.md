@@ -2663,6 +2663,17 @@ asks again for the pages an older revocation still owes: the revision in force c
 revisions that any result it holds a report for reads and the worker has not been asked about, and
 the unfinished older ones after them, out of one page budget per announcement.
 
+A daemon that restarts holds none of this. For a worker that an earlier run recorded, the first
+announcement also reads the revisions between the one the registry holds the worker as having
+acknowledged and the first this run announces, the newest seven at most: the worker may have
+refused them, fenced them by itself and filed names under them. A worker that was told none of
+them cannot say what its fence named for them, and the result says so. Once the start is done, a
+task of its own asks each such worker for the first page of each of the newest
+`kr_worker::journal::MAX_HELD_REVOCATIONS` revocations it acknowledged, at most eight exchanges for
+a worker, and the pass that collects owed names asks for the pages that follow. A repeat of one of
+those revocations then names what the worker still holds. A revocation older than that answers as
+it was first given.
+
 A rejection and its name are one transaction. A rejection committed without its name would be an
 action the result owes and cannot produce, and the next pass would not find it: a pass selects
 intents that are still accepted, and that one is not.
