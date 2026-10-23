@@ -2585,23 +2585,21 @@ mod tests {
         let mut frames = vec![BridgeFrame::HelloAck(Box::new(acknowledgement()))];
         frames.extend(answers.clone());
         frames.push(notification(0));
-        let (_directory, opening) = writing(&frames, "exec sleep 600");
+        let (_directory, opening) = writing_through(&frames, "exec sleep 600");
         let mut stream = opening
             .launch()
             .await
             .expect("the helper answered as the enrolled environment")
             .into_stream_within(SILENCE_LIMIT, charged(&answers[0]) * 2 + 1);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let mut taken = Vec::new();
-        while let Ok(Ok(frame)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), stream.recv()).await
-        {
-            taken.push(match frame {
+        let taken: Vec<String> = held_once_read_through(&mut stream)
+            .await
+            .into_iter()
+            .map(|frame| match frame {
                 ControlFrame::Notification(held) => format!("notification {}", held.sequence.get()),
                 ControlFrame::Response(_) => "response".to_owned(),
                 other => format!("{other:?}"),
-            });
-        }
+            })
+            .collect();
         assert_eq!(taken, ["response", "response", "notification 0"]);
         assert!(stream.shared.lock().ended.is_none());
         let _ = stream
