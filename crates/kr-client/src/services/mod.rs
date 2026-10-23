@@ -58,7 +58,7 @@
 //! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
 //! | [`voice_control::ControlNews`], [`voice_control::ControlEnd`], [`voice_control::Closure`], [`voice_control::Accepted`] | What the service and the provider said to a call: a reason, an identifier, a note, a delegation | Which kind it is and its numbers |
 //! | [`signed::SignedService`] | The key that signs a managed-service call | The gateway, the signer kind |
-//! | [`push::InstallationSigner`] | An installation's authorisation key | The public key |
+//! | [`push::InstallationSigner`] | An installation's authorisation key | Nothing of it |
 //! | [`push::Registration`], [`push::Issued`] | A binding, a challenge's identifiers, a delivery credential | Which state it is, or that a credential was issued |
 //! | [`authority::FeedAnnouncement`] | A sealed announcement for a mailbox | What the item is, and its declared size |
 //! | [`authority::AuthorityFeedRecord`] | A revocation request signed by a remote owner | The position, the request identity, whether it is finished |
