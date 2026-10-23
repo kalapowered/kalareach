@@ -1753,13 +1753,11 @@ jobs:
             echo "::error::the runner's Android SDK has no command-line tools at $manager"
             exit 1
           fi
-          # The image's command-line tools are older than the repository the packages come from.
-          yes | "$manager" --install "cmdline-tools;latest" > "$RUNNER_TEMP/sdkmanager.log"
-          yes | "$manager" --licenses >> "$RUNNER_TEMP/sdkmanager.log"
+          yes | "$manager" --licenses > "$RUNNER_TEMP/sdkmanager.log"
           yes | "$manager" --install "ndk;28.2.13676358" "emulator" \
             "system-images;android-36;google_apis_playstore_ps16k;x86_64" >> "$RUNNER_TEMP/sdkmanager.log"
           tail -n 5 "$RUNNER_TEMP/sdkmanager.log"
-          "$manager" --list_installed | grep -E 'cmdline-tools|ndk;28|emulator|system-images'
+          "$manager" --list_installed | grep -E 'ndk;28|emulator|system-images'
           {
             echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
             echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
@@ -1799,7 +1797,13 @@ jobs:
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd --force --name "$avd" \
             --package "system-images;android-36;google_apis_playstore_ps16k;x86_64" --device pixel
           # The application and the libraries it unpacks are more than the default data partition.
-          config="$HOME/.android/avd/$avd.avd/config.ini"
+          # The tool says where it put the device.
+          directory="$("$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" list avd | sed -n 's/^ *Path: *//p' | head -n 1)"
+          config="$directory/config.ini"
+          if [ ! -f "$config" ]; then
+            echo "::error::the virtual device has no configuration file at $config"
+            exit 1
+          fi
           sed -i '/^disk\.dataPartition\.size=/d' "$config"
           echo "disk.dataPartition.size=8192M" >> "$config"
           "$ANDROID_HOME/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot \
@@ -1888,16 +1892,26 @@ jobs:
         run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
       # The runner's default Xcode is older than the Swift the application's code needs. The choice
-      # is the one the phone unit tests make, and the version is printed.
+      # is the one the phone unit tests make, and the version is printed. It is also made the
+      # system's, because the build below starts Xcode through a program that passes this job's
+      # environment on only in part.
       - name: Choose the newest Xcode
         run: |
           . scripts/lib/xcode.sh
           kr_select_xcode
           echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
-          DEVELOPER_DIR="$DEVELOPER_DIR" xcodebuild -version
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcode-select --print-path
+          xcodebuild -version
 
+      # Xcode runs a build phase of the application that starts pnpm without this runner's settings,
+      # and pnpm, finding the packages installed under others, would install them again before it
+      # ran, and stop for want of a terminal to confirm removing them. Its check before a run is
+      # turned off for this runner's user; the packages are installed here, from the lockfile.
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          printf 'verify-deps-before-run=false\n' >> "$HOME/.npmrc"
+          pnpm install --frozen-lockfile
 
       # What Xcode's build gives the Swift package it builds from the Rust side is the application's
       # minimum system, which a lint outside Xcode has to be given the same way.

@@ -14,6 +14,7 @@
 #   * the web view has opened its debugging socket and lists a page with a title that the
 #     application's own protocol served (tauri.localhost), which is the interface's document
 #     loaded by the Rust shell;
+#   * the screen shows the page: below the status bar it is more than a blank field;
 #   * the system logged no fatal exception for the application;
 #
 # and then saves a screenshot of the screen to the path given. Each wait ends when its condition
@@ -152,7 +153,7 @@ try:
 except ValueError:
     pages = []
 for page in pages:
-    if page.get("title") and "://tauri.localhost" in page.get("url", ""):
+    if page.get("title") not in (None, "", "tauri.localhost") and "://tauri.localhost" in page.get("url", ""):
         print(page["title"])
         break
 ')"
@@ -160,6 +161,34 @@ for page in pages:
 }
 wait_for "the web view to list a page with a title, served by the application's own protocol" page_has_title
 say "page title: $title"
+
+# The device's screen as the raw pixels `screencap` writes: a small header and then four bytes a
+# pixel. The page is drawn when more than half a percent of the sampled pixels below the status bar
+# differ from the colour that covers most of them.
+screen_shows_the_page() {
+    dev exec-out screencap 2> /dev/null | python3 -I -c '
+import collections
+import struct
+import sys
+
+data = sys.stdin.buffer.read()
+if len(data) < 16:
+    sys.exit(1)
+width, height = struct.unpack_from("<II", data, 0)
+header = len(data) - width * height * 4
+if header not in (12, 16) or width == 0 or height == 0:
+    sys.exit(1)
+sampled = []
+for row in range(height * 12 // 100, height, 4):
+    start = header + row * width * 4
+    line = data[start : start + width * 4]
+    sampled.extend(line[i : i + 3] for i in range(0, len(line), 16))
+common = collections.Counter(sampled).most_common(1)[0][0]
+different = sum(1 for pixel in sampled if max(abs(a - b) for a, b in zip(pixel, common)) > 30)
+sys.exit(0 if different * 200 > len(sampled) else 1)
+'
+}
+wait_for "the screen to show the page" screen_shows_the_page
 
 log="$(dev logcat -d -b all 2> /dev/null | tr -d '\r')"
 if grep -E -q 'FATAL EXCEPTION|Fatal signal' <<< "$log"; then
