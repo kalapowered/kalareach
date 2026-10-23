@@ -60,6 +60,7 @@ mod close;
 mod configuration;
 mod create;
 mod host;
+mod identifiers;
 mod inhibition;
 mod insertion;
 mod local;
@@ -374,6 +375,9 @@ pub struct Controller {
     /// renew a lease it did not issue. The same type holds the revocation barrier, because a lease
     /// running out is not a barrier holding and the two have to be read together.
     leases: crate::authority::AuthorityBarrier,
+    /// The identifiers of the mutations the local door is performing, so that two arrivals under
+    /// one identifier for different mutations are not both performed.
+    identifiers_performing: identifiers::Performing,
     /// The network host this daemon serves, once it is on a network.
     ///
     /// The host is what a revocation needs: withdrawing a registration stops the next request, and

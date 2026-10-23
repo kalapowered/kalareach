@@ -2072,6 +2072,28 @@ impl GrantDirectory {
         read_claim(&connection, &key, payload_digest, &self.live)
     }
 
+    /// Whether the grant store at `path` holds a claim of this actor's action, whatever became of it.
+    ///
+    /// It is asked through a connection of its own and takes nothing the store holds, so it waits
+    /// for no work the store is doing. A store that is not there holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the claim cannot be read.
+    pub fn holds_action(
+        path: &std::path::Path,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Result<bool> {
+        let key = claim_key(actor_id, action_id);
+        kr_flush::release::holds_a_row(
+            path,
+            "SELECT 1 FROM authority_receipts WHERE actor_id = ?1 AND action_id = ?2",
+            params![key.0, key.1.as_slice()],
+        )
+        .map_err(ControllerError::registry)
+    }
+
     /// Claims one actor's action before its effect, or reports what this host holds about it.
     ///
     /// Section 9's de-duplication key is the actor and the action together, and the payload digest

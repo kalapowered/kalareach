@@ -573,6 +573,24 @@ pub struct TransferService {
 }
 
 impl TransferService {
+    /// Whether this environment's transfer store holds a record of the actor's action, read
+    /// through a connection of its own that waits for nothing the service is doing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the store cannot be read.
+    pub fn holds_action(
+        paths: &EnvironmentPaths,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: Uuid,
+    ) -> Result<bool> {
+        crate::store::Store::holds_action(
+            &crate::staging::StagingArea::store_path(paths),
+            actor_id,
+            action_id,
+        )
+    }
+
     /// Opens the service for an environment, creating its store and staging area on first use,
     /// against the clock the host supplies.
     ///

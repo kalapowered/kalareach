@@ -44,6 +44,39 @@ pub fn open_connection(
     })
 }
 
+/// Whether the store at `path` has a row for `query`, read through a connection of its own.
+///
+/// For a caller that asks whether a record exists in a store another part of the process holds
+/// open and must not wait for: the connection is read-only and takes no lock of the holder's. A
+/// store in write-ahead mode answers from what is committed while a writer works, and one that is
+/// not waits for a commit at most [`PATIENCE`]. A store that is not there holds no row, and every
+/// other refusal is returned: a store that cannot be read is not one that holds nothing.
+///
+/// # Errors
+///
+/// Returns the store's refusal when it cannot be opened or asked.
+pub fn holds_a_row(
+    path: &std::path::Path,
+    query: &str,
+    parameters: impl rusqlite::Params,
+) -> rusqlite::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let connection = open_connection(
+        path,
+        Some(
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
+    )?;
+    connection.busy_timeout(PATIENCE)?;
+    match connection.query_row(query, parameters, |_| Ok(())) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// How long an open that is told the previous holder has not let go yet asks again before it
 /// reports the refusal.
 ///

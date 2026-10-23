@@ -1196,6 +1196,28 @@ struct RawAction {
     challenge: Option<Vec<u8>>,
 }
 
+/// Whether the registry at `path` holds a record of this actor's pairing action, whatever the
+/// action did.
+///
+/// It is asked through a connection of its own and takes nothing the directory holds, so it waits
+/// for no work the directory is doing. A registry that is not there holds none.
+///
+/// # Errors
+///
+/// Returns an error when the registry cannot be read.
+pub fn holds_pairing_action(
+    path: &std::path::Path,
+    actor: &ActorId,
+    action_id: ActionId,
+) -> Result<bool> {
+    kr_flush::release::holds_a_row(
+        path,
+        "SELECT 1 FROM pairing_actions WHERE actor = ?1 AND action_id = ?2",
+        params![actor.as_str(), action_id.get().as_bytes().as_slice()],
+    )
+    .map_err(ControllerError::registry)
+}
+
 /// Reads the row of one actor's pairing action.
 fn read_action_row(
     connection: &Connection,

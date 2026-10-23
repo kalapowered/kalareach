@@ -1671,11 +1671,39 @@ impl Installer {
         actor_id: &kr_protocol::ids::ActorId,
         action_id: kr_protocol::ids::ActionId,
     ) -> PathBuf {
-        self.records.join("actions").join(format!(
-            "{}-{action_id}.json",
-            hex(&kr_cbor::sha256(actor_id.as_str().as_bytes())[..8])
-        ))
+        action_file(&self.records, actor_id, action_id)
     }
+}
+
+/// Where the record of one actor's installation or removal is kept, under the installer's records.
+fn action_file(
+    records: &Path,
+    actor_id: &kr_protocol::ids::ActorId,
+    action_id: kr_protocol::ids::ActionId,
+) -> PathBuf {
+    records.join("actions").join(format!(
+        "{}-{action_id}.json",
+        hex(&kr_cbor::sha256(actor_id.as_str().as_bytes())[..8])
+    ))
+}
+
+/// Whether this environment holds a record of an installation or a removal under this actor's
+/// action, whatever became of it.
+///
+/// The record is a file of its own, written whole, so it is looked for without the lock an
+/// installation holds.
+///
+/// # Errors
+///
+/// Returns an error when the place the record would be cannot be looked at.
+pub fn holds_installation_action(
+    state_dir: &Path,
+    actor_id: &kr_protocol::ids::ActorId,
+    action_id: kr_protocol::ids::ActionId,
+) -> Result<bool> {
+    action_file(&state_dir.join("agent-tools"), actor_id, action_id)
+        .try_exists()
+        .map_err(storage)
 }
 
 /// Reads a retained result back from its hexadecimal encoding.

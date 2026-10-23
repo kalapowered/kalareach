@@ -187,6 +187,24 @@ impl ChangeSetService {
         paths.state_dir().join(CHANGESETS_DIRECTORY)
     }
 
+    /// Whether this environment's change-set store holds a record of the actor's action, read
+    /// through a connection of its own that waits for nothing the service is doing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the store cannot be read.
+    pub fn holds_action(
+        paths: &EnvironmentPaths,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+    ) -> Result<bool> {
+        crate::store::Store::holds_action(
+            &Self::root_of(paths).join(STORE_FILE_NAME),
+            actor_id,
+            action_id,
+        )
+    }
+
     /// Returns the environment this service owns.
     #[must_use]
     pub const fn environment_id(&self) -> EnvironmentId {
