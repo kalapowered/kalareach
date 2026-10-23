@@ -35,6 +35,18 @@ enum LaunchAction: Equatable {
     case setAutoInit(Bool)
 }
 
+extension LaunchAction {
+    /// Whether this sets a delegate the system calls once the launch ends. The system hands a tap on a
+    /// notification and a push that woke the application to those delegates as soon as the launch
+    /// returns, so they are set before it does and not after the person's answer has been read.
+    var setsADelegate: Bool {
+        switch self {
+        case .addDelegateMethods, .hearNotificationTaps: return true
+        default: return false
+        }
+    }
+}
+
 /// The launch, decided.
 enum LaunchPlan {
     /// The modes that run before Firebase starts and stop the launch there.

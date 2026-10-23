@@ -86,14 +86,21 @@ public final class PushAdapter: NSObject {
     private let keys: LimitedKeyWriting
     private let route: NotificationRoute
     private let clock: () -> UInt64
+    private let permissionRead: (PushPermission) -> Void
 
+    /// `permissionRead` is told every answer the system is read for, so the registration goes on from
+    /// what the system says now: a person who agreed in the system's settings, after refusing, has the
+    /// APNs token handed on without being asked again.
     init(
         permissions: NotificationPermissions,
         tokens: PushTokenStore,
         record: PendingFile?,
         keys: LimitedKeyWriting,
         route: NotificationRoute,
-        clock: @escaping () -> UInt64 = { UInt64(Date().timeIntervalSince1970 * 1000) }
+        clock: @escaping () -> UInt64 = { UInt64(Date().timeIntervalSince1970 * 1000) },
+        permissionRead: @escaping (PushPermission) -> Void = { permission in
+            DispatchQueue.main.async { PushRegistration.shared.permissionKnown(permission) }
+        }
     ) {
         self.permissions = permissions
         self.tokens = tokens
@@ -101,6 +108,7 @@ public final class PushAdapter: NSObject {
         self.keys = keys
         self.route = route
         self.clock = clock
+        self.permissionRead = permissionRead
         super.init()
     }
 
@@ -126,9 +134,15 @@ public final class PushAdapter: NSObject {
 
         switch command {
         case "pushPermission":
-            permissions.current { answer(["state": Self.word($0)]) }
+            permissions.current { [permissionRead] in
+                permissionRead($0)
+                answer(["state": Self.word($0)])
+            }
         case "pushAskPermission":
-            permissions.ask { answer(["state": Self.word($0)]) }
+            permissions.ask { [permissionRead] in
+                permissionRead($0)
+                answer(["state": Self.word($0)])
+            }
         case "pushToken":
             answer(["token": tokens.token() ?? NSNull()])
         case "pushTokenChanged":

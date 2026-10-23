@@ -34,12 +34,15 @@ final class KRNativeLaunch: NSObject {
             PushStartup.carryOut(early)
             return
         }
+        // The delegates the system calls once the launch ends are set before it ends, whatever the
+        // person's answer is: the rest of the plan waits for it.
+        PushStartup.carryOut(early.filter(\.setsADelegate))
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             let permission = PushPermission(status: settings.authorizationStatus)
             let plan = LaunchPlan.decide(debugMode: debugMode, firebase: configured, permission: permission)
             DispatchQueue.main.async {
                 PushRegistration.shared.permissionKnown(permission)
-                PushStartup.carryOut(plan)
+                PushStartup.carryOut(plan.filter { !$0.setsADelegate })
             }
         }
     }
