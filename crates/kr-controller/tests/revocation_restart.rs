@@ -354,7 +354,8 @@ async fn a_restarted_daemon_reads_the_newest_revisions_of_a_long_gap_and_says_th
 /// The registry holds nothing for the worker, as for one that acknowledged nothing, but no fence
 /// was owed when the daemon stopped, so nothing the worker could have fenced alone is missing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that_passed() {
+async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that_passed_when_no_fence_was_owed()
+ {
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     for _ in 0..3 {
