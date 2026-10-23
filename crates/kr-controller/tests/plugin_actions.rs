@@ -1059,12 +1059,14 @@ async fn kr_req_24_27_the_words_a_component_declines_an_action_with_are_withheld
     // And after privacy mode ends, on the connection it stood on.
     acting.hosted.tell_privacy(&mut authority, 2, false).await;
     let after = refused(&acting, &mut client, "cancel.fault").await;
+    assert_eq!(after.code, ErrorCode::InvalidArgument, "{after:?}");
     assert!(
         !after.message.contains("is not something to do"),
         "the component's words reached a person after privacy mode: {}",
         after.message
     );
     let other = refused(&acting, &mut client, "cancel.other.action").await;
+    assert_eq!(other.code, ErrorCode::InvalidArgument, "{other:?}");
     assert!(
         !other.message.contains("turn.cancel"),
         "a name the component chose reached a person after privacy mode: {}",
