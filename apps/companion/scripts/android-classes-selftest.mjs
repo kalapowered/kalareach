@@ -24,7 +24,8 @@ import { definedStrings, missingFrom, packagesOf, requestFrom } from './android-
 const PRESENT = [
   'to.kala.reach.companion.push.KalaReachMessagingService',
   'to.kala.reach.companion.push.PreviewWorker',
-  'to.kala.reach.companion.push.ChallengeWorker'
+  'to.kala.reach.companion.push.ChallengeWorker',
+  'to.kala.reach.platform.PlatformPlugin'
 ]
 
 /**
@@ -107,7 +108,7 @@ expect(
     filler,
     {
       name: 'classes.dex',
-      bytes: dex({ defined: [PRESENT[0], PRESENT[2]], referenced: [PRESENT[1]] })
+      bytes: dex({ defined: [PRESENT[0], PRESENT[2], PRESENT[3]], referenced: [PRESENT[1]] })
     }
   ]),
   PRESENT[1]
@@ -145,8 +146,32 @@ expect(
 expect(
   'an application missing the worker is named, not passed',
   'partial.apk',
-  zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[2]] }) }]),
+  zip([
+    filler,
+    { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[2], PRESENT[3]] }) }
+  ]),
   PRESENT[1]
+)
+expect(
+  'an application missing only the challenge worker is named, not passed',
+  'no-challenge-worker.apk',
+  zip([
+    filler,
+    { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[1], PRESENT[3]] }) }
+  ]),
+  PRESENT[2]
+)
+expect(
+  'an application missing only the platform plugin is named, not passed',
+  'no-plugin.apk',
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: PRESENT.slice(0, 3) }) }]),
+  PRESENT[3]
+)
+expect(
+  'an application that defines only the service is named for everything else',
+  'service-only.apk',
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
+  PRESENT.slice(1).join(', ')
 )
 expect(
   'a dex layout this does not read is refused rather than guessed at',
