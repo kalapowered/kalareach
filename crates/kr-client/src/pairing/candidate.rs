@@ -2795,6 +2795,15 @@ mod tests {
             unreachable!("the host commits nothing")
         }
 
+        fn visit_paired_transport<'a>(
+            &'a self,
+            _host: &'a PairedHost,
+            _identity: &'a LocalIdentity,
+            _in_use: Option<&'a kr_protocol::pairing::NetworkConfig>,
+        ) -> BoxFuture<'a, Result<Arc<dyn crate::transport::ControlTransport>, LinkError>> {
+            unreachable!("the host commits nothing")
+        }
+
         fn hold<'a>(
             &'a self,
             _network: &'a kr_protocol::pairing::NetworkConfig,

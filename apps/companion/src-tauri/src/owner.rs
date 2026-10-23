@@ -14,7 +14,9 @@
 //! that cycle and nothing more; and the record of open sessions is never locked across a wait on
 //! the network. A review holds the endpoint its host is reached through from the ceremony to the
 //! answer, so the watcher's visit to another host on the same relay waits for it rather than
-//! closing the connection the answer goes over.
+//! closing the connection the answer goes over. The watcher's visits never cut off the connection to
+//! the host in use either: an owned host that cannot be reached without that stays out of contact
+//! for as long as another host is the one in use.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -258,13 +260,13 @@ impl Owner {
         .ok_or_else(out_of_contact)?;
         // A session that answers now, and the challenge as the host holds it now: one the host
         // no longer holds open cannot be confirmed any more.
-        let (confirmations, holding) = self.reach(&host).await.ok_or_else(out_of_contact)?;
+        let (confirmations, holding) = self.reach(&host, false).await.ok_or_else(out_of_contact)?;
         let outcome = match held_now(&holding, &listed) {
             Held::Unchanged(current) => confirmations.review(current, &*self.ceremony).await,
             Held::Changed => ReviewOutcome::CannotCheck,
             Held::Gone => ReviewOutcome::Expired,
         };
-        self.refresh(&host).await;
+        self.refresh(&host, false).await;
         Ok(outcome)
     }
 
@@ -272,7 +274,7 @@ impl Owner {
     async fn cycle(&self) {
         let owned = self.device.owner_hosts();
         for host in &owned {
-            self.refresh(host).await;
+            self.refresh(host, true).await;
         }
         let owns = |host: &DeviceId| owned.iter().any(|owned| owned.host_device_id == *host);
         lock(&self.sessions).retain(|host, _| owns(host));
@@ -289,9 +291,11 @@ impl Owner {
         }
     }
 
-    /// Asks `host` what it wants confirmed, and shows its answer, or that it is out of contact.
-    async fn refresh(&self, host: &PairedHost) {
-        let listed = self.visit(host).await;
+    /// Asks `host` what it wants confirmed, and shows its answer, or that it is out of contact. A
+    /// visit leaves the host in use's connection alone; the answer to a review, which the person
+    /// asked for, does not.
+    async fn refresh(&self, host: &PairedHost, visiting: bool) {
+        let listed = self.visit(host, visiting).await;
         self.device
             .set_contact(host.host_device_id, listed.is_some());
         self.show(host, listed.unwrap_or_default());
@@ -299,14 +303,18 @@ impl Owner {
 
     /// One visit to `host`: what it holds open, or `None` when it could not be reached and asked
     /// in time.
-    async fn visit(&self, host: &PairedHost) -> Option<Vec<Listed>> {
-        self.reach(host).await.map(|(_, listed)| listed)
+    async fn visit(&self, host: &PairedHost, visiting: bool) -> Option<Vec<Listed>> {
+        self.reach(host, visiting).await.map(|(_, listed)| listed)
     }
 
     /// A session to `host` that answers now, and what the host holds open, found within
     /// [`VISIT_WITHIN`]: the open session is asked first, and one that no longer answers is let go
     /// for a fresh one.
-    async fn reach(&self, host: &PairedHost) -> Option<(Arc<OwnerConfirmations>, Vec<Listed>)> {
+    async fn reach(
+        &self,
+        host: &PairedHost,
+        visiting: bool,
+    ) -> Option<(Arc<OwnerConfirmations>, Vec<Listed>)> {
         let deadline = tokio::time::Instant::now() + VISIT_WITHIN;
         if let Some(open) = self.session(host.host_device_id) {
             match tokio::time::timeout_at(deadline, open.pending()).await {
@@ -314,7 +322,7 @@ impl Owner {
                 _ => self.forget(host.host_device_id, &open),
             }
         }
-        let opened = tokio::time::timeout_at(deadline, self.open(host))
+        let opened = tokio::time::timeout_at(deadline, self.open(host, visiting))
             .await
             .ok()??;
         let listed = tokio::time::timeout_at(deadline, opened.pending())
@@ -326,11 +334,21 @@ impl Owner {
     }
 
     /// A session to `host`, opened now: connected as the device this computer is there, through
-    /// the host's own network configuration, and aimed at the host's environment.
-    async fn open(&self, host: &PairedHost) -> Option<Arc<OwnerConfirmations>> {
+    /// the host's own network configuration, and aimed at the host's environment. A visit never
+    /// cuts off the connection to the host in use.
+    async fn open(&self, host: &PairedHost, visiting: bool) -> Option<Arc<OwnerConfirmations>> {
         let pairing = self.device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
-        let session = pairing.link.connect_paired(host, &identity).await.ok()?;
+        let session = if visiting {
+            let in_use = self.device.host_in_use().map(|using| using.network_config);
+            pairing
+                .link
+                .visit_paired(host, &identity, in_use.as_ref())
+                .await
+                .ok()?
+        } else {
+            pairing.link.connect_paired(host, &identity).await.ok()?
+        };
         let channel = SessionChannel::open(Arc::new(session)).await.ok()?;
         Some(Arc::new(OwnerConfirmations::new(
             host.clone(),
