@@ -1549,9 +1549,9 @@ impl Session {
     /// Sets the name of the application in the session's foreground, or clears it when the
     /// foreground is no application, and writes the session's record again when it changed.
     ///
-    /// The name is the one a person recognises, as the foreground-application producer of
-    /// KR-REQ-03.27 learns it, and that producer calls this. A session that has closed names no
-    /// application, and the producer does not set one again.
+    /// The name is the one a person recognises, as the foreground-application producer learns it,
+    /// and that producer calls this. A session that has closed names no application, and the
+    /// producer does not set one again.
     pub fn set_application(&mut self, application: Option<String>) {
         if self.application == application {
             return;
