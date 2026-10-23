@@ -5968,7 +5968,7 @@ async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores(
         .expect("the member opens");
     let document: serde_json::Value =
         serde_json::from_slice(exported.expose()).expect("a session export");
-    assert_eq!(document["format"], "kalareach-session-export/1");
+    assert_eq!(document["format"], "kalareach-session-export/2");
     assert!(
         document["output"]["chunks"]
             .as_array()
@@ -6279,7 +6279,7 @@ async fn a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_
         .expect("the session opens");
     let document: serde_json::Value =
         serde_json::from_slice(restored.expose()).expect("a session export");
-    assert_eq!(document["format"], "kalareach-session-export/1");
+    assert_eq!(document["format"], "kalareach-session-export/2");
     let read_back: Vec<u8> = document["output"]["chunks"]
         .as_array()
         .expect("chunks")
