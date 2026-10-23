@@ -207,11 +207,10 @@ impl InstallationSigner {
 }
 
 impl fmt::Debug for InstallationSigner {
-    /// The public key, which is what names this installation to a gateway. Never the private half.
+    /// Names the type and nothing of the key.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("InstallationSigner")
-            .field("public_key", self.key.public())
             .finish_non_exhaustive()
     }
 }
