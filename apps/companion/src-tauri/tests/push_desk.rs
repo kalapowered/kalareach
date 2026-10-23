@@ -2,10 +2,12 @@
 //!
 //! The device is this crate's own backend paired with real in-process hosts. The native half (the
 //! system's permission, the provider's token, the record the receiver answers a challenge into, the
-//! limited key store) and the notification service's gateway are the two things a test has no
-//! phone and no Google for, so each is a small script; the phone's sequencing, its record and its
-//! pairing records are the product's. What the devices' legs show of the receivers and of the real
-//! gateway is shown there; what these hold is the order and the keys the application's core uses.
+//! limited key store), the notification service's gateway and the host's side of the registration
+//! call (`HostLink`, which records what it was handed) are what a test has no phone, no Google and
+//! no push-capable host for, so each is a small script; the phone's sequencing, its record and its
+//! pairing records are the product's. What the devices' legs show of the receivers, of the real
+//! gateway and of what a host takes is shown there; what these hold is the order and the keys the
+//! application's core uses, and what it hands its registrar.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -476,16 +478,26 @@ async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_hos
         derived.key_id().as_bytes(),
         "under that key's identifier"
     );
-    // The control: the installation's authorisation key is another key, and is not what is filed.
+    // The control: the installation's authorisation seed is another secret, which the phone holds
+    // and the application's secure store gives back, and it is not what is filed.
     let authorisation = phone
         .device
         .identity()
-        .keys
-        .authorisation
-        .public()
-        .as_bytes()
-        .to_vec();
-    assert_ne!(derived.public().as_bytes().to_vec(), authorisation);
+        .secrets
+        .get(
+            &SecretName::device_key(
+                companion_platform::secrets::DEVICE_SCOPE,
+                KeyPurpose::Authorisation,
+            )
+            .expect("a name"),
+        )
+        .expect("the store answers")
+        .expect("the phone holds an authorisation seed");
+    assert_ne!(
+        authorisation.expose(),
+        seed.as_slice(),
+        "the authorisation seed is not what is filed"
+    );
 }
 
 /// KR-REQ-16.06: the phone keeps one record of the registration it waits for and the gateway one
