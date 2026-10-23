@@ -5,11 +5,11 @@
 Commands, each given the adb program, the emulator's serial and a screenshot directory:
 
   tap <words>
-      Leaves the application on its Hosts screen in the background (`PUSH-ON-HOSTS`), opens the
-      notification shade, taps the notification that shows those words and waits for the page's own
-      heading to say Attention: the tap moved it there. The words are the host's generic alert, so a
-      notification that carried any of the question's text would not be found. Prints
-      `PUSH-TAPPED <what the screen shows>`.
+      Leaves the application on its Hosts screen in the background (`PUSH-ON-HOSTS`, after closing a
+      sheet an earlier answer left open), opens the notification shade, taps the notification that
+      shows those words and waits for the page's own heading to say Attention: the tap moved it
+      there. The words are the host's generic alert, so a notification that carried any of the
+      question's text would not be found. Prints `PUSH-TAPPED <what the screen shows>`.
 
   choose <words of the question> <Yes|No> [blind]
       On the Attention screen, opens the item that shows those words and chooses the answer, without
@@ -73,9 +73,21 @@ def leave_on_hosts(phone: Phone) -> None:
     background, as a person who has gone to another screen and then away is. A tap on the
     notification is then shown to move the page to Attention, and not to open on it by default."""
     phone.run("shell", "am", "start", "-n", f"{APPLICATION}/.MainActivity")
+    # A sheet from an earlier question can still be open. It covers the tab bar, yet the web view
+    # keeps the tab bar's buttons in the tree, and a tap at a covered button lands on the sheet (it
+    # pressed "Open the session"). The sheet is closed as a person closes it, by its own control.
+    close = seen_within(phone, lambda each: each == "Close item", 6)
+    if close is not None:
+        phone.tap(close)
+        phone.wait_screen(
+            lambda nodes: any(each["label"] == "Hosts" for each in nodes)
+            and not any(each["label"] == "Close item" for each in nodes),
+            "the sheet over the screen to close",
+            30,
+        )
     tab = seen_within(phone, lambda each: each == "Hosts", 10)
     if tab is None:
-        # A sheet from an earlier question is over the screen: the system's back key closes it.
+        # A sheet that has no such control is over the screen: the system's back key closes it.
         phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
         tab = phone.wait(lambda each: each == "Hosts", "the Hosts tab", 60)
     phone.tap(tab)
