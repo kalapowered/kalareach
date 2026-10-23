@@ -361,7 +361,7 @@ late_seen = report.get("late_observe_step") or ""
 late_chosen = report.get("late_step") or ""
 say("a second question answered at the host while the person had chosen Yes and not sent it: the phone says it was answered by someone else and what the person had chosen, and offers nothing to send (09.21)",
     report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen
-    and "answered by someone else" in late_seen and re.search(r"You had chosen( \| )?Yes", late_seen) and "Send answer" not in late_seen
+    and "answered by someone else" in late_seen and re.search(r"You had chosen( \| | )Yes", late_seen) and "Send answer" not in late_seen
     and "still offered" not in late_seen
     and ("PUSH-CHOSEN" in late_chosen or "chosen" in late_chosen),
     late_seen[:300].replace("\n", " "))
