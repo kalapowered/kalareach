@@ -5,9 +5,9 @@ envelopes, the receipt contract, the error codes and the method authority table.
 this repository implements. Transport, pairing cryptography and storage are separate.
 
 [methods.md](methods.md) lists every method in the registry, generated from it, with its effect,
-its ingress, its summary and the section that describes it where one does.
-[method-reference.md](method-reference.md) describes the methods that none of the other guides
-describes. [glossary.md](glossary.md) defines the terms the protocol relies on.
+its ingress, its summary and the section that describes it. [method-reference.md](method-reference.md)
+describes the methods that none of the other guides describes. [glossary.md](glossary.md) defines
+the terms the protocol relies on.
 
 Four pieces make it up:
 
@@ -467,7 +467,7 @@ grant given after it started, so it cannot report that a restart would change th
 `crates/kr-protocol/src/method.rs` holds one exhaustive authority entry per method. The same table
 is generated as data to `packages/protocol/schema/method-authority.json` for consumers that are not
 written in Rust, and as [the method index](methods.md) for people: every method in the registry's
-groups, with its effect, its ingress, its summary and the section that describes it where one does.
+groups, with its effect, its ingress, its summary and the section that describes it.
 
 Anything not listed is denied. `decide(name, version, ingress)` returns a denial for an unknown
 name, a schema failure for a known method at an unsupported version, and a denial for an ingress
@@ -953,7 +953,8 @@ pnpm -r test
 
 `kr-protocol-gen --check` compares the committed files with what the current Rust types produce and
 names the first differing line. It also names every method in the registry that no document under
-`docs/` mentions, and every link in the method index whose document or heading is no longer there.
+`docs/` other than the index mentions, and every link in the method index whose document or heading
+is no longer there.
 The generator's own tests make the same checks, so `cargo test --workspace` fails on them too.
 `pnpm -C packages/protocol generate:check` does the same for the generated TypeScript, and the
 vitest suite runs it, so `pnpm -r test` fails when the types are stale.
