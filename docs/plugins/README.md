@@ -399,11 +399,11 @@ States are distinguished because "unavailable" alone sends people to the wrong f
 | `temporarily_unavailable` | It worked before and does not right now |
 | `not_tested` | No evidence has been gathered |
 
-Evidence is never authority. A signed qualification result says how a version behaves, which is
+Evidence is never authority. A signed evidence record says how a version behaves, which is
 `version_qualified`; it does not say this host has permission. The validator rejects a signed or
-declared result that claims `qualified_available`, because only a host probe or a live binding can
-establish that, and it rejects a signed result that names no qualification profile, because a result
-nothing can invalidate is a result that never goes stale. The grant check still happens separately
+declared evidence record that claims `qualified_available`, because only a host probe or a live
+binding can establish that, and it rejects a signed evidence record that names no qualification
+profile, because a record nothing can invalidate is a record that never goes stale. The grant check still happens separately
 on every action.
 
 ## Effect classes
@@ -803,8 +803,9 @@ An entry adds these to the manifest it came from:
 - The qualified builds of the application: for each, the application, where it was distributed from,
   the upstream version, the platform and the SHA-256 digest of the executable. A host takes an
   executable's version from the qualified build whose digest it matches, and from nowhere else. A
-  build is listed only when the qualification record of that release and platform, a file in the
-  plugins repository, shows every part of its cases passing; the host never reads that file.
+  build is listed by the plugins pipeline only when the qualification record of that release and
+  platform, a file in the plugins repository, shows every part of its cases passing; neither the
+  index nor a host enforces that, and the host never reads that file.
 - A revocation record when the release has one. A revoked release stops new bindings. An active
   binding gets a warning and follows the administrator's explicit disable policy; it does not change
   under a live request.

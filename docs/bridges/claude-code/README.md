@@ -40,8 +40,8 @@ The host applies the recipe in `.claude` in the account's home, the directory Cl
 `CLAUDE_CONFIG_DIR` is not set, once the owner's confirmed installation of the release has
 committed, and removes it when the package is removed; `docs/plugins/catalogue.md` says what it
 checks before writing anything and what a removal leaves. One of those checks is Claude Code's
-version, which only a signed record naming its executable by digest establishes: a build the
-release's entry in the signed index names for this platform. No release names one yet, so the recipe
+version, which only a qualified build establishes: a build the release's entry in the signed index
+names, by the executable's digest, for this platform. No release names one yet, so the recipe
 is refused and nothing is written. The settings key is spliced into the person's own
 `settings.json`, so every other byte of it stays as it was. The package writes the forwarder as
 `{kr_hook}`, and when the host writes each file it replaces that with the full path of the `kr-hook`
