@@ -411,16 +411,16 @@ enum Interruption {
 }
 
 /// Ends the plugin hosts of a harness whose one host has exited and not been collected, with the
-/// interruption in the middle of the third question the harness asks about it, and says what the
-/// harness did and whether the interruption happened.
+/// interruption in the middle of the `at`th question the harness asks about it, and says what the
+/// harness did, whether the interruption happened and how many questions it asked.
 ///
-/// The harness asks about a host three times: whether it needs killing, whether it has ended, and
-/// last which hosts are left. The first two see an ended host, as the kernel describes it before
-/// its parent collects it; the third is the question a parent that collects its children, or a
-/// kernel that will not answer, interrupts after the kernel has described the host and before it
-/// says whether it still runs.
+/// The harness asks whether the host needs killing, which sees an ended host as the kernel
+/// describes it before its parent collects it, and then whether it has ended, until the kernel
+/// says so once. The second question is the one a parent that collects its children, or a kernel
+/// that will not answer, interrupts after the kernel has described the host and before it says
+/// whether it still runs.
 #[cfg(target_os = "linux")]
-fn end_an_exited_host(interruption: Interruption) -> (std::thread::Result<()>, bool) {
+fn end_an_exited_host(interruption: Interruption, at: u32) -> (std::thread::Result<()>, bool, u32) {
     let tree = kr_ipc::testing::TempHost::create();
     let mut host = std::process::Command::new("/bin/sh")
         .args(["-c", "exec sleep 600"])
@@ -453,9 +453,10 @@ fn end_an_exited_host(interruption: Interruption) -> (std::thread::Result<()>, b
         services,
         environment: tree.environment(),
     };
-    let asked = std::cell::Cell::new(0_u32);
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0_u32));
     let interrupted = std::rc::Rc::new(std::cell::Cell::new(false));
     let hook = kr_ipc::identity::before_each_running_check({
+        let asked = std::rc::Rc::clone(&asked);
         let interrupted = std::rc::Rc::clone(&interrupted);
         let host = std::rc::Rc::clone(&host);
         move |process| {
@@ -463,7 +464,7 @@ fn end_an_exited_host(interruption: Interruption) -> (std::thread::Result<()>, b
                 return None;
             }
             asked.set(asked.get() + 1);
-            if asked.get() != 3 {
+            if asked.get() != at {
                 return None;
             }
             interrupted.set(true);
@@ -484,7 +485,7 @@ fn end_an_exited_host(interruption: Interruption) -> (std::thread::Result<()>, b
     drop(hook);
     // Collected by the hook, or here when it was not; the handle remembers a collection it made.
     host.borrow_mut().wait().expect("collects the stand-in");
-    (ended, interrupted.get())
+    (ended, interrupted.get(), asked.get())
 }
 
 /// The harness that ends the plugin hosts a test started sees a host that is collected between the
@@ -493,7 +494,7 @@ fn end_an_exited_host(interruption: Interruption) -> (std::thread::Result<()>, b
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_collected_between_the_two_readings_is_seen_to_end() {
-    let (ended, interrupted) = end_an_exited_host(Interruption::Collected);
+    let (ended, interrupted, _asked) = end_an_exited_host(Interruption::Collected, 2);
 
     assert!(
         interrupted,
@@ -506,21 +507,34 @@ fn a_host_collected_between_the_two_readings_is_seen_to_end() {
 }
 
 /// The control: when the kernel does not answer, the harness does not take an exited host for one
-/// that ended. It says the host was not seen to end, which is what keeps a host that is still
-/// running from being left behind unreported.
+/// that ended. It asks again, which is what keeps a host that is still running from being left
+/// behind unreported.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_the_kernel_will_not_describe_is_not_taken_for_one_that_ended() {
-    let (ended, interrupted) = end_an_exited_host(Interruption::Unanswered);
+    let (ended, interrupted, asked) = end_an_exited_host(Interruption::Unanswered, 2);
 
-    assert!(interrupted, "the kernel did not answer the last question");
-    let said = ended.expect_err("the harness reports a host it did not see end");
-    let said = said
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| said.downcast_ref::<&str>().copied())
-        .unwrap_or_default();
-    assert!(said.contains("not seen to end"), "and says so: {said}");
+    assert!(interrupted, "the kernel did not answer the question");
+    assert!(
+        asked >= 3,
+        "the harness took the unanswered question for the end of the host"
+    );
+    assert!(ended.is_ok(), "and saw it end when the kernel answered");
+}
+
+/// A host that the kernel has described as ended has ended: the harness does not ask about it
+/// again, so what the kernel says of it while its parent collects it, or when it will not answer,
+/// does not turn an end it saw into a host that was not seen to end.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_seen_to_end_is_not_asked_about_again() {
+    let (ended, interrupted, _asked) = end_an_exited_host(Interruption::Unanswered, 3);
+
+    assert!(!interrupted, "the harness asked a third question");
+    assert!(
+        ended.is_ok(),
+        "the harness saw the host end and said nothing"
+    );
 }
 
 /// KR-REQ-23.30: a plan that offers another attachment than the one the invocation names is

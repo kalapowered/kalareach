@@ -280,22 +280,34 @@ impl Drop for HostEnding {
             kill(host);
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while hosts
-            .iter()
-            .any(|host| kr_ipc::identity::process_state(host) != ProcessState::Ended)
-            && std::time::Instant::now() < deadline
-        {
+        // A host that has been read as ended is ended: the system numbers a process once, and a
+        // later reading of the same process can meet the moment its parent collects it, which the
+        // reader does not call an end. So each host is asked until it answers once that it has
+        // ended, and is not asked again.
+        let mut ended = vec![false; hosts.len()];
+        loop {
+            for (host, ended) in hosts.iter().zip(ended.iter_mut()) {
+                *ended = *ended || kr_ipc::identity::process_state(host) == ProcessState::Ended;
+            }
+            if ended.iter().all(|ended| *ended) || std::time::Instant::now() >= deadline {
+                break;
+            }
             // A host the system could not be asked about is killed again once it answers.
-            for host in &hosts {
+            for (host, _) in hosts.iter().zip(&ended).filter(|(_, ended)| !**ended) {
                 kill(host);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         let running: Vec<String> = hosts
             .iter()
-            .filter_map(|host| match kr_ipc::identity::process_state(host) {
-                ProcessState::Ended => None,
-                state => Some(format!("{}: {state:?}", host.pid.get())),
+            .zip(&ended)
+            .filter(|(_, ended)| !**ended)
+            .map(|(host, _)| {
+                format!(
+                    "{}: {:?}",
+                    host.pid.get(),
+                    kr_ipc::identity::process_state(host)
+                )
             })
             .collect();
         let jobs = self.environment.jobs_dir();
