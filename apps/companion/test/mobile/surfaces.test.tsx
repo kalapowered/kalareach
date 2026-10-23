@@ -510,15 +510,28 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
 
   it('leaves what was written in the composer when the host refuses it', async () => {
     const person = userEvent.setup()
-    const { controls } = start('ios')
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          // The host stops answering as the person presses Send.
+          composerSubmit: (params, opening, supersedes) => {
+            controls.setConnected(false)
+            return port.composerSubmit(params, opening, supersedes)
+          }
+        }}
+      >
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
     await person.click(await screen.findByRole('button', { name: /Session 1/ }))
     const composer = await screen.findByLabelText('Message this session')
     await person.type(composer, 'do not lose me')
-    controls.setConnected(false)
     await person.click(screen.getByRole('button', { name: 'Send' }))
     await waitFor(() => {
-      expect(screen.getByText(/not in contact/i)).toBeInTheDocument()
+      expect(screen.getAllByText(/not in contact/i).length).toBeGreaterThan(0)
     })
     // The submission did not happen, so the text is still exactly where the person left it.
     expect(screen.getByLabelText('Message this session')).toHaveValue('do not lose me')

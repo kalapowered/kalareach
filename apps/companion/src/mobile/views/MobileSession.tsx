@@ -42,6 +42,7 @@ import { failureCode, failureMessage, type SessionSubject } from '../../host/por
 import {
   adoptFirstTarget,
   againstCurrent,
+  connectionLost,
   edit,
   notSubmittableBecause,
   startDraft,
@@ -255,20 +256,22 @@ export function MobileSession({
     [sessionId, liveInstance, liveBinding]
   )
   // A draft keeps the conversation it was written for; one whose conversation moved on is
-  // conflicted, and the person chooses whether it goes to the new one.
-  const draft = useMemo(
-    () =>
-      againstCurrent(
-        held ??
-          startDraft(
-            `draft-${sessionId}`,
-            { sessionId, applicationInstanceId: null, agentBindingRevision: null },
-            openedAtMs
-          ),
-        currentTarget
-      ),
-    [held, sessionId, openedAtMs, currentTarget]
-  )
+  // conflicted, and the person chooses whether it goes to the new one. Losing contact removes the
+  // association, not the draft: that is derived here from the connection, as the desktop does, so
+  // a host that stops answering while the phone stays in front detaches the draft as a suspension
+  // does, and the text, the revision and the files are untouched.
+  const draft = useMemo(() => {
+    const against = againstCurrent(
+      held ??
+        startDraft(
+          `draft-${sessionId}`,
+          { sessionId, applicationInstanceId: null, agentBindingRevision: null },
+          openedAtMs
+        ),
+      currentTarget
+    )
+    return connected === false ? connectionLost(against) : against
+  }, [held, sessionId, openedAtMs, currentTarget, connected])
   // What a mutation about this session names: the session with its epoch, which the host reports
   // and this screen does not hold, so it is asked for when a file is picked or a path is asked for.
   const nameSession = useCallback(async (): Promise<SessionSubject> => {
@@ -934,7 +937,7 @@ export function MobileSession({
       id={`composer-${sessionId}`}
       rows={pane === 'terminal' ? 1 : undefined}
       value={draft.text}
-      placeholder={pane === 'terminal' ? 'Type into the terminal' : 'Message this session'}
+      placeholder="Message this session"
       aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
       onChange={(event) => {
         typeInto(event.target.value)
