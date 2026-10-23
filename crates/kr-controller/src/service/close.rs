@@ -590,6 +590,10 @@ impl Controller {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&session_id);
+            self.left_by_an_earlier_boot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&session_id);
         }
         outcome
     }
@@ -636,6 +640,9 @@ impl Controller {
     /// Returns the reason a worker that is confirmed gone ended, where this host can establish
     /// one.
     ///
+    /// A worker of a session this daemon's start found in an earlier boot and could not close yet
+    /// went with that boot, whatever its profile.
+    ///
     /// A desktop-bound worker whose desktop has gone went with it: the platform ended the job with
     /// the login session it was in, which is what a logout does, and the worker had no chance to
     /// write its own record. The desktop the session was created on is in the worker's own
@@ -647,6 +654,14 @@ impl Controller {
     /// Everything else is a worker that ended for reasons this host does not know, including a
     /// desktop it could not read: an unreadable platform is not a logout.
     fn why_a_worker_is_gone(&self, session_id: SessionId, profile: WorkerProfile) -> ClosureReason {
+        if self
+            .left_by_an_earlier_boot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&session_id)
+        {
+            return ClosureReason::HostShutdown;
+        }
         if profile != WorkerProfile::DesktopBound {
             return ClosureReason::WorkerCrash;
         }

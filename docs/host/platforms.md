@@ -116,6 +116,12 @@ directory is cleared with the boot it belonged to, taking the published descript
 daemon that compared descriptors would find nothing to compare after exactly the event it was
 looking for.
 
+Every start records the boot it runs in, whatever it left undone, so a start in a boot reads no
+session that boot made as one of an earlier boot. A session whose worker the kernel says is running
+is never closed as the host's restart. A session of an earlier boot that another recovery holds, or
+whose stores could not be taken safely, is left as it is; the daemon remembers it for as long as it
+runs and closes it as the host's restart when its dead worker is next found gone.
+
 ## Containers and Windows Subsystem for Linux
 
 A container and a WSL distribution each have their own process namespace and their own idea of a

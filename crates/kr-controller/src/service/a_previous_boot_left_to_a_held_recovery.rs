@@ -1,9 +1,9 @@
 //! The sessions a daemon finds recorded in an earlier boot, when another recovery holds one.
 //!
 //! A worker row left by an earlier boot is closed as the host's restart. Where another recovery
-//! holds the session's stores, the daemon leaves the row as it is, and the record of the earlier boot
-//! with it, so that the next start in the same boot closes the session and gives it the reason it
-//! has.
+//! holds the session's stores, the daemon leaves the row as it is and records the boot it runs in
+//! all the same, so that nothing the boot makes is read as a session of the one before. The session
+//! is closed with the reason it has when its worker is next found gone.
 
 use kr_protocol::identity::{BootIdentity, BootIdentitySource};
 use kr_protocol::ids::{ActorId, SessionId};
@@ -72,11 +72,11 @@ async fn recorded_ended_worker(
 }
 
 /// KR-REQ-24.18: a session of an earlier boot that another recovery holds is left as it is by the
-/// daemon that starts over it, and the record of that boot stays, so the next daemon of the same boot
-/// closes it as the host's restart once the recovery is done. Without the record staying, the next
-/// start finds this boot already recorded and never looks at the session as one of an earlier boot.
+/// daemon that starts over it, and closed as the host's restart, not as a crash, once the recovery
+/// is done and its dead worker is reconciled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_session_another_recovery_holds_is_closed_as_the_hosts_restart_by_the_next_start() {
+async fn a_session_another_recovery_holds_is_closed_as_the_hosts_restart_once_the_recovery_is_done()
+{
     let temp = kr_ipc::testing::TempHost::create();
     let controller = daemon(&temp).await;
     let session_id = recorded_ended_worker(&controller, &temp).await;
@@ -113,16 +113,12 @@ async fn a_session_another_recovery_holds_is_closed_as_the_hosts_restart_by_the_
             .is_none(),
         "a session another recovery holds is not closed from under it"
     );
-    stopped(controller).await;
 
     drop(recovery);
-    let controller = started(|| Controller::start(setup(&temp, next_boot.clone()))).await;
     let closure = controller
-        .registry
-        .lock()
+        .reconcile(session_id)
         .await
-        .closure(session_id)
         .expect("the registry answers")
-        .expect("the next start closed the session");
+        .expect("the dead worker's session is closed once nothing holds it");
     assert_eq!(closure.reason, ClosureReason::HostShutdown);
 }
