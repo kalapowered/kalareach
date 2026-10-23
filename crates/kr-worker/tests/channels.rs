@@ -1575,6 +1575,193 @@ async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_ser
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
 
+/// KR-REQ-12.25: when the host does not serve an application's channel, the approval stays in the
+/// terminal where the application asks for it: a channel from a program the application ran, a
+/// second channel, one for a version its table is not qualified for and one for an executable no
+/// record names each leave the instance with no approval capability to use, and a served channel
+/// that has relayed nothing leaves it with none either, since only a relayed approval is evidence
+/// that the application registered the channel.
+#[tokio::test]
+async fn kr_req_12_25_a_channel_the_host_does_not_serve_leaves_the_approval_in_the_terminal() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    package.bind(&broker, 2);
+    let usable = |broker: &Broker| {
+        approval_evidence(broker, 2).is_some_and(|record| record.state.is_usable())
+    };
+
+    for (what, version, starter) in [
+        (
+            "a program the application ran",
+            Some(fixture::QUALIFIED_VERSION),
+            channel_process(9),
+        ),
+        (
+            "a version its table is not qualified for",
+            Some("2.1.277"),
+            launched(2),
+        ),
+        ("an executable no record names", None, launched(2)),
+    ] {
+        let mut channel = Channel::open(package.launch(&broker, 2, version), 2, starter);
+        assert_eq!(channel.next().await, None, "{what}: closed unread");
+        assert!(
+            matches!(channel.ended().await, ChannelEnd::Refused(_)),
+            "{what}: refused"
+        );
+        assert!(!usable(&broker), "{what}: no approval capability");
+    }
+
+    // Served, and nothing relayed: the application has not shown that it registered the channel.
+    let mut served = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    let mut second = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    assert_eq!(second.next().await, None, "a second channel: closed unread");
+    assert!(matches!(second.ended().await, ChannelEnd::Refused(_)));
+    assert!(!usable(&broker), "a served channel that relayed nothing");
+
+    // Control: the first approval the served channel relays is the evidence.
+    served.relay("abcde").await;
+    eventually("the relayed approval is evidence", || usable(&broker)).await;
+    served.close().await;
+    assert!(matches!(served.ended().await, ChannelEnd::Ended { .. }));
+    assert!(!usable(&broker), "and a closed channel withdraws it");
+}
+
+/// KR-REQ-12.26: an answer to a Channels approval is encoded from a decision the request offered
+/// and the request it resolves, and nothing else changes it. A decision the request did not offer,
+/// one spelled with the request's own identifier, and a resource the broker does not hold are
+/// refused inside the host; a prompt sent to the instance whose approval is pending is not an
+/// answer to it and does not reach the channel. After all of them the approval is still pending,
+/// the first thing the channel carries is the verdict for the request's own identifier, and the
+/// ledger names the KR actor who decided it and keeps the application's original request.
+#[tokio::test]
+async fn kr_req_12_26_an_answer_is_encoded_from_an_offered_decision_for_the_pending_request() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    package.bind(&broker, 2);
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    channel.relay("abcde").await;
+    eventually("the approval is interpreted", || {
+        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    let resource = relayed(&broker, 2, "abcde").expect("recorded");
+
+    let mut unheld = resource.clone();
+    unheld.resource_id = PendingResourceId::new(Uuid::from_bytes([9; 16]));
+    for (what, params) in [
+        (
+            "a decision the request did not offer",
+            respond(2, &resource, "maybe"),
+        ),
+        (
+            "a decision spelled with the request's identifier",
+            respond(2, &resource, "allow abcde"),
+        ),
+        (
+            "a resource the broker does not hold",
+            respond(2, &unheld, "allow"),
+        ),
+    ] {
+        assert!(
+            broker
+                .agent_approval_respond(&caller(), &params, TimestampMs::new(5))
+                .await
+                .is_err(),
+            "{what} is refused"
+        );
+    }
+    let prompt = kr_protocol::agent::AgentPromptParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_worker::broker::subject(session(), instance(2)),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::null(),
+        text: Nullable::some(kr_protocol::agent::PromptText::new("allow abcde").expect("a prompt")),
+    };
+    assert!(
+        broker
+            .agent_prompt(&caller(), &prompt, false, TimestampMs::new(5))
+            .await
+            .is_err(),
+        "a prompt is not carried on a channel"
+    );
+    assert_eq!(
+        broker.pending(resource.resource_id).expect("held").state,
+        PendingState::Pending,
+        "nothing changed the approval"
+    );
+
+    let answered = broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &resource, "deny"),
+            TimestampMs::new(6),
+        )
+        .await
+        .expect("the offered decision is carried")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
+    assert_eq!(
+        channel.next().await,
+        Some(serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "deny" }
+        })),
+        "the first frame on the channel is the verdict for the pending request"
+    );
+
+    // What a person inspects afterwards: the application's own identifier of the request and the
+    // request exactly as the application sent it.
+    let inspected = broker
+        .inspect_approval(
+            &kr_protocol::agent::AgentApprovalInspectParams {
+                subject: kr_worker::broker::subject(session(), instance(2)),
+                resource_id: resource.resource_id,
+            },
+            &kr_worker::history_filter::HistoryFilter::new(
+                kr_worker::history_filter::ViewerScope::owner(),
+            ),
+        )
+        .expect("the approval is inspectable");
+    assert_eq!(inspected.decoding.upstream_request_id.as_str(), "\"abcde\"");
+    let original: serde_json::Value =
+        serde_json::from_slice(inspected.decoding.source_bytes.as_slice())
+            .expect("the original is JSON");
+    assert_eq!(original["params"]["request_id"], "abcde");
+    let deciders: Vec<_> = recorded_events(&broker)
+        .into_iter()
+        .filter(|event| {
+            event.resource_id == resource.resource_id
+                && matches!(event.state, PendingState::Claimed | PendingState::Resolved)
+        })
+        .map(|event| event.actor_id)
+        .collect();
+    assert!(!deciders.is_empty(), "the answer is recorded");
+    assert!(
+        deciders
+            .iter()
+            .all(|actor| actor.as_ref() == Some(&caller().actor_id)),
+        "the KR actor who decided is recorded: {deciders:?}"
+    );
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
 /// Writes the Channels frames a release's cut keeps (`channel-frames.json` in `KR_RECORD_DIR`): the
 /// approval the forwarder relayed, which `channel-request.json` there holds, and the verdict this
 /// worker writes on the channel when an answer goes out through `agent.approval.respond`.
