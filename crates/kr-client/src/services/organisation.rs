@@ -1,0 +1,210 @@
+//! The organisation's service, as a member's device asks it for the lease that proves its
+//! membership.
+//!
+//! A host answers for a member's device only while the device holds a membership lease its
+//! organisation signed, and a lease lasts at most fifteen minutes. The organisation's service
+//! signs one for the account that is signed in and for the device key it is asked about, and says
+//! when to ask again. It also publishes the chain of keys that signs its leases, which a host needs
+//! when a lease is signed by a key it has not yet followed.
+//!
+//! Both calls present the account's token for [`LEASE_SCOPE`] and nothing else: the service does
+//! not ask for proof that the device holds the key it names, because a host accepts a lease only
+//! on a connection that proves the key, so a lease for a key the caller does not hold is one only
+//! the holder can use.
+
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
+use kr_protocol::account::{MembershipLease, PolicyAuthority};
+use kr_protocol::ids::OrganisationId;
+use kr_protocol::scalars::{AuthorisationKey, to_base64url};
+use serde::Deserialize;
+
+use super::account::{AccountTokenSource, LEASE_SCOPE};
+use super::relay::ServiceHttp;
+use super::signed::{Repeat, data_or_refusal, unreadable_answer};
+use super::{ServiceFuture, unconfigured};
+use crate::error::{ClientError, Result};
+use crate::shown::Shown;
+
+/// What the organisation's service signed for a device, and when to ask again.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IssuedLease {
+    /// The lease, as a host verifies it.
+    pub lease: MembershipLease,
+    /// How long after this answer the service advises asking for the next lease.
+    ///
+    /// Advice to the holder, kept beside the lease and not inside it: it is no part of the
+    /// statement the organisation signed.
+    pub refresh_after: Duration,
+}
+
+impl fmt::Debug for IssuedLease {
+    /// That a lease was issued and when to ask again. Never the lease, which names an account.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedLease")
+            .field("refresh_after", &self.refresh_after)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a member's device gets the lease its organisation signed for it.
+pub trait MembershipLeaseService: Send + Sync + fmt::Debug {
+    /// Asks for a lease for the account signed in, naming `device_key` as the device it is for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the service's refusal, such as that the account is not a member of the
+    /// organisation, or why no account token could be had.
+    fn lease<'a>(
+        &'a self,
+        organisation: OrganisationId,
+        device_key: AuthorisationKey,
+    ) -> ServiceFuture<'a, IssuedLease>;
+
+    /// Reads the chain of keys that signs the organisation's leases, which a host follows from the
+    /// key it pinned to the one signing now.
+    ///
+    /// # Errors
+    ///
+    /// Returns the service's refusal, or why no account token could be had.
+    fn authority<'a>(&'a self, organisation: OrganisationId) -> ServiceFuture<'a, PolicyAuthority>;
+}
+
+impl MembershipLeaseService for super::NullService {
+    fn lease<'a>(
+        &'a self,
+        _organisation: OrganisationId,
+        _device_key: AuthorisationKey,
+    ) -> ServiceFuture<'a, IssuedLease> {
+        unconfigured(super::ManagedService::AccountLogin.as_str())
+    }
+
+    fn authority<'a>(
+        &'a self,
+        _organisation: OrganisationId,
+    ) -> ServiceFuture<'a, PolicyAuthority> {
+        unconfigured(super::ManagedService::AccountLogin.as_str())
+    }
+}
+
+/// The managed organisation service.
+#[derive(Clone)]
+pub struct ManagedMembershipLeaseService {
+    origin: String,
+    http: Arc<dyn ServiceHttp>,
+    tokens: Arc<dyn AccountTokenSource>,
+}
+
+impl fmt::Debug for ManagedMembershipLeaseService {
+    /// The origin as a diagnostic names one: an address may carry a user name and a password in
+    /// front of its host.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedMembershipLeaseService")
+            .field("origin", &Shown::address(&self.origin))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedMembershipLeaseService {
+    /// Builds a client against one origin, presenting the token `tokens` holds for
+    /// [`LEASE_SCOPE`].
+    #[must_use]
+    pub fn new(
+        origin: &kr_protocol::service::GatewayOrigin,
+        http: Arc<dyn ServiceHttp>,
+        tokens: Arc<dyn AccountTokenSource>,
+    ) -> Self {
+        Self {
+            origin: origin.as_str().to_owned(),
+            http,
+            tokens,
+        }
+    }
+
+    /// The origin this client addresses.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The `authorization` header value a request carries.
+    async fn authorisation(&self) -> Result<String> {
+        let token = self.tokens.token(LEASE_SCOPE).await?;
+        // The one place the token is read. It goes into a header value and nowhere else.
+        Ok(format!("Bearer {}", token.expose()))
+    }
+
+    fn path(&self, organisation: OrganisationId, tail: &str) -> String {
+        format!(
+            "{}/api/account/organisations/{organisation}/{tail}",
+            self.origin
+        )
+    }
+}
+
+/// The members of a lease answer. The service writes them in camel case, as its envelope does.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseAnswer {
+    lease: MembershipLease,
+    #[serde(rename = "refreshAfterSeconds")]
+    refresh_after_seconds: u64,
+}
+
+impl MembershipLeaseService for ManagedMembershipLeaseService {
+    fn lease<'a>(
+        &'a self,
+        organisation: OrganisationId,
+        device_key: AuthorisationKey,
+    ) -> ServiceFuture<'a, IssuedLease> {
+        Box::pin(async move {
+            let authorisation = self.authorisation().await?;
+            let body = serde_json::to_vec(&serde_json::json!({
+                "device_key": to_base64url(device_key.as_bytes()),
+            }))
+            .map_err(|error| {
+                ClientError::refusal(
+                    kr_protocol::error::ErrorCode::InvalidArgument,
+                    crate::shown!(
+                        "a lease request could not be written: {}",
+                        Shown::json(&error)
+                    ),
+                )
+            })?;
+            let answer = self
+                .http
+                .post_json(
+                    &self.path(organisation, "lease"),
+                    &body,
+                    &[("authorization", authorisation.as_str())],
+                )
+                .await?;
+            let answered: LeaseAnswer =
+                serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
+                    .map_err(|error| unreadable_answer("a lease", &error))?;
+            Ok(IssuedLease {
+                lease: answered.lease,
+                refresh_after: Duration::from_secs(answered.refresh_after_seconds),
+            })
+        })
+    }
+
+    fn authority<'a>(&'a self, organisation: OrganisationId) -> ServiceFuture<'a, PolicyAuthority> {
+        Box::pin(async move {
+            let authorisation = self.authorisation().await?;
+            let answer = self
+                .http
+                .get_json(
+                    &self.path(organisation, "policy-authority"),
+                    &[("authorization", authorisation.as_str())],
+                )
+                .await?;
+            serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
+                .map_err(|error| unreadable_answer("a policy authority", &error))
+        })
+    }
+}

@@ -122,6 +122,7 @@ pub mod backup;
 pub mod http;
 pub mod json;
 pub mod mailbox;
+pub mod organisation;
 pub mod push;
 pub mod relay;
 pub mod signed;
@@ -165,6 +166,7 @@ pub use mailbox::{
     MailboxClaimRequired, MailboxClient, MailboxDelivery, MailboxDeliveryState, MailboxItem,
     MailboxPage, MailboxUsage,
 };
+pub use organisation::{IssuedLease, ManagedMembershipLeaseService, MembershipLeaseService};
 pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayPayerAuthorisation, RelayWarning,
@@ -1329,6 +1331,9 @@ crate::debug_fields!(Availability {
 pub struct ServiceClients {
     /// Account login.
     pub account: Option<std::sync::Arc<dyn AccountService>>,
+    /// The membership lease an organisation signs for a member's device, which belongs to account
+    /// login: it is the account's token that asks for it.
+    pub membership_leases: Option<std::sync::Arc<dyn MembershipLeaseService>>,
     /// Relay leases.
     pub relay_leases: Option<std::sync::Arc<dyn RelayLeaseService>>,
     /// Push registration.
@@ -1362,7 +1367,9 @@ impl ServiceClients {
     #[must_use]
     pub fn holds(&self, service: ManagedService) -> bool {
         match service {
-            ManagedService::AccountLogin => self.account.is_some(),
+            ManagedService::AccountLogin => {
+                self.account.is_some() || self.membership_leases.is_some()
+            }
             ManagedService::RelayLeases => self.relay_leases.is_some(),
             ManagedService::Push => self.push.is_some(),
             ManagedService::SyncBackup => {

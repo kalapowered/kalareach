@@ -866,6 +866,26 @@ fn answer_of(answer: &ServiceHttpAnswer, repeat: Repeat) -> Result<Answer> {
     }))
 }
 
+/// The `data` of an answer from a service that proves its caller by an account's bearer token,
+/// or the error the service named.
+///
+/// The envelope is the one [`answer_of`] reads, so an answer that is not exactly the service's is
+/// unreadable and not a refusal. A success envelope under a status that says the request failed is
+/// not this service's answer either.
+pub(super) fn data_or_refusal(
+    answer: &ServiceHttpAnswer,
+    repeat: Repeat,
+) -> Result<serde_json::Value> {
+    match answer_of(answer, repeat)? {
+        Answer::Refused(refusal) => Err(refusal.into_error()),
+        Answer::Data(_) if !(200..300).contains(&answer.status) => Err(unreadable(
+            answer.status,
+            "its answer is a success under a status that says the request failed",
+        )),
+        Answer::Data(data) => Ok(data),
+    }
+}
+
 /// The bytes a success carried, or the refusal a failure carried.
 ///
 /// A request whose success is content is answered with the content itself on a success status and

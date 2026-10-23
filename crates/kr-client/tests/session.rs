@@ -2538,6 +2538,7 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
             "every service replaced",
             ServiceClients {
                 account: Some(Arc::new(NullService)),
+                membership_leases: Some(Arc::new(NullService)),
                 relay_leases: Some(Arc::new(NullService)),
                 push: Some(Arc::new(NullService)),
                 sync_backup: Some(Arc::new(NullService)),
@@ -2703,6 +2704,23 @@ impl ForkServices {
 
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().expect("the record").clone()
+    }
+}
+
+impl kr_client::services::MembershipLeaseService for ForkServices {
+    fn lease<'a>(
+        &'a self,
+        _organisation: kr_protocol::ids::OrganisationId,
+        _device_key: kr_protocol::scalars::AuthorisationKey,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::IssuedLease> {
+        self.refuses("membership.lease")
+    }
+
+    fn authority<'a>(
+        &'a self,
+        _organisation: kr_protocol::ids::OrganisationId,
+    ) -> kr_client::services::ServiceFuture<'a, kr_protocol::account::PolicyAuthority> {
+        self.refuses("membership.authority")
     }
 }
 
@@ -2979,6 +2997,7 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
     let fork = Arc::new(ForkServices::default());
     let clients = ServiceClients {
         account: Some(Arc::clone(&fork) as _),
+        membership_leases: Some(Arc::clone(&fork) as _),
         relay_leases: Some(Arc::clone(&fork) as _),
         push: Some(Arc::clone(&fork) as _),
         sync_backup: Some(Arc::clone(&fork) as _),
@@ -3014,6 +3033,16 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             .revoke(
                 &kr_client::services::account::RefreshToken::new("a-refresh-token")
                     .expect("a token"),
+            )
+            .await
+            .err(),
+        clients
+            .membership_leases
+            .as_ref()
+            .expect("the fork's membership lease client")
+            .lease(
+                kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([5; 16])),
+                kr_protocol::scalars::AuthorisationKey::from_bytes([6; 32]),
             )
             .await
             .err(),
@@ -3068,6 +3097,7 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
         fork.calls(),
         [
             "account.revoke",
+            "membership.lease",
             "relay.issue",
             "push.register",
             "sync.fetch",
