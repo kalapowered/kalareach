@@ -3,8 +3,9 @@
 //
 //  Firebase makes a registration token from the APNs token once the person has agreed to
 //  notifications, and gives a new one when it replaces it. The application keeps the token where the
-//  platform plugin reads it and notes when it changed, so the registration the person asked for is
-//  repeated for the new token. Nothing here sends the token anywhere.
+//  platform plugin reads it, and each look the application makes compares the digest of it with
+//  the digest each host registered with, so the registration the person asked for is repeated for
+//  a new token. Nothing here sends the token anywhere.
 //
 
 import FirebaseMessaging

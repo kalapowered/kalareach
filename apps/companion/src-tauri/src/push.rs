@@ -20,7 +20,7 @@
 //! `push/push.json` under the application's data directory holds, per paired host, whether the
 //! person asked, the authorisation identifier this phone issued for that host (so asking again
 //! issues under the same identifier and the host keeps one authorisation), the digest of the token
-//! its last registration proposed, and the last outcome in words. It holds no token, no key and no
+//! the registration that last turned the host on proposed, and the last outcome in words. It holds no token, no key and no
 //! credential. The credential exists in memory between the gateway's issue and the host's answer
 //! and is never kept: a registration whose answer was lost is made again under a new action with a
 //! fresh credential, which is what the host expects.
@@ -29,9 +29,10 @@
 //!
 //! Each step is safe to repeat, so a restart, a lost answer or a changed token is mended by doing
 //! the sequence again for the host that asked: the same installation key, the same authorisation
-//! identifier, a new action. A change of the token is found by comparing, not by being told: a host
-//! is on only while the digest its registration proposed is the digest of the token the provider
-//! holds, and each look compares the two, so no exit of the application can lose a change. A
+//! identifier, a new action. A change of the token is found by comparing, not by being told: a run
+//! writes a host on only when it has read the token again and found the one it proposed, and each
+//! look compares the digest the record keeps with the token the provider holds and registers a host
+//! that is on with another again, so no exit of the application can lose a change. A
 //! person who is asked for permission and says no is told so, and the sequence is tried again the
 //! next time the application is in front, never in a loop.
 
@@ -122,8 +123,9 @@ struct HostPush {
     settings: bool,
     /// When the phase was set, in UTC milliseconds.
     updated_ms: u64,
-    /// The digest of the token this phone's last registration for this host proposed. A host is on
-    /// only while this is the digest of the token the provider holds. A record that has none
+    /// The digest of the token the registration that last turned this host on proposed. A look
+    /// registers a host that is on again when this is not the digest of the token the provider holds.
+    /// A record that has none
     /// (written before it was kept) is registered again at the next look.
     #[serde(default)]
     registered: Option<Digest256>,
