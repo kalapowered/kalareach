@@ -223,7 +223,7 @@ async fn tries_that_are_never_answered_end_at_the_patience_and_say_so() {
         .expect_err("a host that never answers ends no try");
 
     assert!(
-        matches!(&stopped, PairingStopped::Room(why) if why.contains("no try was answered")),
+        matches!(&stopped, PairingStopped::Room(why) if why.contains("was not answered within")),
         "the patience ended the tries and said so: {stopped}"
     );
 }

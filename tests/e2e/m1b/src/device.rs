@@ -50,8 +50,8 @@ use kr_protocol::invitation::RendezvousMessage;
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     BundleDirection, BundleMessageType, ClientBundle, ConfirmationChannel, DeviceName,
-    DevicePlatform, DirectQrPayload, NetworkConfig, OwnerConfirmationProof, PairStatus, QrPayload,
-    RendezvousOrigin, SensitiveAction,
+    DevicePlatform, DirectQrPayload, MAX_CLIENT_ATTEMPTS, NetworkConfig, OwnerConfirmationProof,
+    PairStatus, QrPayload, RendezvousOrigin, SensitiveAction,
 };
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
@@ -173,12 +173,12 @@ pub enum PairingStopped {
     /// had answered anything: no frame of this attempt can have reached a host, and the attempt
     /// cost the invitation nothing.
     HostNotAttached,
-    /// The room said `HostGone` to the first frame of every attempt this device made within its
-    /// patience, or its budget for the code ran out between two such answers.
+    /// The room said `HostGone` to the first frame of every attempt this device made, until its
+    /// budget of attempts for the code was spent or its patience ran out between two attempts.
     HostNeverAttached {
         /// How many attempts the room answered so.
         times: u32,
-        /// How long the attempts took, from the first to the last answer.
+        /// How long it was from the first attempt until the tries ended.
         over: Duration,
     },
     /// This device's budget of attempts for the code is spent.
@@ -518,9 +518,13 @@ impl Device {
         let started = std::time::Instant::now();
         let mut times = 0_u32;
         let mut pause = patience.pause;
+        let mut trying = false;
         let tries = async {
             loop {
-                match self.enter_code(origin, code).await {
+                trying = true;
+                let answered = self.enter_code(origin, code).await;
+                trying = false;
+                match answered {
                     Err(PairingStopped::HostNotAttached) => {
                         times += 1;
                         eprintln!(
@@ -528,6 +532,14 @@ impl Device {
                              {:?} after the first try: no host was attached yet",
                             started.elapsed()
                         );
+                        // The device's budget for the code is spent by this one: another try would
+                        // be refused before it left.
+                        if times >= MAX_CLIENT_ATTEMPTS {
+                            return Err(PairingStopped::HostNeverAttached {
+                                times,
+                                over: started.elapsed(),
+                            });
+                        }
                         tokio::time::sleep(pause).await;
                         pause = pause.saturating_mul(2);
                     }
@@ -543,12 +555,15 @@ impl Device {
         };
         match tokio::time::timeout(patience.within, tries).await {
             Ok(answered) => answered,
-            Err(_) if times > 0 => Err(PairingStopped::HostNeverAttached {
+            // Between two tries: every try so far met no host, and none is in hand.
+            Err(_) if !trying && times > 0 => Err(PairingStopped::HostNeverAttached {
                 times,
                 over: started.elapsed(),
             }),
+            // During a try: the room may have given it to a host that then said nothing, so what
+            // the tries before it met is context and not the cause.
             Err(_) => Err(PairingStopped::Room(format!(
-                "no try was answered within {:?}",
+                "the try in hand was not answered within {:?}; {times} before it met no host",
                 patience.within
             ))),
         }
