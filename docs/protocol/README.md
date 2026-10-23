@@ -72,7 +72,8 @@ Three rules are easy to get wrong:
   TypeScript type accept the explicit default that the decoder refuses: null for an optional member
   and `false` for a flag. The host configuration document, which is JSON read from a file and not a
   wire message, leaves out its sections of later levels, its `disable_policy` and a test suite's
-  `outputs` in the same way.
+  `outputs` in the same way. The hello's `extensions` maps are left out when empty, and the `reach` and
+  `evidence_from` of an authority revision notice stand for `host` and 0 when left out.
 - **Numbers are never floating point.** Decimal or scaled values use a schema-defined integer or
   text representation. UUIDs are 16-byte strings. Timestamps are integer UTC milliseconds, never
   tagged dates.
@@ -150,9 +151,10 @@ stricter one, and `fixtures/cbor/map-ordering.json` pins the case.
 
 ### Digests and signing input
 
-A domain-separated signing input is `CBOR([domain, element, ...])`, encoded canonically. Everything
-signed in the protocol has this shape, so no signature covers a fragment of a message and none
-covers a re-serialised diagnostic document.
+A domain-separated signing input is `CBOR([domain, element, ...])`, encoded canonically. Every
+signature in the protocol covers this shape, so no signature covers a fragment of a message and none
+covers a re-serialised diagnostic document. A few digests and associated-data strings that are not
+signatures take the domain as raw bytes in front of the value instead, as the table below says.
 
 A collection inside a signed object cannot normalise on the way through, or the transcript would
 cover bytes the peer never sent. Sets on the wire therefore use `CanonicalSet`, which serialises in
@@ -189,13 +191,15 @@ protocol, and a second table after the first names those.
 | `kr-mailbox-claim/1` | The value that claims a mailbox | `mailbox.rs` |
 | `kr-archive-manifest/1`, `kr-recovery-bundle/1`, `kr-backup-writer/1`, `kr-backup-publication/1` | An archive manifest signature; the context a recovery bundle's key is derived from; a collection's writer enrolment; one published generation | `archive.rs` |
 | `kr-collection-keys/1` | A shared collection's key record | `collection_keys.rs` |
+| `KRRECOV1` | The `crypto_kdf` context under which the recovery seed derives subkey 1, the recovery-bundle key, and subkey 2, the recovery recipient's `crypto_box` seed; a device that restores from the kit derives them again ([the cryptography reference](../crypto/README.md#recovery)) | `archive.rs` |
+| `kr-shell-bridge/1` | The first member of the bootstrap transcript, `CBOR([domain, session_id, endpoint, shell_process, integration_version])`, over which a shell's bridge computes an HMAC-SHA-256 under the bootstrap secret and the worker verifies it ([the shell integration reference](../shell-integration/README.md)) | `crates/kr-shell-integration/src/contract/transport.rs` |
 | `kr-relay/lease/1`, `kr-relay/revoke/1`, `kr-relay/receipt/1`, `kr-relay/instance/1` | A relay lease, its revocation, a consumption receipt and an instance registration | `relay.rs` |
 | `kr-service-request/1`, `kr-service-request/1/host` | A service request signed by an installation; one signed by a host | `service.rs` |
 | `kr-push-registration/1`, `kr-push-sender/1`, `kr-push-sender-renewal/1`, `kr-push-sender-revocation/1` | A registration answer; the immutable half of a sender record; a renewal proof; a revocation | `push.rs` |
 | `kr-push-delivery/1`, `kr-push-token/1`, `kr-push-credential/1`, `kr-push-request/1` | Digests: a delivery request, a provider token, a delivery credential's bearer and a signed push request body | `push.rs` |
 | `kr-voice/confirm/1`, `kr-voice/action/1` | A voice confirmation signature; a voice action digest | `voice.rs` |
 | `kr-worker/1/rendezvous`, `kr-worker/1/verify`, `kr-controller/1/generation` | A worker's startup rendezvous; its answer to a verification challenge; a controller's generation token | `worker.rs` |
-| `kr-host-clock/1`, `kr-catalogue-trust/2`, `kr-plugin-grant/1`, `kr-plugin-install/2`, `kr-organisation/enrol/1`, `kr-organisation/exclusive/1`, `kr-transfer/2` | What an owner confirms: the host clock again, a repository's trust root, a package's grant, a package's installation, an organisation's enrolment, the exclusive-management setting of an organisation set, the complete plan of a grant transfer. Each is the first member of the value whose digest the confirmation covers, and an owner device computes the same digest again from what it is shown | `confirmation.rs` |
+| `kr-host-clock/1`, `kr-catalogue-trust/2`, `kr-plugin-grant/1`, `kr-plugin-install/2`, `kr-organisation/enrol/1`, `kr-organisation/exclusive/1`, `kr-transfer/2` | What an owner confirms: the host clock again, a repository's trust root, a package's grant, a package's installation, an organisation's enrolment, the exclusive-management setting of an organisation set, the complete plan of a grant transfer. Each but the clock's is the first member of the value whose digest the confirmation covers (the clock's confirmed value is the text alone), and an owner device computes the same digest again from what it is shown | `confirmation.rs` |
 | `kr-plugin-host/1/rendezvous`, `kr-plugin-host/1/verify` | A plugin host's startup claim; its answer to a verification challenge | `crates/kr-plugin-service/src/protocol.rs` |
 | `kr-relay-lease-request/1`, `kr-relay-lease-revoke/1`, `kr-relay-payer-sign-in/1`, `kr-relay-admission-request/1` | The body digests of the four relay control-plane requests ([The relay requests](#the-relay-requests)) | `crates/kr-client/src/services/relay.rs`, `admission.rs` |
 | `kr-sync-object/1` | The associated data every synchronised object is sealed under, so that a ciphertext made for one purpose cannot be opened as another | `crates/kr-crypto/src/envelope/sync.rs` |
@@ -329,10 +333,16 @@ become decimal strings, so nothing loses precision, but reading that JSON back c
 strings were byte strings or integers. The section 23 example shows small integers as JSON numbers;
 that block is a diagnostic rendering, and section 4's exactness rule is what this implements.
 
-An enum on the wire is externally tagged: a variant with fields is a single-entry map whose key
-names the variant, and a variant without fields is that name as a text string. A tagged
-representation would buffer the variant's content, which both hides unknown fields on a variant
-that carries none and changes the representation of the scalars inside it.
+An enum on the wire is externally tagged unless its schema names a tag member: a variant with fields
+is a single-entry map whose key names the variant, and a variant without fields is that name as a
+text string. Other enums are internally tagged: a map with a tag member beside the variant's fields.
+The tag member is `kind` (`QuestionAnswer`, `NodeOutput`, `DestinationSecret`), `state`
+(`SessionOpenResult`, `AccountState`, `PrivacyCompletion`, the catalogue, backup setup and bundle
+states), `read` (`BackupReadParams` and `BackupReadResult`), `operation` (`ChangeOperation` of the
+contact skill) or `type` (the rendezvous frames), and the schema of each type names it. A sender that writes `{"input": {...}}` where the schema says
+`{"kind": "input", ...}` is refused. The externally tagged form is kept for the rest because an
+internally tagged variant buffers its content, which hides unknown fields on a variant that carries
+none and changes the representation of the scalars inside it.
 
 Every object is closed: a field its schema does not declare is refused, never stripped and then
 verified. Every type says so in serde as well, with `#[serde(deny_unknown_fields)]`, and in the
@@ -423,6 +433,7 @@ service or configuration is.
 | A push delivery credential | Thirty days, and a host may renew it from seven days before it ends | [Push objects](#push-objects) |
 | A signed service request | Admitted within five minutes of the service's clock in either direction; its nonce is remembered for twice that long | [The service credential](#the-service-credential) |
 | A relay lease | The lease states its own end; a revocation and a consumption receipt are signed objects | [Relay leases and receipts](#relay-leases-and-receipts) |
+| A relay principal's grace after exhaustion | At most fifteen minutes and 100 MiB over the reservation's ceiling, one grace for a principal, which a reconnection or a replacement cannot restart | [The rules the types carry](#the-rules-the-types-carry) |
 | A grant | The expiry it states, the end of the grantee's pairing, whichever comes first; a delegated grant never outlives its parent | [Grants, sharing and revocation](../host/README.md#grants-sharing-and-revocation) |
 | A mutation's receipt and a de-duplication record | Thirty days | [Journals and the receipt contract](../host/README.md#journals-and-the-receipt-contract) |
 | Retained session output | Seven days, 128 MiB for a session and 1 GiB for the host, whichever applies first | [Retained output, and what eviction leaves behind](../host/README.md#retained-output-and-what-eviction-leaves-behind) |
@@ -432,7 +443,7 @@ service or configuration is.
 | A mailbox item | 24 hours at most; a replay identifier is kept for 24 hours past its envelope's expiry | `MAX_MAILBOX_ITEM_LIFETIME_MS` and `REPLAY_ID_RETENTION_MS` in `crates/kr-protocol/src/mailbox.rs`; [The mailbox](method-reference.md#the-mailbox) |
 | A voice confirmation challenge | Two minutes, the same as an owner confirmation | `VOICE_CONFIRMATION_LIFETIME_MS` in `crates/kr-protocol/src/voice.rs`; [Pairing and the host's owner](../host/README.md#pairing-and-the-hosts-owner) |
 | A staged transfer | An unfinished upload and a download snapshot 24 hours; a completed attachment that is not submitted seven days | [Limits](../transfer/README.md#limits) |
-| An automation's causal root and a workflow run | A causal root lives one hour and a workflow run has a 30-minute deadline unless a definition shortens them | [Causal roots and budgets](../automation/README.md#causal-roots-and-budgets), [Limits, deadlines and admission](../automation/README.md#limits-deadlines-and-admission) |
+| An automation's causal root and a workflow run | A causal root lives one hour, a fixed bound; a workflow run has a 30-minute deadline unless its definition shortens it | [Causal roots and budgets](../automation/README.md#causal-roots-and-budgets), [Limits, deadlines and admission](../automation/README.md#limits-deadlines-and-admission) |
 
 Every deadline is measured on a clock that counts suspended time, and a host that cannot prove its
 wall clock decides nothing by it ([The host time contract](../host/README.md#the-host-time-contract)).
@@ -501,6 +512,10 @@ encoding to keep in step.
 
 ### The rules the types carry
 
+- **A lease is refused before its signature is checked** unless its own fields are consistent: the
+  two endpoint keys differ, the metering instance holds one of the two route positions, and a grace
+  raises the reservation's ceiling by at most 100 MiB and lasts at most fifteen minutes.
+  `outstanding_bytes` is the figure that the 8 MiB aggregate bounds.
 - **A revision orders everything.** Installation and revocation carry the same `revision` scale per
   lease identity, so a relay keeps the highest it has seen and a replayed older lease cannot restore
   a spent ceiling or a passed deadline. A revocation also names the relay it is addressed to, so the
@@ -554,7 +569,8 @@ the first two, a replayed older lease reopens a closed ceiling. Without the last
 either loses consumption or invents it, and an exact retry of an installation would hand back a
 ceiling that was already spent.
 
-Reporting is idempotent by reservation and sequence, and the sequence is unbroken. A cumulative
+Reporting is idempotent by reservation and sequence, and the sequence is unbroken. A receipt carries
+a sequence of 1 or more, and one report carries at most 256 receipts. A cumulative
 count means a duplicate delivery costs nothing and one lost message is repaired by replaying it, not
 by skipping it: the service records receipts in order and answers every report with the position it
 will accept next, which is where a restarted relay resumes from. It is not a licence to accept a
@@ -947,8 +963,10 @@ covers.
 | `relay.payer.sign_in` | `/api/relay/payer-authorisation/sign-in` | `kr-relay-payer-sign-in/1` |
 | `relay.admission.issue` | `/api/relay/admission` | `kr-relay-admission-request/1` |
 
-`fixtures/relay/requests.json` holds the payer sign-in vector, and the lease and admission vectors
-are in `crates/kr-client/tests/relay_service.rs`.
+A host signs the lease, revocation and sign-in requests as a host, and the payer sign-in alone
+carries the account token. `fixtures/relay/requests.json` holds the payer sign-in vector, the lease
+vectors are in `crates/kr-client/tests/relay_service.rs` and the admission vector is in
+`crates/kr-client/tests/pairing_admission.rs`.
 
 ## Push objects
 
@@ -1032,12 +1050,28 @@ about to send. Both bounds are exclusive where section 16 words them that way.
 Delivery is answered with a `PushDeliveryAck`. `queued` means the provider accepted it for delivery
 and nothing more: it does not mean displayed, read or executed, and review state comes from host
 events and client acknowledgements instead. The other states are an acknowledgement that something
-else happened, and each is a fact the host needs: a transient provider failure the gateway is still
-retrying, a duplicate notification identifier, a destination over its rate policy whose notification
-collapsed into an attention update, a token the provider rejected and the gateway disabled, or a
-notification that expired first. A suppressed notification is reported back with what it collapsed
-into and when the next update may be sent, so the host can record the suppression locally and keep
-the pending decision visible.
+else happened, and each is a fact the host needs:
+
+- `retrying`: a transient provider failure the gateway is still retrying until the notification
+  expires. It settles into `queued`, `collapsed`, `token_disabled`, `refused`, `revoked`,
+  `abandoned` or `expired` by itself, and the same request presented while it is held is answered
+  `retrying` again.
+- `duplicate`: the notification identifier was already handled, and the earlier outcome stands.
+- `collapsed`: the destination is over its rate policy, and the notification collapsed into an
+  attention update.
+- `token_disabled`: the provider rejected the destination token and the gateway disabled it, so
+  nothing more is sent to it until a native registration proves receipt again.
+- `refused`: the provider will not take the notification itself, because it is too large or
+  malformed, and a retry cannot change that; the host fixes what it sent.
+- `revoked`: the authorisation it was sent under ended before the provider accepted it, and the host
+  needs a new one from the device.
+- `abandoned`: the gateway stopped trying before the notification's own expiry, because a provider
+  refused for long enough or a destination had more waiting than a gateway holds for one
+  installation.
+- `expired`: the notification's moment passed before the provider accepted it.
+
+A suppressed notification is reported back with what it collapsed into and when the next update may
+be sent, so the host can record the suppression locally and keep the pending decision visible.
 
 ## Fixtures
 
