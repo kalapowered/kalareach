@@ -229,8 +229,9 @@ mod readiness {
         // `AsyncFd`: nothing else holds its number, so it stays open and names the same socket
         // until the `AsyncFd` drops it, and an `OwnedFd` gives the same number on every call.
         // Nothing swaps the descriptor out through `AsyncFd::get_mut` either: the one caller,
-        // `Readiness::of`, keeps the `AsyncFd` inside the `Readiness` that `Writable` holds
-        // behind an `Arc`, so no code ever has a mutable reference to it.
+        // `Readiness::of`, keeps the `AsyncFd` in `Readiness`, which, like `Writable`'s field,
+        // is private to this file, and `Readiness`'s only method takes `&self`, so no code here
+        // or outside it has a mutable reference to the descriptor.
         unsafe { AsyncFd::register_with_interest(descriptor, Interest::WRITABLE) }
     }
 }
