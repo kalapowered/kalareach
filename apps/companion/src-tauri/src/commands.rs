@@ -668,14 +668,55 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
 #[derive(Debug, Serialize)]
 pub(crate) struct NoParams {}
 
-/// The subject preconditions this application states.
+/// The subject preconditions this application states, which are none.
 ///
-/// None, deliberately. Every precondition this client relies on is one the method carries itself:
-/// the prompt generation and buffer revision on a launch, the revision on a draft update, the
-/// declared size and digest on an upload. A second copy in a separate map would be a second place
-/// for them to disagree.
+/// Deliberately. Every precondition this client relies on is one the method carries itself: the
+/// prompt generation and buffer revision on a launch, the revision on a draft update, the declared
+/// size and digest on an upload. A second copy in a separate map would be a second place for them
+/// to disagree. The one exception is a prompt that follows an outcome nobody could establish, which
+/// says so in [`Supersedes`].
 #[derive(Debug, Serialize)]
 pub(crate) struct NoPreconditions {}
+
+/// The earlier action a prompt names, and the revision of its record the person was shown.
+///
+/// Section 23 lets a new action follow an uncertain one only as an explicit later request that
+/// shows the earlier unknown result, so the host admits a prompt of that kind when it names the
+/// action and the revision of its record that a read showed this device. The page says which, from
+/// what it read; this application sends exactly that and decides nothing of its own.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Supersedes {
+    /// The earlier action whose result is being superseded.
+    action_id: kr_protocol::ids::ActionId,
+    /// The revision of its record that was shown.
+    revision: kr_protocol::scalars::U64,
+}
+
+/// A prompt's subject preconditions: the quote of an earlier result, or nothing.
+///
+/// The keys are the host's own, and a prompt that quotes nothing carries neither: the host refuses
+/// one key without the other, and refuses a key that says nothing.
+struct PromptPreconditions<'a>(Option<&'a Supersedes>);
+
+impl Serialize for PromptPreconditions<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        let mut map = serializer.serialize_map(Some(if self.0.is_some() { 2 } else { 0 }))?;
+        if let Some(quote) = self.0 {
+            map.serialize_entry(kr_protocol::action::SUPERSEDES_ACTION_KEY, &quote.action_id)?;
+            map.serialize_entry(
+                kr_protocol::action::SUPERSEDES_REVISION_KEY,
+                &quote.revision,
+            )?;
+        }
+        map.end()
+    }
+}
 
 /// Parses the page's parameters into the method's own type.
 fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T> {
@@ -926,7 +967,9 @@ macro_rules! session_mutate_command {
             };
             let link = links.link(&state, session_id, Some(opening)).await?;
             let target = subject.target(link.ids.environment_id)?;
-            let answer = links.submit(link.link(), $method, target, &typed).await;
+            let answer = links
+                .submit(link.link(), $method, target, &NoPreconditions {}, &typed)
+                .await;
             if answer.as_ref().is_err_and(crate::agent::ends_the_link) {
                 links.forget(&state, session_id, link.link());
             }
@@ -985,44 +1028,95 @@ macro_rules! agent_mutate_command {
             let target = typed.target;
             submitted(
                 links
-                    .mutate(&state, opening.as_deref(), target, $method, &typed)
+                    .mutate(
+                        &state,
+                        opening.as_deref(),
+                        target,
+                        $method,
+                        &NoPreconditions {},
+                        &typed,
+                    )
                     .await?,
             )
         }
     };
 }
 
-/// Declares a command that sends one prompt to a session's agent.
+/// Sends one prompt to a session's agent.
 ///
 /// A prompt that carries its text goes to the session's own worker, as every agent call does. A
 /// prompt that names a draft goes through the host's control daemon instead, which holds the draft
 /// and its attachments: the daemon records that the draft is sent to the session before it passes
 /// the prompt to the worker, so what was submitted follows the session's retention. The worker
 /// serves a prompt that names a draft to nothing else.
-macro_rules! agent_prompt_command {
-    ($(#[$meta:meta])* $name:ident, $method:expr) => {
-        $(#[$meta])*
-        #[tauri::command]
-        pub async fn $name(
-            state: State<'_, AppState>,
-            links: State<'_, crate::agent::WorkerLinks>,
-            params: Value,
-            opening: Option<String>,
-        ) -> Result<Settled> {
-            let typed: kr_protocol::agent::AgentPromptParams = decode(params)?;
-            typed.validate().map_err(CommandError::invalid)?;
-            let target = typed.target;
-            if typed.draft_id.is_present() {
-                not_on_a_paired_host(&state, "a prompt that names a draft")?;
-                return send_draft_prompt(&state, $method, &typed).await;
-            }
-            submitted(
-                links
-                    .mutate(&state, opening.as_deref(), target, $method, &typed)
-                    .await?,
-            )
-        }
-    };
+///
+/// `supersedes` is the explicit later request that follows an outcome nobody could establish: the
+/// prompt names the earlier action and the revision of its record the person was shown.
+async fn send_prompt(
+    state: &AppState,
+    links: &crate::agent::WorkerLinks,
+    params: Value,
+    opening: Option<&str>,
+    method: Method,
+    supersedes: Option<&Supersedes>,
+) -> Result<Settled> {
+    let typed: kr_protocol::agent::AgentPromptParams = decode(params)?;
+    typed.validate().map_err(CommandError::invalid)?;
+    let target = typed.target;
+    let expected = PromptPreconditions(supersedes);
+    if typed.draft_id.is_present() {
+        not_on_a_paired_host(state, "a prompt that names a draft")?;
+        return send_draft_prompt(state, method, &typed, &expected).await;
+    }
+    submitted(
+        links
+            .mutate(state, opening, target, method, &expected, &typed)
+            .await?,
+    )
+}
+
+/// Submits a prompt to the bound agent: a draft or inline text, and never both.
+///
+/// `supersedes` is set only by a person who checked what became of an earlier prompt and sends
+/// another past it.
+#[tauri::command]
+pub async fn agent_prompt_submit(
+    state: State<'_, AppState>,
+    links: State<'_, crate::agent::WorkerLinks>,
+    params: Value,
+    opening: Option<String>,
+    supersedes: Option<Supersedes>,
+) -> Result<Settled> {
+    send_prompt(
+        &state,
+        &links,
+        params,
+        opening.as_deref(),
+        Method::AgentPromptSubmit,
+        supersedes.as_ref(),
+    )
+    .await
+}
+
+/// Queues a prompt behind the bound agent's current turn: a draft or inline text, and never both.
+///
+/// Nothing is quoted: a queued prompt waits behind an outcome nobody knows, as the guide says.
+#[tauri::command]
+pub async fn agent_prompt_queue(
+    state: State<'_, AppState>,
+    links: State<'_, crate::agent::WorkerLinks>,
+    params: Value,
+    opening: Option<String>,
+) -> Result<Settled> {
+    send_prompt(
+        &state,
+        &links,
+        params,
+        opening.as_deref(),
+        Method::AgentPromptQueue,
+        None,
+    )
+    .await
 }
 
 /// Refuses what a device paired with a host cannot do: the host serves no file to it, so it keeps
@@ -1045,6 +1139,7 @@ async fn send_draft_prompt(
     state: &AppState,
     method: Method,
     params: &kr_protocol::agent::AgentPromptParams,
+    expected: &PromptPreconditions<'_>,
 ) -> Result<Settled> {
     let session = state.session()?;
     let session_id = params.target.subject.session_id;
@@ -1070,14 +1165,7 @@ async fn send_draft_prompt(
         .map_err(|error| CommandError::invalid(error.to_string()))?;
     submitted(
         session
-            .mutate(
-                method,
-                target,
-                None,
-                &NoPreconditions {},
-                params,
-                MUTATION_TTL,
-            )
+            .mutate(method, target, None, expected, params, MUTATION_TTL)
             .await,
     )
 }
@@ -1495,15 +1583,6 @@ agent_read_command!(
     /// answering.
     agent_approval_inspect, Method::AgentApprovalInspect,
     kr_protocol::agent::AgentApprovalInspectParams => kr_protocol::agent::AgentApprovalInspectResult
-);
-agent_prompt_command!(
-    /// Submits a prompt to the bound agent: a draft or inline text, and never both.
-    agent_prompt_submit, Method::AgentPromptSubmit
-);
-agent_prompt_command!(
-    /// Queues a prompt behind the bound agent's current turn: a draft or inline text, and never
-    /// both.
-    agent_prompt_queue, Method::AgentPromptQueue
 );
 agent_mutate_command!(
     /// Steers the turn the bound agent is running.

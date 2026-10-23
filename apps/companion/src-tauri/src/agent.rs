@@ -220,7 +220,8 @@ impl WorkerLinks {
     }
 
     /// Submits one agent mutation to the worker of the session `about` names, about its instance at
-    /// the binding revision it names, and waits for the worker to settle it.
+    /// the binding revision it names, and waits for the worker to settle it. `expected` is the
+    /// request's subject preconditions.
     ///
     /// The target is the worker's own: its environment, its session at its epoch, and the instance
     /// and revision the parameters name. The page supplies the parameters and nothing about the
@@ -231,15 +232,17 @@ impl WorkerLinks {
     ///
     /// Returns why the worker could not be reached, or what the client library returns for the
     /// submission, [`ClientError::SubmissionUncertain`] among it.
-    pub async fn mutate<P>(
+    pub async fn mutate<E, P>(
         &self,
         state: &AppState,
         opening: Option<&str>,
         about: AgentMutationTarget,
         method: Method,
+        expected: &E,
         params: &P,
     ) -> Result<std::result::Result<kr_client::Settled, ClientError>>
     where
+        E: Serialize + ?Sized,
         P: Serialize + ?Sized,
     {
         let session_id = about.subject.session_id;
@@ -251,7 +254,9 @@ impl WorkerLinks {
         target
             .validate()
             .map_err(|error| CommandError::invalid(error.to_string()))?;
-        let answer = self.submit(link.link(), method, target, params).await;
+        let answer = self
+            .submit(link.link(), method, target, expected, params)
+            .await;
         if answer.as_ref().is_err_and(ends_the_link) {
             self.forget(state, session_id, link.link());
         }
@@ -260,14 +265,16 @@ impl WorkerLinks {
 
     /// Submits one mutation on `link`, counted in flight until the worker has answered, naming the
     /// share the link acts under.
-    pub(crate) async fn submit<P>(
+    pub(crate) async fn submit<E, P>(
         &self,
         link: &Arc<Link>,
         method: Method,
         target: ActionTarget,
+        expected: &E,
         params: &P,
     ) -> std::result::Result<kr_client::Settled, ClientError>
     where
+        E: Serialize + ?Sized,
         P: Serialize + ?Sized,
     {
         let _flying = Flight::enter(link);
@@ -276,7 +283,7 @@ impl WorkerLinks {
                 method,
                 target,
                 link.grant_id,
-                &crate::commands::NoPreconditions {},
+                expected,
                 params,
                 crate::commands::MUTATION_TTL,
             )

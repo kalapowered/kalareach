@@ -56,7 +56,7 @@ export function useReceiptReads({
   readonly onReceipt: (localId: string, receipt: Receipt) => void
   readonly gate?: OpeningGate
 }): void {
-  const { port } = useApp()
+  const { port, receiptReads } = useApp()
   const owed = submissions.filter(awaitsReceipt)
   // What the next read asks about, as of that read; and what changes whether a read is owed at all.
   const latest = useRef(owed)
@@ -85,6 +85,9 @@ export function useReceiptReads({
               { action_id: each.actionId, session_id: sessionId },
               token
             )
+            // What the host said is kept as it was read, whatever the submission makes of it: a later
+            // prompt quotes the revision the person was shown, and that is the newest one read.
+            receiptReads.note(record.receipt)
             // Only a record that says more than the submission does is taken, so that a read of the
             // same answer again changes nothing.
             if (applyReceipt(each, record.receipt) !== each) settle.current(each.localId, record.receipt)
@@ -104,11 +107,17 @@ export function useReceiptReads({
       if (document.visibilityState === 'visible') wait = RECEIPT_READ_FIRST_MS
     }
     document.addEventListener('visibilitychange', shown)
+    // A refusal that came of a record having moved is answered by reading it again at once.
+    const stopAsking = receiptReads.whenAskedAgain(sessionId, () => {
+      wait = RECEIPT_READ_FIRST_MS
+      reads.now()
+    })
     reads.now()
     return () => {
       live = false
+      stopAsking()
       document.removeEventListener('visibilitychange', shown)
       reads.stop()
     }
-  }, [connected, owing, port, sessionId, token, waiting])
+  }, [connected, owing, port, receiptReads, sessionId, token, waiting])
 }

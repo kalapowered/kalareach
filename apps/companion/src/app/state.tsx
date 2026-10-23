@@ -27,6 +27,7 @@ import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
 import { QuestionForms } from '../model/question-forms'
 import { Openings } from '../model/openings'
+import { ReceiptReads } from '../model/receipt-reads'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
 import { applyMode, modeApplications } from '../theme-init'
@@ -64,6 +65,11 @@ interface AppValue {
   readonly paths: ManualPaths
   /** The answers people have begun to give, which outlive the screen that showed each. */
   readonly questionForms: QuestionForms
+  /**
+   * What the host last said, in a read, of the actions this window sent: the revision a later
+   * prompt quotes when it supersedes an outcome nobody could establish.
+   */
+  readonly receiptReads: ReceiptReads
   /**
    * The rights the connection last reported, kept while contact is out and for a screen that opens
    * after it ended. The shell writes it as it hears the connection; a control that only keeps what
@@ -126,6 +132,7 @@ export function AppProvider({
   const [drafts] = useState(() => new DraftBook(port))
   const [paths] = useState(() => new ManualPaths(port))
   const [questionForms] = useState(() => new QuestionForms())
+  const [receiptReads] = useState(() => new ReceiptReads())
   const [lastRights, setLastRights] = useState<readonly ActionRight[] | null>(null)
   const rememberRights = useCallback((rights: readonly ActionRight[]) => {
     setLastRights((held) =>
@@ -267,6 +274,7 @@ export function AppProvider({
       drafts,
       paths,
       questionForms,
+      receiptReads,
       lastRights,
       rememberRights,
       place,
@@ -290,6 +298,7 @@ export function AppProvider({
       drafts,
       paths,
       questionForms,
+      receiptReads,
       lastRights,
       rememberRights,
       place,

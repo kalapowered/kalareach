@@ -9,6 +9,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-19.08 | the `kr_req_19_08_` tests here |
+//! | KR-REQ-23.24 | `kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_the_quote_of_what_was_read` |
 
 #![cfg(unix)]
 
@@ -777,6 +778,102 @@ async fn kr_req_19_08_a_prompt_the_host_cannot_establish_reaches_the_page_with_i
             "the action nobody knows the end of stays in the link's book"
         );
     }
+
+    upstream.release();
+    adopted.stop().await;
+}
+
+/// KR-REQ-23.24: a prompt whose outcome the host cannot establish is an uncertain outcome, and a
+/// later prompt for the same conversation is admitted only as an explicit later request that names
+/// that action and the revision of its record the phone read. The command sends the quote it is
+/// given and none of its own: the host refuses a later prompt that names nothing, and one that names
+/// a revision the phone was not shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_the_quote_of_what_was_read()
+ {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "screen").expect("the session opens");
+
+    // The first prompt's outcome nobody can establish: the answer names the action.
+    let first = companion
+        .call(
+            "agent_prompt_submit",
+            json!({ "params": prompt(session, instance, "first"), "opening": "screen" }),
+        )
+        .expect("an outcome nobody can establish is an answer with its action");
+    let action_id = first["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer names the action: {first}"))
+        .to_owned();
+    // The phone reads the host's record of it: this is what the person is shown.
+    let read = companion
+        .call(
+            "action_read",
+            json!({
+                "params": { "action_id": action_id, "session_id": session.to_string() },
+                "opening": "screen",
+            }),
+        )
+        .expect("the record is read under the opening");
+    assert_eq!(read["receipt"]["state"], "unknown", "{read}");
+    let shown: u64 = read["receipt"]["revision"]
+        .as_str()
+        .expect("a revision")
+        .parse()
+        .expect("a number");
+
+    let later = |text: &str, quote: Option<Value>| {
+        let mut call = json!({ "params": prompt(session, instance, text), "opening": "screen" });
+        if let Some(quote) = quote {
+            call["supersedes"] = quote;
+        }
+        companion.call("agent_prompt_submit", call)
+    };
+
+    // A later prompt that names nothing is the host's refusal, and nothing reached the agent.
+    let bare = later("second", None).expect_err("the earlier outcome has not been shown");
+    assert_eq!(code(&bare), "DRAFT_CONFLICT", "{bare}");
+    // So is one that names a revision the phone was never shown: the command sends what it is
+    // given, and does not mend it.
+    let unseen = later(
+        "second",
+        Some(json!({ "action_id": action_id, "revision": (shown + 7).to_string() })),
+    )
+    .expect_err("a revision nobody read shows nothing");
+    assert_eq!(code(&unseen), "DRAFT_CONFLICT", "{unseen}");
+    assert_eq!(
+        upstream.prompts(),
+        vec!["first".to_owned()],
+        "neither refused prompt reached the agent"
+    );
+
+    // The explicit later request, naming what the person was shown, is admitted: the host hands
+    // it to the agent. (This agent answers nothing, so the new action is itself unknown.)
+    let admitted = later(
+        "second",
+        Some(json!({ "action_id": action_id, "revision": shown.to_string() })),
+    )
+    .expect("a request that shows the earlier result is admitted");
+    assert_ne!(
+        admitted["action_id"].as_str(),
+        Some(action_id.as_str()),
+        "a new action: the earlier one is not replaced"
+    );
+    assert_eq!(
+        upstream.prompts(),
+        vec!["first".to_owned(), "second".to_owned()],
+        "the quoted prompt reached the agent"
+    );
 
     upstream.release();
     adopted.stop().await;
