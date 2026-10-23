@@ -172,8 +172,9 @@ network could mend.
 
 The phone shows the host's generic alert and nothing more. A sealed preview is delivered and left
 unopened, and the key is filed so that an opener added later needs no new registration. Android
-receives a data message and shows the notification itself, under the identifier the host gave it
-and with a tap that opens the attention screen. On iOS the system shows the alert, the extension
+receives a data message, which the gateway sends at high priority for every push because a
+normal-priority one waits for an application that is not in front, and shows the notification
+itself, under the identifier the host gave it and with a tap that opens the attention screen. On iOS the system shows the alert, the extension
 runs, and a tap is routed by the notification delegate set at launch.
 
 ### What neither question shows
