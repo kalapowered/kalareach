@@ -695,6 +695,15 @@ impl HostLink for WatchedLink {
         })
     }
 
+    fn visit_paired_transport<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        identity: &'a LocalIdentity,
+        in_use: Option<&'a NetworkConfig>,
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
+        self.inner.visit_paired_transport(host, identity, in_use)
+    }
+
     fn hold<'a>(
         &'a self,
         network: &'a NetworkConfig,

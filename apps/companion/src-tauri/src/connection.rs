@@ -196,8 +196,9 @@ impl Connection {
     }
 
     /// A connection to a paired host for a visit: a look at a host that is not the one this device
-    /// is using, as [`Self::paired`] opens one, except that it says whether the host refused it. It
-    /// is not opened again when it ends: whoever visits opens another.
+    /// is using, as [`Self::paired`] opens one, except that it never cuts off the connection to the
+    /// host in use (see [`kr_client::pairing::link::HostLink::visit_paired`]) and says whether the
+    /// host refused it. It is not opened again when it ends: whoever visits opens another.
     ///
     /// # Errors
     ///
@@ -208,20 +209,34 @@ impl Connection {
         device: &Arc<Device>,
         host: &PairedHost,
     ) -> std::result::Result<Self, Unopened> {
-        Self::open(device, host).await
+        Self::open(device, host, true).await
     }
 
     async fn paired_once(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
-        Self::open(device, host)
+        Self::open(device, host, false)
             .await
             .map_err(Unopened::into_error)
     }
 
-    /// Opens the connection.
-    async fn open(device: &Arc<Device>, host: &PairedHost) -> std::result::Result<Self, Unopened> {
+    /// Opens the connection, as a visit when `visiting`.
+    async fn open(
+        device: &Arc<Device>,
+        host: &PairedHost,
+        visiting: bool,
+    ) -> std::result::Result<Self, Unopened> {
         let pairing = device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
-        let connecting = pairing.link.connect_paired(host, &identity);
+        let connecting = async {
+            if visiting {
+                let in_use = device.host_in_use().map(|using| using.network_config);
+                pairing
+                    .link
+                    .visit_paired(host, &identity, in_use.as_ref())
+                    .await
+            } else {
+                pairing.link.connect_paired(host, &identity).await
+            }
+        };
         let session = tokio::time::timeout(CONNECT_WITHIN, connecting)
             .await
             .map_err(|_| Unopened::unreached("the host did not answer in time"))?

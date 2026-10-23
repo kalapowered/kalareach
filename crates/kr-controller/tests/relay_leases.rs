@@ -5192,6 +5192,21 @@ impl kr_client::pairing::link::HostLink for Counting {
         self.inner.connect_paired_transport(host, identity)
     }
 
+    fn visit_paired_transport<'a>(
+        &'a self,
+        host: &'a kr_client::pairing::paired::PairedHost,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+        in_use: Option<&'a kr_protocol::pairing::NetworkConfig>,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<
+            Arc<dyn kr_client::transport::ControlTransport>,
+            kr_client::pairing::link::LinkError,
+        >,
+    > {
+        self.inner.visit_paired_transport(host, identity, in_use)
+    }
+
     fn hold<'a>(
         &'a self,
         network: &'a kr_protocol::pairing::NetworkConfig,

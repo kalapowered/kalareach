@@ -20,6 +20,7 @@
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
 //! | KR-REQ-13.01 | `the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use` |
 //! | KR-REQ-13.01 | `a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refused` |
+//! | KR-REQ-13.01 | `an_owned_host_is_visited_beside_the_host_in_use_and_never_cuts_it_off` |
 //! | KR-REQ-23.32 | `a_paired_devices_questions_go_through_the_host` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
@@ -586,11 +587,31 @@ async fn the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use() 
         "{read}"
     );
 
+    // Every visit so far was made beside the host in use, which it leaves alone.
+    let in_use_network = first.network().network_config().expect("the configuration");
+    let visits = control.visits();
+    assert!(!visits.is_empty());
+    assert!(
+        visits
+            .iter()
+            .all(|beside| beside.as_ref() == Some(&in_use_network)),
+        "{visits:?}"
+    );
+
     // Choosing it takes it from the visits, and the host before it joins them.
     companion
         .call("hosts_use", json!({ "reference": other }))
         .expect("the host is chosen");
     let after = companion.call("inbox_hosts", json!({})).expect("a visit");
+    let now_in_use = second
+        .network()
+        .network_config()
+        .expect("the configuration");
+    assert_eq!(
+        control.visits().last().and_then(Option::as_ref),
+        Some(&now_in_use),
+        "the host chosen is the one left alone now"
+    );
     assert_eq!(after.as_array().map(Vec::len), Some(1), "{after}");
     assert_ne!(after[0]["reference"], other.as_str(), "{after}");
     assert_eq!(after[0]["state"], "read");
@@ -652,6 +673,39 @@ async fn a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refuse
     assert_eq!(read[0]["state"], "read", "{read}");
     assert!(read[0]["refusal"].is_null(), "{read}");
 
+    first.stop().await;
+    second.stop().await;
+}
+
+/// KR-REQ-13.01: a host this computer owns is watched for what it wants confirmed, and the watcher
+/// visits it beside the host in use: it asks the link to leave the host in use's connection alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owned_host_is_visited_beside_the_host_in_use_and_never_cuts_it_off() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    support::record_owned(&companion.device(), &second, "second");
+
+    tokio::time::timeout(WATCHDOG, async {
+        while control.visits().is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the watcher visits the owned host");
+    let in_use_network = first.network().network_config().expect("the configuration");
+    let visits = control.visits();
+    assert!(
+        visits
+            .iter()
+            .all(|beside| beside.as_ref() == Some(&in_use_network)),
+        "{visits:?}"
+    );
     first.stop().await;
     second.stop().await;
 }

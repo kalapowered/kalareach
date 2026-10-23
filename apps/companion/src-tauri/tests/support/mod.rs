@@ -978,6 +978,8 @@ struct LinkState {
     ending: bool,
     refusing: Option<kr_protocol::error::ErrorCode>,
     waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// The host in use each visit was made beside, in the order the visits were asked for.
+    visits: Vec<Option<kr_protocol::pairing::NetworkConfig>>,
 }
 
 impl LinkControl {
@@ -1053,6 +1055,12 @@ impl LinkControl {
         self.state.lock().expect("the record").ending = ending;
     }
 
+    /// The network configuration of the host in use that each visit was asked to leave alone, in
+    /// the order the visits were asked for, `None` for a visit made while no host was in use.
+    pub fn visits(&self) -> Vec<Option<kr_protocol::pairing::NetworkConfig>> {
+        self.state.lock().expect("the record").visits.clone()
+    }
+
     /// Makes the host refuse every connection at admission with `code`, or stops that.
     pub fn refuse(&self, code: Option<kr_protocol::error::ErrorCode>) {
         self.state.lock().expect("the record").refusing = code;
@@ -1063,6 +1071,66 @@ impl LinkControl {
 struct ControlledLink {
     own: Arc<dyn kr_client::pairing::link::HostLink>,
     control: Arc<LinkControl>,
+}
+
+impl ControlledLink {
+    /// Lets a connection through as the control says, as a visit beside `visiting`'s host in use
+    /// when `visiting` is `Some`.
+    async fn controlled(
+        &self,
+        host: &kr_client::pairing::paired::PairedHost,
+        identity: &kr_transport::handshake::LocalIdentity,
+        visiting: Option<Option<&kr_protocol::pairing::NetworkConfig>>,
+    ) -> Result<Arc<dyn kr_client::transport::ControlTransport>, kr_client::pairing::link::LinkError>
+    {
+        self.control
+            .asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let held = {
+            let mut state = self.control.state.lock().expect("the record");
+            if let Some(in_use) = visiting {
+                state.visits.push(in_use.cloned());
+            }
+            if state.holding {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                state.waiting.push(Some(sender));
+                Some(receiver)
+            } else {
+                None
+            }
+        };
+        if let Some(receiver) = held {
+            let _ = receiver.await;
+        }
+        // What the host does is decided when the connection is let through, so a test can change it
+        // while the connection is held.
+        let (refusing, unreachable, ending) = {
+            let state = self.control.state.lock().expect("the record");
+            (state.refusing, state.unreachable, state.ending)
+        };
+        if let Some(code) = refusing {
+            return Err(kr_client::pairing::link::LinkError::Refused(
+                kr_protocol::error::ProtocolError::new(code, "the host refused the device"),
+            ));
+        }
+        if unreachable {
+            return Err(kr_client::pairing::link::LinkError::Lost(
+                "the host could not be reached".to_owned(),
+            ));
+        }
+        let transport = match visiting {
+            Some(in_use) => {
+                self.own
+                    .visit_paired_transport(host, identity, in_use)
+                    .await?
+            }
+            None => self.own.connect_paired_transport(host, identity).await?,
+        };
+        if ending {
+            transport.close();
+        }
+        Ok(transport)
+    }
 }
 
 impl kr_client::pairing::link::HostLink for ControlledLink {
@@ -1107,45 +1175,22 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
             kr_client::pairing::link::LinkError,
         >,
     > {
-        Box::pin(async move {
-            self.control
-                .asked
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let held = {
-                let mut state = self.control.state.lock().expect("the record");
-                if state.holding {
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    state.waiting.push(Some(sender));
-                    Some(receiver)
-                } else {
-                    None
-                }
-            };
-            if let Some(receiver) = held {
-                let _ = receiver.await;
-            }
-            // What the host does is decided when the connection is let through, so a test can
-            // change it while the connection is held.
-            let (refusing, unreachable, ending) = {
-                let state = self.control.state.lock().expect("the record");
-                (state.refusing, state.unreachable, state.ending)
-            };
-            if let Some(code) = refusing {
-                return Err(kr_client::pairing::link::LinkError::Refused(
-                    kr_protocol::error::ProtocolError::new(code, "the host refused the device"),
-                ));
-            }
-            if unreachable {
-                return Err(kr_client::pairing::link::LinkError::Lost(
-                    "the host could not be reached".to_owned(),
-                ));
-            }
-            let transport = self.own.connect_paired_transport(host, identity).await?;
-            if ending {
-                transport.close();
-            }
-            Ok(transport)
-        })
+        Box::pin(self.controlled(host, identity, None))
+    }
+
+    fn visit_paired_transport<'a>(
+        &'a self,
+        host: &'a kr_client::pairing::paired::PairedHost,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+        in_use: Option<&'a kr_protocol::pairing::NetworkConfig>,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<
+            Arc<dyn kr_client::transport::ControlTransport>,
+            kr_client::pairing::link::LinkError,
+        >,
+    > {
+        Box::pin(self.controlled(host, identity, Some(in_use)))
     }
 
     fn hold<'a>(
