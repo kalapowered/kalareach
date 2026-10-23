@@ -1529,9 +1529,8 @@ mod platform {
 /// process is read by the kernel, so nothing a record says is believed, and the boot a record
 /// belongs to needs no check: a process that has ended is not work, whether a sign-out or a
 /// restart of the machine ended it, which is how a daemon in the next session is told apart from
-/// one beside work left behind. A process this account cannot open is not work either: the
-/// processes of this environment are created by a task of this account, which can open them, so a
-/// recorded number that this account cannot open now belongs to another account's process.
+/// one beside work left behind. See [`work_elsewhere`] for how a process the kernel does not
+/// establish is read.
 ///
 /// # Errors
 ///
@@ -1541,8 +1540,6 @@ pub(crate) fn refuse_work_in_another_session(
     registry: &crate::registry::Registry,
     here: u32,
 ) -> crate::error::Result<()> {
-    use kr_ipc::identity::{ProcessState, process_state};
-
     use crate::registry::LaunchPhase;
 
     let mut left: Vec<kr_protocol::identity::ProcessStartIdentity> = registry
@@ -1566,25 +1563,27 @@ pub(crate) fn refuse_work_in_another_session(
     // process that still runs.
     left.sort();
     left.dedup();
-    let mut elsewhere = Vec::new();
-    let mut unread = Vec::new();
-    for identity in &left {
-        let pid = u32::try_from(identity.pid.get()).unwrap_or(u32::MAX);
-        if process_state(identity) != ProcessState::Running {
-            continue;
-        }
-        match kr_ipc::starter::process_facts(pid) {
-            Ok(facts) if facts.session == here => {}
-            Ok(facts) => elsewhere.push(format!("{pid} in session {}", facts.session)),
-            Err(_) => unread.push(pid.to_string()),
-        }
-    }
+    let seen: Vec<Seen> = left
+        .iter()
+        .filter_map(|identity| {
+            let pid = u32::try_from(identity.pid.get()).unwrap_or(u32::MAX);
+            let state = kr_ipc::identity::process_state(identity);
+            // What has ended is not read again.
+            (state != kr_ipc::identity::ProcessState::Ended).then(|| Seen {
+                pid,
+                state,
+                facts: kr_ipc::starter::process_facts(pid)
+                    .map(|facts| (facts.session, facts.same_user)),
+            })
+        })
+        .collect();
+    let (elsewhere, unread) = work_elsewhere(&seen, here);
     if elsewhere.is_empty() && unread.is_empty() {
         return Ok(());
     }
     let mut said = format!(
-        "this environment's work is still running outside this daemon's login session, {here}, and \
-         a daemon here takes none of it over"
+        "this daemon did not start: this environment's work is still running outside this \
+         daemon's login session, {here}, and a daemon here takes none of it over"
     );
     if !elsewhere.is_empty() {
         said.push_str(&format!(" (processes {})", elsewhere.join(", ")));
@@ -1601,7 +1600,52 @@ pub(crate) fn refuse_work_in_another_session(
         ". Sign in to that session and end the work there, or end those processes, or restart the \
          machine"
     });
-    Err(crate::error::ControllerError::supervision(said))
+    Err(crate::error::ControllerError::work_in_another_session(said))
+}
+
+/// What the kernel said of one process an earlier daemon recorded that has not ended.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct Seen {
+    /// Its identifier.
+    pid: u32,
+    /// Whether the kernel establishes it as the process that was recorded.
+    state: kr_ipc::identity::ProcessState,
+    /// Its login session and whether it is this account's, or the failure to read them.
+    facts: std::io::Result<(u32, bool)>,
+}
+
+/// Which of the recorded processes that have not ended are in a login session other than `here`,
+/// and which run where this account cannot read their session.
+///
+/// A process the kernel establishes as the recorded one is read by its session. One it does not
+/// establish (its reading failed, or the clock it is judged against has stepped back, so that a
+/// creation time lies ahead of it) is read by its session as well when this account can read it,
+/// since then it may be a worker of this environment whose reading failed for a reason other than
+/// being another account's. When it cannot be read, or is another account's, it is not work: the
+/// processes of an environment are created by a task of the account that runs its daemon, which
+/// can open them, so a number this account cannot open is another account's process by now.
+#[cfg(any(windows, test))]
+fn work_elsewhere(seen: &[Seen], here: u32) -> (Vec<String>, Vec<String>) {
+    use kr_ipc::identity::ProcessState;
+
+    let mut elsewhere = Vec::new();
+    let mut unread = Vec::new();
+    for one in seen {
+        let running = match &one.state {
+            ProcessState::Ended => continue,
+            ProcessState::Running => true,
+            ProcessState::Unknown { .. } => false,
+        };
+        match &one.facts {
+            Ok((session, _)) if *session == here => {}
+            Ok((_, false)) if !running => {}
+            Ok((session, _)) => elsewhere.push(format!("{} in session {session}", one.pid)),
+            Err(_) if running => unread.push(one.pid.to_string()),
+            Err(_) => {}
+        }
+    }
+    (elsewhere, unread)
 }
 
 #[cfg(windows)]
@@ -2494,6 +2538,7 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use kr_ipc::identity::ProcessState;
     use kr_ipc::testing::TempHost;
 
     use super::*;
@@ -2502,6 +2547,65 @@ mod tests {
 
     fn starter(host: &TempHost) -> PathBuf {
         host.root().join("bin").join("kr-controller.exe")
+    }
+
+    fn seen(pid: u32, state: ProcessState, facts: Option<(u32, bool)>) -> Seen {
+        Seen {
+            pid,
+            state,
+            facts: facts.ok_or_else(|| std::io::ErrorKind::PermissionDenied.into()),
+        }
+    }
+
+    fn not_established() -> ProcessState {
+        ProcessState::Unknown {
+            detail: "the kernel did not say".to_owned(),
+        }
+    }
+
+    /// KR-REQ-07.58: what a daemon that starts in session 2 makes of the processes an earlier
+    /// daemon recorded. Only a process that runs where this daemon is not is work elsewhere; one
+    /// whose session cannot be read although it runs is said to be unread; what has ended is not
+    /// read at all.
+    #[test]
+    fn work_elsewhere_is_what_runs_in_another_login_session() {
+        let (elsewhere, unread) = work_elsewhere(
+            &[
+                seen(10, ProcessState::Running, Some((2, true))),
+                seen(11, ProcessState::Running, Some((3, true))),
+                seen(12, ProcessState::Running, None),
+            ],
+            2,
+        );
+        assert_eq!(elsewhere, vec!["11 in session 3".to_owned()]);
+        assert_eq!(unread, vec!["12".to_owned()]);
+    }
+
+    /// KR-REQ-07.58: a process the kernel does not establish is read by what this account can read
+    /// of it. A reading that failed for another reason than the process being another account's
+    /// (a clock stepped back past the allowance leaves every creation time out of range) must not
+    /// let a worker of this account in another session through; a number this account cannot open,
+    /// or one that is another account's, is no work of this environment.
+    #[test]
+    fn a_process_the_kernel_does_not_establish_counts_when_this_account_can_read_it() {
+        let (elsewhere, unread) = work_elsewhere(
+            &[
+                seen(20, not_established(), Some((3, true))),
+                seen(21, not_established(), Some((3, false))),
+                seen(22, not_established(), None),
+                seen(23, not_established(), Some((2, true))),
+            ],
+            2,
+        );
+        assert_eq!(
+            elsewhere,
+            vec!["20 in session 3".to_owned()],
+            "only the process of this account, in another session, counts"
+        );
+        assert!(
+            unread.is_empty(),
+            "a number this account cannot open is not work: {unread:?}"
+        );
     }
 
     /// KR-REQ-07.69: the setup step registers a task that logs on as the user in a session where

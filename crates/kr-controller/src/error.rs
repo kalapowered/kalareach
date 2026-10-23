@@ -40,6 +40,12 @@ pub enum ControllerError {
         /// What went wrong.
         detail: String,
     },
+    /// A daemon was not started in the login session an earlier daemon's work still runs in.
+    #[error("{detail}")]
+    WorkInAnotherSession {
+        /// What was found and what to do about it.
+        detail: String,
+    },
     /// A worker did not present a valid startup claim.
     #[error("the worker's startup claim was refused: {detail}")]
     RendezvousRefused {
@@ -154,6 +160,14 @@ impl ControllerError {
         }
     }
 
+    /// Builds the refusal to start in a login session other than the one the environment's work
+    /// runs in.
+    pub fn work_in_another_session(detail: impl std::fmt::Display) -> Self {
+        Self::WorkInAnotherSession {
+            detail: detail.to_string(),
+        }
+    }
+
     /// Builds a refusal from what a subject answered.
     #[must_use]
     pub fn refused(error: &ProtocolError) -> Self {
@@ -179,7 +193,9 @@ impl ControllerError {
             }
             Self::AlreadyRunning { .. } => ErrorCode::ResourceUnavailable,
             Self::SessionLimit { .. } => ErrorCode::SessionLimit,
-            Self::Supervision { .. } => ErrorCode::ResourceUnavailable,
+            Self::Supervision { .. } | Self::WorkInAnotherSession { .. } => {
+                ErrorCode::ResourceUnavailable
+            }
             Self::RendezvousRefused { .. } | Self::Verification(_) | Self::WindowExpired { .. } => {
                 ErrorCode::PermissionDenied
             }
