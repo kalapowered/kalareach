@@ -86,6 +86,10 @@ pub(crate) fn account_origin() -> Option<String> {
 /// process has ended and the kernel has closed the lock it held. A start can therefore find the
 /// environment held. That is a liveness condition: what a suite asserts is that the start takes
 /// the environment over, not how soon the holder lets go.
+///
+/// The environment's lock is not the only thing a daemon's tasks can hold after the suite has let
+/// it go. A pass of the delivery runtime holds the runtime, and the attention store's claim with
+/// it, for as long as the pass runs, and the daemon's lock can be free by then.
 pub const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The time a platform command is given in this process, in milliseconds, when a suite chose it;
@@ -262,13 +266,34 @@ pub(crate) fn note_backup_enable(
 /// How long a start waits before it tries again.
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Starts a daemon with `start`, and again while the environment is held, until
-/// [`ENVIRONMENT_HANDOVER_DEADLINE`] has passed since the first attempt.
+/// How long a start waits before it tries again when the attention store is held. An attempt that
+/// meets the environment's lock held does nothing before it finds that out; one that meets the
+/// store held has taken the lock and done durable work first, so it is made less often.
+const STORE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether a start failed because the attention store is held by this very process: a daemon this
+/// process let go whose delivery runtime has not ended yet keeps the store's claim.
+fn the_attention_store_is_held_by_this_process(error: &ControllerError) -> bool {
+    let ControllerError::RegistryUnavailable { detail } = error else {
+        return false;
+    };
+    let held = kr_attention::Error::StoreHeld {
+        process: u64::from(std::process::id()),
+    };
+    detail.contains(&held.to_string())
+}
+
+/// Starts a daemon with `start`, and again while the environment is held, or its attention store
+/// is held by a daemon of this process that was let go, until [`ENVIRONMENT_HANDOVER_DEADLINE`]
+/// has passed since the first attempt.
+///
+/// A claim on the store that its holder could not delete stays for as long as the process lives,
+/// and no wait ends that: the deadline ends it, and the last failure is returned.
 ///
 /// # Errors
 ///
-/// Returns the first failure that is not the environment being held as soon as it happens, and
-/// the environment still being held once the deadline has passed.
+/// Returns the first failure that is not the environment or its attention store being held as
+/// soon as it happens, and what held it once the deadline has passed.
 pub async fn taken_over<T, F, S>(mut start: F) -> Result<T>
 where
     F: FnMut() -> S,
@@ -276,12 +301,21 @@ where
 {
     let begun = std::time::Instant::now();
     loop {
-        match start().await {
+        let wait = match start().await {
             Err(ControllerError::AlreadyRunning { .. })
-                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+                if begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE =>
+            {
+                RETRY_INTERVAL
+            }
+            Err(error)
+                if the_attention_store_is_held_by_this_process(&error)
+                    && begun.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE =>
+            {
+                STORE_RETRY_INTERVAL
+            }
             outcome => return outcome,
-        }
-        tokio::time::sleep(RETRY_INTERVAL).await;
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -491,6 +525,53 @@ mod tests {
             attempts.get() >= 2,
             "the start met the environment held and tried again: {} attempts",
             attempts.get()
+        );
+        drop(controller);
+    }
+
+    /// A start that meets the environment's attention store held by a daemon of this process that
+    /// was let go waits, and takes the store over once that daemon has ended. The environment's
+    /// lock is free throughout: the holder is only the store's claim.
+    ///
+    /// The holder is this test's own, and it lets go when the second attempt begins. The control is
+    /// the same start without the wait, which meets the store held and fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_takes_the_attention_store_over_once_the_daemon_that_holds_it_has_ended() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let store = crate::attention::AttentionModule::open(&environment, boot.clone())
+            .expect("this test holds the attention store");
+
+        let Err(refused) = Controller::start(setup(&temp, boot.clone())).await else {
+            panic!("a start without the wait meets the store held and fails");
+        };
+        assert!(
+            the_attention_store_is_held_by_this_process(&refused),
+            "the start was refused for the store held by this process: {refused}"
+        );
+
+        let attempts = std::cell::Cell::new(0_u32);
+        let holder = std::cell::RefCell::new(Some(store));
+        let controller = taken_over(|| {
+            attempts.set(attempts.get() + 1);
+            // The holder lets go when the second attempt begins, which is after the first has met
+            // the store held and the start has waited.
+            if attempts.get() > 1 {
+                holder.borrow_mut().take();
+            }
+            Controller::start(setup(&temp, boot.clone()))
+        })
+        .await
+        .expect("the start takes the store over once it is let go");
+        assert!(
+            holder.borrow().is_none(),
+            "the start waited before it took over"
+        );
+        assert_eq!(
+            attempts.get(),
+            2,
+            "the start met the store held, waited, and took it over"
         );
         drop(controller);
     }
