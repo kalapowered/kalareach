@@ -6499,12 +6499,7 @@ impl WorkerService {
         // workflow ingress serves one close of the session a run started and shows nobody
         // anything, so a quote made through it has been shown to no one.
         let shown = declared
-            .filter(|_| {
-                matches!(
-                    caller.ingress,
-                    ActorIngress::LocalIpc | ActorIngress::PairedDevice
-                )
-            })
+            .filter(|_| crate::action::dedup::ingress_shows_a_person(caller.ingress))
             .and_then(|declared| {
                 self.shown_receipts
                     .lock()
@@ -7950,10 +7945,12 @@ impl WorkerService {
         let encoded = encode(&answer)?;
         // Shown only now that the answer is built for this caller and fits its frame: a read that
         // was refused, or that could not be encoded, showed the caller nothing.
-        self.shown_receipts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .show(actor_id, params.action_id, revision);
+        if crate::action::dedup::ingress_shows_a_person(caller.ingress) {
+            self.shown_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .show(actor_id, params.action_id, revision);
+        }
         Ok(encoded)
     }
 

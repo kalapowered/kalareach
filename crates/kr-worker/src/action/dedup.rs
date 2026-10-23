@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
 
@@ -43,6 +44,16 @@ pub struct Uncertain {
 /// How many receipts' revisions the worker remembers having shown, in all.
 const MAX_SHOWN_RECEIPTS: usize = 1024;
 
+/// Whether what a caller of this ingress reads is shown to a person.
+///
+/// A person is shown a result through the local owner's commands or a paired device. The workflow
+/// ingress serves one close of the session a run started and shows nobody anything, so a read
+/// through it is not recorded as a show and a quote made through it has been shown to no one.
+#[must_use]
+pub const fn ingress_shows_a_person(ingress: ActorIngress) -> bool {
+    matches!(ingress, ActorIngress::LocalIpc | ActorIngress::PairedDevice)
+}
+
 /// The revision of an action's receipt that each actor has been shown by `action.read`, since this
 /// worker started.
 ///
@@ -52,10 +63,18 @@ const MAX_SHOWN_RECEIPTS: usize = 1024;
 /// worker that restarted, or that let an entry go for room, has not shown it, and the caller reads
 /// the receipt again. Nothing here is a grant of anything: it says what was shown, and the request
 /// that quotes it is still admitted or refused on its own authority.
+///
+/// The bound is shared, and what goes for room is the oldest entry of the actor that holds the
+/// most: an actor that reads a great many receipts makes room with its own entries, and cannot
+/// push out the revision another actor was shown. Reading a receipt again makes its entry as new
+/// as that read.
 #[derive(Debug, Default)]
 pub struct ShownReceipts {
     shown: HashMap<(ActorId, ActionId), u64>,
+    /// The entries, oldest first.
     oldest: VecDeque<(ActorId, ActionId)>,
+    /// How many entries each actor holds.
+    held: HashMap<ActorId, usize>,
 }
 
 impl ShownReceipts {
@@ -63,12 +82,38 @@ impl ShownReceipts {
     /// was shown before.
     pub fn show(&mut self, actor: &ActorId, action: ActionId, revision: u64) {
         let key = (actor.clone(), action);
-        if self.shown.insert(key.clone(), revision).is_none() {
-            self.oldest.push_back(key);
-            while self.oldest.len() > MAX_SHOWN_RECEIPTS {
-                if let Some(oldest) = self.oldest.pop_front() {
-                    self.shown.remove(&oldest);
-                }
+        if self.shown.insert(key.clone(), revision).is_some() {
+            if let Some(at) = self.oldest.iter().position(|held| *held == key) {
+                self.oldest.remove(at);
+            }
+        } else {
+            *self.held.entry(actor.clone()).or_default() += 1;
+        }
+        self.oldest.push_back(key);
+        while self.oldest.len() > MAX_SHOWN_RECEIPTS {
+            self.make_room();
+        }
+    }
+
+    /// Lets go of the oldest entry of the actor that holds the most, the one whose entry is oldest
+    /// where several hold as many.
+    fn make_room(&mut self) {
+        let most = self.held.values().copied().max().unwrap_or(0);
+        let Some(at) = self
+            .oldest
+            .iter()
+            .position(|(actor, _)| self.held.get(actor).copied() == Some(most))
+        else {
+            return;
+        };
+        let Some(key) = self.oldest.remove(at) else {
+            return;
+        };
+        self.shown.remove(&key);
+        if let Some(count) = self.held.get_mut(&key.0) {
+            *count -= 1;
+            if *count == 0 {
+                self.held.remove(&key.0);
             }
         }
     }

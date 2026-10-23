@@ -1685,6 +1685,230 @@ async fn a_workflow_close_cannot_supersede_an_uncertain_outcome() {
     );
 }
 
+/// A paired device as the daemon verified it.
+fn a_paired_device(name: &str) -> kr_protocol::actor::ActorEnvelope {
+    kr_protocol::actor::ActorEnvelope {
+        actor_id: actor(name),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16]))),
+        grant_id: Nullable::some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16]))),
+        grant_revision: Nullable::some(kr_protocol::ids::AuthorityRevision::new(1)),
+        controller_generation: ControllerGeneration::new(1),
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([8; 16])),
+    }
+}
+
+/// A close as the daemon forwards it for the paired device `name`.
+fn a_paired_close(mutation: &MutationRequest, name: &str) -> ControlFrame {
+    ControlFrame::Forwarded(Box::new(kr_protocol::local::ForwardedMutation {
+        mutation: mutation.clone(),
+        actor: a_paired_device(name),
+        grant_rights: [kr_protocol::rights::ActionRight::SessionClose]
+            .into_iter()
+            .collect(),
+        accepted_deadline_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms() + 120_000),
+        history: None,
+        screen_basis: None,
+        workflow_run_id: None,
+        lease: None,
+    }))
+}
+
+/// A read of `action_id`'s receipt as the daemon forwards it for the paired device `name`.
+fn a_paired_read(name: &str, action_id: ActionId) -> ControlFrame {
+    ControlFrame::ForwardedRead(Box::new(kr_protocol::local::ForwardedRequest {
+        request: Request {
+            request_id: RequestId::new(5),
+            method: Method::ActionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            })
+            .expect("encodes"),
+        },
+        actor: a_paired_device(name),
+        authority_deadline_boot_ms: Nullable::null(),
+        history: None,
+    }))
+}
+
+/// Reads `count` receipts of the local owner, each of an action of its own and settled, the ones
+/// from `first` on, over its connection.
+async fn reads_receipts_of_its_own(
+    host: &Host,
+    client: &mut LocalClient,
+    first: usize,
+    count: usize,
+) {
+    let owner = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let mut ids = Vec::with_capacity(count);
+    {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("a journal");
+        for index in first..first + count {
+            let mut bytes = [0xee_u8; 16];
+            bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let mut intent = fresh(0, 7, 7);
+            intent.actor_id = owner.clone();
+            intent.action_id = ActionId::new(Uuid::from_bytes(bytes));
+            intent.payload_digest =
+                Digest256::from_bytes([u8::try_from(index % 251).unwrap_or(0); 32]);
+            journal.accept(&intent).expect("an intent of the owner");
+            journal
+                .reject(
+                    owner.clone(),
+                    intent.action_id,
+                    RejectionReason::StalePreconditions,
+                    None,
+                    kr_ipc::now_ms(),
+                )
+                .expect("a settled action");
+            ids.push(intent.action_id);
+        }
+    }
+    for action_id in ids {
+        let read = send_request(
+            client,
+            Request {
+                request_id: RequestId::new(6),
+                method: Method::ActionRead.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                    action_id,
+                    session_id: None,
+                })
+                .expect("encodes"),
+            },
+        )
+        .await;
+        assert!(matches!(read, Outcome::Ok(_)), "{read:?}");
+    }
+}
+
+/// KR-REQ-23.24: what one actor reads does not take away the revision another was shown.
+///
+/// A paired device is shown the uncertain outcome of its own action, and the local owner then reads
+/// more receipts than the worker remembers having shown. The device's request that supersedes the
+/// outcome is admitted all the same, and the owner's own earliest read is the one that was let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receipts_one_actor_reads_do_not_push_out_what_another_was_shown() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let mut daemon = controller_client(&host).await;
+    let owner = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = close_mutation(
+        &client,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let owners = an_uncertain_outcome_for(&host, &owner, action(54), &first);
+    let devices = an_uncertain_outcome_for(&host, &actor("device:phone"), action(53), &first);
+
+    // The owner reads its own uncertain outcome first, so that its entry is the oldest.
+    let read = send_request(
+        &mut client,
+        Request {
+            request_id: RequestId::new(4),
+            method: Method::ActionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id: action(54),
+                session_id: None,
+            })
+            .expect("encodes"),
+        },
+    )
+    .await;
+    assert!(matches!(read, Outcome::Ok(_)), "{read:?}");
+    let read = answer_to(&mut daemon, a_paired_read("device:phone", action(53))).await;
+    let ControlFrame::Response(read) = read else {
+        panic!("the device's read is answered");
+    };
+    assert!(matches!(read.outcome, Outcome::Ok(_)), "{:?}", read.outcome);
+
+    reads_receipts_of_its_own(&host, &mut client, 0, 1_100).await;
+
+    // The owner's earliest read went for room, so quoting it shows nothing.
+    let quoting = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(54), owners),
+        ..first.clone()
+    };
+    let Outcome::Error(error) = send_mutation(&mut client, quoting).await else {
+        panic!("the owner's earliest read was let go for room");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+
+    // The device's was not, because the owner's reads made room with the owner's entries.
+    let superseding_close = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(53), devices),
+        ..first
+    };
+    let ControlFrame::Response(admitted) = answer_to(
+        &mut daemon,
+        a_paired_close(&superseding_close, "device:phone"),
+    )
+    .await
+    else {
+        panic!("the device's close is answered");
+    };
+    assert!(
+        matches!(admitted.outcome, Outcome::Ok(_)),
+        "the device was shown the revision, and what another actor read since does not undo it: {:?}",
+        admitted.outcome
+    );
+}
+
+/// KR-REQ-23.24: a receipt read again stays among those the worker remembers having shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_read_again_is_remembered_longer_than_the_receipts_read_after_it() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let owner = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = close_mutation(
+        &client,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let revision = an_uncertain_outcome_for(&host, &owner, action(55), &first);
+    let read_it = |request_id| Request {
+        request_id: RequestId::new(request_id),
+        method: Method::ActionRead.into(),
+        method_version: MethodVersion::V1,
+        params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+            action_id: action(55),
+            session_id: None,
+        })
+        .expect("encodes"),
+    };
+
+    assert!(matches!(
+        send_request(&mut client, read_it(4)).await,
+        Outcome::Ok(_)
+    ));
+    reads_receipts_of_its_own(&host, &mut client, 0, 600).await;
+    assert!(matches!(
+        send_request(&mut client, read_it(5)).await,
+        Outcome::Ok(_)
+    ));
+    reads_receipts_of_its_own(&host, &mut client, 600, 600).await;
+
+    let quoting = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(55), revision),
+        ..first
+    };
+    let admitted = send_mutation(&mut client, quoting).await;
+    assert!(
+        matches!(admitted, Outcome::Ok(_)),
+        "the read after the first flood is the one that counts: {admitted:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-02.08, 23.23: what a caller may assert
 // ---------------------------------------------------------------------------------------------
