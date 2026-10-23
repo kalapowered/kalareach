@@ -274,19 +274,16 @@ export function MobileSessions({
 export function MobileHosts({
   surface,
   connected,
-  environmentId,
-  resumed = 0
+  environmentId
 }: {
   readonly surface: Surface
   /** Whether a host is being reached now, or null before anything has said. */
   readonly connected?: boolean | null
   /** The environment the connection belongs to, which says which host is reached. */
   readonly environmentId?: string | null
-  /** How many times the application has come to the front, each of which looks again at notifications. */
-  readonly resumed?: number
 }): ReactNode {
   const { port } = useApp()
-  const notifications = useNotifications(resumed)
+  const notifications = useNotifications()
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)

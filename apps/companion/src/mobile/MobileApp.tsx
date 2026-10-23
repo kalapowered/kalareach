@@ -139,6 +139,13 @@ export function MobileApp({
     }
   }, [port, lifecycle.resumed])
 
+  // A look at where notifications stand each time the application is in front, whichever screen it
+  // is on: a token the system changed is registered again, and a try that stopped for the person is
+  // tried again once they have had time to act.
+  useEffect(() => {
+    void port.pushRefresh().catch(() => undefined)
+  }, [port, lifecycle.resumed])
+
   useEffect(() => {
     document.documentElement.dataset.surface = resolved
     return () => {
@@ -351,7 +358,6 @@ export function MobileApp({
             surface={resolved}
             connected={connection?.connected ?? null}
             environmentId={connection?.environmentId ?? null}
-            resumed={lifecycle.resumed}
           />
         ) : null}
         {place.tab === 'account' ? <Account surface={resolved} channel={build.channel} /> : null}
