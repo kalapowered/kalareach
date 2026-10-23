@@ -333,6 +333,36 @@ describe("the desktop session list shows each session's description", () => {
   })
 })
 
+// KR-REQ-13.10: the desktop's list has an application column, and a closed session shows none.
+describe('the desktop session list shows the application in the foreground', () => {
+  it('names it, calls a shell at its prompt the shell, and shows none for a closed session or an unnamed program', async () => {
+    const { port } = fakeHost()
+    const listed = (await port.sessionList({ environment_id: null, include_closed: true })).sessions
+    const [first] = listed
+    if (first === undefined) throw new Error('the scripted host lists sessions')
+    const row = (number: string, over: Partial<typeof first>): typeof first => ({
+      ...first,
+      display_number: number,
+      session_id: `8a7b6c50-22bb-4c3d-8e4f-0000000009${number.padStart(2, '0')}`,
+      ...over
+    })
+    const sessions = [
+      row('1', { application: 'Claude Code', application_state: 'agent_busy' }),
+      row('2', { application: undefined, application_state: 'shell_ready' }),
+      row('3', { application: undefined, application_state: 'agent_busy' }),
+      row('4', { application: undefined, application_state: null, state: 'closed' })
+    ]
+    open({ ...port, sessionList: () => Promise.resolve({ sessions }) }, { view: 'sessions' })
+    await screen.findByTestId('session-row-1')
+    expect(screen.getAllByTestId('application-name').map((cell) => cell.textContent)).toEqual([
+      'Claude Code',
+      'Shell',
+      '',
+      'None'
+    ])
+  })
+})
+
 describe("the phone's session list shows each session's description", () => {
   it('shows the host’s title, labelled where a model wrote it, and its activity', async () => {
     const { port, controls } = describedHost()
@@ -372,9 +402,43 @@ describe("the phone's session list shows each session's description", () => {
       expect(
         [...document.querySelectorAll('.m-row-detail')].map((row) => row.textContent)
       ).toEqual([
-        'Agent · Live · 2 views attached',
-        'Agent · Live · 1 view attached',
-        'Shell · Live · 0 views attached'
+        'Claude Code · Live · 2 views attached',
+        'Codex · Live · 1 view attached',
+        'Live · 0 views attached'
+      ])
+    })
+  })
+
+  // KR-REQ-13.10: the application is the host's name for it, a shell at its prompt is the shell,
+  // and a program the host has no name for is not guessed at.
+  it('shows the host’s name for the application, the shell at its prompt, and no guess', async () => {
+    const { port } = fakeHost()
+    const listed = (await port.sessionList({ environment_id: null, include_closed: false })).sessions
+    const [first] = listed
+    if (first === undefined) throw new Error('the scripted host lists sessions')
+    const row = (number: string, over: Partial<typeof first>): typeof first => ({
+      ...first,
+      display_number: number,
+      session_id: `8a7b6c50-22bb-4c3d-8e4f-0000000009${number.padStart(2, '0')}`,
+      ...over
+    })
+    const sessions = [
+      row('1', { application: 'Claude Code', application_state: 'agent_busy' }),
+      row('2', { application: undefined, application_state: 'shell_ready' }),
+      row('3', { application: undefined, application_state: 'agent_busy' })
+    ]
+    render(
+      <AppProvider port={{ ...port, sessionList: () => Promise.resolve({ sessions }) }}>
+        <MobileSessions surface="ios" onOpen={() => undefined} />
+      </AppProvider>
+    )
+    await waitFor(() => {
+      expect(
+        [...document.querySelectorAll('.m-row-detail')].map((each) => each.textContent)
+      ).toEqual([
+        'Claude Code · Live · 2 views attached',
+        'Shell · Live · 2 views attached',
+        'Live · 2 views attached'
       ])
     })
   })
