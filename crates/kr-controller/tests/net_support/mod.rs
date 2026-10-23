@@ -326,6 +326,31 @@ impl Host {
         host
     }
 
+    /// Starts a daemon with `owner` as its first owner, on the clocks a suite moves by hand and the
+    /// network settings it names: a suite that restarts the daemon and has it come back at the
+    /// address it had names that address here.
+    pub async fn start_on_clocks_with_settings(
+        owner: &DeviceKeys,
+        clocks: Clocks,
+        settings: NetworkSettings,
+    ) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            settings,
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            clocks,
+            None,
+            Waits::default(),
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
     async fn start_unowned_on_clocks(clocks: Clocks) -> Self {
         Self::start_on(
             kr_ipc::testing::TempHost::create(),

@@ -94,6 +94,7 @@ pub fn device_in_boot(
             clock: Arc::new(clock),
             link: None,
             managed: None,
+            leases: None,
         },
         move || {
             if let Some(device) = kept.get() {
@@ -850,6 +851,7 @@ pub fn parts(secrets: Arc<dyn SecretStore>, room: Arc<dyn CandidateRoom>) -> Par
         clock: Arc::new(DeviceClock::current().expect("a clock")),
         link: None,
         managed: None,
+        leases: None,
     }
 }
 
