@@ -56,6 +56,7 @@ mod backup_production;
 mod barrier;
 mod capabilities;
 mod capability_checks;
+mod clients;
 mod close;
 mod configuration;
 mod create;
@@ -397,6 +398,10 @@ pub struct Controller {
     /// calls rather than answers, so what belongs to the daemon is the accounting: what was
     /// admitted, what is staged, what has been dispatched and what became of it.
     backup: Arc<crate::backup::BackupService>,
+    /// The managed service clients this daemon holds for its whole life, built once from its
+    /// configuration document: the carrier, the relay lease keeper and the voice service each take
+    /// theirs from it, and `kr doctor` says which it holds.
+    clients: kr_client::services::ServiceClients,
     /// What carries the backup outbox to the managed storage service, when this host's
     /// configuration document selects one.
     backup_runtime: Option<crate::backup::runtime::BackupRuntime>,
@@ -1103,6 +1108,12 @@ impl Controller {
     #[must_use]
     pub fn backup(&self) -> &Arc<crate::backup::BackupService> {
         &self.backup
+    }
+
+    /// The managed service clients this daemon holds.
+    #[must_use]
+    pub const fn service_clients(&self) -> &kr_client::services::ServiceClients {
+        &self.clients
     }
 
     /// What carries the backup outbox to the managed storage service, when this host selects one.

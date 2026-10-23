@@ -284,6 +284,22 @@ impl HostAccount {
         account
     }
 
+    /// The account service client, when a sign-in can start at it.
+    ///
+    /// A host that selects no managed service keeps a client to read and end a sign-in it already
+    /// holds, and to that client it is not an account login: nothing it does presents an account.
+    /// The same holds over a closed route, where nothing is sent.
+    #[must_use]
+    pub fn account_service(&self) -> Option<Arc<dyn AccountService>> {
+        if self.inner.unavailable.is_some() {
+            return None;
+        }
+        self.inner
+            .held
+            .as_ref()
+            .map(|held| Arc::clone(&held.account))
+    }
+
     /// Tells the account where the managed calls on this host are, so that signing in or out never
     /// changes the account a call closes under. A call is open from the moment its start asks the
     /// broker until its close has been told, or until it is over without its device.

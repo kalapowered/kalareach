@@ -409,6 +409,11 @@ impl Rig {
 
     /// What `kr doctor` says of the keeper.
     async fn check(&self) -> DoctorCheck {
+        self.check_named("relay-leases").await
+    }
+
+    /// What `kr doctor` says in the check `id`.
+    async fn check_named(&self, id: &str) -> DoctorCheck {
         let mut local = self.host.client().await;
         let doctor: HostDoctorResult =
             net_support::pairing::read(&mut local, Method::HostDoctor, &())
@@ -417,8 +422,8 @@ impl Rig {
         doctor
             .checks
             .into_iter()
-            .find(|check| check.id() == "relay-leases")
-            .expect("the keeper's check")
+            .find(|check| check.id() == id)
+            .unwrap_or_else(|| panic!("the {id} check"))
     }
 
     /// Stops the daemon and starts it again on its tree.
@@ -847,6 +852,14 @@ async fn an_allowance_that_is_spent_is_shown_to_the_owner_and_asked_again() {
     let ended = kr_ipc::now_ms().get();
     assert_eq!(shown.status, DoctorStatus::Warning);
     assert!(shown.detail().contains("allowance"), "{}", shown.detail());
+    // Entitlement explains what a call is answered and decides nothing else: the host still holds
+    // its lease client, and the account says nothing of it.
+    let services = rig.check_named("managed-services").await;
+    assert!(
+        services.detail().contains("relay leases: configured"),
+        "{}",
+        services.detail()
+    );
     // What is shown is what the answer announced less the time that has passed on the daemon's
     // clock since it was read, so it is held to the readings of that clock and not to how long the
     // machine took to get from one to the next.
