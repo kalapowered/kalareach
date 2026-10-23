@@ -17,10 +17,11 @@
 //! # What waits and what is given up
 //!
 //! A request waits while its component is being registered (a first registration can include a
-//! cold compile, and a session's first approvals arrive in that time). It is given up, counted in
-//! the binding's report and left opaque for the terminal to answer, when the binding is gone or
-//! disabled or its component is unavailable. It is not decoded later if the component registers
-//! later.
+//! cold compile, and a session's first approvals arrive in that time) and while the task has not yet
+//! read where its binding stands. It is given up, counted in the binding's report and left opaque
+//! for the terminal to answer, when the binding is gone or disabled or its component is
+//! unavailable, and when the binding no longer holds the grant and trust to decode it at the moment
+//! its component is to be asked. It is not decoded later if the component registers later.
 //!
 //! # What is made of the answer
 //!

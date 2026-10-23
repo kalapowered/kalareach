@@ -188,8 +188,9 @@ pub enum NotDecoded {
     NoDecisions,
     /// The answer's summary was over the bound.
     SummaryTooLong,
-    /// The request was refused when the answer came: it had been answered, the source had moved on
-    /// or the decoder's trust was gone.
+    /// The request was refused when the component was to be asked or when its answer came: it had
+    /// been answered, the source had moved on, the decoder's trust was gone or the interpretation
+    /// could not be recorded.
     Refused,
 }
 
@@ -238,7 +239,8 @@ impl From<DecodeRefusal> for NotDecoded {
 pub enum Verdict {
     /// Ask the component now.
     Take,
-    /// Leave it where it is: its component is not registered yet, or is being asked.
+    /// Leave it where it is: its component is not registered yet, or is being asked, or the job
+    /// was queued after where the components stand was read.
     Wait,
     /// It will not be asked, for this reason.
     Drop(NotDecoded),
@@ -536,16 +538,16 @@ impl Broker {
         job: &DecodeJob,
     ) -> std::result::Result<ScopedSourceEvent, Option<NotDecoded>> {
         let state = self.state();
+        let pending = &state.arbitration.get(job.resource_id).ok_or(None)?.resource;
+        if pending.state != PendingState::Pending || pending.interpretation_verified {
+            return Err(None);
+        }
         let trusted = state
             .bindings
             .get(&job.binding_id)
             .is_some_and(|binding| !binding.ending && binding.may_decode(&job.method));
         if !trusted {
             return Err(Some(NotDecoded::Refused));
-        }
-        let pending = &state.arbitration.get(job.resource_id).ok_or(None)?.resource;
-        if pending.state != PendingState::Pending || pending.interpretation_verified {
-            return Err(None);
         }
         let instance = state
             .instances
