@@ -3,12 +3,13 @@
 //! A reader who meets a method on the wire has to be able to find it in `docs/`. Two things here
 //! make sure of that. The method index is generated from the registry, so it lists every method in
 //! the registry's groups and order and cannot list one the registry does not have. The check reads
-//! the registry and every Markdown document under the documentation root, names each method that no
-//! document mentions, and names each index link whose document or section is not there any more.
+//! the registry and every Markdown document under the documentation root other than the index,
+//! which names every method by construction. It names each method that no other document mentions
+//! and each index link whose document or section is not there any more.
 //!
 //! What a link points at is decided here, in [`described_in`], one arm per method. The match is
 //! exhaustive, so a method added to the registry does not build until somebody has decided which
-//! section describes it, or that none does.
+//! section describes it.
 //!
 //! A link goes to the document and names the section in its words. The check reads lines, not
 //! Markdown: a section is there when the document has a line that is one to six `#`, a space and
@@ -97,20 +98,28 @@ const HOST_UPDATES: Document = Document {
     label: "Host updates",
 };
 
-const fn at(document: Document, heading: &'static str) -> Option<Section> {
-    Some(Section { document, heading })
+const METHOD_REFERENCE: Document = Document {
+    path: "protocol/method-reference.md",
+    label: "Method reference",
+};
+
+const fn at(document: Document, heading: &'static str) -> Section {
+    Section { document, heading }
 }
 
-/// The section that describes what a method does, where a document outside the index does.
-pub(crate) const fn described_in(method: Method) -> Option<Section> {
+/// The section that describes what a method does.
+///
+/// A guide of the part of the product a method belongs to describes it where that guide has a
+/// section that does. The method reference describes the rest.
+pub(crate) const fn described_in(method: Method) -> Section {
     match method {
-        Method::HostInfo
-        | Method::EnvironmentList
-        | Method::HostDoctor
-        | Method::EnvironmentEnrol
-        | Method::EnvironmentForget
-        | Method::EnvironmentInventory
-        | Method::EnvironmentRefresh => None,
+        Method::HostInfo | Method::EnvironmentList | Method::HostDoctor => {
+            at(METHOD_REFERENCE, "Host and environment reads")
+        }
+        Method::EnvironmentEnrol | Method::EnvironmentInventory | Method::EnvironmentRefresh => {
+            at(HOST, "The enrolled environments, and the cached inventory")
+        }
+        Method::EnvironmentForget => at(METHOD_REFERENCE, "Forgetting an environment"),
         Method::EnvironmentCapabilities | Method::EnvironmentCapabilitiesCheck => {
             at(PLATFORMS, "What may be done on a desktop")
         }
@@ -145,15 +154,21 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         }
         Method::PairRedeem | Method::PairCancel | Method::PairStatus => at(PAIRING, "Direct QR"),
 
-        Method::DeviceList | Method::DeviceRevoke | Method::DeviceKeysComplete => None,
+        Method::DeviceList => at(HOST, "Grants, sharing and revocation"),
+        Method::DeviceRevoke => at(HOST, "Revocation"),
+        Method::DeviceKeysComplete => at(METHOD_REFERENCE, "Completing a device's keys"),
         Method::DevicePreviewKeyUpdate => at(DELIVERY, "What travels, and what does not"),
         Method::DevicePushRegister => at(DELIVERY, "A paired device becomes a destination"),
 
-        Method::CatalogueList | Method::CataloguePin => None,
+        Method::CatalogueList | Method::PluginList | Method::PluginRemove => {
+            at(HOST, "The plugin catalogue")
+        }
+        Method::CataloguePin | Method::PluginPin => {
+            at(METHOD_REFERENCE, "Pinning a repository or a package")
+        }
         Method::CatalogueAdd | Method::CatalogueRemove => at(CATALOGUE, "Enrolment comes first"),
         Method::CatalogueSync => at(CATALOGUE, "What a sync does"),
 
-        Method::PluginList | Method::PluginRemove | Method::PluginPin => None,
         Method::PluginInstall => at(CATALOGUE, "Two activations, each atomic on its own"),
         Method::PluginEnable | Method::PluginDisable => {
             at(CATALOGUE, "Matching, enabling and binding")
@@ -175,27 +190,26 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
             at(CONTACT, "Installing the skill")
         }
 
-        Method::SessionList
-        | Method::SessionCreate
-        | Method::SessionRead
-        | Method::SessionClose
-        | Method::SessionDescribe
-        | Method::SessionRename => None,
+        Method::SessionList | Method::SessionRead => at(METHOD_REFERENCE, "Reading sessions"),
+        Method::SessionCreate => at(HOST, "Creating a session"),
+        Method::SessionClose => at(HOST, "Closure"),
+        Method::SessionDescribe | Method::SessionRename => {
+            at(HOST, "Session names and descriptions")
+        }
         Method::SessionOpen => at(HOST, "Grants, sharing and revocation"),
         Method::SessionScreenPreview => at(HOST, "Grants, sharing and revocation"),
 
         Method::SessionAttach => at(PROTOCOL, "Rights and capabilities are not the same thing"),
-        Method::SessionDetach
-        | Method::AttachmentConfigure
-        | Method::AttachmentViewport
-        | Method::TerminalResize
-        | Method::TerminalGeometryTransfer
-        | Method::TerminalPaletteSet => None,
+        Method::SessionDetach | Method::AttachmentConfigure => at(METHOD_REFERENCE, "Attachments"),
+        Method::AttachmentViewport | Method::TerminalResize | Method::TerminalGeometryTransfer => {
+            at(HOST, "Who owns the size")
+        }
+        Method::TerminalPaletteSet => at(METHOD_REFERENCE, "The terminal palette"),
 
-        Method::InputAcquire
-        | Method::InputRelease
-        | Method::InputInterrupt
-        | Method::InputWrite => None,
+        Method::InputAcquire | Method::InputRelease | Method::InputWrite => {
+            at(HOST, "Who may type")
+        }
+        Method::InputInterrupt => at(METHOD_REFERENCE, "Interrupting the foreground"),
 
         Method::RootEditorEnter
         | Method::RootEditorLeave
@@ -212,7 +226,7 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::AgentTurnSteer
         | Method::AgentTurnCancel
         | Method::AgentApprovalRespond
-        | Method::AgentApprovalInspect => None,
+        | Method::AgentApprovalInspect => at(METHOD_REFERENCE, "The agent methods"),
 
         Method::DraftCreate | Method::DraftUpdate | Method::AgentDraftAddAttachment => {
             at(TRANSFER, "Attachments, drafts and insertion")
@@ -247,15 +261,18 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         | Method::ChangesetRead
         | Method::ChangesetMaterialize => at(PROJECT, "Change sets"),
 
-        Method::ReviewRead
-        | Method::ReviewAcknowledge
-        | Method::AttentionRead
-        | Method::AttentionAcknowledge
-        | Method::AttentionQuietHours
-        | Method::VisitAcknowledge
-        | Method::VisitChanged => None,
+        Method::ReviewRead => at(METHOD_REFERENCE, "Reading review state"),
+        Method::ReviewAcknowledge => at(HOST, "Review, and what it does not do"),
+        Method::AttentionRead => at(HOST, "What a caller is served"),
+        Method::AttentionAcknowledge => at(HOST, "Acknowledgement"),
+        Method::AttentionQuietHours | Method::VisitAcknowledge => {
+            at(METHOD_REFERENCE, "Quiet hours and visits")
+        }
+        Method::VisitChanged => at(HOST, "Changed since a visit"),
 
-        Method::ActionCancel => None,
+        Method::ActionCancel | Method::ActionRead => {
+            at(METHOD_REFERENCE, "Reading and cancelling an action")
+        }
 
         Method::OwnerConfirmationRequest
         | Method::OwnerConfirmationPending
@@ -265,33 +282,33 @@ pub(crate) const fn described_in(method: Method) -> Option<Section> {
         Method::EventsSubscribe
         | Method::EventsSnapshot
         | Method::AgentInstances
-        | Method::HistoryPage
-        | Method::HistoryTimes
-        | Method::ActionRead => None,
+        | Method::HistoryPage => at(METHOD_REFERENCE, "Events, snapshots and history"),
+        Method::HistoryTimes => at(HOST, "When output was produced"),
 
         Method::GrantCreate | Method::GrantRedeem | Method::GrantTransfer | Method::GrantHeld => {
             at(PAIRING, "Grants")
         }
-        Method::GrantRevoke | Method::GrantList => None,
+        Method::GrantRevoke => at(HOST, "Revocation"),
+        Method::GrantList => at(HOST, "Grants, sharing and revocation"),
 
         Method::PushInstallationRegister
         | Method::PushSenderIssue
         | Method::PushSenderRenew
         | Method::PushSenderRevoke => at(PROTOCOL, "Push objects"),
-        Method::MailboxRead
-        | Method::MailboxDeliver
-        | Method::MailboxAcknowledge
-        | Method::AuthoritySync
-        | Method::SyncCompareExchange
-        | Method::BackupManifest
-        | Method::StorageStatus
+        Method::MailboxRead | Method::MailboxDeliver | Method::MailboxAcknowledge => {
+            at(METHOD_REFERENCE, "The mailbox")
+        }
+        Method::AuthoritySync => at(METHOD_REFERENCE, "The authority feed"),
+        Method::SyncCompareExchange => at(METHOD_REFERENCE, "Settings sync"),
+        Method::BackupManifest => at(METHOD_REFERENCE, "The backup manifest"),
+        Method::StorageStatus
         | Method::StorageRetentionSet
         | Method::StorageUploadCreate
         | Method::StorageUploadPart
         | Method::StorageUploadComplete
         | Method::StorageUploadAbort
         | Method::StorageObjectRead
-        | Method::StorageObjectDelete => None,
+        | Method::StorageObjectDelete => at(METHOD_REFERENCE, "Managed storage"),
 
         Method::VoicePrepare | Method::VoiceStart => at(VOICE, "The rate a call runs under"),
         Method::VoiceStop => at(VOICE, "A voice session is not a terminal session"),
@@ -359,8 +376,8 @@ const HEADER: &[&str] = &[
     "summary. The complete authority entry of every method is in",
     "[`packages/protocol/schema/method-authority.json`](../../packages/protocol/schema/method-authority.json),",
     "and [the method and authority table](README.md#the-method-and-authority-table) explains its fields.",
-    "The last column names the section that describes what the method does, where one does, and",
-    "links to its document.",
+    "The last column names the section that describes what the method does and links to its",
+    "document.",
 ];
 
 /// Returns the method index.
@@ -382,9 +399,7 @@ pub(crate) fn render() -> String {
             .iter()
             .map(|ingress| format!("`{}`", ingress.as_str()))
             .collect();
-        let described = described_in(entry.method)
-            .map(|section| link(&section))
-            .unwrap_or_default();
+        let described = link(&described_in(entry.method));
         out.push_str(&format!(
             "| `{}` | {} | {} | {} | {} |\n",
             entry.name,
@@ -402,9 +417,7 @@ pub(crate) fn broken_links(docs: &Path) -> Vec<String> {
     let mut documents: BTreeMap<&str, Option<String>> = BTreeMap::new();
     let mut broken = Vec::new();
     for entry in REGISTRY {
-        let Some(section) = described_in(entry.method) else {
-            continue;
-        };
+        let section = described_in(entry.method);
         let path = section.document.path;
         let text = documents
             .entry(path)
@@ -468,9 +481,18 @@ pub(crate) fn names(text: &str, name: &str) -> bool {
 }
 
 /// Returns the registry methods that no Markdown document under `docs` names, in registry order.
+///
+/// The index is not one of the documents: it lists every method, so counting it would leave
+/// nothing to find.
 pub(crate) fn unnamed_methods(docs: &Path) -> std::io::Result<Vec<&'static str>> {
     let mut texts = Vec::new();
     for document in markdown_documents(docs)? {
+        if document
+            .strip_prefix(docs)
+            .is_ok_and(|relative| relative == Path::new(INDEX_PATH))
+        {
+            continue;
+        }
         texts.push(std::fs::read_to_string(&document)?);
     }
     Ok(REGISTRY
@@ -602,10 +624,7 @@ mod tests {
         let broken = broken_links(copy.path());
         let described_there = REGISTRY
             .iter()
-            .filter(|entry| {
-                described_in(entry.method)
-                    .is_some_and(|section| section.document.path == "automation/README.md")
-            })
+            .filter(|entry| described_in(entry.method).document.path == "automation/README.md")
             .count();
         assert!(
             described_there > 0,
@@ -621,11 +640,22 @@ mod tests {
     }
 
     #[test]
-    fn a_method_only_the_index_named_is_undocumented_without_it() {
-        let copy = DocsCopy::of_the_documentation("no-index");
-        std::fs::remove_file(copy.path().join(INDEX_PATH)).expect("remove");
+    fn the_index_does_not_count_as_a_document_that_names_a_method() {
+        let root =
+            std::env::temp_dir().join(format!("kr-protocol-gen-index-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let copy = DocsCopy(root);
+        std::fs::create_dir_all(copy.path().join("protocol")).expect("create");
+        std::fs::create_dir_all(copy.path().join("host")).expect("create");
+        std::fs::write(copy.path().join(INDEX_PATH), render()).expect("write the index");
+        std::fs::write(
+            copy.path().join("host/README.md"),
+            "`session.read` answers one session.\n",
+        )
+        .expect("write");
         let unnamed = unnamed_methods(copy.path()).expect("read the documentation");
-        assert!(unnamed.contains(&"storage.upload.part"), "{unnamed:?}");
-        assert!(!unnamed.contains(&"upload.begin"), "{unnamed:?}");
+        assert!(!unnamed.contains(&"session.read"), "{unnamed:?}");
+        assert!(unnamed.contains(&"session.list"), "{unnamed:?}");
+        assert_eq!(unnamed.len(), REGISTRY.len() - 1, "{unnamed:?}");
     }
 }
