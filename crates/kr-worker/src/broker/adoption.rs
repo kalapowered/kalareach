@@ -8,8 +8,10 @@
 //! that no instance of this broker holds, and whose executable an admitted package recognises is
 //! recorded as a native terminal instance with the profile it was observed running, and bound to
 //! that package in the same step. The package is the one the software development kit's rule
-//! selects among every package the admissions this worker holds admit, with nothing selected: an
-//! exact rule beats an inferred one, and two that both recognise it exactly adopt nothing. A package
+//! selects among every package the admissions this worker holds admit, with nothing selected: the
+//! worker reads every rule as a guess, a rule that names the installation location outranks one
+//! that names only the executable among the packages of one publisher through one repository, and
+//! packages that recognise the program equally well adopt nothing. A package
 //! with no connector table is adopted and bound the same way. An adopted instance gets no
 //! registration, no endpoint and no credential, so none of its bridges is admitted, and its
 //! announcement says so; the process it was found running as places the questions it asks, and
