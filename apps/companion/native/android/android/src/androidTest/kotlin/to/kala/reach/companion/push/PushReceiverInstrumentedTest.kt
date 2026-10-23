@@ -100,7 +100,7 @@ class PushReceiverInstrumentedTest {
     }
 
     /** A gateway on this device's loopback interface that answers a post with 200 once it is up. */
-    private class Gateway(val port: Int) : AutoCloseable {
+    private class Gateway(val port: Int, private val whenPosted: () -> Unit = {}) : AutoCloseable {
         val body = AtomicReference<String?>(null)
         private var server: ServerSocket? = null
         private var thread: Thread? = null
@@ -132,6 +132,7 @@ class PushReceiverInstrumentedTest {
                                     read += n
                                 }
                                 body.set(String(bytes, Charsets.UTF_8))
+                                whenPosted()
                                 it.getOutputStream().write(
                                     "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}".toByteArray()
                                 )
@@ -147,12 +148,11 @@ class PushReceiverInstrumentedTest {
         }
     }
 
-    // KR-REQ-16.15: a challenge the receiver cannot post is asked again by the scheduler, and the
-    // registration is answered once the gateway is there.
-    @Test
-    fun aChallengeThatCouldNotBePostedIsAskedAgainByTheSchedulerAndThenAnswered() {
-        val free = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
-        val origin = "http://127.0.0.1:$free"
+    /**
+     * Writes the record of a registration that waits for its challenge at `origin`, and the key the
+     * receiver signs with, and returns the registration's identifier and the challenge's data.
+     */
+    private fun pendingChallenge(origin: String): Pair<String, Map<String, String>> {
         val registration = UUID.randomUUID().toString()
         val digest = "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ"
         val challenge = "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE"
@@ -191,6 +191,17 @@ class PushReceiverInstrumentedTest {
         assertEquals("answer", verdict.getString("verdict"))
         PushStores.secrets(noBackup, KeystoreSealer()).write(verdict.getString("seed_item"), ByteArray(32) { 9 })
 
+
+        return registration to data
+    }
+
+    // KR-REQ-16.15: a challenge the receiver cannot post is asked again by the scheduler, and the
+    // registration is answered once the gateway is there.
+    @Test
+    fun aChallengeThatCouldNotBePostedIsAskedAgainByTheSchedulerAndThenAnswered() {
+        val free = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        val origin = "http://127.0.0.1:$free"
+        val (registration, data) = pendingChallenge(origin)
         deliver(data)
         // Nothing is listening, so the post does not get there: the receiver leaves the record
         // pending and hands the answer to the scheduler.
@@ -224,6 +235,33 @@ class PushReceiverInstrumentedTest {
                 request.getJSONObject("body").getJSONObject("installation_register").getJSONObject("request")
                     .getJSONObject("answer").getJSONObject("answer").getJSONObject("payload")
             assertEquals(registration, answer.getString("registration_id"))
+        }
+    }
+
+    // KR-REQ-16.15: the scheduler holds the answer's safety net by the time the answer is posted, so
+    // a process the system ends in the middle of the post leaves a try behind; once the gateway has
+    // taken the answer the safety net is taken back.
+    @Test
+    fun theSchedulerHoldsTheAnswersSafetyNetWhenItIsPostedAndLetsItGoOnceTheGatewayTakesIt() {
+        val free = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        val (registration, data) = pendingChallenge("http://127.0.0.1:$free")
+        val held = AtomicReference<Boolean?>(null)
+        fun net() =
+            WorkManager.getInstance(context)
+                .getWorkInfosByTag(ChallengeWorker::class.java.name)
+                .get()
+                .any { it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.RUNNING }
+        Gateway(free) { held.set(net()) }.use { gateway ->
+            gateway.start()
+            deliver(data)
+            val answered =
+                until(60) {
+                    JSONObject(PushStores.pending(noBackup).read(System.currentTimeMillis())!!)
+                        .getString("state") == "answered"
+                }
+            assertTrue("the gateway took the answer of $registration", answered)
+            assertEquals("the safety net was held when the answer was posted", true, held.get())
+            assertTrue("the safety net was taken back once the answer was taken", until(30) { !net() })
         }
     }
 }
