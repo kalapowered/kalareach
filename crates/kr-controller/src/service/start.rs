@@ -1142,6 +1142,7 @@ impl Controller {
             )),
             finalising: Mutex::new(()),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
+            left_by_an_earlier_boot: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             collection: crate::collection::Collection::default(),
             handover: super::host::Handover::default(),
             machine,
@@ -1622,6 +1623,11 @@ impl Controller {
     /// directory does not: on most hosts it is cleared with the boot it belonged to, taking the
     /// published descriptors with it, so a daemon that compared descriptors would find nothing to
     /// compare after exactly the event it was looking for.
+    ///
+    /// The record is made current by every start, whatever this one left undone. A session it
+    /// could not close yet is remembered for as long as this daemon runs, and is closed when its
+    /// dead worker is next reconciled. A daemon that starts again in this boot finds the sessions
+    /// this boot made running, and no record that says otherwise.
     async fn close_previous_boot(&self) -> Result<()> {
         let path = self.paths.state_dir().join(BOOT_FILE);
         let current = kr_cbor::to_canonical_vec(&self.boot_identity)
@@ -1638,16 +1644,12 @@ impl Controller {
             )
             .ok()
         });
-        // Whether a session of the earlier boot was left as it was, so that the record of that boot
-        // stays and the next start closes it.
-        let mut left = false;
         if recorded.is_some_and(|recorded| recorded != self.boot_identity) {
             let rows = {
                 let registry = self.registry.lock().await;
                 registry.workers()?
             };
             for row in rows {
-                self.directory.lock().await.remove(row.session_id);
                 // The worker went with the boot it was in: a boot that is not this one ended
                 // every process in it, which is what the boot record establishes and what the
                 // kernel may still decline to say about any one of them. So the closure is
@@ -1665,19 +1667,33 @@ impl Controller {
                     row.display_number,
                     &row.process_identity,
                 );
+                // A worker the kernel says is running did not come from the boot that ended: the
+                // record of that boot is no evidence about it, and it is not the host's restart
+                // that closes it. It stays in the directory, to be reached like any other.
+                if matches!(
+                    ownership,
+                    Err(crate::archive::OwnershipRefusal::WorkerAlive { .. })
+                ) {
+                    continue;
+                }
+                self.directory.lock().await.remove(row.session_id);
                 // Another recovery of this session is under way, or the stores cannot be taken
                 // safely yet (the worker's endpoint cannot be removed, or the lock cannot be
-                // made). The session keeps its worker row, and the record of the earlier boot
-                // stays where it is below, so the next start closes it as the host's restart: a
-                // closure written here over a death that was not validated would be written over
-                // its stores, and it would refuse every read of the session for good.
+                // made). The session keeps its worker row and is closed later, when its worker is
+                // found gone again: a closure written here over a death that was not validated
+                // would be written over its stores, and it would refuse every read of the session
+                // for good. It is remembered here as one of the earlier boot, so that closing it
+                // later gives the reason it has.
                 if matches!(
                     ownership,
                     Err(crate::archive::OwnershipRefusal::Held { .. }
                         | crate::archive::OwnershipRefusal::Unfenced { .. }
                         | crate::archive::OwnershipRefusal::LockUnavailable { .. })
                 ) {
-                    left = true;
+                    self.left_by_an_earlier_boot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(row.session_id);
                     continue;
                 }
                 if let Ok(ownership) = &ownership {
@@ -1696,7 +1712,9 @@ impl Controller {
                 drop(ownership);
             }
         }
-        if !left && bytes.as_deref() != Some(current.as_slice()) {
+        // The boot this daemon runs in is recorded whatever was left, so that a start in this boot
+        // never reads a session this boot made as one of an earlier boot.
+        if bytes.as_deref() != Some(current.as_slice()) {
             kr_ipc::paths::write_owner_only_file(&path, &current)?;
         }
         Ok(())

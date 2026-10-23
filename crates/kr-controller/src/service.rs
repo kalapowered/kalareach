@@ -773,6 +773,13 @@ pub struct Controller {
     /// and writing its closure happen once: the second to arrive waits and finds the closure.
     crash_flights:
         std::sync::Mutex<std::collections::HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    /// The sessions of an earlier boot that this daemon's start could not close yet, because
+    /// another recovery held them or their stores could not be taken safely.
+    ///
+    /// Their workers are gone with that boot, so the reason their closure gives is the host's
+    /// restart whenever it is written. A session the boot this daemon runs in has made is never
+    /// in it.
+    left_by_an_earlier_boot: std::sync::Mutex<std::collections::BTreeSet<SessionId>>,
     /// What the daemon collects of the sessions that have closed, and the task that does it.
     collection: crate::collection::Collection,
     /// This daemon's side of an update of the host: its gate to new sessions, the creates under
