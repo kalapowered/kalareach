@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
 
@@ -44,16 +43,6 @@ pub struct Uncertain {
 /// How many receipts' revisions the worker remembers having shown, in all.
 const MAX_SHOWN_RECEIPTS: usize = 1024;
 
-/// Whether what a caller of this ingress reads is shown to a person.
-///
-/// A person is shown a result through the local owner's commands or a paired device. The workflow
-/// ingress serves one close of the session a run started and shows nobody anything, so a read
-/// through it is not recorded as a show and a quote made through it has been shown to no one.
-#[must_use]
-pub const fn ingress_shows_a_person(ingress: ActorIngress) -> bool {
-    matches!(ingress, ActorIngress::LocalIpc | ActorIngress::PairedDevice)
-}
-
 /// The revision of an action's receipt that each actor has been shown by `action.read`, since this
 /// worker started.
 ///
@@ -65,9 +54,9 @@ pub const fn ingress_shows_a_person(ingress: ActorIngress) -> bool {
 /// that quotes it is still admitted or refused on its own authority.
 ///
 /// The bound is shared, and what goes for room is the oldest entry of the actor that holds the
-/// most: an actor that reads a great many receipts makes room with its own entries, and cannot
-/// push out the revision another actor was shown. Reading a receipt again makes its entry as new
-/// as that read.
+/// most: an actor that reads a great many receipts gives up its own oldest entries first, and
+/// pushes out another actor's only while that actor holds more than it does. Reading a receipt
+/// again makes its entry as new as that read.
 #[derive(Debug, Default)]
 pub struct ShownReceipts {
     shown: HashMap<(ActorId, ActionId), u64>,
