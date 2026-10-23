@@ -12,6 +12,7 @@
 //
 
 import Foundation
+import UIKit
 import ObjectiveC
 
 enum DelegateMethods {
@@ -52,8 +53,8 @@ enum DelegateMethods {
         }
         let remoteBlock: @convention(block) (AnyObject, AnyObject, NSDictionary, @escaping Finished) -> Void = {
             _, _, userInfo, finished in
-            // 1 is the result for "new data": the application did what the message asked.
-            onMessage(userInfo as? [AnyHashable: Any] ?? [:]) { finished(1) }
+            // The system is told there was new data: the application did what the message asked.
+            onMessage(userInfo as? [AnyHashable: Any] ?? [:]) { finished(UIBackgroundFetchResult.newData.rawValue) }
         }
         let added = [
             class_addMethod(delegateClass, received, imp_implementationWithBlock(receivedBlock), "v@:@@"),
