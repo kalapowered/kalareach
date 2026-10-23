@@ -2191,6 +2191,52 @@ fn the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen() {
     );
 }
 
+/// KR-REQ-24.15: a host that is behind its feed refuses every grant for an ingress other than the
+/// owner at this machine, the default owner grant included, until it has caught up.
+#[test]
+fn a_host_behind_its_feed_refuses_every_grant_but_the_owners_at_the_machine() {
+    let owner = grant(
+        1,
+        None,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        GrantExpiry::Never,
+    );
+    let stored = record(owner.clone());
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    decide(
+        &owner,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, 900_000),
+    )
+    .expect("a host that has caught up serves the grant");
+
+    policy.set_behind_its_feed(true);
+    assert_eq!(
+        decide(
+            &owner,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 900_000)
+        ),
+        Err(Refusal::BehindItsFeed),
+        "no remote access stands on a state the registry was restored to"
+    );
+    let mut at_the_machine = request(Method::SessionRead, 900_000);
+    at_the_machine.ingress = ActorIngress::LocalIpc;
+    decide(&owner, &stored, &mut policy, at_the_machine)
+        .expect("the person at this machine is not locked out");
+
+    policy.set_behind_its_feed(false);
+    decide(
+        &owner,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, 900_000),
+    )
+    .expect("the host decides again once it has caught up");
+}
+
 /// A feed that removed the host is a reason to refuse only the grants whose validity rests on the
 /// feed: an organisation's, and personal remote access under the bounded policy the owner chose.
 /// The default non-expiring owner grant is account-free and stays usable, and the person at this

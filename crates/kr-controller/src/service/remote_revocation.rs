@@ -513,6 +513,71 @@ impl Controller {
         }
     }
 
+    /// Compares the revision the authority feed holds for this host with the registry's, and
+    /// refuses every grant but the owner's at this machine from this moment when the feed is
+    /// ahead. Returns whether the host is behind its feed: now, or since an earlier comparison
+    /// that has not been lifted ([`Self::authority_feed_caught_up`]).
+    ///
+    /// A registry restored together with its mirror is one earlier state this host accepts, and
+    /// the feed is the one record outside both that still holds the highest revision the host
+    /// issued. Nothing is stored for the refusal: a start or a pass compares again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(crate) async fn authority_feed_behind(&self, feed_revision: u64) -> Result<bool> {
+        let registry = self.authority_revision().await?;
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if feed_revision > registry.get() && !policy.behind_its_feed() {
+            policy.set_behind_its_feed(true);
+            drop(policy);
+            self.advance_authority_epoch();
+            return Ok(true);
+        }
+        Ok(policy.behind_its_feed())
+    }
+
+    /// Carries out again a request the feed shows this host completed, for a registry restored to
+    /// a state from before it was carried out. What the restored registry holds nothing for is
+    /// skipped, and what it already revoked withdraws nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a revocation cannot be written or its barrier raised.
+    pub(crate) async fn replay_feed_request(&self, request: &RevocationRequest) -> Result<()> {
+        let plan = self.plan_of(request)?;
+        if plan.devices.is_empty() && plan.grants.is_empty() {
+            return Ok(());
+        }
+        self.apply_feed_plan(&plan).await.map(|_| ())
+    }
+
+    /// Raises the registry to the revision the feed holds, in one barrier, and then lets the host
+    /// decide again: it has applied what the feed shows completed and numbers what it issues next
+    /// above everything it has issued.
+    ///
+    /// # Errors
+    ///
+    /// Returns the barrier's error. The refusal stands then, and the next pass finds the registry
+    /// still behind and does this again.
+    pub(crate) async fn authority_feed_caught_up(&self, feed_revision: u64) -> Result<()> {
+        self.catch_up_with_the_feed(AuthorityRevision::new(feed_revision))
+            .await?;
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.behind_its_feed() {
+            policy.set_behind_its_feed(false);
+            drop(policy);
+            self.advance_authority_epoch();
+        }
+        Ok(())
+    }
+
     /// Records that the feed at `origin` answered that this host was removed from it: refuses the
     /// grants that rest on the feed at once, writes the removal down, and tells the owner.
     ///

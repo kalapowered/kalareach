@@ -6450,6 +6450,27 @@ stopped for a reason of this host's own, such as a record it could not write dow
 stale, as an unreachable feed does. The revocations the carrier makes do not wake it, so a pass that
 failed waits out its backoff.
 
+In every pass, before it settles a record, the host compares the revision the feed holds for it
+with the registry's. A feed that is ahead means the registry, and the policy row and its copy with
+it, is an earlier state than one this host issued: a state directory put back from a copy, or one
+that is another host's. While the feed is ahead the host refuses every grant for an ingress other
+than the owner at the machine, an organisation's and a personal one alike, with
+`PERMISSION_DENIED` saying that it is catching up with its feed, and `kr doctor` says so. It
+carries out again each request the feed shows complete, which withdraws nothing it had already
+withdrawn, and when it has read the feed through it raises the registry to the feed's revision in
+one barrier that fences the workers and withdraws every connection admitted under the earlier
+state. The next revision it issues is then above everything it issued, and it decides again. A pass
+that stops before the barrier leaves the refusal in force and the registry behind, and the next pass
+does the same again; nothing is stored for it. The comparison has limits. A host that is offline or
+reads no feed cannot see a restore. A restore to a point after the last revision the host issued
+to its feed is not seen, because the feed holds only what the host issued for its requests. A
+revocation the feed no longer retains is not carried out again. The feed's number is trusted as the
+check that a grant claims a revision this host never reached trusts it: a service that names a
+number above the truth can fence the host once and move its revision up, and gains no authority by
+it. And the comparison does not rebuild the policy row. Nothing outside the host holds its
+enrolments, its exclusive-management flag, its bound or its lease records, and the feed carries
+revocations and no policy, so once the host has caught up they are the restored ones.
+
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says
 how many owners are beyond that. A device that holds no management right is never named, and
@@ -6527,8 +6548,10 @@ notice again. Setting a clock back will not make any numbers be lower than any p
   nothing, an enrolment that was withdrawn included. The copy is written after the row has
   committed, so a stop between the two leaves the row the newer, and it is kept. A copy that fails
   to write is reported once and does not stop a change. The protection has three limits: a registry
-  and a copy put back together are one earlier state; a copy that cannot be read protects nothing
-  until the next write replaces it; and an earlier release writes the row without raising the
+  and a copy put back together are one earlier state, which only the host's comparison of its
+  registry with its authority feed can see ("The remote authority feed"); a copy that cannot be
+  read protects nothing until the next write replaces it; and an earlier release writes the row
+  without raising the
   sequence, so a registry put back and then written by that release has what it wrote replaced by
   the copy's policy when this build starts again.
 

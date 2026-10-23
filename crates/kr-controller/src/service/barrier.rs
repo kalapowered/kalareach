@@ -151,6 +151,10 @@ pub(super) struct Debts {
     /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
     /// host's, which fences every caller under a grant.
     reaches: BTreeMap<u64, Option<std::sync::Arc<Named>>>,
+    /// The revision the next barrier advances the registry to at least, when the authority feed
+    /// holds revisions above it ([`Controller::catch_up_with_the_feed`]). Memory alone: the
+    /// registry's fence debt is what a stop leaves owed.
+    floor: Option<AuthorityRevision>,
 }
 
 /// The grants and the devices one revision withdrew authority from.
@@ -1289,7 +1293,12 @@ impl Controller {
                 // The store's lock order is the registry first, then the connections. Admission
                 // takes the same two in the same order, so a connection cannot be registered
                 // against a revision this has already replaced.
-                registry.advance_authority_revision()?;
+                let floor = self.debts().floor;
+                match floor {
+                    Some(floor) => registry.advance_authority_revision_to(floor)?,
+                    None => registry.advance_authority_revision()?,
+                };
+                self.debts().floor = None;
                 let revision = registry.authority_revision()?;
                 let host_wide = captured.values().any(|reach| *reach == Reach::Host);
                 let reach = Self::reach_of(&captured);
@@ -1398,6 +1407,31 @@ impl Controller {
             ),
         }
         Ok(barrier)
+    }
+
+    /// Raises the registry to the revision the authority feed holds for this host, in one barrier
+    /// that fences every worker and withdraws every connection admitted under the state the
+    /// registry was restored to.
+    ///
+    /// The revision moves to the feed's, or one past where it stands when that is higher, so the
+    /// next revocation this host issues is numbered above everything it has issued. The barrier is
+    /// the whole host's. A stop before it lands leaves the registry's fence debt owed, and the
+    /// feed's pass finds the registry still behind and does this again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the barrier's error; the registry stays where it was.
+    pub(crate) async fn catch_up_with_the_feed(
+        &self,
+        feed_revision: AuthorityRevision,
+    ) -> Result<RevocationBarrier> {
+        self.debts().floor = Some(feed_revision);
+        let own = self.publish_debts(&[(crate::grants::store::DebtId::fresh(), Reach::Host)]);
+        let barrier = self.barrier(own).await;
+        if barrier.is_err() {
+            self.debts().floor = None;
+        }
+        barrier
     }
 
     /// Raises a barrier for every debt left to the debt pass ([`Debts`]): the debts a start found
