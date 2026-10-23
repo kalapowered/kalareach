@@ -1351,7 +1351,23 @@ async fn kr_req_06_07_a_native_request_is_decoded_and_a_scrape_or_an_unnamed_req
         matches!(&refused, ServiceError::Protocol { detail } if detail.contains("identifier")),
         "{refused}"
     );
-    // Neither reached the component.
+    // An identifier longer than the broker records one is not a request's.
+    let unbounded = kr_plugin_service::vocabulary::ScopedSourceEvent::new(
+        kr_protocol::ids::SourceEventHandle::new("se-4").expect("a bounded handle"),
+        kr_plugin_service::vocabulary::SourceProvenance::NativeProtocol,
+        1_700_000_000_004,
+        Some("9".repeat(kr_plugin_service::vocabulary::MAX_REQUEST_ID_BYTES + 1)),
+        b"a request".to_vec(),
+    );
+    let refused = client
+        .decode(binding_id, &unbounded, deadline)
+        .await
+        .expect_err("an identifier past its bound is not a request's");
+    assert!(
+        matches!(&refused, ServiceError::Protocol { detail } if detail.contains("identifier")),
+        "{refused}"
+    );
+    // None reached the component.
     assert!(
         account_of(&client, binding_id).await.contains("decode=1;"),
         "a component was asked to decode what the host refused"

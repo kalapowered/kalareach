@@ -39,9 +39,9 @@ use kr_plugin_service::protocol::{
     WireSourceEvent,
 };
 use kr_plugin_service::vocabulary::{
-    Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, MAX_REQUEST_TEXT_BYTES,
-    ScopedSourceEvent, attachments_of, check_attachments, check_facts, check_snapshot, deadline_of,
-    event_of, facts_of,
+    Admission, BindingId, COMPILE_DEADLINE_MS, MAX_NODE_BYTES, MAX_REQUEST_ID_BYTES,
+    MAX_REQUEST_TEXT_BYTES, ScopedSourceEvent, attachments_of, check_attachments, check_facts,
+    check_snapshot, deadline_of, event_of, facts_of,
 };
 
 use crate::runtime::binding::{
@@ -1306,10 +1306,18 @@ fn native_request_of(event: &WireSourceEvent) -> Result<ScopedSourceEvent, (Stri
                 .to_owned(),
         ));
     }
-    if scoped.request_id.is_none() {
-        return Err(refused(
-            "the event carries no native request identifier".to_owned(),
-        ));
+    match scoped.request_id.as_deref() {
+        None => {
+            return Err(refused(
+                "the event carries no native request identifier".to_owned(),
+            ));
+        }
+        Some(id) if id.len() > MAX_REQUEST_ID_BYTES => {
+            return Err(refused(
+                "the event's request identifier is over its bound".to_owned(),
+            ));
+        }
+        Some(_) => {}
     }
     if scoped.bytes.len() as u64 > MAX_NODE_BYTES {
         return Err(refused(
