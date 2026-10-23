@@ -144,6 +144,11 @@ impl Deployment {
 /// pass it is not made: the answer that asked for the wait is the call's result.
 pub const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// The least gap between two sends of one call, at the first, and the most it grows to: it doubles
+/// with every send again that follows an answer that asked for one.
+const RETRY_SPACING_MIN: std::time::Duration = std::time::Duration::from_millis(100);
+const RETRY_SPACING_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long a retryable answer asks the caller to wait, or nothing when the answer is not one.
 ///
 /// An answer is retryable when its code is one the protocol calls transient, and the wait is what
@@ -166,13 +171,15 @@ pub fn retry_after(error: &kr_client::ClientError) -> Option<std::time::Duration
 /// the feed is one whose repeat the service answers the same way as the call: a publication by its
 /// request identifier and digest, a revision by its number and digest, an acknowledgement by the
 /// statement it makes, a refusal and a removal by the state they leave. So a repeat cannot do a
-/// thing twice. The call is made again only after the wait, and the whole of it ends at
+/// thing twice. The call is made again only after the wait, which is never shorter than a gap that
+/// starts at a tenth of a second and doubles with each send again, up to five seconds, so that an
+/// answer that names no delay is not asked for several times a second. The whole of it ends at
 /// [`RETRY_DEADLINE`], which only ends a call that is never answered.
 ///
 /// # Errors
 ///
 /// Returns the answer that is not a request to send again, or the last such answer once the wait
-/// it asks for would pass [`RETRY_DEADLINE`].
+/// it asks for would pass [`RETRY_DEADLINE`] or the deadline has passed when the wait is over.
 pub async fn following_the_retry<T, Call, Pending>(
     what: &str,
     mut send: Call,
@@ -182,6 +189,10 @@ where
     Pending: std::future::Future<Output = kr_client::Result<T>>,
 {
     let started = tokio::time::Instant::now();
+    // The least gap between two sends of one call when the answer names none: the client's policy
+    // gives the same first step for every answer, so a service that keeps failing without naming a
+    // delay would be asked several times a second without this.
+    let mut spacing = RETRY_SPACING_MIN;
     loop {
         let asked = match send().await {
             Err(asked) => asked,
@@ -190,11 +201,17 @@ where
         let Some(wait) = retry_after(&asked) else {
             return Err(asked);
         };
-        if started.elapsed() + wait > RETRY_DEADLINE {
+        let wait = wait.max(spacing);
+        spacing = (spacing * 2).min(RETRY_SPACING_MAX);
+        if wait > RETRY_DEADLINE.saturating_sub(started.elapsed()) {
             return Err(asked);
         }
         eprintln!("{what} was asked to be sent again after {wait:?}: {asked}");
         tokio::time::sleep(wait).await;
+        // A wake-up that came late is not a send that may start: the deadline is the call's.
+        if started.elapsed() >= RETRY_DEADLINE {
+            return Err(asked);
+        }
     }
 }
 
