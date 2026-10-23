@@ -356,6 +356,11 @@ pub struct WorkerService {
     /// in every shipped build.
     #[cfg(feature = "testing")]
     fence_stall: crate::testing::Stall,
+    /// A stop at the start of the next accepted action's preparation, before its bound begins and
+    /// before its component is asked, which this host's own tests arm to hold an action in its
+    /// preparation for as long as they need. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    preparation_stall: crate::testing::Stall,
     /// A pause in the binding of a question's or an alert's source to the session, which this
     /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
     /// away in every shipped build.
@@ -694,6 +699,8 @@ impl WorkerService {
             binding_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             fence_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            preparation_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -1194,6 +1201,26 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.fence_stall.arm()
+    }
+
+    /// Stops the next accepted action's preparation before it begins, for this host's own tests.
+    ///
+    /// The action's receipt says `accepted` by then and its component has not been asked, so the
+    /// preparation's own bound has not started to run: the action stays held in its preparation for
+    /// as long as a test holds it, while the worker goes on answering the daemon over the
+    /// connections the daemon holds. Returns the end that says the preparation has arrived, and
+    /// the end that lets it go. The stop fires once, and holds a thread of the runtime the worker
+    /// runs on, which hands what it holds to another before it waits: a runtime with one thread
+    /// has nothing to hand it to, and a test that arms the stop there stops the worker with it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_preparation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.preparation_stall.arm()
     }
 
     /// Makes every connection's loop take a finished preparation before it reads what its client
@@ -4887,6 +4914,8 @@ impl WorkerService {
     ///
     /// The preparation is bounded by what is left of the action's accepted deadline.
     async fn prepare(&self, pending: &PendingPreparation) -> Preparation {
+        #[cfg(feature = "testing")]
+        self.preparation_stall.stand();
         let within = pending.deadline.saturating_duration_since(self.clock.now());
         // The receipt is read once more immediately before an attachment is claimed: an action
         // that was cancelled or fenced while its plan was prepared claims nothing.

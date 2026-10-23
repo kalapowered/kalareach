@@ -8,20 +8,20 @@
 //!
 //! The action is held in its preparation. A plugin action is prepared by its package's component
 //! outside the worker's dispatch boundary, after the worker has accepted the intent durably and
-//! before it writes the dispatch marker; the plugin host is stopped, so the intent waits there,
-//! while the worker goes on answering the daemon over the connections the daemon holds. That is a
-//! worker paused after durable acceptance with its control path live, which is what lets the
-//! revocation's barrier be reached while the intent is held.
+//! before it writes the dispatch marker; the worker stops the preparation where it begins, before
+//! its component is asked (a stop the worker offers its own tests), so the intent waits there while
+//! the worker goes on answering the daemon over the connections the daemon holds. That is a worker
+//! paused after durable acceptance with its control path live, which is what lets the revocation's
+//! barrier be reached while the intent is held. The preparation's own bound (five seconds, on the
+//! runtime's timer) starts when the preparation is let go, so how long the case takes to announce
+//! the revision decides nothing; what this does not show is a revocation that falls while a
+//! component's call is outstanding, which the plugin-action suites hold their actions for.
 //!
 //! What this suite does not show is the daemon's own report of the barrier, which the cases in
 //! `barrier.rs` show. The daemon does not hold the worker here, so the test speaks to the worker as
 //! its daemon does, over connections of its own: it forwards the action and announces the revision.
 //!
-//! The worker bounds a component's preparation at five seconds from acceptance, on the runtime's
-//! own timer, and no test clock stops it: the sequence is a few exchanges, and a run too slow for
-//! it fails (the action is rejected as unavailable) and does not pass.
-//!
-//! Not claimed: Windows, where a plugin host cannot be held with a stop signal.
+//! Not claimed: Windows, where the plugin world these cases run in is not built.
 
 #![cfg(unix)]
 
@@ -34,15 +34,16 @@ use kr_protocol::receipt::ReceiptState;
 
 mod plugin_world;
 
+use plugin_world::PATIENCE;
 use plugin_world::acting::{
-    Acting, a_lease, a_paired_device, announce, signal, until_the_devices_receipt_is,
+    Acting, a_lease, a_paired_device, announce, until_the_devices_receipt_is,
 };
 
-/// A paired device's action, forwarded by the daemon and accepted by the worker, held while its
-/// component prepares it.
+/// A paired device's action, forwarded by the daemon and accepted by the worker, held in its
+/// preparation before its component is asked.
 ///
-/// The plugin host is stopped, so the action has a receipt that says `accepted`, no dispatch marker
-/// and nothing written to the upstream.
+/// The action has a receipt that says `accepted`, no dispatch marker and nothing written to the
+/// upstream.
 struct HeldDeviceAction {
     acting: Acting,
     proxy: kr_ipc::client::BoundLink,
@@ -50,15 +51,21 @@ struct HeldDeviceAction {
     device: kr_protocol::actor::ActorEnvelope,
     request_id: u64,
     action_id: ActionId,
-    host: kr_protocol::identity::ProcessStartIdentity,
+    /// Lets the preparation go on.
+    release: std::sync::mpsc::Sender<()>,
 }
 
 impl HeldDeviceAction {
     /// Holds a device's `turn.cancel` in its preparation, or nothing where the test components
     /// are not built.
+    ///
+    /// Returns once the worker says the preparation has arrived at the stop, and the receipt says
+    /// `accepted` with no dispatch marker.
     async fn begin() -> Option<Self> {
         // The worker's deadlines are measured on a clock this suite never moves, so neither the
-        // action's accepted deadline nor its lease ends before the revocation does.
+        // action's accepted deadline nor its lease ends before the revocation does. The
+        // preparation's bound is on the runtime's timer, and starts only when the stop below lets
+        // the preparation go.
         let acting = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await?;
         let mut proxy = acting
             .hosted
@@ -74,7 +81,7 @@ impl HeldDeviceAction {
         let mutation = acting.invocation(&proxy, "turn.cancel", b"{}");
         let request_id = mutation.request_id.get();
         let action_id = mutation.action_id;
-        let host = acting.stop_host();
+        let (arrived, release) = acting.hosted._service.stall_next_preparation();
         proxy
             .send(&kr_protocol::envelope::ControlFrame::Forwarded(Box::new(
                 kr_protocol::local::ForwardedMutation {
@@ -101,6 +108,10 @@ impl HeldDeviceAction {
             !accepted.state.has_dispatch_marker(),
             "the held action has no dispatch marker: {accepted:?}"
         );
+        tokio::time::timeout(PATIENCE, arrived)
+            .await
+            .expect("the preparation reaches its stop")
+            .expect("the stop is not dropped before the preparation reaches it");
         assert!(
             acting.frames().is_empty(),
             "the held action has written nothing to the upstream: {:?}",
@@ -113,30 +124,37 @@ impl HeldDeviceAction {
             device,
             request_id,
             action_id,
-            host,
+            release,
         })
     }
 
-    /// Lets the plugin host go on, and reads the daemon's answer to the forwarded action, with
+    /// Lets the preparation go on, and reads the daemon's answer to the forwarded action, with
     /// whether the worker sent it retained: the daemon holds a retained answer back from a device
-    /// whose authority has moved, where a plain response would reach the device unchecked.
+    /// whose authority has moved, where a plain response would reach the device unchecked. The
+    /// wait for the answer ends only a worker that never gives it.
     async fn resumed(&mut self) -> (kr_protocol::envelope::Response, bool) {
-        signal(&self.host, rustix::process::Signal::CONT);
-        loop {
-            match self.proxy.recv().await.expect("the worker answers") {
-                kr_protocol::envelope::ControlFrame::RetainedResponse(response)
-                    if response.request_id.get() == self.request_id =>
-                {
-                    return (*response, true);
+        self.release
+            .send(())
+            .expect("the preparation is waiting at its stop");
+        tokio::time::timeout(PATIENCE, async {
+            loop {
+                match self.proxy.recv().await.expect("the worker answers") {
+                    kr_protocol::envelope::ControlFrame::RetainedResponse(response)
+                        if response.request_id.get() == self.request_id =>
+                    {
+                        return (*response, true);
+                    }
+                    kr_protocol::envelope::ControlFrame::Response(response)
+                        if response.request_id.get() == self.request_id =>
+                    {
+                        return (response, false);
+                    }
+                    _ => {}
                 }
-                kr_protocol::envelope::ControlFrame::Response(response)
-                    if response.request_id.get() == self.request_id =>
-                {
-                    return (response, false);
-                }
-                _ => {}
             }
-        }
+        })
+        .await
+        .expect("the worker answers the forwarded action once its preparation is let go")
     }
 
     /// The receipt the worker's journal holds for the device's action: the device's own reads are
@@ -160,9 +178,9 @@ impl HeldDeviceAction {
 /// committed while it is held, as the daemon's next authority revision announced over the
 /// connection the worker answers on, and the worker's acknowledgement carries the fence's
 /// evidence, which names the action as one it took back, under the device that made it, and none
-/// as one that may have executed. The worker then resumes, and the action is answered with the
-/// rejected receipt, its dispatch never marked and the upstream never written. The control below
-/// holds the same action, resumes it the same way and revokes nothing; it executes.
+/// as one that may have executed. The preparation then goes on, and the action is answered with
+/// the rejected receipt, its dispatch never marked and the upstream never written. The control
+/// below holds the same action, lets it go the same way and revokes nothing; it executes.
 ///
 /// KR-REQ-02.08, the part that is about a paired device's current state: an action a device's
 /// authority admitted is decided against the authority in force when the host acts on it, so a
@@ -174,16 +192,19 @@ async fn kr_acc_022_a_paired_devices_held_action_is_taken_back_by_a_revocation_a
     let Some(mut held) = HeldDeviceAction::begin().await else {
         return;
     };
-    let ack = held
-        .authority
-        .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
-            environment_id: held.acting.hosted.environment_id,
-            revision: kr_protocol::ids::AuthorityRevision::new(2),
-            reach: kr_protocol::worker::RevisionReach::Host,
-            evidence_from: 0,
-        })
-        .await
-        .expect("the worker acknowledges the revision while its plugin host is held");
+    let ack = tokio::time::timeout(
+        PATIENCE,
+        held.authority
+            .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
+                environment_id: held.acting.hosted.environment_id,
+                revision: kr_protocol::ids::AuthorityRevision::new(2),
+                reach: kr_protocol::worker::RevisionReach::Host,
+                evidence_from: 0,
+            }),
+    )
+    .await
+    .expect("the worker acknowledges the revision while the action is held")
+    .expect("the worker acknowledges the revision while the action is held");
     assert_eq!(ack.revision, kr_protocol::ids::AuthorityRevision::new(2));
     let fence = ack.fence.expect("the worker reports what its fence did");
     assert_eq!(
@@ -234,10 +255,10 @@ async fn kr_acc_022_a_paired_devices_held_action_is_taken_back_by_a_revocation_a
     );
 }
 
-/// The control of the case above: the same device's action, held the same way and with its host
-/// resumed the same way, executes when nothing revokes it.
+/// The control of the case above: the same device's action, held the same way and let go the same
+/// way, executes when nothing revokes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_paired_devices_held_action_that_nothing_revokes_executes_once_its_host_resumes() {
+async fn a_paired_devices_held_action_that_nothing_revokes_executes_once_it_is_let_go() {
     let Some(mut held) = HeldDeviceAction::begin().await else {
         return;
     };
