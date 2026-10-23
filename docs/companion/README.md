@@ -530,7 +530,10 @@ screen lock" on an Android phone. A computer with no ceremony, Linux among them,
 says where to confirm instead, and a phone with no passcode or screen lock says that it cannot check
 that it is you, and to set a lock or confirm on another device. A phone lists the requests on its
 Attention tab, above its invitations, and counts them in the tab's badge. A request whose description does not match what it would authorise says it could
-not be checked, and has no button either.
+not be checked, and has no button either. A request for a device, an invitation or a hand-over of
+control also lists what the grant allows, kind by kind, in a fact named "Allows". The line may say a
+role instead ("who may act as the session's controller"), and the fact lists each kind the role
+stands for (`docs/pairing/README.md`).
 
 New requests are announced once, on whichever screen is open, in one message for all that arrive
 together, with "Review", which opens Attention and moves focus to the first of them. Requests that

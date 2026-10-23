@@ -23,13 +23,14 @@ use std::time::Duration;
 
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
-    STATEMENT_CHARS, SessionChannel, Subject, is_plain_text, policy_key_identifier, reason, shown,
-    shown_host, shows_value, utc_second,
+    STATEMENT_CHARS, SessionChannel, Subject, describe_rights, is_plain_text,
+    policy_key_identifier, reason, shown, shown_host, shows_value, utc_second,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::confirmation::{
     CatalogueTrustPlan, PluginInstallPlan, install_notices, split_install_statement,
 };
+use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
@@ -593,6 +594,10 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
                     shown(plan.from_device_name.as_str(), HOST_NAME_CHARS),
                 ),
                 words("To", shown(plan.to_device_name.as_str(), HOST_NAME_CHARS)),
+                words(
+                    "Allows",
+                    describe_rights(&plan.actions, &SessionSelector::Any),
+                ),
             ],
             notice: None,
             statement: None,
@@ -610,7 +615,10 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
         }),
         Subject::IssueInvitation { proposed_grant, .. }
         | Subject::ConfirmDevice { proposed_grant, .. } => Some(Particulars {
-            facts: membership_facts(proposed_grant),
+            facts: rights_facts(proposed_grant)
+                .into_iter()
+                .chain(membership_facts(proposed_grant))
+                .collect(),
             notice: None,
             statement: None,
             reading: None,
@@ -622,6 +630,15 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
             reading: None,
         }),
     }
+}
+
+/// What a grant lets a device do, kind by kind. The sentence beside it may say a role's name for a
+/// set of rights that is exactly the role's, and the role stands for every kind listed here.
+fn rights_facts(grant: &kr_protocol::pairing::ProposedGrant) -> Vec<Fact> {
+    vec![words(
+        "Allows",
+        describe_rights(&grant.actions, &grant.session_selector),
+    )]
 }
 
 /// The organisation a grant answers to, for an invitation or a device that would hold one, and
@@ -1089,6 +1106,11 @@ mod tests {
                 fact("Session", &Uuid::from_bytes([0xab; 16]).to_string(), true),
                 fact("From", "Laptop", false),
                 fact("To", "Pixel 8", false),
+                fact(
+                    "Allows",
+                    "share sessions with others and view sessions",
+                    false
+                ),
             ]
         );
     }
@@ -1198,16 +1220,16 @@ mod tests {
             assert_eq!(
                 view.facts,
                 vec![
+                    fact("Allows", "view sessions", false),
                     fact("Needs membership of", &organisation.to_string(), true),
                     fact("Enrolment of this host", "7", false),
                 ],
                 "{name}"
             );
             let listed = listed_subject(subject(personal.clone()), action);
-            assert!(
-                describe("a reference", "studio", &listed, NOW)
-                    .facts
-                    .is_empty(),
+            assert_eq!(
+                describe("a reference", "studio", &listed, NOW).facts,
+                vec![fact("Allows", "manage the host as an owner", false)],
                 "{name}: a personal grant answers to no organisation"
             );
         }
@@ -1461,12 +1483,16 @@ mod tests {
         );
     }
 
-    /// A request that names nothing beyond its sentence, a device being added, has no facts, no
-    /// notice and no statement.
+    /// A device being added is listed with what it would be allowed, kind by kind, and nothing
+    /// else: no notice and no statement. The sentence may say a role for a set of rights that is
+    /// exactly the role's; the fact beside it still lists each kind the role stands for.
     #[test]
-    fn a_device_being_added_carries_no_facts_notice_or_statement() {
+    fn a_device_being_added_carries_what_it_allows_and_no_notice_or_statement() {
         let view = describe("a reference", "studio", &a_device_being_added(), NOW);
-        assert!(view.facts.is_empty());
+        assert_eq!(
+            view.facts,
+            vec![fact("Allows", "manage the host as an owner", false)]
+        );
         assert_eq!((view.notice, view.statement), (None, None));
     }
 
