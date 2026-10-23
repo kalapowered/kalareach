@@ -174,9 +174,14 @@ Every step can be repeated. A lost answer, a restart or a changed token is mende
 from the proposal or the issue under a new action. Issuing again under the same record identifier
 gives a fresh bearer at the next revision, the host keeps the higher revision and owes the gateway no
 revocation, and one authorisation stands. The application looks at where notifications stand when
-it starts, each time it comes to the front on whichever screen, and when the network changes. At a
-look the phone repeats the sequence for each host that asked when the token has changed, and, once
-a minute at most, for a host that stopped for something the person or the network could mend. The
+it starts, each time it comes to the front on whichever screen, and when the network changes. The
+record keeps, for each host, the digest of the token its last registration proposed, and a host is
+on only while that is the digest of the token the provider holds, so a look finds a changed token
+by comparing and not by being told, whenever the token changed and whatever the application was
+doing then. A run that ends while the provider holds another token than the one it proposed goes
+round again and does not write the host on. At a look the phone repeats the sequence for each host
+that is on with another token, or with no digest, and, once a minute at most, for a host that
+stopped for something the person or the network could mend. The
 phone keeps one record of the registration it waits for and the gateway one pending attempt, so
 registrations for several hosts go one at a time. A provider makes its registration token a moment
 after the person agrees, and the phone waits up to twenty seconds for it before it stops and says
