@@ -137,10 +137,11 @@ impl Deployment {
     }
 }
 
-/// The longest one call waits through answers that ask it to try again.
+/// The longest one call goes on through answers that ask it to try again.
 ///
 /// It only ends a call that is never answered: each wait is the time the answer named, and the call
-/// goes on for as long as the service keeps asking, up to this.
+/// goes on for as long as the service keeps asking. No send starts after it, and a wait that would
+/// pass it is not made: the answer that asked for the wait is the call's result.
 pub const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// How long a retryable answer asks the caller to wait, or nothing when the answer is not one.
@@ -170,8 +171,8 @@ pub fn retry_after(error: &kr_client::ClientError) -> Option<std::time::Duration
 ///
 /// # Errors
 ///
-/// Returns the answer that is not a request to send again, or the last such answer once
-/// [`RETRY_DEADLINE`] has passed.
+/// Returns the answer that is not a request to send again, or the last such answer once the wait
+/// it asks for would pass [`RETRY_DEADLINE`].
 pub async fn following_the_retry<T, Call, Pending>(
     what: &str,
     mut send: Call,
@@ -182,16 +183,18 @@ where
 {
     let started = tokio::time::Instant::now();
     loop {
-        match send().await {
-            Err(asked) if started.elapsed() < RETRY_DEADLINE => {
-                let Some(wait) = retry_after(&asked) else {
-                    return Err(asked);
-                };
-                eprintln!("{what} was asked to be sent again after {wait:?}: {asked}");
-                tokio::time::sleep(wait).await;
-            }
+        let asked = match send().await {
+            Err(asked) => asked,
             answered => return answered,
+        };
+        let Some(wait) = retry_after(&asked) else {
+            return Err(asked);
+        };
+        if started.elapsed() + wait > RETRY_DEADLINE {
+            return Err(asked);
         }
+        eprintln!("{what} was asked to be sent again after {wait:?}: {asked}");
+        tokio::time::sleep(wait).await;
     }
 }
 
