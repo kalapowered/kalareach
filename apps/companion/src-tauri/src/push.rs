@@ -403,10 +403,17 @@ impl PushDesk {
     ///
     /// A token that changed is remembered for each host until a run has read it, so a host whose
     /// run was under way at the time registers again when that run ends.
+    ///
+    /// Asking the platform whether the token changed clears what it keeps, so a change it reports
+    /// is kept here before anything else is waited for: each host that is on is written down as
+    /// working at once, and a start that finds a host working knows the run that was to register it
+    /// was cut short, and offers the person its retry. A change that is only remembered in memory
+    /// would be lost with the process, and the host would stay on with a token the gateway does not
+    /// know.
     pub async fn refresh(self: &Arc<Self>) -> PushView {
         let changed = self.native.token_changed().await.unwrap_or(false);
         let now = (self.wiring.clock)();
-        let due: Vec<PairedHost> = {
+        let due: Vec<(PairedHost, bool)> = {
             let record = lock(&self.record);
             let mut stale = lock(&self.stale);
             self.device
@@ -415,11 +422,9 @@ impl PushDesk {
                 .list()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|host| {
-                    let Some(kept) = record.hosts.get(&host.host_device_id.to_string()) else {
-                        return false;
-                    };
-                    match kept.phase {
+                .filter_map(|host| {
+                    let kept = record.hosts.get(&host.host_device_id.to_string())?;
+                    let is_due = match kept.phase {
                         Phase::On | Phase::Working => {
                             if changed {
                                 stale.insert(host.host_device_id);
@@ -427,11 +432,16 @@ impl PushDesk {
                             kept.phase == Phase::On && stale.contains(&host.host_device_id)
                         }
                         Phase::Attention => now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS),
-                    }
+                    };
+                    is_due.then_some((host, kept.phase == Phase::On))
                 })
                 .collect()
         };
-        for host in due {
+        for (host, was_on) in due {
+            if was_on {
+                // Written to disk before the run is spawned or anything is awaited.
+                self.set(&host, Phase::Working, "Registering this phone again.", None);
+            }
             if self.claim(&host) {
                 self.spawn_run(host);
             }
