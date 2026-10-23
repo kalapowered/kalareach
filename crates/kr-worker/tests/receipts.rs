@@ -6257,7 +6257,7 @@ fn a_revocation_this_journal_can_no_longer_count_for_is_not_answered_as_an_empty
                 .expect("the announcement is recorded");
         }
     }
-    let journal = Journal::open(&path).expect("the journal reopens");
+    let mut journal = Journal::open(&path).expect("the journal reopens");
     assert!(
         !journal.evidence_answerable(1).expect("reads"),
         "the oldest revocation is one this journal can no longer answer for"
@@ -6277,8 +6277,22 @@ fn a_revocation_this_journal_can_no_longer_count_for_is_not_answered_as_an_empty
         "the newest is answerable, because its names are here"
     );
     assert!(
+        !journal.evidence_answerable(revisions + 5).expect("reads"),
+        "a revocation no fence of this journal ran is not answerable: nothing ran for it"
+    );
+    // One whose fence ran to its end and named nothing is the empty answer, and the revision below
+    // it, which a joined fence took, still has nothing to say.
+    let (fenced, outcome) =
+        journal.fence_for_revocation(revisions + 5, None, kr_ipc::now_ms(), revisions, 1);
+    outcome.expect("the fence runs");
+    assert_eq!(fenced.named(), 0);
+    assert!(
         journal.evidence_answerable(revisions + 5).expect("reads"),
-        "a revocation this journal never ran is answerable: it named nothing"
+        "a fence that ran and named nothing is an empty answer"
+    );
+    assert!(
+        !journal.evidence_answerable(revisions + 4).expect("reads"),
+        "the revision below it was never fenced by this journal"
     );
 }
 
