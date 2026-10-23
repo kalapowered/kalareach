@@ -6177,6 +6177,29 @@ a grant is written, and the grant carries no role afterwards. Only controller an
 carries the notice explaining that an answer, including free text, is input the agent may act on
 under its own permissions.
 
+**A grant's consequences are stated in the host's words, and no label promises a boundary the
+upstream does not enforce.** A grant that carries `terminal.input` types into the session's shell
+as the shell's user, so it exposes that user's account: no file rule, repository label or other
+selector on a grant limits what a command typed through the terminal does. A prompt, an approval or
+an answer, free text included, is input the agent may act on under its own permissions, and nothing
+in the grant restricts what the agent then does. The
+host therefore computes, from the actions a grant carries, which of four notices the grant carries,
+and states each in fixed words that a surface may translate and may not soften:
+
+| Notice | Carried by | Sentence |
+| --- | --- | --- |
+| `account_access` | `terminal.input` | Terminal input runs as your account. Anything this recipient types can do what you can do on this machine. |
+| `agent_permissions` | `agent.prompt`, `agent.approval.respond`, `question.respond` | Prompts, approvals and answers, including free text, are input the agent may act on under its own permissions on this machine. This is not a restricted sandbox. |
+| `environment_writes` | `files.upload`, `files.apply_diff`, `project.create`, `workspace.manage`, `changeset.create` | This recipient can change files and repositories in this environment. |
+| `delegation` | `session.share` | This recipient can pass on what it holds, narrowed but never enlarged, to somebody else. |
+
+The issuer is shown the sentences before the grant exists, and the request names the notices it
+accepted; `grant.create` is refused when they are not the set the grant carries, so a surface that
+showed a softer set cannot get the grant written. The recipient is shown the same consequences,
+addressed to it, when it opens the invitation. A role's name promises nothing. The default viewer
+carries no notice, a viewer invited to answer the agent's questions carries `agent_permissions`, and
+the notices follow the actions and not the label.
+
 **An issuer is shown what it is sharing.** The preview is computed by the same code that writes the
 grant, and an invitation that names a question, an approval or the live screen is refused unless
 text for that thing arrives with it and the two name the same things. `grant.create` reads that text
