@@ -8581,7 +8581,8 @@ export interface SessionSummary {
    * Absent from the wire when the worker knows no application, which is every session at a
    * prompt and every session of a worker of a release that wrote no such member, so a summary
    * of one is byte for byte what that release reads. A session of such a worker shows no
-   * application. A closed session shows the application its worker last recorded for it.
+   * application. A closed session shows none: the application is what holds the foreground of
+   * a session, and a closed session has no foreground.
    */
   application?: string | null
   /**
@@ -15854,7 +15855,8 @@ export interface SessionSummary1 {
    * Absent from the wire when the worker knows no application, which is every session at a
    * prompt and every session of a worker of a release that wrote no such member, so a summary
    * of one is byte for byte what that release reads. A session of such a worker shows no
-   * application. A closed session shows the application its worker last recorded for it.
+   * application. A closed session shows none: the application is what holds the foreground of
+   * a session, and a closed session has no foreground.
    */
   application?: string | null
   /**
@@ -28387,7 +28389,8 @@ export interface SessionSummary2 {
    * Absent from the wire when the worker knows no application, which is every session at a
    * prompt and every session of a worker of a release that wrote no such member, so a summary
    * of one is byte for byte what that release reads. A session of such a worker shows no
-   * application. A closed session shows the application its worker last recorded for it.
+   * application. A closed session shows none: the application is what holds the foreground of
+   * a session, and a closed session has no foreground.
    */
   application?: string | null
   /**
@@ -28556,7 +28559,8 @@ export interface SessionSummary3 {
    * Absent from the wire when the worker knows no application, which is every session at a
    * prompt and every session of a worker of a release that wrote no such member, so a summary
    * of one is byte for byte what that release reads. A session of such a worker shows no
-   * application. A closed session shows the application its worker last recorded for it.
+   * application. A closed session shows none: the application is what holds the foreground of
+   * a session, and a closed session has no foreground.
    */
   application?: string | null
   /**
@@ -28984,7 +28988,8 @@ export interface SessionSummary4 {
    * Absent from the wire when the worker knows no application, which is every session at a
    * prompt and every session of a worker of a release that wrote no such member, so a summary
    * of one is byte for byte what that release reads. A session of such a worker shows no
-   * application. A closed session shows the application its worker last recorded for it.
+   * application. A closed session shows none: the application is what holds the foreground of
+   * a session, and a closed session has no foreground.
    */
   application?: string | null
   /**

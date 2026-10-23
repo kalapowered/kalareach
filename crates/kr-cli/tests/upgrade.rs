@@ -1438,13 +1438,16 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     host.worker_ended(&updated.worker).await;
 }
 
-/// KR-REQ-13.10, KR-REQ-26.10: a session of this release whose journal names the application in
-/// its foreground is read by the release before, once the session has closed and the host has been
+/// KR-REQ-26.10: a session of this release whose journal holds a name for the application in its
+/// foreground is read by the release before, once the session has closed and the host has been
 /// rolled back to it: the archive of that release reads the summary row, which keeps the shape every
-/// release reads, and shows the session as it did before, with no application.
+/// release reads, and shows the session as it did before, with no application. This release shows
+/// a closed session no application either, whatever its journal holds: the application is what is in
+/// the foreground of a session, and a closed session has none.
 ///
-/// No worker names an application yet, so the journal is written the way a worker that did would
-/// write it, through the worker's own journal, once the session's worker has ended.
+/// A worker clears the application when its session closes, so the journal is written the way a
+/// worker that did not would write it, through the worker's own journal, once the session's worker
+/// has ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_session_naming_an_application_is_read_by_the_release_before_after_a_rollback() {
     let updated = Updated::new().await;
@@ -1479,7 +1482,8 @@ async fn a_closed_session_naming_an_application_is_read_by_the_release_before_af
         );
     }
 
-    // This release's daemon shows the closed session with the application the journal holds.
+    // This release's daemon shows the closed session with no application, though the journal holds
+    // one.
     let endpoint = host
         .tree
         .environment()
@@ -1499,9 +1503,8 @@ async fn a_closed_session_naming_an_application_is_read_by_the_release_before_af
         .to_typed()
         .expect("this release reads the answer");
     assert_eq!(
-        read.session.application.as_deref(),
-        Some("Claude Code"),
-        "this release's daemon shows the application of the closed session"
+        read.session.application, None,
+        "this release's daemon shows a closed session no application"
     );
     drop(client);
 
