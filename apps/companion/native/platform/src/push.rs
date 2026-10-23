@@ -74,8 +74,6 @@ pub enum PendingState {
     Refused,
     /// Its deadline passed.
     Expired,
-    /// A newer registration replaced it.
-    Superseded,
 }
 
 /// The one registration this device is waiting for the challenge of.
