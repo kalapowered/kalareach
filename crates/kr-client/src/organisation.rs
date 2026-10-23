@@ -8,27 +8,28 @@
 //!
 //! The first presentation comes before anything else on a connection: the host refuses every other
 //! method to such a device until it holds a lease, and no lease survives a host's restart, so a
-//! connection that is opened again presents first. The keeper holds the last lease the host took,
-//! so a connection made beside the one that keeps it fresh presents that lease again and asks the
-//! service for a new one only when the host refuses it, as a host does that restarted or whose
-//! clock has passed the lease's end.
+//! connection that is opened again presents first. The keeper holds the lease the host took last,
+//! so a connection made beside the one that keeps it fresh presents that lease again while it lasts
+//! and asks the service for a new one only when none is held or the host refuses the one that is,
+//! as a host does that restarted or whose clock has passed the lease's end.
 //!
 //! What it does with a refusal depends on who can mend the cause. A lease that has run out, one the
 //! host installed before it restarted, one a newer lease replaced, and one signed by a key the host
 //! has not followed are mended by asking again, with the chain of keys beside the lease where that
-//! is the cause. A service that is down, a host whose clock is in doubt and a service that asks for
-//! a delay are waited out. A device whose account is not signed in, is not a member, or whose lease
-//! the host refuses for a reason only an administrator can change is not retried: the keeper stops,
-//! says why, and a person mends it.
+//! is the cause; but a lease the service has just signed and the host refuses all the same is not
+//! asked for again at once, because the host's clock or records are what differ. A service that is
+//! down, a host whose clock is in doubt and a service that asks for a delay are waited out. A
+//! device whose account is not signed in, is not a member, or whose lease the host refuses for a
+//! reason only an administrator can change is not retried: the keeper stops, says why, and a person
+//! mends it.
 //!
 //! The organisation's service allows an account a hundred and twenty lease requests an hour, and
-//! the same account's other devices spend from it. So no failure makes the keeper ask faster than
-//! once a minute while it keeps a lease, and a stop that a person or an administrator mends is
-//! remembered: the keeper answers a later connection with the same stop and sends nothing until
-//! the stop has been held for the time [`LeaseStop::holds_for`] names. The service rejecting the
-//! account's token is waited out and tried three times, with the token the account holds, because
-//! the token source renews a token by itself as it nears its end and offers no renewal on demand;
-//! after the third the person is told to sign in again.
+//! the same account's other devices spend from it. So the keeper sends no lease request sooner than
+//! a minute after the last wait it began while it keeps a lease, and no connection asks while it
+//! waits. A stop that a person or an administrator mends is remembered: the keeper answers a later
+//! connection with the same stop and sends nothing until the stop has been held for the time
+//! [`LeaseStop::holds_for`] names. A token the service rejects is replaced once by the service
+//! client before the keeper hears of it, so a second rejection ends in `TokenRefused`.
 
 use std::fmt;
 use std::future::Future;
@@ -49,6 +50,7 @@ use crate::error::ClientError;
 use crate::retry::UserAction;
 use crate::services::MembershipLeaseService;
 use crate::session::Session;
+use crate::shown::{Said, Shown};
 
 /// The shortest the keeper waits between two leases it asks the service for while it keeps one,
 /// whatever the service advises and however it fails, so that no failure becomes a loop. The
@@ -64,10 +66,6 @@ pub const LONGEST_REFRESH: Duration =
 /// How long a presentation stays acceptable.
 const PRESENT_TTL: DurationMs = DurationMs::new(30_000);
 
-/// How many times in a row the keeper asks again at once for a lease the host says has run out or
-/// was installed before its restart, before it treats the host as one that cannot take it.
-const IMMEDIATE_RETRIES: u32 = 3;
-
 /// How many times a connection waits and asks again for its first lease before it gives up for now.
 const FIRST_LEASE_TRIES: u32 = 3;
 
@@ -82,6 +80,14 @@ const LONGEST_WAIT_AT_CONNECT: Duration = Duration::from_secs(10);
 /// How much of a lease must be left, beyond the interval to the next one, for the keeper to
 /// present it again rather than ask for another.
 const LEASE_MARGIN: Duration = Duration::from_secs(30);
+
+/// The most a connection's first presentation takes in all, counting its requests to the service
+/// and its waits. The callers that wait for it allow twelve seconds at the least.
+const PRESENT_WITHIN: Duration = Duration::from_secs(8);
+
+/// How much earlier than a wait ends, by the wall clock, a request may go: a clock that was set
+/// during the wait is not a reason to wait again.
+const CLOCK_SLACK_MS: u64 = 1_000;
 
 /// How long the keeper sends no request after a stop that an administrator mends.
 const HELD_FOR_AN_ADMINISTRATOR: Duration = Duration::from_secs(5 * 60);
@@ -120,13 +126,13 @@ pub enum LeaseStop {
     /// for nothing: its own account says so.
     SignIn,
     /// The organisation's service does not take the account's token, though the account holds one:
-    /// it rejected it three times in a row, or asked for the sign-in to be made again.
+    /// it rejected a renewed token as well, or asked for the sign-in to be made again.
     TokenRefused,
     /// The organisation's service says the signed-in account is not a member of the organisation.
     NotAMember,
     /// The host refuses the lease for a reason only a person or an administrator can change: the
-    /// name of the host's rule, or what it did not accept.
-    Refused(String),
+    /// name of the host's rule that this build knows, or what the host did not accept.
+    Refused(&'static str),
     /// The service refused the request in a way asking again does not change.
     Unusable,
     /// The service asked this device to wait longer than a connection waits, so the connection
@@ -189,55 +195,59 @@ impl LeaseStop {
     }
 }
 
-/// A delay in words a person reads.
-fn in_words(delay: Duration) -> String {
-    let seconds = delay.as_secs().max(1);
-    if seconds < 60 {
-        return format!("{seconds} seconds");
-    }
-    match seconds.div_ceil(60) {
-        1 => "a minute".to_owned(),
-        minutes => format!("{minutes} minutes"),
-    }
-}
-
-impl fmt::Display for LeaseStop {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Said for LeaseStop {
+    fn said(&self) -> Shown {
         match self {
-            Self::SignIn => formatter.write_str(
+            Self::SignIn => Shown::said(
                 "sign in to your account again: this device cannot ask your organisation for the \
                  lease that lets it use this host",
             ),
-            Self::TokenRefused => formatter.write_str(
+            Self::TokenRefused => Shown::said(
                 "sign in to your account again: your organisation's service does not take the \
                  sign-in this device holds",
             ),
-            Self::NotAMember => formatter
-                .write_str("this account is not a member of the organisation this host answers to"),
-            Self::Refused(rule) => write!(
-                formatter,
-                "this host refused the lease your organisation signed ({rule}); ask your \
-                 organisation's administrator"
+            Self::NotAMember => {
+                Shown::said("this account is not a member of the organisation this host answers to")
+            }
+            Self::Refused(rule) => crate::shown!(
+                "this host refused the lease your organisation signed ({}); ask your \
+                 organisation's administrator",
+                *rule
             ),
-            Self::Unusable => formatter.write_str(
+            Self::Unusable => Shown::said(
                 "your organisation's service refused the request for a lease; update this app",
             ),
-            Self::Later(delay) => write!(
-                formatter,
-                "your organisation's service asks this device to wait {} before it asks for the \
-                 lease this host needs",
-                in_words(*delay)
-            ),
-            Self::ConnectionEnded => {
-                formatter.write_str("the connection to this host ended before a lease was held")
+            Self::Later(delay) => {
+                let seconds = delay.as_secs().max(1);
+                match seconds.div_ceil(60) {
+                    _ if seconds < 60 => crate::shown!(
+                        "your organisation's service asks this device to wait {} seconds before \
+                         it asks for the lease this host needs",
+                        seconds
+                    ),
+                    1 => Shown::said(
+                        "your organisation's service asks this device to wait a minute before it \
+                         asks for the lease this host needs",
+                    ),
+                    minutes => crate::shown!(
+                        "your organisation's service asks this device to wait {} minutes before \
+                         it asks for the lease this host needs",
+                        minutes
+                    ),
+                }
             }
-            Self::Unreachable => formatter.write_str(
+            Self::ConnectionEnded => {
+                Shown::said("the connection to this host ended before a lease was held")
+            }
+            Self::Unreachable => Shown::said(
                 "your organisation's service did not give this device the lease it needs just \
                  now; this app asks again",
             ),
         }
     }
 }
+
+crate::display_as_said!(LeaseStop);
 
 /// What the keeper reports as it goes, for whoever shows it to a person.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,28 +266,40 @@ pub enum LeaseEvent {
 /// What one failure calls for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Next {
-    /// Ask again at once for a new lease.
+    /// Ask the service for a new lease at once: the host will not take the one it was given.
     Now,
-    /// Fetch the chain of keys, and ask again at once.
+    /// Fetch the chain of keys again, and present the lease with it at once.
     WithTheChain,
     /// Wait for the delay the service named.
     After(Duration),
     /// Wait out the backoff.
     BackOff,
-    /// Wait out the backoff, and carry the chain of keys with the next presentation.
+    /// Wait out the backoff, and ask the service for a new lease that carries the chain of keys.
     BackOffWithTheChain,
-    /// Wait out the backoff, and stop with this when the same thing has happened
-    /// [`UNEXPLAINED_REFUSALS`] times in a row: nothing says what is wrong.
+    /// Wait out the backoff, and stop with this when it has happened [`UNEXPLAINED_REFUSALS`] times
+    /// since a lease was last held: nothing says what is wrong.
     Doubtful(LeaseStop),
+    /// As [`Self::Doubtful`], for a lease the host refused as ended or replaced the moment the
+    /// service had signed it: that lease is dropped, and the next is asked for after the wait.
+    Mistrusted(LeaseStop),
     /// Stop, because only a person can mend this.
     Stop(LeaseStop),
+}
+
+/// What a presentation consisted of, which decides what a refusal of it means.
+#[derive(Clone, Copy)]
+struct Presented {
+    /// The service signed the lease for this presentation, so a host that refuses it as ended or
+    /// replaced has not been given a stale one, and asking again would be refused the same way.
+    fresh: bool,
+    /// The chain of keys was fetched again for this presentation.
+    with_chain: bool,
 }
 
 /// Whether a lease may be presented again as it is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reuse {
-    /// The lease the host took, while it is not yet due to be replaced, and one the host has not
-    /// taken yet.
+    /// Any lease that still lasts: the one the host took, or one it has not taken yet.
     Held,
     /// Only a lease the host has not taken yet: this is the refresh.
     Unaccepted,
@@ -291,23 +313,19 @@ struct Held {
     authority: Option<PolicyAuthority>,
     /// The interval the service advised with the lease.
     advised: Duration,
+    /// When the lease ends, in UTC milliseconds by this device's clock: its length counted from
+    /// when it arrived, so a device whose clock differs from the service's is not misled.
+    ends_at_ms: u64,
     /// When the lease is due to be replaced, in UTC milliseconds, once the host has taken it.
     due_at_ms: Option<u64>,
 }
 
 impl Held {
-    /// Whether this lease is worth presenting again at `now_ms`: it lasts through the interval to
-    /// the next, and it is not yet due to be replaced when the host took it already.
+    /// Whether this lease is worth presenting again at `now_ms`.
     fn usable(&self, now_ms: u64, reuse: Reuse) -> bool {
-        let needs = self.advised.max(SHORTEST_REFRESH) + LEASE_MARGIN;
-        let lasts = self.lease.payload.expires_at_ms.get()
-            > now_ms.saturating_add(u64::try_from(needs.as_millis()).unwrap_or(u64::MAX));
-        lasts
-            && match (self.due_at_ms, reuse) {
-                (None, _) => true,
-                (Some(due), Reuse::Held) => due > now_ms,
-                (Some(_), Reuse::Unaccepted) => false,
-            }
+        let margin = u64::try_from(LEASE_MARGIN.as_millis()).unwrap_or(u64::MAX);
+        self.ends_at_ms > now_ms.saturating_add(margin)
+            && (reuse == Reuse::Held || self.due_at_ms.is_none())
     }
 }
 
@@ -321,6 +339,9 @@ struct Kept {
     lease: Option<Held>,
     /// A stop that sends nothing until the moment it names, in UTC milliseconds.
     held_back: Option<(u64, LeaseStop)>,
+    /// No request goes to the service before this moment, in UTC milliseconds: the keeper is
+    /// waiting out a failure or a delay the service named, and every connection waits with it.
+    not_before_ms: u64,
 }
 
 /// Keeps one organisation's lease for one device on one host.
@@ -341,6 +362,11 @@ impl fmt::Debug for LeaseKeeper {
             .field("organisation", &self.organisation)
             .finish_non_exhaustive()
     }
+}
+
+/// A duration as milliseconds.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl LeaseKeeper {
@@ -378,9 +404,9 @@ impl LeaseKeeper {
 
     /// Presents a lease as the first thing on the connection.
     ///
-    /// The lease the host took last is presented again while it is not due to be replaced; the
-    /// service is asked only when none is held, or the host refuses the one that is. A failure that
-    /// asking again mends is mended here, and one that time mends is waited out.
+    /// The lease the host took last is presented again while it lasts; the service is asked only
+    /// when none is held, or the host refuses the one that is. A failure that asking again mends is
+    /// mended here, and one that time mends is waited out.
     ///
     /// # Errors
     ///
@@ -391,9 +417,17 @@ impl LeaseKeeper {
         if let Some(stop) = self.held_back() {
             return Err(stop);
         }
-        self.until_held(session, &mut Pace::first(), Reuse::Held)
-            .await
-            .map(|_| ())
+        // The caller's own limit is shorter than a few slow requests add up to, and a hold is
+        // recorded only by a stop, so the keeper stops itself first.
+        match tokio::time::timeout(
+            PRESENT_WITHIN,
+            self.until_held(session, &mut Pace::first(), Reuse::Held),
+        )
+        .await
+        {
+            Ok(held) => held.map(|_| ()),
+            Err(_) => Err(self.stopped(LeaseStop::Unreachable)),
+        }
     }
 
     /// Keeps the lease until something stops it. It begins with a wait until the lease the host
@@ -422,12 +456,25 @@ impl LeaseKeeper {
             })
     }
 
-    /// The stop that is held, while it is.
+    /// How long the lease the host holds has left, when it holds one this keeper presented.
+    fn left_on_the_lease(&self) -> Option<Duration> {
+        let now = self.timer.now_ms();
+        self.kept()
+            .lease
+            .as_ref()
+            .filter(|held| held.due_at_ms.is_some())
+            .map(|held| Duration::from_millis(held.ends_at_ms.saturating_sub(now)))
+    }
+
+    /// The stop that is held, while it is, with the delay it still has to run.
     fn held_back(&self) -> Option<LeaseStop> {
         let now = self.timer.now_ms();
         let mut kept = self.kept();
         match &kept.held_back {
-            Some((until, stop)) if *until > now => Some(stop.clone()),
+            Some((until, stop)) if *until > now => Some(match stop {
+                LeaseStop::Later(_) => LeaseStop::Later(Duration::from_millis(*until - now)),
+                other => other.clone(),
+            }),
             Some(_) => {
                 kept.held_back = None;
                 None
@@ -452,28 +499,41 @@ impl LeaseKeeper {
                 }
                 Err(next) => next,
             };
-            if next == Next::Now {
-                // The host will not take this lease again.
+            if matches!(
+                next,
+                Next::Now | Next::BackOffWithTheChain | Next::Mistrusted(_)
+            ) {
+                // The host will not take this lease again, with a chain or without.
                 self.kept().lease = None;
             }
             let wait = match next {
-                Next::Now => pace.at_once(),
+                Next::Now => None,
                 Next::WithTheChain => {
                     pace.chain = true;
-                    pace.at_once()
+                    None
                 }
                 Next::After(delay) => {
                     if pace.connecting && delay > LONGEST_WAIT_AT_CONNECT {
                         return Err(self.stopped(LeaseStop::Later(delay)));
                     }
-                    Some(delay.max(pace.floor))
+                    let wait = delay.max(pace.floor);
+                    self.ask_nothing_for(wait);
+                    if !pace.connecting
+                        && let Some(left) = self.left_on_the_lease().filter(|left| wait >= *left)
+                    {
+                        // The host stops answering when the lease it holds ends, which is before
+                        // the service lets this device ask: say so when it does.
+                        self.timer.wait(left).await;
+                        return Err(self.stopped(LeaseStop::Later(delay)));
+                    }
+                    Some(wait)
                 }
                 Next::BackOff => Some(pace.backoff.next_delay()),
                 Next::BackOffWithTheChain => {
                     pace.chain = true;
                     Some(pace.backoff.next_delay())
                 }
-                Next::Doubtful(stop) => {
+                Next::Doubtful(stop) | Next::Mistrusted(stop) => {
                     pace.doubts += 1;
                     if pace.doubts >= UNEXPLAINED_REFUSALS {
                         return Err(self.stopped(stop));
@@ -487,9 +547,18 @@ impl LeaseKeeper {
                     return Err(self.stopped(LeaseStop::Unreachable));
                 }
                 (self.report)(LeaseEvent::Retrying);
+                self.ask_nothing_for(wait);
                 self.timer.wait(wait).await;
             }
         }
+    }
+
+    /// No connection asks the service for a lease for `wait`: the keeper waits it out, and so does
+    /// every connection beside it.
+    fn ask_nothing_for(&self, wait: Duration) {
+        let until = self.timer.now_ms().saturating_add(millis(wait));
+        let mut kept = self.kept();
+        kept.not_before_ms = kept.not_before_ms.max(until);
     }
 
     /// Records a stop: what it spoils is dropped, and what it holds back is held back.
@@ -501,10 +570,7 @@ impl LeaseKeeper {
             }
             let held = stop.holds_for();
             if !held.is_zero() {
-                let until = self
-                    .timer
-                    .now_ms()
-                    .saturating_add(u64::try_from(held.as_millis()).unwrap_or(u64::MAX));
+                let until = self.timer.now_ms().saturating_add(millis(held));
                 kept.held_back = Some((until, stop.clone()));
             }
         }
@@ -528,23 +594,34 @@ impl LeaseKeeper {
                 .filter(|held| held.usable(now, reuse))
                 .cloned()
         };
-        let mut held = match reusable {
-            Some(held) => held,
-            None => {
-                let issued = self
-                    .leases
-                    .lease(self.organisation, self.device_key)
-                    .await
-                    .map_err(|error| from_the_service(&error))?;
-                let held = Held {
-                    lease: issued.lease,
-                    authority: None,
-                    advised: issued.refresh_after,
-                    due_at_ms: None,
-                };
-                self.kept().lease = Some(held.clone());
-                held
+        let fresh = reusable.is_none();
+        let mut held = if let Some(held) = reusable {
+            held
+        } else {
+            let now = self.timer.now_ms();
+            let not_before = self.kept().not_before_ms;
+            if not_before > now.saturating_add(CLOCK_SLACK_MS) {
+                return Err(Next::After(Duration::from_millis(not_before - now)));
             }
+            let issued = self
+                .leases
+                .lease(self.organisation, self.device_key)
+                .await
+                .map_err(|error| from_the_service(&error))?;
+            let payload = &issued.lease.payload;
+            let lasts = payload
+                .expires_at_ms
+                .get()
+                .saturating_sub(payload.issued_at_ms.get());
+            let held = Held {
+                ends_at_ms: self.timer.now_ms().saturating_add(lasts),
+                lease: issued.lease,
+                authority: None,
+                advised: issued.refresh_after,
+                due_at_ms: None,
+            };
+            self.kept().lease = Some(held.clone());
+            held
         };
         let revision = held.lease.payload.key_revision.get();
         let newer = revision > self.kept().followed;
@@ -557,6 +634,10 @@ impl LeaseKeeper {
                     .map_err(|error| from_the_service(&error))?,
             );
         }
+        let presented = Presented {
+            fresh,
+            with_chain: force_chain,
+        };
         let params = MembershipPresentParams {
             lease: held.lease.clone(),
             authority: held
@@ -575,12 +656,11 @@ impl LeaseKeeper {
             )
             .await
             .and_then(|settled| settled.to_typed())
-            .map_err(|error| from_the_host(&error))?;
+            .map_err(|error| from_the_host(&error, presented))?;
         let now = self.timer.now_ms();
-        let advised = clamp(held.advised);
-        let due = held.due_at_ms.unwrap_or_else(|| {
-            now.saturating_add(u64::try_from(advised.as_millis()).unwrap_or(u64::MAX))
-        });
+        let due = held
+            .due_at_ms
+            .unwrap_or_else(|| now.saturating_add(millis(clamp(held.advised))));
         held.due_at_ms = Some(due);
         {
             let mut kept = self.kept();
@@ -597,16 +677,14 @@ impl LeaseKeeper {
 /// How the keeper paces itself while a lease is being got.
 struct Pace {
     backoff: Backoff,
-    /// The shortest a delay the service named is waited.
+    /// The shortest a wait is.
     floor: Duration,
     /// Whether a connection waits for this lease, and so gives up after a few tries and does not
     /// wait out a long delay.
     connecting: bool,
     /// The waits allowed before giving up for now, when there is a limit.
     waits_left: Option<u32>,
-    /// Asks made at once in a row.
-    immediate: u32,
-    /// Failures in a row that nothing explains.
+    /// Failures since a lease was last held that nothing explains.
     doubts: u32,
     /// Whether the next presentation travels with the chain of keys.
     chain: bool,
@@ -620,7 +698,6 @@ impl Pace {
             floor: Duration::from_secs(1),
             connecting: true,
             waits_left: Some(FIRST_LEASE_TRIES),
-            immediate: 0,
             doubts: 0,
             chain: false,
         }
@@ -634,7 +711,6 @@ impl Pace {
             floor: SHORTEST_REFRESH,
             connecting: false,
             waits_left: None,
-            immediate: 0,
             doubts: 0,
             chain: false,
         }
@@ -643,7 +719,6 @@ impl Pace {
     /// A lease is held: the next failure starts again.
     fn held(&mut self) {
         self.backoff.reset();
-        self.immediate = 0;
         self.doubts = 0;
         self.chain = false;
     }
@@ -658,14 +733,6 @@ impl Pace {
             }
             None => true,
         }
-    }
-
-    /// How long to wait before asking again for a lease the host said to ask again for: none for
-    /// the first few, and the backoff after, so a host that keeps saying it is not asked
-    /// for ever.
-    fn at_once(&mut self) -> Option<Duration> {
-        self.immediate += 1;
-        (self.immediate > IMMEDIATE_RETRIES).then(|| self.backoff.next_delay())
     }
 }
 
@@ -689,10 +756,11 @@ fn from_the_service(error: &ClientError) -> Next {
         (Some("RATE_LIMITED" | "SERVICE_UNAVAILABLE"), Some(seconds)) => {
             Next::After(Duration::from_secs(*seconds))
         }
-        (Some("REAUTHENTICATION_REQUIRED"), _) => Next::Stop(LeaseStop::TokenRefused),
-        // A token the service rejects may have ended in transit, so the keeper asks again with
-        // whatever the account holds now. The account being signed out is for the person.
-        (Some("UNAUTHENTICATED"), _) => Next::Doubtful(LeaseStop::TokenRefused),
+        // The service client has already asked once more with a renewed token when the first was
+        // rejected, so a token it still rejects is the person's to replace.
+        (Some("REAUTHENTICATION_REQUIRED" | "UNAUTHENTICATED"), _) => {
+            Next::Stop(LeaseStop::TokenRefused)
+        }
         (Some("FORBIDDEN"), _) => Next::Stop(LeaseStop::NotAMember),
         (Some("INVALID_REQUEST" | "METHOD_NOT_ALLOWED" | "NOT_FOUND"), _) => {
             Next::Stop(LeaseStop::Unusable)
@@ -703,8 +771,17 @@ fn from_the_service(error: &ClientError) -> Next {
     }
 }
 
+/// What the host says of a lease it was not given a rule for.
+const NOT_EXPLAINED: &str = "not explained";
+
+/// What the host says of a lease or chain it refuses as malformed.
+const NOT_ACCEPTED: &str = "the host did not accept the lease or the chain of keys beside it";
+
+/// What a stop says of a rule of the host's that this build does not know.
+const UNKNOWN_RULE: &str = "a rule this app does not know";
+
 /// What a refusal from the host calls for.
-fn from_the_host(error: &ClientError) -> Next {
+fn from_the_host(error: &ClientError, presented: Presented) -> Next {
     match error {
         ClientError::Transport(_)
         | ClientError::Ipc(_)
@@ -712,18 +789,16 @@ fn from_the_host(error: &ClientError) -> Next {
         | ClientError::SubmissionUncertain { .. } => Next::Stop(LeaseStop::ConnectionEnded),
         ClientError::Host(refusal) if refusal.code == ErrorCode::PermissionDenied => {
             match rule_of(&refusal.message) {
-                Some(rule) => by_rule(rule),
+                Some(rule) => by_rule(rule, presented),
                 // A window the host no longer accepts, or a device it no longer answers to: the
                 // connection says which when it ends.
-                None => Next::Doubtful(LeaseStop::Refused("not explained".to_owned())),
+                None => Next::Doubtful(LeaseStop::Refused(NOT_EXPLAINED)),
             }
         }
         // A chain that does not verify, or one that is not current yet: time may mend the second,
         // and nothing says which this is.
         ClientError::Host(refusal) if refusal.code == ErrorCode::InvalidArgument => {
-            Next::Doubtful(LeaseStop::Refused(
-                "the host did not accept the lease or the chain of keys beside it".to_owned(),
-            ))
+            Next::Doubtful(LeaseStop::Refused(NOT_ACCEPTED))
         }
         _ => Next::BackOff,
     }
@@ -763,11 +838,11 @@ const RULES: [(&str, Cure); 18] = [
 /// What mends a refused lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cure {
-    /// Asking the service for a new lease: this one is gone, or a newer one is already held.
+    /// Asking the service for a new lease: the one presented is gone or replaced.
     Ask,
     /// The chain of keys beside the lease.
     Chain,
-    /// Time, and the chain beside the lease.
+    /// Time, and a new lease that carries the chain of keys.
     ChainLater,
     /// Time, and presenting the same lease again.
     Later,
@@ -775,13 +850,21 @@ enum Cure {
     Person,
 }
 
-fn by_rule(rule: &str) -> Next {
-    match RULES.iter().find(|(name, _)| *name == rule) {
-        Some((_, Cure::Ask)) => Next::Now,
-        Some((_, Cure::Chain)) => Next::WithTheChain,
-        Some((_, Cure::ChainLater)) => Next::BackOffWithTheChain,
-        Some((_, Cure::Later)) => Next::BackOff,
-        Some((_, Cure::Person)) | None => Next::Stop(LeaseStop::Refused(rule.to_owned())),
+fn by_rule(rule: &str, presented: Presented) -> Next {
+    let Some(&(name, cure)) = RULES.iter().find(|(name, _)| *name == rule) else {
+        return Next::Stop(LeaseStop::Refused(UNKNOWN_RULE));
+    };
+    match cure {
+        // A lease the service has just signed is not one the host has seen before: if it refuses
+        // that as ended or replaced, asking for another is refused the same way, as it is when
+        // this host's clock is far from the service's.
+        Cure::Ask if presented.fresh => Next::Mistrusted(LeaseStop::Refused(name)),
+        Cure::Ask => Next::Now,
+        Cure::Chain if presented.with_chain => Next::Doubtful(LeaseStop::Refused(name)),
+        Cure::Chain => Next::WithTheChain,
+        Cure::ChainLater => Next::BackOffWithTheChain,
+        Cure::Later => Next::BackOff,
+        Cure::Person => Next::Stop(LeaseStop::Refused(name)),
     }
 }
 
