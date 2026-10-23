@@ -785,6 +785,7 @@ impl Controller {
             Some(keeper) => keeper.doctor_check(self),
             None => crate::relay_leases::RelayKeeper::unconfigured_check(),
         });
+        checks.push(self.managed_services_check());
         checks.push(match &self.mailbox_reader {
             Some(reader) => reader.doctor_check(self),
             None => crate::mailbox_reader::MailboxReader::unconfigured_check(),

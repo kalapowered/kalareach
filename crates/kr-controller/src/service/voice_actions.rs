@@ -6,10 +6,8 @@ use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
-use kr_protocol::service::GatewayOrigin;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::voice::{VoiceDelegateResult, VoiceDelegationOutcome};
-use kr_voice::broker::ManagedVoiceService;
 
 use crate::error::{ControllerError, Result};
 
@@ -92,7 +90,7 @@ impl Controller {
             self.sharing.host_device_id(),
             self.me.clone(),
         ));
-        let provider = self.managed_voice_provider();
+        let provider = self.clients.managed_inference.clone();
         let module = crate::voice::VoiceModule::new(
             Arc::new(crate::voice::ControllerFacts::new(self.me.clone())),
             authority,
@@ -114,47 +112,6 @@ impl Controller {
             daemon: Arc::downgrade(self),
         }));
         let _ = self.voice.set(module);
-    }
-
-    /// The managed broker the configuration document names, reached over a transport of its own
-    /// through the proxy that document selects, or none where it names none.
-    ///
-    /// A host that cannot reach the broker it names still starts: the transport is built on its
-    /// first use and says why when it cannot be, and a broker the document names wrongly is a
-    /// document the daemon refused before it got here. What is reported here is what leaves a
-    /// device with no broker where the document names one.
-    fn managed_voice_provider(&self) -> Option<Arc<dyn ManagedVoiceService>> {
-        let origin = self.started.voice.broker_origin()?;
-        let unavailable = |reason: &dyn std::fmt::Display| {
-            eprintln!("kr-controller: managed voice is not attached: {reason}");
-        };
-        let origin_unusable = |error: &dyn std::fmt::Display| {
-            unavailable(&format_args!(
-                "voice.broker_origin in this host's configuration document is not usable: {error}"
-            ));
-        };
-        let gateway = GatewayOrigin::new(origin)
-            .inspect_err(|error| origin_unusable(error))
-            .ok()?;
-        // A proxy the document selects and this host cannot read is never gone around; the error
-        // names `network.proxy_url` itself.
-        let proxy = self
-            .started_outbound()
-            .and_then(|route| route.proxy().map(|proxy| proxy.cloned()))
-            .inspect_err(|error| unavailable(error))
-            .ok()?;
-        let transport = Arc::new(crate::managed_transport::ManagedTransport::new(
-            gateway,
-            proxy,
-            crate::managed_transport::VOICE_DEADLINES,
-        ));
-        crate::voice::VoiceModule::managed_provider(
-            origin,
-            transport,
-            self.account.tokens_for(origin),
-        )
-        .inspect_err(|error| origin_unusable(error))
-        .ok()
     }
 
     /// The environment's voice service.

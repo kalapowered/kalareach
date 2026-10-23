@@ -699,32 +699,44 @@ impl Controller {
             setup.paths.runtime_root(),
         )?);
         // The managed storage service this host uploads its backups to, when its configuration
-        // document selects one. Its clients are built here, from that document and from nothing a
-        // process inherited, and they sign as a writer key only this host holds, made the first
-        // time one is needed and loaded after that. They go through the proxy this daemon started
-        // with, the endpoint's own. Nothing runs yet: settling comes before the store is
-        // reconciled, and the carrier starts after it.
-        let (backup_runtime, relay_parts, backup_production) = match started.storage.origin() {
-            None => (None, None, None),
+        // document selects one, and the writer key only this host holds that its uploads are
+        // signed with, made the first time one is needed and loaded after that.
+        let storage_parts = match started.storage.origin() {
+            None => None,
             Some(origin) => {
-                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
-                    ControllerError::NotConfigured(format!(
-                        "{} in this host's configuration document ({}) is not usable: {error}",
-                        kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
-                        kr_protocol::hostinfo::configuration::FILE_NAME,
-                    ))
-                })?;
+                let origin = super::clients::selected_origin(
+                    &kr_protocol::hostinfo::configuration::STORAGE_ORIGIN,
+                    origin,
+                )?;
                 let writer = kr_crypto::store::load_or_create_backup_writer(
                     &*secret_store,
                     &net::device_key_scope(setup.environment_id),
                 )
                 .map_err(ControllerError::registry)?;
-                let clients = crate::backup::runtime::managed_clients(
-                    &origin,
-                    Self::outbound_of(&started)?.proxy()?,
-                    &writer,
-                    &account.bound_tokens_for(origin.as_str(), backup.binding()),
-                )?;
+                Some((origin, writer))
+            }
+        };
+        // The clients this host holds for its whole life, built here from that document and from
+        // nothing a process inherited. They go through the proxy this daemon started with, the
+        // endpoint's own, and nothing runs yet: settling comes before the store is reconciled,
+        // and the carrier starts after it.
+        let clients = Self::build_service_clients(
+            &started,
+            &super::clients::ClientParts {
+                account: &account,
+                host_key: &device_keys.authorisation,
+                storage: storage_parts.as_ref().map(|(origin, writer)| {
+                    super::clients::StorageParts {
+                        origin,
+                        writer,
+                        binding: backup.binding(),
+                    }
+                }),
+            },
+        )?;
+        let (backup_runtime, relay_parts, backup_production) = match storage_parts {
+            None => (None, None, None),
+            Some((origin, writer)) => {
                 // Kept for the owner's setup, which signs the writer's enrolment with the host's
                 // device authorisation key and names the producer by its stored-envelope key.
                 let host_owner_key = device_keys.authorisation.clone();
@@ -813,31 +825,23 @@ impl Controller {
                 (None, None) => crate::relay_leases::record::Kept::Nothing,
             },
         )?;
-        let relay_keeper = match started.relay.origin() {
-            None => None,
-            Some(origin) => {
-                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
-                    ControllerError::NotConfigured(format!(
-                        "{} in this host's configuration document ({}) is not usable: {error}",
-                        kr_protocol::hostinfo::configuration::RELAY_ORIGIN.key,
-                        kr_protocol::hostinfo::configuration::FILE_NAME,
-                    ))
-                })?;
-                let service = crate::relay_leases::managed_service(
-                    &origin,
-                    Self::outbound_of(&started)?.proxy()?,
-                    Arc::new(crate::push::sender::HostSigner::new(
-                        device_keys.authorisation.clone(),
-                    )),
+        let relay_keeper = match (started.relay.origin(), clients.relay_leases.as_ref()) {
+            (Some(origin), Some(service)) => {
+                let origin = super::clients::selected_origin(
+                    &kr_protocol::hostinfo::configuration::RELAY_ORIGIN,
+                    origin,
                 )?;
                 Some(crate::relay_leases::RelayKeeper::new(
-                    service,
+                    Arc::clone(service),
                     &origin,
                     Arc::clone(&account),
                     lease_record,
                     Arc::clone(&timer),
                 ))
             }
+            // No relay lease service is selected, and the builder holds a client of it exactly
+            // when one is.
+            _ => None,
         };
         // The mailbox this host reads: a remote owner's announcement that the authority feed
         // changed is placed in the mailbox of the service that holds the feed, so the host reads
@@ -1096,6 +1100,7 @@ impl Controller {
             supervisor,
             plugin_runtimes,
             backup,
+            clients,
             backup_runtime,
             backup_relay,
             backup_setup,

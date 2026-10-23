@@ -1319,12 +1319,16 @@ enrolment and a fetch spend nothing and carry no token.
   `services::managed_response_limits` gives each path a bound of its own.
 
 Two things call the storage and backup manifest clients: the host's outbox uploader,
-`kr_controller::backup::uploader`, which the daemon runs from the `ServiceClients` it fills when
-its configuration selects a storage origin (`kr_controller::backup::runtime`), and the device's
-settings archive, `recovery::SettingsArchive`, below.
+`kr_controller::backup::uploader`, which the daemon runs from the `ServiceClients` it builds when it
+starts, with the storage and backup manifest slots filled when its configuration selects a storage
+origin (`kr_controller::backup::runtime`), and the device's settings archive,
+`recovery::SettingsArchive`, below.
 
 The relay-lease client has one caller: the daemon's lease keeper, `kr_controller::relay_leases`,
-which `docs/host/README.md` describes.
+which `docs/host/README.md` describes. The daemon builds that client, the account service client, the
+storage and backup manifest clients and the managed inference broker together, into the one
+`ServiceClients` it holds, and `kr doctor` reads `ServiceClients::availability` from it for the
+`managed-services` check.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
