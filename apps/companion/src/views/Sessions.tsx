@@ -262,8 +262,9 @@ export function Sessions(): ReactNode {
               <span className="host-column mono" role="cell">
                 {session.cwd}
               </span>
-              <span className="agent-column" role="cell">
-                {applicationName(session)}
+              <span className="agent-column" role="cell" data-testid="application-name">
+                {applicationName(session) ??
+                  (session.state === 'closed' ? <span className="faint">None</span> : null)}
               </span>
               <span className="agent-column" role="cell" data-testid="attachment-count">
                 {session.attachment_count}
