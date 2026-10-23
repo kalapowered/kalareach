@@ -32,6 +32,11 @@ use kr_plugin_service::vocabulary::{Admission, BindingFacts, MAX_NODE_BYTES};
 /// How long a test waits for a compile. Generous: a machine under load is not the case under test.
 const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 
+/// How long a case waits for what a binding's thread does before it calls that a failure. Nothing
+/// is decided by it: the waits are on conditions, and this ends only a binding that never gets
+/// there.
+const LIVENESS: core::time::Duration = core::time::Duration::from_secs(60);
+
 /// A cache directory that removes itself, the runtime built over it, and who its bindings belong to.
 struct Host {
     _directory: tempfile::TempDir,
@@ -1733,7 +1738,9 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    let host = host();
+    // The runtime's epoch is held: a snapshot is stopped by its deadline only when a test advances
+    // the epoch, so a pass that starts late cannot make the component fault.
+    let host = held_host();
     let (events, mut received) = events();
     let handle = host
         .runtime
@@ -1757,7 +1764,7 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     // here would race the pump, which may already have discharged it by the next line.
     handle.require_snapshot();
 
-    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + LIVENESS;
     let mut drew = false;
     while !drew && std::time::Instant::now() < deadline {
         match next_event(&mut received, core::time::Duration::from_millis(200)).await {
@@ -1778,7 +1785,7 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     // leaves the obligation standing. Holding the document therefore says the component drew, not
     // that the binding has finished with the obligation, so this waits for it as the loop above
     // waits for the document.
-    let cleared_by = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    let cleared_by = std::time::Instant::now() + LIVENESS;
     while handle.snapshot_required() && std::time::Instant::now() < cleared_by {
         tokio::time::sleep(core::time::Duration::from_millis(10)).await;
     }
