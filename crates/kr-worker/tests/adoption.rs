@@ -1335,6 +1335,87 @@ async fn kr_req_03_27_the_command_the_integration_answered_for_names_the_program
     typing.close().await;
 }
 
+/// A shell that is not yet running the script the line named, and then execs the interpreter on
+/// it, is named for the script once it runs it: the process and its image are the same before and
+/// after, and the look before the exec found the script not running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shell_that_execs_the_script_the_line_named_is_named_for_it_once_it_runs_it() {
+    use kr_worker::application::Following;
+
+    let setup = Setup::new();
+    let go = setup.host.root().join("go");
+    let assistant = setup.host.root().join("assistant");
+    script(&assistant, "#!/bin/sh\nsleep 60\ntrue\n");
+    let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
+    let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
+    let mut following = Following::new(Arc::clone(&producer));
+
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; exec /bin/sh '{}'",
+        go.display(),
+        assistant.display()
+    ));
+    let started = setup.spawn_in_a_group(command);
+    let foreground = Setup::foreground(&started, vec![(assistant.display().to_string(), None)]);
+    let before = look_until_name(&mut following, &producer, &foreground, |_| true);
+    assert_ne!(
+        before, "assistant",
+        "a shell that is not running the script the line named is not named for it"
+    );
+
+    std::fs::write(&go, b"").expect("lets the shell exec the script");
+    let after = look_until_name(&mut following, &producer, &foreground, |name| {
+        name == "assistant"
+    });
+    assert_eq!(after, "assistant", "the script it runs now names it");
+    started.end();
+    typing.close().await;
+}
+
+/// A script that execs the interpreter that runs it on another script is no longer named for the
+/// script it was: the process and its image are the same before and after, and the look before
+/// the exec found the script running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_that_execs_its_interpreter_on_another_script_is_no_longer_named_for_itself() {
+    use kr_worker::application::Following;
+
+    let setup = Setup::new();
+    let go = setup.host.root().join("go");
+    let (assistant, other) = (
+        setup.host.root().join("assistant"),
+        setup.host.root().join("other"),
+    );
+    script(
+        &assistant,
+        &format!(
+            "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nexec /bin/sh '{}'\n",
+            go.display(),
+            other.display()
+        ),
+    );
+    script(&other, "#!/bin/sh\nsleep 60\ntrue\n");
+    let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
+    let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
+    let mut following = Following::new(Arc::clone(&producer));
+
+    let started = setup.start_script(&assistant);
+    let foreground = Setup::foreground(&started, vec![(assistant.display().to_string(), None)]);
+    let before = look_until_name(&mut following, &producer, &foreground, |_| true);
+    assert_eq!(before, "assistant", "the script it runs names it");
+
+    std::fs::write(&go, b"").expect("lets the script exec another");
+    let after = look_until_name(&mut following, &producer, &foreground, |name| {
+        name != "assistant"
+    });
+    assert_ne!(
+        after, "other",
+        "the script the line did not name is not what names the program"
+    );
+    started.end();
+    typing.close().await;
+}
+
 /// Looks at `foreground` until two looks in a row have found the same group and the program is
 /// named, and says the name.
 fn look_until_named(
@@ -1342,16 +1423,32 @@ fn look_until_named(
     producer: &kr_worker::application::Producer,
     foreground: &Foreground,
 ) -> String {
+    look_until_name(following, producer, foreground, |_| true)
+}
+
+/// Looks at `foreground` until the program is named and `wanted` accepts the name, and says it.
+fn look_until_name(
+    following: &mut kr_worker::application::Following,
+    producer: &kr_worker::application::Producer,
+    foreground: &Foreground,
+    wanted: impl Fn(&str) -> bool,
+) -> String {
     let started = std::time::Instant::now();
     loop {
         following.look(Some(foreground));
-        if let Some(name) = producer.application().name {
-            return name;
+        match producer.application().name {
+            Some(name) if wanted(&name) => return name,
+            Some(name) => {
+                assert!(
+                    started.elapsed() < LIVENESS,
+                    "the program was still named {name:?} after {LIVENESS:?}"
+                );
+            }
+            None => assert!(
+                started.elapsed() < LIVENESS,
+                "no program was named within {LIVENESS:?}"
+            ),
         }
-        assert!(
-            started.elapsed() < LIVENESS,
-            "no program was named within {LIVENESS:?}"
-        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
