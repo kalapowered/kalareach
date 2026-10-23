@@ -287,8 +287,9 @@ from the flags to decide what a launch admits. A package that installs a native 
 bridge its installation put in place, or none where the installation did not. A package that
 installs none gets a hook bridge of its own; Qoder CLI's inline settings, for example, register its
 hook by naming `kr-hook` as a bare command. Where a hook is registered and how its command is spelt
-decide nothing: a bridge is admitted only when it says it is the package's own and runs this
-installation's own `kr-hook`, under the launch's registration and credential.
+decide nothing: a bridge is admitted only when it says it is for the application the package
+declares and runs this installation's own `kr-hook`, under the launch's registration and
+credential.
 
 ### The launch probe
 
