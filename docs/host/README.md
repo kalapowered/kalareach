@@ -2438,9 +2438,11 @@ disk or the session on such a request, it still reads on, and hands the batch to
 once. Once it holds sixteen of these requests the worker stops reading ahead, and a batch it has not
 read by then waits for the request that is running. Every other mutation, an attach, a detach, an
 input acquire, release or interrupt, or a close among them, and every frame that is not a request
-still holds a batch back, so the batch meets the state the client asked for. The exception is a
-`plugin.action.invoke` that a component prepares: a batch sent while the component prepares it is
-taken before the action's effect. A key sent right after a resize can reach the application before
+still holds a batch back, so the batch meets the state the client asked for. The exceptions are a
+`shell.launch` that waits for the reader, the five agent mutations and a `plugin.action.invoke` that
+goes to an upstream, whose answers a task of their own writes later, and a `plugin.action.invoke`
+that a component prepares: a batch sent while the component prepares it is taken before the
+action's effect. A key sent right after a resize can reach the application before
 the pseudo-terminal has its new size, and a read sent before a key can show what the key did.
 
 A paired device's keystroke batches take the same short way through the control daemon. Without it,
@@ -2796,8 +2798,11 @@ caller presents. That key proves possession and nothing else. The command line o
 challenge at an interactive controlling terminal outside a KalaReach session, which protects against
 an agent starting the ceremony by accident; it is not isolation from other code running under the
 same account. The commit that pairs the first owner device writes the owner record in the same
-transaction, and from then on the terminal channel is refused for good, even if every owner device
-is later revoked: revoking authority must never turn into a weaker way to confirm.
+transaction, and from then on the terminal channel is refused, even if every owner device is later
+revoked: revoking authority must never turn into a weaker way to confirm. The one exception is the
+end of exclusive management on a host that is exclusively organisation-managed, has an owner and
+has no owner device left that could confirm; it is described under the organisation's exclusive
+management.
 
 **Owner confirmations.** Six actions need a fresh confirmation bound to the exact action. A caller
 asks with `owner.confirmation.request`, naming a subject; the host fills in the action, the digest,
@@ -4668,8 +4673,10 @@ an action this host may already have performed is answered from it; when it sett
 host's own maintenance takes its content then.
 
 Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
-can still page through, and there is no semantic-history cache or generated-title store in the
-worker at all. Neither is described here as though it were done.
+can still page through, and the worker keeps a bounded log of the semantic entries that a bound
+agent's bridge observed (up to 4,096 for each instance, the text of notifications and details
+included), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
+described here as though it were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has
