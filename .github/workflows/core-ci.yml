@@ -1799,12 +1799,14 @@ jobs:
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd --force --name "$avd" \
             --package "system-images;android-36;google_apis_playstore_ps16k;x86_64" --device pixel
           # The application and the libraries it unpacks are more than the default data partition.
-          echo "disk.dataPartition.size=8192M" >> "$HOME/.android/avd/$avd.avd/config.ini"
+          config="$HOME/.android/avd/$avd.avd/config.ini"
+          sed -i '/^disk\.dataPartition\.size=/d' "$config"
+          echo "disk.dataPartition.size=8192M" >> "$config"
           "$ANDROID_HOME/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot \
             -gpu swiftshader_indirect -accel on > "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log" 2>&1 &
           emulator=$!
           trap 'kill "$emulator" 2> /dev/null || true' EXIT
-          serial=emulator-5554
+          serial="emulator-5554"
           started=$SECONDS
           until [ "$(adb -s "$serial" shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; do
             if ! kill -0 "$emulator" 2> /dev/null; then
