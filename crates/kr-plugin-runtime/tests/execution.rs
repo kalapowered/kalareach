@@ -56,6 +56,20 @@ fn host_with(adjust: impl FnOnce(&mut RuntimeConfig)) -> Host {
     }
 }
 
+/// A runtime whose epoch no time advances, for the tests of what a binding does with the events it
+/// is given: a call is stopped by its deadline only when a test advances the epoch, so a machine
+/// that stalls a call for as long as it likes cannot reach one.
+fn held_host() -> Host {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let config = RuntimeConfig::new(directory.path().join("plugin-cache"));
+    let runtime = Runtime::with_epoch_held(config).expect("a runtime");
+    Host {
+        _directory: directory,
+        runtime: Arc::new(runtime),
+        owner: BindingOwner::next(),
+    }
+}
+
 fn engine() -> RuntimeEngine {
     RuntimeEngine::new().expect("an engine")
 }
@@ -1344,7 +1358,7 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    let host = host();
+    let host = held_host();
     let (events, mut received) = events();
     let compiled = host
         .runtime
@@ -1366,26 +1380,29 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
         .expect("the component instantiates");
 
     // Filling the queue faster than the component drains it. Each event is 64 KiB, so sixty-five
-    // of them are already more than the 4 MiB the queue holds, and two hundred and fifty-six
-    // arrive long before the component has read the first few.
+    // of them are already more than the 4 MiB the queue holds. Events are offered until the queue
+    // says it overflowed: how many that takes depends on how fast the component reads and how
+    // fast this thread runs, so the count decides nothing, and the limit only ends a queue that
+    // never overflows.
     let filler = "y".repeat(64 * 1024);
-    let mut gapped = false;
-    for index in 0..256 {
+    let mut offered = 0_u32;
+    loop {
         let admission =
-            handle.enqueue_observation(components::scrape(&format!("se-{index}"), &filler));
-        if matches!(admission, Admission::QueuedWithGap { .. }) {
-            gapped = true;
-        }
+            handle.enqueue_observation(components::scrape(&format!("se-{offered}"), &filler));
+        offered += 1;
         assert!(
             handle.queued_bytes() <= OBSERVATION_QUEUE_BYTES,
             "the queue holds {} bytes, over its {OBSERVATION_QUEUE_BYTES} byte bound",
             handle.queued_bytes()
         );
+        if matches!(admission, Admission::QueuedWithGap { .. }) {
+            break;
+        }
+        assert!(
+            offered < 100_000,
+            "{offered} observations of 64 KiB did not overflow a 4 MiB queue"
+        );
     }
-    assert!(
-        gapped,
-        "two hundred and fifty-six 64 KiB observations did not overflow a 4 MiB queue"
-    );
 
     // The gap is reported, and a snapshot follows it.
     let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
