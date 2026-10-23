@@ -23,11 +23,13 @@ class PushReceiverTest {
 
     private val now = 1_763_000_000_000L
 
+    private val registration = "2e749a03-c158-4d62-a019-6f3bd784215c"
+
     private fun file() = File(folder.root, "pending.json")
 
     private fun pendingText(deadlineMillis: Long = now + 60_000, state: String = "pending") =
         JSONObject()
-            .put("registration_id", "2e749a03-c158-4d62-a019-6f3bd784215c")
+            .put("registration_id", registration)
             .put("token_digest", "vluKsRhhTV5NI9BuJZCyN2OsL1hi2yQbHXhFhtHMqmQ")
             .put("gateway_origin", "https://reach.kala.to")
             .put("platform", "android")
@@ -53,25 +55,41 @@ class PushReceiverTest {
     fun onlyAPendingRecordMovesAndAReplacedOrExpiredOneIsLeftAlone() {
         val record = PendingFile(file())
         record.write(pendingText())
-        assertTrue(record.mark(PendingFile.ANSWERED, null, now))
+        assertTrue(record.mark(registration, PendingFile.ANSWERED, null, now))
         assertEquals("answered", stateOf(record))
-        assertFalse("an answered record is not moved again", record.mark(PendingFile.REFUSED, "late", now))
+        assertFalse("an answered record is not moved again", record.mark(registration, PendingFile.REFUSED, "late", now))
         assertEquals("answered", stateOf(record))
 
         record.write(pendingText(deadlineMillis = now + 1))
-        assertFalse(record.mark(PendingFile.ANSWERED, null, now + 1))
+        assertFalse(record.mark(registration, PendingFile.ANSWERED, null, now + 1))
         assertEquals("expired", stateOf(record, now + 1))
 
         record.clear()
         assertNull(record.read(now))
-        assertFalse(record.mark(PendingFile.ANSWERED, null, now))
+        assertFalse(record.mark(registration, PendingFile.ANSWERED, null, now))
+    }
+
+    @Test
+    fun aTryThatOutlivedItsRegistrationCannotMoveItsReplacement() {
+        val record = PendingFile(file())
+        record.write(pendingText())
+        val replacement =
+            JSONObject(pendingText())
+                .put("registration_id", "9a0f4c2e-6b1d-4c53-8e8a-7d1f2b3c4d5e")
+                .toString()
+        // The later registration replaces the record while the earlier one's post is in flight.
+        PendingFile(file()).write(replacement)
+        assertFalse(record.mark(registration, PendingFile.REFUSED, "gateway_403", now))
+        assertEquals("pending", stateOf(record))
+        assertTrue(record.mark("9a0f4c2e-6b1d-4c53-8e8a-7d1f2b3c4d5e", PendingFile.ANSWERED, null, now))
+        assertEquals("answered", stateOf(record))
     }
 
     @Test
     fun aNewRegistrationReplacesTheOldOneWhole() {
         val record = PendingFile(file())
         record.write(pendingText())
-        record.mark(PendingFile.REFUSED, "gateway_403", now)
+        record.mark(registration, PendingFile.REFUSED, "gateway_403", now)
         record.write(pendingText(deadlineMillis = now + 120_000))
         val read = JSONObject(record.read(now)!!)
         assertEquals("pending", read.getString("state"))
@@ -197,6 +215,56 @@ class PushReceiverTest {
             answerer(Crypto(goOn), Seeds(null), gateway).answer(challenge)
         )
         assertTrue(gateway.posted.isEmpty())
+    }
+
+    @Test
+    fun aKeyThatCannotBeReadIsAnsweredLikeOneThatIsNotThereAndTheReceiverDoesNotFail() {
+        val unreadable = SeedSource { throw java.security.GeneralSecurityException("the key store is locked") }
+        val gateway = Gateway(PostResult.Status(200))
+        val record = PendingFile(file()).also { it.write(pendingText()) }
+        val outcome = ChallengeAnswerer(record, Crypto(goOn), unreadable, gateway) { now }.answer(challenge)
+        assertEquals(ChallengeOutcome.Ignored("key_missing"), outcome)
+        assertTrue(gateway.posted.isEmpty())
+        assertEquals("pending", stateOf(record))
+    }
+
+    @Test
+    fun theSchedulerIsHandedTheAnswerAfterItIsSignedAndBeforeItIsPosted() {
+        val order = mutableListOf<String>()
+        val gateway =
+            object : GatewayPost {
+                override fun post(url: String, body: ByteArray): PostResult {
+                    order.add("posted")
+                    return PostResult.Status(200)
+                }
+            }
+        val crypto =
+            object : ChallengeCrypto {
+                override fun classify(input: String): String = goOn
+
+                override fun sign(input: String, seed: ByteArray): String {
+                    order.add("signed")
+                    return """{"ok":true,"url":"https://reach.kala.to/api/push/installation/register","body":"{}"}"""
+                }
+            }
+        val record = PendingFile(file()).also { it.write(pendingText()) }
+        val outcome =
+            ChallengeAnswerer(record, crypto, Seeds(ByteArray(32)), gateway, { order.add("handed") }) { now }
+                .answer(challenge)
+        assertEquals(ChallengeOutcome.Answered, outcome)
+        assertEquals(listOf("signed", "handed", "posted"), order)
+
+        // A message the decision refuses is handed to nobody.
+        var handed = false
+        ChallengeAnswerer(
+                PendingFile(file()).also { it.write(pendingText()) },
+                Crypto("""{"verdict":"refused","reason":"token"}"""),
+                Seeds(ByteArray(32)),
+                Gateway(PostResult.Status(200)),
+                { handed = true }
+            ) { now }
+            .answer(challenge)
+        assertFalse("nothing is handed to the scheduler for a message that is refused", handed)
     }
 
     @Test

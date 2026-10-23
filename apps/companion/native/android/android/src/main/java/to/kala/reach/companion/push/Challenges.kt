@@ -21,12 +21,13 @@ import to.kala.reach.platform.KeystoreSealer
 object Challenges {
     fun record(context: Context): PendingFile = PushStores.pending(context.noBackupFilesDir)
 
-    fun answerer(context: Context): ChallengeAnswerer =
+    fun answerer(context: Context, beforePosting: () -> Unit = {}): ChallengeAnswerer =
         ChallengeAnswerer(
             record = record(context),
             crypto = RustChallengeCrypto(),
             seeds = KeystoreSeeds(context),
-            gateway = UrlConnectionPost()
+            gateway = UrlConnectionPost(),
+            beforePosting = beforePosting
         )
 }
 
