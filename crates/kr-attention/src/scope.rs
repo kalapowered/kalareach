@@ -116,6 +116,18 @@ impl Viewer<'_> {
         }
     }
 
+    /// Whether this caller's history reaches back to every moment, so that nothing the host
+    /// recorded lies outside what it may be shown.
+    ///
+    /// The owner's does, and so does a device's whose grant starts at the beginning of time.
+    #[must_use]
+    pub fn reaches_every_moment(&self) -> bool {
+        match self {
+            Self::Owner => true,
+            Self::Device(scope) => scope.history_from_ms == 0,
+        }
+    }
+
     /// Whether this caller may be told about one gap.
     ///
     /// A gap names a session and a range of its records, which is itself something about that

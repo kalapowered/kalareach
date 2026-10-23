@@ -131,6 +131,8 @@ pub enum Mutation<'a> {
     },
     /// `visit.acknowledge`.
     Visit {
+        /// Who is asking, which bounds how far its visit can have got.
+        viewer: &'a Viewer<'a>,
         /// The session visited.
         session_id: SessionId,
         /// The semantic cursor the caller has seen up to.
@@ -788,11 +790,12 @@ impl Attention {
     pub fn acknowledge_visit(
         &mut self,
         actor: &ActorId,
+        viewer: &Viewer<'_>,
         session_id: SessionId,
         cursor: u64,
         views: Vec<LogViewState>,
     ) -> Result<VisitAcknowledgeResult> {
-        self.try_commit(|state| visit_in(state, actor, session_id, cursor, views))
+        self.try_commit(|state| visit_in(state, actor, viewer, session_id, cursor, views))
     }
 
     /// Performs one of the group's mutations as an action, answering an exact repeat from its
@@ -844,10 +847,13 @@ impl Attention {
                 } => review_in(state, &actor, viewer, subject, version, reading)
                     .map(Answer::Reviewed),
                 Mutation::Visit {
+                    viewer,
                     session_id,
                     cursor,
                     views,
-                } => visit_in(state, &actor, session_id, cursor, views).map(Answer::Visited),
+                } => {
+                    visit_in(state, &actor, viewer, session_id, cursor, views).map(Answer::Visited)
+                }
             },
             admit,
             |answer| {
@@ -948,13 +954,15 @@ impl Attention {
         content: Content,
     ) -> Result<ChangedPage> {
         self.live()?;
-        let changed = self.state.visits.changed_since(
-            actor,
-            session_id,
-            max_changes,
-            oldest_output_cursor,
-            &|at_ms| viewer.reaches(Some(at_ms)),
-        );
+        let changed = with_reach_of(viewer, |reach| {
+            self.state.visits.changed_since(
+                actor,
+                session_id,
+                max_changes,
+                oldest_output_cursor,
+                reach,
+            )
+        });
         let texts = if content == Content::Whole {
             changed
                 .changes
@@ -1018,7 +1026,7 @@ impl Attention {
         subject: &ReviewSubject,
     ) -> Result<Option<ReviewState>> {
         self.live()?;
-        if !viewer.sees_session(crate::review::subject_session(subject)) {
+        if !self.state.reviews.shows(viewer, subject) {
             return Ok(None);
         }
         Ok(self.state.reviews.state(actor, subject))
@@ -1192,8 +1200,9 @@ fn review_in(
 ) -> Result<ReviewAcknowledgeResult> {
     admit(state, actor)?;
     // A subject outside the caller's scope is answered exactly as one the store never held, so
-    // an acknowledgement cannot be used to find out what exists beyond it.
-    if !viewer.sees_session(crate::review::subject_session(subject)) {
+    // an acknowledgement cannot be used to find out what exists beyond it. The scope is the
+    // session it may see and the moment its history reaches back to.
+    if !state.reviews.shows(viewer, subject) {
         return Err(crate::Error::UnknownReviewSubject {
             subject: crate::review::subject_key(subject),
         });
@@ -1221,19 +1230,31 @@ fn review_in(
     })
 }
 
+/// Runs `with` on how far back a viewer's history reaches into a session's change log.
+fn with_reach_of<T>(viewer: &Viewer<'_>, with: impl FnOnce(crate::visit::Reach<'_>) -> T) -> T {
+    let reaches = |at_ms| viewer.reaches(Some(at_ms));
+    with(crate::visit::Reach {
+        reaches: &reaches,
+        every_moment: viewer.reaches_every_moment(),
+    })
+}
+
 /// Records one actor's visit on a candidate state.
 fn visit_in(
     state: &mut State,
     actor: &ActorId,
+    viewer: &Viewer<'_>,
     session_id: SessionId,
     cursor: u64,
     views: Vec<LogViewState>,
 ) -> Result<VisitAcknowledgeResult> {
     admit(state, actor)?;
     let revision = bump(state, actor);
-    let visit = state
-        .visits
-        .acknowledge(actor, session_id, cursor, views, revision);
+    let visit = with_reach_of(viewer, |reach| {
+        state
+            .visits
+            .acknowledge(actor, session_id, cursor, views, revision, reach)
+    });
     Ok(VisitAcknowledgeResult {
         actor_id: actor.clone(),
         acknowledged_cursor: U64::new(visit.cursor),

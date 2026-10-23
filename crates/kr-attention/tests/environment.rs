@@ -1851,7 +1851,13 @@ fn a_write_changes_only_the_rows_that_changed() {
         0,
     );
     attention
-        .acknowledge_visit(&actor("local:501"), session(3), 1, Vec::new())
+        .acknowledge_visit(
+            &actor("local:501"),
+            &Viewer::Owner,
+            session(3),
+            1,
+            Vec::new(),
+        )
         .expect("the store records the visit");
 
     // Every row written from here on is counted, table by table.
@@ -2101,7 +2107,13 @@ fn a_store_reopens_exactly_as_it_was_written() {
             }
             8 => {
                 attention
-                    .acknowledge_visit(&actor("local:501"), session_id, choices.next(6), Vec::new())
+                    .acknowledge_visit(
+                        &actor("local:501"),
+                        &Viewer::Owner,
+                        session_id,
+                        choices.next(6),
+                        Vec::new(),
+                    )
                     .expect("recorded");
             }
             9 => {
