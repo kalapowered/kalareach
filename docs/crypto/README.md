@@ -91,7 +91,9 @@ with a fixed nonce. The fixture documents say so, and nothing else does it.
 either built from a domain and its elements or built from bytes another module produced and then
 checked: the bytes must decode as a canonical array whose first element is the claimed domain. The
 three transcripts the specification writes as arrays reach a signature that way, and nothing else
-can. The domains this crate and `kr-protocol` define:
+can. This table lists the domains that the cryptographic primitives sign or derive under. [The
+protocol reference](../protocol/README.md#domain-separation) lists every domain of the protocol,
+which is the longer list.
 
 | Domain | Covers |
 | --- | --- |
@@ -110,9 +112,12 @@ can. The domains this crate and `kr-protocol` define:
 | `kr-recovery-bundle/1` | The retrieval context a recovery bundle's key is derived from |
 | `KRRECOV1` | The `crypto_kdf` context of the recovery seed |
 
-`kr-client` adds two digest domains of its own, neither of them a signature: `kr-collection-key-mark/1`,
-the SHA-256 of a collection key a member compares keys by without keeping them, and
-`kr-sync-membership-plan/1`, the digest that binds an owner's plan to the one operation it confirms.
+`kr-client` adds digest domains of its own, none of them a signature: `kr-collection-key-mark/1`,
+the SHA-256 of a collection key a member compares keys by without keeping them,
+`kr-sync-membership-plan/1`, the digest that binds an owner's plan to the one operation it confirms,
+`kalareach-recovery-kit-fingerprint/1`, the hash prefix of a recovery kit's fingerprint, and the
+four relay request domains that [the protocol reference](../protocol/README.md#the-relay-requests)
+lists.
 
 ## Encrypted objects
 
