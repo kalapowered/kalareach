@@ -10,6 +10,7 @@
 //! | --- | --- |
 //! | KR-REQ-19.08 | the `kr_req_19_08_` tests here |
 //! | KR-REQ-23.24 | `kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_the_quote_of_what_was_read` |
+//! | KR-REQ-13.13 | `kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows_its_conversation_only_when_retargeted` |
 
 #![cfg(unix)]
 
@@ -876,6 +877,197 @@ async fn kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_
     );
 
     upstream.release();
+    adopted.stop().await;
+}
+
+/// The conversation the host reports for `session`, read as the page reads it to bind a draft: the
+/// live instance and its binding revision.
+fn conversation(companion: &Companion, session: SessionId, opening: &str) -> (String, String) {
+    let agents = companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": opening }),
+        )
+        .expect("the session's agents are read");
+    let instance = agents["instances"]["instances"][0]["application_instance_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a live instance: {agents}"))
+        .to_owned();
+    let facts = companion
+        .call(
+            "agent_capabilities",
+            json!({
+                "params": { "subject": { "session_id": session.to_string(), "application_instance_id": instance } },
+                "opening": opening,
+            }),
+        )
+        .expect("the agent's capabilities are read");
+    let binding = facts["binding"]["binding_revision"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a binding revision: {facts}"))
+        .to_owned();
+    (instance, binding)
+}
+
+/// KR-REQ-13.13: a draft kept on the phone is the device's own: it is written and read back whole
+/// while the host is out of contact, the host's facts the page rebinds it from are read again once
+/// it returns, and when the agent has moved to another conversation the draft follows it only by
+/// the person's explicit retarget. A prompt at the conversation the draft was written for is the
+/// host's to refuse, and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows_its_conversation_only_when_retargeted()
+ {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(Upstream::default());
+    let instance = worker.register_agent(Arc::clone(&upstream));
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "screen").expect("the session opens");
+
+    // The page writes the draft for the conversation the host reports.
+    let (first_instance, first_binding) = conversation(companion, session, "screen");
+    assert_eq!(first_instance, instance.to_string());
+    let save =
+        |id: Option<&str>, revision: Option<&str>, binding: &str, state: &str, text: &str| {
+            companion.call(
+                "device_draft_save",
+                json!({ "params": {
+                "id": id,
+                "expectedRevision": revision,
+                "sessionId": session.to_string(),
+                "applicationInstanceId": instance.to_string(),
+                "agentBindingRevision": binding,
+                "state": state,
+                "text": text,
+                "attachments": []
+            } }),
+            )
+        };
+    let saved =
+        save(None, None, &first_binding, "open", "half a thought").expect("the draft is kept");
+    let id = saved["draft"]["id"].as_str().expect("an id").to_owned();
+
+    // The host stops answering and the connection for the host alone ends.
+    control.unreachable(true);
+    let (_, _, main) = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_snapshot()
+        .expect("a connection");
+    main.close();
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let state = companion
+                .call("connection_state", json!({}))
+                .expect("the connection's state");
+            if state["connected"] == false {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the connection ends");
+
+    // The draft is the device's: it is written to and read back whole with no host.
+    save(
+        Some(&id),
+        Some("1"),
+        &first_binding,
+        "open",
+        "half a thought, and more",
+    )
+    .expect("the draft is kept while the host is out of contact");
+    let kept = companion
+        .call("device_drafts", json!(null))
+        .expect("the drafts are read");
+    let drafts = kept["drafts"].as_array().expect("a list of drafts");
+    assert_eq!(drafts.len(), 1, "{kept}");
+    assert_eq!(drafts[0]["text"], "half a thought, and more");
+    assert_eq!(drafts[0]["state"], "open");
+
+    // The host returns, and what the page rebinds the draft from is the same conversation.
+    control.unreachable(false);
+    connected(companion).await;
+    open(companion, session, None, "screen-again").expect("the session opens again");
+    assert_eq!(
+        conversation(companion, session, "screen-again"),
+        (first_instance.clone(), first_binding.clone())
+    );
+
+    // The agent moves to another conversation. The host reports it, a prompt at the old one is the
+    // host's to refuse, and the store will not move the draft to the new one on a save.
+    worker
+        .service
+        .broker()
+        .advance_binding(
+            instance,
+            Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+            kr_ipc::now_ms(),
+        )
+        .expect("the binding advances");
+    let (_, moved_binding) = conversation(companion, session, "screen-again");
+    assert_ne!(
+        moved_binding, first_binding,
+        "the host reports the new conversation"
+    );
+    let refused = companion
+        .call(
+            "agent_prompt_submit",
+            json!({ "params": prompt(session, instance, "half a thought, and more"), "opening": "screen-again" }),
+        )
+        .expect_err("the host refuses a prompt for a conversation that has moved on");
+    assert!(
+        matches!(code(&refused), "DRAFT_CONFLICT" | "STALE_SESSION"),
+        "{refused}"
+    );
+    assert!(upstream.prompts().is_empty(), "nothing reached the agent");
+    let followed = save(
+        Some(&id),
+        Some("2"),
+        &moved_binding,
+        "open",
+        "half a thought, and more",
+    )
+    .expect_err("a draft with text does not follow the agent on a save");
+    assert_eq!(code(&followed), "DRAFT_CONFLICT", "{followed}");
+
+    // The person's retarget names the version they were shown, and is the one way across.
+    save(
+        Some(&id),
+        Some("2"),
+        &first_binding,
+        "conflicted",
+        "half a thought, and more",
+    )
+    .expect("the page marks the draft conflicted");
+    let moved = companion
+        .call(
+            "device_draft_retarget",
+            json!({ "params": {
+                "id": id,
+                "expectedRevision": "3",
+                "sessionId": session.to_string(),
+                "applicationInstanceId": instance.to_string(),
+                "agentBindingRevision": moved_binding
+            } }),
+        )
+        .expect("the draft is retargeted by the person");
+    assert_eq!(moved["state"], "open");
+    assert_eq!(moved["agentBindingRevision"], moved_binding.as_str());
+    assert_eq!(moved["text"], "half a thought, and more");
+    assert!(
+        upstream.prompts().is_empty(),
+        "nothing was sent by the move"
+    );
     adopted.stop().await;
 }
 
