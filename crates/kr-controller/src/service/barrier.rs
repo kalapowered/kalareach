@@ -79,6 +79,15 @@ impl Retries {
         }
     }
 
+    /// What the read-back at a restart may spend: nothing, so that it is one exchange for each
+    /// revision it asks about and no more.
+    fn none() -> Self {
+        Self {
+            left: 0,
+            ..Self::for_an_announcement()
+        }
+    }
+
     /// What one run of the evidence pass may spend.
     fn for_the_pass() -> Self {
         Self {
@@ -1471,9 +1480,9 @@ impl Controller {
     /// has taken them all, and a replacement controller has taken none, so it still holds them
     /// for the newest [`kr_worker::journal::MAX_HELD_REVOCATIONS`] revocations. The first page is
     /// asked for each of the revisions at or below the one the registry holds the worker as having
-    /// acknowledged, that many at most. The answers carry into no result: each opens a report of
-    /// its own, which a repeat of that revocation reads, and the pages that follow the first are
-    /// collected by the evidence pass. The daemon keeps a report for
+    /// acknowledged, that many at most, in one exchange each and none asked again. The answers
+    /// carry into no result: each opens a report of its own, which a repeat of that revocation
+    /// reads, and the pages that follow the first are collected by the evidence pass. The daemon keeps a report for
     /// [`crate::authority::MAX_HELD_FENCE_REPORTS`] revisions of a worker in all, so the older of
     /// these go first when the start's own announcement has read more. A revision older than those
     /// answers as it was first given.
@@ -1501,7 +1510,7 @@ impl Controller {
 
     /// As [`Self::recover_what_workers_hold`], on this task.
     async fn read_back_what_workers_hold(&self, workers: &[(SessionId, AuthorityRevision)]) {
-        let mut retries = Retries::for_an_announcement();
+        let mut retries = Retries::none();
         for (session_id, held) in workers {
             let oldest = held
                 .get()
