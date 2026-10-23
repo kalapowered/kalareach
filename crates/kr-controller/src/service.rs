@@ -1270,6 +1270,10 @@ mod a_collection_started_with_the_daemon;
 #[cfg(test)]
 mod a_copy_a_viewer_may_hold;
 
+/// A worker the kernel confirms has ended, whose published endpoint cannot be removed.
+#[cfg(all(test, unix))]
+mod a_crash_whose_endpoint_cannot_be_removed;
+
 /// The sessions a daemon finds recorded in an earlier boot, when another recovery holds one.
 #[cfg(test)]
 mod a_previous_boot_left_to_a_held_recovery;

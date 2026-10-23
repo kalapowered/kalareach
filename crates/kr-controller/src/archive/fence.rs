@@ -105,6 +105,24 @@ impl Fenced {
             coverage: OwnershipCoverage::Incomplete,
         }
     }
+
+    /// Returns what a closure records when the worker is gone and its published endpoint could not
+    /// be removed, so that nothing the session owned was looked for or stopped.
+    ///
+    /// The record says so: it lists the reason among what this host could not account for, which
+    /// also keeps the session's registration as a writer until the daemon next starts.
+    #[must_use]
+    pub fn unfenced(session_id: kr_protocol::ids::SessionId, detail: &str) -> Self {
+        Self {
+            session_id,
+            ended: Vec::new(),
+            surviving: vec![unestablished(format!(
+                "the endpoint this session's worker published could not be removed, so what the \
+                 session owned was not looked for and was not stopped: {detail}"
+            ))],
+            coverage: OwnershipCoverage::Incomplete,
+        }
+    }
 }
 
 /// What the worker's record came to when it was read.

@@ -23,6 +23,7 @@ use crate::supervision::{JobRetirement, WorkerSupervisor};
 
 use super::barrier::{DEBT_PASS_INTERVAL, Debts, PassSchedule, Published, Reach};
 use super::capabilities::{DesktopReading, capability_revision, resolved_desktop};
+use super::close::Death;
 use super::inhibition::DemandScan;
 use super::{Clocks, Controller, net};
 
@@ -1704,7 +1705,11 @@ impl Controller {
                     ClosureReason::HostShutdown,
                     &row.process_identity,
                     &crate::archive::Fenced::nothing(row.session_id),
-                    ownership.is_ok(),
+                    if ownership.is_ok() {
+                        Death::Confirmed
+                    } else {
+                        Death::Unconfirmed
+                    },
                 )
                 .await?;
                 // Held to here, so that nothing else recovers or collects the session while its

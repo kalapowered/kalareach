@@ -14,7 +14,7 @@ use crate::service::Controller;
 use crate::service::net::tests::{daemon, setup, started, stopped};
 
 /// Records a worker of a session whose process has ended, as an earlier boot left it.
-async fn recorded_ended_worker(
+pub(super) async fn recorded_ended_worker(
     controller: &Controller,
     temp: &kr_ipc::testing::TempHost,
 ) -> SessionId {
@@ -134,6 +134,18 @@ async fn a_session_another_recovery_holds_is_closed_as_the_hosts_restart_once_th
         .expect("the registry answers")
         .expect("the dead worker's session is closed once nothing holds it");
     assert_eq!(closure.reason, ClosureReason::HostShutdown);
+    assert!(
+        closure.surviving.is_empty(),
+        "a worker of an earlier boot owned nothing that outlived the boot: {closure:?}"
+    );
+    assert!(
+        !controller
+            .project()
+            .service()
+            .holds()
+            .has_session(session_id),
+        "and its session is no longer a writer"
+    );
 }
 
 /// KR-REQ-24.18: a worker the kernel says is running is not one an earlier boot left, whatever the
