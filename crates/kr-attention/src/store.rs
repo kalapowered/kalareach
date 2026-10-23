@@ -1862,6 +1862,23 @@ impl Store {
         Ok((after, answer))
     }
 
+    /// Whether the store at `path` holds a record of this actor's action, whatever the action did.
+    ///
+    /// It is asked through a connection of its own and takes neither the store's claim nor the
+    /// holder's connection, so it waits for no work the holder is doing. A store that is not there
+    /// holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreUnavailable`] when the record cannot be read.
+    pub(crate) fn holds_action(path: &Path, actor: &ActorId, action_id: &str) -> Result<bool> {
+        Ok(kr_flush::release::holds_a_row(
+            path,
+            "SELECT 1 FROM attention_actions WHERE actor = ?1 AND action_id = ?2",
+            params![actor.as_str(), action_id],
+        )?)
+    }
+
     /// Returns the record of one actor's action, when this store performed it.
     ///
     /// # Errors

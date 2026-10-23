@@ -2147,6 +2147,27 @@ fn without_variables(stored: &str) -> std::result::Result<Option<String>, String
 }
 
 impl WorkflowStore {
+    /// Whether the workflow journal in `state_dir` holds a record of the actor's action, whatever
+    /// the action did.
+    ///
+    /// It is asked through a connection of its own and takes nothing the module holds, so it waits
+    /// for no work the module is doing. A journal that is not there holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the journal cannot be read.
+    pub fn holds_action(
+        state_dir: impl AsRef<Path>,
+        actor_id: &str,
+        action_id: &str,
+    ) -> Result<bool> {
+        Ok(kr_flush::release::holds_a_row(
+            &state_dir.as_ref().join(WORKFLOW_DB_NAME),
+            "SELECT 1 FROM action_records WHERE actor_id = ?1 AND action_id = ?2",
+            params![actor_id, action_id],
+        )?)
+    }
+
     /// Opens the workflow journal in the environment's state directory.
     ///
     /// # Errors

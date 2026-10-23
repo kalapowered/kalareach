@@ -820,6 +820,34 @@ impl DeviceDirectory {
         })
     }
 
+    /// Whether the registry at `path` holds a route or a declaration for this actor's action,
+    /// whatever became of it.
+    ///
+    /// It is asked through a connection of its own and takes nothing the directory holds, so it
+    /// waits for no work the directory is doing. A registry that is not there holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub fn holds_action(
+        path: &std::path::Path,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Result<bool> {
+        for table in ["network_actions", "network_key_declarations"] {
+            if kr_flush::release::holds_a_row(
+                path,
+                &format!("SELECT 1 FROM {table} WHERE actor_id = ?1 AND action_id = ?2"),
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+            )
+            .map_err(ControllerError::registry)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Returns what one action's declaration ended as, when this host recorded one.
     ///
     /// # Errors

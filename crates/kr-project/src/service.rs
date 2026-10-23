@@ -286,6 +286,24 @@ impl ProjectService {
         paths.state_dir().join(crate::store::PROJECTS_DIRECTORY)
     }
 
+    /// Whether this environment's project store holds a record of the actor's action, read
+    /// through a connection of its own that waits for nothing the service is doing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the store cannot be read.
+    pub fn holds_action(
+        paths: &EnvironmentPaths,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: Uuid,
+    ) -> Result<bool> {
+        crate::store::Store::holds_action(
+            &Self::root_of(paths).join(crate::store::STORE_FILE_NAME),
+            actor_id,
+            action_id,
+        )
+    }
+
     /// Returns the environment this service owns.
     #[must_use]
     pub const fn environment_id(&self) -> EnvironmentId {

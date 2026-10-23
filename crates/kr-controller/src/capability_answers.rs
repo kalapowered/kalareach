@@ -157,6 +157,24 @@ impl Record {
         })
     }
 
+    /// Whether the record in `state_dir` holds an answer to this actor's request under this action
+    /// identifier.
+    ///
+    /// It is asked through a connection of its own and takes nothing the record holds, so it waits
+    /// for no work the record is doing. A record that is not there holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read.
+    pub fn holds(state_dir: &Path, actor_id: &ActorId, action_id: ActionId) -> Result<bool> {
+        kr_flush::release::holds_a_row(
+            &state_dir.join(CAPABILITY_ANSWERS_RECORD),
+            "SELECT 1 FROM capability_answers WHERE actor_id = ?1 AND action_id = ?2",
+            params![actor_id.as_str(), action_id.to_string()],
+        )
+        .map_err(ControllerError::registry)
+    }
+
     /// What was answered to this actor's request under this action identifier, where the record
     /// still holds one.
     ///

@@ -1097,6 +1097,7 @@ impl Controller {
                 leases.recovered(recorded_workers.iter().map(|(session_id, _)| *session_id));
                 leases
             },
+            identifiers_performing: Default::default(),
             clock,
             wall,
             network: std::sync::OnceLock::new(),

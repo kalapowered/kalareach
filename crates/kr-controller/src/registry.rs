@@ -2387,6 +2387,27 @@ impl Registry {
         )
     }
 
+    /// Whether the registry at `path` holds a reservation for the token one actor's create named.
+    ///
+    /// It is asked through a connection of its own and takes nothing the registry holds, so it
+    /// waits for no work the registry is doing. A registry that is not there holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub fn holds_token(
+        path: &std::path::Path,
+        actor_id: &ActorId,
+        create_token: Uuid,
+    ) -> Result<bool> {
+        kr_flush::release::holds_a_row(
+            path,
+            "SELECT 1 FROM reservations WHERE actor_id = ?1 AND create_token = ?2",
+            params![actor_id.as_str(), create_token.as_bytes().as_slice()],
+        )
+        .map_err(ControllerError::registry)
+    }
+
     /// Returns the reservation one actor's create token already named, if any.
     ///
     /// # Errors

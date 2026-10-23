@@ -2833,6 +2833,27 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the store at `path` holds a record of this actor's action, whatever the action did.
+    ///
+    /// It is asked through a connection of its own and takes nothing the service holds, so it
+    /// waits for no work the service is doing. A store that is not there holds none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the store cannot be read.
+    pub fn holds_action(
+        path: &std::path::Path,
+        actor_id: &ActorId,
+        action_id: Uuid,
+    ) -> Result<bool> {
+        kr_flush::release::holds_a_row(
+            path,
+            "SELECT 1 FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+            params![actor_id.as_str(), uuid_sql(action_id)],
+        )
+        .map_err(TransferError::store)
+    }
+
     /// Returns a retained mutation result, when the same actor performed the same action before.
     ///
     /// # Errors

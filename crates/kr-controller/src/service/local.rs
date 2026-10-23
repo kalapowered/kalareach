@@ -904,6 +904,18 @@ impl Controller {
             }
             return DoorReply::Answered(retained);
         }
+        // A first admission spends an identifier no other method of this actor has spent, and holds
+        // it until its effect has ended.
+        let spending = match self.spend_the_identifier(actor_id, &mutation, method).await {
+            Ok(spending) => spending,
+            Err(error) => {
+                return DoorReply::Refused(error_reply(
+                    mutation.request_id,
+                    error.code(),
+                    error.to_string(),
+                ));
+            }
+        };
         let accepted = match self.check_envelope(connection_id, &mutation, method, received_at) {
             Ok(accepted) => Some(accepted),
             // A window that admits nothing says nothing about an action the host may already
@@ -954,6 +966,7 @@ impl Controller {
         let controller = Arc::clone(self);
         let actor_id = actor_id.clone();
         let effect = tokio::spawn(async move {
+            let _spending = spending;
             controller
                 .write_method(
                     &actor_id,

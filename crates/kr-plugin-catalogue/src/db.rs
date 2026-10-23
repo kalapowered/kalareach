@@ -1798,6 +1798,26 @@ fn failed(path: &Path, source: &rusqlite::Error) -> CatalogueError {
     }
 }
 
+/// Whether the catalogue in `root` holds a receipt for this actor's action, whatever the action
+/// did.
+///
+/// It is asked through a connection of its own and takes nothing the catalogue holds, so it waits
+/// for neither a synchronisation's fetch nor an installation. A catalogue that is not there holds
+/// none.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::StorageUnavailable`] when the database cannot be read.
+pub fn holds_action(root: &Path, actor: &str, action: &str) -> CatalogueResult<bool> {
+    let path = root.join(DATABASE_FILE);
+    kr_flush::release::holds_a_row(
+        &path,
+        "SELECT 1 FROM receipts WHERE actor = ?1 AND action = ?2",
+        params![actor, action],
+    )
+    .map_err(|source| failed(&path, &source))
+}
+
 /// Returns the canonical path of the catalogue's own directory, every link above it resolved.
 ///
 /// On Windows the path is the one the host named: SQLite resolves nothing there, and a canonical

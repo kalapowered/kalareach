@@ -864,6 +864,22 @@ impl Attention {
         Ok(Performed::Done(answer))
     }
 
+    /// Whether the store at `path` holds a record of this actor's action, whatever the action did.
+    ///
+    /// It is asked through a connection of its own, so it waits for nothing the owner of the store
+    /// is doing and takes nothing of its claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreUnavailable`] when the record cannot be read.
+    pub fn holds_action(
+        path: impl AsRef<std::path::Path>,
+        actor: &ActorId,
+        action_id: &str,
+    ) -> Result<bool> {
+        Store::holds_action(path.as_ref(), actor, action_id)
+    }
+
     /// Returns the record of one actor's action, when this store performed it.
     ///
     /// # Errors

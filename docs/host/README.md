@@ -2757,6 +2757,24 @@ a withdrawal of an invitation that had already ended, writes it before it is giv
 answered from that record and only for the same payload: the identifier reused with another payload
 is `ID_CONFLICT`, whichever of these methods it was first spent on, and nothing is done under it.
 
+**One identifier across the daemon's stores.** Each of the daemon's stores keeps the actions it
+performed, keyed by the verified caller and the action identifier, and each compares an arriving
+mutation with its own records alone. Over the owner's own socket, a first admission is therefore
+also checked against every other store before its effect: an identifier that another method of the
+same caller has spent in the grant, project, transfer, change-set, workflow, attention, catalogue,
+pairing, device, capability-check, installation or session-reservation records is `ID_CONFLICT`,
+and nothing is done under it. The check asks only whether a record exists, because a record in
+another store is a record of another method. It reads each store through a connection of its own
+and takes none of the locks a service holds, so a catalogue synchronisation that is fetching, or an
+installation that is under way, holds nothing up; a store that cannot be read refuses the
+admission, and is not read as holding nothing. The daemon also keeps the identifiers it is
+performing, so two mutations of different methods that arrive together under one identifier do not
+both run. A paired device's route needs none of this, because the device directory claims every
+action first. Two things are outside the check: a mutation forwarded to a worker (a close, a
+prompt) is kept in that worker's journal, which the daemon does not read here; and four methods
+keep no record of their action and so spend no identifier, `organisation.policy.apply`,
+`membership.present`, `backup.enable` and `backup.bundle.write`.
+
 **Authority when an answer is spent.** An owner device's grant is in force under the same time
 contract the network admits devices under: a deadline anchored on the continuous clock, a wall
 clock that is not trusted once it has gone backwards, and an expiry tombstone that keeps a grant
