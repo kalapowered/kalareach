@@ -1738,9 +1738,7 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    // The runtime's epoch is held: a snapshot is stopped by its deadline only when a test advances
-    // the epoch, so a pass that starts late cannot make the component fault.
-    let host = held_host();
+    let host = host();
     let (events, mut received) = events();
     let handle = host
         .runtime
