@@ -1287,6 +1287,7 @@ dependencies = [
  "exacl",
  "futures-util",
  "iroh",
+ "kr-attention",
  "kr-cbor",
  "kr-client",
  "kr-controller",
