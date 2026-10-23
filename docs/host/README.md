@@ -2627,6 +2627,15 @@ with an empty page: absent evidence and empty evidence are different statements,
 reads the difference. The boundary is written down before the count it replaces goes, so a failure
 between the two leaves the conservative answer rather than none.
 
+A revision no fence of the worker ran for gets the same answer. A worker that refused two revisions
+while it was inside a dispatch transition, and then fenced them once, as one, filed the names of
+both under the higher revision and has nothing under the lower one. Asked about the lower one, it
+answers with no evidence, because an empty page would read as a revocation that found nothing to
+take back. Only a fence that ran to its end and named nothing is answered as an empty page. The
+worker remembers the newest 256 of those in memory, and a worker that restarted fences the revision
+again when it is asked. The result of the higher revision then says that the worker cannot say what
+its fence named for the lower one, and it still names every action the joined fence took.
+
 The daemon keeps its reports the same way, one per revocation rather than one per worker. An older
 revocation's result names what that revocation's fence named, and a newer one's lists are a
 different question's answer. The exception is one announcement. A worker's fence files its names

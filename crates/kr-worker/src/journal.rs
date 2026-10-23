@@ -54,6 +54,12 @@ pub const PRUNE_INTERVAL_MS: u64 = 60 * 60 * 1000;
 /// nothing and reading as a fence that named nothing.
 pub const MAX_HELD_REVOCATIONS: usize = 8;
 
+/// How many revisions whose fence ran and named nothing this journal remembers in memory.
+///
+/// The lowest goes first. A revision that falls out is answered as one this journal cannot speak
+/// for, which is the conservative reading.
+const MAX_EMPTY_FENCES: usize = 256;
+
 /// The host event kind that records a binding on a release its repository revoked.
 pub const ADAPTER_REVOKED: &str = "adapter.revoked";
 
@@ -207,6 +213,13 @@ pub struct Journal {
     /// issues live in its memory and the host has restarted. That is what lets retention treat
     /// this boot's records and an earlier boot's differently.
     boot: Option<Vec<u8>>,
+    /// The revisions whose fence this journal ran and which named nothing.
+    ///
+    /// A revision no fence of this journal ran has no rows either, and the two must not read the
+    /// same: a joined fence at a higher revision takes the actions a lower one owed, so the lower
+    /// revision's page is empty because nothing ran for it, not because nothing was found.
+    /// Only a fence that ran and named nothing is an empty answer.
+    fenced_empty: std::collections::BTreeSet<u64>,
     /// Woken after this journal commits a host event or a privacy transition.
     ///
     /// The control daemon holds a request for this session's attention records until there is
@@ -355,6 +368,7 @@ impl Journal {
             boot: kr_ipc::identity::boot_identity()
                 .ok()
                 .map(|boot| boot.value.as_slice().to_vec()),
+            fenced_empty: std::collections::BTreeSet::new(),
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
@@ -1929,7 +1943,18 @@ impl Journal {
         if let Err(error) = self.record_fence_boundary(reached) {
             return (fenced, Err(error));
         }
+        if fenced.named() == 0 {
+            self.remember_empty_fence(revision);
+        }
         (fenced, Ok(reached))
+    }
+
+    /// Remembers that the fence for `revision` ran to its end and named nothing.
+    fn remember_empty_fence(&mut self, revision: u64) {
+        self.fenced_empty.insert(revision);
+        while self.fenced_empty.len() > MAX_EMPTY_FENCES {
+            self.fenced_empty.pop_first();
+        }
     }
 
     /// Records one action past its dispatch marker, and says whether it was new.
@@ -2199,16 +2224,21 @@ impl Journal {
     /// the acknowledgement two statements; a worker that cannot make the second one says so by
     /// carrying no evidence at all, which is what a caller reads here.
     ///
+    /// A revision is answerable when this journal holds names or a count for it, or when its own
+    /// fence ran and named nothing. A revision no fence of this journal ran is not: a joined fence
+    /// at a higher revision took what it owed, so an empty page for it would read as a revocation
+    /// that found nothing to take back.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
     pub fn evidence_answerable(&self, revision: u64) -> Result<bool> {
-        let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+        let key = i64::try_from(revision).unwrap_or(i64::MAX);
         let held: i64 = self
             .connection
             .query_row(
                 "SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1",
-                params![revision],
+                params![key],
                 |row| row.get(0),
             )
             .map_err(|error| faulted(&self.health, error))?;
@@ -2219,7 +2249,7 @@ impl Journal {
             .connection
             .query_row(
                 "SELECT COUNT(*) FROM fence_delivery WHERE revision = ?1",
-                params![revision],
+                params![key],
                 |row| row.get(0),
             )
             .map_err(|error| faulted(&self.health, error))?;
@@ -2235,7 +2265,7 @@ impl Journal {
             )
             .optional()
             .map_err(|error| faulted(&self.health, error))?;
-        Ok(forgotten.is_none_or(|before| revision > before))
+        Ok(forgotten.is_none_or(|before| key > before) && self.fenced_empty.contains(&revision))
     }
 
     /// Records how many of a revocation's names the controller of one generation holds.
@@ -3165,6 +3195,7 @@ impl Journal {
             semantic_corruption: std::sync::atomic::AtomicBool::new(false),
             health: crate::persistence::fault::JournalHealth::shared(),
             boot: None,
+            fenced_empty: std::collections::BTreeSet::new(),
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),

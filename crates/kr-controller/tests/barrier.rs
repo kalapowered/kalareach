@@ -2890,9 +2890,13 @@ struct HeldBoundary {
 
 impl HeldBoundary {
     async fn take(hosted: &Hosted) -> Self {
+        Self::take_service(Arc::clone(hosted.service_to_stop())).await
+    }
+
+    /// As [`Self::take`], for a worker a case talks to over its own wire.
+    async fn take_service(service: Arc<WorkerService>) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
-        let service = Arc::clone(hosted.service_to_stop());
         let thread = std::thread::spawn(move || {
             let _boundary = service.hold_the_dispatch_boundary();
             let _ = held.send(());
@@ -4560,6 +4564,140 @@ async fn a_result_that_could_not_ask_about_a_refused_revision_says_so_and_the_ne
     })
     .await;
     names_the_actions(&later, &hosted, &device, rejected, dispatched);
+}
+
+/// KR-REQ-09.12, 09.13: a worker whose fence for a revision was taken by a joined fence at a
+/// higher revision does not answer for the lower one as a fence that named nothing.
+///
+/// Both revisions are refused while the worker's dispatch boundary is held, and the worker's own
+/// maintenance fences them as one, naming the intents under the higher revision. Asked about the
+/// lower one afterwards, the worker holds no fence of its own for it: an empty page would read as
+/// a revocation that found nothing to take back, and the acknowledgement carries no evidence
+/// instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_revision_a_joined_fence_took_is_not_answered_as_a_fence_that_named_nothing() {
+    let worker = worker_apart().await;
+    let device = actor("device:phone");
+    seed_undispatched(&worker, &device);
+    let mut client = daemon(&worker, 1).await;
+
+    let boundary = HeldBoundary::take_service(Arc::clone(&worker.service)).await;
+    for revision in [1, 2] {
+        tokio::time::timeout(
+            REACHABLE,
+            client.announce_revision(notice(&worker, revision)),
+        )
+        .await
+        .expect("the worker answers")
+        .expect_err("a worker inside its dispatch boundary refuses the announcement");
+    }
+    boundary.release().await;
+    worker.service.fence_what_is_owed_for_tests();
+
+    let higher = tokio::time::timeout(REACHABLE, client.announce_revision(notice(&worker, 2)))
+        .await
+        .expect("the worker answers")
+        .expect("the worker acknowledges");
+    let named = higher.fence.expect("the fence it ran reports its names");
+    assert_eq!(named.rejected_actions.len(), 1);
+
+    let lower = tokio::time::timeout(REACHABLE, client.announce_revision(notice(&worker, 1)))
+        .await
+        .expect("the worker answers")
+        .expect("the worker acknowledges");
+    assert_eq!(lower.revision, AuthorityRevision::new(1));
+    assert!(
+        lower.fence.is_none(),
+        "no fence of its own ran for revision 1, so nothing is said of what it named: {lower:?}"
+    );
+}
+
+/// KR-REQ-09.12, 09.13: a fence that ran and named nothing is answered as an empty one, asked
+/// again and asked for a page past its names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fence_that_named_nothing_is_still_answered_as_an_empty_one() {
+    let worker = worker_apart().await;
+    let mut client = daemon(&worker, 1).await;
+    for evidence_from in [0, 0, 3] {
+        let mut asked = notice(&worker, 1);
+        asked.evidence_from = evidence_from;
+        let ack = tokio::time::timeout(REACHABLE, client.announce_revision(asked))
+            .await
+            .expect("the worker answers")
+            .expect("the worker acknowledges");
+        let fence = ack.fence.expect("a fence that ran reports, empty or not");
+        assert!(fence.rejected_actions.is_empty());
+        assert!(fence.possibly_executed.is_empty());
+        assert_eq!(fence.remaining.get(), 0);
+    }
+}
+
+/// KR-REQ-09.12, 09.13: the result of the higher revision says the worker cannot say what its
+/// fence named for the lower one, and names every action the joined fence took.
+///
+/// The worker refused the first revision while its dispatch boundary was held, and was announced
+/// the second after it was let go, before its own maintenance had fenced the first. Its one fence
+/// took both revisions' actions and filed them under the second. The first revision's page is not
+/// the worker's to give, and the result does not read it as a revocation that named nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_result_says_the_worker_cannot_say_for_a_revision_a_joined_fence_took() {
+    let hosted = hosted_worker_apart().await;
+    let settled = announced_until(
+        &hosted.controller,
+        hosted
+            .controller
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded"),
+        |barrier| barrier.holds(),
+    )
+    .await;
+    let held = settled.authority_revision.get();
+    let device = actor("device:phone");
+    let rejected = 3;
+    seed_undispatched_intents(&hosted, &device, rejected);
+
+    let boundary = HeldBoundary::take(&hosted).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    assert_eq!(refused.pending(), vec![hosted.session_id], "{refused:?}");
+    boundary.release().await;
+
+    let next = announced_until(
+        &hosted.controller,
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            hosted.controller.revoke_authority(),
+        )
+        .await
+        .expect("the revocation reports")
+        .expect("the next revocation is recorded"),
+        |barrier| {
+            barrier.holds()
+                && barrier.authority_revision.get() == held + 2
+                && worker_report(barrier, hosted.session_id)
+                    .names_pending
+                    .get()
+                    == 0
+        },
+    )
+    .await;
+    let reported = worker_report(&next, hosted.session_id);
+    assert_eq!(reported.state, BarrierState::Acknowledged, "{reported:?}");
+    assert_eq!(
+        reported.rejected_actions.len(),
+        rejected,
+        "every intent the joined fence took back is named: {reported:?}"
+    );
+    assert!(
+        reported.detail.contains("cannot say"),
+        "the result says what the worker could not answer for: {reported:?}"
+    );
 }
 
 /// Writes one mutation to this daemon and returns what it answered.
