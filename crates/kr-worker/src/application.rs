@@ -229,6 +229,7 @@ impl Producer {
                 return;
             }
             session.set_application_state(application.state);
+            session.set_application(application.name.clone());
         }
         self.published.send_replace(application);
     }

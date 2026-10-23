@@ -1550,9 +1550,8 @@ impl Session {
     /// foreground is no application, and writes the session's record again when it changed.
     ///
     /// The name is the one a person recognises, as the foreground-application producer of
-    /// KR-REQ-03.27 learns it. That producer calls this; until it lands no caller does, and a
-    /// session shows no application. It stays as the producer's entry point: the summary's member
-    /// and the journal's row for it are what the cut carries.
+    /// KR-REQ-03.27 learns it, and that producer calls this. A session that has closed names no
+    /// application, and the producer does not set one again.
     pub fn set_application(&mut self, application: Option<String>) {
         if self.application == application {
             return;
@@ -4951,6 +4950,7 @@ impl Session {
         record.durability = self.commit_closure(&record);
         self.input.lock().set_state(SessionState::Closed);
         self.application_state = None;
+        self.application = None;
         self.closure = Some(record.clone());
         // Every attachment is told, behind whatever output it was still owed, and one that has not
         // subscribed yet is owed it until it does or leaves. This is the only place a session
