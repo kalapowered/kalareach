@@ -508,11 +508,12 @@ android_launch() { # <adb> <serial> <name> <json fields>
 # and chooses an answer; for `send` it then sends it. What the phone showed is written to the step's
 # done file.
 action_android() { # <adb> <serial> <step> <words of the question> <choice> <send|stop>
-    local adb="$1" serial="$2" step="$3" words="$4" choice="$5" ending="$6" alert out="$harness/done-$3.tmp" blind=""
+    local adb="$1" serial="$2" step="$3" words="$4" choice="$5" ending="$6" alert out="$harness/done-$3.tmp" blind=blind
     alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
-    # The first sheet the application opens is not always in the tree the web view hands over, so
-    # the person who answers from it presses where the form draws its choices.
-    [ "$ending" = send ] && blind=blind
+    # The sheet a notification's tap opens is not always in the tree the web view hands over, so the
+    # person who answers from it presses where the form draws its choices. Every question's form is
+    # laid out from the foot of the sheet, so a question with more or fewer lines above its choices
+    # leaves them where they were.
     : >"$out"
     if python3 "$here/scripts/lib/push-android.py" tap "$adb" "$serial" "$shots" "$alert" >>"$out" 2>&1 \
         && python3 "$here/scripts/lib/push-android.py" choose "$adb" "$serial" "$shots" "$words" "$choice" $blind >>"$out" 2>&1 \
