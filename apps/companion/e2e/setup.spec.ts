@@ -5,12 +5,13 @@
  * the single path through the steps at a real window size and at a narrow one, the disclosure that
  * opens with a row transition, the colour modes, and the focus a sheet takes and gives back.
  *
- * Every screenshot goes under `/tmp` and is named for the requirement row it evidences.
+ * Every screenshot goes under the test artefact directory and is named for the requirement row it evidences.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -30,7 +31,7 @@ const TEXT_SIZES = [
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
-  return `/tmp/kr-companion-${name}.png`
+  return screenshotPath(`kr-companion-${name}`)
 }
 
 /**

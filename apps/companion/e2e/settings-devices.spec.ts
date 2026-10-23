@@ -7,11 +7,12 @@
  * that a device is shared with, taken out (after one question) and an offer joined from the keyboard
  * alone.
  *
- * Every screenshot goes under `/tmp`, named for the engine and the case.
+ * Every screenshot goes under the test artefact directory, named for the engine and the case.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -47,7 +48,7 @@ const EVERYTHING = {
 } as const
 
 function shot(name: string): string {
-  return `/tmp/kr-companion-devices-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-devices-${name}-${test.info().project.name}`)
 }
 
 /** Sets the phone's text size as the web view would, before the page loads. */

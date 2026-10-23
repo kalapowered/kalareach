@@ -9,11 +9,12 @@
  * alone, focus follows the request to the words that say where it stands, and a refusal returns
  * focus to the control that was pressed.
  *
- * Every screenshot goes under `/tmp`, named for the engine and the case.
+ * Every screenshot goes under the test artefact directory, named for the engine and the case.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The Linux runner draws the page in DejaVu Sans, which sets about a tenth more text across a line. */
@@ -139,7 +140,7 @@ const EVERYTHING = {
 } as const
 
 function shot(name: string): string {
-  return `/tmp/kr-companion-devices-screen-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-devices-screen-${name}-${test.info().project.name}`)
 }
 
 /** Opens the Devices screen with the host reporting `view`. */

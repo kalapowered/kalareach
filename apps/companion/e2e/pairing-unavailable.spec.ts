@@ -14,6 +14,7 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { screenshotPath } from './evidence'
 import { overrunning } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -38,7 +39,7 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
 
 /** Where a screenshot goes. */
 function shot(name: string): string {
-  return `/tmp/kr-pairing-unavailable-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-pairing-unavailable-${name}-${test.info().project.name}`)
 }
 
 async function holdsTheFailure(page: Page): Promise<void> {

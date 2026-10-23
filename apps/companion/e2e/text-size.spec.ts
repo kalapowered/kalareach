@@ -15,6 +15,7 @@ import { Buffer } from 'node:buffer'
 import { expect, test, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
 
 /** The longest a passing message stays once nothing holds it, in milliseconds (the application's `TOAST_CEILING_MS`). */
@@ -398,7 +399,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
 
       await release.scrollIntoViewIfNeeded()
       await page.screenshot({
-        path: `/tmp/kr-text-size-send-anyway-${surface}-${test.info().project.name}.png`
+        path: screenshotPath(`kr-text-size-send-anyway-${surface}-${test.info().project.name}`)
       })
       const roots = ['.m-hint', '[data-testid="composer-send-anyway"]']
       for (const root of roots) {
@@ -439,7 +440,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         const left = page.getByRole('status', { name: 'The last call' })
         await expect(left).toBeVisible()
         await page.screenshot({
-          path: `/tmp/kr-voice-aftermath-${size}-${surface}-${test.info().project.name}.png`,
+          path: screenshotPath(`kr-voice-aftermath-${size}-${surface}-${test.info().project.name}`),
           fullPage: true
         })
         expect(await overrunning(page, '.kr-voice__aftermath'), 'lines of what the last call left that run past their box').toEqual([])
@@ -457,7 +458,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         await expect(told).toBeVisible()
         await told.scrollIntoViewIfNeeded()
         await page.screenshot({
-          path: `/tmp/kr-voice-call-${size}-${surface}-${test.info().project.name}.png`,
+          path: screenshotPath(`kr-voice-call-${size}-${surface}-${test.info().project.name}`),
           fullPage: true
         })
         expect(await overrunning(page, '.kr-voice__delegation'), 'lines of a request row that run past their box').toEqual([])
@@ -482,7 +483,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         const end = page.getByRole('button', { name: 'End the call' })
         await expect(end).toBeVisible()
         await page.screenshot({
-          path: `/tmp/kr-voice-setup-${size}-${surface}-${test.info().project.name}.png`,
+          path: screenshotPath(`kr-voice-setup-${size}-${surface}-${test.info().project.name}`),
           fullPage: true
         })
         expect(await overrunning(page, '.kr-voice__note'), 'lines of the setup note that run past their box').toEqual([])
@@ -494,7 +495,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         await expect(page.getByRole('heading', { name: 'Ending a voice session' })).toBeVisible()
         await expect(page.getByRole('button', { name: 'End the call' })).toHaveCount(0)
         await page.screenshot({
-          path: `/tmp/kr-voice-ending-${size}-${surface}-${test.info().project.name}.png`,
+          path: screenshotPath(`kr-voice-ending-${size}-${surface}-${test.info().project.name}`),
           fullPage: true
         })
         expect(await overrunning(page, '.kr-voice__note'), 'lines of the ending note that run past their box').toEqual([])
@@ -531,7 +532,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         // The word and its ellipsis are one thing: the ellipsis never sits on a line of its own.
         expect(await lineCount(page, '.kr-voice__start'), 'the start label on one line').toBe(1)
         await page.screenshot({
-          path: `/tmp/kr-voice-own-start-${size}-${surface}-${test.info().project.name}.png`
+          path: screenshotPath(`kr-voice-own-start-${size}-${surface}-${test.info().project.name}`)
         })
         expect(await overrunning(page, '.kr-voice__control'), 'a control label that runs past its box').toEqual([])
         expect(await overrunning(page, '.kr-voice__start'), 'the start label that runs past its box').toEqual([])
@@ -546,7 +547,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         await expect(page.getByText('This device is ending its call.')).toBeInViewport()
         expect(await overrunning(page, '.kr-voice__note'), 'the ending note that runs past its box').toEqual([])
         await page.screenshot({
-          path: `/tmp/kr-voice-own-start-ending-${size}-${surface}-${test.info().project.name}.png`
+          path: screenshotPath(`kr-voice-own-start-ending-${size}-${surface}-${test.info().project.name}`)
         })
         expect(await overrunning(page, '.kr-voice__control'), 'the ending label that runs past its box').toEqual([])
 
@@ -600,7 +601,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       await expect(end).toBeInViewport()
       await expect(page.getByRole('button', { name: 'Starting…' })).toBeDisabled()
       await page.screenshot({
-        path: `/tmp/kr-voice-own-start-wide-${surface}-${test.info().project.name}.png`
+        path: screenshotPath(`kr-voice-own-start-wide-${surface}-${test.info().project.name}`)
       })
       expect(await lineCount(page, '.kr-voice__start'), 'the start label on one line').toBe(1)
       expect(await overrunning(page, '.kr-voice__start'), 'the start label that runs past its box').toEqual([])
@@ -644,7 +645,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       await expect(ending).toBeInViewport({ ratio: 0.99 })
       await expect(words).toBeInViewport()
       await page.screenshot({
-        path: `/tmp/kr-voice-own-start-ending-wide-${surface}-${test.info().project.name}.png`
+        path: screenshotPath(`kr-voice-own-start-ending-wide-${surface}-${test.info().project.name}`)
       })
       expect(await overrunning(page, '.kr-voice__control'), 'the ending label that runs past its box').toEqual([])
 
@@ -683,7 +684,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         expect(covered, 'the start of part of the entry is covered').toBe(false)
       }
       await page.screenshot({
-        path: `/tmp/kr-text-size-earlier-actions-${surface}-${test.info().project.name}.png`
+        path: screenshotPath(`kr-text-size-earlier-actions-${surface}-${test.info().project.name}`)
       })
       expect(await overrunning(page, '[data-testid="earlier-actions"]'), 'lines of the list that run past the screen or their box').toEqual([])
       await stopWrapping(page, ['[data-testid="earlier-actions"]'])
@@ -780,7 +781,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
           return each.getBoundingClientRect().width - around
         })
         expect(column / 320, 'the share of the screen the card keeps for its text').toBeGreaterThan(0.5)
-        await page.screenshot({ path: `/tmp/kr-text-size-card-${tab}-${surface}-${test.info().project.name}.png` })
+        await page.screenshot({ path: screenshotPath(`kr-text-size-card-${tab}-${surface}-${test.info().project.name}`) })
       })
     }
   }
@@ -1092,7 +1093,7 @@ test.describe('the connection text in the top bar', () => {
           page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
         expect(await sideways(), 'the page does not scroll sideways for the reason').toBeLessThanOrEqual(0)
         expect(await overrunning(page, '.topbar'), 'lines of the reason that run past the screen or the bar').toEqual([])
-        await page.screenshot({ path: `/tmp/kr-text-size-topbar-${size}-${width}-${test.info().project.name}.png` })
+        await page.screenshot({ path: screenshotPath(`kr-text-size-topbar-${size}-${width}-${test.info().project.name}`) })
 
         // The control: kept from wrapping, the same measure sees the reason run out of the bar. On
         // a wide window at the default size the reason fits on one line, and there is nothing to see.
@@ -1186,7 +1187,7 @@ test.describe('a passing message on the phone, above the bar and the keyboard', 
           }))
           expect(bars.top, 'the message starts below the top bar').toBeGreaterThanOrEqual(bars.bar - 0.5)
           await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
-          await page.screenshot({ path: `/tmp/kr-text-size-toast-keyboard-${surface}-${size}-${String(width)}-${test.info().project.name}.png` })
+          await page.screenshot({ path: screenshotPath(`kr-text-size-toast-keyboard-${surface}-${size}-${String(width)}-${test.info().project.name}`) })
 
           // The keyboard goes, and the message comes back down to the bar.
           await page.evaluate(() => {
