@@ -88,6 +88,16 @@ pub(crate) struct Applied {
     pub completion: RevocationCompletion,
 }
 
+/// What carrying out again a request the feed shows complete came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// Nothing more is to be done for the request: what it names is withdrawn here, or its owner is
+    /// known and it is not a request this host could have carried out.
+    Done,
+    /// The request names something live here, and its owner is not one this host knows.
+    Unverified,
+}
+
 impl Controller {
     /// Judges a request read from the feed: whether this host applies it, and to what.
     ///
@@ -139,11 +149,12 @@ impl Controller {
     /// is: by its grant, this host's policy and the rights ceiling this host's configuration put
     /// in force.
     ///
-    /// One thing differs. A bounded offline validity is what stops personal remote access while
+    /// Two things differ. A bounded offline validity is what stops personal remote access while
     /// the authority feed cannot be reached, and the caller has just read the feed, so the bound is
-    /// left out of this decision. Everything else, the rights, the selectors, an organisation's
-    /// lease, an exclusive management, the ceiling and the clock, is decided as it is for the
-    /// device's own request.
+    /// left out of this decision; and the refusal a withdrawal the host cannot verify puts on remote
+    /// grants is left out, because the feed is how a known owner reaches the host then. Everything
+    /// else, the rights, the selectors, an organisation's lease, an exclusive management, the
+    /// ceiling and the clock, is decided as it is for the device's own request.
     fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
         let ceiling = self
             .rights_ceiling
@@ -187,6 +198,9 @@ impl Controller {
         self.write_owed_floor(&live);
         let mut policy = live.clone();
         policy.set_offline_validity(None);
+        // A withdrawal the host cannot verify refuses remote grants, and a device that manages the
+        // host acts by this decision on the feed it reads, which the refusal does not close.
+        policy.set_withdrawal_unverified(false);
         let decided = crate::config::ceilings::decide_with_ceiling(
             ceiling.as_ref(),
             &device.grant,
@@ -545,32 +559,26 @@ impl Controller {
     /// back to one whose counter stands at the feed's, has lost it.
     ///
     /// The feed is not trusted to say that this host approved a request, so only a request this host
-    /// could have carried out is: one the issuer signed with the key the registry holds for it,
+    /// could have carried out is: one an owner signed with a key the registry holds for a device
     /// whose pairing grant holds the right to manage this host, and which this host did not refuse.
-    /// A request whose issuer the registry does not know cannot be checked, and is not carried out.
+    /// The owner is the device the request names, or, when the registry holds no such device, the
+    /// device that holds the key the request names, which is how an owner paired again is found.
     /// What is already withdrawn is left alone, so a request the registry shows done raises no
     /// barrier, and carrying one out twice is carrying it out once.
+    ///
+    /// A request that names a device or grant the registry holds live, and whose owner the registry
+    /// does not know at all, can be neither carried out nor dismissed: it comes back as
+    /// [`Replay::Unverified`], and the host refuses every grant but the owner's at this machine
+    /// until the owner at this machine has revoked what it names or paired the owner again.
     ///
     /// # Errors
     ///
     /// Returns an error when a record cannot be read, a revocation cannot be written or its barrier
     /// cannot be raised.
-    pub(crate) async fn replay_feed_request(&self, request: &RevocationRequest) -> Result<()> {
+    pub(crate) async fn replay_feed_request(&self, request: &RevocationRequest) -> Result<Replay> {
         let host = self.host_device_id();
         if request.host_device_id != host {
-            return Ok(());
-        }
-        let Some(issuer) = self.devices.record_for_device(request.issuer_device_id)? else {
-            return Ok(());
-        };
-        if !issuer.grant.actions.contains(&ActionRight::HostManage)
-            || kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
-                .is_err()
-            || self
-                .authority_feed_record(request.request_id)
-                .is_some_and(|noted| noted.is_refused_by(host))
-        {
-            return Ok(());
+            return Ok(Replay::Done);
         }
         let named = self.plan_of(request)?;
         let held = self.devices.devices()?;
@@ -596,9 +604,47 @@ impl Controller {
             }
         }
         if plan.devices.is_empty() && plan.grants.is_empty() {
-            return Ok(());
+            return Ok(Replay::Done);
         }
-        self.apply_feed_plan(&plan).await.map(|_| ())
+        let issuer = held
+            .iter()
+            .find(|record| record.device_id == request.issuer_device_id)
+            .or_else(|| {
+                held.iter().find(|record| {
+                    kr_crypto::keys::key_id(
+                        KeyPurpose::Authorisation,
+                        record.authorisation.as_bytes(),
+                    ) == request.issuer_key_id
+                })
+            });
+        let Some(issuer) = issuer else {
+            return Ok(Replay::Unverified);
+        };
+        if !issuer.grant.actions.contains(&ActionRight::HostManage)
+            || kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
+                .is_err()
+            || self
+                .authority_feed_record(request.request_id)
+                .is_some_and(|noted| noted.is_refused_by(host))
+        {
+            return Ok(Replay::Done);
+        }
+        self.apply_feed_plan(&plan).await?;
+        Ok(Replay::Done)
+    }
+
+    /// Records whether the feed shows complete a withdrawal this host cannot verify, and moves the
+    /// authority epoch when that changes what a remote grant is decided to be.
+    pub(crate) fn authority_feed_withdrawal_unverified(&self, unverified: bool) {
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if policy.withdrawal_unverified() != unverified {
+            policy.set_withdrawal_unverified(unverified);
+            drop(policy);
+            self.advance_authority_epoch();
+        }
     }
 
     /// Raises the registry to the revision the feed holds, in one barrier, and then lets the host
@@ -638,6 +684,8 @@ impl Controller {
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
+        // A feed that was removed shows nothing to compare, so it cannot keep a withdrawal unverified.
+        self.authority_feed_withdrawal_unverified(false);
         {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);

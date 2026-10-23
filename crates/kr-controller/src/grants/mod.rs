@@ -170,6 +170,10 @@ pub enum Refusal {
     /// catching up with revocations its records do not have, and refuses every grant but the
     /// owner's at this machine until it has.
     BehindItsFeed,
+    /// The authority feed this host reads shows complete a revocation by an owner this host does not
+    /// know, so the devices it names may be live here against that owner's word, and this host
+    /// refuses every grant but the owner's at this machine until that owner has dealt with them.
+    WithdrawalUnverified,
     /// The decision reads this host's clock, and the clock floor it would stand on is owed its
     /// record, so it is not taken until the floor is written down
     /// ([`policy::UtcFloor::bound`]).
@@ -265,6 +269,12 @@ impl Refusal {
             Self::BehindItsFeed => {
                 "this host is catching up with its authority feed, which holds revocations its own \
                  records do not, so it refuses remote access until it has"
+                    .to_owned()
+            }
+            Self::WithdrawalUnverified => {
+                "this host's authority feed shows a revocation by an owner this host does not know, \
+                 so it refuses remote access until the owner at this machine has revoked what it \
+                 names"
                     .to_owned()
             }
             Self::FloorUnrecorded | Self::ExpiryUnrecorded { .. } => FLOOR_UNRECORDED.to_owned(),

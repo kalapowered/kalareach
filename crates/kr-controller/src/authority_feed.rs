@@ -77,7 +77,7 @@ use crate::error::{ControllerError, Result};
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
 use crate::quiet::{Quiet, Timer};
 use crate::service::Controller;
-use crate::service::remote_revocation::Judged;
+use crate::service::remote_revocation::{Judged, Replay};
 
 /// The deadlines the feed's exchanges are made under. A request and its answer are small.
 pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
@@ -180,6 +180,10 @@ struct Observed {
     /// Whether the feed holds a revision above the registry's, so that this host is catching up
     /// with it and refuses every grant but the owner's at this machine until it has.
     catching_up: bool,
+    /// Whether the feed shows complete a withdrawal this host cannot verify, so that this host
+    /// refuses every grant but the owner's at this machine until the owner at this machine has
+    /// dealt with what it names.
+    unverified: bool,
     /// How many owners are paired beyond the keys the feed takes.
     unnamed_owners: usize,
 }
@@ -217,6 +221,9 @@ struct Shared {
     scan_unfinished: AtomicBool,
     /// Whether a record the scan met so far was put off because the host is behind its feed.
     scan_put_off: AtomicBool,
+    /// Whether a record the scan met so far is a withdrawal the feed shows complete and this host
+    /// cannot verify.
+    scan_unverified: AtomicBool,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
     /// How many passes have finished, for whatever waits on one.
@@ -282,6 +289,7 @@ impl FeedRuntime {
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
                 scan_put_off: AtomicBool::new(false),
+                scan_unverified: AtomicBool::new(false),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
                 passes: tokio::sync::watch::channel(0).0,
@@ -478,6 +486,16 @@ impl FeedRuntime {
         } else {
             detail
         };
+        let detail = if observed.unverified {
+            detail.stated(
+                "; the feed shows complete a revocation by an owner this host does not know, so the \
+                 devices it names may still be live here, and this host refuses every grant but the \
+                 owner's at this machine until that owner is paired again or the owner at this \
+                 machine revokes them",
+            )
+        } else {
+            detail
+        };
         let detail = if observed.unissued {
             detail.stated(
                 "; the feed holds a revision this host has not reached, so it cannot issue its own",
@@ -669,6 +687,7 @@ async fn pass(
     let starting = resumed == 0;
     let mut unfinished = shared.scan_unfinished.load(Ordering::SeqCst);
     let mut put_off = !starting && shared.scan_put_off.load(Ordering::SeqCst);
+    let mut unverified = !starting && shared.scan_unverified.load(Ordering::SeqCst);
     let mut cursor = if starting {
         shared.settled_through.load(Ordering::SeqCst)
     } else {
@@ -705,18 +724,30 @@ async fn pass(
             shared.observed().catching_up = behind;
         }
         for record in &state.records {
-            if settle(shared, controller, record, &mut now).await? {
-                if contiguous {
-                    through = record.sequence.get();
+            match settle(shared, controller, record, &mut now).await? {
+                Settled::Done => {
+                    if contiguous {
+                        through = record.sequence.get();
+                    }
                 }
-            } else {
-                contiguous = false;
-                // While the host is behind its feed, a record that is not settled is one put off:
-                // the scan that follows the catch-up judges it, in the order the feed holds it.
-                if controller.policy().behind_its_feed() {
-                    put_off = true;
-                } else {
-                    unfinished = true;
+                Settled::Unverified => {
+                    // Refused from this moment, and read again by every scan until the owner at
+                    // this machine has dealt with what it names.
+                    contiguous = false;
+                    unverified = true;
+                    controller.authority_feed_withdrawal_unverified(true);
+                    shared.observed().unverified = true;
+                }
+                Settled::Waiting => {
+                    contiguous = false;
+                    // While the host is behind its feed, a record that is not settled is one put
+                    // off: the scan that follows the catch-up judges it, in the order the feed
+                    // holds it.
+                    if controller.policy().behind_its_feed() {
+                        put_off = true;
+                    } else {
+                        unfinished = true;
+                    }
                 }
             }
         }
@@ -732,6 +763,7 @@ async fn pass(
     }
     shared.scan_unfinished.store(unfinished, Ordering::SeqCst);
     shared.scan_put_off.store(put_off, Ordering::SeqCst);
+    shared.scan_unverified.store(unverified, Ordering::SeqCst);
     if !read_through {
         // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
         // as read, the bounded offline validity is not extended from it, and nothing waits for
@@ -744,6 +776,11 @@ async fn pass(
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
     shared.scan_put_off.store(false, Ordering::SeqCst);
+    shared.scan_unverified.store(false, Ordering::SeqCst);
+    // Read through, the scan has seen every withdrawal the feed shows complete that is not settled:
+    // the refusal is lifted when it saw none, and stands when it saw one.
+    controller.authority_feed_withdrawal_unverified(unverified);
+    shared.observed().unverified = unverified;
     if let Some(latest) = latest {
         // A registry found behind the feed is raised to the feed's revision, in one barrier, before
         // the feed is called read: until then what the host decides stands on an earlier state.
@@ -797,9 +834,57 @@ async fn name_owners(
     Ok(())
 }
 
-/// Settles one record the feed holds: refuses it, or carries it out and acknowledges it. Returns
-/// whether the feed has nothing more to wait for on it.
+/// How a record the feed holds stands after this host has dealt with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settled {
+    /// The feed has nothing more to wait for on it.
+    Done,
+    /// It waits: a barrier still running, or the host catching up with its feed.
+    Waiting,
+    /// The feed shows it complete, and this host holds what it names live and cannot tell whose
+    /// word it is. It stays unsettled, so every scan reads it again.
+    Unverified,
+}
+
+/// Settles one record the feed holds: refuses it, or carries it out and acknowledges it.
 async fn settle(
+    shared: &Arc<Shared>,
+    controller: &Arc<Controller>,
+    record: &AuthorityFeedRecord,
+    latest: &mut Latest,
+) -> std::result::Result<Settled, Stopped> {
+    if record.rejected.0.is_none()
+        && let Some(held) = record.acknowledgement.0.as_ref()
+        && held.completion == RevocationCompletion::Complete
+    {
+        // A registry restored to an earlier state has lost what this host carried out for the
+        // request, which the feed still shows complete: what the registry does not show done is
+        // carried out again, whatever its counter says.
+        let id = record.request.request_id;
+        return match controller
+            .replay_feed_request(&record.request)
+            .await
+            .map_err(Stopped::local)?
+        {
+            Replay::Done => {
+                controller.authority_feed_settled(id, shared.host_device_id);
+                Ok(Settled::Done)
+            }
+            Replay::Unverified => Ok(Settled::Unverified),
+        };
+    }
+    Ok(
+        if settle_request(shared, controller, record, latest).await? {
+            Settled::Done
+        } else {
+            Settled::Waiting
+        },
+    )
+}
+
+/// Settles a record the feed does not show complete: refuses it, or carries it out and
+/// acknowledges it. Returns whether the feed has nothing more to wait for on it.
+async fn settle_request(
     shared: &Arc<Shared>,
     controller: &Arc<Controller>,
     record: &AuthorityFeedRecord,
@@ -812,19 +897,6 @@ async fn settle(
         controller
             .authority_feed_refusal_noted(id, shared.host_device_id)
             .map_err(Stopped::local)?;
-        return Ok(true);
-    }
-    if let Some(held) = record.acknowledgement.0.as_ref()
-        && held.completion == RevocationCompletion::Complete
-    {
-        // A registry restored to an earlier state has lost what this host carried out for the
-        // request, which the feed still shows complete: what the registry does not show done is
-        // carried out again, whatever its counter says.
-        controller
-            .replay_feed_request(request)
-            .await
-            .map_err(Stopped::local)?;
-        controller.authority_feed_settled(id, shared.host_device_id);
         return Ok(true);
     }
     // A request the registry does not show completed waits until the host has caught up: it is
