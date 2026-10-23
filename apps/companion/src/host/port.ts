@@ -105,6 +105,7 @@ import type {
 
 import type { AccountView, UsageView } from '../model/account'
 import type { LaunchSurface } from '../model/pending'
+import type { Supersession } from '../model/receipt-reads'
 
 /** A failure a command answered with. */
 export interface HostError {
@@ -1626,7 +1627,17 @@ export interface HostPort {
    * prepared against in its own parameters, and nothing else: native code builds the envelope from
    * exactly those, so the two cannot disagree.
    */
-  composerSubmit(params: AgentPromptParams, opening?: string): Promise<Settled<AgentMutationResult>>
+  /**
+   * Sends a prompt. `supersedes` makes it the explicit later request that follows an outcome nobody
+   * could establish: it names that earlier action and the revision of its record the person was
+   * shown, and the host admits it only when both are true of what it holds. It is for a prompt and
+   * for nothing else the page sends.
+   */
+  composerSubmit(
+    params: AgentPromptParams,
+    opening?: string,
+    supersedes?: Supersession
+  ): Promise<Settled<AgentMutationResult>>
   composerQueue(params: AgentPromptParams, opening?: string): Promise<Settled<AgentMutationResult>>
   composerSteer(params: AgentSteerParams, opening?: string): Promise<Settled<AgentMutationResult>>
   composerInterrupt(

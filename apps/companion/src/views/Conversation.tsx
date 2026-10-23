@@ -92,6 +92,7 @@ import {
   type DraftTarget
 } from '../model/drafts'
 import { FrameBatcher } from '../model/frame'
+import { supersessionFor } from '../model/receipt-reads'
 import { eventIsFor } from '../model/sessions'
 import {
   answered,
@@ -159,7 +160,7 @@ export function Conversation({
   readonly shellMode?: 'managed' | 'native_compat' | null
   readonly onLaunched: () => void
 }): ReactNode {
-  const { port, say, drafts: book, paths } = useApp()
+  const { port, say, drafts: book, paths, receiptReads } = useApp()
   const { rights, paired } = useHeldConnection()
   const { state, update } = useSession(sessionId)
   // The draft belongs to the window, not to this view: it is kept on this device as it is typed,
@@ -387,7 +388,15 @@ export function Conversation({
         return
       }
       const label = typed.trim() || action
-      const local = queued(`s-${Date.now()}-${Math.random()}`, label, Date.now(), typed)
+      // The conversation it goes to is kept with it: a later prompt to the same conversation is
+      // the one that can name this action's unconfirmed outcome.
+      const local: Submission = {
+        ...queued(`s-${Date.now()}-${Math.random()}`, label, Date.now(), typed),
+        sentTo: {
+          applicationInstanceId: written.applicationInstanceId,
+          agentBindingRevision: written.agentBindingRevision
+        }
+      }
       const clears = action === 'submit' || action === 'queue'
 
       // The stored draft is brought up to what is being sent and held as it is until the prompt
@@ -414,9 +423,16 @@ export function Conversation({
               binding_revision: written.agentBindingRevision ?? binding.binding_revision
             }
       const turn = binding.turn_id ?? ''
+      // A person who checked sends a prompt past an outcome nobody could establish as an explicit
+      // later request: it names the earlier action and the revision of its record they were shown.
+      // With nothing of that kind to name it names nothing, and the host decides.
+      const quote =
+        anyway && action === 'submit'
+          ? supersessionFor(state.submissions, receiptReads, written)
+          : null
       const dispatch = () =>
         action === 'submit'
-          ? port.composerSubmit({ target, draft_id: null, text: typed })
+          ? port.composerSubmit({ target, draft_id: null, text: typed }, undefined, quote ?? undefined)
           : action === 'queue'
             ? port.composerQueue({ target, draft_id: null, text: typed })
             : action === 'steer'
@@ -461,6 +477,9 @@ export function Conversation({
             return
           }
           const code = failureCode(error) ?? 'UNKNOWN'
+          // A refusal of the earlier result's quote says the host's record is not what was shown:
+          // it is read again at once, so the person sees what it says now.
+          if (anyway && code === 'DRAFT_CONFLICT') receiptReads.askAgain(sessionId)
           update((current) => ({
             ...current,
             submissions: current.submissions.map((submission) =>
@@ -487,7 +506,9 @@ export function Conversation({
       say,
       returnRefusedText,
       refresh,
-      unconfirmed
+      unconfirmed,
+      state.submissions,
+      receiptReads
     ]
   )
 

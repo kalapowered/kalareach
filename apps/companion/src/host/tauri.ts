@@ -255,7 +255,8 @@ export function tauriPort(): HostPort {
     agentSnapshot: (params, opening) => readIn('agent_snapshot', params, opening),
     agentCommands: (params, opening) => readIn('agent_commands', params, opening),
     approvalInspect: (params, opening) => readIn('agent_approval_inspect', params, opening),
-    composerSubmit: (params, opening) => call('agent_prompt_submit', { params, opening }),
+    composerSubmit: (params, opening, supersedes) =>
+      call('agent_prompt_submit', { params, opening, supersedes }),
     composerQueue: (params, opening) => call('agent_prompt_queue', { params, opening }),
     composerSteer: (params, opening) => call('agent_turn_steer', { params, opening }),
     composerInterrupt: (params, opening) => call('agent_turn_cancel', { params, opening }),
