@@ -426,6 +426,13 @@ service or configuration is.
 | A grant | The expiry it states, the end of the grantee's pairing, whichever comes first; a delegated grant never outlives its parent | [Grants, sharing and revocation](../host/README.md#grants-sharing-and-revocation) |
 | A mutation's receipt and a de-duplication record | Thirty days | [Journals and the receipt contract](../host/README.md#journals-and-the-receipt-contract) |
 | Retained session output | Seven days, 128 MiB for a session and 1 GiB for the host, whichever applies first | [Retained output, and what eviction leaves behind](../host/README.md#retained-output-and-what-eviction-leaves-behind) |
+| A session invitation | One hour by default; the issuer may choose less or extend it to at most 30 days, and a longer lifetime is refused and not shortened | [Grants, sharing and revocation](../host/README.md#grants-sharing-and-revocation) |
+| The longest grant lifetime an organisation policy may permit | At most 90 days; zero, or more than 90 days, is refused | `MAX_POLICY_GRANT_LIFETIME_MS` in `crates/kr-protocol/src/account.rs` |
+| A question | 24 hours by default and at most, or the life of the application that asked, whichever ends first | [Questions](../contact/README.md#questions) |
+| A mailbox item | 24 hours at most; a replay identifier is kept for 24 hours past its envelope's expiry | `MAX_MAILBOX_ITEM_LIFETIME_MS` and `REPLAY_ID_RETENTION_MS` in `crates/kr-protocol/src/mailbox.rs`; [The mailbox](method-reference.md#the-mailbox) |
+| A voice confirmation challenge | Two minutes, the same as an owner confirmation | `VOICE_CONFIRMATION_LIFETIME_MS` in `crates/kr-protocol/src/voice.rs`; [Pairing and the host's owner](../host/README.md#pairing-and-the-hosts-owner) |
+| A staged transfer | An unfinished upload and a download snapshot 24 hours; a completed attachment that is not submitted seven days | [Limits](../transfer/README.md#limits) |
+| An automation's causal root and a workflow run | A causal root lives one hour and a workflow run has a 30-minute deadline unless a definition shortens them | [Causal roots and budgets](../automation/README.md#causal-roots-and-budgets), [Limits, deadlines and admission](../automation/README.md#limits-deadlines-and-admission) |
 
 Every deadline is measured on a clock that counts suspended time, and a host that cannot prove its
 wall clock decides nothing by it ([The host time contract](../host/README.md#the-host-time-contract)).
