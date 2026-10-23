@@ -9,7 +9,6 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.07 | a session is launched with an entry for each integration installed, confirmed and admitted, on where the configuration turns it on and off where it does not; a create request naming one is refused before anything is reserved |
-//! | KR-REQ-07.45 | the doctor reports each integration: its package, command, flags and variables, what a new session gets of it and why, the mode an invocation runs in, and the executable the daemon's search path names with the version a signed record gives it |
 
 #![cfg(unix)]
 
@@ -460,6 +459,8 @@ async fn doctor(daemon: &Daemon) -> kr_protocol::hostinfo::HostDoctorResult {
 /// could launch through it here, which for this daemon is its worker with no launcher beside it;
 /// so its command runs as typed, on the native terminal. A package the configuration names that is
 /// not installed is reported too, and the check says the configuration asks for what cannot apply.
+/// The executable the search path names, and the version a signed record gives it, are read by the
+/// doctor's cases in the library (`catalogue::integrations`), not here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_07_45_the_doctor_reports_each_integration_and_what_a_new_session_gets() {
     use kr_protocol::hostinfo::{
