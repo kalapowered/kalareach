@@ -182,7 +182,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         Method::QuestionCreate => at(CONTACT, "What binds a helper to a session"),
         Method::QuestionReadOwn => at(CONTACT, "The caller token"),
         Method::QuestionCancelOwn | Method::QuestionCancel => at(CONTACT, "Cancellation"),
-        Method::AlertCreate => at(CONTACT, "The four tools"),
+        Method::AlertCreate => at(METHOD_REFERENCE, "Alerts"),
         Method::QuestionRead => at(CONTACT, "Answering from the terminal"),
         Method::QuestionAnswer => at(CONTACT, "Questions"),
 
@@ -199,7 +199,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         Method::SessionOpen => at(HOST, "Grants, sharing and revocation"),
         Method::SessionScreenPreview => at(HOST, "Grants, sharing and revocation"),
 
-        Method::SessionAttach => at(PROTOCOL, "Rights and capabilities are not the same thing"),
+        Method::SessionAttach => at(METHOD_REFERENCE, "Attachments"),
         Method::SessionDetach | Method::AttachmentConfigure => at(METHOD_REFERENCE, "Attachments"),
         Method::AttachmentViewport | Method::TerminalResize | Method::TerminalGeometryTransfer => {
             at(HOST, "Who owns the size")
