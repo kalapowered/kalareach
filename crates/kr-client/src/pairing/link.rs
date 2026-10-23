@@ -57,10 +57,11 @@ use crate::transport::{ControlTransport, NetworkTransport};
 pub enum LinkError {
     /// The host answered with a refusal of its own.
     Refused(ProtocolError),
-    /// The device could not give the host the membership lease it needs on a connection, and the
-    /// host was not asked: the organisation's service or this device's own account said no. It is
-    /// no word of the host's, so a caller that reads a refusal as the host's decision about what
-    /// it asked does not read this as one.
+    /// The device could not give the host the membership lease it needs on a connection, so the
+    /// connection was not used for what it was made for. The cause is the organisation's service,
+    /// this device's account, or the host's refusal of the lease it was given, and the message says
+    /// which. It is no refusal of what the caller asked the host, so a caller that reads a refusal
+    /// as the host's decision about that does not read this as one.
     Membership(ProtocolError),
     /// The host could not be reached, or the connection to it ended.
     Lost(String),
@@ -142,7 +143,7 @@ pub trait Preauth: Send {
 }
 
 /// What gives a host the membership lease a member's device needs on a connection to it.
-pub trait MembershipPresenter: Send + Sync + std::fmt::Debug {
+pub trait MembershipPresenter: Send + Sync {
     /// Presents the lease `host`'s grant needs, as the first thing on `session`, which proves
     /// `device_key`, or does nothing for a host whose grant answers to no organisation.
     ///
@@ -569,12 +570,14 @@ impl EndpointPool {
 }
 
 /// The product's link: the pool's endpoints, `connect_unpaired`, and the authorised handshake.
-#[derive(Debug)]
 pub struct IrohLink {
     pool: Arc<EndpointPool>,
     admissions: Option<Arc<PairingAdmissions>>,
     membership: Option<Arc<dyn MembershipPresenter>>,
 }
+
+// The presenter is left out: a trait object prints whatever implements it.
+crate::debug_fields!(IrohLink { pool, admissions });
 
 impl IrohLink {
     /// A link over `pool`.

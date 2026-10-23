@@ -13,20 +13,21 @@
 //! device's authorisation key, and the host accepts it only on a connection that proves that key.
 //! Which organisation is the one the host's grant names, kept with the pairing. The host holds one
 //! lease for the device, not one for each connection, so the desk keeps one keeper for each host
-//! and every connection to it presents the lease that keeper holds again, asking the organisation's
-//! service for another only when the host refuses it.
+//! and every connection to it presents the lease that keeper holds again while it lasts, asking the
+//! organisation's service for another only when none is held or the host refuses the one that is.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use kr_client::organisation::{LeaseEvent, LeaseKeeper, LeaseStop, LeaseTimer, RealTimer};
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::{LinkError, MembershipPresenter};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedMembershipLeaseService, managed_response_limits,
+    AccountMark, HttpDeadlines, HttpService, ManagedMembershipLeaseService, managed_response_limits,
 };
 use kr_client::session::Session;
 use kr_protocol::error::ProtocolError;
@@ -45,9 +46,21 @@ struct Kept {
     keeper: Arc<LeaseKeeper>,
     organisation: OrganisationId,
     key: AuthorisationKey,
-    /// The account the keeper asks with. A keeper holds a lease signed for one account, so another
+    /// Which account, at which service, the keeper asks as. A keeper holds a lease signed for one
+    /// account, and the application keeps one `Account` whoever is signed in to it, so another
     /// account gets a keeper of its own.
-    account: Arc<Account>,
+    account: AccountMark,
+}
+
+impl Kept {
+    fn is_for(
+        &self,
+        organisation: OrganisationId,
+        key: AuthorisationKey,
+        account: AccountMark,
+    ) -> bool {
+        self.organisation == organisation && self.key == key && self.account == account
+    }
 }
 
 struct Inner {
@@ -69,7 +82,8 @@ impl std::fmt::Debug for LeaseDesk {
 }
 
 /// The failure a lease that cannot be got is reported as, which the connection says to the person.
-/// It is the organisation's word, not the host's.
+/// It is not the host's word about what it was asked: a stop can be the organisation's service, this
+/// device's account, or the host's refusal of the lease it was given.
 fn failed(stop: &LeaseStop) -> LinkError {
     LinkError::Membership(ProtocolError::new(stop.code(), stop.to_string()))
 }
@@ -117,8 +131,8 @@ impl LeaseDesk {
     }
 
     /// The keeper of `host`'s lease, made the first time it is asked for and again when the
-    /// organisation, this device's key or the account is not the one it was made for, or none for
-    /// a host whose grant answers to no organisation.
+    /// organisation, this device's key or the account signed in is not the one it was made for, or
+    /// none for a host whose grant answers to no organisation.
     async fn keeper_of(
         &self,
         host: &PairedHost,
@@ -131,16 +145,28 @@ impl LeaseDesk {
         let Some(account) = (self.inner.account)().await else {
             return Err(LeaseStop::SignIn);
         };
+        let mark = match account.tokens().mark(account.origin().as_str()) {
+            Ok(Some(mark)) => mark,
+            Ok(None) => return Err(LeaseStop::SignIn),
+            Err(error) => {
+                tracing::warn!(%error, "this device cannot read which account is signed in");
+                return Err(LeaseStop::Unreachable);
+            }
+        };
         if let Some(kept) = self.hosts().get(&host.host_device_id)
-            && kept.organisation == organisation
-            && kept.key == key
-            && Arc::ptr_eq(&kept.account, &account)
+            && kept.is_for(organisation, key, mark)
         {
             return Ok(Some(Arc::clone(&kept.keeper)));
         }
+        // A first presentation is waited for by a person and by callers that allow ten seconds, so
+        // one request is not given the twenty seconds a background request is.
         let http = HttpService::with(
             account.origin().clone(),
-            HttpDeadlines::default(),
+            HttpDeadlines {
+                connect: Duration::from_secs(3),
+                read: Duration::from_secs(5),
+                total: Duration::from_secs(5),
+            },
             managed_response_limits(),
         )
         .map_err(|error| {
@@ -149,7 +175,7 @@ impl LeaseDesk {
         })?;
         let leases =
             ManagedMembershipLeaseService::new(account.origin(), Arc::new(http), account.tokens());
-        let keeper = Arc::new(
+        let made = Arc::new(
             LeaseKeeper::new(
                 Arc::new(leases),
                 Arc::clone(&self.inner.timer),
@@ -167,16 +193,24 @@ impl LeaseDesk {
                 }
             }),
         );
-        self.hosts().insert(
+        // Two connections that both found none made one each: the one that is kept first is the
+        // one both use, so they share the lease it holds and the stop it remembers.
+        let mut hosts = self.hosts();
+        if let Some(kept) = hosts.get(&host.host_device_id)
+            && kept.is_for(organisation, key, mark)
+        {
+            return Ok(Some(Arc::clone(&kept.keeper)));
+        }
+        hosts.insert(
             host.host_device_id,
             Kept {
-                keeper: Arc::clone(&keeper),
+                keeper: Arc::clone(&made),
                 organisation,
                 key,
-                account,
+                account: mark,
             },
         );
-        Ok(Some(keeper))
+        Ok(Some(made))
     }
 
     /// Keeps the lease the host holds for this device for as long as `session` lasts, and says why

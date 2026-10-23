@@ -1325,16 +1325,21 @@ origin (`kr_controller::backup::runtime`), and the device's settings archive,
 `recovery::SettingsArchive`, below.
 
 The relay-lease client has one caller: the daemon's lease keeper, `kr_controller::relay_leases`,
-which `docs/host/README.md` describes. The daemon builds that client, the account service client, the
-storage and backup manifest clients and the managed inference broker together, into the one
-`ServiceClients` it holds, and `kr doctor` reads `ServiceClients::availability` from it for the
-`managed-services` check.
+which `docs/host/README.md` describes. The daemon builds that client, the storage and backup manifest
+clients and the managed inference broker together, into the one `ServiceClients` it holds, with a view
+of the account service client its sign-in keeps for itself, and `kr doctor` reads
+`ServiceClients::availability` from it for the `managed-services` check. The clients of the authority
+feed, the mailbox and delivery are built where those start, from their own configuration.
 
 `services::organisation` is the client of an organisation's service, for a member's device. It asks for
 the membership lease the organisation signed for the signed-in account and the device's authorisation
 key (`POST /api/account/organisations/{id}/lease`, with the account's token for the
 `organisation.lease` scope), and reads the chain of keys that signs the organisation's leases (`GET
-.../policy-authority`). `ServiceClients::membership_leases` holds it and counts under account login.
+.../policy-authority`). A request the service turns back as `UNAUTHENTICATED` is sent again once with
+a renewed token (`SignedInAccount::token_of_account` with `renew`), because a token can end in
+transit or on a clock that runs behind the service's. `ServiceClients::membership_leases` is the slot
+for it and counts under account login; the companion's lease desk builds its client from the account
+signed in on the device.
 
 `organisation::LeaseKeeper` uses it. It presents the lease to the host with `membership.present` as
 the first thing on a connection made through `HostLink::connect_paired`, because the host refuses a
@@ -1344,34 +1349,42 @@ asks again on the interval the service advises, held between one and five minute
 reaches the host before the lease it replaces ends. A lease signed by a key revision the keeper has
 not carried before travels with the chain of keys.
 
-The keeper holds the lease the host last took. A connection made beside the application's own (the
-pairing's confirmation, an owner's confirmation, the settings listing) presents that lease again,
-and the service is asked for another only when the host refuses it, as a host does that restarted or
-whose clock has passed the lease's end. The standing links the companion opens to a host's sessions
-use `connect_paired_transport`, present nothing, and rely on the lease the application's own
-connection keeps. The companion keeps one keeper for each host, and makes another when the
-organisation, the device's key or the account differs, or when the person forgets the host.
+The keeper holds the lease the host last took, and counts its life from when it arrived. A connection
+made beside the application's own (the pairing's confirmation, an owner's confirmation, the settings
+listing) presents that lease again while it lasts, and the service is asked for another only when
+none is held, the application's own refresh is due, or the host refuses the one that is, as a host
+does that restarted or whose clock has passed the lease's end. The standing links the companion opens
+to a host's sessions use `connect_paired_transport`, present nothing, and rely on the lease the
+application's own connection keeps. The companion keeps one keeper for each host, and makes another
+when the organisation, the device's key or the account signed in differs, or when the person forgets
+the host.
 
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
 service answers. A lease that has ended, that the host installed before its restart, or that a newer
-lease replaced, is asked for again at once. A service that is down, a host clock in doubt and a delay
-the service names are waited out, and no failure makes the keeper ask the service more than once a
-minute while it keeps a lease. A delay of more than ten seconds is not waited out inside a
-connection, which is given twenty: the connection ends with `LeaseStop::Later` and the delay. A
-chain the host does not accept, and a token the service rejects, are tried three times before the
-keeper stops, because nothing says whether time mends them; the token source renews a token as it
-nears its end and has no renewal on demand. The keeper stops, and says why (`LeaseStop`), when no
-account is signed in (`SignIn`), when the service no longer takes the sign-in (`TokenRefused`), when
-the account is not a member, or when the host refuses the lease for a reason only an administrator
-can change.
+lease replaced is dropped and a new one asked for at once. A lease the service has only just signed
+and the host refuses that way is not asked for again at once: the host's clock or records differ
+from the service's, and a new lease would be refused the same way, so the keeper waits and tries up
+to three times, then stops and names the rule. A service that is down, a host clock in doubt and a
+delay the service names are waited out. While a lease is kept, the keeper begins no wait of less
+than a minute and sends the service at most one lease request after each wait, and while it waits no
+connection asks the service either; a delay that outlasts the lease the host holds ends the keeper
+with `LeaseStop::Later` when that lease ends. A delay of more than ten seconds is not waited out
+inside a connection, which is given twenty: the connection ends with `LeaseStop::Later` and the
+delay, and a first presentation takes eight seconds at the most. A chain the host does not accept
+is tried three times before the keeper stops, because nothing says whether time mends it. The keeper
+stops, and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no
+longer takes the sign-in (`TokenRefused`), when the account is not a member, or when the host
+refuses the lease for a reason only an administrator can change.
 
 A stop is remembered, so that a device the organisation removed does not send a request at every
 reconnect: the service allows an account a hundred and twenty lease requests an hour, shared with its
 other devices. After a stop that an administrator mends (`NotAMember`, `Refused`, `Unusable`) a
 connection fails at once with the same stop and sends nothing for five minutes; after `TokenRefused`
-or `Unreachable` for a minute; after `Later` for the delay the service named, an hour at most.
-`SignIn` and the end of a connection are not remembered: the first made no request, and the second
-needs none.
+or `Unreachable` for a minute; after `Later` for the delay the service named, an hour at most. The
+words of a held `Later` give the time that is left. `SignIn` and the end of a connection are not
+remembered: the first made no request, and the second needs none. A keeper belongs to the account
+that was signed in when it was made, so a person who signs in as another member is asked about
+afresh.
 
 A personal grant on an exclusively managed host needs a lease too and names no organisation, so the
 keeper does not serve it. The host's local owner presents with `kr organisation present`.
