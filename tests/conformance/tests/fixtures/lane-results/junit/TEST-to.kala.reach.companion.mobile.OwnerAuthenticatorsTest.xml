@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="to.kala.reach.companion.mobile.OwnerAuthenticatorsTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-10-23T02:53:26.895Z" hostname="runner" time="0.006">
+  <properties/>
+  <testcase name="before_android_11_only_a_strong_biometric_on_a_locked_phone_is_asked" classname="to.kala.reach.companion.mobile.OwnerAuthenticatorsTest" time="0.005"/>
+  <testcase name="a_strong_biometric_is_asked_with_the_screen_lock_as_its_fallback_from_android_11" classname="to.kala.reach.companion.mobile.OwnerAuthenticatorsTest" time="0.0"/>
+  <testcase name="the_wait_is_the_time_the_challenge_has_left_and_never_more_than_the_longest" classname="to.kala.reach.companion.mobile.OwnerAuthenticatorsTest" time="0.001"/>
+  <testcase name="the_ceremony_is_named_for_what_the_person_will_be_asked" classname="to.kala.reach.companion.mobile.OwnerAuthenticatorsTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
