@@ -272,11 +272,19 @@ impl InstalledConnector {
                      registration or no absolute forwarder"
                 )));
             }
-            // A bridge admitted for a launch is the package's own, whatever registered it.
-            if bridge.application != package.manifest.plugin_name.as_str() {
+            // A bridge admitted for a launch is for the application the package declares,
+            // whoever published the package and whatever it is called.
+            let declared = package
+                .manifest
+                .native_bridge
+                .as_ref()
+                .map(|recipe| recipe.application.as_str());
+            if declared.and_then(crate::broker::bridge::forwarder_application)
+                != Some(bridge.application.as_str())
+            {
                 return Err(ConnectorRefusal::new(format!(
                     "the native bridge installed for {plugin_id} starts the forwarder for {:?}, \
-                     which is not the package's own",
+                     which is not the application the package declares",
                     bridge.application
                 )));
             }
