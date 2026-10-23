@@ -970,6 +970,41 @@ fn a_comment_between_two_tests_names_a_row_it_keys_for_none() {
 }
 
 #[test]
+fn a_comment_above_a_test_whose_attribute_closes_on_the_line_of_its_function_keys_that_test() {
+    let root = tempfile::tempdir().expect("a directory");
+    let kotlin = "apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/ArgumentsTest.kt";
+    let target = root.path().join(kotlin);
+    std::fs::create_dir_all(target.parent().expect("a directory")).expect("directories");
+    std::fs::write(
+        &target,
+        "package to.kala.reach.companion.mobile\n\nclass ArgumentsTest {\n    /** KR-REQ-15.35: about the first. */\n    @Test(\n        timeout = 10) fun first() {\n    }\n    @Test fun second() {\n    }\n}\n",
+    )
+    .expect("a file");
+    let map = map_of(root.path());
+    assert!(
+        !map.problems
+            .iter()
+            .any(|problem| problem.starts_with(kotlin)),
+        "{:?}",
+        map.problems
+    );
+    let parts: Vec<lane::Part> = map.keys[&"KR-REQ-15.35".parse().expect("an identifier")]
+        .keys()
+        .filter_map(|place| match place {
+            Place::Lane { file, part, .. } if file == kotlin => Some(part.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        parts,
+        [lane::Part::Case {
+            class: "to.kala.reach.companion.mobile.ArgumentsTest".to_owned(),
+            name: "first".to_owned()
+        }]
+    );
+}
+
+#[test]
 fn a_phone_test_file_that_names_a_row_and_declares_no_class_is_a_problem() {
     let root = tempfile::tempdir().expect("a directory");
     let kotlin = "apps/companion/native/android/src/test/kotlin/to/kala/reach/companion/mobile/VoiceCaptureGateTest.kt";
