@@ -305,24 +305,31 @@ command that selects the title runs them all.
 | `apps/companion/native/ios/Tests/**` | The `phones` group in the macOS report, with Xcode |
 | `apps/companion/e2e/**` | Playwright over the built interface: the landing workflow's companion job runs it |
 
-A comment in a Kotlin or Swift file of the first two lanes keys that file as a whole: every case
-the lane reports for a class the file declares belongs to the rows its comments name, whichever
-test in the file the comment sits above. A failing case therefore fails every row its file names.
-The report reads the classes a file declares from the lines outside every brace, comment and
-string that begin with modifiers, attributes and `class` (a Kotlin or Java class by its
-package-qualified name). A class nested in another belongs to the file of the class around it
-(a JVM reports it as `Outer$Inner`).
+A comment in a Kotlin or Swift file of the first two lanes keys what it stands next to. A comment
+directly above a test, with nothing but comments between them, or inside its body, keys that test
+alone: a Kotlin function annotated `@Test` (a quoted name is the text between its backticks), or a
+Swift method of a class whose name begins with `test` and that takes nothing. A comment directly
+above a class, its attributes included, keys the tests of that class; a comment before the first
+line of code keys every test of the file. Any other comment, between the tests of a class or in a
+helper, keys nothing and is listed as a reference. A failing case therefore fails the rows its own
+comment, its class's comment and its file's head name, and no other. The report reads the classes
+and tests a file declares from the lines outside every brace, comment and string: the classes begin
+with modifiers, attributes and `class` (a Kotlin or Java class by its package-qualified name), and
+the tests are the functions of those classes at the top of their bodies. A class nested in another
+belongs to the file of the class around it (a JVM reports it as `Outer$Inner`).
 
-The report stops before it runs anything when it cannot read a file of these lanes for its classes:
-its braces do not balance once comments and strings are blanked, it declares a class whose name is
-in backticks or on the next line, or it names a row and declares no class. A case the lane reports
-that no file of the lane declares, or that two declare, is a problem of the result, and it fails
-every file of its lane: a result that cannot be given to one file cannot be given to any row. That
-holds whichever way the reading of the sources went wrong, with one limit. A class that the reading
-misses in its own file and lists in exactly one other is given to the other file, so its cases count
-for that file's rows, and the rows of the file that holds the class read only that file's other
-classes; a failure of it still fails the run, as a failure of those rows or as one listed outside
-any row.
+The report stops before it runs anything when it cannot read a file of these lanes: its braces do
+not balance once comments and strings are blanked, it declares a class whose name is in backticks or
+on the next line, it names a row and declares no class, or it names a row and declares a test this
+reading does not follow (a Kotlin test outside the body of a top-level class, a name it cannot read,
+or a Swift Testing test). A key whose test, or class, the lane's results do not hold is failed, not
+left to the other cases of the file. A case the lane reports that no file of the lane declares, or
+that two declare, is a problem of the result, and it fails every key of its lane: a result that
+cannot be given to one file cannot be given to any row. That holds whichever way the reading of the
+sources went wrong, with one limit. A class that the reading misses in its own file and lists in
+exactly one other is given to the other file, so its cases count for that file's keys, and the keys
+that name the missed class in its own file fail for want of a case; a failure of it still fails the
+run, as a failure of those rows or as one listed outside any row.
 
 The two scripts run the tests unchanged and leave what the tool wrote at the path `--results` names:
 Gradle's JUnit files in a directory, and, for Xcode, the tree `xcrun xcresulttool get test-results
@@ -339,9 +346,10 @@ reason, and does not count against the exit status, which Xcode leaves at 0 for 
 fail a check fail the lane's step and every file of the lane. A skipped case is not run, never
 passed.
 
-In the report of a platform that does not run a lane, that lane's files are shown as not run, with
-the platform that does. In a report that does, a file whose classes the results do not name is
-failed: the lane ran, and nothing of the file ran with it. The record of each case has the command
+In the report of a platform that does not run a lane, the tests its files key are shown as not run,
+with the platform that does: one record for each key, a test, a class or a file. In a report that
+does, a key whose test or class the results do not name is failed: the lane ran, and nothing it
+keys ran with it. The record of each case has the command
 that runs it alone, which is the script with the tool's own filter after `--`. A Playwright test is
 keyed as any TypeScript test is, and shown as not built with the lane's reason.
 
