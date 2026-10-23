@@ -127,7 +127,8 @@ requests more, outside these limits.
 
 A person turns notifications on for one paired host, on the Hosts screen. The phone asks the system
 for permission to notify (iOS `requestAuthorization`, Android 13 `POST_NOTIFICATIONS`) and for the
-registration token its provider gave the installation. A refusal is a state in words and changes
+registration token its provider gave the installation. Only that choice asks the system's question:
+the looks the application makes by itself never do. A refusal is a state in words and changes
 nothing else. Stopping notifications later is the system's setting, and ending a destination is the
 host's: a host ends it when it unpairs the device.
 
@@ -151,9 +152,13 @@ a field is malformed. Only after a yes does the receiver read the installation's
 `sign`, which returns the answer and the signed request that carries it; the receiver posts that to
 the origin the record names and moves the record to `answered` or `refused`. The function is reached
 through JNI on Android and through C symbols on iOS, and it signs nothing but a managed-service
-request and this answer. A post that did not reach the gateway is asked again on Android by
-WorkManager inside the deadline. On iOS nothing asks again: the challenge is lost, the record
-expires, and the person tries again.
+request and this answer. On Android the receiver hands WorkManager the answer as a safety net
+before it posts, so a process the system ends in the middle of the post leaves a try behind;
+WorkManager asks again inside the deadline when the post did not reach the gateway, and the
+receiver takes the safety net back only when the registration has ended. On iOS nothing asks again:
+the challenge is lost, the record expires, and the person tries again. Only a device shows the system waking the
+application for a challenge: the simulator hands a push that only wakes the application to no
+delegate, and the legs there call the delegate method themselves.
 
 The companion's core waits by reading the record each half second. That is a read of a local file
 and sends nothing. When the record says `answered` it checks that the phone is still paired with the
@@ -168,21 +173,23 @@ reads.
 Every step can be repeated. A lost answer, a restart or a changed token is mended by starting again
 from the proposal or the issue under a new action. Issuing again under the same record identifier
 gives a fresh bearer at the next revision, the host keeps the higher revision and owes the gateway no
-revocation, and one authorisation stands. The phone repeats the sequence when the token changes,
-for each host that asked, and once a minute at most when the application comes to the front after a
-stop that the person or the network could mend; it looks each time the application is in front, on
-whichever screen. The phone keeps one record of the registration it waits for and the gateway one
-pending attempt, so registrations for several hosts go one at a time. A provider makes its
-registration token a moment after the person agrees, and the phone waits up to twenty seconds for
-it before it stops and says so.
+revocation, and one authorisation stands. The application looks at where notifications stand when
+it starts, each time it comes to the front on whichever screen, and when the network changes. At a
+look the phone repeats the sequence for each host that asked when the token has changed, and, once
+a minute at most, for a host that stopped for something the person or the network could mend. The
+phone keeps one record of the registration it waits for and the gateway one pending attempt, so
+registrations for several hosts go one at a time. A provider makes its registration token a moment
+after the person agrees, and the phone waits up to twenty seconds for it before it stops and says
+so.
 
 The phone shows the host's generic alert and nothing more. A sealed preview is delivered and left
 unopened, and the key is filed so that an opener added later needs no new registration. Android
 receives a data message, which the gateway sends at high priority for every push because a
 normal-priority one waits for an application that is not in front, and shows the notification
-itself, under the identifier the host gave it and with a tap that opens the attention screen. On iOS the system shows the alert, and a tap is routed
-by the notification delegate, which is set before the launch ends. The notification service
-extension is installed with the application and has nothing to open until a preview opener exists.
+itself, under the identifier the host gave it and with a tap that opens the attention screen. On
+iOS the system shows the alert, and a tap is routed by the notification delegate, which is set
+before the launch ends. The notification service extension is installed with the application and
+has nothing to open until a preview opener exists.
 
 ### What neither question shows
 
