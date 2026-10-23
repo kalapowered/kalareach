@@ -922,7 +922,9 @@ fn a_locked_or_unavailable_desktop_is_reported_separately_from_process_life() {
 /// The boot is changed where the host records it, in its own state directory, which is the record
 /// a real reboot leaves behind: a runtime directory and the descriptors in it are cleared with the
 /// boot they belonged to, so a daemon that compared those would find nothing to compare after
-/// exactly the event it was looking for.
+/// exactly the event it was looking for. The workers of the first daemon are ended before the
+/// second one starts, as a reboot ends them: a worker the kernel says is running is not one an
+/// earlier boot left, and its session is not closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles() {
     let host = Host::create();
@@ -948,15 +950,13 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     } else {
         None
     };
-    // Each worker's endpoint and recorded process are kept so this test can end what it started
-    // and see that it ended: the workers themselves are still running afterwards, because this
-    // test moved a record rather than a machine.
+    // Each worker's recorded process is kept so that this test can end what it started, as a
+    // reboot does, and see that it ended.
     let mut workers = Vec::new();
     for entry in kr_ipc::descriptor::read_all(&host.paths()).expect("reads the descriptors") {
         let descriptor = entry.descriptor.expect("a descriptor");
         workers.push((
             descriptor.session_id,
-            descriptor.endpoint.clone(),
             descriptor.process_start_identity.clone(),
         ));
     }
@@ -1003,6 +1003,26 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     };
     let encoded = kr_cbor::to_canonical_vec(&another).expect("encodes");
     kr_ipc::paths::write_owner_only_file(&recorded, &encoded).expect("records another boot");
+    // A reboot ends every process of the boot it ends, and the record of the boot is not the only
+    // thing it changes: the workers the first daemon started are gone. A worker the kernel says is
+    // running is not one an earlier boot left, whatever the record says, and the daemon that
+    // starts over it leaves its session alone.
+    for (_, process) in &workers {
+        let stopped = kr_ipc::identity::stop_process(process, kr_ipc::identity::Stop::Kill);
+        assert!(
+            matches!(
+                stopped,
+                kr_ipc::identity::Stopped::Signalled | kr_ipc::identity::Stopped::Gone
+            ),
+            "the worker was not ended: {stopped:?}"
+        );
+    }
+    let waiting = wait_for_the_workers_to_end(&workers).await;
+    assert!(
+        waiting.is_empty(),
+        "workers this test ended had not ended {WORKER_EXIT_DEADLINE:?} after: {}",
+        waiting.join(", ")
+    );
 
     let second = host.start().await;
     let mut client = host.client().await;
@@ -1033,46 +1053,29 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
 
     drop(client);
     second.stop().await;
+}
 
-    for (session_id, endpoint, _) in &workers {
-        let session_id = *session_id;
-        let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(endpoint) else {
-            continue;
-        };
-        let connected = tokio::time::timeout(
-            WORKER_CALL_BOUND,
-            LocalClient::connect(&endpoint, LocalClientKind::Cli, build()),
-        )
-        .await;
-        let Ok(Ok(mut worker)) = connected else {
-            continue;
-        };
-        let _ = tokio::time::timeout(
-            WORKER_CALL_BOUND,
-            worker.mutate(
-                Method::SessionClose,
-                ActionId::new(kr_ipc::new_uuid()),
-                session_target(host.environment_id, session_id),
-                &SessionCloseParams { session_id },
-            ),
-        )
-        .await;
-    }
-    // What says a worker has gone is the kernel's answer about the process the descriptor recorded,
-    // not an endpoint that stopped answering: a worker that dropped its socket and stayed would
-    // pass that. A worker is a child of whatever process runs the daemon, which here is this test,
-    // so each one is collected here as well: until a child is collected the operating system keeps
-    // its entry, and on Linux that entry still carries the start value the descriptor recorded, so
-    // the identity alone would go on answering that the worker is running. Collecting is what
-    // establishes the end; the identity is what answers for a process this test is not the parent
-    // of. A query the operating system would not answer establishes nothing either way, so it
-    // keeps waiting and is named with what it said if the bound passes.
+/// Waits for the kernel to say that each recorded worker has ended, and returns what is still
+/// waited for when the bound passes, each with what the kernel said.
+///
+/// What says a worker has gone is the kernel's answer about the process the descriptor recorded,
+/// not an endpoint that stopped answering: a worker that dropped its socket and stayed would pass
+/// that. A worker is a child of whatever process runs the daemon, which here is this test, so each
+/// one is collected here as well: until a child is collected the operating system keeps its entry,
+/// and on Linux that entry still carries the start value the descriptor recorded, so the identity
+/// alone would go on answering that the worker is running. Collecting is what establishes the
+/// end; the identity is what answers for a process this test is not the parent of. A query the
+/// operating system would not answer establishes nothing either way, so it keeps waiting and is
+/// named with what it said if the bound passes.
+async fn wait_for_the_workers_to_end(
+    workers: &[(SessionId, kr_protocol::identity::ProcessStartIdentity)],
+) -> Vec<String> {
     let deadline = std::time::Instant::now() + WORKER_EXIT_DEADLINE;
     let mut ended = vec![false; workers.len()];
     let mut waiting: Vec<String> = Vec::new();
     loop {
         waiting.clear();
-        for (index, (session_id, _, process)) in workers.iter().enumerate() {
+        for (index, (session_id, process)) in workers.iter().enumerate() {
             if ended[index] {
                 continue;
             }
@@ -1092,16 +1095,10 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
             }
         }
         if waiting.is_empty() || std::time::Instant::now() >= deadline {
-            break;
+            return waiting;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(
-        waiting.is_empty(),
-        "workers this test started had not ended {WORKER_EXIT_DEADLINE:?} after they were asked \
-         to close: {}",
-        waiting.join(", ")
-    );
 }
 
 /// Collects one child of this test process, without waiting for it.
@@ -1131,9 +1128,6 @@ const fn collected(_pid: u64) -> bool {
 
 /// How long a worker this test closed is given to end.
 const WORKER_EXIT_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How long one call to a worker this test is ending may take.
-const WORKER_CALL_BOUND: Duration = Duration::from_secs(10);
 
 /// KR-REQ-03.23: the desktop a session was created on outlives its worker, so a host that finds
 /// the worker gone can say whether the desktop went with it.
