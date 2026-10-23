@@ -136,9 +136,13 @@ describe('the notifications of a paired host (KR-REQ-16.08)', () => {
     expect(within(row).queryByRole('button', { name: 'Open settings' })).toBeNull()
   })
 
-  it('looks again each time the application comes to the front', async () => {
+  it('looks again each time the application comes to the front, whichever screen it is on', async () => {
     const { controls } = start()
-    const row = await openHosts()
+    // The application opens on the attention screen and the person never opens Hosts.
+    await screen.findByRole('button', { name: 'Hosts' })
+    await waitFor(() => {
+      expect(controls.pushLooks.count).toBeGreaterThan(0)
+    })
     const before = controls.pushLooks.count
     // A person who left to change the system's setting comes back to the screen they left.
     act(() => {
@@ -147,7 +151,7 @@ describe('the notifications of a paired host (KR-REQ-16.08)', () => {
     await waitFor(() => {
       expect(controls.pushLooks.count).toBeGreaterThan(before)
     })
-    expect(row).toBeInTheDocument()
+    expect(screen.queryByTestId('host-notifications')).toBeNull()
   })
 
   it('shows nothing of notifications on a device that has none', async () => {
