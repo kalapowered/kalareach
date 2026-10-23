@@ -649,8 +649,10 @@ run_android() {
 # the system's and the process is suspended.
 # Says where the application is to be, and waits until the test that drives it has put it there.
 want_ios() { # foreground|background
-    /bin/rm -f "$harness/is"
+    # The place is written before `is` is taken away, since the test serves a place when it finds `is`
+    # gone, and must then read this one and not the last.
     printf '%s\n' "$1" >"$harness/want"
+    /bin/rm -f "$harness/is"
     local waited=0
     until [ "$(cat "$harness/is" 2>/dev/null)" = "$1" ]; do
         sleep 1
