@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -161,10 +162,9 @@ class PushReceiverTest {
         val crypto = Crypto("""{"verdict":"refused","reason":"registration"}""")
         val seeds = Seeds(ByteArray(32) { 5 })
         val gateway = Gateway(PostResult.Status(200))
-        assertEquals(
-            ChallengeOutcome.Ignored("registration"),
-            answerer(crypto, seeds, gateway, record).answer(challenge)
-        )
+        val outcome = answerer(crypto, seeds, gateway, record).answer(challenge)
+        assertEquals(ChallengeOutcome.Ignored("registration"), outcome)
+        assertFalse("a message that is refused says nothing about the registration", outcome.settles)
         assertTrue("the key is read only after the decision says to go on", seeds.asked.isEmpty())
         assertTrue(gateway.posted.isEmpty())
         assertNull("nothing was signed", crypto.signedWith)
@@ -285,7 +285,28 @@ class PushReceiverTest {
             val outcome =
                 answerer(Crypto(goOn), Seeds(ByteArray(32)), Gateway(result), record).answer(challenge)
             assertTrue("$result: $outcome", outcome is ChallengeOutcome.Retry)
+            assertFalse("a try that is asked again has not ended the registration", outcome.settles)
             assertEquals("pending", stateOf(record))
+        }
+    }
+
+    @Test
+    fun aRecordThatCannotBeWrittenLeavesTheAnswerToBeAskedAgainAndDoesNotFailTheReceiver() {
+        val record = PendingFile(file()).also { it.write(pendingText()) }
+        folder.root.setWritable(false)
+        try {
+            assumeFalse(
+                "the folder still takes a file (a super-user)",
+                runCatching { File(folder.root, "probe").createNewFile() }.getOrDefault(false)
+            )
+            for (code in listOf(200, 403)) {
+                val outcome =
+                    answerer(Crypto(goOn), Seeds(ByteArray(32)), Gateway(PostResult.Status(code)), record)
+                        .answer(challenge)
+                assertEquals("status $code", ChallengeOutcome.Retry("record_unwritable"), outcome)
+            }
+        } finally {
+            folder.root.setWritable(true)
         }
     }
 
@@ -296,6 +317,7 @@ class PushReceiverTest {
             answerer(Crypto(goOn), Seeds(ByteArray(32)), Gateway(PostResult.Status(403)), record)
                 .answer(challenge)
         assertEquals(ChallengeOutcome.GatewayRefused(403), outcome)
+        assertTrue("a refusal ends the registration", outcome.settles)
         val read = JSONObject(record.read(now)!!)
         assertEquals("refused", read.getString("state"))
         assertEquals("gateway_403", read.getString("reason"))
