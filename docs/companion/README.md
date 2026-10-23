@@ -497,8 +497,9 @@ directory: per host, whether the person asked, the authorisation identifier this
 token, no key and no credential. `docs/delivery/README.md` ("What the phone does first") says what
 the steps are. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
-comes back to the screen they left. A tap on a notification opens the application, and `notification_route` hands the page the
-screen once; the page goes to the attention screen, where what needs the person is.
+comes back to the screen they left. A tap on a notification opens the application, and
+`notification_route` hands the page the screen once; the page goes to the attention screen, where
+what needs the person is.
 
 The platform plugin carries the commands the steps need to native code: the permission, the token,
 the record of the registration being waited for, the limited key store, and the route of a tap. Its
