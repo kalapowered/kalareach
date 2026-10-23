@@ -19996,10 +19996,11 @@ export interface OwnerConfirmationCompleteParams {
   /**
    * The key a bootstrap proof is signed with.
    *
-   * Present only for the `local_bootstrap_terminal` channel, which a host accepts only while it
-   * has no owner, only from local IPC and only for establishing its first owner or its clock.
-   * The key proves possession and nothing else: the evidence is the local caller at an
-   * interactive terminal outside a KalaReach session.
+   * Present only for the `local_bootstrap_terminal` channel, which a host accepts only from local
+   * IPC, and only while it has no owner, for establishing its first owner or its clock, or, once
+   * it has an owner, for the one challenge that ends exclusive organisation management when no
+   * owner device is left that could confirm. The key proves possession and nothing else: the
+   * evidence is the local caller at an interactive terminal outside a KalaReach session.
    */
   bootstrap_signer: AuthorisationKey | null
   proof: OwnerConfirmationProof1
