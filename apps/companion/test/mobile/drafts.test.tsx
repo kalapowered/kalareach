@@ -107,6 +107,66 @@ describe('a phone whose drafts could not be opened', () => {
   })
 })
 
+describe('a draft whose host stops answering while the phone stays in front (KR-REQ-13.13)', () => {
+  it('is detached from the conversation, keeps its text, and is bound again when the host returns', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const { controls } = open(device)
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'half a thought')
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+
+    // The phone is still online and in front; only the host stopped answering.
+    act(() => {
+      controls.setConnected(false, 'the host stopped answering')
+    })
+    expect(
+      await screen.findByText('Not in contact with this host. The draft is kept here.')
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.getByLabelText('Message this session')).toHaveValue('half a thought')
+    expect(device.all().map((draft) => draft.text)).toEqual(['half a thought'])
+
+    // The host is back: the same draft is bound to the conversation it was written for.
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    })
+    expect(screen.queryByText('Not in contact with this host. The draft is kept here.')).toBeNull()
+    expect(screen.getByLabelText('Message this session')).toHaveValue('half a thought')
+  })
+})
+
+describe('the field under the terminal on a phone', () => {
+  it('says what Send does: it messages the session, and sends the agent a prompt', async () => {
+    const device = new FakeDraftStore()
+    const sent: string[] = []
+    const person = userEvent.setup()
+    open(device, (port) => ({
+      ...port,
+      composerSubmit: (params, opening, supersedes) => {
+        sent.push(params.text ?? '')
+        return port.composerSubmit(params, opening, supersedes)
+      }
+    }))
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.click(await screen.findByRole('tab', { name: 'Terminal' }))
+    const field = await screen.findByLabelText('Message this session')
+    expect(field).toHaveAttribute('placeholder', 'Message this session')
+    await person.type(field, 'run the tests')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(sent).toEqual(['run the tests'])
+    })
+  })
+})
+
 describe('the drafts no composer shows, on a phone (KR-REQ-13.13)', () => {
   it('says so when some drafts could not be read, and has the entry for it', async () => {
     const device = new FakeDraftStore()
