@@ -133,9 +133,11 @@ host's: a host ends it when it unpairs the device.
 
 Before the phone proposes the token it writes a record that the native half owns and that holds no
 secret: the registration identifier, the digest of the token, the gateway origin, the platform, the
-state (`pending`, `answered`, `refused`, `expired` or `superseded`) and a deadline seven minutes
-away, two longer than the gateway's five. A record past its deadline reads as expired on every
-read, in whatever process reads it, because nothing runs a timer in a stopped process. The phone
+state (`pending`, `answered`, `refused` or `expired`) and a deadline seven minutes away, two
+longer than the gateway's five. A new registration replaces the record whole, and what becomes of an
+answer is written only to the record of the registration it was for. A record past its deadline
+reads as expired on every read, in whatever process reads it, because nothing runs a timer in a
+stopped process. The phone
 then sends `push.installation.register` and the gateway sends the challenge to the token as a data
 message that carries `kr_challenge`, `kr_registration_id`, `kr_token_digest`, `kr_gateway_origin` and
 `kr_expires_at_ms`.
@@ -166,16 +168,21 @@ reads.
 Every step can be repeated. A lost answer, a restart or a changed token is mended by starting again
 from the proposal or the issue under a new action. Issuing again under the same record identifier
 gives a fresh bearer at the next revision, the host keeps the higher revision and owes the gateway no
-revocation, and one authorisation stands. The phone repeats the sequence when the token changes, and
-once a minute at most when the application comes to the front after a stop that the person or the
-network could mend.
+revocation, and one authorisation stands. The phone repeats the sequence when the token changes,
+for each host that asked, and once a minute at most when the application comes to the front after a
+stop that the person or the network could mend; it looks each time the application is in front, on
+whichever screen. The phone keeps one record of the registration it waits for and the gateway one
+pending attempt, so registrations for several hosts go one at a time. A provider makes its
+registration token a moment after the person agrees, and the phone waits up to twenty seconds for
+it before it stops and says so.
 
 The phone shows the host's generic alert and nothing more. A sealed preview is delivered and left
 unopened, and the key is filed so that an opener added later needs no new registration. Android
 receives a data message, which the gateway sends at high priority for every push because a
 normal-priority one waits for an application that is not in front, and shows the notification
-itself, under the identifier the host gave it and with a tap that opens the attention screen. On iOS the system shows the alert, the extension
-runs, and a tap is routed by the notification delegate set at launch.
+itself, under the identifier the host gave it and with a tap that opens the attention screen. On iOS the system shows the alert, and a tap is routed
+by the notification delegate, which is set before the launch ends. The notification service
+extension is installed with the application and has nothing to open until a preview opener exists.
 
 ### What neither question shows
 
