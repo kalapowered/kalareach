@@ -184,14 +184,21 @@ async fn an_identifier_spent_before_a_restart_is_spent_after_it() {
     drop(workers);
 }
 
-/// KR-REQ-09.07: two mutations of different stores that arrive together under one identifier do not
-/// both run.
+/// KR-REQ-09.07: an identifier that a mutation is being performed under is refused to a mutation of
+/// another store that arrives meanwhile, before the first has written anything.
+///
+/// The first mutation is stopped inside its store, where it holds the registry and has written no
+/// record, so the stores hold nothing under the identifier for the second to find. Only the
+/// identifier the daemon is performing can refuse the second, and the second is refused without
+/// waiting for the registry the first holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn two_mutations_of_different_stores_arriving_together_under_one_identifier_do_not_both_run()
-{
+async fn an_identifier_being_performed_is_refused_to_a_mutation_of_another_store_arriving_meanwhile()
+ {
     let Adopted { host, workers, .. } = Adopted::start(1).await;
     let session_id = workers[0].session_id;
     let shared = identifier(0x61);
+    let mut client = host.client().await;
+    let (arrived, release) = host.controller().attention().pause_before_store();
     let host = Arc::new(host);
     let visiting = {
         let host = Arc::clone(&host);
@@ -200,24 +207,37 @@ async fn two_mutations_of_different_stores_arriving_together_under_one_identifie
             visit(&host, &mut client, session_id, shared).await.is_ok()
         })
     };
-    let setting = {
-        let host = Arc::clone(&host);
-        tokio::spawn(async move {
-            let mut client = host.client().await;
-            privacy(&host, &mut client, true, shared).await.is_ok()
-        })
-    };
-    let (visited, set) = (
+    // Bounded, because the module keeps the other end of this channel: a mutation that answered
+    // without reaching the pause would leave an unbounded wait rather than a failure.
+    tokio::task::spawn_blocking(move || {
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the visit reached its store")
+    })
+    .await
+    .expect("the wait ends");
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        privacy(&host, &mut client, true, shared),
+    )
+    .await
+    .expect("the second mutation is answered without waiting for the first");
+    assert!(
+        is_a_reuse(refused),
+        "the identifier being performed is refused to the other mutation"
+    );
+    release.send(()).expect("the visit is let go");
+    assert!(
         visiting.await.expect("the visit task ends"),
-        setting.await.expect("the privacy task ends"),
+        "the first mutation is performed"
     );
     assert!(
-        visited ^ set,
-        "exactly one ran: visit {visited}, privacy {set}"
+        !privacy_is_on(&host).await,
+        "the refused mutation did not run"
     );
-    assert_eq!(privacy_is_on(&host).await, set);
     Arc::try_unwrap(host)
-        .unwrap_or_else(|_| panic!("both tasks have ended"))
+        .unwrap_or_else(|_| panic!("the task has ended"))
         .stop()
         .await;
     drop(workers);
