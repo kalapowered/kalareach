@@ -99,6 +99,15 @@ final class PushDeviceTests: DeviceTestCase {
             let wanted = read("want")
             let inFront = app.state == .runningForeground
             if wanted == "background" && inFront {
+                // The person goes to another screen before going away, so that a tap on a notification
+                // is seen to move the page to Attention and not to find it there already.
+                let hosts = app.buttons.matching(NSPredicate(format: "label == 'Hosts'")).firstMatch
+                var onHosts = false
+                if hosts.waitForExistence(timeout: 10) {
+                    hosts.tap()
+                    onHosts = app.staticTexts.matching(NSPredicate(format: "label == 'Hosts'")).firstMatch.waitForExistence(timeout: 10)
+                }
+                note("left the page on Hosts: \(onHosts)")
                 XCUIDevice.shared.press(.home)
                 // The application may stay a background application with its audio mode and not be
                 // suspended: either way it is not in front, and the banner is the system's.
@@ -192,12 +201,14 @@ final class PushDeviceTests: DeviceTestCase {
             screenshot("sent-\(act)")
             write("acted-\(act)", "sent \(screenText())")
         case "observe":
-            // The page stops offering a question that was answered at the host: the button goes and
-            // the screen says nothing is waiting or that the question is no longer waiting.
+            // The page says that a question the person had chosen an answer to, and had not sent,
+            // was answered by someone else, and offers nothing to send.
             let send = anyElement(labelled: "Send answer", within: app)
-            let said = NSPredicate(format: "label BEGINSWITH 'No longer waiting' OR label BEGINSWITH 'Nothing needs you right now'")
+            let said = { (words: String) -> Bool in
+                app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", words)).firstMatch.exists
+            }
             let end = Date().addingTimeInterval(60)
-            while Date() < end, send.exists || !app.staticTexts.matching(said).firstMatch.exists {
+            while Date() < end, send.exists || !(said("no longer waiting") && said("answered by someone else") && said("You had chosen")) {
                 Thread.sleep(forTimeInterval: 0.25)
             }
             screenshot("ended-\(act)")

@@ -272,7 +272,19 @@ try:
 except Exception:
     state = "none"
 say("the phone's registration record is answered", state == "answered", f"state {state}")
-say("five other messages were given first and the host had no destination before the answer",
+outcomes = {}
+for line in read("challenge-outcomes.txt").splitlines():
+    number, _, text = line.partition("|")
+    if number.isdigit():
+        outcomes[int(number)] = text
+expected = {1: "registration", 2: "token", 3: "origin", 4: "expired", 5: "malformed"}
+for number, reason in expected.items():
+    text = outcomes.get(number, "")
+    say(f"message {number} was a challenge the phone left unanswered for its reason: {reason} (16.06)",
+        "ignored" in text and reason in text, text)
+say("the real challenge was answered (16.06)", "answered" in outcomes.get(6, "") and "ignored" not in outcomes.get(6, ""), outcomes.get(6, ""))
+say("the same challenge again was not answered a second time (16.06)", "ignored" in outcomes.get(7, "") and "not_pending" in outcomes.get(7, ""), outcomes.get(7, ""))
+say("the host had no destination before the answer",
     report.get("destinations_before_the_challenge") == 0, f"destinations {report.get('destinations_before_the_challenge')}")
 say("the host holds the phone as a destination (16.08)", report.get("destination_present") is True)
 say("the destination is in service", report.get("destination_enabled") is True)
@@ -331,14 +343,23 @@ say("the delivery was shown on the phone, with the host's generic alert and none
     report.get("delivery_shown") is True)
 
 tapped = report.get("tap_step") or ""
-say("a tap on the delivery's notification opened the application on its Attention tab (09.21)",
-    "PUSH-TAPPED" in tapped and "Attention" in tapped, tapped[:200].replace("\n", " "))
-say("the person answered from there, and the worker's ledger holds the answer as this paired device's (09.21)",
-    report.get("question_answered_from_the_notification") is True and report.get("answer_is_the_paired_devices") is True)
+if platform == "android":
+    left_on_hosts = "PUSH-ON-HOSTS" in tapped
+else:
+    notes = read("test-notes.txt")
+    left_on_hosts = "left the page on Hosts: true" in notes and "left the page on Hosts: false" not in notes
+say("the application was on its Hosts screen when the notification was tapped, and the tap opened it on its Attention screen (09.21)",
+    left_on_hosts and "PUSH-TAPPED" in tapped and "Attention" in tapped, tapped[:200].replace("\n", " "))
+say("the person answered Yes from there, and the worker's ledger holds that answer as this paired device's (09.21)",
+    report.get("question_answered_from_the_notification") is True and report.get("answer_is_the_paired_devices") is True
+    and report.get("answer_is_yes") is True)
 late_seen = report.get("late_observe_step") or ""
-say("a second question answered at the host while the person had chosen an answer to it: the phone no longer offers it to send, and says nothing is waiting or that the question is no longer waiting (09.21)",
-    report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen and "Send answer" not in late_seen
-    and ("PUSH-CHOSEN" in (report.get("late_step") or "") or "chosen" in (report.get("late_step") or "")),
+late_chosen = report.get("late_step") or ""
+say("a second question answered at the host while the person had chosen Yes and not sent it: the phone says it was answered by someone else and what the person had chosen, and offers nothing to send (09.21)",
+    report.get("second_resolved_at_the_host") is True and "PUSH-ENDED" in late_seen
+    and "answered by someone else" in late_seen and "You had chosen" in late_seen and "Send answer" not in late_seen
+    and "still offered" not in late_seen
+    and ("PUSH-CHOSEN" in late_chosen or "chosen" in late_chosen),
     late_seen[:300].replace("\n", " "))
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
 
@@ -351,8 +372,8 @@ else:
     say("the application was ended when the host renewed (16.09)", report.get("reissue_step") == "ended", f"{report.get('reissue_step')}")
     say("the host renewed through the gateway and the delivery arrived (16.09)", report.get("renewal_delivered") is True)
     before, after = report.get("revision_before_the_reissue"), report.get("revision_after_the_renewal")
-    say("the credential the host holds is a later revision than the one before the reissue (16.09)",
-        isinstance(before, int) and isinstance(after, int) and after > before, f"before {before} after {after}")
+    say("the credential the host holds is the revision after the reissue's own: the host renewed over it (16.09)",
+        isinstance(before, int) and isinstance(after, int) and after == before + 2, f"before {before} after {after}")
     say("the renewal left the destination as it was and in service (16.09)", report.get("renewal_left_the_destination_as_it_was") is True)
     say("the renewal kept the authorisation the destination delivers under (16.09)", report.get("renewal_kept_the_authorisation") is True)
     say("the provider answered a send as it answers an unknown token (16.16)", report.get("provider_answered_unregistered") is True)
@@ -364,12 +385,14 @@ else:
         report.get("destination_back_in_service") is True)
     say("delivery resumed on the new token (16.16)", report.get("delivery_resumed_on_the_new_token") is True)
     asked = report.get("burst_asked")
+    allowance = report.get("burst_policy_burst")
     say("the host's journal retained every one of the burst's events (16.17)",
         report.get("burst_settled") is True and report.get("burst_events_retained") == asked, f"events {report.get('burst_events_retained')} of {asked}")
-    say("each event is one delivery record, and the records are accounted for as accepted, collapsed or otherwise (16.17)",
-        report.get("burst_deliveries_written") == asked
-        and report.get("burst_accepted", 0) + report.get("burst_collapsed", 0) + report.get("burst_other", 0) == asked,
-        f"states {report.get('burst_states')}")
+    say("each event is one delivery record, and the host accepted as many as its allowance gives and collapsed the rest (16.17)",
+        report.get("burst_deliveries_written") == asked and isinstance(allowance, int) and isinstance(asked, int)
+        and report.get("burst_accepted") == min(asked, allowance)
+        and report.get("burst_collapsed") == asked - min(asked, allowance) and report.get("burst_other") == 0,
+        f"states {report.get('burst_states')} allowance {allowance}")
     say("what reached the provider is exactly what the host's journal says the gateway accepted (16.17)",
         report.get("burst_provider_caught_up") is True and report.get("burst_at_the_provider") == report.get("burst_accepted"),
         f"provider {report.get('burst_at_the_provider')} accepted {report.get('burst_accepted')}")
@@ -393,7 +416,7 @@ PY
 # application logs what became of each message (by kind, never by content), which is what this
 # waits for.
 pump_android() { # <adb> <serial>
-    local adb="$1" serial="$2" n=1 file
+    local adb="$1" serial="$2" n=1 file outcome
     while [ ! -e "$harness/finish" ]; do
         file="$harness/inject-$n.json"
         if [ ! -s "$file" ]; then
@@ -428,9 +451,12 @@ pump_android() { # <adb> <serial>
         done
         python3 "$here/scripts/lib/push-inject.py" note "$file" >>"$artefacts/injected.txt"
         [ ! -e "$artefacts/cold-start.txt" ] || grep -q 'after' "$artefacts/cold-start.txt" || echo "pid after the message: '$("$adb" -s "$serial" shell pidof "$app_id" | tr -d '\r')'" >>"$artefacts/cold-start.txt"
-        say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $("$adb" -s "$serial" logcat -d -s KalaReachPush:I 2>/dev/null | tail -n 1 | sed 's/^.*KalaReachPush: //')"
+        outcome="$("$adb" -s "$serial" logcat -d -s KalaReachPush:I 2>/dev/null | tail -n 1 | sed 's/^.*KalaReachPush: //')"
+        say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $outcome"
         if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
             check_android_notification "$adb" "$serial" "$n"
+        else
+            printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/challenge-outcomes.txt"
         fi
         : >"$harness/injected-$n"
         n=$((n + 1))
@@ -445,7 +471,10 @@ check_android_notification() { # <adb> <serial> <n>
     printf '%s\n' "$dump" >"$artefacts/notifications-$n.txt"
     # Read from the file: a search that stops at its first match would end a pipe early, which a
     # script that sets pipefail takes for a failure.
-    if grep -q "pkg=$app_id" "$artefacts/notifications-$n.txt" && ! grep -q 'kr-marker-4f1c9a' "$artefacts/notifications-$n.txt"; then
+    local alert
+    alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$harness/inject-$n.json")"
+    if grep -q "pkg=$app_id" "$artefacts/notifications-$n.txt" && grep -q -F "$alert" "$artefacts/notifications-$n.txt" \
+        && ! grep -q 'kr-marker-4f1c9a' "$artefacts/notifications-$n.txt"; then
         : >"$harness/shown-$n"
     fi
 }
@@ -630,7 +659,7 @@ want_ios() { # foreground|background
 }
 
 pump_ios() { # <udid>
-    local udid="$1" n=1 file kind before after waited place=foreground deliveries=0
+    local udid="$1" n=1 file kind before after waited place=foreground deliveries=0 outcome
     while [ ! -e "$harness/finish" ]; do
         file="$harness/inject-$n.json"
         if [ ! -s "$file" ]; then
@@ -678,7 +707,9 @@ pump_ios() { # <udid>
                 [ "$waited" -lt 40 ] || break
                 sleep 1
             done
-            say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $(grep 'a registration challenge' "$harness/ios.log" 2>/dev/null | tail -n 1 | sed 's/^.*KalaReach: //')"
+            outcome="$(grep 'a registration challenge' "$harness/ios.log" 2>/dev/null | tail -n 1 | sed 's/^.*KalaReach: //')"
+            say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $outcome"
+            printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/challenge-outcomes.txt"
         else
             # A delivery is shown by the system while the application is in the background: the
             # person's acts bring it to the front, so it is asked to go every time.
