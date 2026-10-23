@@ -10,7 +10,7 @@
  * rather than about a screen, and both are what the recovery banner and the inbox are drawn from.
  */
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import type { ActionRight } from '@kalareach/protocol'
 
@@ -120,7 +120,10 @@ export function MobileApp({
     readonly reason: string | null
     readonly rights: readonly ActionRight[] | null
     readonly paired: boolean
+    /** When this window heard that contact was lost, while it is lost. */
+    readonly lostSinceMs: number | null
   } | null>(null)
+  const lostSince = useRef<number | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
   useRebind(connection?.connected === true, lifecycle)
@@ -180,21 +183,26 @@ export function MobileApp({
         () => port.connectionState(),
         (state) => {
           if (state.connected && state.rights !== null) rememberRights(state.rights)
+          // Contact lost is noted at the moment it is heard, and kept until it is back.
+          lostSince.current = state.connected ? null : (lostSince.current ?? Date.now())
           setConnection({
             connected: state.connected,
             environmentId: state.environment_id,
             reason: state.reason,
             rights: state.connected ? state.rights : null,
-            paired: state.connected && state.paired
+            paired: state.connected && state.paired,
+            lostSinceMs: lostSince.current
           })
         },
         (failure) => {
+          lostSince.current ??= Date.now()
           setConnection({
             connected: false,
             environmentId: null,
             reason: failureMessage(failure),
             rights: null,
-            paired: false
+            paired: false,
+            lostSinceMs: lostSince.current
           })
         }
       ),
@@ -326,7 +334,19 @@ export function MobileApp({
 
       <main className="m-main" id="main" tabIndex={-1}>
         {place.tab === 'attention' ? (
-          <Inbox surface={resolved} onOpenSession={openSession} onCounts={setActionable} />
+          <Inbox
+            surface={resolved}
+            connection={
+              connection === null
+                ? null
+                : {
+                    connected: connection.connected,
+                    lostSinceMs: connection.lostSinceMs
+                  }
+            }
+            onOpenSession={openSession}
+            onCounts={setActionable}
+          />
         ) : null}
         {place.tab === 'sessions' && !inSession && !inVoice && !inDrafts ? (
           <MobileSessions

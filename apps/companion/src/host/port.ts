@@ -651,6 +651,30 @@ export interface HostRow {
   readonly in_contact: boolean | null
 }
 
+/** A session of a host, by the number the host gives it. */
+export interface NumberedSession {
+  readonly session_id: string
+  readonly display_number: string
+}
+
+/** What one visit to a paired host that is not the one in use found of its inbox. */
+export interface HostInbox {
+  /** The host, by the reference the pairing screen lists it under. */
+  readonly reference: string
+  /** The name the host gives people. */
+  readonly name: string
+  /** `read` when the host answered; `out_of_contact` when it could not be reached or did not answer. */
+  readonly state: 'read' | 'out_of_contact'
+  /** When the inbox was read, by this device's clock. */
+  readonly read_at_ms: number | null
+  /** Since when this device has not been in contact with the host, by its own clock. */
+  readonly lost_since_ms: number | null
+  /** The host's inbox, when it was read. */
+  readonly result: AttentionReadResult | null
+  /** The host's sessions by number, when its inbox was read. */
+  readonly sessions: readonly NumberedSession[]
+}
+
 /** Where one paired host's notifications stand, as native code tells it. */
 export interface PushHostView {
   /** The host, by the reference the pairing screen lists it under. */
@@ -1880,6 +1904,12 @@ export interface HostPort {
    * was the one in use, and then there is none until another is chosen.
    */
   hostsForget(reference: string): Promise<ConnectionState>
+  /**
+   * The inbox of each paired host that is not the one in use, each read over a connection of its
+   * own, all at once: the inbox is one across hosts. A host that cannot be reached is listed as
+   * out of contact with the moment this device lost it, and holds up no other.
+   */
+  inboxHosts(): Promise<readonly HostInbox[]>
 
   /** Where each paired host's notifications stand. */
   pushView(): Promise<PushView>

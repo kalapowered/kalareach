@@ -55,6 +55,7 @@ import type {
   ConnectionState,
   DroppedFile,
   HostEvent,
+  HostInbox,
   HostPort,
   ImportedImage,
   KeyAction,
@@ -673,6 +674,11 @@ export interface FakeHostControls {
   routeNextTapTo(route: string | null): void
   /** How many times the page asked which screen a tap opened the application on. */
   readonly routeAsks: { count: number }
+  /**
+   * Sets what a visit to each paired host that is not in use finds of its inbox, as native code
+   * would tell it. A host the pairing screen lists as in use is not visited, whatever is set.
+   */
+  setInboxHosts(hosts: readonly HostInbox[]): void
   /** The references the page asked to use as the host its commands go to, in order. */
   readonly usedHosts: string[]
   /** The references the person forgot, in order. */
@@ -1191,6 +1197,8 @@ export function fakeHost(
   const voiceAllows: VoiceAllowRequest[] = []
   const usedHosts: string[] = []
   const forgottenHosts: string[] = []
+  /** What a visit to each other paired host finds of its inbox, until a test sets another. */
+  let inboxHosts: readonly HostInbox[] = []
   /** The words the host refuses a preparation with while no voice grant stands, or none. */
   let voiceGrantMissing: string | null = null
   let voiceAllowFailure: string | null = null
@@ -2288,6 +2296,12 @@ export function fakeHost(
       for (const listener of connectionListeners) listener(connectionNow())
       return Promise.resolve(connectionNow())
     },
+    inboxHosts: () =>
+      Promise.resolve(
+        inboxHosts.filter(
+          (each) => !pairing.hosts.some((host) => host.reference === each.reference && host.in_use)
+        )
+      ),
     hostsForget: (reference) => {
       const forgotten = pairing.hosts.find((host) => host.reference === reference)
       if (forgotten === undefined) {
@@ -3113,6 +3127,9 @@ export function fakeHost(
     },
     withDefaultShell(mode, source) {
       defaultShell = { mode, source }
+    },
+    setInboxHosts(hosts) {
+      inboxHosts = hosts
     },
     usedHosts,
     forgottenHosts,

@@ -110,6 +110,8 @@ kr-width.workspace = true
 # The pairing suite runs this computer against kr-controller's in-process daemon, whose test
 # support it includes by path.
 iroh.workspace = true
+# The events a host's attention store is given, so a suite can fill an inbox the phone reads.
+kr-attention.workspace = true
 kr-controller = { workspace = true, features = ["testing"] }
 # The description host's test catalogue and the conditions it reads, which the setup card's suite
 # places under the in-process daemon.

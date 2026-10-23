@@ -35,6 +35,7 @@ import type {
   PairingUnavailable,
   PairingView,
   PushView,
+  HostInbox,
   IntakeView,
   RecoveryView,
   RevocationView,
@@ -373,6 +374,7 @@ export function tauriPort(): HostPort {
 
     hostsUse: (reference) => choose('hosts_use', reference),
     hostsForget: (reference) => choose('hosts_forget', reference),
+    inboxHosts: () => call<readonly HostInbox[]>('inbox_hosts', {}),
     pushView: () => call<PushView>('push_view', {}),
     pushEnable: (reference) => call<PushView>('push_enable', { reference }),
     pushRefresh: () => call<PushView>('push_refresh', {}),

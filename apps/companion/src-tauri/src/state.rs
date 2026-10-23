@@ -47,6 +47,7 @@ pub struct AppState {
     sync_service: OnceLock<Arc<SyncService>>,
     recovery: OnceLock<Arc<Recovery>>,
     push: OnceLock<Arc<crate::push::PushDesk>>,
+    inbox: Arc<crate::inbox::InboxDesk>,
     mailbox: OnceLock<Arc<crate::mailbox::MailboxDesk>>,
     settings: OnceLock<Arc<crate::settings::Settings>>,
     drafts: Arc<crate::drafts::DraftDesk>,
@@ -90,6 +91,7 @@ impl AppState {
             sync_service: OnceLock::new(),
             recovery: OnceLock::new(),
             push: OnceLock::new(),
+            inbox: Arc::new(crate::inbox::InboxDesk::default()),
             mailbox: OnceLock::new(),
             settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
@@ -559,6 +561,12 @@ impl AppState {
     /// Records this computer's reader of its own mailbox, once it has been opened.
     pub fn mailbox_opened(&self, desk: Arc<crate::mailbox::MailboxDesk>) {
         let _ = self.mailbox.set(desk);
+    }
+
+    /// The inboxes of the hosts this device is paired with and is not using.
+    #[must_use]
+    pub fn inbox(&self) -> Arc<crate::inbox::InboxDesk> {
+        Arc::clone(&self.inbox)
     }
 
     /// Records this phone's notifications, once they have been opened.

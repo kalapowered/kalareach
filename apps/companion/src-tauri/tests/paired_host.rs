@@ -18,6 +18,7 @@
 //! | KR-REQ-13.08 | `a_choice_made_from_a_listing_that_has_since_forgotten_the_host_is_refused` |
 //! | KR-REQ-13.08 | `forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other` |
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
+//! | KR-REQ-13.01 | `the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use` |
 //! | KR-REQ-23.32 | `a_paired_devices_questions_go_through_the_host` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
@@ -37,7 +38,10 @@ use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
-use support::{Companion, NoOwner, StubIntake, WATCHDOG, pair, phone_paired_with};
+use support::{
+    Companion, LinkControl, NoOwner, StubIntake, WATCHDOG, pair, phone_paired_with,
+    unpaired_phone_controlled,
+};
 
 /// This computer paired with `host` as a device holding `rights`, and the data directory its
 /// records live in.
@@ -464,6 +468,142 @@ async fn choosing_between_two_paired_hosts_goes_to_the_one_chosen_last() {
             "round {round}: the connection is to the host the screen says is in use"
         );
     }
+    first.stop().await;
+    second.stop().await;
+}
+
+/// An approval the host's attention store is given, raised in `session`.
+fn approval(session: kr_protocol::ids::SessionId) -> kr_attention::SourceEvent {
+    kr_attention::SourceEvent::new(
+        kr_attention::EventCursor::in_session(
+            session,
+            kr_protocol::attention::AttentionSource::Receipts,
+            1,
+        ),
+        kr_ipc::now_ms(),
+        kr_attention::EventKind::ApprovalRequested {
+            request_id: kr_protocol::ids::ApprovalRequestId::new("req-1").expect("an identifier"),
+            session_id: session,
+            summary: String::new(),
+        },
+    )
+}
+
+/// A completed turn the host's attention store is given, in `session`.
+fn completed_turn(session: kr_protocol::ids::SessionId) -> kr_attention::SourceEvent {
+    kr_attention::SourceEvent::new(
+        kr_attention::EventCursor::in_session(
+            session,
+            kr_protocol::attention::AttentionSource::Semantic,
+            1,
+        ),
+        kr_ipc::now_ms(),
+        kr_attention::EventKind::TurnCompleted {
+            session_id: session,
+            turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("an identifier"),
+            version: 1,
+            change_set: None,
+            summary: String::new(),
+        },
+    )
+}
+
+/// The rules of the items one visit read, oldest first.
+fn rules(visit: &serde_json::Value) -> Vec<String> {
+    visit["result"]["items"]
+        .as_array()
+        .expect("the items of a host that was read")
+        .iter()
+        .map(|item| item["rule"].as_str().expect("a rule").to_owned())
+        .collect()
+}
+
+/// KR-REQ-13.01: the inbox is one across hosts. The host in use is read as any read of it is; every
+/// other host this phone is paired with is visited over a connection of its own, and the phone is
+/// given that host's inbox, or that it is out of contact with it and since when. A host that cannot
+/// be reached holds up no answer, is still listed with the contact it lost, and is read again once
+/// it can be reached; a host the phone forgets, or begins to use, is not visited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    let state = connection(companion, true).await;
+    assert_eq!(state["environment_id"], first.environment_id.to_string());
+
+    // The second host has things that wait for the person; the first, the host in use, is not
+    // visited.
+    let session = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    second
+        .controller()
+        .attention()
+        .observe(&[approval(session), completed_turn(session)])
+        .expect("the store records an approval and a completed turn");
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let others: Vec<&serde_json::Value> = view["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .filter(|row| row["in_use"] != true)
+        .collect();
+    assert_eq!(others.len(), 1, "{view}");
+    let other = others[0]["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+
+    // The host cannot be reached: it is listed, out of contact since a moment this phone noted, and
+    // the same moment at the next visit.
+    control.unreachable(true);
+    let visited = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(visited.as_array().map(Vec::len), Some(1), "{visited}");
+    assert_eq!(visited[0]["reference"], other.as_str());
+    assert_eq!(visited[0]["state"], "out_of_contact", "{visited}");
+    assert!(visited[0]["result"].is_null(), "{visited}");
+    let since = visited[0]["lost_since_ms"].as_u64().expect("since when");
+    let again = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(again[0]["lost_since_ms"].as_u64(), Some(since), "{again}");
+
+    // It can be reached: its inbox is read, and the loss is gone.
+    control.unreachable(false);
+    let read = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(read[0]["state"], "read", "{read}");
+    assert!(read[0]["lost_since_ms"].is_null(), "{read}");
+    let mut found = rules(&read[0]);
+    found.sort();
+    assert_eq!(
+        found,
+        vec!["attention.pending_approval", "attention.review_ready"],
+        "{read}"
+    );
+
+    // Choosing it takes it from the visits, and the host before it joins them.
+    companion
+        .call("hosts_use", json!({ "reference": other }))
+        .expect("the host is chosen");
+    let after = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(after.as_array().map(Vec::len), Some(1), "{after}");
+    assert_ne!(after[0]["reference"], other.as_str(), "{after}");
+    assert_eq!(after[0]["state"], "read");
+
+    // Forgetting the other leaves nothing to visit.
+    let remaining = after[0]["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+    companion
+        .call("hosts_forget", json!({ "reference": remaining }))
+        .expect("the host is forgotten");
+    let none = companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(none.as_array().map(Vec::len), Some(0), "{none}");
     first.stop().await;
     second.stop().await;
 }
