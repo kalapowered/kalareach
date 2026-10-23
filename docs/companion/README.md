@@ -497,9 +497,9 @@ steps for the host the person chose and holds the result in `push/push.json` und
 directory: per host, whether the person asked, the authorisation identifier this phone issued for it
 (so that asking again issues under the same one) and the last outcome in words. The file holds no
 token, no key and no credential. `docs/delivery/README.md` ("What the phone does first") says what
-the steps are. The page looks again with `push_refresh` when the application starts and each time it
-comes to the front, because a person who left to change the system's setting comes back to this
-screen. A tap on a notification opens the application, and `notification_route` hands the page the
+the steps are. The application looks again with `push_refresh` when it starts and each time it
+comes to the front, on whichever screen, because a person who left to change the system's setting
+comes back to the screen they left. A tap on a notification opens the application, and `notification_route` hands the page the
 screen once; the page goes to the attention screen, where what needs the person is.
 
 The platform plugin carries the commands the steps need to native code: the permission, the token,
