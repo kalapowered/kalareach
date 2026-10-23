@@ -417,6 +417,24 @@ impl Runtime {
             })
     }
 
+    /// Stops the next pass over the observation queue of the live binding `binding_id`, whichever
+    /// owner holds it, as [`BindingHandle::stop_next_pump`] does: for the tests of a host that
+    /// serves a binding to a connection the test cannot name the owner of.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stop_next_pump(&self, binding_id: BindingId) -> Option<PumpStop> {
+        self.bindings
+            .lock()
+            .ok()
+            .and_then(|bindings| match bindings.get(&binding_id) {
+                Some(Registration {
+                    state: RegistrationState::Live(handle),
+                    ..
+                }) => Some(handle.stop_next_pump()),
+                _ => None,
+            })
+    }
+
     /// Takes one preparation's claim on an identifier, or says it is taken.
     ///
     /// The returned guard gives the reservation up if the preparation does not finish, however it
