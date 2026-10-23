@@ -67,7 +67,7 @@ describe('the notifications of a paired host (KR-REQ-16.08)', () => {
     })
     const words = await within(row).findByText('Asking for permission.')
     // A step in progress is a status, said politely. Nothing is wrong, so it is not an alert.
-    expect(words).toHaveAttribute('role', 'status')
+    expect(words.parentElement).toHaveAttribute('role', 'status')
     expect(within(row).queryByRole('button', { name: 'Turn on notifications' })).toBeNull()
     expect(within(row).queryByRole('alert')).toBeNull()
   })
@@ -108,7 +108,8 @@ describe('the notifications of a paired host (KR-REQ-16.08)', () => {
     const words = await within(row).findByText(
       'Notifications are turned off for KalaReach in Settings.'
     )
-    expect(words).not.toHaveAttribute('role', 'status')
+    // The same live region says the stop, so a change from a step to a stop is announced.
+    expect(words.parentElement).toHaveAttribute('role', 'status')
     expect(within(row).getByRole('button', { name: 'Try again' })).toBeInTheDocument()
     expect(controls.settingsOpened.count).toBe(0)
     await person.click(within(row).getByRole('button', { name: 'Open settings' }))
