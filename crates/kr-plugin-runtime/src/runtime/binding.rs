@@ -833,6 +833,8 @@ pub struct BindingHandle {
     disabled: Arc<Mutex<Option<String>>>,
     stopping: Arc<AtomicBool>,
     pump_pending: Arc<AtomicBool>,
+    #[cfg(feature = "testing")]
+    pump_stop: Arc<Mutex<Option<PumpStopSide>>>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
     calls: Arc<AtomicU64>,
@@ -866,6 +868,8 @@ impl BindingHandle {
         let disabled = Arc::new(Mutex::new(None));
         let stopping = Arc::new(AtomicBool::new(false));
         let pump_pending = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "testing")]
+        let pump_stop = Arc::new(Mutex::new(None));
         let pending = Arc::new(PendingUpdates::default());
         let outstanding = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(AtomicU64::new(0));
@@ -893,6 +897,8 @@ impl BindingHandle {
             disabled: Arc::clone(&disabled),
             stopping: Arc::clone(&stopping),
             pump_pending: Arc::clone(&pump_pending),
+            #[cfg(feature = "testing")]
+            pump_stop: Arc::clone(&pump_stop),
             pending: Arc::clone(&pending),
             outstanding: Arc::clone(&outstanding),
             commands: commands.clone(),
@@ -913,6 +919,8 @@ impl BindingHandle {
             disabled,
             stopping,
             pump_pending,
+            #[cfg(feature = "testing")]
+            pump_stop,
             pending,
             outstanding,
             calls,
@@ -968,6 +976,27 @@ impl BindingHandle {
     #[must_use]
     pub fn queued_bytes(&self) -> u64 {
         self.queue.lock().map_or(0, |queue| queue.held_bytes())
+    }
+
+    /// Stops the binding's next pass over its observation queue before it takes anything from it,
+    /// for the tests of what the queue does while the component has not yet read it: the
+    /// component's speed against the producer's decides nothing once the pass is held.
+    ///
+    /// Observations offered while the pass stands are held in the queue, and the pass that goes on
+    /// when the stop is released finds them all. Call it before the offer that wakes the pass, and
+    /// release the stop before [`Self::stop`], which waits for the pass.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stop_next_pump(&self) -> PumpStop {
+        let (reached, acknowledged) = tokio::sync::watch::channel(false);
+        let (release, released) = mpsc::channel();
+        if let Ok(mut slot) = self.pump_stop.lock() {
+            *slot = Some(PumpStopSide { reached, released });
+        }
+        PumpStop {
+            acknowledged,
+            _release: release,
+        }
     }
 
     /// Says the component's view is stale and a fresh snapshot is owed.
@@ -1224,6 +1253,37 @@ impl Drop for BindingHandle {
     }
 }
 
+/// A test's stop of a binding's next pump pass, held from [`BindingHandle::stop_next_pump`].
+///
+/// Dropping it lets the pass go, as [`Self::release`] does.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct PumpStop {
+    acknowledged: tokio::sync::watch::Receiver<bool>,
+    _release: mpsc::Sender<()>,
+}
+
+#[cfg(feature = "testing")]
+impl PumpStop {
+    /// Waits until the pass has stopped, which is the point the stop is acknowledged at: the pass
+    /// has been woken, and nothing has left the queue.
+    pub async fn reached(&mut self) {
+        // The sender lives in the binding's slot or in the pass that stands. It drops unsent only
+        // if the binding ends first, and then there is no pass to wait for.
+        let _ = self.acknowledged.wait_for(|reached| *reached).await;
+    }
+
+    /// Lets the pass go on.
+    pub fn release(self) {}
+}
+
+/// The pass's side of a [`PumpStop`].
+#[cfg(feature = "testing")]
+struct PumpStopSide {
+    reached: tokio::sync::watch::Sender<bool>,
+    released: mpsc::Receiver<()>,
+}
+
 /// What the binding's thread needs to create its instance.
 struct WorkerSetup {
     engine: RuntimeEngine,
@@ -1247,6 +1307,8 @@ struct BindingWorker {
     disabled: Arc<Mutex<Option<String>>>,
     stopping: Arc<AtomicBool>,
     pump_pending: Arc<AtomicBool>,
+    #[cfg(feature = "testing")]
+    pump_stop: Arc<Mutex<Option<PumpStopSide>>>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
     commands: mpsc::Sender<Command>,
@@ -1380,6 +1442,8 @@ impl BindingWorker {
     }
 
     fn pump(&mut self) {
+        #[cfg(feature = "testing")]
+        self.stand_when_stopped();
         // Cleared before the queue is read, so an event that arrives during this pass wakes the
         // next one rather than being left in the queue with nobody coming for it.
         self.pump_pending.store(false, Ordering::Release);
@@ -1485,6 +1549,20 @@ impl BindingWorker {
             .lock()
             .ok()
             .and_then(|mut queue| queue.take_one())
+    }
+
+    /// Stands at the start of a pass a test has stopped, until the test lets it go.
+    ///
+    /// The stop is taken, so it holds one pass and the next runs freely. The pass is acknowledged
+    /// before it waits, and nothing has left the queue by then.
+    #[cfg(feature = "testing")]
+    fn stand_when_stopped(&self) {
+        let Some(stop) = self.pump_stop.lock().ok().and_then(|mut slot| slot.take()) else {
+            return;
+        };
+        stop.reached.send_replace(true);
+        // Ends when the test releases the pass, or drops its side without having released it.
+        let _ = stop.released.recv();
     }
 
     /// Wakes the pump again when there is more to do.
