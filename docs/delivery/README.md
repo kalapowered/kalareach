@@ -51,9 +51,9 @@ text a producer supplies, so a command line, an approval argument or a project n
 provider's logs by mistake.
 
 The **preview** is sealed to the destination device's `notification_preview` key and to no other
-key. That key is registered through the device's own authenticated channel with a purpose and a
-revision, and it is a different kind of key from the one that opens mailbox records, archive key
-wraps and recovery bundles. A device that turns previews off stops receiving the recipient key on
+key. That key is registered, and rotated, through the device's own authenticated channel with
+`device.preview_key.update`, with a purpose and a revision, and it is a different kind of key from
+the one that opens mailbox records, archive key wraps and recovery bundles. A device that turns previews off stops receiving the recipient key on
 future notifications; the generic alert still arrives.
 
 A registration is one action with one answer. The host keeps the answer with the action, so a device
