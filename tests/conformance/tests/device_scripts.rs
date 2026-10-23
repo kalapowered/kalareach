@@ -4,9 +4,9 @@
 //! one listed, or defaults to a name that is someone else's, starts, fills and wipes what is not
 //! KalaReach's. Each case runs a script as it is committed, from a copy of the tree, with the
 //! Android tools replaced by programs that record their arguments and start nothing: the SDK's
-//! `adb` and `emulator`, and the build tools, browser and image reader a script calls before it
-//! reaches the device. Every script is run to the point where it starts the emulator, so the
-//! arguments the emulator was given are what the cases read.
+//! `adb` and `emulator`, and the build tools, Gradle wrapper, browser and image reader a script
+//! calls before it reaches the device. Every script is run to the point where it starts the
+//! emulator, so the arguments the emulator was given are what the cases read.
 
 #![cfg(unix)]
 
@@ -34,7 +34,7 @@ struct Script {
     env: &'static [(&'static str, &'static str)],
 }
 
-const SCRIPTS: [Script; 9] = [
+const SCRIPTS: [Script; 11] = [
     Script {
         path: "scripts/e2e-mobile.sh",
         args: &["android"],
@@ -89,6 +89,23 @@ const SCRIPTS: [Script; 9] = [
         args: &[],
         waits_for_boot: false,
         env: &[("KR_RELEASE_APK", "application.apk")],
+    },
+    Script {
+        // The web checkout the gateway runs from and the package to install are named, so the
+        // script goes no further than the device for them.
+        path: "scripts/e2e-push-device.sh",
+        args: &["android"],
+        waits_for_boot: false,
+        env: &[
+            ("KR_WEB_TREE", "web"),
+            ("KR_PUSH_ANDROID_APK", "application.apk"),
+        ],
+    },
+    Script {
+        path: "scripts/e2e-push-android-receiver.sh",
+        args: &[],
+        waits_for_boot: false,
+        env: &[],
     },
 ];
 
@@ -199,6 +216,21 @@ fn run(
     fs::create_dir_all(package.parent().expect("a parent")).expect("a directory");
     fs::write(package, "").expect("a package");
     fs::write(tree.join("application.apk"), "").expect("a package");
+    // What the receiver's script builds with and installs from, and the web checkout the push
+    // script starts its gateway from.
+    let android = companion.join("src-tauri/gen/android");
+    let outputs = android.join("app/build/outputs/apk");
+    for package in [
+        "arm64/debug/app-arm64-debug.apk",
+        "androidTest/arm64/debug/app-arm64-debug-androidTest.apk",
+    ] {
+        let package = outputs.join(package);
+        fs::create_dir_all(package.parent().expect("a parent")).expect("a directory");
+        fs::write(package, "").expect("a package");
+    }
+    let driver = tree.join("web/infra/scripts/testing/local-restore.mjs");
+    fs::create_dir_all(driver.parent().expect("a parent")).expect("a directory");
+    fs::write(driver, "").expect("a driver");
 
     fs::write(root.join("avds.txt"), format!("{}\n", listed.join("\n"))).expect("a list");
     if let Some((serial, name)) = running {
@@ -238,6 +270,9 @@ fn run(
         ),
     );
 
+    // The Gradle wrapper builds nothing and says so in the record.
+    stand_in(&android, "gradlew", &record, "exit 0");
+
     // The signer and the aligner a release run looks for before it builds anything.
     for tool in ["apksigner", "zipalign"] {
         stand_in(&sdk.join("build-tools/36.0.0"), tool, &record, "exit 0");
@@ -255,7 +290,7 @@ fn run(
         &record,
         &format!(
             "case \"$*\" in\n\
-             *--message-format=json*) for host in voice_device pairing_device release_tls_device; do echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"{path}\",\"target\":{{\"name\":\"'$host'\"}}}}'; done ;;\n\
+             *--message-format=json*) for host in voice_device pairing_device release_tls_device push_device; do echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"{path}\",\"target\":{{\"name\":\"'$host'\"}}}}'; done ;;\n\
              *) exit 1 ;;\n\
              esac",
             path = tools.join("voice_device").display()
@@ -315,6 +350,7 @@ fn run(
         .env("ANDROID_HOME", &sdk)
         .env("KR_TEST_ARTIFACTS_DIR", root.join("artefacts"))
         .env("KR_MOBILE_SCREENSHOT_DIR", root.join("scratch"))
+        .env("KR_PUSH_SHOTS", root.join("scratch"))
         .env("KR_STANDING_SHOTS", root.join("scratch"))
         .env("KR_TEXT_SIZE_SHOTS", root.join("scratch"))
         .env("KR_MOBILE_SETTLE", "0");
@@ -351,9 +387,9 @@ fn a_machine_that_lacks_kalareachs_virtual_device_is_told_so_and_no_other_is_sta
         if !run.started().is_empty() {
             wrong.push(format!("it started {:?}", run.started()));
         }
-        // A refusal costs the two voice-call scripts, which build the application (and one of them
-        // the host), no build.
-        if run.called("pnpm android") || run.called("cargo") {
+        // A refusal costs the scripts that build the application (and the ones that build the
+        // host) no build.
+        if run.called("pnpm android") || run.called("cargo") || run.called("gradlew") {
             wrong.push("it built before it refused".to_string());
         }
         if !wrong.is_empty() {
