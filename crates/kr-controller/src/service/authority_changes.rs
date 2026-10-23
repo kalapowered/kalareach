@@ -3078,8 +3078,8 @@ fn open_number(
 }
 
 /// Whether the daemon's entry for a worker now can stand in for the one an answer was given with:
-/// the barrier holds for it, fewer names are still to come, and every name the answer gave is in
-/// it, with no more gone than there were.
+/// the barrier holds for it, fewer names are still to come or the worker has ended since and none
+/// can be asked for, and every name the answer gave is in it, with no more gone than there were.
 ///
 /// The totals alone do not say it. The result of a revision also reads the reports of the revisions
 /// its announcement carried, and when one of those goes the names it gave go from the entry while
@@ -3088,8 +3088,11 @@ fn carries_what_was_given(
     now: &kr_protocol::action::WorkerBarrier,
     given: &kr_protocol::action::WorkerBarrier,
 ) -> bool {
+    let ended_since = now.state == kr_protocol::action::BarrierState::Ended
+        && given.state != kr_protocol::action::BarrierState::Ended
+        && now.names_pending.get() <= given.names_pending.get();
     now.state.holds()
-        && now.names_pending.get() < given.names_pending.get()
+        && (now.names_pending.get() < given.names_pending.get() || ended_since)
         && now.omitted_actions.get() <= given.omitted_actions.get()
         && given
             .rejected_actions

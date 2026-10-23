@@ -3430,32 +3430,103 @@ async fn the_asking_again_of_an_announcement_is_bounded_for_all_the_workers_it_c
 /// once the limit is lifted.
 struct Unasked {
     hosted: Hosted,
-    barrier: kr_protocol::action::RevocationBarrier,
+    client: LocalClient,
+    /// The revocation of a grant, as the local owner sent it: repeating it repeats the action.
+    mutation: MutationRequest,
+    /// What the host answered the revocation with.
+    given: kr_protocol::sharing::RevocationResult,
     affected: usize,
 }
 
+/// A grant the host issued, which a revocation can name.
+fn an_issued_grant(hosted: &Hosted) -> kr_protocol::ids::GrantId {
+    use kr_controller::grants::GrantRecord;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{DeviceId, GrantId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::CanonicalSet;
+
+    let held = Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([0x67; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    hosted
+        .controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: held.clone(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+    held.grant_id
+}
+
+/// A real revocation of a grant, sent by the local owner, whose answer leaves names to come.
 async fn a_revocation_that_left_names_unasked() -> Unasked {
     let hosted = hosted_worker().await;
+    let granted = an_issued_grant(&hosted);
     hosted.controller.limit_evidence_pages_for_tests(0);
     let device = actor("device:phone");
     let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
     seed_undispatched_intents(&hosted, &device, affected);
-    let first = tokio::time::timeout(
-        Duration::from_secs(60),
-        hosted.controller.revoke_authority(),
-    )
-    .await
-    .expect("the revocation reports")
-    .expect("the revocation is recorded");
-    let barrier = announced_until(&hosted.controller, first, |barrier| barrier.holds()).await;
-    let reported = worker_report(&barrier, hosted.session_id);
+
+    let mut client = LocalClient::connect(&hosted.client_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon");
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            ActionId::new(Uuid::from_bytes([0x66; 16])),
+            ActionTarget::environment(hosted.environment_id),
+            &kr_protocol::sharing::GrantRevokeParams { grant_id: granted },
+        )
+        .await
+        .expect("the revocation is composed");
+    let given: kr_protocol::sharing::RevocationResult =
+        tokio::time::timeout(Duration::from_secs(60), client.repeat(&mutation))
+            .await
+            .expect("the revocation is answered")
+            .expect("the daemon answers")
+            .expect("the grant is revoked")
+            .to_typed()
+            .expect("a revocation result");
+    assert!(given.barrier.holds(), "{:?}", given.barrier);
+    let reported = worker_report(&given.barrier, hosted.session_id);
     assert!(
         reported.names_pending.get() > 0 && reported.rejected_actions.len() < affected,
         "the worker still owes names when the revocation is answered: {reported:?}"
     );
     Unasked {
         hosted,
-        barrier,
+        client,
+        mutation,
+        given,
         affected,
     }
 }
@@ -3493,61 +3564,6 @@ async fn the_names_a_busy_worker_still_owed_are_collected_without_another_announ
     );
 }
 
-/// The action of a revocation of a grant that the host answered with `barrier`, as the host keeps
-/// it for a repeat, and the mutation that repeats it.
-async fn a_revocation_answered_with(
-    hosted: &Hosted,
-    barrier: &kr_protocol::action::RevocationBarrier,
-) -> (
-    LocalClient,
-    MutationRequest,
-    kr_protocol::sharing::RevocationResult,
-) {
-    let mut client = LocalClient::connect(&hosted.client_endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("connects to the daemon");
-    let action_id = ActionId::new(Uuid::from_bytes([0x66; 16]));
-    let mutation = client
-        .compose(
-            Method::GrantRevoke,
-            action_id,
-            ActionTarget::environment(hosted.environment_id),
-            &kr_protocol::sharing::GrantRevokeParams {
-                grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([0x67; 16])),
-            },
-        )
-        .await
-        .expect("the revocation is composed");
-    let principal = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
-    let digest = kr_protocol::digest::mutation_digest(&mutation, &principal).expect("a digest");
-    let grants = hosted.controller.sharing().grants();
-    let now_ms = kr_ipc::now_ms().get();
-    let kr_controller::grants::ActionClaim::Claimed { hold } = grants
-        .claim_action(&principal, action_id, &digest, now_ms)
-        .expect("the claim is written")
-    else {
-        panic!("the first claim of an action is this attempt's");
-    };
-    let answered = kr_protocol::sharing::RevocationResult::bounded(
-        barrier.authority_revision,
-        [],
-        barrier.clone(),
-    );
-    grants
-        .retain_result(
-            &hold,
-            &kr_cbor::encode(
-                ParamsValue::from_typed(&answered)
-                    .expect("encodes")
-                    .as_value(),
-            ),
-            now_ms + 1,
-        )
-        .expect("the answer is recorded");
-    drop(hold);
-    (client, mutation, answered)
-}
-
 /// KR-REQ-09.13: a repeat of a revocation, with its action identifier, is answered with the names
 /// the worker has given since it was first answered.
 ///
@@ -3555,19 +3571,19 @@ async fn a_revocation_answered_with(
 /// stands, and takes from it what the daemon collected afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_repeat_of_a_revocation_names_what_its_worker_gave_after_the_first_answer() {
-    let left = a_revocation_that_left_names_unasked().await;
-    let (mut client, mutation, _) = a_revocation_answered_with(&left.hosted, &left.barrier).await;
+    let mut left = a_revocation_that_left_names_unasked().await;
     until_the_names_are_collected(&left.hosted).await;
 
-    let again: kr_protocol::sharing::RevocationResult = client
-        .repeat(&mutation)
+    let again: kr_protocol::sharing::RevocationResult = left
+        .client
+        .repeat(&left.mutation)
         .await
         .expect("the daemon answers")
         .expect("the revocation is answered from its record")
         .to_typed()
         .expect("a revocation result");
     assert_eq!(
-        again.authority_revision, left.barrier.authority_revision,
+        again.authority_revision, left.given.authority_revision,
         "the repeat is the same revocation and not a new one"
     );
     let reported = worker_report(&again.barrier, left.hosted.session_id);
@@ -3584,26 +3600,30 @@ async fn a_repeat_of_a_revocation_names_what_its_worker_gave_after_the_first_ans
 /// report out; a live entry that says nothing of the revision is not a worker that named nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_repeat_of_a_revocation_whose_report_has_gone_keeps_the_names_it_was_given() {
-    let left = a_revocation_that_left_names_unasked().await;
-    let (client, mutation, given) = a_revocation_answered_with(&left.hosted, &left.barrier).await;
+    let Unasked {
+        hosted,
+        client,
+        mutation,
+        given,
+        ..
+    } = a_revocation_that_left_names_unasked().await;
     for _ in 0..=kr_controller::authority::MAX_HELD_FENCE_REPORTS {
         let later = tokio::time::timeout(
             Duration::from_secs(60),
-            left.hosted.controller.revoke_authority(),
+            hosted.controller.revoke_authority(),
         )
         .await
         .expect("the revocation reports")
         .expect("the revocation is recorded");
-        announced_until(&left.hosted.controller, later, |barrier| barrier.holds()).await;
+        announced_until(&hosted.controller, later, |barrier| barrier.holds()).await;
     }
 
     // The connection the revocation was sent on was admitted before the later revisions, so the
     // caller opens another to ask again.
     drop(client);
-    let mut client =
-        LocalClient::connect(&left.hosted.client_endpoint, LocalClientKind::Cli, build())
-            .await
-            .expect("connects to the daemon");
+    let mut client = LocalClient::connect(&hosted.client_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon");
     let again: kr_protocol::sharing::RevocationResult = client
         .repeat(&mutation)
         .await
@@ -3611,8 +3631,8 @@ async fn a_repeat_of_a_revocation_whose_report_has_gone_keeps_the_names_it_was_g
         .expect("the revocation is answered from its record")
         .to_typed()
         .expect("a revocation result");
-    let first = worker_report(&given.barrier, left.hosted.session_id);
-    let repeated = worker_report(&again.barrier, left.hosted.session_id);
+    let first = worker_report(&given.barrier, hosted.session_id);
+    let repeated = worker_report(&again.barrier, hosted.session_id);
     assert_eq!(
         (
             repeated.names_pending.get(),
@@ -3629,6 +3649,83 @@ async fn a_repeat_of_a_revocation_whose_report_has_gone_keeps_the_names_it_was_g
         "the repeat says what the first answer said of a report the daemon no longer holds"
     );
     assert!(repeated.names_pending.get() > 0);
+}
+
+/// Ends the worker as the daemon learns of it when the worker hands over its own account of how
+/// its session ended, and announces the revision in force.
+async fn the_worker_has_ended(left: &Unasked) -> kr_protocol::action::RevocationBarrier {
+    left.hosted
+        .controller
+        .retire(&kr_protocol::session::ClosureRecord {
+            session_id: left.hosted.session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::CloseRequested,
+            root_exit_code: Nullable::some(kr_protocol::scalars::U64::new(0)),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Complete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        })
+        .await
+        .expect("the closure is recorded");
+    left.hosted
+        .controller
+        .announce_authority_revision()
+        .await
+        .expect("the revision is announced")
+}
+
+/// KR-REQ-10.45, 09.13: the result of a revision whose worker ended with names unasked says that
+/// nothing can ask for them any more.
+///
+/// The names stay in the result as the worker gave them, and the entry is not the one of a worker
+/// the daemon goes on asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_that_ended_with_names_unasked_is_reported_as_one_nothing_can_ask() {
+    let left = a_revocation_that_left_names_unasked().await;
+    let pending = worker_report(&left.given.barrier, left.hosted.session_id)
+        .names_pending
+        .get();
+    let barrier = the_worker_has_ended(&left).await;
+    let reported = worker_report(&barrier, left.hosted.session_id);
+    assert_eq!(reported.names_pending.get(), pending);
+    assert!(
+        reported.detail.contains("nothing can ask for them"),
+        "{:?}",
+        reported.detail
+    );
+}
+
+/// KR-REQ-10.45, 09.13: a repeat of a revocation after its worker ended says that nothing can ask
+/// for the names still to come, and not that the daemon asks for them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_after_the_worker_ended_says_nothing_can_ask_for_the_names() {
+    let mut left = a_revocation_that_left_names_unasked().await;
+    assert!(
+        worker_report(&left.given.barrier, left.hosted.session_id)
+            .detail
+            .contains("asks for them again"),
+        "the first answer says the daemon asks for them"
+    );
+    the_worker_has_ended(&left).await;
+
+    let again: kr_protocol::sharing::RevocationResult = left
+        .client
+        .repeat(&left.mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from its record")
+        .to_typed()
+        .expect("a revocation result");
+    let reported = worker_report(&again.barrier, left.hosted.session_id);
+    assert_eq!(reported.state, BarrierState::Ended, "{reported:?}");
+    assert!(
+        reported.detail.contains("nothing can ask for them"),
+        "{:?}",
+        reported.detail
+    );
 }
 
 /// KR-REQ-10.45: the revision a withdrawal of one grant advances to is announced to a worker with
