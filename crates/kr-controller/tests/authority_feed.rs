@@ -891,6 +891,143 @@ async fn a_request_the_feed_holds_while_the_host_catches_up_is_carried_out_after
         .await;
 }
 
+impl Rig {
+    /// Whether a device paired as `record` is answered by the host: its dial and its first request.
+    async fn answers(
+        &self,
+        device: &Device,
+        record: &kr_controller::service::net::devices::DeviceRecord,
+    ) -> Result<(), kr_client::ClientError> {
+        let transport = paired_dial(&self.host, device, record).try_dial().await?;
+        let session = kr_client::session::Session::start(Arc::new(transport)).expect("a session");
+        within("the host answers", self.doctor_as(&session))
+            .await
+            .map(|_| ())
+    }
+}
+
+/// KR-REQ-24.15: a withdrawal the feed shows complete that the host cannot verify keeps remote
+/// access refused until the owner at the machine acts.
+///
+/// The registry is put back to before an owner was paired, and that owner's completed revocation
+/// is in the feed. The registry holds the device it named live and no owner to say whose word that
+/// was, so the host does not serve the device, and does not serve any other remote device either.
+/// Every pass reads the record again. The owner at the machine revokes the device, and the host
+/// serves the others again while the device stays revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_refused_until_the_owner_at_the_machine_acts()
+ {
+    let rig = Rig::start().await;
+    let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
+
+    // Another owner is paired after the copy, and revokes the first device from the feed.
+    let owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let request = kr_pairing::grants::sign_revocation_request(
+        &owner.0.keys().authorisation,
+        RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([0xc1; 16])),
+        owner.1.device_id,
+        rig.host_device(),
+        devices(victim.1.device_id),
+        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+    )
+    .expect("a signed request");
+    // The feed shows each publisher what it published, so the owner reads its own request.
+    let publisher = client_for(rig.served.origin(), owner.0.keys().authorisation.clone());
+    publisher
+        .publish(rig.feed(), &request, None)
+        .await
+        .expect("the feed stores the request");
+    rig.poll().await;
+    let mut passes = rig.runtime().passes();
+    let completion = within(
+        "the host carries the revocation out and acknowledges it",
+        async {
+            loop {
+                let _ = *passes.borrow_and_update();
+                let state = publisher
+                    .read(rig.feed(), None, false)
+                    .await
+                    .expect("the feed answers the owner");
+                if let Some(acknowledged) = state
+                    .record(request.request_id)
+                    .and_then(|record| record.acknowledgement.0.as_ref())
+                {
+                    return acknowledged.completion;
+                }
+                passes.changed().await.expect("the carrier runs");
+            }
+        },
+    )
+    .await;
+    assert_eq!(completion, RevocationCompletion::Complete);
+
+    // The registry goes back to before that owner was paired.
+    let rig = rig
+        .restarted(false, |tree| put_the_registry_back(tree, &earlier))
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+
+    let says_so = |outcome: &Result<(), kr_client::ClientError>| {
+        outcome.as_ref().is_err_and(|error| {
+            error
+                .to_string()
+                .contains("an owner this host does not know")
+        })
+    };
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(
+        says_so(&refused),
+        "a device the feed does not name is refused, and told why: {refused:?}"
+    );
+    let refused = rig.answers(&victim.0, &victim.1).await;
+    assert!(
+        says_so(&refused),
+        "the device the withdrawal names is not served: {refused:?}"
+    );
+    let shown = rig.shown().await;
+    assert!(
+        shown
+            .check
+            .is_some_and(|check| check.detail().contains("an owner this host does not know")),
+        "the host says what it is waiting for"
+    );
+
+    // The owner at this machine revokes the device the withdrawal names.
+    let mut local = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: victim.1.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+    rig.until_the_carrier_is_idle().await;
+
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the other device is served once the owner at the machine has acted");
+    rig.connects_while_a_revocation_is_held(&victim.0, &victim.1)
+        .await;
+    let shown = rig.shown().await;
+    assert!(
+        shown
+            .check
+            .is_some_and(|check| !check.detail().contains("an owner this host does not know")),
+        "the host no longer waits"
+    );
+}
+
 /// KR-REQ-24.15: a request on a page the scan has left behind is judged before the feed counts as
 /// read. A scan of more than one pass puts requests off while the host is behind, and the scan
 /// that raises the registry is not the synchronisation a connection waits for: another begins,

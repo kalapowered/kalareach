@@ -723,6 +723,15 @@ pub struct HostPolicy {
     /// It is a fact found by comparing the feed with the registry and is not written with the
     /// policy: the comparison is made again at every start and every pass of the feed.
     behind_its_feed: bool,
+    /// True while the authority feed shows complete a withdrawal that this host's records cannot
+    /// verify: the owner who issued it is not one the registry knows, as after a restore to a point
+    /// before that owner was paired, so the devices it names may be live here against that owner's
+    /// word.
+    ///
+    /// Like [`Self::behind_its_feed`] it is a fact found by comparing the feed with the registry,
+    /// not written with the policy, and found again at every start and every pass. The owner at
+    /// this machine clears it by revoking what the request names.
+    withdrawal_unverified: bool,
 }
 
 /// The offline cell a policy starts with, before the daemon has anchored anything: a bound that has
@@ -771,6 +780,7 @@ impl HostPolicy {
             utc_floor: Arc::new(UtcFloor::default()),
             feed_removed: false,
             behind_its_feed: false,
+            withdrawal_unverified: false,
         }
     }
 
@@ -1233,6 +1243,7 @@ impl HostPolicy {
             utc_floor,
             feed_removed: false,
             behind_its_feed: false,
+            withdrawal_unverified: false,
         }
     }
 
@@ -1265,6 +1276,19 @@ impl HostPolicy {
     #[must_use]
     pub const fn behind_its_feed(&self) -> bool {
         self.behind_its_feed
+    }
+
+    /// Records whether the feed shows complete a withdrawal this host cannot verify.
+    ///
+    /// While it does, every grant is refused for an ingress other than the owner at this machine.
+    pub const fn set_withdrawal_unverified(&mut self, unverified: bool) {
+        self.withdrawal_unverified = unverified;
+    }
+
+    /// Whether the feed shows complete a withdrawal this host cannot verify.
+    #[must_use]
+    pub const fn withdrawal_unverified(&self) -> bool {
+        self.withdrawal_unverified
     }
 
     /// Chooses a bounded offline-validity policy for personal remote access.
@@ -1355,8 +1379,13 @@ impl HostPolicy {
         now_ms: u64,
     ) -> std::result::Result<PolicyIntersection, Refusal> {
         // The person at this machine is never locked out by the feed, as the feed's removal keeps.
-        if self.behind_its_feed && request.ingress != ActorIngress::LocalIpc {
-            return Err(Refusal::BehindItsFeed);
+        if request.ingress != ActorIngress::LocalIpc {
+            if self.behind_its_feed {
+                return Err(Refusal::BehindItsFeed);
+            }
+            if self.withdrawal_unverified {
+                return Err(Refusal::WithdrawalUnverified);
+            }
         }
         match grant.organisation.as_ref() {
             Some(requirement) => {
