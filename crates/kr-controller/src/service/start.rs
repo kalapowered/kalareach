@@ -552,8 +552,11 @@ impl Controller {
         feed.enrol(host_device_id);
         sharing.grants().store_feed(&feed.snapshot())?;
         feed.written();
-        // The machine's own continuous clock, which the leases of the session text the attention
-        // module releases are held to and the offline bound below is counted on.
+        // The machine's own continuous clock. The leases of the session text the attention module
+        // releases are held to it, and so is the offline bound's time, which is taken as the policy
+        // holding it is restored and before anything remote is decided under it: from what this
+        // boot recorded of it, advanced by this clock, and never less than this host's reading of
+        // UTC says.
         let shared_clock: Arc<dyn kr_ipc::clock::SharedClock> =
             Arc::new(kr_ipc::clock::SystemSharedClock);
         let attention = Arc::new(
@@ -565,9 +568,6 @@ impl Controller {
         )?);
         // The routes of the actions an earlier build claimed in the grant store alone.
         devices.adopt_receipts_as_routes()?;
-        // The offline bound's time, taken as the policy holding it is restored and before anything
-        // remote is decided under it: from what this boot recorded of it, advanced by the boot
-        // clock, and never less than this host's reading of UTC says.
         // What an earlier build's attention store recorded of the wall clock is taken into this
         // host's one record of it before anything reads that record.
         net::adopt_earlier_attention_clock(
