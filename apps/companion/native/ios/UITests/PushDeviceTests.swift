@@ -17,7 +17,7 @@
 //  | `go-app` | the script | nothing; the request is in place and the application may start |
 //  | `app-running` | this test | nothing; the application is running |
 //  | `want` | the script | `foreground` or `background`: where the application is to be |
-//  | `is` | this test | where the application is now, once it has gone where `want` says |
+//  | `is` | this test | where the application is now, once it has gone where `want` says; the script takes it away as it writes a new `want`, and each `want` is served once |
 //  | `banner-wanted-<n>` | the script | nothing; delivery `n` has been pushed |
 //  | `banner-expect-<n>.txt` | the script | the words the banner is to carry |
 //  | `banner-<n>.txt` | this test | what the banner said, or `none` |
@@ -94,32 +94,37 @@ final class PushDeviceTests: DeviceTestCase {
         var acted = 0
         let end = Date().addingTimeInterval(1500)
         while !exists("finish") && Date() < end {
-            // Where the application is to be is read from the application itself each time, since a
-            // person's act brings it to the front without this loop having moved it.
-            let wanted = read("want")
-            let inFront = app.state == .runningForeground
-            if wanted == "background" && inFront {
-                // The person goes to another screen before going away, so that a tap on a notification
-                // is seen to move the page to Attention and not to find it there already.
-                let hosts = app.buttons.matching(NSPredicate(format: "label == 'Hosts'")).firstMatch
-                var onHosts = false
-                if hosts.waitForExistence(timeout: 10) {
-                    hosts.tap()
-                    onHosts = app.staticTexts.matching(NSPredicate(format: "label == 'Hosts'")).firstMatch.waitForExistence(timeout: 10)
+            // Each place the script asks for is served once: the script takes `is` away as it asks, and
+            // this test writes `is` when the application is there. The application is read for where
+            // it is now and not trusted to stay where it was put, since a person's act, a tap on a
+            // banner, brings it to the front; serving the same request again after such an act would
+            // take the page to Hosts and away from the question the person has just opened.
+            if !exists("is") {
+                let wanted = read("want")
+                let inFront = app.state == .runningForeground
+                if wanted == "background" && inFront {
+                    // The person goes to another screen before going away, so that a tap on a notification
+                    // is seen to move the page to Attention and not to find it there already.
+                    let hosts = app.buttons.matching(NSPredicate(format: "label == 'Hosts'")).firstMatch
+                    var onHosts = false
+                    if hosts.waitForExistence(timeout: 10) {
+                        hosts.tap()
+                        onHosts = app.staticTexts.matching(NSPredicate(format: "label == 'Hosts'")).firstMatch.waitForExistence(timeout: 10)
+                    }
+                    note("left the page on Hosts: \(onHosts)")
+                    XCUIDevice.shared.press(.home)
+                    // The application may stay a background application with its audio mode and not be
+                    // suspended: either way it is not in front, and the banner is the system's.
+                    let gone = leftTheFront()
+                    note("went to the background: \(gone), state \(app.state.rawValue)")
+                    write("is", wanted)
+                } else if wanted == "foreground" && !inFront {
+                    app.activate()
+                    XCTAssertTrue(app.wait(for: .runningForeground, timeout: 30), "the application did not come back")
+                    write("is", wanted)
+                } else if !wanted.isEmpty {
+                    write("is", wanted)
                 }
-                note("left the page on Hosts: \(onHosts)")
-                XCUIDevice.shared.press(.home)
-                // The application may stay a background application with its audio mode and not be
-                // suspended: either way it is not in front, and the banner is the system's.
-                let gone = leftTheFront()
-                note("went to the background: \(gone), state \(app.state.rawValue)")
-                write("is", wanted)
-            } else if wanted == "foreground" && !inFront {
-                app.activate()
-                XCTAssertTrue(app.wait(for: .runningForeground, timeout: 30), "the application did not come back")
-                write("is", wanted)
-            } else if !wanted.isEmpty && !exists("is") {
-                write("is", wanted)
             }
             let act = acted + 1
             if exists("act-\(act)") {
@@ -204,7 +209,7 @@ final class PushDeviceTests: DeviceTestCase {
             // The page says that a question the person had chosen an answer to, and had not sent,
             // was answered by someone else, and offers nothing to send.
             let send = anyElement(labelled: "Send answer", within: app)
-            let said = { (words: String) -> Bool in
+            let said = { [app] (words: String) -> Bool in
                 app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", words)).firstMatch.exists
             }
             let end = Date().addingTimeInterval(60)
