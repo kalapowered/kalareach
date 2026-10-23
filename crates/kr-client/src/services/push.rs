@@ -490,19 +490,13 @@ mod tests {
     }
 
     /// What a rendering of a signer, a registration, a credential or a signed request prints is
-    /// held to the exact fields it may: the public key, and which state or call it is.
+    /// held to the exact fields it may: which state or call it is, and nothing of a key.
     #[test]
     fn a_rendering_of_a_signer_a_registration_a_credential_or_a_request_carries_none_of_it() {
         use crate::services::rendering::renders_only;
 
         let signer = installation();
-        renders_only(
-            &signer,
-            &format!(
-                "InstallationSigner{{public_key:{:?},..}}",
-                signer.public_key()
-            ),
-        );
+        renders_only(&signer, "InstallationSigner{..}");
 
         let records = vectors()["records"].clone();
         let issued: Issued = serde_json::from_value(serde_json::json!({
