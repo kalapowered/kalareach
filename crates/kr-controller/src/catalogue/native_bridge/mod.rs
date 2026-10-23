@@ -68,6 +68,7 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::PluginId;
 use kr_protocol::scalars::Digest256;
 pub use kr_worker::broker::bridge::BridgeSurface;
+use kr_worker::broker::bridge::forwarder_application;
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
 pub use self::check::{check, unread_check};
@@ -857,14 +858,15 @@ impl NativeBridges {
             }
         }
         // The forwarder a registration starts reports for the application it names, and a
-        // launch of this package admits only its own: a registration for another package's
-        // application would be a bridge no launch of either could use.
+        // launch of this package admits only the application the package declares, under any
+        // publisher and any package name: a registration for another application would be a
+        // bridge no launch of this package could use.
         if let Some(facts) = facts.as_ref() {
-            let own = package_name(&target.plugin_id);
-            if facts.application != own {
+            let declared = forwarder_application(recipe.application.as_str());
+            if declared != Some(facts.application.as_str()) {
                 return Err(format!(
                     "the registration starts the forwarder for {}, which is not the application \
-                     of {} ({own})",
+                     {} declares ({application})",
                     facts.application, target.plugin_id
                 ));
             }
@@ -2267,14 +2269,6 @@ fn removal_of(recipe: &NativeBridge) -> std::result::Result<Vec<Removal>, String
             },
         })
         .collect())
-}
-
-/// Returns a package's name under its publisher, the application name its forwarder reports for.
-fn package_name(plugin_id: &PluginId) -> &str {
-    plugin_id
-        .as_str()
-        .rsplit_once('/')
-        .map_or(plugin_id.as_str(), |(_, name)| name)
 }
 
 /// What the registration the recipe installs says: the application name its `kr-hook`
