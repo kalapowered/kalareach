@@ -66,48 +66,14 @@ case "$results" in
     *) results="$PWD/$results" ;;
 esac
 
+# shellcheck source=scripts/lib/xcode.sh
+. "$root/scripts/lib/xcode.sh"
+
 for tool in xcodebuild xcrun python3; do
     command -v "$tool" > /dev/null 2>&1 || { echo "ios-unit-tests: $tool is needed and is not on the path" >&2; exit 2; }
 done
 
-if [ -z "${DEVELOPER_DIR:-}" ]; then
-    newest="$(python3 -I - <<'PYTHON'
-import glob
-import os
-import re
-import subprocess
-
-best = None
-candidates = []
-for application in glob.glob("/Applications/Xcode_*.app"):
-    # A hosted runner names each Xcode by version and links other names to the same one.
-    if os.path.islink(application) or not re.fullmatch(r"/Applications/Xcode_[0-9.]+\.app", application):
-        continue
-    candidates.append(application + "/Contents/Developer")
-# The Xcode the machine has selected competes too, so that a Mac with its own Xcode beside a
-# versioned one is not made to use the older.
-selected = subprocess.run(["xcode-select", "-p"], capture_output=True, text=True).stdout.strip()
-if selected:
-    candidates.append(selected)
-for developer in candidates:
-    try:
-        said = subprocess.run([developer + "/usr/bin/xcodebuild", "-version"], capture_output=True, text=True, check=True).stdout
-    except (OSError, subprocess.CalledProcessError):
-        continue
-    found = re.match(r"Xcode ([0-9.]+)\s+Build version (\S+)", " ".join(said.split()))
-    if not found:
-        continue
-    key = (tuple(int(part) for part in found.group(1).split(".")), found.group(2))
-    if best is None or key > best[0]:
-        best = (key, developer)
-if best:
-    print(best[1])
-PYTHON
-)"
-    if [ -n "$newest" ]; then
-        export DEVELOPER_DIR="$newest"
-    fi
-fi
+kr_select_xcode
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-ios-tests.XXXXXX")"
 booted_here=""

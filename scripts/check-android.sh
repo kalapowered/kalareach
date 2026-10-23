@@ -24,44 +24,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 target="${1:-aarch64-linux-android}"
 
-# The platform level the application declares as its minimum (`minSdkVersion` in
-# `apps/companion/src-tauri/tauri.conf.json`): the compiler is named after the level it builds for.
-level=29
-case "$target" in
-    armv7-linux-androideabi) compiler="armv7a-linux-androideabi${level}-clang" ;;
-    aarch64-linux-android | i686-linux-android | x86_64-linux-android) compiler="${target}${level}-clang" ;;
-    *)
-        echo "check-android: $target is not an Android target of the companion" >&2
-        exit 2
-        ;;
-esac
-
-ndk="${NDK_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
-if [ -z "$ndk" ]; then
-    echo "check-android: set NDK_HOME to an Android NDK: the C library in the companion's graph is built with its compiler" >&2
-    exit 2
-fi
-tools=""
-for candidate in "$ndk"/toolchains/llvm/prebuilt/*/bin; do
-    if [ -x "$candidate/llvm-ar" ] && [ -x "$candidate/$compiler" ]; then
-        tools="$candidate"
-        break
-    fi
-done
-if [ -z "$tools" ]; then
-    echo "check-android: $ndk holds no toolchain with $compiler and llvm-ar" >&2
-    exit 2
-fi
+# shellcheck source=scripts/lib/android-ndk.sh
+. "$PWD/scripts/lib/android-ndk.sh"
 
 # The C library's build script runs whatever archiver it finds under the plain names, and a
 # host's own archiver can produce an empty archive for this target. Nothing is linked here, but the
 # archive stays in the target directory, where the packaging build refuses an empty one, so the
 # toolchain's tools are named exactly as that build names them.
-export "CC_${target//-/_}=$tools/$compiler"
-export AR="$tools/llvm-ar"
-export RANLIB="$tools/llvm-ranlib"
-export NM="$tools/llvm-nm"
-export STRIP="$tools/llvm-strip"
+kr_android_toolchain "$target" || exit 2
+tools="$KR_ANDROID_TOOLS"
 
 # The lint also refuses the two kinds of call an Android phone cannot make and the stores must not:
 # the standard library's file lock, which Android does not support, and a hard link, which the
