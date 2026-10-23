@@ -70,7 +70,9 @@ Three rules are easy to get wrong:
   `screen_basis`, `workflow_run_id` and `lease` of a forwarded request or mutation, and the optional
   members of a worker launch and of an authority revision notice. The generated schema and
   TypeScript type accept the explicit default that the decoder refuses: null for an optional member
-  and `false` for a flag.
+  and `false` for a flag. The host configuration document, which is JSON read from a file and not a
+  wire message, leaves out its sections of later levels, its `disable_policy` and a test suite's
+  `outputs` in the same way.
 - **Numbers are never floating point.** Decimal or scaled values use a schema-defined integer or
   text representation. UUIDs are 16-byte strings. Timestamps are integer UTC milliseconds, never
   tagged dates.
@@ -159,9 +161,11 @@ a received value re-encodes to the bytes it arrived in. The action-right vocabul
 wire string, so a reader can verify the order from the encoded values alone.
 
 The first two domains below are described in this section. The table after them lists every domain
-the protocol defines; each constant sits beside the type it covers in `crates/kr-protocol/src`, except
-the short-code attempt counter and the two device-confirmation domains, which `crates/kr-pairing`
-holds, and the plugin-host and relay-request domains, whose crates the table names.
+the protocol defines: every domain of a signature, a digest, a derived key or an associated-data
+string that a second program or device has to compute again or verify. Each constant sits beside the
+type it covers in `crates/kr-protocol/src`, except the ones the table's file column names in another
+crate. A domain that labels a value only the program that made it reads back is not part of the
+protocol, and a second table after the first names those.
 
 - `kr-connect/1` for the connection proof transcript.
 - `kr-mutation/1` for the mutation payload digest.
@@ -177,6 +181,7 @@ holds, and the plugin-host and relay-request domains, whose crates the table nam
 | `kr-pair/host-bundle/1`, `kr-pair/client-bundle/1`, `kr-pair/finish/1` | The signed device bundle of each side; the binding tag of `pair.finish` | `pairing.rs` |
 | `kr-pair/owner-confirm/1`, `kr-pair/issue-invitation/1` | An owner-confirmation proof; an owner's confirmation to issue an invitation | `pairing.rs`, `invitation.rs` |
 | `kr-pair/confirm-device/short-code/1`, `kr-pair/confirm-device/direct/1` | The action digest of a device confirmation, one for each entry mode, so a confirmation for one cannot approve a candidate that arrived by the other | `kr-pairing` |
+| `kr-pair/1/client-confirm`, `kr-pair/1/host-confirm`, `kr-pair/1/client-to-host`, `kr-pair/1/host-to-client`, `kr-pair/1/iroh-bind` | The HKDF-SHA256 information strings of the five keys one pairing attempt derives: the client's and the host's confirmation keys, the key of each direction's bundle and the key of the `pair.finish` tag that binds the transcript to the two iroh endpoints | `pairing.rs` |
 | `kr-pair/client-budget/1` | The key under which a device counts its own short-code attempts | `kr-pairing` |
 | `kr-device-keys/1` | A device's declaration of its four public keys (`device.keys.complete`) | `sharing.rs` |
 | `kr-revocation/1`, `kr-authority/1` | A revocation request signature; a host authority revision record signature | `pairing.rs` |
@@ -193,11 +198,32 @@ holds, and the plugin-host and relay-request domains, whose crates the table nam
 | `kr-host-clock/1`, `kr-catalogue-trust/2`, `kr-plugin-grant/1`, `kr-plugin-install/2`, `kr-organisation/enrol/1`, `kr-organisation/exclusive/1`, `kr-transfer/2` | What an owner confirms: the host clock again, a repository's trust root, a package's grant, a package's installation, an organisation's enrolment, the exclusive-management setting of an organisation set, the complete plan of a grant transfer. Each is the first member of the value whose digest the confirmation covers, and an owner device computes the same digest again from what it is shown | `confirmation.rs` |
 | `kr-plugin-host/1/rendezvous`, `kr-plugin-host/1/verify` | A plugin host's startup claim; its answer to a verification challenge | `crates/kr-plugin-service/src/protocol.rs` |
 | `kr-relay-lease-request/1`, `kr-relay-lease-revoke/1`, `kr-relay-payer-sign-in/1`, `kr-relay-admission-request/1` | The body digests of the four relay control-plane requests ([The relay requests](#the-relay-requests)) | `crates/kr-client/src/services/relay.rs`, `admission.rs` |
+| `kr-sync-object/1` | The associated data every synchronised object is sealed under, so that a ciphertext made for one purpose cannot be opened as another | `crates/kr-crypto/src/envelope/sync.rs` |
+| `kr-collection-key-mark/1`, `kr-sync-membership-plan/1` | The digest by which members compare a collection's key without keeping it; the digest that binds an owner's membership plan to the one operation it confirms ([the cryptography reference](../crypto/README.md)) | `crates/kr-client/src/sync/membership` |
+| `kalareach-recovery-kit-fingerprint/1` | The eight-symbol fingerprint of a recovery kit's recipient key, which a person compares to tell one kit from another | `crates/kr-client/src/recovery/setup.rs` |
+| `kr-describe/profile/1` | The detached signature of a model profile: its identifier, its revision and the digest of its document, which a host checks before it maps a model | `crates/kr-describe/src/profile.rs` |
 
-`kr-sharing/1` is not one of these: it derives a grant or invitation identity from an action
-identifier and a purpose label, so that a retry finds the identity it made. The client library adds
-two more digest domains, for a shared collection's key mark and a membership plan, which [the
-cryptography reference](../crypto/README.md) names.
+A format tag is not a domain. `kr-keywrap/1`, `kr-mailbox/1`, `kr-collection-key-wrap/1` and
+`kr-sync-membership/1` are the only value that a record's version member accepts, and a record
+that holds another value is not read.
+
+A domain that labels a value only the program that made it reads back is not part of the protocol,
+and the table does not list it. The crates hold several, and this reference does not enumerate them.
+These are the ones a reader of the other sections meets:
+
+| Domain | What it labels | File |
+| --- | --- | --- |
+| `kr-sharing/1` | A grant or invitation identity, derived from an action identifier and a purpose label, so that a retry finds the identity it made | `sharing.rs` |
+| `kr-project-location-authorise/1`, `kr-project-location-attach/1` | What an owner confirms when a project location is authorised or a repository is attached to one: the exact request and the identity of the directory the host opened for it. The host computes the digest and places it in the challenge | `crates/kr-project/src/policy.rs` |
+| `kr-project-location-authorise-request/1`, `kr-project-location-attach-request/1` | A request without its proof, which a repeat of the request has to match | `crates/kr-project/src/policy.rs` |
+| `kr-question/create/1`, `kr-alert/create/1` | A question or an alert as created, which tells an exact repeat from a reused request or deduplication identifier | `crates/kr-worker/src/questions/store.rs` |
+| `kr-question/caller-token/1` | A question's caller token, separating its sealed copy from its verification tag | `crates/kr-worker/src/questions/token.rs` |
+| `kr-delivery/collapse/1`, `kr-delivery/detail-object/1` | Keyed digests under a secret that only the environment's delivery journal holds: a notification group's collapse identifier and the identifier of the encrypted object that holds a notification's detail | `crates/kr-delivery/src/budget.rs`, `preview.rs` |
+| `kr-voice/prepare/1` | What a planned voice call would be bound to: its sessions, its actions and its provider | `crates/kr-voice/src/delegate.rs` |
+| `kr-pair/client-budget-key-id/1` | The digest that names the key a device counted its short-code attempts under | `crates/kr-pairing/src/budget.rs` |
+| `kalareach-account-mark/1` | The mark of one account at one service, from the issuer, the account's subject and the service's origin, so that a caller can tell that a token is still its account's | `crates/kr-client/src/services/account.rs` |
+| `kalareach-backup-session/1`, `kalareach-backup-source/2` | The digest of one session as a backup generation keeps it, and the digest of everything a pass could pack | `crates/kr-controller/src/service/backup_production.rs` |
+| `kalareach phone boot v1`, `kalareach.changeset.version.v1` | A phone's boot identity for its pairing clock; the version digest of a captured tree, which never travels on the wire | `crates/kr-client/src/pairing/clock.rs`, `crates/kr-changeset/src/version.rs` |
 
 The mutation digest covers the method and version, the actor and grant, the complete target, the
 preconditions, the action identifier, the action window, the requested time to live, and the
