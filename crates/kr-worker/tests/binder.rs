@@ -2082,12 +2082,12 @@ fn kr_req_11_13_a_launch_given_back_after_its_bind_leaves_no_binding_or_row() {
     assert!(worker.broker.owed_rows().is_empty());
 }
 
-/// KR-REQ-11.26: a binding that leaves wakes the task that decodes. A request waits in the decode
+/// A binding that leaves wakes the task that decodes. A request waits in the decode
 /// queue for the binding that decodes it, and the task that takes the queue's requests looks again
 /// only when it is woken, so a binding that leaves without a wake would keep its requests' places in
 /// a queue that holds thirty-two, and later requests would be refused for want of room.
 #[tokio::test]
-async fn kr_req_11_26_a_binding_that_leaves_wakes_the_task_that_decodes() {
+async fn a_binding_that_leaves_wakes_the_task_that_decodes() {
     let worker = Worker::open();
     let source = worker.claude_code();
     let frame = worker.admit(1, vec![testing::admitted(&source)]);
