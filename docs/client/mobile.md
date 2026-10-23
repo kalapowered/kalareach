@@ -420,6 +420,10 @@ builds with no signing identity, certificate or profile. The `android` job and t
 and lint the phone's other architectures and do not run them; the emulator exercises libsodium's
 x86_64 code paths.
 
+`apps/companion/e2e/` takes the path of each screenshot from `e2e/evidence.ts`, which puts it under
+`${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/companion-screenshots`. `scripts/check-test-evidence.sh`
+fails a run that kept none there or left one named `kr-*.png` in the temporary directory.
+
 `scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only
 what it started, and changes a device's settings only on one it started itself. A platform that is
 not available exits 3 and says so rather than exiting 0. It opens each screen and photographs it; it
