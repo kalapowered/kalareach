@@ -22,37 +22,49 @@ import org.json.JSONObject
  * timer, because nothing guarantees a timer in a stopped process.
  */
 class PendingFile(private val file: File) {
+    /**
+     * One lock for every reader of this file in the process, whichever instance it holds: the
+     * receiver, the scheduler's worker and the application each make their own.
+     */
+    private val lock: Any = locks.getOrPut(file.absoluteFile.normalize().path) { Any() }
+
     /** The record as text, with the state it is in now, or null when there is none. */
-    @Synchronized
-    fun read(nowMillis: Long): String? {
-        val record = load() ?: return null
-        if (record.optString("state") == PENDING && nowMillis >= record.optLong("deadline_ms", 0L)) {
-            record.put("state", EXPIRED)
-            store(record)
+    fun read(nowMillis: Long): String? =
+        synchronized(lock) {
+            val record = load() ?: return null
+            if (record.optString("state") == PENDING && nowMillis >= record.optLong("deadline_ms", 0L)) {
+                record.put("state", EXPIRED)
+                store(record)
+            }
+            record.toString()
         }
-        return record.toString()
-    }
 
     /** Replaces the record, which supersedes whatever was there. */
-    @Synchronized
     fun write(text: String) {
-        store(JSONObject(text))
+        synchronized(lock) { store(JSONObject(text)) }
     }
 
     /** Removes the record. */
-    @Synchronized
     fun clear() {
-        if (file.exists() && !file.delete()) throw IOException("the pending record could not be removed")
+        synchronized(lock) {
+            if (file.exists() && !file.delete()) throw IOException("the pending record could not be removed")
+        }
     }
 
     /**
-     * Moves a record that is still `pending` to `state`, with the reason when there is one.
-     * Returns false when there is no such record, which is the case for one that has since been
-     * replaced or has expired: it is then left alone.
+     * Moves the record of registration `registrationId` to `state`, with the reason when there is
+     * one, if that record is still `pending`. Returns false when the record is another
+     * registration's, since a try that outlived its registration must not move its replacement,
+     * and when there is none or it has expired: it is then left alone.
      */
-    @Synchronized
-    fun mark(state: String, reason: String? = null, nowMillis: Long): Boolean {
+    fun mark(registrationId: String, state: String, reason: String? = null, nowMillis: Long): Boolean =
+        synchronized(lock) {
+            marked(registrationId, state, reason, nowMillis)
+        }
+
+    private fun marked(registrationId: String, state: String, reason: String?, nowMillis: Long): Boolean {
         val record = load() ?: return false
+        if (record.optString("registration_id") != registrationId) return false
         if (record.optString("state") != PENDING) return false
         if (nowMillis >= record.optLong("deadline_ms", 0L)) {
             record.put("state", EXPIRED)
@@ -98,6 +110,8 @@ class PendingFile(private val file: File) {
     }
 
     companion object {
+        private val locks = java.util.concurrent.ConcurrentHashMap<String, Any>()
+
         /** A registration waiting for its challenge. */
         const val PENDING = "pending"
 

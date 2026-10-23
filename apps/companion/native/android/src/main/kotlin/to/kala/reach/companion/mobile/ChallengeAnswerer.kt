@@ -1,5 +1,6 @@
 package to.kala.reach.companion.mobile
 
+import java.io.IOException
 import org.json.JSONObject
 
 /**
@@ -21,11 +22,22 @@ class ChallengeAnswerer(
     private val crypto: ChallengeCrypto,
     private val seeds: SeedSource,
     private val gateway: GatewayPost,
+    /**
+     * Called once the answer is signed and before it is posted: the receiver hands the scheduler a
+     * safety net here, which a process that is ended mid-post leaves behind.
+     */
+    private val beforePosting: () -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis
 ) {
     fun answer(data: Map<String, String>): ChallengeOutcome {
         val now = clock()
-        val pending = record.read(now)
+        val pending =
+            try {
+                record.read(now)
+            } catch (failure: IOException) {
+                return ChallengeOutcome.Ignored("record_unreadable")
+            }
+        val registrationId = pending?.let { JSONObject(it).optString("registration_id") }
         val input =
             JSONObject()
                 .put("data", JSONObject(data))
@@ -50,7 +62,13 @@ class ChallengeAnswerer(
             else -> return ChallengeOutcome.Ignored(verdict.optString("reason", "refused"))
         }
 
-        val seed = seeds.read(verdict.getString("seed_item")) ?: return ChallengeOutcome.Ignored("key_missing")
+        // A key that cannot be read answers the same as one that is not there.
+        val seed =
+            try {
+                seeds.read(verdict.getString("seed_item"))
+            } catch (failure: Exception) {
+                null
+            } ?: return ChallengeOutcome.Ignored("key_missing")
         val signed =
             try {
                 JSONObject(crypto.sign(input, seed))
@@ -61,12 +79,13 @@ class ChallengeAnswerer(
             return ChallengeOutcome.Ignored(signed.optString("reason", "not_signed"))
         }
 
+        beforePosting()
         return when (val sent = gateway.post(signed.getString("url"), signed.getString("body").toByteArray(Charsets.UTF_8))) {
             is PostResult.Unreachable -> ChallengeOutcome.Retry("unreachable")
             is PostResult.Status ->
                 when {
                     sent.code in 200..299 -> {
-                        record.mark(PendingFile.ANSWERED, null, clock())
+                        record.mark(registrationId.orEmpty(), PendingFile.ANSWERED, null, clock())
                         ChallengeOutcome.Answered
                     }
                     // The gateway answered and will not take it, or is not able to now. The second
@@ -74,7 +93,7 @@ class ChallengeAnswerer(
                     sent.code == 408 || sent.code == 429 || sent.code >= 500 ->
                         ChallengeOutcome.Retry("status_${sent.code}")
                     else -> {
-                        record.mark(PendingFile.REFUSED, "gateway_${sent.code}", clock())
+                        record.mark(registrationId.orEmpty(), PendingFile.REFUSED, "gateway_${sent.code}", clock())
                         ChallengeOutcome.GatewayRefused(sent.code)
                     }
                 }
