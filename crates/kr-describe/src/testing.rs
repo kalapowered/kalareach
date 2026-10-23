@@ -123,10 +123,12 @@ pub struct Script {
     pub verify_until_cancelled: bool,
     /// How long checking a file sleeps without looking at its token, in milliseconds.
     pub verify_ignore_token_ms: u64,
-    /// Whether a check waits for its cancellation, or its deadline, and then finishes and answers
-    /// that the file passed, as a check that was already past its last block would rather than
-    /// act on the cancellation it was sent. Nothing but the cancellation's arrival decides when it
-    /// answers, so a case that sends the cancellation decides what the answer is raced by.
+    /// Whether a check waits for its cancellation or its deadline. After the cancellation it
+    /// finishes and answers what checking the file finds, which for a file that is as it should be
+    /// is that it passed, as a check that was already past its last block would rather than act on
+    /// the cancellation it was sent; at the deadline it answers that the deadline was exceeded.
+    /// Nothing but the cancellation's arrival decides when it answers, so a case that sends the
+    /// cancellation decides what the answer is raced by.
     pub verify_passes_once_cancelled: bool,
     /// Whether a load checks each file of the profile against its recorded size and digest first,
     /// as the real process does, and ends as [`crate::wire::LoadEnd::Assets`] when one is not it.
