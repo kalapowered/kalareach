@@ -14,6 +14,7 @@
 //! | KR-REQ-16.06 | `two_hosts_that_ask_together_register_one_after_the_other` |
 //! | KR-REQ-16.16 | `a_token_that_changes_while_a_host_registers_is_registered_again_when_that_run_ends` |
 //! | KR-REQ-16.06 | `a_token_that_arrives_a_moment_after_the_permission_is_waited_for` |
+//! | KR-REQ-16.06 | `a_look_the_application_makes_by_itself_never_asks_the_system_for_permission` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -21,6 +22,7 @@ mod support;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +57,12 @@ struct Receiver {
 
 struct ReceiverState {
     permission: Permission,
+    /// What the system answers when it is asked: a person who agrees makes the permission granted,
+    /// and one who refuses leaves it as it was.
+    when_asked: Permission,
+    /// How many times the system was asked, and how many times the permission was read.
+    asked: usize,
+    permission_reads: usize,
     /// The provider's token, once the provider has made one.
     token: Option<String>,
     /// Reads of the token that say there is none yet, before there is one.
@@ -75,6 +83,9 @@ impl Receiver {
         Arc::new(Self {
             state: Mutex::new(ReceiverState {
                 permission: Permission::Granted,
+                when_asked: Permission::Granted,
+                asked: 0,
+                permission_reads: 0,
                 token: Some(token.to_owned()),
                 reads_without_a_token: 0,
                 changed: false,
@@ -101,11 +112,22 @@ impl Receiver {
 
 impl Native for Receiver {
     fn permission(&self) -> PushFuture<'_, Permission> {
-        Box::pin(async move { Ok(self.state.lock().expect("the receiver").permission) })
+        Box::pin(async move {
+            let mut state = self.state.lock().expect("the receiver");
+            state.permission_reads += 1;
+            Ok(state.permission)
+        })
     }
 
     fn ask_permission(&self) -> PushFuture<'_, Permission> {
-        self.permission()
+        Box::pin(async move {
+            let mut state = self.state.lock().expect("the receiver");
+            state.asked += 1;
+            if state.when_asked == Permission::Granted {
+                state.permission = Permission::Granted;
+            }
+            Ok(state.when_asked)
+        })
     }
 
     fn token(&self) -> PushFuture<'_, Option<String>> {
@@ -279,6 +301,8 @@ struct Desk {
     gateway: Arc<Gateway>,
     registered: Arc<Mutex<Registered>>,
     device: Arc<Device>,
+    /// What the desk's clock is ahead of the real one, so that a test can let time pass.
+    clock_ahead_ms: Arc<AtomicU64>,
     /// Kept so the phone's records outlive the test.
     _phone: support::Phone,
 }
@@ -293,6 +317,18 @@ impl Desk {
         let mut views = self.view().hosts;
         views.reverse();
         views.into_iter().map(|host| host.reference).collect()
+    }
+
+    /// Waits until the first host's words contain `wanted`.
+    async fn until_words(&self, wanted: &str) {
+        let words = || self.view().hosts[0].words.clone();
+        tokio::time::timeout(WATCHDOG, async {
+            while !words().contains(wanted) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the words never said {wanted:?}: they say {:?}", words()));
     }
 
     /// Waits until `holds` says of the hosts' states what is wanted.
@@ -332,6 +368,8 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
     });
     let registered = Arc::new(Mutex::new(Registered::default()));
     let http = Arc::clone(&gateway);
+    let clock_ahead_ms = Arc::new(AtomicU64::new(0));
+    let ahead = Arc::clone(&clock_ahead_ms);
     let desk = PushDesk::open(
         phone.data.path(),
         Arc::clone(&device),
@@ -339,7 +377,7 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
         Arc::new(HostLink(Arc::clone(&registered))),
         Wiring {
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
-            clock: Arc::new(|| kr_ipc::now_ms().get()),
+            clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
         },
         || {},
     )
@@ -350,6 +388,7 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
         gateway,
         registered,
         device,
+        clock_ahead_ms,
         _phone: phone,
     }
 }
@@ -552,4 +591,46 @@ async fn a_token_that_arrives_a_moment_after_the_permission_is_waited_for() {
             .as_slice(),
         [FIRST_TOKEN]
     );
+}
+
+/// KR-REQ-16.06: the system's permission question is asked when the person chooses to turn
+/// notifications on, and by nothing else. A person who refused once leaves the permission unread
+/// as granted or denied on some phones, and the look the application makes at its start, when it
+/// comes to the front or when the network changes finds a host that stopped for it: that look
+/// reads the permission and puts no dialog on the screen the person is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_the_application_makes_by_itself_never_asks_the_system_for_permission() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    receiver.with(|state| {
+        state.permission = Permission::Unknown;
+        state.when_asked = Permission::Denied;
+    });
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    let asked = |phone: &Desk| phone.receiver.state.lock().expect("the receiver").asked;
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until_words("off for this app").await;
+    assert_eq!(asked(&phone), 1, "the person's own choice asked the system");
+
+    // Time passes, and the application looks again by itself.
+    phone
+        .clock_ahead_ms
+        .fetch_add(2 * 60 * 1000, Ordering::SeqCst);
+    phone.desk.refresh().await;
+    phone.until_words("not allowed for this app yet").await;
+    assert_eq!(
+        asked(&phone),
+        1,
+        "a look the application made by itself asked the system again"
+    );
+
+    // The person chooses again, and only then is the system asked once more.
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    phone.until_words("off for this app").await;
+    assert_eq!(asked(&phone), 2);
 }
