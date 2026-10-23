@@ -65,6 +65,20 @@ struct ReceiverState {
     permission_hangs: bool,
     /// Whether the question about the permission ends the task that asked it.
     permission_panics: bool,
+    /// The reads of the permission, by their number, that wait to be released: the answer is the
+    /// one the platform gave when it was asked, and reaches the asker when the test lets it.
+    permission_held: BTreeSet<usize>,
+    permission_released: BTreeSet<usize>,
+    /// How many reads of the permission have answered.
+    permission_answered: usize,
+    /// The reads of the token, by their number, that wait to be released in the same way.
+    token_held: BTreeSet<usize>,
+    token_released: BTreeSet<usize>,
+    /// How many reads of the token have been asked, and how many of them were told the token is
+    /// out of reach.
+    token_reads: usize,
+    /// How many reads of the token are answered with a token before the platform says there is none.
+    token_readable_for: Option<usize>,
     /// The provider's token, once the provider has made one.
     token: Option<String>,
     /// Reads of the token that say there is none yet, before there is one.
@@ -89,6 +103,13 @@ impl Receiver {
                 permission_reads: 0,
                 permission_hangs: false,
                 permission_panics: false,
+                permission_held: BTreeSet::new(),
+                permission_released: BTreeSet::new(),
+                permission_answered: 0,
+                token_held: BTreeSet::new(),
+                token_released: BTreeSet::new(),
+                token_reads: 0,
+                token_readable_for: None,
                 token: Some(token.to_owned()),
                 reads_without_a_token: 0,
                 pending: None,
@@ -113,16 +134,34 @@ impl Receiver {
 impl Native for Receiver {
     fn permission(&self) -> PushFuture<'_, Permission> {
         Box::pin(async move {
-            let (hangs, panics) = {
+            let (number, answer, hangs, panics) = {
                 let mut state = self.state.lock().expect("the receiver");
                 state.permission_reads += 1;
-                (state.permission_hangs, state.permission_panics)
+                (
+                    state.permission_reads,
+                    state.permission,
+                    state.permission_hangs,
+                    state.permission_panics,
+                )
             };
             assert!(!panics, "the task that asked about the permission ends");
             if hangs {
                 std::future::pending::<()>().await;
             }
-            Ok(self.state.lock().expect("the receiver").permission)
+            // The answer is the one the platform had when it was asked, whenever it arrives.
+            loop {
+                {
+                    let mut state = self.state.lock().expect("the receiver");
+                    if !state.permission_held.contains(&number)
+                        || state.permission_released.contains(&number)
+                    {
+                        state.permission_answered += 1;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(answer)
         })
     }
 
@@ -139,12 +178,31 @@ impl Native for Receiver {
 
     fn token(&self) -> PushFuture<'_, Option<String>> {
         Box::pin(async move {
-            let mut state = self.state.lock().expect("the receiver");
-            if state.reads_without_a_token > 0 {
-                state.reads_without_a_token -= 1;
-                return Ok(None);
+            let (number, answer) = {
+                let mut state = self.state.lock().expect("the receiver");
+                state.token_reads += 1;
+                let number = state.token_reads;
+                if state.reads_without_a_token > 0 {
+                    state.reads_without_a_token -= 1;
+                    return Ok(None);
+                }
+                if state.token_readable_for.is_some_and(|reads| number > reads) {
+                    return Ok(None);
+                }
+                (number, state.token.clone())
+            };
+            // The answer is the token the provider held when it was asked, whenever it arrives.
+            loop {
+                {
+                    let state = self.state.lock().expect("the receiver");
+                    if !state.token_held.contains(&number) || state.token_released.contains(&number)
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            Ok(state.token.clone())
+            Ok(answer)
         })
     }
 
@@ -1066,4 +1124,145 @@ fn find(directory: &Path, name: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// A run that cannot read the token again when it has made its registration has no evidence that
+/// the host is registered with the token the provider holds, and does not turn the host on: it
+/// stops for a retry, and the retry that follows registers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_that_cannot_read_the_token_at_its_end_does_not_turn_the_host_on() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    // The first read of the token is the run's own, to propose it; the next is its comparison.
+    receiver.with(|state| state.token_readable_for = Some(1));
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+
+    phone.receiver.with(|state| state.token_readable_for = None);
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    phone.until(|states| states == [PushState::On]).await;
+}
+
+/// A token that the provider changed while a run's last read of it was on its way is not hidden by
+/// the answer that arrives late: the look that saw the new token is kept, and the run goes round
+/// again with it and does not turn the host on with the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_to_a_runs_last_read_does_not_hide_a_change_a_look_saw() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    // The run's second read of the token, the comparison, is held on its way.
+    receiver.with(|state| {
+        state.token_held.insert(2);
+    });
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the comparison read was asked", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .token_reads
+            >= 2
+    })
+    .await;
+
+    // The provider changes the token and the application looks, while the run's answer is still on
+    // its way. The look finds the host held by its run.
+    phone.receiver.token_is(SECOND_TOKEN);
+    look(&phone.desk).await;
+    phone.receiver.with(|state| {
+        state.token_released.insert(2);
+    });
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN, SECOND_TOKEN],
+        "the run went round again with the token the look saw"
+    );
+}
+
+/// The run of a host that was forgotten does not use the consent the person gave when they turned
+/// the host on again: it ends without asking the system anything, and the new run asks once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_replaced_it() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    receiver.with(|state| {
+        state.permission = Permission::Unknown;
+        // Each run's first read of the permission waits to be let go.
+        state.permission_held.extend([1, 2]);
+    });
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the first run read the permission", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .permission_reads
+            >= 1
+    })
+    .await;
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .remove(0);
+    phone.desk.forgotten(paired.host_device_id);
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    eventually("the second run read the permission", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .permission_reads
+            >= 2
+    })
+    .await;
+
+    // The first run's answer arrives first, and is let finish before the second run's does.
+    phone.receiver.with(|state| {
+        state.permission_released.insert(1);
+    });
+    eventually("the first run's answer reached it", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .permission_answered
+            >= 1
+    })
+    .await;
+    // The second run's answer is let go next. It notices that at its next look at the gate, which
+    // is later than the first run needs to take what it takes, a few steps with nothing awaited.
+    phone.receiver.with(|state| {
+        state.permission_released.insert(2);
+    });
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        phone.receiver.state.lock().expect("the receiver").asked,
+        1,
+        "the system was asked once, by the run that was given consent"
+    );
 }

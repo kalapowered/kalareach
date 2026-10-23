@@ -298,6 +298,10 @@ struct State {
     /// the question, and out again whenever it ends or goes round again, so a look the application
     /// makes by itself never asks.
     asking: BTreeSet<DeviceId>,
+    /// What a look saw of the provider's token for a host a run holds: the digest, kept until the
+    /// run has compared. A run clears it before it reads the token for its comparison, so what is
+    /// here when it compares is something a look saw while the run's own answer was on its way.
+    observed: BTreeMap<DeviceId, Digest256>,
     /// The number the next claim is given.
     next_run: u64,
 }
@@ -394,6 +398,7 @@ impl PushDesk {
                 record,
                 running: BTreeMap::new(),
                 asking: BTreeSet::new(),
+                observed: BTreeMap::new(),
                 next_run: 0,
             }),
             registering: tokio::sync::Mutex::new(()),
@@ -504,6 +509,13 @@ impl PushDesk {
             let mut marked = false;
             for host in hosts {
                 let id = host.host_device_id;
+                if let Some(digest) = current
+                    && state.running.contains_key(&id)
+                {
+                    // A run holds the host: what this look saw is kept for the run to weigh when
+                    // it compares, since its own answer may be older.
+                    state.observed.insert(id, digest);
+                }
                 let Some(kept) = state.record.hosts.get(&id.to_string()) else {
                     continue;
                 };
@@ -562,6 +574,7 @@ impl PushDesk {
             let mut state = lock(&self.state);
             state.running.remove(&host);
             state.asking.remove(&host);
+            state.observed.remove(&host);
             if state.record.hosts.remove(&host.to_string()).is_some() {
                 self.keep(&state.record);
             }
@@ -583,6 +596,7 @@ impl PushDesk {
             loop {
                 match desk.sequence(&host, run).await {
                     Ok(registered) => {
+                        desk.about_to_compare(host.host_device_id, run);
                         let current = desk.current_digest().await;
                         if !desk.registered(host.host_device_id, run, registered, current) {
                             break;
@@ -598,9 +612,20 @@ impl PushDesk {
         });
     }
 
+    /// A run is about to read the token for its comparison: what a look saw until now is older than
+    /// the answer, and is let go.
+    fn about_to_compare(&self, host: DeviceId, run: u64) {
+        let mut state = lock(&self.state);
+        if state.holds(host, run) {
+            state.observed.remove(&host);
+        }
+    }
+
     /// What a run does when its registration is made: the host is on when the token it proposed is
-    /// the one the provider holds, and the run goes round again when it is not. Returns whether it
-    /// goes round again. A run that no longer holds its host writes nothing.
+    /// the one the provider holds, and the run goes round again when it is not, whether its own
+    /// last read or a look made while that read was on its way says so. A run that cannot say what
+    /// the provider holds has no evidence, and stops for a retry. Returns whether it goes round
+    /// again. A run that no longer holds its host writes nothing.
     fn registered(
         &self,
         host: DeviceId,
@@ -615,9 +640,25 @@ impl PushDesk {
                 return false;
             }
             state.asking.remove(&host);
-            if current.is_some_and(|digest| digest != registered) {
+            let observed = state.observed.remove(&host);
+            if current
+                .into_iter()
+                .chain(observed)
+                .any(|digest| digest != registered)
+            {
                 // The record already says working, and the repeat reads the token as it stands.
                 return true;
+            }
+            if current.is_none() && observed.is_none() {
+                drop(state);
+                self.stopped(
+                    host,
+                    run,
+                    &"This phone could not read its notification token to finish. Try again in a moment."
+                        .to_owned()
+                        .into(),
+                );
+                return false;
             }
             state.running.remove(&host);
             let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
@@ -645,6 +686,7 @@ impl PushDesk {
             }
             state.running.remove(&host);
             state.asking.remove(&host);
+            state.observed.remove(&host);
             let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
                 return;
             };
@@ -727,7 +769,16 @@ impl PushDesk {
             // look the application makes by itself, at its start, when it comes to the front or when
             // the network changes, must not put a dialog on a screen the person chose for something
             // else.
-            if !lock(&self.state).asking.remove(&host.host_device_id) {
+            let consent = {
+                let mut state = lock(&self.state);
+                // Only the run that holds the host may take the person's consent: the run of a host
+                // that was forgotten and turned on again must leave it to the run that replaced it.
+                if !state.holds(host.host_device_id, run) {
+                    return Err(forgotten_host());
+                }
+                state.asking.remove(&host.host_device_id)
+            };
+            if !consent {
                 return Err(Stop {
                     words: "Notifications are not allowed for this app yet. Choose Try again, and \
                             the system will ask."
@@ -735,7 +786,9 @@ impl PushDesk {
                     settings: false,
                 });
             }
-            self.working(host.host_device_id, run, "Asking for permission.");
+            if !self.working(host.host_device_id, run, "Asking for permission.") {
+                return Err(forgotten_host());
+            }
             permission = native
                 .ask_permission()
                 .await
