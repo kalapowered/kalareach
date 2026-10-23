@@ -50,7 +50,8 @@ pub fn open_connection(
 /// open and must not wait for: the connection is read-only and takes no lock of the holder's. A
 /// store in write-ahead mode answers from what is committed while a writer works, and one that is
 /// not waits for a commit at most [`PATIENCE`]. A store that is not there holds no row, and every
-/// other refusal is returned: a store that cannot be read is not one that holds nothing.
+/// other refusal is returned, a path that cannot be looked for among them: a store that cannot be
+/// read is not one that holds nothing.
 ///
 /// # Errors
 ///
@@ -60,7 +61,13 @@ pub fn holds_a_row(
     query: &str,
     parameters: impl rusqlite::Params,
 ) -> rusqlite::Result<bool> {
-    if !path.exists() {
+    // A path that cannot be looked for is not a store that is not there.
+    if !path.try_exists().map_err(|error| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(error.to_string()),
+        )
+    })? {
         return Ok(false);
     }
     let connection = open_connection(
