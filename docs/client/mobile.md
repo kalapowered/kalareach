@@ -380,7 +380,34 @@ pnpm -C apps/companion test:privacy-manifest
 # The manifest the packaged application was built from.
 cat apps/companion/src-tauri/gen/android/app/build/intermediates/packaged_manifests/\
 universalDebug/processUniversalDebugManifestForPackage/AndroidManifest.xml
+
+# The native library's own cases, run on a device that is already running: the crate `kr-crypto`
+# builds libsodium from source for each target, and these build its tests for the device's
+# architecture and run them there. Android takes an emulator (x86_64-linux-android by default;
+# KR_ANDROID_TARGET names another the device runs) and iOS a booted simulator's identifier.
+scripts/native-library-tests.sh android [--serial <serial>]
+scripts/native-library-tests.sh ios --udid <simulator identifier>
+
+# The debug application installed on a running device, started, and looked at; each script waits
+# for conditions, not for a time, and saves a screenshot.
+scripts/android-app-launch.sh path/to/app-universal-debug.apk screenshot.png [--serial <serial>]
+scripts/ios-app-launch.sh path/to/KalaReach.app <simulator identifier> screenshot.png
 ```
+
+`scripts/android-app-launch.sh` holds that the application installs and its main activity starts;
+that its process has native code of the package mapped, which is the Rust library, stored in the
+package uncompressed and mapped from it; that the web view lists a page with a title which the
+application's own protocol (`tauri.localhost`) served; and that the log holds no fatal exception or
+signal. `scripts/ios-app-launch.sh` holds that the built application defines the Swift plugin's entry
+point (`init_plugin_companion_platform`), that the application and the web view's content process
+run in the simulator, and that the system wrote no crash report for the application. The jobs
+`android-app` and `ios` of the landing workflow run both scripts, and the library's cases, on an
+Android emulator (x86_64, Android 16 with Google Play and 16 KB pages) and in an iPhone simulator
+(arm64) of the hosted runners, after building the debug application for each, and keep the
+screenshots with the run's evidence (`test-evidence-android`, `test-evidence-ios`). The `ios` job
+builds with no signing identity, certificate or profile. The phone's other architectures are
+compiled and linted by the `android` job and the `ios` job and are not run: the emulator runs
+x86_64, so libsodium's x86 code paths are the ones it exercises.
 
 `scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only
 what it started, and changes a device's settings only on one it started itself. A platform that is
