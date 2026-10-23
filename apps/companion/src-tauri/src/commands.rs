@@ -172,6 +172,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // The host a phone's commands go to.
     ("hosts_use", None),
     ("hosts_forget", None),
+    // The attention inboxes of the other hosts this device is paired with, read over a connection
+    // of their own to each, so the inbox is one across hosts.
+    ("inbox_hosts", None),
     // Notifications: where each paired host's stand, turning them on for one, looking again, and the
     // screen a tap on a notification opened.
     ("push_view", None),
@@ -314,6 +317,17 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // The host's own account of which environment it is, read once the connection to a paired
     // host is up: the connection carries none on its handshake.
     ("hosts_use", &[Method::HostInfo, Method::SessionOpen]),
+    // The inbox of each paired host that is not in use: the host says which environment it is, opens
+    // the connection for the host alone, and answers the inbox's pages and its sessions' numbers.
+    (
+        "inbox_hosts",
+        &[
+            Method::HostInfo,
+            Method::SessionOpen,
+            Method::AttentionRead,
+            Method::SessionList,
+        ],
+    ),
     // A phone hands its host the credential its installation was issued, and says it holds the
     // key the host seals previews to. The page names a host and nothing else.
     (
@@ -613,6 +627,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         revocation_revoke,
         hosts_use,
         hosts_forget,
+        inbox_hosts,
         push_view,
         push_enable,
         push_refresh,
@@ -2585,6 +2600,18 @@ fn unavailable_push_view() -> crate::push::PushView {
     }
 }
 
+/// The attention inboxes of the hosts this device is paired with and is not using.
+///
+/// The inbox is one across hosts, so each of the others is visited over a connection of its own,
+/// all at once and each within a bound, and the page is given what each said: its inbox and its
+/// sessions' numbers, that the device is out of contact with it and since when, or that its grant
+/// does not reach the inbox. The page names no host and no parameter.
+#[tauri::command]
+pub async fn inbox_hosts(state: State<'_, AppState>) -> Result<Vec<crate::inbox::HostInbox>> {
+    let device = state.device()?;
+    Ok(state.inbox().visit(&device).await)
+}
+
 /// Forgets a host this computer is paired with, named by the reference the pairing screen listed it
 /// under, and says where that leaves the connection.
 ///
@@ -2606,6 +2633,7 @@ pub fn hosts_forget<R: tauri::Runtime>(
     if let Some(desk) = state.push() {
         desk.forgotten(host.host_device_id);
     }
+    state.inbox().forgotten(host.host_device_id);
     Ok(forgotten)
 }
 
@@ -3578,6 +3606,7 @@ mod tests {
     /// table is not left out of the one tour that proves the route of the commands that reach a
     /// session: adding one fails this test until it is classified.
     const HOST_OR_LOCAL_COMMANDS: &[&str] = &[
+        "inbox_hosts",
         "push_view",
         "push_enable",
         "push_refresh",
@@ -3647,6 +3676,7 @@ mod tests {
         "revocation_revoke",
         "hosts_use",
         "hosts_forget",
+        "inbox_hosts",
         "voice_prepare",
         "voice_start",
         "voice_stop",
@@ -3800,6 +3830,9 @@ mod tests {
                 // The host a phone's commands go to: it pairs, then it chooses, and it may forget.
                 "hosts_use",
                 "hosts_forget",
+                // The inboxes of the other hosts this device is paired with: native code visits
+                // each over a connection of its own, and the page is given what each said.
+                "inbox_hosts",
                 // Notifications: where each paired host's stand, turning them on for one, looking
                 // again, and the screen a tap opened. Native code asks the gateway, waits for its
                 // own receiver, and hands the host the credential; the page names a host.

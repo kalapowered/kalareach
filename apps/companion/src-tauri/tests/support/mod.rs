@@ -592,6 +592,7 @@ impl Companion {
                 companion_tauri::commands::revocation_revoke,
                 companion_tauri::commands::hosts_use,
                 companion_tauri::commands::hosts_forget,
+                companion_tauri::commands::inbox_hosts,
                 companion_tauri::commands::connection_state,
                 companion_tauri::commands::session_list,
                 companion_tauri::commands::session_read,

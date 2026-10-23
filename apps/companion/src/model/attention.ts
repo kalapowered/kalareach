@@ -220,19 +220,60 @@ export function present(item: AttentionItem, nowMs: number): AttentionRow {
   }
 }
 
+/** Which of two items is shown first: kind, then the more recent. */
+function byUrgency(left: AttentionItem, right: AttentionItem): number {
+  const byKind = KIND_ORDER[kindOf(left)] - KIND_ORDER[kindOf(right)]
+  if (byKind !== 0) return byKind
+  const byTime = BigInt(right.last_seen_ms) - BigInt(left.last_seen_ms)
+  return byTime > 0n ? 1 : byTime < 0n ? -1 : 0
+}
+
 /**
  * The inbox in the order it is shown: kind first, because what is waiting on a person outranks
  * what is only waiting, then the most recent within a kind.
  */
 export function order(inbox: AttentionReadResult, nowMs: number): readonly AttentionRow[] {
-  return [...inbox.items]
-    .sort((left, right) => {
-      const byKind = KIND_ORDER[kindOf(left)] - KIND_ORDER[kindOf(right)]
-      if (byKind !== 0) return byKind
-      const byTime = BigInt(right.last_seen_ms) - BigInt(left.last_seen_ms)
-      return byTime > 0n ? 1 : byTime < 0n ? -1 : 0
-    })
-    .map((item) => present(item, nowMs))
+  return [...inbox.items].sort(byUrgency).map((item) => present(item, nowMs))
+}
+
+/** The host a row belongs to. A host in use has no reference to name: it is already the one in use. */
+export interface HostTag {
+  readonly reference: string | null
+  readonly name: string
+}
+
+/** A row, with the host it is from and the numbers that host gives its sessions. */
+export interface HostedRow {
+  readonly row: AttentionRow
+  readonly host: HostTag
+  readonly numbers: ReadonlyMap<string, string>
+}
+
+/** The rows of several hosts in the order they are shown: by kind, then the most recent. */
+export function orderAcrossHosts(rows: readonly HostedRow[]): readonly HostedRow[] {
+  return [...rows].sort((left, right) => byUrgency(left.row.item, right.row.item))
+}
+
+/**
+ * What the inbox says of a host this device is out of contact with: for how long when it knows, and
+ * that nothing here says its processes stopped. Lost contact is a fact about the connection.
+ */
+export function contactWords(sinceMs: number | null, nowMs: number): string {
+  const lost =
+    sinceMs === null ? 'No contact.' : `No contact for ${describeElapsed(nowMs - sinceMs)}.`
+  return `${lost} Its sessions may still be running; nothing here says they are not.`
+}
+
+/** The counts of two inboxes together. */
+export function addCounts(left: AttentionCounts, right: AttentionCounts): AttentionCounts {
+  return {
+    pending_decision: left.pending_decision + right.pending_decision,
+    failed_action: left.failed_action + right.failed_action,
+    awaiting_review: left.awaiting_review + right.awaiting_review,
+    disconnected: left.disconnected + right.disconnected,
+    notice: left.notice + right.notice,
+    actionable: left.actionable + right.actionable
+  }
 }
 
 /** How many items of each kind there are, which is what the tab badge counts. */
