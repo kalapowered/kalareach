@@ -1196,9 +1196,9 @@ fn summary_with_root(
     }
 }
 
-/// KR-REQ-26.10: the journal of a session whose root is a command holds the session's summary in
-/// the form a release that does not know the marker reads, and the marker in a row of its own,
-/// which this build reads back into the summary.
+/// The journal of a session whose root is a command holds the session's summary in the form a
+/// release that does not know the marker reads, and the marker in a row of its own, which this
+/// build reads back into the summary.
 #[test]
 fn a_command_sessions_marker_is_kept_apart_from_the_summary_an_earlier_release_reads() {
     let path = journal_path("command-root");
