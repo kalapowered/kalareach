@@ -494,6 +494,56 @@ fn kr_req_12_24_a_package_of_another_publisher_does_not_take_a_program_by_naming
     );
 }
 
+/// KR-REQ-12.24: a publisher's name is vouched for by the root of the repository that lists it, and
+/// two repositories can list one name. A package published under the name the shipped package has,
+/// through another repository, does not take a program from it by naming an installation location,
+/// though a package of that name through the same repository does: the second is one publisher's
+/// choice between its own products, as the two Kimi profiles are, and the first is a stranger's.
+#[test]
+fn kr_req_12_24_a_package_under_the_same_publisher_name_in_another_repository_does_not_take_a_program()
+ {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        vec![
+            fixture::claude_code_package(store, &bin.join("kr-hook")).expect("the package"),
+            fixture::declarative_package_with(store, "placed", |manifest| {
+                manifest["match_rules"][0]["executable"]["file_stem"] =
+                    serde_json::json!(fixture::COMMAND);
+                manifest["match_rules"][0]["executable"]["path_suffix"] =
+                    serde_json::json!(["bin"]);
+                manifest["match_rules"][0]["distribution"] = serde_json::Value::Null;
+                manifest["match_rules"][0]["confidence"] = serde_json::json!("inferred");
+            })
+            .expect("the package"),
+        ]
+    });
+    let path = setup.program.display().to_string();
+    let selected = |setup: &Setup| {
+        setup
+            .broker
+            .admitted_match(&path)
+            .map(|found| found.plugin_id.to_string())
+    };
+    // Both through the repository the host seeded: one publisher's choice, by location.
+    assert_eq!(selected(&setup).as_deref(), Some("kalareach/placed"));
+
+    // The second through a repository of its own: the same name, another root.
+    let shipped = testing::admitted(&setup.packages[0]);
+    let mut stranger = testing::admitted(&setup.packages[1]);
+    stranger.origin.enrolment_key = "another-root".to_owned();
+    let _ = testing::admit(
+        &setup.admissions,
+        &setup.sources,
+        &setup.broker,
+        vec![shipped, stranger],
+        2,
+    );
+    assert_eq!(
+        selected(&setup),
+        None,
+        "equal claims from two roots bind neither"
+    );
+}
+
 /// KR-REQ-11.13: a package with no connector table recognises and adopts a program the way a
 /// connector does, as a native terminal instance with no registration, and binds it, with no
 /// decoding trust.
