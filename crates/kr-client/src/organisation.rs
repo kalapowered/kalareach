@@ -55,6 +55,9 @@ const PRESENT_TTL: DurationMs = DurationMs::new(30_000);
 /// was installed before its restart, before it treats the host as one that cannot take it.
 const IMMEDIATE_RETRIES: u32 = 3;
 
+/// How many times a connection waits and asks again for its first lease before it gives up for now.
+const FIRST_LEASE_TRIES: u32 = 3;
+
 /// How many times in a row the host may refuse a lease for a reason the keeper does not know, or
 /// the service reject its token, before the keeper stops.
 const UNEXPLAINED_REFUSALS: u32 = 3;
@@ -92,6 +95,33 @@ pub enum LeaseStop {
     /// The connection to the host ended, so the lease it held is the host's to forget. A caller
     /// that opens another connection presents again before it asks the host anything.
     ConnectionEnded,
+    /// The first lease could not be got in the few tries a connection is given, because the
+    /// organisation's service or the host did not answer well enough. A caller that tries again
+    /// later may succeed.
+    Unreachable,
+}
+
+impl LeaseStop {
+    /// The protocol code a person-facing failure for this stop carries.
+    #[must_use]
+    pub const fn code(&self) -> ErrorCode {
+        match self {
+            Self::SignIn | Self::NotAMember | Self::Refused(_) => ErrorCode::PermissionDenied,
+            Self::Unusable => ErrorCode::InvalidArgument,
+            Self::ConnectionEnded | Self::Unreachable => ErrorCode::ResourceUnavailable,
+        }
+    }
+
+    /// What the person does about it.
+    #[must_use]
+    pub const fn user_action(&self) -> UserAction {
+        match self {
+            Self::SignIn => UserAction::SignIn,
+            Self::NotAMember | Self::Refused(_) => UserAction::Nothing,
+            Self::Unusable => UserAction::Update,
+            Self::ConnectionEnded | Self::Unreachable => UserAction::Wait,
+        }
+    }
 }
 
 impl fmt::Display for LeaseStop {
@@ -114,6 +144,10 @@ impl fmt::Display for LeaseStop {
             Self::ConnectionEnded => {
                 formatter.write_str("the connection to this host ended before a lease was held")
             }
+            Self::Unreachable => formatter.write_str(
+                "your organisation's service did not give this device the lease it needs just \
+                 now; this app asks again",
+            ),
         }
     }
 }
@@ -157,7 +191,6 @@ enum Next {
 /// Keeps one organisation's lease for one device on one host.
 pub struct LeaseKeeper {
     leases: Arc<dyn MembershipLeaseService>,
-    session: Arc<Session>,
     timer: Arc<dyn LeaseTimer>,
     organisation: OrganisationId,
     environment: EnvironmentId,
@@ -178,12 +211,11 @@ impl fmt::Debug for LeaseKeeper {
 }
 
 impl LeaseKeeper {
-    /// A keeper that gets the lease for `device_key` from `leases` and presents it on `session`,
-    /// to the host whose environment is `environment`.
+    /// A keeper that gets the lease for `device_key` from `leases` and presents it to the host
+    /// whose environment is `environment`, on the session each call is given.
     #[must_use]
     pub fn new(
         leases: Arc<dyn MembershipLeaseService>,
-        session: Arc<Session>,
         timer: Arc<dyn LeaseTimer>,
         organisation: OrganisationId,
         environment: EnvironmentId,
@@ -191,7 +223,6 @@ impl LeaseKeeper {
     ) -> Self {
         Self {
             leases,
-            session,
             timer,
             organisation,
             environment,
@@ -217,18 +248,18 @@ impl LeaseKeeper {
     ///
     /// Returns why the host does not hold a lease and will not without a person or a new
     /// connection.
-    pub async fn present_first(&self) -> Result<Duration, LeaseStop> {
-        self.until_held(&mut Pace::new()).await
+    pub async fn present_first(&self, session: &Session) -> Result<Duration, LeaseStop> {
+        self.until_held(session, &mut Pace::first()).await
     }
 
     /// Keeps the lease until something stops it. It begins with a wait of `advised`, the interval
     /// [`Self::present_first`] returned, so a lease just presented is not presented again.
-    pub async fn keep(&self, advised: Duration) -> LeaseStop {
+    pub async fn keep(&self, session: &Session, advised: Duration) -> LeaseStop {
         let mut pace = Pace::new();
-        let mut wait = advised;
+        let mut wait = clamp(advised);
         loop {
             self.timer.wait(wait).await;
-            match self.until_held(&mut pace).await {
+            match self.until_held(session, &mut pace).await {
                 Ok(advised) => wait = advised,
                 Err(stop) => return stop,
             }
@@ -237,9 +268,9 @@ impl LeaseKeeper {
 
     /// Asks and presents until the host holds a lease, and returns the interval to wait before the
     /// next.
-    async fn until_held(&self, pace: &mut Pace) -> Result<Duration, LeaseStop> {
+    async fn until_held(&self, session: &Session, pace: &mut Pace) -> Result<Duration, LeaseStop> {
         loop {
-            let next = match self.step(pace.chain).await {
+            let next = match self.step(session, pace.chain).await {
                 Ok(advised) => {
                     pace.held();
                     return Ok(clamp(advised));
@@ -272,6 +303,9 @@ impl LeaseKeeper {
                 Next::Stop(stop) => return Err(self.stopped(stop)),
             };
             if let Some(wait) = wait {
+                if !pace.waits() {
+                    return Err(self.stopped(LeaseStop::Unreachable));
+                }
                 (self.report)(LeaseEvent::Retrying);
                 self.timer.wait(wait).await;
             }
@@ -284,7 +318,7 @@ impl LeaseKeeper {
     }
 
     /// One lease asked for and presented. Returns the interval the service advised.
-    async fn step(&self, force_chain: bool) -> Result<Duration, Next> {
+    async fn step(&self, session: &Session, force_chain: bool) -> Result<Duration, Next> {
         let issued = self
             .leases
             .lease(self.organisation, self.device_key)
@@ -306,8 +340,7 @@ impl LeaseKeeper {
             lease: issued.lease,
             authority: authority.map_or_else(Nullable::null, Nullable::some),
         };
-        let held: MembershipPresentResult = self
-            .session
+        let held: MembershipPresentResult = session
             .mutate(
                 Method::MembershipPresent,
                 ActionTarget::environment(self.environment),
@@ -331,6 +364,8 @@ impl LeaseKeeper {
 /// How the keeper paces itself while a lease is being got.
 struct Pace {
     backoff: Backoff,
+    /// The waits allowed before giving up for now, when there is a limit.
+    waits_left: Option<u32>,
     /// Asks made at once in a row.
     immediate: u32,
     /// Failures in a row that nothing explains.
@@ -343,15 +378,36 @@ impl Pace {
     fn new() -> Self {
         Self {
             backoff: backoff(),
+            waits_left: None,
             immediate: 0,
             doubts: 0,
             chain: false,
         }
     }
 
+    /// The pace of a connection's first lease, which gives up after a few waits.
+    fn first() -> Self {
+        Self {
+            waits_left: Some(FIRST_LEASE_TRIES),
+            ..Self::new()
+        }
+    }
+
     /// A lease is held: the next failure starts again.
     fn held(&mut self) {
         *self = Self::new();
+    }
+
+    /// Spends one wait, and says whether there was one to spend.
+    fn waits(&mut self) -> bool {
+        match &mut self.waits_left {
+            Some(0) => false,
+            Some(left) => {
+                *left -= 1;
+                true
+            }
+            None => true,
+        }
     }
 
     /// How long to wait before asking again for a lease the host said to ask again for: none for

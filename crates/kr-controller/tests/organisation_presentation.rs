@@ -689,3 +689,68 @@ async fn a_presentation_whose_deadline_passes_while_it_waits_for_the_store_write
     fresh.close();
     fixture.host.stop().await;
 }
+
+/// KR-REQ-17.53: a member's client tells the host's refusals of a lease apart by the name of the
+/// rule the host ends its message with, and acts on each as the rule calls for. It knows every
+/// rule the host refuses by, so that a rule the host gains is one this suite fails to compile or
+/// fails on, and not one the client meets for the first time in the field.
+#[test]
+fn the_member_client_knows_every_rule_the_host_refuses_a_lease_by() {
+    let all = [
+        LeaseRefused::NotEnrolled,
+        LeaseRefused::NoOrganisationGrant,
+        LeaseRefused::HostNotExclusive,
+        LeaseRefused::UnauthenticatedRevision,
+        LeaseRefused::BadSignature,
+        LeaseRefused::DeviceMismatch,
+        LeaseRefused::IssuedBeforeActivation,
+        LeaseRefused::SignedAfterSuccessor,
+        LeaseRefused::TooLong,
+        LeaseRefused::AboveRoleCeiling,
+        LeaseRefused::ClockUntrusted,
+        LeaseRefused::FloorUnrecorded,
+        LeaseRefused::NotYetValid,
+        LeaseRefused::Expired,
+        LeaseRefused::InstalledEarlier,
+        LeaseRefused::AmbiguousIssue,
+        LeaseRefused::Superseded,
+        LeaseRefused::AccountMismatch,
+    ];
+    // Every variant is in the list above: this match names each, and a variant added to the host's
+    // list is one it does not name.
+    for refused in all {
+        match refused {
+            LeaseRefused::NotEnrolled
+            | LeaseRefused::NoOrganisationGrant
+            | LeaseRefused::HostNotExclusive
+            | LeaseRefused::UnauthenticatedRevision
+            | LeaseRefused::BadSignature
+            | LeaseRefused::DeviceMismatch
+            | LeaseRefused::IssuedBeforeActivation
+            | LeaseRefused::SignedAfterSuccessor
+            | LeaseRefused::TooLong
+            | LeaseRefused::AboveRoleCeiling
+            | LeaseRefused::ClockUntrusted
+            | LeaseRefused::FloorUnrecorded
+            | LeaseRefused::NotYetValid
+            | LeaseRefused::Expired
+            | LeaseRefused::InstalledEarlier
+            | LeaseRefused::AmbiguousIssue
+            | LeaseRefused::Superseded
+            | LeaseRefused::AccountMismatch => {}
+        }
+    }
+    let known = kr_client::organisation::known_rules();
+    for refused in all {
+        assert!(
+            known.contains(&refused.name()),
+            "the client does not know the rule {}",
+            refused.name()
+        );
+    }
+    assert_eq!(
+        known.len(),
+        all.len(),
+        "the client names a rule the host does not"
+    );
+}

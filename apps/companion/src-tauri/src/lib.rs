@@ -578,7 +578,8 @@ fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
             format!("the secret store could not be opened: {error}"),
         )
     })?;
-    let parts = device::Parts::platform(secrets, application_clock(app)?)?;
+    let mut parts = device::Parts::platform(secrets, application_clock(app)?)?;
+    parts.leases = Some(lease::LeaseDesk::for_app(app));
     start_pairing(
         app,
         &data,

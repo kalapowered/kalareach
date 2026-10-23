@@ -1346,6 +1346,25 @@ storage and backup manifest clients and the managed inference broker together, i
 `ServiceClients` it holds, and `kr doctor` reads `ServiceClients::availability` from it for the
 `managed-services` check.
 
+`services::organisation` is the client of an organisation's service, for a member's device. It asks for
+the membership lease the organisation signed for the signed-in account and the device's authorisation
+key (`POST /api/account/organisations/{id}/lease`, with the account's token for the
+`organisation.lease` scope), and reads the chain of keys that signs the organisation's leases (`GET
+.../policy-authority`). `ServiceClients::membership_leases` holds it and counts under account login.
+
+`organisation::LeaseKeeper` uses it. It presents the lease to the host with `membership.present` as
+the first thing on a connection, because the host refuses a device whose grant answers to an
+organisation every other method until it holds a lease, and no lease survives a host's restart. It
+then asks again on the interval the service advises, held between one and five minutes, so a renewal
+reaches the host before the lease it replaces ends. A lease signed by a key revision the keeper has
+not carried before travels with the chain of keys.
+
+The keeper reads a refusal by the rule name the host ends its message with, and by the code the
+service answers. A lease that has ended, or that the host installed before its restart, is asked for
+again at once. A service that is down, a host clock in doubt and a delay the service names are waited
+out. The keeper stops, and says why (`LeaseStop`), when the account is not signed in or is not a
+member, or when the host refuses the lease for a reason only an administrator can change.
+
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
 them. `ServiceClients::availability` reports every service in one shape. A service with no

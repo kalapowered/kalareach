@@ -47,6 +47,7 @@ pub use hosts::HostRow;
 pub use identity::DeviceIdentity;
 
 use crate::error::{CommandError, Result};
+use crate::lease::LeaseDesk;
 
 /// How long a pasted invitation is held before it is dropped unused.
 pub const HELD_FOR: Duration = Duration::from_secs(5 * 60);
@@ -176,6 +177,8 @@ pub struct Device {
     /// The host this application's commands go to, remembered across runs in `use_file`.
     in_use: Mutex<Option<DeviceId>>,
     use_file: PathBuf,
+    /// What gives a host this computer's membership lease, when it has any to give.
+    leases: Option<LeaseDesk>,
     changed: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -218,9 +221,9 @@ pub struct Parts {
     /// The managed service this computer asks for an admission to reach a host through one of the
     /// service's relays before it has paired with it, when it asks any.
     pub managed: Option<ManagedService>,
-    /// What gives a host the membership lease this computer's grant on it needs, when it has any
-    /// such grant to hold.
-    pub leases: Option<crate::lease::LeaseDesk>,
+    /// What gives a host the membership lease this computer's grant on it needs, on every
+    /// connection it makes to it as a paired device, when it has any such grant to hold.
+    pub leases: Option<LeaseDesk>,
 }
 
 /// The managed service a device asks to admit it through a relay, and how it reaches it.
@@ -336,6 +339,12 @@ impl Device {
                     }
                     None => link,
                 };
+                // A host whose grant answers to an organisation is given the lease it needs before
+                // it is asked anything else on a connection, the pairing's own included.
+                let link = match &parts.leases {
+                    Some(leases) => link.presenting_membership(Arc::new(leases.clone())),
+                    None => link,
+                };
                 let own: Arc<dyn HostLink> = Arc::new(link);
                 match parts.link {
                     Some(behind) => behind(own),
@@ -367,6 +376,7 @@ impl Device {
             contact: Mutex::new(BTreeMap::new()),
             in_use: Mutex::new(in_use),
             use_file,
+            leases: parts.leases,
             changed: Box::new(changed),
         }))
     }
@@ -401,6 +411,12 @@ impl Device {
     #[must_use]
     pub const fn pairing(&self) -> &Arc<Pairing> {
         &self.pairing
+    }
+
+    /// What gives a host this computer's membership lease, when it has any to give.
+    #[must_use]
+    pub const fn leases(&self) -> Option<&LeaseDesk> {
+        self.leases.as_ref()
     }
 
     /// Everything the pairing screen shows.
