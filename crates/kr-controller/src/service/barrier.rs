@@ -760,7 +760,7 @@ impl Controller {
     ) -> Option<kr_protocol::worker::AuthorityRevisionAck> {
         let mut notices = self.revision_notices(revision, held, 0);
         let told: Vec<AuthorityRevision> = notices.iter().map(|notice| notice.revision).collect();
-        self.leases.announced(session_id, &told);
+        self.leases.announced(session_id, held, &told);
         let last = notices.pop().expect("an announcement is made");
         for notice in notices {
             #[cfg(feature = "testing")]
@@ -1427,6 +1427,74 @@ impl Controller {
             Arc::downgrade(self),
             PassSchedule::every(EVIDENCE_PASS_INTERVAL),
         ));
+    }
+
+    /// Reads back, once, what each worker an earlier run recorded still holds of the revocations it
+    /// acknowledged before this run started, on a task of its own that the start does not wait for.
+    ///
+    /// A restart loses what this daemon had collected: the pages it had half collected, and the
+    /// report a repeat of a revocation reads. The worker keeps a revocation's names until a daemon
+    /// has taken them all, and a replacement controller has taken none, so it still holds them
+    /// for the newest [`kr_worker::journal::MAX_HELD_REVOCATIONS`] revocations. Each of those is
+    /// asked for from the start. The answers carry into no result: each opens a report of its own,
+    /// which a repeat of that revocation reads, and the pages that follow the first are collected
+    /// by the evidence pass. A revision older than those answers as it was first given.
+    pub(super) fn recover_what_workers_hold(
+        self: &Arc<Self>,
+        workers: Vec<(SessionId, AuthorityRevision)>,
+    ) {
+        let daemon = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            while_held(&daemon, async move |controller: &Controller| {
+                controller.read_back_what_workers_hold(&workers).await;
+            })
+            .await;
+        });
+        #[cfg(feature = "testing")]
+        {
+            *self
+                .read_back
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        }
+        #[cfg(not(feature = "testing"))]
+        drop(task);
+    }
+
+    /// As [`Self::recover_what_workers_hold`], on this task.
+    async fn read_back_what_workers_hold(&self, workers: &[(SessionId, AuthorityRevision)]) {
+        let mut retries = Retries::for_an_announcement();
+        for (session_id, held) in workers {
+            let oldest = held
+                .get()
+                .saturating_sub(kr_worker::journal::MAX_HELD_REVOCATIONS as u64 - 1)
+                .max(1);
+            // A worker whose session has closed is bound no more, and holds nothing to give.
+            let Ok(Some(binding)) = self.binding_or_bind(*session_id).await else {
+                continue;
+            };
+            for revision in (oldest..=held.get()).rev().map(AuthorityRevision::new) {
+                // The start's own announcement asked about some of these.
+                if self.leases.reported(*session_id, revision) {
+                    continue;
+                }
+                // One exchange for the first page; the pages that follow are the pass's.
+                let mut budget = EvidenceBudget { pages: 1 };
+                self.collect_fence_evidence(
+                    *session_id,
+                    binding,
+                    revision,
+                    &mut budget,
+                    &mut retries,
+                    true,
+                )
+                .await;
+                // A worker that did not answer is not asked again for the older ones.
+                if !self.leases.reported(*session_id, revision) {
+                    break;
+                }
+            }
+        }
     }
 
     /// Asks every worker that still owes names of a revocation for them, out of one bound on the

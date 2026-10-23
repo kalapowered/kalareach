@@ -378,6 +378,12 @@ struct WorkerFences {
     /// revision is above what an acknowledged announcement took in, says that some revisions may
     /// not be read: it may have read it.
     unfollowed_through: Option<AuthorityRevision>,
+    /// Whether a registry of an earlier run recorded this worker, and no announcement of this run
+    /// has been recorded for it yet. What the earlier run announced is not in memory, so the
+    /// revisions between what the worker acknowledged and the first this run announces may have
+    /// been fenced by the worker alone, and the first announcement takes them in
+    /// ([`Self::announce`]).
+    recovered: bool,
 }
 
 impl WorkerFences {
@@ -456,7 +462,17 @@ impl WorkerFences {
     /// What is read is added to what an earlier recording of the same revision stored, never
     /// replacing it. Whatever the daemon had to let go for room, a result recorded after says it
     /// (`Carries::unread`) rather than reading less in silence.
-    fn announce(&mut self, notices: &[AuthorityRevision]) {
+    ///
+    /// `held` is the revision the worker last acknowledged, as the registry recorded it. For a
+    /// worker a registry of an earlier run recorded, the first announcement also reads the
+    /// revisions after `held` and before it, which the earlier run may have announced and which
+    /// the worker may have fenced by itself: this daemon holds nothing of what it was told.
+    fn announce(&mut self, held: AuthorityRevision, notices: &[AuthorityRevision]) {
+        if std::mem::take(&mut self.recovered)
+            && let Some(first) = notices.first()
+        {
+            self.take_in_the_gap(held, *first);
+        }
         let floor = self.claimed_through;
         for (at, revision) in notices.iter().enumerate() {
             if *revision <= floor {
@@ -515,6 +531,24 @@ impl WorkerFences {
             self.carries.remove(&forgotten);
             self.forgotten_through = self.forgotten_through.max(Some(forgotten));
         }
+    }
+
+    /// Adds the revisions after `held` and before `first`, above what an acknowledged
+    /// announcement took in, to those announced to this worker, the newest [`MAX_TOLD_REVISIONS`]
+    /// at most. What is left out says so in the results recorded after ([`Self::unfollowed_through`]).
+    fn take_in_the_gap(&mut self, held: AuthorityRevision, first: AuthorityRevision) {
+        let from = held.max(self.claimed_through).get().saturating_add(1);
+        let to = first.get();
+        if from >= to {
+            return;
+        }
+        let start = from.max(to.saturating_sub(MAX_TOLD_REVISIONS as u64));
+        if start > from {
+            self.unfollowed_through = self
+                .unfollowed_through
+                .max(Some(AuthorityRevision::new(start - 1)));
+        }
+        self.told.extend((start..to).map(AuthorityRevision::new));
     }
 
     /// Takes the revisions up to `revision` in: the last notice of an announcement has been
@@ -979,12 +1013,44 @@ impl AuthorityBarrier {
     /// daemon accepts, over which control path, does not change it. So it is recorded for any worker
     /// the lease issuer still holds, whichever binding the announcement travels on, and an answer
     /// the daemon refuses does not undo it.
-    pub fn announced(&self, session_id: SessionId, notices: &[AuthorityRevision]) {
+    ///
+    /// `held` is the revision the registry records the worker as having acknowledged.
+    pub fn announced(
+        &self,
+        session_id: SessionId,
+        held: AuthorityRevision,
+        notices: &[AuthorityRevision],
+    ) {
         let _order = self.ordered();
         if self.leases.binding(session_id) == WorkerBinding::default() {
             return;
         }
-        self.lock().entry(session_id).or_default().announce(notices);
+        self.lock()
+            .entry(session_id)
+            .or_default()
+            .announce(held, notices);
+    }
+
+    /// Marks the workers a registry of an earlier run recorded, which this daemon has been told
+    /// nothing of: the first announcement to each reads the revisions between what it
+    /// acknowledged and that announcement ([`WorkerFences::announce`]). A worker made in this run
+    /// is not marked, because everything announced to it is in memory.
+    pub fn recovered(&self, workers: impl IntoIterator<Item = SessionId>) {
+        let _order = self.ordered();
+        let mut fences = self.lock();
+        for session_id in workers {
+            fences.entry(session_id).or_default().recovered = true;
+        }
+    }
+
+    /// Returns whether this daemon holds a report of what the worker said about one revision.
+    #[must_use]
+    pub fn reported(&self, session_id: SessionId, revision: AuthorityRevision) -> bool {
+        let _order = self.ordered();
+        let fences = self.lock();
+        fences
+            .get(&session_id)
+            .is_some_and(|held| held.at(revision).is_some())
     }
 
     /// Records a worker's acknowledgement of the last notice of an announcement, as
@@ -2738,7 +2804,7 @@ mod tests {
      {
         let barrier = barrier();
         let first = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             first,
@@ -2773,7 +2839,7 @@ mod tests {
         // A told 4 then 5, and 5 was refused; B, bound after A, tells 6 alone and asks for 5.
         let barrier = barrier();
         let first = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             first,
@@ -2781,7 +2847,7 @@ mod tests {
             evidence(vec![action(10)], Vec::new()),
         ));
         let second = barrier.bind(session(1));
-        barrier.announced(session(1), &[revision(6)]);
+        barrier.announced(session(1), revision(0), &[revision(6)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             second,
@@ -2811,7 +2877,7 @@ mod tests {
         // A told 4 then 5 and 4 was accepted; B, bound after that, tells 5 then 6.
         let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
         let first = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             first,
@@ -2819,7 +2885,7 @@ mod tests {
             evidence(vec![action(10)], Vec::new()),
         ));
         let second = barrier.bind(session(1));
-        barrier.announced(session(1), &told(5, 6));
+        barrier.announced(session(1), revision(0), &told(5, 6));
         assert!(barrier.acknowledge(
             session(1),
             second,
@@ -2849,7 +2915,7 @@ mod tests {
     fn a_result_does_not_read_a_revision_it_has_no_answer_for_as_one_that_named_nothing() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -2887,7 +2953,7 @@ mod tests {
     fn a_revision_the_worker_cannot_answer_for_is_not_asked_again_and_stays_unanswered() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -2910,7 +2976,7 @@ mod tests {
     fn a_result_says_what_went_with_a_report_it_carried() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -2950,7 +3016,7 @@ mod tests {
     fn a_result_reads_the_reports_it_carries_in_revision_order() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 6));
+        barrier.announced(session(1), revision(0), &told(4, 6));
         let applied = PossiblyExecutedAction {
             state: ReceiptState::Applied,
             ..possibly_executed(11)
@@ -2984,7 +3050,7 @@ mod tests {
     fn a_revision_a_result_has_taken_in_is_not_taken_in_by_the_next() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -2999,8 +3065,8 @@ mod tests {
         ));
         // An announcement that read the record before that result was made tells 5 again, alone,
         // and then 4 and 5 again with 6.
-        barrier.announced(session(1), &[revision(5)]);
-        barrier.announced(session(1), &told(4, 6));
+        barrier.announced(session(1), revision(0), &[revision(5)]);
+        barrier.announced(session(1), revision(0), &told(4, 6));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3023,7 +3089,7 @@ mod tests {
     fn a_result_says_that_earlier_revisions_are_not_read() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 100));
+        barrier.announced(session(1), revision(0), &told(4, 100));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3046,8 +3112,8 @@ mod tests {
     fn a_result_a_later_one_has_overtaken_still_reads_its_own_announcement() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
-        barrier.announced(session(1), &told(6, 7));
+        barrier.announced(session(1), revision(0), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(6, 7));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3083,7 +3149,7 @@ mod tests {
     fn a_result_is_not_charged_with_what_went_from_a_report_it_never_read() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3097,7 +3163,7 @@ mod tests {
             evidence(Vec::new(), Vec::new()),
         ));
         // Revision 6 is announced after 5 was taken in: it reads neither 4 nor 5.
-        barrier.announced(session(1), &[revision(6)]);
+        barrier.announced(session(1), revision(0), &[revision(6)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3130,7 +3196,7 @@ mod tests {
     fn a_result_says_a_carried_report_that_said_nothing_is_not_read_when_it_goes() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(session(1), binding, revision(4), None));
         assert!(barrier.acknowledge_announced(
             session(1),
@@ -3166,7 +3232,7 @@ mod tests {
     fn an_ended_worker_is_kept_for_the_result_that_carries_its_names() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3190,7 +3256,7 @@ mod tests {
         // One that never said anything of a carried revision is kept for the same reason.
         let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
         let binding = barrier.bind(session(2));
-        barrier.announced(session(2), &told(4, 5));
+        barrier.announced(session(2), revision(0), &told(4, 5));
         assert!(barrier.acknowledge_announced(
             session(2),
             binding,
@@ -3216,7 +3282,7 @@ mod tests {
         // are the asks for 4 and 5 answered.
         let barrier = barrier();
         let first = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         let second = barrier.bind(session(1));
         assert!(!barrier.acknowledge(
             session(1),
@@ -3224,14 +3290,14 @@ mod tests {
             revision(4),
             evidence(vec![action(10)], Vec::new()),
         ));
-        barrier.announced(session(1), &[revision(6)]);
+        barrier.announced(session(1), revision(0), &[revision(6)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             second,
             revision(6),
             evidence(Vec::new(), Vec::new()),
         ));
-        barrier.announced(session(1), &[revision(7)]);
+        barrier.announced(session(1), revision(0), &[revision(7)]);
         assert!(barrier.acknowledge(
             session(1),
             second,
@@ -3250,8 +3316,8 @@ mod tests {
         // A result overtaken by a later one, announced again after, whose reports come last.
         let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
-        barrier.announced(session(1), &told(6, 7));
+        barrier.announced(session(1), revision(0), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(6, 7));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3264,7 +3330,7 @@ mod tests {
             revision(7),
             evidence(Vec::new(), Vec::new()),
         ));
-        barrier.announced(session(1), &[revision(8)]);
+        barrier.announced(session(1), revision(0), &[revision(8)]);
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3290,7 +3356,7 @@ mod tests {
     {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3305,10 +3371,10 @@ mod tests {
         ));
         let last = u64::try_from(MAX_TOLD_REVISIONS).expect("fits") + 100;
         for number in 6..=last {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
         // An older announcement arrives again, after all of them.
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         let report = barrier.report(revision(5), [session(1)]);
         assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
         assert!(
@@ -3355,7 +3421,7 @@ mod tests {
         let binding = barrier.bind(session(1));
         // Revisions 6 to 4101 are followed, all of them, and each result reads what is before it.
         for number in 6..=(5 + followed) {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
         // Ten reports: those of revisions 7 and 8 go, and their associations with them.
         for number in 7..=16 {
@@ -3367,8 +3433,8 @@ mod tests {
             ));
         }
         // Two more are announced, and the daemon stops following revisions 6 and 7.
-        barrier.announced(session(1), &[revision(6 + followed)]);
-        barrier.announced(session(1), &[revision(7 + followed)]);
+        barrier.announced(session(1), revision(0), &[revision(6 + followed)]);
+        barrier.announced(session(1), revision(0), &[revision(7 + followed)]);
         // Revision 9 was recorded when it could read both of them.
         let report = barrier.report(revision(9), [session(1)]);
         assert!(
@@ -3378,7 +3444,7 @@ mod tests {
         );
         // Revision 7 is announced again and has no association to add to: revision 6 is before it,
         // and is not followed any more.
-        barrier.announced(session(1), &[revision(7)]);
+        barrier.announced(session(1), revision(0), &[revision(7)]);
         let report = barrier.report(revision(7), [session(1)]);
         assert!(
             report.workers[0].detail.contains(
@@ -3395,7 +3461,7 @@ mod tests {
             revision(7 + followed),
             evidence(Vec::new(), Vec::new()),
         ));
-        barrier.announced(session(1), &[revision(8 + followed)]);
+        barrier.announced(session(1), revision(0), &[revision(8 + followed)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3420,7 +3486,7 @@ mod tests {
         let binding = barrier.bind(session(1));
         // Revision 8 is left out. The daemon stops following revision 6.
         for number in (6..=(7 + followed)).filter(|number| *number != 8) {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
         // An acknowledged announcement takes revision 6 in, and then the daemon stops following
         // revision 7.
@@ -3430,7 +3496,7 @@ mod tests {
             revision(6),
             evidence(Vec::new(), Vec::new()),
         ));
-        barrier.announced(session(1), &[revision(8 + followed)]);
+        barrier.announced(session(1), revision(0), &[revision(8 + followed)]);
         // Room for one more association.
         for number in 9..=17 {
             assert!(barrier.acknowledge(
@@ -3441,7 +3507,7 @@ mod tests {
             ));
         }
         // Revision 8, announced now, was announced after revision 7, which no result took in.
-        barrier.announced(session(1), &[revision(8)]);
+        barrier.announced(session(1), revision(0), &[revision(8)]);
         let report = barrier.report(revision(8), [session(1)]);
         assert!(
             report.workers[0].detail.contains(
@@ -3460,7 +3526,7 @@ mod tests {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         // Revision 6 reads revision 5, which an acknowledged announcement then takes in.
-        barrier.announced(session(1), &told(5, 6));
+        barrier.announced(session(1), revision(0), &told(5, 6));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3470,7 +3536,7 @@ mod tests {
         // One more association than the daemon holds for results with no report: revision 6, the
         // oldest of them, is forgotten.
         for number in 7..=(5 + followed) {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
         // Room for one more: the report of revision 5 goes with its association.
         for number in 7..=14 {
@@ -3481,7 +3547,7 @@ mod tests {
                 evidence(Vec::new(), Vec::new()),
             ));
         }
-        barrier.announced(session(1), &[revision(6)]);
+        barrier.announced(session(1), revision(0), &[revision(6)]);
         let report = barrier.report(revision(6), [session(1)]);
         assert!(
             report.workers[0].detail.contains(
@@ -3500,7 +3566,7 @@ mod tests {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         for number in 4..=76 {
-            barrier.announced(session(1), &[revision(number), revision(100)]);
+            barrier.announced(session(1), revision(0), &[revision(number), revision(100)]);
             let named = if number == 4 {
                 vec![action(10)]
             } else {
@@ -3516,7 +3582,7 @@ mod tests {
         let once = barrier.report(revision(100), [session(1)]).workers[0].clone();
         assert_eq!(once.omitted_actions.get(), 1, "{once:?}");
         // The announcement is recorded again, and the worker answers for revision 4 again.
-        barrier.announced(session(1), &[revision(100)]);
+        barrier.announced(session(1), revision(0), &[revision(100)]);
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3534,8 +3600,8 @@ mod tests {
             revision(77),
             evidence(Vec::new(), Vec::new()),
         ));
-        barrier.announced(session(1), &[revision(3)]);
-        barrier.announced(session(1), &[revision(100)]);
+        barrier.announced(session(1), revision(0), &[revision(3)]);
+        barrier.announced(session(1), revision(0), &[revision(100)]);
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3560,7 +3626,7 @@ mod tests {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         for number in 4..=76 {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
         for number in 5..=76 {
             assert!(barrier.acknowledge(
@@ -3589,10 +3655,10 @@ mod tests {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         for number in 4..=12 {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
         let before = barrier.report(revision(12), [session(1)]);
-        barrier.announced(session(1), &[revision(12)]);
+        barrier.announced(session(1), revision(0), &[revision(12)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3603,7 +3669,7 @@ mod tests {
             .detail
             .clone();
         assert!(once.contains(unread), "{once:?} ({before:?})");
-        barrier.announced(session(1), &[revision(12)]);
+        barrier.announced(session(1), revision(0), &[revision(12)]);
         let again = barrier.report(revision(12), [session(1)]).workers[0]
             .detail
             .clone();
@@ -3614,10 +3680,10 @@ mod tests {
         let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
         let binding = barrier.bind(session(1));
         for number in 5..=71 {
-            barrier.announced(session(1), &[revision(number)]);
+            barrier.announced(session(1), revision(0), &[revision(number)]);
         }
-        barrier.announced(session(1), &[revision(4)]);
-        barrier.announced(session(1), &[revision(71)]);
+        barrier.announced(session(1), revision(0), &[revision(4)]);
+        barrier.announced(session(1), revision(0), &[revision(71)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3630,7 +3696,7 @@ mod tests {
             "{:?}",
             report.workers[0].detail
         );
-        barrier.announced(session(1), &[revision(72)]);
+        barrier.announced(session(1), revision(0), &[revision(72)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3651,7 +3717,7 @@ mod tests {
     fn a_result_reads_the_revisions_it_has_an_answer_for_before_the_newest_it_has_not() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 20));
+        barrier.announced(session(1), revision(0), &told(4, 20));
         // Revision 5, one of the oldest, was answered; the fifteen after it were not.
         assert!(barrier.acknowledge(
             session(1),
@@ -3681,7 +3747,7 @@ mod tests {
     fn a_report_that_went_is_charged_once_though_its_announcement_is_recorded_again() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 11));
+        barrier.announced(session(1), revision(0), &told(4, 11));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3696,14 +3762,14 @@ mod tests {
                 evidence(Vec::new(), Vec::new()),
             ));
         }
-        barrier.announced(session(1), &told(11, 12));
+        barrier.announced(session(1), revision(0), &told(11, 12));
         assert!(barrier.acknowledge(
             session(1),
             binding,
             revision(11),
             evidence(Vec::new(), Vec::new()),
         ));
-        barrier.announced(session(1), &told(12, 13));
+        barrier.announced(session(1), revision(0), &told(12, 13));
         // The ninth report lets revision 4's go, and result 13 is charged its name.
         assert!(barrier.acknowledge(
             session(1),
@@ -3714,7 +3780,7 @@ mod tests {
         let once = barrier.report(revision(13), [session(1)]).workers[0].clone();
         assert_eq!(once.omitted_actions.get(), 1, "{once:?}");
         // A retry records the announcement of 13 again, and the ask for 4 is answered again.
-        barrier.announced(session(1), &told(12, 13));
+        barrier.announced(session(1), revision(0), &told(12, 13));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3734,8 +3800,8 @@ mod tests {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         // 4 was announced and not answered; 5 and 6 are told in one announcement.
-        barrier.announced(session(1), &[revision(4)]);
-        barrier.announced(session(1), &told(5, 6));
+        barrier.announced(session(1), revision(0), &[revision(4)]);
+        barrier.announced(session(1), revision(0), &told(5, 6));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3772,7 +3838,7 @@ mod tests {
     fn an_announcement_recorded_again_leaves_what_was_stored_for_it() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 6));
+        barrier.announced(session(1), revision(0), &told(4, 6));
         assert!(barrier.acknowledge(
             session(1),
             binding,
@@ -3780,7 +3846,7 @@ mod tests {
             evidence(vec![action(10)], Vec::new()),
         ));
         // Another announcement tells 5 alone, and its result takes 5 in.
-        barrier.announced(session(1), &[revision(5)]);
+        barrier.announced(session(1), revision(0), &[revision(5)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3788,7 +3854,7 @@ mod tests {
             evidence(Vec::new(), Vec::new()),
         ));
         // The first announcement is recorded again, by a retry that read the record before.
-        barrier.announced(session(1), &told(4, 6));
+        barrier.announced(session(1), revision(0), &told(4, 6));
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3805,7 +3871,7 @@ mod tests {
     fn a_result_that_has_no_report_of_its_own_reads_what_its_announcement_named() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
-        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), revision(0), &told(4, 5));
         assert!(barrier.acknowledge(
             session(1),
             binding,

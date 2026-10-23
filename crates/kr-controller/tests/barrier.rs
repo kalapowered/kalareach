@@ -4700,6 +4700,48 @@ async fn a_result_says_the_worker_cannot_say_for_a_revision_a_joined_fence_took(
     );
 }
 
+/// KR-REQ-09.13: a worker made after revisions advanced is asked about the revision in force and no
+/// other, and its result says nothing of revisions it was never told.
+///
+/// A daemon that starts on a registry holds nothing of what an earlier run told its workers, and
+/// reads the revisions between what a worker acknowledged and its first announcement. A worker
+/// this run made has no such revisions: everything announced to it is in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_made_after_revisions_advanced_is_not_asked_about_revisions_it_was_never_told() {
+    let daemon = hosted_daemon().await;
+    for _ in 0..3 {
+        daemon
+            .controller
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded");
+    }
+    let hosted = add_worker(&daemon, false).await;
+    let barrier = announced_until(
+        &daemon.controller,
+        daemon
+            .controller
+            .announce_authority_revision()
+            .await
+            .expect("the revision is announced"),
+        |barrier| named_in_full(barrier, &hosted),
+    )
+    .await;
+    let asked: std::collections::BTreeSet<u64> = daemon
+        .controller
+        .announcements_sent_for_tests()
+        .iter()
+        .filter(|sent| sent.session_id == hosted.session_id)
+        .map(|sent| sent.revision)
+        .collect();
+    assert_eq!(
+        asked,
+        std::collections::BTreeSet::from([barrier.authority_revision.get()]),
+        "the worker is told the revision in force and no earlier one"
+    );
+    assert!(worker_report(&barrier, hosted.session_id).detail.is_empty());
+}
+
 /// Writes one mutation to this daemon and returns what it answered.
 async fn submit(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
     client
