@@ -63,34 +63,28 @@ impl Authority {
         }
     }
 
-    /// The product's room connector, trusting this authority alone.
-    pub fn connector(&self) -> RoomConnector {
+    /// A TLS client configuration trusting this authority alone, for a device that dials the room
+    /// itself rather than through the product's connector.
+    pub fn client_config(&self) -> ClientConfig {
         let mut roots = RootCertStore::empty();
         roots.add(self.der.clone()).expect("a root");
-        RoomConnector::with_tls(
-            ClientConfig::builder_with_provider(Arc::new(
-                tokio_rustls::rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
+        ClientConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+    }
+
+    /// The product's room connector, trusting this authority alone.
+    pub fn connector(&self) -> RoomConnector {
+        RoomConnector::with_tls(self.client_config())
     }
 
     /// The product's control-socket connector, trusting this authority alone.
     pub fn control_connector(&self) -> ControlConnector {
-        let mut roots = RootCertStore::empty();
-        roots.add(self.der.clone()).expect("a root");
-        ControlConnector::with_tls(
-            ClientConfig::builder_with_provider(Arc::new(
-                tokio_rustls::rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
+        ControlConnector::with_tls(self.client_config())
     }
 
     /// A TLS acceptor presenting a certificate this authority issued for the loopback address.

@@ -4792,6 +4792,7 @@ dependencies = [
  "kr-worker",
  "libproc",
  "portable-pty",
+ "rcgen",
  "rustix",
  "rustls-platform-verifier",
  "serde",

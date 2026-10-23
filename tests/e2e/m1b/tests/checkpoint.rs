@@ -237,7 +237,7 @@ fn wrong_code(code: &str) -> String {
 /// by the owner), KR-REQ-10.52 (sensitive confirmation by a separately paired owner device).
 #[test]
 fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
-    use kr_e2e_m1b::device::{Device, PairingStopped};
+    use kr_e2e_m1b::device::{Device, PairingStopped, Patience};
     use kr_protocol::confirmation::ConfirmationDisplay;
     use kr_protocol::invitation::InviteModeKind;
 
@@ -272,9 +272,17 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
     );
 
     // A wrong code for the same locator reaches the host, fails the confirmation, and costs the
-    // invitation one of its five.
+    // invitation one of its five. The host attaches to the locator's room in a task of its own, so
+    // a code entered as soon as it is issued can reach the room first: the room then closes the
+    // attempt's first frame with `HostGone`, nothing of the attempt has reached a host, and the
+    // code is entered again (every such answer is printed). When the host never attaches, what the
+    // invitation and the host's daemon say is in the failure.
     let refused = runtime
-        .block_on(first.enter_code(&origin, &wrong_code(&code)))
+        .block_on(first.enter_code_once_the_host_is_attached(
+            &origin,
+            &wrong_code(&code),
+            &Patience::default(),
+        ))
         .expect_err("a wrong code does not pair");
     assert!(
         matches!(
@@ -284,7 +292,10 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
                 ..
             }
         ),
-        "a wrong code is refused with four confirmations left: {refused}"
+        "a wrong code is refused with four confirmations left: {refused}; the invitation: {}; \
+         the host's daemon said: {}",
+        host.kr_json(&["pair", "status", &invitation_id]),
+        host.daemon_said()
     );
     let status = host.kr_json(&["pair", "status", &invitation_id]);
     assert_eq!(
@@ -294,7 +305,7 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
 
     // The right code, through the same room.
     let mut exchange = runtime
-        .block_on(first.enter_code(&origin, &code))
+        .block_on(first.enter_code_once_the_host_is_attached(&origin, &code, &Patience::default()))
         .unwrap_or_else(|stopped| panic!("the right code: {stopped}"));
     let candidate = runtime
         .block_on(first.finish(&mut exchange))
