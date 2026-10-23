@@ -71,23 +71,19 @@ pub(super) struct Admitted {
 
 impl Admitted {
     /// Returns the admitted package the software development kit's rule selects for a program at
-    /// `path`, with no selection made: an exact rule wins over an inferred one, and a conflict
-    /// selects nothing.
+    /// `path`, with no selection made: an exact rule wins over an inferred one, a rule that names
+    /// the installation location over one that names only the executable, and a conflict selects
+    /// nothing.
     fn selected_for(&self, path: &str) -> Option<Digest256> {
         let mut found: Vec<(Candidate, Digest256)> = Vec::new();
         for (digest, (_, read)) in &self.packages {
             let manifest = read.manifest();
+            let plugin_id = manifest.plugin_id();
             for rule in &manifest.match_rules {
-                if rule.executable.matches_path(path) {
-                    found.push((
-                        Candidate {
-                            plugin_id: manifest.plugin_id(),
-                            rule_id: rule.id.to_string(),
-                            confidence: rule.confidence,
-                            distribution_matched: false,
-                        },
-                        *digest,
-                    ));
+                // The worker establishes no distribution for a program it finds running, so a rule
+                // that names one recognises the program by its name and location as a guess.
+                if let Some(candidate) = rule.candidate(&plugin_id, path, None) {
+                    found.push((candidate, *digest));
                 }
             }
         }
