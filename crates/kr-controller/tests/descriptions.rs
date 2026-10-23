@@ -3888,8 +3888,9 @@ async fn a_server_that_goes_silent_fails_the_fetch_at_the_bound_and_keeps_nothin
 
 /// KR-REQ-22.01: a cancellation that comes while the process is checking the last file wins over
 /// the check, even when the process answers that the file passed before it read the cancellation:
-/// no file is kept and no marker is written. The stub reads the check's cancellation only after it
-/// has answered, as a process that was already past the last block does.
+/// no file is kept and no marker is written. The stub holds its answer until the cancellation
+/// reaches it and then answers that the file passed, as a process that was already past the last
+/// block does, so nothing but the daemon's order decides which of the two wins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancellation_during_the_last_check_wins_over_a_check_that_passed() {
     let fixture = Fixture::start().await;
@@ -3898,8 +3899,7 @@ async fn a_cancellation_during_the_last_check_wins_over_a_check_that_passed() {
         catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
         held: false,
         script: Script {
-            verify_ignore_token_ms: 800,
-            verify_finishes_after_cancel: true,
+            verify_passes_once_cancelled: true,
             ..Script::default()
         },
         ..Setup::new()
