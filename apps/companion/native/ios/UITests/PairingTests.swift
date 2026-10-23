@@ -14,10 +14,17 @@
 //  writes a picture, the script says when the picture is in the library (`<picture>.added`), and
 //  the test says each phase it wants with `go-<phase>` and the host answers it with `done-<phase>`.
 //
-//  The paired phone is an owner device (10.52), and the last two cases are the host asking it to
+//  The paired phone is an owner device (10.52), and the next two cases are the host asking it to
 //  confirm: a request of the host's own, and a second device the host would add. The phone's
 //  ceremony is Face ID, which the script enrols on the simulator and matches when the test says
 //  the system's prompt is wanted (`faceid-wanted`) and until it says it is done (`faceid-done`).
+//
+//  The last cases use the paired host as a person does. The host is given the four kinds of thing
+//  the inbox tells apart and a question from a program whose name imitates the one the host
+//  verified (13.01, 11.61); the tabs, the session and the settings over it are walked (13.09); a
+//  draft is written and carried across the conversation and the terminal, and across the host
+//  being switched off and on again (13.03, 13.13, 13.01); and the host asks the phone to confirm a
+//  hand-over of a session to another device (18.15).
 //
 
 import XCTest
@@ -226,6 +233,84 @@ final class PairingTests: DeviceTestCase {
         touch("faceid-done")
     }
 
+    // MARK: Walking the paired host
+
+    /// The text a person writes as the draft, which the host's agent is later sent.
+    private let draft = "Check the release notes before tagging"
+
+    /// Opens a tab of the shell by its name.
+    private func openTab(_ name: String) {
+        let tab = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
+        XCTAssertTrue(tab.waitForExistence(timeout: 60), "no \(name) tab")
+        // The bar over the tab names it: a tap that lands while the shell settles is made again.
+        for _ in 1...3 {
+            tab.tap()
+            if waitUntil(10, { app.staticTexts.matching(NSPredicate(format: "label == %@", name)).firstMatch.exists }) { return }
+        }
+        XCTFail("the \(name) tab never opened")
+    }
+
+    private func waitUntil(_ seconds: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return condition()
+    }
+
+    /// Starts the application on its tab bar and opens `name`.
+    private func openShell(_ name: String) {
+        launch()
+        XCTAssertTrue(app.buttons["Hosts"].waitForExistence(timeout: 60), "the shell did not appear")
+        openTab(name)
+    }
+
+    /// Whether a row of the inbox begins with `kind` and holds `text`.
+    private func hasRow(_ kind: String, _ text: String) -> Bool {
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@ AND label CONTAINS %@", "\(kind). ", text)).firstMatch.exists
+    }
+
+    /// Presses the control named `name` whatever kind of element the page makes it: a control that
+    /// opens a dialog is not always a button to the accessibility tree.
+    private func pressControl(_ name: String, timeout: TimeInterval = 30) {
+        let control = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", name)).firstMatch
+        XCTAssertTrue(control.waitForExistence(timeout: timeout), "no \(name) control on the page")
+        control.tap()
+    }
+
+    /// Asks the host to be switched off or on, and waits until it says it has been. The host takes
+    /// the request away when it is done, so a later request is a new one.
+    private func askHost(_ phase: String, timeout: TimeInterval) {
+        try? FileManager.default.removeItem(atPath: path("done-\(phase)"))
+        touch("go-\(phase)")
+        waitFor("done-\(phase)", timeout: timeout)
+    }
+
+    /// Opens the first session of the host from the Sessions tab, as a person does.
+    private func openTheSession() {
+        openTab("Sessions")
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Session 1'")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 90), "the host's session is not listed")
+        row.tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: 60), "the session shows no composer")
+    }
+
+    /// The field a person writes a message in.
+    private var composer: XCUIElement {
+        let named = app.textViews.matching(NSPredicate(format: "label == 'Message this session' OR placeholderValue == 'Message this session'")).firstMatch
+        return named.exists ? named : app.textViews.firstMatch
+    }
+
+    private func composerText() -> String { (composer.value as? String) ?? "" }
+
+    private func switchView(_ name: String) {
+        let tab = app.buttons.matching(NSPredicate(format: "label == %@", name)).firstMatch
+        XCTAssertTrue(tab.waitForExistence(timeout: 30), "no \(name) view")
+        tab.tap()
+        eventually("the \(name) view to be chosen") { app.buttons.matching(NSPredicate(format: "label == %@", name)).firstMatch.isSelected }
+    }
+
     // MARK: The cases
 
     /// A direct invitation whose secret has one bit changed opens nothing, and the page says so.
@@ -386,5 +471,139 @@ final class PairingTests: DeviceTestCase {
         waitFor("done-paste")
         XCTAssertEqual(read("paste-result.txt"), "candidate_locked=0", "the host locked a candidate on a changed secret")
         say("PAIRING a pasted invitation was held through the system's paste question")
+    }
+
+    // MARK: The paired host, used
+
+    /// The inbox of a phone paired with a host tells an approval, a failed command, finished work
+    /// and a question apart, by a word and by the sentence under it; and the question's sheet names
+    /// the program the host verified as the asker and the name it gave itself as its own, apart
+    /// from it and said not to be verified, however the name imitates the identity (13.01, 11.61).
+    func test7TheInboxTellsFourKindsApartAndAQuestionNamesWhoAsked() {
+        openAttention()
+        touch("go-seed")
+        waitFor("seed-result.txt", timeout: 120)
+        // A paired device is given the host's own words for each item and none of a session's text.
+        for (kind, text) in [
+            ("Waiting for you", "An approval is waiting for you"),
+            ("Did not finish", "A command ended with a failure"),
+            ("Ready to review", "Finished work is ready to review"),
+            ("Waiting for you", "A question is waiting for an answer")
+        ] {
+            eventually("a \"\(kind)\" row holding \"\(text)\"", timeout: 120) { hasRow(kind, text) }
+        }
+        screenshot("attention-four-kinds")
+        say("PAIRING the inbox tells an approval, a failure, finished work and a question apart")
+
+        let question = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Waiting for you. ' AND label CONTAINS 'A question is waiting for an answer'")).firstMatch
+        question.tap()
+        waitToShow("Asked by", timeout: 60)
+        // The page draws the identity and the name as parts of one line, and the accessibility tree
+        // lists each part: the identity is the program the host verified, and the name it gave itself
+        // is a text of its own after it, said not to be verified.
+        let identity = app.staticTexts.matching(NSPredicate(format: "label == 'claude'")).firstMatch
+        let name = app.staticTexts.matching(NSPredicate(format: "label == 'claude (verified by KalaReach)'")).firstMatch
+        XCTAssertTrue(identity.waitForExistence(timeout: 30), "the program the host verified is not named as the asker")
+        XCTAssertTrue(name.exists, "the name the program gave itself is not shown")
+        XCTAssertTrue(shows("process"), "the asker's process is not shown")
+        XCTAssertTrue(shows("calls itself") && shows("not verified"), "the program's own name is not said to be unverified")
+        let after = name.frame.minY > identity.frame.minY || (name.frame.minY == identity.frame.minY && name.frame.minX > identity.frame.minX)
+        XCTAssertTrue(after, "the program's own name is not after the identity")
+        XCTAssertTrue(shows("/usr/local/bin/claude"), "the verified path is not shown")
+        screenshot("question-identity")
+        say("PAIRING the question names the verified program and shows the name it gave itself as unverified")
+        press("Close item")
+
+        // The host is switched off: the inbox says so in so many words, keeps what it last read
+        // from the host beneath, said to be from then, and shows no failure.
+        askHost("down", timeout: 120)
+        eventually("the inbox to say the host is out of contact", timeout: 90) { shows("is out of contact") }
+        XCTAssertTrue(shows("No contact for") || shows("No contact."), "the inbox does not say how long")
+        XCTAssertTrue(shows("may still be running"), "the inbox does not say the sessions may still be running")
+        XCTAssertTrue(shows("What is listed here from it was read"), "the rows it last read are not said to be from that read")
+        XCTAssertTrue(hasRow("Waiting for you", "An approval is waiting for you"), "the rows last read were dropped")
+        XCTAssertFalse(shows("The inbox could not be read"), "the inbox says it failed")
+        screenshot("inbox-host-out-of-contact")
+        say("PAIRING the inbox shows the host as out of contact above what it last read from it")
+        askHost("up", timeout: 180)
+        eventually("the inbox to be in contact with the host again", timeout: 180) { !shows("is out of contact") }
+    }
+
+    /// The tabs of the shell list the host in use and its session, and the settings open over a live
+    /// session and close again to the same session (13.09).
+    func test8TheTabsListTheHostAndTheSessionAndTheSettingsOpenOverIt() {
+        openShell("Hosts")
+        waitToShow("In use", timeout: 60)
+        screenshot("tab-hosts")
+        openTheSession()
+        screenshot("tab-sessions-open-session")
+        pressControl("Settings")
+        waitToShow("The session behind this keeps running.")
+        screenshot("settings-over-the-session")
+        pressControl("Close settings")
+        eventually("the settings to close") { !shows("The session behind this keeps running.") }
+        XCTAssertTrue(composer.exists, "the session is not where it was once the settings closed")
+        screenshot("settings-closed")
+        press("Back to sessions")
+        openTab("Attention")
+        say("PAIRING the tabs list the host and its session, and the settings open over a session and close to it")
+    }
+
+    /// A draft written in a session keeps its text when the view is switched to the terminal and
+    /// back, and when the host stops answering: the phone says in the session that it is out of
+    /// contact and keeps the draft. The host is switched on again at the same address, the draft is
+    /// bound to the conversation it was written for, and it is sent there (13.03, 13.13).
+    func test9ADraftIsKeptAcrossViewsAndAHostThatIsOutOfContact() {
+        openShell("Sessions")
+        openTheSession()
+        composer.tap()
+        composer.typeText(draft)
+        eventually("the composer to hold the draft") { composerText() == draft }
+        switchView("Terminal")
+        eventually("the draft to be in the terminal view's composer") { composerText() == draft }
+        screenshot("draft-terminal-view")
+        switchView("Conversation")
+        eventually("the draft to be in the conversation view's composer") { composerText() == draft }
+        screenshot("draft-conversation-view")
+        say("PAIRING the draft is the same text in both views")
+
+        let lost = "Not in contact with this host. The draft is kept here."
+        askHost("down", timeout: 120)
+        waitToShow(lost, timeout: 90)
+        XCTAssertEqual(composerText(), draft, "the draft was changed when the host stopped answering")
+        XCTAssertFalse(app.buttons["Send"].firstMatch.isEnabled, "a draft that lost its host can be sent")
+        screenshot("draft-host-out-of-contact")
+        // The person leaves the session, and the host comes back while they are elsewhere.
+        press("Back to sessions")
+        askHost("up", timeout: 180)
+        openTheSession()
+        eventually("the draft to be bound again", timeout: 180) { !shows(lost) && app.buttons["Send"].firstMatch.isEnabled }
+        XCTAssertEqual(composerText(), draft, "the draft was changed while the host was out of contact")
+        screenshot("draft-host-back")
+        press("Send")
+        touch("go-sent")
+        waitFor("sent-result.txt", timeout: 90)
+        XCTAssertEqual(read("sent-result.txt"), "prompts=1 text=\(draft)", "the agent was not sent the draft once")
+        say("PAIRING the draft was kept across the views and the host being out of contact, and sent once")
+    }
+
+    /// The host asks the owner to confirm the hand-over of a session to another device. The phone
+    /// shows what the hand-over is, in the sentence and beside it, and Face ID confirms it; the
+    /// host then sends exactly that hand-over (18.15).
+    func testAThePhoneConfirmsTheHandOverOfASession() {
+        openAttention()
+        touch("go-handover")
+        waitFor("handover-asked.txt", timeout: 120)
+        waitToShow("Hand control of a session to another device", timeout: 120)
+        eventually("the sentence to name the role the receiving device is given") { shows("who may act as the session\u{2019}s owner for") || shows("who may act as the session's owner for") }
+        eventually("the sheet to list what the hand-over allows") { shows("Allows") && shows("share sessions with others") }
+        screenshot("handover-sheet")
+        say("PAIRING the hand-over is shown with the role and each kind of action it allows")
+        pressConfirm()
+        continueToFaceID()
+        waitFor("handover-result.txt", timeout: 120)
+        XCTAssertTrue(read("handover-result.txt").hasSuffix("receiver_holds=1 giver_holds=0"), "the hand-over did not move the session: \(read("handover-result.txt"))")
+        screenshot("handover-confirmed")
+        say("PAIRING the hand-over is confirmed with Face ID and the session changes hands")
     }
 }
