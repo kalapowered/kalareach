@@ -10,7 +10,7 @@
 //  is recorded, and is handed to Firebase once the person has agreed to notifications: Firebase
 //  makes an installation and a registration token of its own from it, and that is not for a person
 //  who has not agreed. The registration token Firebase gives is kept where the platform plugin reads
-//  it, and a change of it is noted.
+//  it, and the application compares it with what each host registered with.
 //
 
 import FirebaseCore

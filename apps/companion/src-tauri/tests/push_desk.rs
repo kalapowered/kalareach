@@ -985,18 +985,12 @@ async fn a_record_with_no_digest_is_registered_again_at_the_next_look() {
     phone.desk.enable(&reference).expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
-    // The record as an earlier build wrote it.
+    // The record as an earlier build wrote it: without the digest.
     let file = phone._phone.data.path().join("push").join("push.json");
     let mut record: Value =
         serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("a record");
     for kept in record["hosts"].as_object_mut().expect("hosts").values_mut() {
-        assert!(
-            kept.as_object_mut()
-                .expect("a host")
-                .remove("registered")
-                .is_some(),
-            "the record keeps the digest of the token it proposed"
-        );
+        kept.as_object_mut().expect("a host").remove("registered");
     }
     std::fs::write(&file, serde_json::to_vec(&record).expect("a record")).expect("written");
 
@@ -1009,10 +1003,23 @@ async fn a_record_with_no_digest_is_registered_again_at_the_next_look() {
     );
     assert_eq!(restarted.desk.view().hosts[0].state, PushState::On);
     look(&restarted.desk).await;
+    eventually("the host was registered again", || {
+        proposed(&restarted.gateway) == [FIRST_TOKEN]
+    })
+    .await;
     states_until(&restarted.desk, |states| states == [PushState::On]).await;
-    assert_eq!(proposed(&restarted.gateway), [FIRST_TOKEN]);
-    let kept = std::fs::read_to_string(&file).expect("the record");
-    assert!(kept.contains("\"registered\""), "{kept}");
+
+    // The digest is kept now: the next start finds nothing to register.
+    let again = open_over(
+        phone._phone.data.path(),
+        &phone.device,
+        &Receiver::new(FIRST_TOKEN),
+        &phone.registered,
+        Arc::new(AtomicBool::new(false)),
+    );
+    look(&again.desk).await;
+    assert_eq!(again.desk.view().hosts[0].state, PushState::On);
+    assert!(proposed(&again.gateway).is_empty());
 }
 
 /// A host that is forgotten while its run is under way is not made again by that run, and a host
