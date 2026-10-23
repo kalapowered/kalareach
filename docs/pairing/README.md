@@ -244,7 +244,9 @@ how the confirmation was obtained.
 A session, plugin or contact-tool channel is refused outright. The interactive controlling terminal
 is the initial local bootstrap exception: while a host has no owner it confirms the first owner and
 the host's clock, and nothing more. Afterwards a host with no user-presence-capable signer and no
-separately paired owner refuses rather than downgrading.
+separately paired owner refuses rather than downgrading. One narrow exception remains: when the
+host is exclusively organisation-managed, has an owner and has no owner device left that could
+confirm, the same terminal confirms the end of exclusive management and nothing else.
 
 The challenge is consumed exactly once, which is part of the host's acceptance record. Verification
 comes first and consumption second, so rubbish cannot burn an owner's outstanding challenge and a
@@ -295,7 +297,7 @@ channel, a proof of another capability set and a proof a grant already spent (se
 `a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else` in
 `crates/kr-controller/tests/network_catalogue.rs`). For `catalogue.add` and `plugin.install` the
 proof can be passed inline with the request too, and an installation needs it only when it goes
-beyond what is already permitted, installs a native bridge or declares a command integration. Terminals do not have the owner's key,
+beyond what is already permitted, installs a native bridge, declares a command integration or asks for `launch.probe`. Terminals do not have the owner's key,
 so they do not send a proof with the request. Instead the host spends the one answer an owner device
 recorded for exactly that request, and only for a challenge the host described itself (see
 `a_recorded_owner_answer_lets_catalogue_add_enrol_a_repository_once` in
