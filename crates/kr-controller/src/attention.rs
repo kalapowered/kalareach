@@ -5610,26 +5610,27 @@ pub(crate) mod tests {
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let (_link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut releasing = Vec::new();
+        let mut released = Vec::new();
         for _ in 0..3 {
             let module = Arc::clone(&module);
             let stop = Arc::clone(&stop);
-            let releases = Arc::clone(&releases);
+            let once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            released.push(Arc::clone(&once));
             releasing.push(tokio::spawn(async move {
                 while !stop.load(Ordering::SeqCst) {
                     let fences = module.release.read().await;
                     // One transport write's worth of holding it.
                     std::thread::sleep(Duration::from_millis(2));
                     drop(fences);
-                    releases.fetch_add(1, Ordering::SeqCst);
+                    once.store(true, Ordering::SeqCst);
                     tokio::task::yield_now().await;
                 }
             }));
         }
         // The statement is stated beside releases that are under way: every task has released once.
         tokio::time::timeout(WRITER_LIVENESS, async {
-            while releases.load(Ordering::SeqCst) < 3 {
+            while !released.iter().all(|once| once.load(Ordering::SeqCst)) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })

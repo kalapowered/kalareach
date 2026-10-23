@@ -3466,17 +3466,32 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
 
     let (arrived, release) = wired.service.stall_next_fence();
     // A regression leaves the fence holding what the keystrokes wait for. A thread of its own lets
-    // the fence go once the case has waited its liveness bound, so that the case fails naming the
-    // wait instead of waiting with it; it says so when it did, and the case asserts it did not.
+    // the fence go once the case has waited its liveness bound since the fence stopped, so that the
+    // case fails naming the wait instead of waiting with it; it says so when it did, and the case
+    // asserts it did not.
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let let_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watchdog = {
-        let (release, done, let_go) = (release.clone(), Arc::clone(&done), Arc::clone(&let_go));
+        let (release, done, stalled, let_go) = (
+            release.clone(),
+            Arc::clone(&done),
+            Arc::clone(&stalled),
+            Arc::clone(&let_go),
+        );
         std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            while started.elapsed() < LIVENESS_DEADLINE {
+            let mut stalled_at = None;
+            loop {
                 if done.load(Ordering::Acquire) {
                     return;
+                }
+                if stalled.load(Ordering::Acquire) {
+                    stalled_at.get_or_insert_with(std::time::Instant::now);
+                }
+                if stalled_at
+                    .is_some_and(|at: std::time::Instant| at.elapsed() >= LIVENESS_DEADLINE)
+                {
+                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -3489,6 +3504,7 @@ async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_i
         within("the fence to reach its stop", arrived)
             .await
             .expect("the fence stopped");
+        stalled.store(true, Ordering::Release);
         // The session is held by the fence and the revision is not installed. The phone's
         // keystrokes are validated at revision 2, which is the one in force.
         let mut accepted = 0_u64;
