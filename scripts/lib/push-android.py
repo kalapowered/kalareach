@@ -161,15 +161,15 @@ def send(phone: Phone, blind: bool) -> None:
 
 
 def observe(phone: Phone) -> None:
-    """Waits for the page to say that a question the person had chosen an answer to, and had not
-    sent, was answered by someone else, and to offer nothing to send."""
+    """Waits for the page to say that a question the person had chosen Yes to, and had not sent,
+    was answered by someone else, and to offer nothing to send."""
     def said(nodes: list[dict]) -> bool:
         labels = [each["label"] for each in nodes]
         return (
             not any(label == "Send answer" for label in labels)
             and any(label.lower() == "no longer waiting" for label in labels)
             and any("answered by someone else" in label for label in labels)
-            and any(label.startswith("You had chosen") for label in labels)
+            and any(label.startswith("You had chosen Yes") for label in labels)
         )
 
     phone.wait_screen(said, "the page to say the question was answered by someone else", 60, nudging=True)
