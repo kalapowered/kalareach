@@ -16,7 +16,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.38 | `kr_req_11_38_what_the_lane_lost_comes_with_the_entry_and_is_older_than_it`, `kr_req_11_38_a_loss_goes_with_the_first_entry_newer_than_it` |
-//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it`, `kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on`, `kr_req_24_27_a_component_handed_private_content_while_it_registers_stays_marked_when_it_is_ready` |
+//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it`, `kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on`, `kr_req_24_27_a_component_handed_private_content_on_the_connection_it_registers_on_stays_marked`, `kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked` |
 
 use std::sync::Arc;
 
@@ -185,8 +185,8 @@ fn kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_af
     let lane = ObservationLane::new();
     let binding = BrokerBindingId::new(Uuid::from_bytes([7; 16]));
     // A view for the binding, as the link makes one when it registers the component.
-    let registering = lane.registering(binding);
-    lane.set_ready(binding, registering);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
     let held = |state: &[u8]| Held {
         package_digest: Digest256::from_bytes([1; 32]),
         generation: 1,
@@ -291,43 +291,46 @@ fn kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_pri
     );
 }
 
-/// KR-REQ-24.27: a component registered afresh holds nothing it was offered before, so a mark made
-/// before its registration began goes; a component handed something made in privacy mode after the
-/// registration began, by the pump, a decode or an action, stays marked when it becomes ready, since
-/// it may hold what it was handed and is asked for no state until it starts again.
+/// KR-REQ-24.27: a component registered on a connection holds only what it was handed on it. A mark
+/// of an earlier connection goes when the component is registered afresh; a mark made on the
+/// connection the component is registered on stays when it becomes ready, whenever in its
+/// registration it was made, and whatever handed it the content: the pump, a decode or an action.
 #[test]
-fn kr_req_24_27_a_component_handed_private_content_while_it_registers_stays_marked_when_it_is_ready()
- {
+fn kr_req_24_27_a_component_handed_private_content_on_the_connection_it_registers_on_stays_marked()
+{
     let lane = ObservationLane::new();
     let binding = BrokerBindingId::new(Uuid::from_bytes([11; 16]));
     let marked = |lane: &ObservationLane| lane.view(binding).map(|view| view.private_content);
 
     // A first registration, and a component handed something made in privacy mode.
-    let registering = lane.registering(binding);
-    lane.set_ready(binding, registering);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
     lane.expose(binding, true);
     assert_eq!(marked(&lane), Some(true));
 
-    // The runtime is replaced: the registration that follows holds nothing it was offered before.
+    // The runtime is replaced: the registration on the new connection holds nothing its
+    // predecessor was handed.
     lane.all_not_ready();
-    let registering = lane.registering(binding);
-    lane.set_ready(binding, registering);
+    lane.began_connection();
+    lane.set_ready(binding, lane.connection());
     assert_eq!(
         marked(&lane),
         Some(false),
         "a component registered afresh was still marked for what its predecessor was handed"
     );
 
-    // Handed something made in privacy mode after the registration began and before it was ready:
-    // the mark stays.
+    // An action accepted in privacy mode is handed over on the new connection before the component
+    // is registered on it, which the link does after it has published the connection: the mark is
+    // made on a view that is there from an earlier registration, and then the registration begins.
     lane.all_not_ready();
-    let registering = lane.registering(binding);
+    lane.began_connection();
     lane.expose(binding, true);
-    lane.set_ready(binding, registering);
+    let connection = lane.connection();
+    lane.set_ready(binding, connection);
     assert_eq!(
         marked(&lane),
         Some(true),
-        "becoming ready cleared a mark made during the registration"
+        "becoming ready cleared a mark made on the connection before the registration began"
     );
     let held = Held {
         package_digest: Digest256::from_bytes([1; 32]),
@@ -339,5 +342,22 @@ fn kr_req_24_27_a_component_handed_private_content_while_it_registers_stays_mark
         lane.held_checkpoints().0,
         0,
         "the state of a component that was handed private content was held"
+    );
+}
+
+/// KR-REQ-24.27: the same hand-over, to a binding the lane has no view of yet: the first
+/// connection, and an action accepted in privacy mode that reaches its component's call before the
+/// component is registered. The mark is kept, so the component is asked for no state.
+#[test]
+fn kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked() {
+    let lane = ObservationLane::new();
+    let binding = BrokerBindingId::new(Uuid::from_bytes([12; 16]));
+    lane.began_connection();
+    lane.expose(binding, true);
+    lane.set_ready(binding, lane.connection());
+    assert_eq!(
+        lane.view(binding).map(|view| view.private_content),
+        Some(true),
+        "a component handed private content before it was registered was not marked"
     );
 }

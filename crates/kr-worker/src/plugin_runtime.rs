@@ -498,9 +498,9 @@ impl Link {
                 ComponentState::Pending,
                 Some(REGISTERING),
             );
-            // Before the component exists: whatever it is handed from here on marks it, and the mark
-            // outlasts its becoming ready.
-            let registering = self.lane.registering(want.binding_id);
+            // Before the component exists, on the connection it is registered on: whatever it is
+            // handed on this connection marks it, and the mark outlasts its becoming ready.
+            let connection = self.lane.connection();
             let registered = client
                 .register(
                     service_id(want.binding_id),
@@ -534,7 +534,7 @@ impl Link {
                         );
                     }
                     report(broker, want.binding_id, ComponentState::Registered, None);
-                    if let Err(error) = self.make_ready(broker, want, registering).await {
+                    if let Err(error) = self.make_ready(broker, want, connection).await {
                         let reason = error.to_string();
                         self.lose(broker, &reason);
                         for want in wants {
@@ -806,8 +806,8 @@ impl Link {
     /// component may hold some of the state it was given, and the snapshot rebuilds its view from
     /// whatever it holds.
     ///
-    /// `registering` is the mark count taken before the registration began: a component handed
-    /// something made in privacy mode since then stays marked as having been.
+    /// `connection` is the one the registration was made on: a component handed something made in
+    /// privacy mode on it stays marked as having been, and a mark of an earlier connection goes.
     ///
     /// # Errors
     ///
@@ -816,7 +816,7 @@ impl Link {
         &mut self,
         broker: &Weak<Broker>,
         want: &ComponentWant,
-        registering: u64,
+        connection: u64,
     ) -> Result<(), ServiceError> {
         let Some(client) = self.client.clone() else {
             return Ok(());
@@ -858,7 +858,7 @@ impl Link {
                 );
             }
         }
-        self.lane.set_ready(binding, registering);
+        self.lane.set_ready(binding, connection);
         Ok(())
     }
 

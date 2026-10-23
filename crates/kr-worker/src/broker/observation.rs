@@ -309,8 +309,8 @@ pub struct View {
     /// Whether the component was offered something made while privacy mode was on, so that its
     /// state may hold it. None is taken from it until it starts again.
     pub private_content: bool,
-    /// The count of marks made on the lane when the latest one was made.
-    pub marked_at: u64,
+    /// The connection to the plugin runtime that was the link's when the latest mark was made.
+    pub marked_connection: u64,
     /// The first entry the binding may be offered: those pushed before it was made ready are older
     /// than its view.
     pub ready_from: u64,
@@ -363,8 +363,9 @@ struct Inner {
     checkpoint_bytes: u64,
     /// Whether privacy mode has been on since the link made the connection it now holds.
     words_tainted: bool,
-    /// How many times a component has been marked as handed something made in privacy mode.
-    marks: u64,
+    /// How many connections to the plugin runtime the link has made: the one it holds now is this
+    /// one. A component is registered on a connection and holds only what it was handed on it.
+    connection: u64,
 }
 
 impl Inner {
@@ -678,32 +679,29 @@ impl ObservationLane {
 
     // -- the views ----------------------------------------------------------------------------
 
-    /// Says that a component is about to be registered afresh, and returns the mark count that the
-    /// registration is made ready under ([`Self::set_ready`]).
-    ///
-    /// The binding has a view from here on, so that a component handed something made in privacy
-    /// mode between its registration and its becoming ready is marked as having been.
-    pub fn registering(&self, binding: BrokerBindingId) -> u64 {
-        let mut inner = self.inner();
-        let marks = inner.marks;
-        inner.views.entry(binding).or_default();
-        marks
+    /// Returns the connection to the plugin runtime that the link holds now, which a registration
+    /// made on it is made ready under ([`Self::set_ready`]).
+    #[must_use]
+    pub fn connection(&self) -> u64 {
+        self.inner().connection
     }
 
-    /// Makes a binding ready to be offered anything, its component registered afresh under the mark
-    /// count [`Self::registering`] returned.
+    /// Makes a binding ready to be offered anything, its component registered afresh on
+    /// `connection`, which [`Self::connection`] returned before the registration began.
     ///
-    /// A component registered afresh holds nothing it was offered before, so a mark made before the
-    /// registration began goes. A mark made after it began stays, whatever made it: the component
-    /// may already hold what it was handed, and it is not asked for its state until it starts
-    /// again.
-    pub fn set_ready(&self, binding: BrokerBindingId, registering: u64) {
+    /// A component registered on a connection holds only what it was handed on it, and a component
+    /// handed something made in privacy mode is marked when it is handed it ([`Self::expose`]),
+    /// before the registration has ended or after. So a mark made on an earlier connection goes,
+    /// since the component it described went with that connection, and a mark made on this one
+    /// stays, whenever in the registration it was made: the component may already hold what it was
+    /// handed, and it is asked for no state until it starts again.
+    pub fn set_ready(&self, binding: BrokerBindingId, connection: u64) {
         let mut inner = self.inner();
         let next = inner.next_seq;
         let view = inner.views.entry(binding).or_default();
         view.ready = true;
         view.silent_until = None;
-        if view.marked_at <= registering {
+        if view.marked_connection < connection {
             view.private_content = false;
         }
         view.silence = None;
@@ -878,18 +876,21 @@ impl ObservationLane {
     /// ([`Self::words_withheld`]): the pump may have read what it needed before the link made that
     /// connection, so that privacy mode having stood on it is not the only way it can be handed
     /// something made in privacy mode.
+    ///
+    /// The mark belongs to the connection the link holds when it is made, and the caller takes that
+    /// connection before it calls, so it is the connection the content goes on. A binding that has
+    /// no view yet gets one, so that a hand-over that comes before the component is registered is
+    /// marked too; the link forgets the views of bindings it no longer wants.
     pub fn expose(&self, binding: BrokerBindingId, made_in_privacy: bool) {
         if !(made_in_privacy || self.private.load(Ordering::Acquire)) {
             return;
         }
         let mut inner = self.inner();
         inner.words_tainted = true;
-        inner.marks += 1;
-        let marks = inner.marks;
-        if let Some(view) = inner.views.get_mut(&binding) {
-            view.private_content = true;
-            view.marked_at = marks;
-        }
+        let connection = inner.connection;
+        let view = inner.views.entry(binding).or_default();
+        view.private_content = true;
+        view.marked_connection = connection;
     }
 
     // -- checkpoints --------------------------------------------------------------------------
@@ -1092,6 +1093,7 @@ impl ObservationLane {
     /// privacy mode is on now ([`Self::words_withheld`]).
     pub fn began_connection(&self) {
         let mut inner = self.inner();
+        inner.connection += 1;
         inner.words_tainted = self.private.load(Ordering::Acquire);
         #[cfg(feature = "testing")]
         self.documents_read
