@@ -1363,29 +1363,52 @@ fn approval_evidence(
         .cloned()
 }
 
-/// KR-REQ-12.18: a channel whose writer cannot deliver an answer, because the application stopped
-/// reading it, is closed however long its reading end stays open: its transports go, what it
-/// relayed is settled, the approval evidence is withdrawn with the identity that established it,
-/// and the instance can open its channel again.
-#[tokio::test]
-async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is_open() {
-    let broker = memory_broker();
-    register(&broker, 2);
+/// A channel on a connection that holds 64 bytes unread, which an answer does not fit in while
+/// nothing reads it, and the approval it relayed once the package's binding has interpreted it.
+async fn channel_nobody_reads(broker: &Arc<Broker>) -> (Package, Channel, PendingResource) {
+    register(broker, 2);
     let package = Package::laid_out();
-    package.bind(&broker, 2);
-    // A connection that holds 64 bytes unread: an answer does not fit while nothing reads it.
+    package.bind(broker, 2);
     let mut channel = Channel::open_with(
-        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        package.launch(broker, 2, Some(fixture::QUALIFIED_VERSION)),
         2,
         launched(2),
         64,
     );
     channel.relay("abcde").await;
     eventually("the approval is interpreted", || {
-        relayed(&broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
+        relayed(broker, 2, "abcde").is_some_and(|resource| resource.interpretation_verified)
     })
     .await;
-    let resource = relayed(&broker, 2, "abcde").expect("recorded");
+    let resource = relayed(broker, 2, "abcde").expect("recorded");
+    (package, channel, resource)
+}
+
+/// What the broker has counted of its adapters' failures, as adapter, outcome and count.
+fn adapter_failures(
+    broker: &Broker,
+) -> Vec<(
+    kr_protocol::metrics::Adapter,
+    kr_protocol::metrics::MetricOutcome,
+    u64,
+)> {
+    broker
+        .metrics()
+        .adapter_failure
+        .iter()
+        .map(|series| (series.adapter, series.outcome, series.count.get()))
+        .collect()
+}
+
+/// KR-REQ-12.18 and KR-REQ-26.43: a channel whose writer cannot deliver an answer, because the
+/// application stopped reading it, is closed however long its reading end stays open: its
+/// transports go, what it relayed is settled, the approval evidence is withdrawn with the identity
+/// that established it, and the instance can open its channel again. The answer that did not go is
+/// one failure of the application's adapter.
+#[tokio::test]
+async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is_open() {
+    let broker = memory_broker();
+    let (package, mut channel, resource) = channel_nobody_reads(&broker).await;
     let connection = resource.request.connection;
     let evidence = approval_evidence(&broker, 2).expect("the relayed approval is evidence");
     assert!(evidence.state.is_usable());
@@ -1426,6 +1449,15 @@ async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is
         answering.await.expect("the answer's task joins").is_err(),
         "an answer that could not be written is not an applied one"
     );
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![(
+            kr_protocol::metrics::Adapter::ClaudeCode,
+            kr_protocol::metrics::MetricOutcome::Unavailable,
+            1
+        )],
+        "and it is one failure of the application's adapter"
+    );
     assert!(
         broker.connection_dispatch(connection).is_none(),
         "nothing carries answers on the closed channel"
@@ -1454,6 +1486,52 @@ async fn kr_req_12_18_a_channel_whose_writer_fails_is_closed_while_its_reader_is
     .await;
     again.close().await;
     assert!(matches!(again.ended().await, ChannelEnd::Ended { .. }));
+}
+
+/// KR-REQ-26.43: an answer a channel accepted and could not write is counted when the writer says
+/// it did not go, though the caller that handed it over has stopped waiting.
+#[tokio::test]
+async fn kr_req_26_43_an_answer_a_channel_could_not_write_is_counted_though_its_caller_gave_up() {
+    let broker = memory_broker();
+    let (_package, mut channel, resource) = channel_nobody_reads(&broker).await;
+    let admitted = broker
+        .admit_approval(
+            &caller(),
+            &respond(2, &resource, "allow"),
+            TimestampMs::new(5),
+        )
+        .expect("the answer is admitted");
+    let marked = broker
+        .mark_approval(&admitted, TimestampMs::new(5))
+        .expect("the answer's marker is written");
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch
+        .submit(&request)
+        .expect("the channel's writer takes the answer");
+    // The caller stops waiting for what became of it, before the writer has said.
+    drop(pending);
+    drop(marked);
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![],
+        "the caller giving up counts nothing"
+    );
+    let ChannelEnd::Ended { why, .. } = channel.ended_while_open().await else {
+        panic!("the channel was served");
+    };
+    assert!(why.contains("writer"), "{why}");
+    eventually("the writer's failure is counted", || {
+        !adapter_failures(&broker).is_empty()
+    })
+    .await;
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![(
+            kr_protocol::metrics::Adapter::ClaudeCode,
+            kr_protocol::metrics::MetricOutcome::Unavailable,
+            1
+        )]
+    );
 }
 
 /// KR-REQ-12.18: only a binding of exactly the package whose table the channel reads gives what it
