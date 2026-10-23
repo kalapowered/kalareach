@@ -84,6 +84,35 @@ async function openSharing(page: Page): Promise<void> {
 }
 
 /**
+ * Issues the invitation the form describes, takes away the message that says it is ready, has the
+ * invited device accept it and reads again.
+ *
+ * The message is drawn in the sheet's own row and goes by itself a few seconds after the pointer
+ * leaves it. The sheet rests on the foot of the window and is as tall as what it holds, so when the
+ * row goes everything above it moves down by the row's height, and a press that begins before that
+ * and ends after it is released over something else and sends no click. The message is taken away
+ * from its own control, so that nothing in the sheet moves of itself while a case presses.
+ *
+ * The message is said before the invitation's row is listed, so once the row is drawn the message is
+ * either on the page or has already gone by itself. A script in the page finds the control and
+ * clicks it in one step, so a message that has gone is not waited for. That click moves neither the
+ * pointer nor the focus.
+ */
+async function inviteAndAccept(page: Page): Promise<void> {
+  await page.getByTestId('invite').click()
+  await expect(page.locator('[data-testid="access"] [data-state="pending"]')).toBeVisible()
+  await page.evaluate(() => {
+    document.querySelector<HTMLElement>('.toast [aria-label="Dismiss"]')?.click()
+  })
+  await expect(page.locator('.toast')).toHaveCount(0)
+  await page.evaluate(() => {
+    const [first] = window.krTestHost?.sharing.grants() ?? []
+    if (first !== undefined) window.krTestHost?.sharing.deviceAccepts(first.grant.grant_id)
+  })
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+}
+
+/**
  * Whether anything under `selector` is wider than the box it sits in, or than the scrolling pane
  * that holds it: a control past the pane's edge is cut off, not scrolled to.
  */
@@ -311,12 +340,7 @@ for (const size of SIZES) {
       await page.getByRole('radio', { name: /Owner/ }).check()
       await page.getByTestId('lasts').selectOption('15m')
       await page.getByRole('checkbox', { name: /I understand this lets Sam/ }).check()
-      await page.getByTestId('invite').click()
-      await page.evaluate(() => {
-        const [first] = window.krTestHost?.sharing.grants() ?? []
-        if (first !== undefined) window.krTestHost?.sharing.deviceAccepts(first.grant.grant_id)
-      })
-      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+      await inviteAndAccept(page)
       await page.getByTestId('hand-over-open').click()
       const sheet = page.getByTestId('hand-over')
       await sheet.getByRole('radio', { name: /Guest tablet/ }).check()
@@ -349,12 +373,7 @@ for (const size of SIZES) {
       await page.getByRole('radio', { name: /Owner/ }).check()
       await page.getByTestId('lasts').selectOption('15m')
       await page.getByRole('checkbox', { name: /I understand this lets Sam/ }).check()
-      await page.getByTestId('invite').click()
-      await page.evaluate(() => {
-        const [first] = window.krTestHost?.sharing.grants() ?? []
-        if (first !== undefined) window.krTestHost?.sharing.deviceAccepts(first.grant.grant_id)
-      })
-      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+      await inviteAndAccept(page)
       const opener = page.getByTestId('hand-over-open')
       await expect(opener).toBeVisible()
       await opener.click()
