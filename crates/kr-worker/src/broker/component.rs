@@ -283,6 +283,39 @@ pub(super) fn report_of(
     })
 }
 
+/// What is woken when the set of bindings a component is wanted for, or what a component is told,
+/// may have changed.
+///
+/// Two tasks look again: the link, which registers and feeds the components, and the task that
+/// asks components to decode, whose queue holds requests that wait for a binding which may since
+/// have gone. Every change wakes both, so a request cannot keep its place in the queue for a
+/// binding that has left, however the binding left.
+#[derive(Debug)]
+pub struct ComponentChanges {
+    link: tokio::sync::Notify,
+    decoding: Arc<crate::broker::decoding::DecodeQueue>,
+}
+
+impl ComponentChanges {
+    pub(super) fn new(decoding: Arc<crate::broker::decoding::DecodeQueue>) -> Self {
+        Self {
+            link: tokio::sync::Notify::new(),
+            decoding,
+        }
+    }
+
+    /// Wakes the link and the task that decodes. A wake is kept until it is waited for.
+    pub fn notify_one(&self) {
+        self.link.notify_one();
+        self.decoding.wake();
+    }
+
+    /// Waits for a change, as the link does.
+    pub async fn notified(&self) {
+        self.link.notified().await;
+    }
+}
+
 impl Broker {
     /// Returns what is woken whenever the set of bindings the plugin runtime is wanted for may
     /// have changed: a binding made, forgotten, disabled or due to end.
@@ -290,7 +323,7 @@ impl Broker {
     /// A wake that finds nothing changed costs a look at [`Self::component_wants`], and a change
     /// is never missed: the wake is kept until it is waited for.
     #[must_use]
-    pub fn component_changes(&self) -> Arc<tokio::sync::Notify> {
+    pub fn component_changes(&self) -> Arc<ComponentChanges> {
         Arc::clone(&self.state().component_changes)
     }
 

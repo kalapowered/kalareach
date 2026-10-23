@@ -151,13 +151,7 @@ pub async fn link(request: RuntimeRequest, broker: Weak<Broker>) {
         health_failures: 0,
     };
     loop {
-        let Some(wants) = broker.upgrade().map(|broker| {
-            // The set of bindings may have changed, and a request that waits to be decoded by a
-            // binding that has left holds a place in the queue until the task that takes them
-            // looks again.
-            broker.decode_queue().wake();
-            broker.component_wants()
-        }) else {
+        let Some(wants) = broker.upgrade().map(|broker| broker.component_wants()) else {
             return;
         };
         let delay = link.settle(&broker, wants).await;
@@ -691,7 +685,7 @@ impl Link {
     async fn wait(
         &mut self,
         broker: &Weak<Broker>,
-        changes: &tokio::sync::Notify,
+        changes: &crate::broker::component::ComponentChanges,
         delay: Option<Duration>,
     ) {
         // Held for the wait by a reference of its own, so the notice that ends it can be handled

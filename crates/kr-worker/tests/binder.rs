@@ -2082,6 +2082,29 @@ fn kr_req_11_13_a_launch_given_back_after_its_bind_leaves_no_binding_or_row() {
     assert!(worker.broker.owed_rows().is_empty());
 }
 
+/// KR-REQ-11.26: a binding that leaves wakes the task that decodes. A request waits in the decode
+/// queue for the binding that decodes it, and the task that takes the queue's requests looks again
+/// only when it is woken, so a binding that leaves without a wake would keep its requests' places in
+/// a queue that holds thirty-two, and later requests would be refused for want of room.
+#[tokio::test]
+async fn kr_req_11_26_a_binding_that_leaves_wakes_the_task_that_decodes() {
+    let worker = Worker::open();
+    let source = worker.claude_code();
+    let frame = worker.admit(1, vec![testing::admitted(&source)]);
+    worker.register(1);
+    worker
+        .bind(1, 1, source.package_digest, frame)
+        .expect("binds");
+
+    // The wake kept from making the binding is used up, so that the next one is the leaving's.
+    let queue = worker.broker.decode_queue();
+    let _ = tokio::time::timeout(std::time::Duration::ZERO, queue.wait()).await;
+    assert!(worker.broker.end(instance(1)));
+    tokio::time::timeout(std::time::Duration::from_secs(20), queue.wait())
+        .await
+        .expect("a binding that left did not wake the task that decodes");
+}
+
 /// KR-REQ-11.13: a row a process could not remove before it ended is removed by the next process
 /// that opens the session's ledger, which never takes an earlier process's bindings back; and an
 /// instance's native exit removes its bindings' rows.

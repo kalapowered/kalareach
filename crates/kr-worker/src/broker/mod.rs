@@ -839,7 +839,7 @@ struct BrokerState {
     /// What a person is told about each binding's component beyond where it stands.
     component_notes: BTreeMap<BrokerBindingId, component::ComponentNotes>,
     /// Woken when the set of bindings the plugin runtime is wanted for may have changed.
-    component_changes: Arc<tokio::sync::Notify>,
+    component_changes: Arc<component::ComponentChanges>,
 }
 
 /// The tables one installation was qualified with, as the installation pinned them.
@@ -982,6 +982,8 @@ impl Broker {
         // last announced under comes back with it, so the next event about one this host was
         // already answering names that event as its parent rather than starting a second chain.
         let next_event = ledger.highest_event()?.saturating_add(1);
+        // The requests waiting for a component to decode them, which a change to the bindings wakes.
+        let decoding = Arc::new(decoding::DecodeQueue::default());
         // One generation per open. Sequence numbers are unique inside a generation and mean
         // nothing across two, because a stretch the journal could not take spends numbers that the
         // next process hands out again.
@@ -1025,14 +1027,16 @@ impl Broker {
                 action_refusals: BTreeMap::new(),
                 component_states: BTreeMap::new(),
                 component_notes: BTreeMap::new(),
-                component_changes: Arc::new(tokio::sync::Notify::new()),
+                component_changes: Arc::new(component::ComponentChanges::new(Arc::clone(
+                    &decoding,
+                ))),
             }),
             notices_ready: tokio::sync::Notify::new(),
             recorder: Mutex::new(recorder),
             description_facts: std::sync::OnceLock::new(),
             component_calls: Arc::new(prepare::ComponentCalls::new()),
             observation: Arc::new(observation::ObservationLane::new()),
-            decoding: Arc::new(decoding::DecodeQueue::default()),
+            decoding,
             drafts: Arc::new(crate::daemon_link::Drafts::new()),
             #[cfg(feature = "testing")]
             recovery_pause: Mutex::new(None),
