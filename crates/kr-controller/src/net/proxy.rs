@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kr_ipc::client::BoundLink;
+use kr_ipc::framed::FrameWhile;
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Request, Response};
 use kr_protocol::grant::HistoryScope;
@@ -216,6 +217,13 @@ pub struct WorkerProxy {
     calls_at_the_writer: AtomicU64,
 }
 
+/// Why a call did not send its frame: the check it is admitted under refused it, with the frame
+/// taken back (the link is whole) or cut (the link ends).
+enum NotSent {
+    Withdrawn(ControllerError),
+    Cut(ControllerError),
+}
+
 /// Whom this link owes an answer, and whether it can still give one.
 #[derive(Debug, Default)]
 struct Waiters {
@@ -341,8 +349,10 @@ impl WorkerProxy {
     /// before anything is sent.
     ///
     /// `still_admitted` is asked again once this call has the write half of the link, which it can
-    /// wait for, and before any of the frame is written: an error from it is returned and nothing
-    /// is sent.
+    /// wait for, and before every transport write of the frame, a wait for room in the socket
+    /// included. An error from it is returned and the rest of the frame is not written: if the worker
+    /// had none of the frame the link stays whole, and if it had part of it the link ends, so that
+    /// the worker reads a frame that stops short and acts on nothing of it.
     ///
     /// # Errors
     ///
@@ -493,9 +503,10 @@ impl WorkerProxy {
         // The write half is shared by every call on the link, so a call can wait for it behind a
         // frame the worker is slow to read, and the socket can be full when it has the half. What
         // this call was admitted for is asked again before every transport write: a refusal that
-        // rose while it waited, and that moves nothing the worker would find, stops it while the
-        // worker has none of its frame, and the link stays whole. A frame the worker has part of is
-        // finished, because only finishing it keeps the stream whole.
+        // rose while it waited, and that moves nothing the worker would find, stops it. While the
+        // worker has none of the frame the link stays whole. Once it has part of it the rest is not
+        // written and the link ends, so that the worker reads a frame that stops short and acts on
+        // nothing of it: the call is refused, and nothing was done.
         let exchange = async {
             #[cfg(test)]
             self.calls_at_the_writer.fetch_add(1, Ordering::SeqCst);
@@ -517,12 +528,17 @@ impl WorkerProxy {
                     }
                 })
                 .await;
+            let mut refused = || {
+                refusal.take().unwrap_or_else(|| {
+                    ControllerError::supervision("this call was not admitted to write")
+                })
+            };
             let written = match written {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    return Err(refusal.unwrap_or_else(|| {
-                        ControllerError::supervision("this call was not admitted to write")
-                    }));
+                Ok(FrameWhile::Sent) => Ok(()),
+                Ok(FrameWhile::Withdrawn) => return Err(NotSent::Withdrawn(refused())),
+                Ok(FrameWhile::Cut) => {
+                    held.take();
+                    return Err(NotSent::Cut(refused()));
                 }
                 Err(error) => Err(error),
             };
@@ -537,8 +553,14 @@ impl WorkerProxy {
             Ok((written, interrupted, unusable))
         };
         let sent = match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
-            Ok(Err(refusal)) => {
+            Ok(Err(NotSent::Withdrawn(refusal))) => {
                 self.waiters().pending.remove(&request_id);
+                return Err(refusal);
+            }
+            Ok(Err(NotSent::Cut(refusal))) => {
+                // The worker has part of a frame it will never get the rest of: the link ends, and
+                // it reads a frame that stops short.
+                self.close();
                 return Err(refusal);
             }
             Ok(Ok((written, interrupted, unusable))) => {
