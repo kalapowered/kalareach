@@ -2996,7 +2996,9 @@ What the grant decides, for every request:
   Two readings can find it expired: the deadline its connection anchored on the continuous clock,
   and this host's wall clock with the floor under it, which a clock stepped forward or another
   decision can move first. Either way the connection ends with its subscription, and the expiry is
-  written to the device's record, so the device cannot connect again. A refusal the wall clock
+  written to the device's record, so the device cannot connect again. A device that connects
+  again after its grant ran out, on either clock, is refused at admission, and `reconnect.time`
+  counts the attempt with the outcome `refused`, not `ok`. A refusal the wall clock
   decided also writes that floor down. A write that fails is retried by every later decision and
   by the network's record task, and until one lands the floor is owed its record: no decision that
   reads the clock is taken, so a request under a grant that expires, under an organisation's lease,
@@ -6544,37 +6546,38 @@ the registry's. A feed that is ahead means the registry, and the policy row and 
 an earlier state than one this host issued: a state directory put back from a copy, or one that is
 another host's. While the feed is ahead the host refuses every grant for an ingress other than the
 owner at the machine, an organisation's and a personal one alike, with `PERMISSION_DENIED` saying
-that it is catching up with its feed, and `kr doctor` says so as a warning with a remedy. It carries out again each request the
-feed shows complete and the registry does not show withdrawn, each time a pass reads the record and
-whatever the two counters say: a restore that stopped after it moved the counter has lost the
-withdrawal all the same. It does so only for a request it could have carried out, because the feed
-judges nothing and could name any request as complete: one that a device the registry holds and has
-not revoked signed with the key the registry holds for it, whose pairing grant holds the right to
-manage the host and the configured ceiling leaves it, and that the host did not refuse. The clock and
-the policy are not asked. The request took effect when it did, so an owner whose grant has run out
-since still counts; a revoked device proves nothing, because its request took effect before the
-revocation and a registry that holds the revocation holds what it withdrew. The device the request
-names as its issuer is judged alone. When the registry holds no such device, a device that holds the
-key the request names and could have made it is the issuer, which is how an owner paired again is
-found, and the first device that holds the key is not. A request that names something live here and
-whose issuer the registry cannot show, because it holds no device of that identity and none that is
-not revoked and holds the key and could have made it, as after a restore to a point before that
-owner was paired, can be neither carried out nor dismissed: the feed could have named any request as
-complete, and the host cannot tell whose word it was. The host then refuses
-every grant but the owner's at the machine, with `PERMISSION_DENIED` saying that it shows a
-revocation by an owner it does not know. `kr doctor` shows the feed check as a warning with a
-remedy, and names the device the request says made it, the key it gives for that device, and the
-devices and grants it names, up to eight of each. Every scan reads such a record
-again, so a restart does not lose the refusal, and nothing is stored for it. It ends when the owner
-at the machine revokes what the request names, or pairs the owner again, whose key the request names
-and whose request is then carried out. A feed that shows a revocation complete that no owner made
-can only keep remote access refused this way. It cannot revive a device, and the owner at the
-machine can always end it. While the refusal stands, the devices the request names keep no standing
-over the feed, and neither does a device that holds a key one of them holds, because a feed removes
-the host by a key: none of those keys is named to the feed as permitted to remove it, and a request
-one of them publishes is refused as lacking owner authority. Another owner can still remove the
-feed, which ends the refusal. If the named device is the only owner, no key can remove a lost host
-while the refusal stands. A host that starts again reads no removed feed, so nothing finds the
+that it is catching up with its feed, and `kr doctor` shows a warning with a remedy. It carries out
+again each request the feed shows complete and the registry does not show withdrawn, each time a
+pass reads the record and whatever the two counters say: a restore that stopped after it moved the
+counter has lost the withdrawal all the same. It does so only for a request it could have carried
+out, because the feed judges nothing and could name any request as complete. Such a request was
+signed with the key the registry holds for a device it has not revoked, the device's pairing grant
+holds the right to manage the host and the configured ceiling leaves it, and the host did not refuse
+the request. The clock and the policy are not asked. The request took effect when it did, so an
+owner whose grant has since run out still counts. A revoked device proves nothing: its request took
+effect before the revocation, and a registry that holds the revocation holds what the request
+withdrew. The device the request names as its issuer is judged alone. When the registry holds no
+such device, the issuer is a device that is not revoked, holds the key the request names and could
+have made the request, which is how an owner paired again is found. The first device that holds the
+key is not taken for the issuer. A request can name something live here while the registry cannot
+show its issuer: it holds no device of that identity, and no device that is not revoked, holds the
+key and could have made the request. That happens after a restore to a point before that owner was
+paired. The host can neither carry out nor dismiss such a request, because the feed could have named
+any request as complete and the host cannot tell whose word it was. The host then refuses every
+grant but the owner's at the machine, with `PERMISSION_DENIED` saying that it shows a revocation by
+an owner it does not know. `kr doctor` shows the feed check as a warning with a remedy. It names the
+device the request says made it, the key the request gives for that device, and the devices and
+grants the request names, up to eight of each. Every scan reads such a record again, so a restart
+does not lose the refusal, and nothing is stored for it. It ends when the owner at the machine
+revokes what the request names, or pairs the owner again, whose key the request names and whose
+request is then carried out. A feed that shows a revocation complete that no owner made can only
+keep remote access refused this way. It cannot revive a device, and the owner at the machine can
+always end it. While the refusal stands, the devices the request names keep no standing over the
+feed, and neither does a device that holds a key one of them holds. A feed removes the host by a
+key, so none of those keys is named to the feed as permitted to remove it, and a request one of them
+publishes is refused as lacking owner authority. Another owner can still remove the feed, which ends
+the refusal. If the named device is the only owner, no key can remove a lost host while the refusal
+stands. A host that starts again does not read a feed that has been removed, so nothing finds the
 condition again. A request the feed holds that is not shown complete waits until the host
 has caught up, and is then judged on the registry as it stands, in a scan of its own that is the
 synchronisation a connection waits for, so the owner is not refused for the host's being behind.
@@ -6593,17 +6596,18 @@ exclusive-management flag, its bound or its lease records, and the feed carries 
 policy, so once the host has caught up they are the restored ones.
 
 Both refusals, being behind the feed and a withdrawal the host cannot verify, take a remote device's
-standing away whole, and neither moves a revision or withdraws a registration. Work a remote
-connection had admitted before one rose is therefore held to it where it commits. Every mutation
-asks it beside the admission it asks again at its write, a push registration that waited for the
-gateway among them. An answer decided before is written as the refusal, whether it waits for the
-writer or has only been decided, and an answer being written when the refusal rises ends with the
-connection. A device's close, and a read or raw input that waited for the link to the session's
-worker, are refused when the link opens. Three things remain. A mutation already forwarded to a
-worker runs for what is left of its dispatch lease, five seconds at most. A voice call a device
-started is not ended, as a revocation ends it, and runs to its deadline. An owner confirmation that a
-remote owner device signed, spent at the machine after the refusal rose, is spent under the standing
-the signer had. The owner at the machine is never refused, and can stop any session locally.
+standing away entirely, but neither moves a revision or withdraws a registration. Work that a remote
+connection had admitted before either refusal rose is therefore held to the refusal where it
+commits. Every mutation asks for the refusal at its write, beside the admission it asks again there;
+a push registration that waited for the gateway is among them. An answer decided before the refusal
+rose is written as the refusal, whether it waits for the writer or has only been decided, and an
+answer being written when the refusal rises ends with the connection. A device's close, and a read
+or raw input that waited for the link to the session's worker, are refused when the link opens.
+Three things remain. A mutation already forwarded to a worker runs for what is left of its dispatch
+lease, five seconds at most. A voice call a device started is not ended, as a revocation ends it,
+and runs to its deadline. An owner confirmation that a remote owner device signed, spent at the
+machine after the refusal rose, is spent under the standing the signer had. The owner at the machine
+is never refused, and can stop any session locally.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says
