@@ -2745,7 +2745,7 @@ async fn a_connection_that_decided_a_request_under_a_share_resting_on_the_feed_i
             device.device_id,
             session_id,
             kr_protocol::grant::GrantExpiry::Never,
-            member.organisation.clone(),
+            member.organisation,
         );
         let personal = a_share_of(
             &controller,
