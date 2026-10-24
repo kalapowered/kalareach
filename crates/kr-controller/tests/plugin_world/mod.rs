@@ -458,6 +458,29 @@ impl Hosted {
         }
     }
 
+    /// As [`Self::runtime`], through a [`Gate`] that can keep the host's replies back.
+    pub async fn runtime_through_a_gate(&self) -> (Gate, PluginClient) {
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let said;
+            match self.ask().await {
+                PluginRuntimeState::Running => {
+                    match Gate::to_the_runtime_of(&self.environment()).await {
+                        Ok(through) => return through,
+                        Err(error) => said = format!("the runtime was running and: {error}"),
+                    }
+                }
+                PluginRuntimeState::Unavailable(told) => said = told.reason,
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited {PATIENCE:?} for the plugin runtime to be running; the daemon last said: \
+                 {said}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Stops the daemon and starts another on the same tree, as a restart of the host does: every
     /// durable record stays, nothing held in memory does, and the plugin host goes on running.
     /// What the new daemon is asked to start is counted from here.
@@ -561,6 +584,154 @@ pub enum Epoch {
     /// and the action it was asked to prepare fail, which says nothing about those answers. The
     /// host must have been built with the `testing` feature of `kr-plugin-host`.
     Held,
+}
+
+/// A pipe between this process and the plugin host, through which a case reaches the host.
+///
+/// While it is held the host's replies are kept back, so a call the case has made stays unanswered
+/// for as long as the case likes, which is how a host that a machine is slow to schedule looks to
+/// its caller, and nothing the machine does can end it. When the host ends while its replies are
+/// kept back, what it had said is lost with it and the case's connection ends, as the connection of
+/// a caller of a host that ended in the middle of a call does. Letting it go passes the replies on.
+pub struct Gate {
+    valve: tokio::sync::watch::Sender<bool>,
+    /// How many whole frames the case has sent the host through this gate.
+    frames: Arc<std::sync::atomic::AtomicU64>,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl Gate {
+    /// Connects a client to the plugin host of `environment` through a gate.
+    async fn to_the_runtime_of(
+        environment: &EnvironmentPaths,
+    ) -> Result<(Self, PluginClient), String> {
+        let descriptor = launcher::read_descriptor(environment, &HostProtocol::THIS)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "this environment has no plugin host".to_owned())?;
+        let host = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
+            .map_err(|error| error.to_string())?;
+        let own = kr_ipc::paths::Endpoint::from_path(
+            Path::new(&descriptor.endpoint).with_file_name("kr-gate"),
+        )
+        .map_err(|error| error.to_string())?;
+        let listener = Listener::bind(&own).map_err(|error| error.to_string())?;
+        let (valve, held) = tokio::sync::watch::channel(false);
+        let frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let serving = tokio::spawn({
+            let frames = Arc::clone(&frames);
+            async move {
+                while let Ok((worker, _peer)) = listener.accept().await {
+                    let Ok(plugin_host) = kr_ipc::endpoint::Connection::connect(&host).await else {
+                        continue;
+                    };
+                    tokio::spawn(carry(
+                        worker,
+                        plugin_host,
+                        held.clone(),
+                        Arc::clone(&frames),
+                    ));
+                }
+            }
+        });
+        let gate = Self {
+            valve,
+            frames,
+            serving,
+        };
+        let connection = kr_ipc::endpoint::Connection::connect(&own)
+            .await
+            .map_err(|error| error.to_string())?;
+        let client = PluginClient::over(connection, descriptor)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((gate, client))
+    }
+
+    /// How many whole frames the case has sent the host through this gate so far. A frame is
+    /// counted as it reaches the gate, before the host is given it, so a frame the case waited an
+    /// answer to is always counted; the world a case registers its component in by hand sends the
+    /// host nothing but the registration and the calls the case makes, so a call is on its way to
+    /// the host, and its reply is the one the gate keeps back, once this has grown past what it
+    /// was before the call.
+    #[must_use]
+    pub fn frames_sent(&self) -> u64 {
+        self.frames.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Keeps the host's replies back from now on.
+    pub fn hold(&self) {
+        self.valve.send_replace(true);
+    }
+
+    /// Passes the replies kept back on, and the ones after them.
+    pub fn release(&self) {
+        self.valve.send_replace(false);
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// Carries one connection between the case and the host, in both directions, keeping the host's
+/// bytes back while the gate is held.
+async fn carry(
+    worker: kr_ipc::endpoint::Connection,
+    host: kr_ipc::endpoint::Connection,
+    mut held: tokio::sync::watch::Receiver<bool>,
+    frames: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (mut from_worker, mut to_worker) = tokio::io::split(worker);
+    let (mut from_host, mut to_host) = tokio::io::split(host);
+    let up = tokio::spawn(async move {
+        // A frame is a four-byte big-endian length and a payload of that many bytes.
+        let mut unparsed = Vec::<u8>::new();
+        let mut chunk = vec![0_u8; 16 * 1024];
+        while let Ok(count @ 1..) = from_worker.read(&mut chunk).await {
+            unparsed.extend_from_slice(&chunk[..count]);
+            while let Some(prefix) = unparsed.first_chunk::<4>() {
+                let whole = 4 + u32::from_be_bytes(*prefix) as usize;
+                if unparsed.len() < whole {
+                    break;
+                }
+                unparsed.drain(..whole);
+                frames.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            if to_host.write_all(&chunk[..count]).await.is_err() {
+                break;
+            }
+        }
+        let _ = to_host.shutdown().await;
+    });
+    let mut kept = Vec::new();
+    let mut chunk = vec![0_u8; 16 * 1024];
+    loop {
+        if !*held.borrow() && !kept.is_empty() {
+            if to_worker.write_all(&kept).await.is_err() {
+                break;
+            }
+            kept.clear();
+        }
+        tokio::select! {
+            read = from_host.read(&mut chunk) => match read {
+                Ok(0) | Err(_) => break,
+                Ok(count) => kept.extend_from_slice(&chunk[..count]),
+            },
+            changed = held.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    // What the host said and was kept back is lost with it; what it said while the gate was open
+    // has been passed on.
+    let _ = to_worker.shutdown().await;
+    up.abort();
 }
 
 /// A daemon, a session whose worker is this process with a shell of its own, and the plugin host

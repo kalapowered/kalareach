@@ -16,8 +16,10 @@
 //! | KR-REQ-24.27 | the words a component declines an action with, and the names its plan chooses, are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, including when the reply is read after the connection was replaced, and the binding is marked as handed something made in privacy mode |
 //! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
 //!
-//! The scripted peer stands in for a vendor's agent. A test that needs a stopped plugin host stops
-//! the real one and lets it go, and every wait is for a condition the product reaches.
+//! The scripted peer stands in for a vendor's agent. A test that needs an action to wait for its
+//! component holds the worker's preparation before it asks, and one that needs a call outstanding
+//! in the component keeps the plugin host's replies back; every wait is for a condition the
+//! product reaches.
 
 #![cfg(unix)]
 
@@ -39,7 +41,7 @@ mod plugin_world;
 
 use plugin_world::acting::{
     ACTIONS, Acting, Change, a_lease, a_paired_device, announce, answer, binding, read_receipt,
-    send, signal, until_receipt, until_settled, until_the_devices_receipt_is,
+    send, until_receipt, until_settled, until_the_devices_receipt_is,
 };
 use plugin_world::{PATIENCE, kill, until};
 
@@ -299,7 +301,7 @@ async fn kr_req_23_30_arguments_other_than_the_declared_ones_are_rejected_before
 /// starts at the release, so neither runs out while the case reads the receipt, however long the
 /// machine takes to do that. A cancellation that lands while a component call is outstanding is
 /// shown by `kr_req_23_30_an_action_cancelled_while_prepared_claims_nothing` in
-/// `plugin_insertion.rs`, which holds the plugin host.
+/// `plugin_insertion.rs`, which keeps the plugin host's replies back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_and_cancelled() {
     let Some(acting) = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await
@@ -398,25 +400,29 @@ async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_a
     );
 }
 
-/// Accepts one action, holds its component, makes `change`, lets the component go and shows the
+/// Accepts one action, holds its preparation, makes `change`, lets the preparation go and shows the
 /// action rejected with nothing written to the upstream. Returns the rejected receipt, or nothing
 /// where the test components are not built.
+///
+/// The worker's deadlines are on a clock the case never moves, and the preparation's own bound
+/// starts at the release, so neither runs out however long the machine takes over the change.
 async fn rejected_after(change: Change) -> Option<Receipt> {
-    let acting = Acting::start().await?;
+    let acting = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await?;
     let mut watcher = acting.client().await;
     let mut asking = acting.client().await;
     let mutation = acting.invocation(&asking, "turn.cancel", b"{}");
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let mut held = acting.hold_the_next_preparation();
     asking
         .writer()
         .write_message(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+    held.arrives().await;
     let mut asking = Some(asking);
     acting.change(change, "turn.cancel", &mut asking).await;
-    signal(&host, rustix::process::Signal::CONT);
+    held.release();
     // The action has come back from its component and been answered, so that what was not written
     // was left unwritten by the second pass and not by a preparation still waiting.
     if let Some(asking) = asking.as_mut() {
@@ -520,7 +526,8 @@ async fn kr_req_23_30_an_authority_revision_announced_while_the_component_prepar
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is_answered_with_its_receipt()
  {
-    let Some(acting) = Acting::start().await else {
+    let Some(acting) = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await
+    else {
         return;
     };
     // The daemon forwards a paired device's action over a proxy of that device's own, and announces
@@ -540,7 +547,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
     let mutation = acting.invocation(&proxy, "turn.cancel", b"{}");
     let request_id = mutation.request_id.get();
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let mut held = acting.hold_the_next_preparation();
     proxy
         .send(&ControlFrame::Forwarded(Box::new(
             kr_protocol::local::ForwardedMutation {
@@ -564,8 +571,9 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
     // announces the next authority revision over the connection it holds the worker's authority
     // by. The device reads its own receipt through the daemon to know.
     until_the_devices_receipt_is(&mut proxy, &device, action_id, ReceiptState::Accepted).await;
+    held.arrives().await;
     announce(&mut authority, &acting, 2).await;
-    signal(&host, rustix::process::Signal::CONT);
+    held.release();
     // A retained answer, which the daemon holds back from a device whose authority has moved: a
     // plain response would reach the device unchecked.
     let response = loop {
@@ -619,7 +627,7 @@ async fn kr_req_09_10_a_lease_that_ends_while_the_component_prepared_rejects_the
     let mutation = acting.invocation(&proxy, "turn.cancel", b"{}");
     let request_id = mutation.request_id.get();
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let mut held = acting.hold_the_next_preparation();
     proxy
         .send(&ControlFrame::Forwarded(Box::new(
             kr_protocol::local::ForwardedMutation {
@@ -642,9 +650,10 @@ async fn kr_req_09_10_a_lease_that_ends_while_the_component_prepared_rejects_the
         .expect("writes the forwarded mutation");
     // The action is accepted, and its lease is good: it waits for its component.
     until_the_devices_receipt_is(&mut proxy, &device, action_id, ReceiptState::Accepted).await;
+    held.arrives().await;
     // Only the lease ends: the clock passes it, and the accepted deadline has twenty-six seconds.
     clock.advance(Duration::from_secs(4));
-    signal(&host, rustix::process::Signal::CONT);
+    held.release();
     let response = loop {
         match proxy.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) if response.request_id.get() == request_id => {
@@ -717,8 +726,8 @@ async fn kr_req_23_30_a_connection_that_ended_while_the_component_prepared_rejec
 }
 
 /// KR-REQ-23.30: an action is answered within its own deadline whatever its component does. With
-/// the plugin host stopped, a call that is never answered is given up on, and the action is
-/// rejected, while the host is still stopped.
+/// the host's replies kept back, a call that is never answered is given up on, and the action is
+/// rejected, while they are still kept back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_nothing_else() {
     let Some(acting) = Acting::start().await else {
@@ -728,12 +737,12 @@ async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_noth
     let mut mutation = acting.invocation(&client, "turn.cancel", b"{}");
     mutation.requested_ttl_ms = DurationMs::new(1_500);
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    acting.gate().hold();
     let outcome = send(&mut client, mutation).await;
     let Outcome::Error(refusal) = outcome else {
         panic!("an action whose component is silent was carried: {outcome:?}");
     };
-    // The host has not been let go: the answer came from the bound on the call, and it is a
+    // The replies have not been let go: the answer came from the bound on the call, and it is a
     // rejection either way, for the call that was given up on or for the deadline that passed.
     let receipt = read_receipt(&mut client, action_id)
         .await
@@ -754,7 +763,58 @@ async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_noth
         "nothing was written to the upstream: {:?}",
         acting.frames()
     );
-    signal(&host, rustix::process::Signal::CONT);
+}
+
+/// KR-REQ-11.31: the native terminal's requests are carried and answered while a call to the
+/// component is outstanding, and the action whose call it is is carried out when the component
+/// answers.
+///
+/// The host's replies are kept back, so the call stays outstanding for as long as the case likes,
+/// and the case lets them go only once the terminal has been answered. The one bound the case
+/// cannot hold is the worker's own on a preparation (five seconds from its start): a terminal that
+/// waited for the call would be answered when the call was given up on, the reply would be let go
+/// too late, and the action would be rejected and not carried out. A machine that stalls the case
+/// for as long as that bound allows fails it for the same reason, which is why the bound is the
+/// only thing this case cannot decide by a condition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_31_the_native_terminal_goes_on_while_a_call_to_the_component_is_outstanding() {
+    let Some(acting) =
+        Acting::start_with_a_terminal_on(Arc::new(kr_transport::clock::ManualClock::new())).await
+    else {
+        return;
+    };
+    let mut client = acting.client().await;
+    let mutation = acting.invocation(&client, "turn.cancel", b"{}");
+    acting.gate().hold();
+    let before = acting.gate().frames_sent();
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("writes the mutation");
+    until("the worker to make its call to the component", || async {
+        (acting.gate().frames_sent() > before).then_some(())
+    })
+    .await;
+
+    tokio::time::timeout(PATIENCE, acting.native_round_trip(1))
+        .await
+        .expect("the terminal's request is carried and answered while the call is outstanding");
+    acting.gate().release();
+    let outcome = answer(&mut client, Some(1)).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the action whose call was outstanding is carried out when the component answers: \
+         {outcome:?}"
+    );
+    let frames = acting.frames();
+    assert_eq!(
+        frames.len(),
+        2,
+        "the upstream was written the terminal's request and the action's: {frames:?}"
+    );
+    assert!(frames[0].contains("session/prompt"), "{frames:?}");
+    assert!(frames[1].contains("turn.cancel"), "{frames:?}");
 }
 
 /// KR-REQ-23.30: a plugin runtime that ends while an action's component is being asked costs the
@@ -768,13 +828,20 @@ async fn kr_req_23_30_a_runtime_that_ends_during_the_call_costs_its_action_a_ret
     let mut asking = acting.client().await;
     let mutation = acting.invocation(&asking, "turn.cancel", b"{}");
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let host = acting.hosted.published().expect("the host is published");
+    acting.gate().hold();
+    let before = acting.gate().frames_sent();
     asking
         .writer()
         .write_message(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+    // The worker has made the call, and its reply is kept back.
+    until("the call to reach the plugin host", || async {
+        (acting.gate().frames_sent() > before).then_some(())
+    })
+    .await;
     kill(&host);
     let Outcome::Error(refusal) = answer(&mut asking, Some(1)).await else {
         panic!("an action whose runtime ended was carried");
@@ -863,9 +930,12 @@ async fn kr_req_23_30_an_action_whose_component_is_not_there_is_rejected_for_the
 /// The worker's own link runs, so the plugin runtime's notice that it disabled a binding reaches the
 /// broker, and the plugin host's epoch runs, so the component that never returns is stopped by its
 /// deadline. A native terminal is served on the transport the production gateway uses: its requests
-/// are carried upstream and answered, before the component is asked, while the plugin host is held
-/// with a call to the component waiting on it, between the faults, and after the binding is
-/// disabled. Once it is, a rich action is refused and nothing is written to the upstream for it.
+/// are carried upstream and answered, before the component is asked, while an action waits for its
+/// component (the worker holds the preparation before it asks), between the faults, and after the
+/// binding is disabled; that they are carried while a call to the component is outstanding is
+/// shown by `kr_req_11_31_the_native_terminal_goes_on_while_a_call_to_the_component_is_outstanding`.
+/// Once the binding is disabled, a rich action is refused and nothing is written to the upstream
+/// for it.
 ///
 /// Not claimed: a launch through `kr-hook launch` (the terminal here is the transport's client end,
 /// not a program in a managed shell), and Windows, where no gateway runs.
@@ -915,23 +985,25 @@ async fn kr_req_11_31_a_component_that_faults_disables_its_binding_and_the_nativ
         acting.frames()
     );
 
-    // The first fault is asked while the plugin host is held: the call waits on the host, the
-    // terminal's request is carried and answered meanwhile, and the call faults when the host runs.
+    // The first fault is asked of a preparation that is held: the action waits for its component,
+    // the terminal's request is carried and answered meanwhile, and the component faults when the
+    // preparation is let go.
     let mut watcher = acting.client().await;
     let mut asking = acting.client().await;
     let mut mutation = acting.invocation(&asking, "cancel.loop", b"{}");
     mutation.request_id = RequestId::new(1);
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let mut held = acting.hold_the_next_preparation();
     asking
         .writer()
         .write_message(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+    held.arrives().await;
     native += 1;
     acting.native_round_trip(native).await;
-    signal(&host, rustix::process::Signal::CONT);
+    held.release();
     let Outcome::Error(refusal) = answer(&mut asking, Some(1)).await else {
         panic!("an action whose component never returns was carried");
     };
