@@ -6558,7 +6558,10 @@ device that made a waiting request is not carried out ahead of that request: the
 be refused for a revocation that came after it. The record waits as well, with the device that made
 it, so that a record which would revoke that device waits too, and the scan reads on to the end of
 the feed to settle its refusals and catch up. The records that wait are judged and carried out in
-the order the feed holds them by the scan that follows once the clock is proven. The pass ends as
+the order the feed holds them by the scan that follows once the clock is proven. That is a limit
+while a standing is undecided: a record that waits waits whole, so the other devices and grants it
+names stay served, until the host's clock is established or the waiting request is judged. The owner
+at the machine can revoke them at once, which needs no confirmation. The pass ends as
 one this host could not finish, so nothing is shown as read, no key is added to the list of keys
 that may remove the feed, those of owners the pass revoked are taken off it, and it asks again
 after its backoff. A device whose grant holds no right to manage the host is turned away whatever
