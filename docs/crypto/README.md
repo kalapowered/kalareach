@@ -664,9 +664,9 @@ loop. A Linux case reads the memory of a running Bash, Fish and Zsh after its fi
 no copy of the secret in a writable mapping.
 
 The wipe covers the buffer the secret was decoded into. The base64url text that carried it stays in
-the memory the process was started with after the variable is unset, and the PowerShell bridge's
-runtime keeps managed copies of the text and of the key its HMAC object held; no code of the bridge
-can clear those.
+the memory the process was started with after the variable is unset, and in the blocks the shell
+freed when it copied or dropped the variable, and the PowerShell bridge's runtime keeps managed
+copies of the text and of the key its HMAC object held; no code of the bridge can clear those.
 
 ## Release manifest
 
