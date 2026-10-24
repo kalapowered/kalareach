@@ -400,16 +400,18 @@ impl Unwritable {
             rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
                 ErrorCode::DiskFull => "the disk is full",
                 ErrorCode::ReadOnly | ErrorCode::PermissionDenied => {
-                    "the registry cannot be written"
+                    "the daemon may not write to the registry"
                 }
                 ErrorCode::SystemIoFailure => "the disk failed to read or write",
                 ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
                     "the registry file is damaged"
                 }
                 ErrorCode::CannotOpen => "the registry file cannot be opened",
-                _ => "the registry refused the write",
+                ErrorCode::DatabaseLocked => "a table of the registry is locked",
+                ErrorCode::FileLockingProtocolFailed => "the registry's lock could not be taken",
+                _ => "the registry gave an error this build does not name",
             },
-            _ => "the registry refused the write",
+            _ => "the registry gave an error this build does not name",
         };
         Self {
             kind,
@@ -690,8 +692,9 @@ impl DeviceDirectory {
     ///
     /// A write that holds the lock makes this wait for the handle's busy timeout. `Ok(false)` says
     /// that the wait ended with the lock still held, so a caller that needs every write that began
-    /// earlier to have ended asks again. A failure to take the lock for another reason is an
-    /// [`Unwritable`]: it says nothing of a write on another handle.
+    /// earlier to have ended asks again. A failure to take the lock for another reason, such as a
+    /// table that is locked, is an [`Unwritable`]: SQLite does not wait out the busy timeout for
+    /// it, and it says nothing of a write on another handle.
     ///
     /// # Errors
     ///
@@ -707,12 +710,7 @@ impl DeviceDirectory {
         match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(transaction) => transaction.commit().map(|()| true).map_err(Unwritable::of),
             Err(rusqlite::Error::SqliteFailure(failure, _))
-                if matches!(
-                    failure.code,
-                    ErrorCode::DatabaseBusy
-                        | ErrorCode::DatabaseLocked
-                        | ErrorCode::FileLockingProtocolFailed
-                ) =>
+                if failure.code == ErrorCode::DatabaseBusy =>
             {
                 Ok(false)
             }

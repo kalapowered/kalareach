@@ -6729,9 +6729,11 @@ that has risen has returned only when every write to the pairing records that be
 ended. A spend holds the lock for a few milliseconds; the wait goes on past that only for a write
 that does not end, or a registry that cannot take a write at all. The refusal stands meanwhile, the
 carrier reads no more of the feed, and `kr doctor` shows the check as a warning that says the
-refusal waits for the registry to take a write, since when, and why; the log says it once. The
-wait asks again by itself and goes on when the registry takes a write. What a spend that had
-committed before the refusal rose goes on
+refusal waits for the registry to take a write, since when, and why; the log says it when the
+wait starts and when its reason changes. The
+wait asks again by itself and goes on when the registry takes a write. A start that restores a
+removal waits for nothing, since no endpoint is bound yet and no confirmation can be under way. What
+a spend that had committed before the refusal rose goes on
 to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
 nothing else, so a refusal never turns into a weaker way to confirm. What the owner at the machine

@@ -1860,6 +1860,22 @@ async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records
     const WAITS: &str = "waits for the registry to take a write";
 
     let rig = Rig::start().await;
+    // The last pass stopped because the feed turned a request back, and the check carries the advice
+    // for that, which the wait for the registry replaces while it goes on.
+    for nth in 1..=4 {
+        rig.served
+            .web()
+            .fail_with_member(AUTHORITY, "read", nth, TURNED_BACK);
+    }
+    rig.poll().await;
+    let before = rig.shown().await.check.expect("the feed check");
+    assert!(
+        before
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("Until the feed answers")),
+        "the control: the stopped pass has its own advice: {:?}",
+        before.remedy()
+    );
     let writer = rusqlite::Connection::open(rig.host.registry_database()).expect("the registry");
     writer
         .execute_batch("BEGIN IMMEDIATE")
@@ -1887,10 +1903,11 @@ async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records
         check.detail()
     );
     assert!(
-        check
-            .remedy()
-            .is_some_and(|remedy| remedy.contains("takes a write")),
-        "and what to do"
+        check.remedy().is_some_and(|remedy| {
+            remedy.contains("takes a write") && !remedy.contains("Until the feed answers")
+        }),
+        "and what to do, in place of the stopped pass's advice: {:?}",
+        check.remedy()
     );
     assert!(!raising.is_finished(), "the refusal's rise waits meanwhile");
 
