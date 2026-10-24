@@ -238,6 +238,10 @@ pub struct Journal {
     /// every shipped build.
     #[cfg(feature = "testing")]
     host_event_stall: crate::testing::Stall,
+    /// How many names one page of a revocation's evidence carries, where a test of this host has
+    /// asked for fewer than the protocol allows. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    evidence_page_names: Option<usize>,
 }
 
 /// The privacy record: the generation in force, whether privacy mode is on, and where each
@@ -376,6 +380,8 @@ impl Journal {
             prune_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             host_event_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            evidence_page_names: None,
         };
         journal.migrate()?;
         // The mark describes the store rather than this process, so it starts at the highest
@@ -2361,7 +2367,7 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         let held = u64::try_from(held).unwrap_or(0);
         let from = from.min(held);
-        let page_size = u64::try_from(kr_protocol::action::MAX_NAMED_FENCED_ACTIONS).unwrap_or(256);
+        let page_size = self.evidence_page_size();
         let mut page = EvidencePage {
             remaining: held.saturating_sub(from.saturating_add(page_size)),
             omitted: self.evidence_omitted(revision, held)?,
@@ -3036,6 +3042,24 @@ impl Journal {
         Ok(removed)
     }
 
+    /// How many names one page of a revocation's evidence carries.
+    fn evidence_page_size(&self) -> u64 {
+        #[cfg(feature = "testing")]
+        if let Some(names) = self.evidence_page_names {
+            return u64::try_from(names).unwrap_or(u64::MAX);
+        }
+        u64::try_from(kr_protocol::action::MAX_NAMED_FENCED_ACTIONS).unwrap_or(256)
+    }
+
+    /// Makes a page of a revocation's evidence carry at most `names` names, for this host's own
+    /// tests, so that a fence of a few actions spans several pages. Each action a fence takes back
+    /// is a durable commit of its own, and a test that needs more than one page of them would
+    /// otherwise spend as many commits as a page holds, twice over.
+    #[cfg(feature = "testing")]
+    pub const fn limit_evidence_page_for_tests(&mut self, names: usize) {
+        self.evidence_page_names = Some(names);
+    }
+
     /// Stops the commit of the next dispatch marker, for this host's own tests.
     ///
     /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
@@ -3213,6 +3237,8 @@ impl Journal {
             prune_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             host_event_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            evidence_page_names: None,
         };
         // The same mark the writable opener starts from. A reader that faulted would otherwise
         // report a gap reaching back to the beginning of the session.
