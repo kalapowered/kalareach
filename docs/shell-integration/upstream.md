@@ -75,6 +75,16 @@ is distributed before its requalification passes, and no package is swapped into
 already running: a session keeps the package identity it started with until it ends.
 <!-- /kr:target -->
 
+The requalification has two parts, and each runs where it can. The whole of it, with the startup
+customisations, the second Zsh build and the PowerShell package, runs in the `shell-packages` job
+of the core workflow on Linux. Before a release tree is assembled, each of its four targets builds
+the Zsh, Bash and Fish packages natively and runs the contract suites of the three, the Fish source
+checks, the native-module proof of Zsh and the case that compares each package with its pin, against
+the packages it just built; a failing suite stops the tree before anything is assembled or signed.
+The Developer ID signature is put on the programs after that. The PowerShell package is not part of
+a release tree, and the startup customisations are pinned for two of the four targets, so the whole
+corpus does not run on the other two.
+
 ## A package that cannot meet its target
 
 The flag is a row of this register: no host, CLI or companion code reads it, and none of them tells a person that a package is past its target. A package whose fourteen days pass without a requalified build is flagged in the triage record
