@@ -69,8 +69,9 @@ fn launch(pid: &str, ending_log: &str, ends: &str) -> Launch {
     launch_with(pid, ending_log, ends, &[])
 }
 
-/// The same, on a device with the further state files `state` names (see `device.py`).
-fn launch_with(pid: &str, ending_log: &str, ends: &str, state_files: &[&str]) -> Launch {
+/// The same, on a device with the further state files `state_files` name, each with its contents
+/// (see `device.py`).
+fn launch_with(pid: &str, ending_log: &str, ends: &str, state_files: &[(&str, &str)]) -> Launch {
     let directory = TempDir::new().expect("a directory");
     let root = directory.path();
     let state = root.join("state");
@@ -81,8 +82,8 @@ fn launch_with(pid: &str, ending_log: &str, ends: &str, state_files: &[&str]) ->
     fs::write(state.join("ends"), ends).expect("an end");
     fs::copy(fixtures().join(ending_log), state.join("ending.log")).expect("the log");
     fs::write(root.join("application.apk"), "").expect("a package");
-    for name in state_files {
-        fs::write(state.join(name), "").expect("a state file");
+    for (name, contents) in state_files {
+        fs::write(state.join(name), contents).expect("a state file");
     }
 
     let device = fixtures().join("device.py");
@@ -237,8 +238,24 @@ fn a_crash_of_the_application_is_named_as_a_crash_with_the_lines_that_show_it() 
 /// and not at the deadline with a screen that is said not to show the page.
 #[test]
 fn a_screen_in_another_pixel_format_stops_the_run_with_the_format_named() {
-    let run = launch_with("7072", "application-killed.log", "never", &["format"]);
+    let run = launch_with("7072", "application-killed.log", "never", &[("format", "")]);
     assert_eq!(run.status, Some(1), "{}", run.output);
     assert!(run.output.contains("pixel format 4"), "{}", run.output);
     assert!(!run.output.contains("gave up waiting"), "{}", run.output);
+}
+
+/// A capture that failed writes its error text where the frame would be, and the text is not a
+/// screen in some pixel format: the screen is read again, and the run goes on to keep the frame
+/// that shows the page.
+#[test]
+fn a_capture_that_failed_is_read_again_and_not_taken_for_a_pixel_format() {
+    let run = launch_with(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[("unreadable-screens", "2")],
+    );
+    assert_eq!(run.status, Some(0), "{}", run.output);
+    assert!(!run.output.contains("pixel format"), "{}", run.output);
+    assert_eq!(run.picture(), Some((64, 128)), "{}", run.output);
 }
