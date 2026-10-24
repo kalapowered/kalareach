@@ -1159,6 +1159,7 @@ impl Controller {
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             feed_refusal: std::sync::atomic::AtomicU8::new(0),
+            feed_withheld: std::sync::Mutex::default(),
             local_access: super::local_access::LocalAccessState::default(),
             host_authorisation_key,
             utc_floor,

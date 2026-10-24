@@ -1219,7 +1219,7 @@ async fn an_answer_decided_before_a_feed_refusal_rose_is_answered_with_the_refus
             .expect("an answer");
         match between {
             Between::Nothing => {}
-            Between::AFeedRefusal => controller.authority_feed_withdrawal_unverified(true).await,
+            Between::AFeedRefusal => controller.raise_the_unverified_withdrawal_refusal().await,
             Between::AnUnrelatedPolicyChange => controller.advance_authority_epoch(),
         }
         assert!(
@@ -1276,7 +1276,7 @@ async fn an_answer_held_at_the_writer_is_not_written_once_a_feed_refusal_rises()
         let (stands, ()) = tokio::join!(connection.write_answer(answered), async {
             stream.waited(1).await;
             if refused {
-                controller.authority_feed_withdrawal_unverified(true).await;
+                controller.raise_the_unverified_withdrawal_refusal().await;
             } else {
                 controller.advance_authority_epoch();
             }
