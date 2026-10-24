@@ -170,6 +170,10 @@ pub enum LeaseStop {
     /// Another account is signed in than the one this keeper asks as. The work begun for the first
     /// ends, and a connection that opens again asks as the second.
     AccountChanged,
+    /// The connection that presents the lease has not had the host take one yet, and nothing is
+    /// held against the service. Whatever needs a lease the host took, a link opened beside that
+    /// connection, ends and opens again once the host has taken it.
+    Presenting,
 }
 
 impl LeaseStop {
@@ -182,7 +186,7 @@ impl LeaseStop {
             }
             Self::Unusable => ErrorCode::InvalidArgument,
             Self::Later(_) => ErrorCode::RateLimited,
-            Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged => {
+            Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged | Self::Presenting => {
                 ErrorCode::ResourceUnavailable
             }
         }
@@ -195,9 +199,11 @@ impl LeaseStop {
             Self::SignIn | Self::TokenRefused => UserAction::SignIn,
             Self::NotAMember | Self::Refused(_) => UserAction::Nothing,
             Self::Unusable => UserAction::Update,
-            Self::Later(_) | Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged => {
-                UserAction::Wait
-            }
+            Self::Later(_)
+            | Self::ConnectionEnded
+            | Self::Unreachable
+            | Self::AccountChanged
+            | Self::Presenting => UserAction::Wait,
         }
     }
 
@@ -207,7 +213,9 @@ impl LeaseStop {
     #[must_use]
     pub fn holds_for(&self) -> Duration {
         match self {
-            Self::SignIn | Self::ConnectionEnded | Self::AccountChanged => Duration::ZERO,
+            Self::SignIn | Self::ConnectionEnded | Self::AccountChanged | Self::Presenting => {
+                Duration::ZERO
+            }
             Self::TokenRefused | Self::Unreachable => SHORTEST_REFRESH,
             Self::NotAMember | Self::Refused(_) | Self::Unusable => HELD_FOR_AN_ADMINISTRATOR,
             Self::Later(delay) => (*delay).min(LONGEST_HOLD),
@@ -219,7 +227,7 @@ impl LeaseStop {
     const fn spoils_the_lease(&self) -> bool {
         !matches!(
             self,
-            Self::ConnectionEnded | Self::Unreachable | Self::Later(_)
+            Self::ConnectionEnded | Self::Unreachable | Self::Later(_) | Self::Presenting
         )
     }
 }
@@ -275,6 +283,10 @@ impl Said for LeaseStop {
             Self::AccountChanged => Shown::said(
                 "the account signed in on this device changed; this app asks for the lease again \
                  as the new one",
+            ),
+            Self::Presenting => Shown::said(
+                "this device is still presenting its lease to this host; this app tries again \
+                 once the host has taken it",
             ),
         }
     }
@@ -454,11 +466,11 @@ impl LeaseKeeper {
     }
 
     /// Why this keeper holds no lease the host took: the stop that is held against the service,
-    /// and otherwise that the service has not given one yet.
+    /// and otherwise that the lease is still being presented.
     #[must_use]
     pub fn why_no_lease(&self) -> LeaseStop {
         self.held_back()
-            .map_or(LeaseStop::Unreachable, |(stop, _)| stop)
+            .map_or(LeaseStop::Presenting, |(stop, _)| stop)
     }
 
     /// Presents a lease as the first thing on the connection.

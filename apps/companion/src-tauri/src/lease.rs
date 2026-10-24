@@ -215,7 +215,9 @@ impl LeaseDesk {
                     Err(kept.keeper.why_no_lease())
                 }
             }
-            _ => Err(LeaseStop::Unreachable),
+            // No keeper made for this sign-in yet: the connection that presents its lease has not
+            // come to it.
+            _ => Err(LeaseStop::Presenting),
         }
     }
 

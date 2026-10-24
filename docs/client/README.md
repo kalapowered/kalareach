@@ -1416,11 +1416,13 @@ own refusal of the list does that. A connection that presents no lease of its ow
 serves the person only while the keeper of its sign-in holds a lease the host took
 (`LeaseKeeper::took_a_lease`): the host binds a device to the first account that presents a lease,
 so a link opened after a switch to an account whose lease the host refuses is ended with the
-keeper's held stop and not served on the lease of the account before. The binding hears what the
-account object publishes. A change another process of the application makes in the shared store of a
-desktop, and one whose status could not be read when it was published, are not heard: the old
-account's sessions then end at the keeper's next request, and at the latest when the lease ends, up
-to fifteen minutes.
+keeper's held stop and not served on the lease of the account before. A link opened before the
+application's connection has had the host take the lease of a new sign-in (after a start, a sign-in
+or a switch) is ended with `LeaseStop::Presenting`, whose words say the device is still presenting
+its lease, and opens again once the host has taken it. The binding hears what the account object
+publishes. A change another process of the application makes in the shared store of a desktop, and
+one whose status could not be read when it was published, are not heard: the old account's sessions
+then end at the keeper's next request, and at the latest when the lease ends, up to fifteen minutes.
 
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
 service answers. A lease that has ended, that the host installed before its restart, or that a newer
