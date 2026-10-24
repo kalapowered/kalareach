@@ -1668,11 +1668,8 @@ async fn a_host_that_cannot_be_reached_is_not_issued_an_authorisation() {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
-    phone
-        .registered
-        .lock()
-        .expect("the script")
-        .connect_fails = Some("the host did not answer in time".to_owned());
+    phone.registered.lock().expect("the script").connect_fails =
+        Some("the host did not answer in time".to_owned());
     phone.desk.enable(&reference).expect("the person asks");
     phone
         .until(|states| states == [PushState::NeedsAttention])
@@ -1691,7 +1688,10 @@ async fn a_host_that_cannot_be_reached_is_not_issued_an_authorisation() {
     );
 
     phone.registered.lock().expect("the script").connect_fails = None;
-    phone.desk.enable(&reference).expect("the person asks again");
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
     phone.until(|states| states == [PushState::On]).await;
     assert_eq!(phone.gateway.issue_requests(), 1);
 }
@@ -2784,4 +2784,273 @@ async fn a_list_of_paired_hosts_that_cannot_be_read_leaves_the_receivers_keys_as
         "nothing was handed over on a list that could not be read"
     );
     assert_eq!(held_keys(&phone), Some(held));
+}
+
+/// A phone with one host whose notifications are on.
+async fn a_phone_with_notifications_on() -> (Host, Desk, String) {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    (host, phone, reference)
+}
+
+/// What the host was handed, registration by registration: whether previews were asked for.
+fn previews_asked(phone: &Desk) -> Vec<bool> {
+    phone
+        .registered
+        .lock()
+        .expect("what was handed")
+        .credentials
+        .iter()
+        .map(|(_, handed)| handed["previews_enabled"].as_bool().expect("a choice"))
+        .collect()
+}
+
+/// KR-REQ-16.11: turning previews off takes the host's key out of what the receivers hold before
+/// the host is told, tells the host, and asks the provider for nothing: no token is proposed and no
+/// challenge is waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_previews_off_takes_the_hosts_key_out_before_the_host_is_told() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    assert_eq!(held_keys(&phone).expect("keys").senders.len(), 1);
+    phone.registered.lock().expect("the script").hold_connection = true;
+
+    let view = phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("the person chooses");
+
+    assert!(!view.hosts[0].previews, "the choice is recorded at once");
+    assert!(
+        held_keys(&phone).expect("keys").senders.is_empty(),
+        "the receivers hold no key of the host before it is told"
+    );
+    eventually("the run reached the host", || {
+        phone.registered.lock().expect("the script").connected.len() == 2
+    })
+    .await;
+    assert_eq!(previews_asked(&phone), [true], "the host is not told yet");
+
+    phone.registered.lock().expect("the script").hold_connection = false;
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(previews_asked(&phone), [true, false]);
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN],
+        "no token was proposed again"
+    );
+    assert!(held_keys(&phone).expect("keys").senders.is_empty());
+}
+
+/// KR-REQ-16.11: turning previews on files the host's key before the host is told to seal them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_previews_on_files_the_hosts_key_before_the_host_is_told() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    phone.until(|states| states == [PushState::On]).await;
+    eventually("the host was told", || {
+        previews_asked(&phone) == [true, false]
+    })
+    .await;
+    phone.registered.lock().expect("the script").hold_connection = true;
+
+    phone.desk.set_previews(&reference, true).await.expect("on");
+
+    assert_eq!(
+        held_keys(&phone).expect("keys").senders.len(),
+        1,
+        "the receivers hold the host's key before the host is told"
+    );
+    assert_eq!(
+        previews_asked(&phone),
+        [true, false],
+        "the host is not told yet"
+    );
+    phone.registered.lock().expect("the script").hold_connection = false;
+    eventually("the host was told", || {
+        previews_asked(&phone) == [true, false, true]
+    })
+    .await;
+    phone.until(|states| states == [PushState::On]).await;
+}
+
+/// KR-REQ-16.11: a host that cannot be told leaves the row needing the person, the choice stays
+/// recorded and no key is filed for the host, and Try again runs the whole sequence with the choice
+/// that was recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_it() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    phone.registered.lock().expect("the script").register_stops =
+        Some(LineStop::Host("it did not answer".to_owned()));
+
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    assert!(!phone.view().hosts[0].previews, "the choice stays recorded");
+    assert!(held_keys(&phone).expect("keys").senders.is_empty());
+
+    phone.registered.lock().expect("the script").register_stops = None;
+    phone.desk.enable(&reference).expect("Try again");
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN, FIRST_TOKEN],
+        "Try again runs the whole sequence"
+    );
+    assert_eq!(
+        previews_asked(&phone).last(),
+        Some(&false),
+        "with the recorded choice"
+    );
+}
+
+/// KR-REQ-16.11: a token that changed while the host was told of the choice is registered again,
+/// as it is after any run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_that_changed_while_the_host_was_told_of_a_choice_is_registered() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    phone.registered.lock().expect("the script").hold_answer = true;
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    eventually("the host was handed the registration", || {
+        previews_asked(&phone).len() == 2
+    })
+    .await;
+    phone.receiver.token_is(SECOND_TOKEN);
+    phone.registered.lock().expect("the script").hold_answer = false;
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN, SECOND_TOKEN]);
+}
+
+/// KR-REQ-16.11: a token that cannot be read when the host has been told of a choice leaves the host
+/// unconfirmed, as it does after any run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_that_cannot_be_read_after_a_choice_leaves_the_host_unconfirmed() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    phone
+        .receiver
+        .with(|state| state.token_readable_for = Some(state.token_reads));
+
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    phone
+        .until_words("could not read its notification token")
+        .await;
+}
+
+/// KR-REQ-16.11: a choice made while a run holds the host is read by that run when it tells the host,
+/// and goes round again when the choice changed after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_made_while_a_run_tells_the_host_is_told_after_it() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.registered.lock().expect("the script").hold_answer = true;
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the host was handed the registration", || {
+        previews_asked(&phone).len() == 1
+    })
+    .await;
+
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    phone.registered.lock().expect("the script").hold_answer = false;
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(previews_asked(&phone), [true, false]);
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN],
+        "one proposal: the second pass was the host's only"
+    );
+}
+
+/// An earlier record, written before the choice existed, reads as previews on, and the host is told
+/// so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_earlier_record_with_no_choice_reads_as_previews_on() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    let file = find(phone._phone.data.path(), "push.json").expect("the record");
+    let mut record: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("json");
+    for host in record["hosts"].as_object_mut().expect("hosts").values_mut() {
+        host.as_object_mut().expect("a host").remove("previews");
+        host.as_object_mut()
+            .expect("a host")
+            .remove("told_previews");
+    }
+    std::fs::write(&file, serde_json::to_vec(&record).expect("json")).expect("an earlier record");
+
+    let restarted = reopened(&phone);
+    assert!(
+        restarted.desk.view().hosts[0].previews,
+        "an earlier record reads as on"
+    );
+    restarted.desk.enable(&reference).expect("Try again");
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    assert_eq!(previews_asked(&phone).last(), Some(&true));
+}
+
+/// A look finds a host that is on and was last told another choice than the one recorded, and tells
+/// it, at most once a minute, with no token proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_tells_a_host_the_choice_it_was_not_told() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    let file = find(phone._phone.data.path(), "push.json").expect("the record");
+    let mut record: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("json");
+    for host in record["hosts"].as_object_mut().expect("hosts").values_mut() {
+        host["previews"] = json!(false);
+        host["told_previews"] = json!(true);
+    }
+    std::fs::write(&file, serde_json::to_vec(&record).expect("json")).expect("a choice not told");
+
+    let restarted = reopened(&phone);
+    assert!(!restarted.desk.view().hosts[0].previews);
+    look(&restarted.desk).await;
+    assert_eq!(
+        previews_asked(&phone),
+        [true],
+        "a look within a minute of the write waits"
+    );
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    eventually("the host was told", || {
+        previews_asked(&phone) == [true, false]
+    })
+    .await;
+    assert_eq!(
+        proposed(&restarted.gateway),
+        Vec::<String>::new(),
+        "no token was proposed"
+    );
+    let _ = reference;
 }
