@@ -300,10 +300,13 @@ struct State {
     /// the question, and out again whenever it ends or goes round again, so a look the application
     /// makes by itself never asks.
     asking: BTreeSet<DeviceId>,
-    /// What a look saw of the provider's token for a host a run holds: the digest, kept until the
-    /// run has compared. A run clears it before it reads the token for its comparison, so what is
-    /// here when it compares is something a look saw while the run's own answer was on its way.
-    observed: BTreeMap<DeviceId, Digest256>,
+    /// What looks saw of the provider's token for a host a run holds: every digest, kept until the
+    /// run has compared. Answers to looks and to the run's own read reach the desk in any order, so
+    /// the last to arrive is not the last the provider gave: one that arrives late must not
+    /// replace what an earlier arrival showed. A run clears the set before it reads the token for
+    /// its comparison, so what is here when it compares is something a look saw while the run's own
+    /// answer was on its way.
+    observed: BTreeMap<DeviceId, BTreeSet<Digest256>>,
     /// The number the next claim is given.
     next_run: u64,
 }
@@ -515,8 +518,9 @@ impl PushDesk {
                     && state.running.contains_key(&id)
                 {
                     // A run holds the host: what this look saw is kept for the run to weigh when
-                    // it compares, since its own answer may be older.
-                    state.observed.insert(id, digest);
+                    // it compares, since its own answer may be older, and so may this one be
+                    // older than another look's.
+                    state.observed.entry(id).or_default().insert(digest);
                 }
                 let Some(kept) = state.record.hosts.get(&id.to_string()) else {
                     continue;
@@ -642,16 +646,16 @@ impl PushDesk {
                 return false;
             }
             state.asking.remove(&host);
-            let observed = state.observed.remove(&host);
+            let observed = state.observed.remove(&host).unwrap_or_default();
             if current
                 .into_iter()
-                .chain(observed)
+                .chain(observed.iter().copied())
                 .any(|digest| digest != registered)
             {
                 // The record already says working, and the repeat reads the token as it stands.
                 return true;
             }
-            if current.is_none() && observed.is_none() {
+            if current.is_none() && observed.is_empty() {
                 drop(state);
                 self.stopped(
                     host,

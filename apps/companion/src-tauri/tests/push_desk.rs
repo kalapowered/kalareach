@@ -1273,3 +1273,56 @@ async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_re
         "the system was asked once, by the run that was given consent"
     );
 }
+
+/// Looks whose answers reach the desk out of order do not hide a change: the look that read the
+/// token first answers last, with the old token, and it does not take the place of what the look
+/// that read the new token showed. The run, whose own late answer is the old token too, goes round
+/// again with the new one and does not turn the host on with the old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_whose_older_answer_arrives_last_does_not_hide_a_change_another_look_saw() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    // The reads of the token are numbered as they are asked: the run's proposal (1), its comparison
+    // (2), the first look (3) and the second look (4). The comparison and the first look are held.
+    receiver.with(|state| {
+        state.token_held.extend([2, 3]);
+    });
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    let reads = || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .token_reads
+    };
+    eventually("the comparison read was asked", || reads() >= 2).await;
+    let first = Arc::clone(&phone.desk);
+    let first_look = tokio::spawn(async move { first.refresh().await });
+    eventually("the first look read the token", || reads() >= 3).await;
+
+    // The provider changes the token, and a second look reads the new one and is answered at once.
+    phone.receiver.token_is(SECOND_TOKEN);
+    look(&phone.desk).await;
+    // The older answers arrive after it: the first look's, then the run's.
+    phone.receiver.with(|state| {
+        state.token_released.insert(3);
+    });
+    first_look
+        .await
+        .expect("the first look ended")
+        .expect("a look");
+    phone.receiver.with(|state| {
+        state.token_released.insert(2);
+    });
+
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN, SECOND_TOKEN],
+        "the run went round again with the token the second look saw"
+    );
+}
