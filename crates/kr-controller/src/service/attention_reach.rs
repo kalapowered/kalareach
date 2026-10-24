@@ -6,6 +6,7 @@ use kr_ipc::client::BoundLink;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::SessionId;
 
+use crate::attention::ClosedJournal;
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 
@@ -190,13 +191,21 @@ impl crate::attention::Reach for AttentionReach {
         })
     }
 
-    fn closed_journal(&self, session_id: SessionId) -> Option<kr_worker::journal::Journal> {
-        let controller = self.0.upgrade()?;
+    fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
+        let Some(controller) = self.0.upgrade() else {
+            return ClosedJournal::Unreadable;
+        };
         // A session that closed under an earlier build wrote an earlier schema, and the archive
-        // brings it forward once, under this daemon's ownership of a session with no worker.
-        controller.archive().bring_forward(session_id);
-        kr_worker::journal::Journal::open_read_only(controller.paths.journal_database(session_id))
-            .ok()
+        // brings it forward once no worker may own it. Until then the journal is held back, which
+        // the store tries again later and does not take for a journal it cannot read.
+        let forward = controller.archive().bring_forward(session_id);
+        match kr_worker::journal::Journal::open_read_only(
+            controller.paths.journal_database(session_id),
+        ) {
+            Ok(journal) => ClosedJournal::Open(Box::new(journal)),
+            Err(_) if forward == crate::archive::Forward::HeldBack => ClosedJournal::HeldBack,
+            Err(_) => ClosedJournal::Unreadable,
+        }
     }
 
     fn output_floor(&self, session_id: SessionId) -> Option<u64> {

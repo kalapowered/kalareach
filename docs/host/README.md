@@ -1081,8 +1081,8 @@ A process identifier alone is never enough. Every ownership check compares the s
 so a recycled identifier reads as a different process. Neither carries a boot. On Linux the start
 value counts clock ticks since boot, so a process of a later boot that repeats a recorded worker's
 identifier and tick reads as that worker for as long as it runs: a start that finds the sessions of
-an earlier boot leaves such a session open, and it closes later as a crash and not as the host's
-restart. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
+an earlier boot leaves such a session open, and it closes later with the reason a worker found
+gone has, not as the host's restart. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
 A process query answers one of three things: the process and its start identity, gone, or cannot
@@ -4022,16 +4022,20 @@ journal not read for a closure of its own: its closure records the worker's end,
 among what the host could not account for, and so keeps the session's registration as a writer
 until the daemon next starts. The reason such a session closes with, a desktop lost with its login
 session, comes from the desktop the worker reported when it came up, which the registry keeps with
-the worker's row, so the worker's journal is not opened to find it. A migration of a session's
+the worker's row, so the worker's journal is not opened to find it. A desktop the worker bound to
+after it came up reaches the registry when the daemon next describes the worker, so a worker that
+goes before that closes as a crash. A migration of a session's
 journal is a write and takes the same lock, and when another holds it the store is left as it is and
 read as unmigrated. The offline importer holds the environment's singleton lock instead, which no daemon
 can be running under.
 
 **A session closed on request is closed the same way.** The daemon watches the worker it asked to
-close, and when the kernel says the worker has ended it takes the ownership and records the closure
-under it, whether or not the worker handed over a closure of its own. When another recovery holds the
-session, or the lock cannot be taken, nothing is recorded yet: the next list or read of the session
-that cannot reach its worker closes it, and so does the next start.
+close, looking every 200 milliseconds for a minute, and when the kernel says the worker has ended it
+takes the ownership and records the closure under it, whether or not the worker wrote a closure of
+its own in its journal. When another recovery holds the session, or the lock cannot be taken,
+nothing is recorded in that look. After the minute, the next list or read of the session that
+cannot reach its worker tries again, and so does the next start; each closes the session when it
+can take the lock.
 
 The order is that way round because the answer can be *no*: a daemon that fenced before it asked
 would delete a working session's socket on the way to finding out that it was working. A query the
@@ -4056,8 +4060,9 @@ and not absent from the machine; so is a session whose launch's process still ru
 lock and need no ownership: they only read what is there, and the writes that could change it (a
 recovery, a collection, a migration) take the lock and the value. A migration is held back the same
 way wherever it is asked for, by a session list, by the attention store's reading of a closed
-journal or by the transfer sweep: while a worker of the session may remain, the store is left as it
-is, and the sweep keeps what was submitted to the session without reading its archive. On Linux a
+journal or by the transfer sweep: while a worker of the session may remain, or the registry is busy
+for the moment, the store is left as it is and a later look makes the migration. The attention store
+keeps a session it could not read for that reason to try again, and does not finish it with gaps. On Linux a
 process of a later boot that repeats the launch process's identifier and start tick reads as the
 worker for as long as it runs, because an identity carries no boot; the reads and the collection
 leave the session alone until it ends.
@@ -4212,9 +4217,9 @@ reading the answer is *kept*, and a range that aged out is a gap and not a reaso
 ever. The age is counted from the time the closure recorded, which is the wall clock's reading when
 the closure was written, with no record of whether the clock could be proved then. Once nothing else
 keeps a file, a clock that was behind at that moment and has been corrected since shortens the thirty
-days by the error. A session the registry holds with a worker or a launch under way, or with no closure, or whose
-launch's process has not ended, keeps what was submitted to it; one neither the registry nor the
-archive knows about keeps nothing.
+days by the error. A session the registry holds with a worker or a launch under way, or with no
+closure, keeps what was submitted to it; one neither the registry nor the archive knows about keeps
+nothing.
 
 ## The backup service
 

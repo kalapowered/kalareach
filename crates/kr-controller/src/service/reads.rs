@@ -321,11 +321,12 @@ impl Controller {
 
     /// Refuses a read of a session whose worker this daemon has not confirmed gone.
     ///
-    /// Three things can say so, and a closure erases two of them: writing it removes the
-    /// registry's worker row and retires the published descriptor. So the closure carries the
-    /// third itself. A session closed without a confirmed death lists its worker as a surviving
-    /// resource rather than a terminated one, and that is what this reads once the other two are
-    /// gone.
+    /// Four things can say so, and a closure erases two of them: writing it removes the
+    /// registry's worker row and retires the published descriptor. The closure carries a third
+    /// itself: a session closed without a confirmed death lists its worker as a surviving
+    /// resource rather than a terminated one. The fourth is the process the session's launch ran,
+    /// which the reservation names and which is the worker until the kernel says it ended. These
+    /// are what this reads once the row and the descriptor are gone.
     ///
     /// # Errors
     ///
