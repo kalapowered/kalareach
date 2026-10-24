@@ -600,13 +600,20 @@ impl Drop for FeedRuntime {
 }
 
 /// What a person who finds the host refusing remote access for a withdrawal it cannot verify does:
-/// the devices and the grants the withdrawal names are what to revoke. A revocation at the machine
-/// needs no owner device's confirmation, and none is spent while the refusal stands.
-const UNVERIFIED_REMEDY: &str = "Revoke what the request names, at this machine, with `kr device \
-     revoke <device>` for a device and `kr share revoke <grant>` for a grant. Neither needs a \
-     confirmation. Remote access returns once the request names nothing live here. Until then no \
-     confirmation from an owner device is accepted, so a device cannot be paired. If the request \
-     names every owner device, the host guide says how the host is recovered once they are revoked.";
+/// the devices and the grants the withdrawal names are what to revoke, unless it names every owner
+/// device. A revocation at the machine needs no owner device's confirmation, and none is spent while
+/// the refusal stands, so a host whose last owner device is revoked can pair none again. The refusal
+/// is not stored, which is what the way out for that case rests on.
+const UNVERIFIED_REMEDY: &str = "Never revoke the last owner device of this host while this \
+     stands: no confirmation from an owner device is accepted until it ends, and a host with no \
+     owner device left cannot pair one again. Otherwise revoke what the request names, at this \
+     machine, with `kr device revoke <device>` for a device and `kr share revoke <grant>` for a \
+     grant. Neither needs a confirmation. Remote access returns once the request names nothing \
+     live here. If the request names every owner device, remove `authority.origin` from the \
+     configuration document and start the daemon again, which ends the refusal because the host \
+     keeps none of it. Then pair a new owner device, revoke what the request names, set \
+     `authority.origin` back and start the daemon again. Until you revoke them, this host serves \
+     the devices the request names, and while it reads no feed it learns no remote revocation.";
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \

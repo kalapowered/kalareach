@@ -1180,7 +1180,13 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         DoctorStatus::Warning,
         "a refusal that stands is a warning"
     );
-    assert!(check.remedy().is_some(), "and it says what to do about it");
+    // It says what to do about it: never to revoke the last owner device while the refusal stands,
+    // and the route that exists when the withdrawal names every owner device, which is to point
+    // `authority.origin` at none.
+    let remedy = check.remedy().expect("and it says what to do about it");
+    for named in ["last owner device", "authority.origin"] {
+        assert!(remedy.contains(named), "{named} is not in: {remedy}");
+    }
     // It names what the owner at the machine acts on: the device and the share the withdrawals
     // name, the owner who made them as the requests say, and that owner's key.
     let issuer_key = owner.0.keys().authorisation.key_id();
