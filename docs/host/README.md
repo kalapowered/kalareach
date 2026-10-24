@@ -6719,9 +6719,14 @@ Every spend of one is refused with `PERMISSION_DENIED` and the refusal's words, 
 takes that device's standing away whole. The confirmation is checked inside the write that spends
 it, and a refusal that rises waits for each such write that began before it, so none is spent under
 a standing the refusal took away. The wait asks for the pairing records' write lock, and asks again
-when the database is busy, twelve times at most: about a minute. After that it ends as if every spend
-had ended, so a spend that holds the lock for longer than that could still commit under the standing
-the refusal took away. What a spend that had committed before the refusal rose goes on
+for as long as a write holds it. It ends when it has the lock and at no other point, so a refusal
+that has risen has returned only when every write to the pairing records that began before it has
+ended. A spend holds the lock for a few milliseconds; the wait goes on past that only for a write
+that does not end, or a registry that cannot take a write at all. The refusal stands meanwhile, the
+carrier reads no more of the feed, and `kr doctor` shows the check as a warning that says the
+refusal waits for the registry to take a write, since when, and why; the log says it once. The
+wait asks again by itself and goes on when the registry takes a write. What a spend that had
+committed before the refusal rose goes on
 to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
 nothing else, so a refusal never turns into a weaker way to confirm. What the owner at the machine

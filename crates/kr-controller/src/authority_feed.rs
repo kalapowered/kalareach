@@ -78,7 +78,7 @@ use crate::grants::Refusal;
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
 use crate::quiet::{Quiet, Timer};
 use crate::service::Controller;
-use crate::service::remote_revocation::{Judged, Replay, Unverified};
+use crate::service::remote_revocation::{DrainWhy, Judged, Replay, Unverified};
 
 /// The deadlines the feed's exchanges are made under. A request and its answer are small.
 pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
@@ -554,6 +554,35 @@ impl FeedRuntime {
         } else {
             detail
         };
+        // A refusal this host raised waits for the registry to take a write, and the pass that
+        // raised it goes no further until it has: the refusal stands and nothing more is read.
+        let stuck = controller.stuck_drain();
+        let detail = match stuck {
+            Some(stuck) => {
+                let detail = detail.stated(
+                    "; a refusal this host raised on remote grants waits for the registry to \
+                         take a write, so this host reads no more of the feed until it has: ",
+                );
+                match stuck.why {
+                    DrainWhy::Held => detail
+                        .stated(
+                            "a write to the pairing records has held the registry's write lock \
+                             for at least ",
+                        )
+                        .number(now.saturating_sub(stuck.since_ms) / 1000)
+                        .stated(" seconds"),
+                    DrainWhy::Failed(kind) => detail
+                        .stated("the registry could not take the write, because ")
+                        .stated(kind),
+                }
+            }
+            None => detail,
+        };
+        let (state, remedy) = match (stuck, remedy) {
+            (Some(_), None) => (DoctorStatus::Warning, Some(STUCK_DRAIN_REMEDY)),
+            (Some(_), remedy) => (DoctorStatus::Warning, remedy),
+            (None, remedy) => (state, remedy),
+        };
         let detail = if observed.unnamed_owners > 0 {
             detail
                 .stated("; ")
@@ -660,6 +689,12 @@ const UNVERIFIED_WAITING_REMEDY: &str = concat!(
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
      this, the registry cannot take the write: check the disk and the permissions of the state \
      directory.";
+
+/// What a person who finds a refusal waiting for the registry to take a write does.
+const STUCK_DRAIN_REMEDY: &str = "This host asks again by itself and goes on once the registry \
+     takes a write; the refusal stands until then. Check that the disk of the state directory has \
+     room, that the daemon may write there and that no other program holds the registry database. \
+     If it stays like this, start the daemon again.";
 
 /// How many of each of the issuers, devices and grants a withdrawal names a check says by name.
 const MOST_NAMED: usize = 8;
