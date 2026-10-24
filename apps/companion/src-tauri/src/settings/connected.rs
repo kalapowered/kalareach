@@ -331,7 +331,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                     let device = Arc::clone(&device);
                     tauri::async_runtime::spawn(async move {
                         let pairing = device.pairing();
-                        let identity = pairing.candidate.paired_identity(host.device_id);
+                        let identity = pairing.paired_identity_for(&host);
                         let visit = async {
                             match pairing.link.connect_paired(&host, &identity).await {
                                 Ok(session) => listed(&Arc::new(session)).await,
