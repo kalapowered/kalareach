@@ -667,12 +667,18 @@ impl Rig {
         self.served.web().fail(path, 1, moment);
     }
 
-    /// The application is told to use another host, a plain one this device pairs with now, so that
-    /// the member host is one it only visits. The other host is returned to be kept running.
-    async fn uses_another_host(&self) -> Host {
+    /// A plain host this device pairs with now, returned to be kept running.
+    async fn pairs_another_host(&self) -> Host {
         let owner = DeviceKeys::generate().expect("keys");
         let other = Host::start(&owner).await;
         pair_under(&self.phone, &other, &owner, proposal(SERVED)).await;
+        other
+    }
+
+    /// The application is told to use another host, a plain one this device pairs with now, so that
+    /// the member host is one it only visits. The other host is returned to be kept running.
+    async fn uses_another_host(&self) -> Host {
+        let other = self.pairs_another_host().await;
         let listed = self
             .companion()
             .call("pairing_view", json!({}))
@@ -694,6 +700,20 @@ impl Rig {
             }
         }
         panic!("the other host is among the hosts paired");
+    }
+
+    /// The reference the inbox names the member host by.
+    fn member_reference(&self) -> String {
+        let device = self.companion().device();
+        let member = device
+            .pairing()
+            .hosts
+            .list()
+            .expect("the paired hosts")
+            .into_iter()
+            .find(|host| host.proposed_grant.organisation.as_ref().is_some())
+            .expect("the member host is paired");
+        companion_tauri::device::hosts::reference_of(&member)
     }
 
     /// The row the inbox shows for the member host when the device visits it, as it does a host it
@@ -2299,6 +2319,40 @@ async fn a_kept_visit_whose_account_leaves_before_its_session_list_publishes_not
     assert!(row.result.is_none(), "nothing was published: {row:?}");
     let said = row.refusal.expect("the reason").message;
     assert!(said.contains("sign in"), "{said}");
+}
+
+/// KR-REQ-17.53: the inbox answers for all the hosts at once and waits for the slowest. When the
+/// account signs out after the member host's pass ended and before a slow host answers, the answer
+/// has nothing of the member host: what it read was read for an account that has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_signed_out() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _in_use = rig.uses_another_host().await;
+    let device = rig.companion().device();
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+
+    // A second plain host is visited too, and the host in use stays the one it was. The member
+    // host's connection is kept and answers at once; the plain host's is made now, and held.
+    let _slow = rig.pairs_another_host().await;
+    rig.control.hold();
+    let asked = rig.control.asked_if_ended();
+    let (rows, ()) = tokio::join!(desk.visit(&device), async {
+        // The member host's pass asks once, at its end, whether its connection ended.
+        rig.control.until_asked_if_ended(asked + 1).await;
+        let _ = rig.tokens.sign_out().await;
+        rig.control.stop_holding();
+        rig.control.release_all();
+    });
+    let member = rig.member_reference();
+    assert!(
+        rows.iter().all(|row| row.reference != member),
+        "nothing read for the account that left is published: {rows:?}"
+    );
+    assert_eq!(rows.len(), 1, "the slow host answered: {rows:?}");
+    assert_eq!(rows[0].state, HostInboxState::Read, "{rows:?}");
 }
 
 /// KR-REQ-17.53: when the service turns a token back while the service is held off for a minute

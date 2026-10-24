@@ -1041,6 +1041,9 @@ pub struct LinkControl {
     /// Told when a request is held before it is sent, and when it is let go.
     request_arrived: tokio::sync::Notify,
     request_released: tokio::sync::Notify,
+    /// How many times a connection was asked whether this device ended it, and told each time.
+    ended_asked: std::sync::atomic::AtomicUsize,
+    ended_asks: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -1233,6 +1236,34 @@ impl LinkControl {
         self.request_released.notify_waiters();
     }
 
+    /// How many times a connection has been asked whether this device ended it.
+    pub fn asked_if_ended(&self) -> usize {
+        self.ended_asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits until a connection has been asked `count` times in all whether this device ended it,
+    /// and has answered.
+    pub async fn until_asked_if_ended(&self, count: usize) {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let asked = self.ended_asks.notified();
+                tokio::pin!(asked);
+                asked.as_mut().enable();
+                if self.asked_if_ended() >= count {
+                    return;
+                }
+                asked.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "connections were asked {} times whether this device ended them, not {count}",
+                self.asked_if_ended()
+            )
+        });
+    }
+
     /// Holds `frame` before it is sent when it is the request the test asked to hold.
     async fn before_sending(&self, frame: &ControlFrame) {
         let method = match frame {
@@ -1383,7 +1414,13 @@ impl kr_client::transport::ControlTransport for Tapped {
     }
 
     fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
-        self.inner.ended_by_this_device()
+        // Counted once the answer is known, so a test that waits for the question acts after it.
+        let ended = self.inner.ended_by_this_device();
+        self.control
+            .ended_asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.control.ended_asks.notify_waiters();
+        ended
     }
 
     fn send<'a>(
