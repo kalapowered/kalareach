@@ -455,6 +455,20 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
         assert!(enabled.status.success());
     }
 
+    // Which of the bundled agents this host offers: Gemini CLI's hooks are for a POSIX shell, so
+    // its package is not published for Windows and is not here.
+    let listed = managed.host.kr(&["--json", "plugin", "list"], &[]).await;
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    eprintln!("the plugins this host holds: {listed}");
+    assert!(
+        listed.contains("kalareach/claude-code") && listed.contains("kalareach/qoder-cli"),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("kalareach/gemini-cli"),
+        "Gemini CLI is offered on Windows: {listed}"
+    );
+
     let programs = stand_ins();
     let claude = stand_in(programs.path(), "claude");
     let _qoder = stand_in(programs.path(), "qodercli");
@@ -516,6 +530,37 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     assert!(
         !printed.contains("--dangerously-load-development-channels"),
         "a program started by its path was given the integration's flags: {printed}"
+    );
+
+    // Where the shell finds a shim first, nothing is established and the shim runs as typed: a
+    // batch file is run by the command shell, whose identity is not the agent's.
+    let shims = stand_ins();
+    std::fs::write(
+        shims.path().join("claude.cmd"),
+        "@if defined KR_REGISTRATION (echo shim-registered) else (echo shim-plain)\r\n",
+    )
+    .expect("a shim");
+    terminal
+        .type_line(&format!(
+            "$kr_path = $env:PATH; $env:PATH = '{}' + ';' + $env:PATH; Write-Output ('shim-' + 'set')",
+            shims.path().display()
+        ))
+        .await;
+    terminal
+        .shown("shim-set", "the shim is first on the path")
+        .await;
+    terminal.type_line("claude").await;
+    terminal.shown("shim-plain", "the shim ran").await;
+    terminal
+        .type_line("$env:PATH = $kr_path; Write-Output ('shim-' + 'done')")
+        .await;
+    terminal
+        .shown("shim-done", "the search path came back")
+        .await;
+    let shown = terminal.text();
+    assert!(
+        shown.contains("shim-plain") && !shown.contains("shim-registered"),
+        "a shim found first was launched through the forwarder: {shown}"
     );
 
     // The status the program ends with is the line's.

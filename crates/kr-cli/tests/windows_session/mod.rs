@@ -384,6 +384,7 @@ impl WorkerHost {
             .expect("the daemon is running")
             .seed_catalogue(&bundle)
             .await;
+        eprintln!("the bundled catalogue: {}", outcome.report());
         assert!(outcome.failure.is_none(), "{}", outcome.report());
     }
 
