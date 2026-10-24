@@ -417,7 +417,9 @@ the keys still queued ahead of the terminal. Two reads taken a moment apart desc
 instants, which is the ambiguity a fence exists to remove, so a qualified package takes them
 together. A reader cannot tell a byte a person typed from one the host put into the terminal for
 an application, such as the answer to a device query, and it does not try: what it has not read is
-unread input, and its queues are not drained until it has.
+unread input, and the Zsh, Bash and Fish readers do not report their queues drained until they have
+read it. The PowerShell reader counts the keys its editor has queued and nothing else, so bytes still
+in the terminal's queue or in .NET's input buffer are in none of its counts.
 
 A launch is never written into the pseudo-terminal. There is no wake marker and no launch string,
 because the process reading the terminal may not be the shell. A rejection installs nothing.
