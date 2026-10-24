@@ -226,15 +226,37 @@ impl GrantLifetimes {
     /// alternative is a device that keeps reconnecting on a grant this host has already decided is
     /// over.
     pub fn deadline(&self, record: &DeviceRecord) -> Result<Option<ContinuousInstant>> {
+        let over = || ControllerError::PermissionDenied {
+            detail: "this device's grant has run out; the owner can invite a device this host \
+                     has not paired before"
+                .to_owned(),
+        };
         match self.lifetime(record)? {
             Anchored::Unlimited => Ok(None),
-            Anchored::Until(deadline) => Ok(Some(deadline)),
-            Anchored::Over => Err(ControllerError::PermissionDenied {
-                detail: "this device's grant has run out; the owner can invite a device this host \
-                         has not paired before"
-                    .to_owned(),
-            }),
+            // An anchor taken in this run is returned from memory, so a device that comes back
+            // after its grant ran out is compared with the time here, on both clocks, and an end
+            // found is owed its record as any other is.
+            Anchored::Until(deadline) => {
+                if self.holds(Anchored::Until(deadline), record.grant.expiry) {
+                    Ok(Some(deadline))
+                } else {
+                    self.record_the_end_found(record);
+                    Err(over())
+                }
+            }
+            Anchored::Over => Err(over()),
         }
+    }
+
+    /// Owes the directory the end of `record`'s grant, which has just been found, and writes it
+    /// when it can: the tombstone a later boot reads, where this boot's deadline means nothing.
+    fn record_the_end_found(&self, record: &DeviceRecord) {
+        let moment = self
+            .clock_trust
+            .observe(&self.devices)
+            .unwrap_or_else(|_| self.wall_now());
+        self.pending_expiry.owe(record.device_id, moment);
+        self.pending_expiry.settle(&self.devices);
     }
 
     /// Returns what `record`'s grant's lifetime is in this boot, anchoring it the first time it is
@@ -279,14 +301,8 @@ impl GrantLifetimes {
             return Ok(GrantStanding::InForce);
         }
         if lifetime != Anchored::Over {
-            // Observed here, so it is written here: the tombstone is what a later boot reads,
-            // where this boot's deadline means nothing any more.
-            let moment = self
-                .clock_trust
-                .observe(&self.devices)
-                .unwrap_or_else(|_| self.wall_now());
-            self.pending_expiry.owe(record.device_id, moment);
-            self.pending_expiry.settle(&self.devices);
+            // Observed here, so it is written here.
+            self.record_the_end_found(record);
         }
         Ok(if self.pending_expiry.is_owed(record.device_id) {
             GrantStanding::Unrecorded
@@ -1306,6 +1322,53 @@ mod tests {
             panic!("a grant that has run out is refused its deadline: {refused:?}");
         };
         assert!(detail.contains("invite"), "{detail}");
+    }
+
+    /// A device whose grant was anchored in this run and ran out on the continuous clock before it
+    /// came back is refused its deadline, and the end is on record: the anchor is returned from
+    /// memory, and without the comparison the connection would be admitted and then ended by the
+    /// grant's own watch. The control: before the end, the deadline is given.
+    #[test]
+    fn a_grant_anchored_in_this_run_that_ran_out_is_refused_its_deadline() {
+        let devices = Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+        let now = kr_ipc::now_ms().get();
+        let wall = Arc::new(AtomicU64::new(now));
+        let clock = ManualClock::new();
+        let device = owner(
+            8,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 60_000),
+            },
+        );
+        devices.commit(&device).expect("the device");
+        let lifetimes = lifetimes_at(
+            &devices,
+            &clock,
+            &wall,
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+            &Arc::new(UtcFloor::default()),
+        );
+        assert!(
+            lifetimes.deadline(&device).expect("decided").is_some(),
+            "the control: the grant is anchored and has time left"
+        );
+
+        clock.advance(Duration::from_secs(61));
+        let refused = lifetimes.deadline(&device);
+        assert!(
+            matches!(refused, Err(ControllerError::PermissionDenied { .. })),
+            "{refused:?}"
+        );
+        lifetimes.settle();
+        assert!(
+            devices
+                .record_for_device(device.device_id)
+                .expect("readable")
+                .expect("the device")
+                .expired_at_ms
+                .is_some(),
+            "the end is on record"
+        );
     }
 
     /// While this boot's clock continuity is lost, nothing proves an expiring grant in force,

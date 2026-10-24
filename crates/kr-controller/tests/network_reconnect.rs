@@ -15,7 +15,7 @@ use kr_protocol::metrics::{
     Environment, HostMetrics, MetricOutcome, MetricsReport, ReconnectAttempt,
 };
 use kr_protocol::rights::ActionRight;
-use net_support::{Device, Host, connect, pair_with, proposal};
+use net_support::{Device, Host, MovedWall, connect, pair_with, paired_dial, proposal};
 
 /// A grant that sees a session and nothing more: all a device needs to hold a connection.
 const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
@@ -95,5 +95,62 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
     );
 
     session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-09.17 and KR-REQ-26.43: a device that comes back after its grant ran out, in a run that
+/// had anchored the grant, is refused at admission and counted refused in what the host reports,
+/// and not admitted and counted ok before the grant's own watch ends it. The host has seen its
+/// first connection end before the clock moves, so the return is a reconnection, and no one has
+/// observed the end: the anchor is answered from memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_17_a_device_that_comes_back_after_its_anchored_grant_ran_out_is_counted_refused()
+{
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = MovedWall::new();
+    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner, proposal(VIEWER)).await;
+
+    // The first connection anchors the grant, and ends.
+    let first = connect(&host, &device, &record).await;
+    first
+        .read::<_, kr_protocol::hostinfo::HostInfoResult>(Method::HostInfo, &())
+        .await
+        .expect("the host answers the device");
+    first.close();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while host.controller().network_connections_served() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the host sees the connection end");
+
+    // The grant is a day's: two days on, it has run out, and nothing has observed that.
+    wall.advance(std::time::Duration::from_secs(2 * 24 * 60 * 60));
+    if let Ok(transport) = paired_dial(&host, &device, &record).try_dial().await {
+        let session =
+            kr_client::session::Session::start(std::sync::Arc::new(transport)).expect("a session");
+        session
+            .read::<_, kr_protocol::hostinfo::HostInfoResult>(Method::HostInfo, &())
+            .await
+            .expect_err("the host turns a device with no grant away");
+    }
+    let report = counted(&host).await;
+    assert!(
+        report
+            .reconnect_time
+            .iter()
+            .any(|series| series.outcome == MetricOutcome::Refused),
+        "the return is counted refused: {report:?}"
+    );
+    assert!(
+        report
+            .reconnect_time
+            .iter()
+            .all(|series| series.outcome != MetricOutcome::Ok),
+        "and not admitted: {report:?}"
+    );
     host.stop().await;
 }
