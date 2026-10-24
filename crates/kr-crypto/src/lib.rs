@@ -127,8 +127,20 @@ pub fn initialise() -> Result<()> {
 
 /// Fills `buffer` from libsodium's random generator.
 ///
-/// This is the only randomness in the workspace. Every nonce, key, seed, identifier and code
-/// character comes from here, so a build has one generator to qualify rather than several.
+/// Every key, seed, nonce, code and other secret that the workspace's Rust code makes for a host or
+/// a client comes from here, so those have one generator to qualify. It is not the only randomness
+/// in the tree, and the rest is named so that it is not taken for this:
+///
+/// * Identifiers and file names that must be unique and that nothing treats as secret are
+///   version-four UUIDs, which the `uuid` crate fills from the operating system.
+/// * The release tool's development keys and its signatures use the `SystemRandom` of `aws-lc-rs`,
+///   on a build machine.
+/// * The libraries the cryptography guide lists draw their own: the pairing exchange, TLS and the
+///   transport between devices.
+/// * The companion's phone code uses the platform's own: the Android Keystore and `SecureRandom`
+///   for the keys and random files it holds, Foundation's `UUID` for identifiers on iOS, and, in
+///   the page it shows, `crypto.randomUUID` (or `Math.random` where that is missing) for local
+///   tokens.
 ///
 /// # Errors
 ///

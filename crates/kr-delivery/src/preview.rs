@@ -486,8 +486,9 @@ pub const fn generic_text(alert: PushAlert) -> &'static str {
 
 /// Mints a notification identifier, with nothing of the work in it.
 ///
-/// It is a version-four UUID: 122 random bits inside a 128-bit value, which is the workspace's
-/// random source and is far past what a provider or a gateway could enumerate.
+/// It is a version-four UUID: 122 random bits inside a 128-bit value, drawn from the operating
+/// system, which is far past what a provider or a gateway could enumerate. It names a notification
+/// and is not a secret.
 #[must_use]
 pub fn fresh_notification_id() -> NotificationId {
     NotificationId::new(kr_protocol::scalars::Uuid::from_bytes(
