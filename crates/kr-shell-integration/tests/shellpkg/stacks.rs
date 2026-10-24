@@ -1571,6 +1571,47 @@ impl Session {
         }
     }
 
+    /// Asks the reader what it is doing, again and again, until what it says is what the drive
+    /// is waiting for, and returns that answer.
+    ///
+    /// A key that follows another is typed once the reader has said the first one took effect,
+    /// and not after a delay. A reader that resolves a lone escape on a timer of its own reads a
+    /// key typed before the timer ran as part of the sequence the escape began, so on a machine
+    /// that stalls the shell for a moment the delay a drive allowed is the whole of what the next
+    /// key arrives in. The reader's own report of its keymap, or of what it is in the middle of,
+    /// is a condition that does not depend on the speed of the machine.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader never says it is in the state, naming what was waited for and what
+    /// the reader said last.
+    pub fn until_the_reader_shows<F>(
+        &mut self,
+        enter: &RootEditorEnterParams,
+        fence: FenceId,
+        what: &str,
+        reached: F,
+    ) -> ReaderMark
+    where
+        F: Fn(&ReaderMark) -> bool,
+    {
+        let deadline = Instant::now() + REPLY;
+        let mut last;
+        loop {
+            match self.reader_state_now(enter, fence) {
+                Ok(held) if reached(&held) => return held,
+                Ok(held) => last = format!("{:?} with {}", held.keymap, held.doing()),
+                Err(why) => last = why,
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reader never showed {what}; the last it said was {last}:\n{}",
+                self.terminal_output()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Ends the state a drive left the reader in, then proves the shell and the bridge still work.
     ///
     /// The command that proves it is typed only once the reader has said a typed line would be

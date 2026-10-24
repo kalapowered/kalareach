@@ -862,10 +862,37 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         let vi_prompt = session.next_prompt();
         std::thread::sleep(Duration::from_millis(300));
         session.forget_events();
-        session.type_bytes(ESCAPE);
-        std::thread::sleep(Duration::from_millis(120));
-        session.type_bytes(b"d");
-        std::thread::sleep(Duration::from_millis(120));
+        if kind == ShellKind::Fish {
+            // This reader resolves a lone escape on a timer of its own, and a key that is already
+            // there when the timer is read goes with the escape as the sequence it began (the
+            // escape and a d are alt-d, and no operator waits for anything). On a machine that
+            // stalls the shell for a moment the delay a drive allows is the whole of what the
+            // next key arrives in, so each key goes in once the reader has said the one before
+            // it took effect: the escape once the reader is in the command keymap, and the
+            // operator once the reader is waiting behind it, which it holds back as the first key
+            // of the sequences that begin with it and reports as a sequence in progress.
+            session.type_bytes(ESCAPE);
+            session.until_the_reader_shows(
+                &vi_prompt,
+                fence_id(20),
+                "the command keymap",
+                |held| held.keymap == kr_protocol::root::EditorKeymap::ViCommand,
+            );
+            session.type_bytes(b"d");
+            session.until_the_reader_shows(
+                &vi_prompt,
+                fence_id(21),
+                "the operator waiting",
+                |held| held.pending.vi_motion || held.pending.multikey_sequence,
+            );
+        } else {
+            // The readers that wait out a lone escape in their own poll are not asked while they
+            // do, since a question restarts the wait and an escape that is asked about never ends.
+            session.type_bytes(ESCAPE);
+            std::thread::sleep(Duration::from_millis(120));
+            session.type_bytes(b"d");
+            std::thread::sleep(Duration::from_millis(120));
+        }
         session.type_bytes(CTRL_D);
         assert!(
             !session.saw_event(Duration::from_millis(600), |event| matches!(
