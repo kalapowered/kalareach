@@ -56,6 +56,22 @@ pub struct Binding {
 }
 
 impl Binding {
+    fn new(
+        inner: Arc<dyn ControlTransport>,
+        generation: String,
+        changes: watch::Receiver<AccountStatus>,
+        lease: LeaseGate,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            generation,
+            changes: Mutex::new(changes),
+            lease,
+            presented: AtomicBool::new(false),
+            inner,
+            stop: OnceLock::new(),
+        })
+    }
+
     /// The reason the connection has ended, finding out first whether it should have: nothing is
     /// read of the account's store, only what it published.
     fn check(&self) -> Option<ProtocolError> {
@@ -138,14 +154,7 @@ impl BoundTransport {
         mut task_changes: watch::Receiver<AccountStatus>,
         lease: LeaseGate,
     ) -> Arc<dyn ControlTransport> {
-        let binding = Arc::new(Binding {
-            generation,
-            changes: Mutex::new(gate_changes),
-            lease,
-            presented: AtomicBool::new(false),
-            inner,
-            stop: OnceLock::new(),
-        });
+        let binding = Binding::new(inner, generation, gate_changes, lease);
         let over = Arc::new(Notify::new());
         let watching = Arc::clone(&binding);
         let ended = Arc::clone(&over);
@@ -232,5 +241,81 @@ impl ControlTransport for BoundTransport {
     fn close(&self) {
         self.over.notify_one();
         self.binding.inner.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection that only knows when it is closed.
+    #[derive(Debug, Default)]
+    struct Closing(AtomicBool);
+
+    impl ControlTransport for Closing {
+        fn connection_id(&self) -> ConnectionId {
+            unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn limits(&self) -> ReceiveLimits {
+            unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn initial_action_window(&self) -> ActionWindow {
+            unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+            None
+        }
+
+        fn send<'a>(&'a self, _: &'a ControlFrame) -> TransportFuture<'a, ()> {
+            unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn claim_receiver(&self) -> Result<()> {
+            unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+            unreachable!("the connection is only asked whether it ended")
+        }
+
+        fn revoke_streams(&self) {}
+
+        fn close(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn signed_in(generation: &str) -> AccountStatus {
+        AccountStatus::SignedIn {
+            email: None,
+            name: None,
+            scopes: Vec::new(),
+            generation: generation.to_owned(),
+        }
+    }
+
+    /// Two callers ask whether the account left, one just after the other, and the first has found
+    /// the change but not yet kept the reason. The second still finds the connection ended.
+    #[test]
+    fn a_second_look_finds_the_change_the_first_has_not_yet_recorded() {
+        let (account, status) = watch::channel(signed_in("first"));
+        let inner = Arc::new(Closing::default());
+        let binding = Binding::new(
+            Arc::clone(&inner) as Arc<dyn ControlTransport>,
+            "first".to_owned(),
+            status,
+            Arc::new(|| Ok(())),
+        );
+        account.send_replace(AccountStatus::SignedOut);
+
+        assert_eq!(binding.account_left(), Some(LeaseStop::SignIn));
+        assert!(
+            binding.check().is_some(),
+            "the account left, and the connection is not ended"
+        );
+        assert!(inner.0.load(Ordering::SeqCst), "the connection was closed");
     }
 }
