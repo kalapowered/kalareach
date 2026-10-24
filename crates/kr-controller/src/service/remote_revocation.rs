@@ -71,6 +71,10 @@ pub(crate) enum Judged {
     Refuse(RejectionReason),
     /// This host applies it.
     Apply(Plan),
+    /// This host cannot yet say whether the device that made it was revoked by a record later in the
+    /// feed, because no scan of this run has read the feed through: it is judged by the scan that
+    /// follows the first one that has.
+    Wait,
 }
 
 /// Whether a paired device may, now, manage this host.
@@ -113,26 +117,33 @@ pub(crate) struct Unverified {
     /// The identifier and the key each request names for its issuer.
     pub(crate) issuers: std::collections::BTreeSet<(DeviceId, KeyId)>,
     /// The devices this host holds live that the requests name, the holders of a pairing grant a
-    /// request names among them.
-    pub(crate) devices: std::collections::BTreeSet<DeviceId>,
+    /// request names among them, each with the place in the feed (the record's sequence) of the
+    /// first request that names it.
+    pub(crate) devices: std::collections::BTreeMap<DeviceId, u64>,
     /// The grants in the grant store, live, that the requests name.
     pub(crate) grants: std::collections::BTreeSet<GrantId>,
 }
 
 impl Unverified {
-    /// What one request that names `plan` and says it was made by `issuer`, with `key`, comes to.
-    fn of(issuer: DeviceId, key: KeyId, plan: &Plan) -> Self {
+    /// What one request at `place` in the feed that names `plan` and says it was made by `issuer`,
+    /// with `key`, comes to.
+    fn of(issuer: DeviceId, key: KeyId, plan: &Plan, place: u64) -> Self {
         Self {
             issuers: [(issuer, key)].into_iter().collect(),
-            devices: plan.devices.iter().copied().collect(),
+            devices: plan.devices.iter().map(|device| (*device, place)).collect(),
             grants: plan.grants.iter().copied().collect(),
         }
     }
 
-    /// Adds what `other` found.
+    /// Adds what `other` found. A device keeps the earliest place that names it.
     pub(crate) fn extend(&mut self, other: &Self) {
         self.issuers.extend(other.issuers.iter().copied());
-        self.devices.extend(other.devices.iter().copied());
+        for (device, place) in &other.devices {
+            self.devices
+                .entry(*device)
+                .and_modify(|held| *held = (*held).min(*place))
+                .or_insert(*place);
+        }
         self.grants.extend(other.grants.iter().copied());
     }
 
@@ -147,12 +158,41 @@ impl Unverified {
 #[derive(Debug, Default)]
 pub(crate) struct Withheld {
     found: Unverified,
-    keys: std::collections::BTreeSet<kr_protocol::scalars::AuthorisationKey>,
+    /// The keys of the named devices, each with the earliest place in the feed that names a device
+    /// holding it.
+    keys: std::collections::BTreeMap<kr_protocol::scalars::AuthorisationKey, u64>,
     /// The keys among `keys` that the feed is known not to list as permitted to remove it: the
     /// feed answered a change of its list that left them out, or showed a list without them.
     unlisted: std::collections::BTreeSet<kr_protocol::scalars::AuthorisationKey>,
     /// Whether the keys of some device `found` names could not be read, so that `keys` is short.
     keys_unresolved: bool,
+}
+
+/// Where in the feed this run found the devices it revoked, so that a request is judged by the
+/// standing its issuer had at its own place in the feed.
+///
+/// The feed's order is the order the host took requests in. A request the host put off, or could not
+/// judge, while it was behind its feed or could not tell the time is judged later, after the records
+/// that follow it have been carried out again; an issuer revoked by one of those later records was
+/// the owner's when its request was made. The places are read from the feed by the first scan of
+/// every run, which begins at the first record, so nothing is stored for them.
+#[derive(Debug, Default)]
+pub(crate) struct FeedPlaces {
+    /// The earliest place of a complete record this run saw that names the device and that this
+    /// host could have carried out.
+    explained: std::collections::BTreeMap<DeviceId, u64>,
+    /// Whether a scan of this run has read the feed through, so that `explained` holds every
+    /// record the feed has.
+    through: bool,
+}
+
+impl FeedPlaces {
+    fn explain(&mut self, device: DeviceId, place: u64) {
+        self.explained
+            .entry(device)
+            .and_modify(|held| *held = (*held).min(place))
+            .or_insert(place);
+    }
 }
 
 /// What the registry shows of who made a request the feed shows complete.
@@ -177,24 +217,35 @@ impl Controller {
         &self,
         request: &RevocationRequest,
         now_ms: u64,
+        place: u64,
     ) -> Result<Judged> {
         let host = self.host_device_id();
         if request.host_device_id != host {
             return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
         }
-        let Some(issuer) = self
-            .devices
-            .record_for_device(request.issuer_device_id)?
-            .filter(DeviceRecord::is_paired)
-        else {
+        let Some(mut issuer) = self.devices.record_for_device(request.issuer_device_id)? else {
             return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
         };
+        if issuer.revoked_at_ms.is_some() && issuer.expired_at_ms.is_none() {
+            // A device that is revoked made no request after its revocation. When a record that
+            // follows this request in the feed is what revoked it, it was the owner's at this
+            // place; a revocation no record in the feed explains is the owner's at this machine,
+            // which has no place in the feed, and it refuses the request as ever.
+            match self.revoked_later_in_the_feed(issuer.device_id, place) {
+                Some(true) => issuer.revoked_at_ms = None,
+                Some(false) => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
+                None => return Ok(Judged::Wait),
+            }
+        }
+        if !issuer.is_paired() {
+            return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
+        }
         if kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
             .is_err()
         {
             return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
         }
-        match self.standing_to_manage(&issuer, now_ms) {
+        match self.standing_to_manage(&issuer, now_ms, Some(place)) {
             Standing::Holds => {}
             Standing::Not => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
             Standing::Undecided(Refusal::ClockUnproven) => {
@@ -243,11 +294,18 @@ impl Controller {
     /// grants is left out, because the feed is how a known owner reaches the host then. Everything
     /// else, the rights, the selectors, an organisation's lease, an exclusive management, the
     /// ceiling and the clock, is decided as it is for the device's own request.
-    fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
+    fn standing_to_manage(
+        &self,
+        device: &DeviceRecord,
+        now_ms: u64,
+        place: Option<u64>,
+    ) -> Standing {
         // A device a withdrawal this host cannot verify names keeps no standing over the feed, nor
         // does one that holds a key it holds, because a feed removes by key. Else the device the
-        // withdrawal would take its standing from could end the refusal by removing the feed.
-        if self.withheld_from_the_feed(device) {
+        // withdrawal would take its standing from could end the refusal by removing the feed. A
+        // request at `place` in the feed is judged by the standing its issuer had there: a
+        // withdrawal that comes later in the feed took nothing from it yet.
+        if self.withheld_from_the_feed(device, place) {
             return Standing::Not;
         }
         let ceiling = self.configured_rights_ceiling();
@@ -414,7 +472,8 @@ impl Controller {
             .devices()?
             .into_iter()
             .filter(|record| {
-                record.is_paired() && self.standing_to_manage(record, now_ms) == Standing::Holds
+                record.is_paired()
+                    && self.standing_to_manage(record, now_ms, None) == Standing::Holds
             })
             .collect();
         owners.sort_by_key(|record| (record.paired_at_ms, record.device_id));
@@ -673,13 +732,26 @@ impl Controller {
     ///
     /// Returns an error when a record cannot be read, a revocation cannot be written or its barrier
     /// cannot be raised.
-    pub(crate) async fn replay_feed_request(&self, request: &RevocationRequest) -> Result<Replay> {
+    pub(crate) async fn replay_feed_request(
+        &self,
+        request: &RevocationRequest,
+        place: u64,
+    ) -> Result<Replay> {
         let host = self.host_device_id();
         if request.host_device_id != host {
             return Ok(Replay::Done);
         }
         let named = self.plan_of(request)?;
         let held = self.devices.devices()?;
+        let issuer = self.issuer_of_a_completed_request(request, &held);
+        if matches!(issuer, Issuer::Could) {
+            // What this request revoked, or found revoked already, is explained by its place in the
+            // feed, whoever revoked it first in this registry.
+            let mut places = self.feed_places();
+            for device in &named.devices {
+                places.explain(*device, place);
+            }
+        }
         let mut plan = Plan {
             devices: named
                 .devices
@@ -704,7 +776,7 @@ impl Controller {
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(Replay::Done);
         }
-        match self.issuer_of_a_completed_request(request, &held) {
+        match issuer {
             Issuer::Could => {}
             Issuer::CouldNot => return Ok(Replay::Done),
             Issuer::Unknown => {
@@ -712,6 +784,7 @@ impl Controller {
                     request.issuer_device_id,
                     request.issuer_key_id,
                     &plan,
+                    place,
                 )));
             }
         }
@@ -785,7 +858,14 @@ impl Controller {
             let mut held = self.feed_withheld();
             held.found.extend(found);
             match &keys {
-                Ok(keys) => held.keys.extend(keys.iter().copied()),
+                Ok(keys) => {
+                    for (key, place) in keys {
+                        held.keys
+                            .entry(*key)
+                            .and_modify(|held| *held = (*held).min(*place))
+                            .or_insert(*place);
+                    }
+                }
                 Err(_) => held.keys_unresolved = true,
             }
         }
@@ -819,14 +899,20 @@ impl Controller {
             // to go on.
             match &keys {
                 Ok(keys) => {
-                    held.keys = keys.iter().copied().collect();
+                    held.keys.clear();
+                    for (key, place) in keys {
+                        held.keys
+                            .entry(*key)
+                            .and_modify(|held| *held = (*held).min(*place))
+                            .or_insert(*place);
+                    }
                     held.keys_unresolved = false;
                 }
                 Err(_) => held.keys_unresolved = true,
             }
             // Nothing more is known of a key that stays than was.
             let kept = held.keys.clone();
-            held.unlisted.retain(|key| kept.contains(key));
+            held.unlisted.retain(|key| kept.contains_key(key));
         }
         self.move_a_feed_refusal(
             WITHDRAWAL_UNVERIFIED,
@@ -848,7 +934,7 @@ impl Controller {
     pub(crate) fn withheld_key_ids(&self) -> Vec<KeyId> {
         self.feed_withheld()
             .keys
-            .iter()
+            .keys()
             .map(|key| kr_crypto::keys::key_id(KeyPurpose::Authorisation, key.as_bytes()))
             .collect()
     }
@@ -856,14 +942,14 @@ impl Controller {
     /// Notes that the feed lists none of the keys held back now as permitted to remove it.
     pub(crate) fn feed_lists_no_withheld_key(&self) {
         let mut held = self.feed_withheld();
-        held.unlisted = held.keys.clone();
+        held.unlisted = held.keys.keys().copied().collect();
     }
 
     /// Whether the feed may still list a key that a withdrawal this host cannot verify takes the
     /// right to remove it from: a device the withdrawal names could then have removed the feed.
     fn a_withheld_key_may_still_remove_the_feed(&self) -> bool {
         let held = self.feed_withheld();
-        held.keys_unresolved || !held.keys.is_subset(&held.unlisted)
+        held.keys_unresolved || held.keys.keys().any(|key| !held.unlisted.contains(key))
     }
 
     fn feed_withheld(&self) -> std::sync::MutexGuard<'_, Withheld> {
@@ -876,21 +962,68 @@ impl Controller {
     fn keys_of_the_named(
         &self,
         found: &Unverified,
-    ) -> Result<Vec<kr_protocol::scalars::AuthorisationKey>> {
+    ) -> Result<Vec<(kr_protocol::scalars::AuthorisationKey, u64)>> {
         Ok(self
             .devices
             .devices()?
             .into_iter()
-            .filter(|record| found.devices.contains(&record.device_id))
-            .map(|record| record.authorisation)
+            .filter_map(|record| {
+                found
+                    .devices
+                    .get(&record.device_id)
+                    .map(|place| (record.authorisation, *place))
+            })
             .collect())
     }
 
     /// Whether `device` is one a withdrawal this host cannot verify names, or holds a key one of
-    /// them holds.
-    fn withheld_from_the_feed(&self, device: &DeviceRecord) -> bool {
+    /// them holds, at `place` in the feed: the withdrawal is earlier in the feed than the place, or
+    /// there is no place, for a question that is not about a request.
+    fn withheld_from_the_feed(&self, device: &DeviceRecord, place: Option<u64>) -> bool {
         let held = self.feed_withheld();
-        held.found.devices.contains(&device.device_id) || held.keys.contains(&device.authorisation)
+        let named_at = [
+            held.found.devices.get(&device.device_id),
+            held.keys.get(&device.authorisation),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .copied();
+        named_at.is_some_and(|named| place.is_none_or(|place| named < place))
+    }
+
+    fn feed_places(&self) -> std::sync::MutexGuard<'_, FeedPlaces> {
+        self.feed_places
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the device `issuer` was revoked by a record that comes later in the feed than
+    /// `place`: `Some(true)` when the first record this run saw that names it is later,
+    /// `Some(false)` when it is not later or none is and the feed has been read through, and `None`
+    /// while no scan of this run has read it through and nothing explains the revocation yet.
+    fn revoked_later_in_the_feed(&self, issuer: DeviceId, place: u64) -> Option<bool> {
+        let places = self.feed_places();
+        match places.explained.get(&issuer) {
+            Some(named) => Some(*named > place),
+            None if places.through => Some(false),
+            None => None,
+        }
+    }
+
+    /// Notes that a scan of this run has read the feed through: the places it saw are all there
+    /// are, and a request is no longer held back to wait for them.
+    pub(crate) fn feed_read_through(&self) {
+        self.feed_places().through = true;
+    }
+
+    /// Notes the devices a request at `place` revoked when it was carried out, for the places a
+    /// later request is judged by.
+    pub(crate) fn feed_request_revoked(&self, plan: &Plan, place: u64) {
+        let mut places = self.feed_places();
+        for device in &plan.devices {
+            places.explain(*device, place);
+        }
     }
 
     /// Raises or lifts one of the two refusals the feed puts on every remote grant: the policy's
@@ -1347,7 +1480,7 @@ mod tests {
         );
 
         let found = Unverified {
-            devices: [named.device_id].into_iter().collect(),
+            devices: [(named.device_id, 1)].into_iter().collect(),
             ..Unverified::default()
         };
         controller
