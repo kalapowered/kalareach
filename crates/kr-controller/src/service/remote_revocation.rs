@@ -706,16 +706,24 @@ impl Controller {
     /// that is exclusively organisation-managed. A restriction does not wait for its record to be
     /// written, so a registry that cannot take a write restricts all the same.
     ///
-    /// It rises as the other two refusals do, in the order a withdrawal takes its locks in, so that
-    /// work which checked the refusal before it rose has committed before it returns.
+    /// It rises as the other refusals do, in the order a withdrawal takes its locks in, so that
+    /// work which checked the refusal before it rose has committed before it returns, and it ends
+    /// the links of the connections it reaches. It does not wait for the writes to the pairing
+    /// records that were under way, as the two refusals on every remote grant do: an owner
+    /// confirmation reads those two and never the removal, so the wait would order nothing, and a
+    /// registry that cannot take a write would keep the removal from being recorded and shown.
     async fn refuse_the_grants_that_rest_on_the_feed(&self) {
-        self.move_a_feed_refusal(
-            RemoteRefusal::FEED_REMOVED,
-            true,
-            crate::grants::HostPolicy::feed_removed,
-            crate::grants::HostPolicy::set_feed_removed,
-        )
-        .await;
+        if self
+            .put_a_feed_refusal(
+                RemoteRefusal::FEED_REMOVED,
+                true,
+                crate::grants::HostPolicy::feed_removed,
+                crate::grants::HostPolicy::set_feed_removed,
+            )
+            .await
+        {
+            self.release_the_links_the_feed_refuses();
+        }
     }
 
     /// Raises the refusal of the grants that rest on the feed as a start restores a removal, and
@@ -1055,13 +1063,12 @@ impl Controller {
         named_at.is_some_and(|named| place.is_none_or(|place| named < place))
     }
 
-    /// Raises or lifts one of the refusals the feed puts on every remote grant, and when it raises
-    /// one, ends the links of the connections it reaches and waits for the writes to the pairing
-    /// records that were under way ([`Self::put_a_feed_refusal`]).
+    /// Raises or lifts one of the two refusals the feed puts on every remote grant, and when it
+    /// raises one, ends the links of the connections it reaches and waits for the writes to the
+    /// pairing records that were under way ([`Self::put_a_feed_refusal`]). The removal of the host
+    /// is raised without that wait ([`Self::refuse_the_grants_that_rest_on_the_feed`]).
     ///
-    /// The callers are the carrier's one pass at a time. A start that restores a removal raises it
-    /// through [`Self::put_a_feed_refusal`] and waits for nothing
-    /// ([`Self::refuse_the_grants_that_rest_on_the_feed_at_start`]).
+    /// The callers are the carrier's one pass at a time.
     async fn move_a_feed_refusal(
         &self,
         bit: u8,
@@ -1137,8 +1144,8 @@ impl Controller {
     /// the wait goes on, and why ([`Self::stuck_drain`]). Each ask holds the connection of the
     /// daemon's own handle on the pairing records, so other users of that handle wait as long.
     ///
-    /// The only caller is the carrier's one pass at a time, so two waits do not overlap. A start
-    /// that restores a removal waits for nothing ([`Self::put_a_feed_refusal`]).
+    /// The only caller is the carrier's one pass at a time, so two waits do not overlap. The
+    /// removal of the host does not wait, whether the carrier raises it or a start restores it.
     async fn wait_for_the_confirmations_being_spent(&self) {
         loop {
             let devices = Arc::clone(&self.devices);
@@ -2067,6 +2074,61 @@ mod tests {
         rise.await
             .expect("the rise returns once the registry takes a write");
         assert!(controller.stuck_drain().is_none());
+    }
+
+    /// KR-REQ-24.15: the feed's removal of this host rises at once while a write to the pairing
+    /// records is held. No owner confirmation reads the removal, so the carrier raises it and ends
+    /// the links it reaches without the wait that the two refusals on every remote grant make, and
+    /// a registry that cannot take a write does not keep the grants that rest on the feed from
+    /// being refused. Another handle holds a write here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_removal_of_the_host_rises_at_once_while_a_write_to_the_pairing_records_is_held() {
+        use crate::service::a_transfer_left_unanswered::daemon;
+        use crate::service::net::devices::DeviceDirectory;
+
+        let (temp, controller) = daemon().await;
+        let beside = DeviceDirectory::open_beside(
+            temp.environment().registry_database(),
+            controller.devices(),
+        )
+        .expect("a second handle on the registry");
+        let (inside, under_way) = tokio::sync::oneshot::channel();
+        let (go, held_open) = std::sync::mpsc::channel::<()>();
+        let write = std::thread::spawn(move || {
+            beside.transaction(|_| {
+                inside.send(()).expect("the case waits for the write");
+                held_open.recv().expect("the case lets the write go on");
+                Ok(())
+            })
+        });
+        under_way.await.expect("the write is under way");
+
+        let refusing = tokio::spawn({
+            let controller = std::sync::Arc::clone(&controller);
+            async move { controller.refuse_the_grants_that_rest_on_the_feed().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while !refusing.is_finished() && controller.stuck_drain().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the removal rises or the wait says it goes on");
+        assert!(
+            controller.stuck_drain().is_none(),
+            "the removal made no wait for the registry"
+        );
+        refusing.await.expect("the removal has risen");
+        assert!(
+            controller.policy().feed_removed(),
+            "and the grants that rest on the feed are refused"
+        );
+
+        go.send(()).expect("the write goes on");
+        write
+            .join()
+            .expect("the write ends")
+            .expect("the write commits");
     }
 
     /// KR-REQ-24.15: a start that restores the feed's removal waits for nothing. No endpoint is
