@@ -128,7 +128,18 @@ impl Controller {
     ) -> Option<crate::grants::Refusal> {
         connection
             .filter(|connection| connection.door == Door::Network)
-            .and_then(|connection| self.feed_refusal(connection.grant.as_ref()))
+            .and_then(|connection| {
+                // The grant the connection was admitted under, and each share it has decided a
+                // request under: a share keeps the organisation requirement of what it was
+                // delegated from, so the removal reaches it when it does not reach the pairing
+                // grant.
+                self.feed_refusal(connection.grant.as_ref()).or_else(|| {
+                    connection
+                        .shares
+                        .values()
+                        .find_map(|share| self.feed_refusal(Some(share)))
+                })
+            })
     }
 
     /// The admission check a mutation's own effect repeats, when it is carrying an admission.
@@ -426,6 +437,20 @@ impl Controller {
             .get_mut(&connection_id)
             .map(|registration| registration.acting.insert(grant_id))
             .is_some()
+    }
+
+    /// Records the share a connection decides a request under, as the grant store holds it, so
+    /// that what the authority feed refuses of a share is asked where its work commits.
+    ///
+    /// Called after the share's record was read, which is after [`Self::note_acting`] noted it.
+    pub(crate) fn note_share(
+        &self,
+        connection_id: ConnectionId,
+        grant: &kr_protocol::grant::Grant,
+    ) {
+        if let Some(registration) = self.admitted_table().get_mut(&connection_id) {
+            registration.shares.insert(grant.grant_id, grant.clone());
+        }
     }
 
     /// The grants a connection has decided a request under, so a revocation of any of them
@@ -1114,6 +1139,8 @@ pub(super) struct AdmittedConnection {
     /// The pairing grant a connection through the network was admitted under, which says whether
     /// the authority feed's removal refuses it ([`Controller::feed_refusal`]).
     grant: Option<kr_protocol::grant::Grant>,
+    /// The shares the connection has decided a request under, as the grant store holds them.
+    shares: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::grant::Grant>,
 }
 
 /// The door a connection came through, which is where a session it creates takes its
@@ -1145,6 +1172,7 @@ impl AdmittedConnection {
             acting: std::collections::BTreeSet::new(),
             door: Door::Network,
             grant: None,
+            shares: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1168,6 +1196,7 @@ impl AdmittedConnection {
             acting: std::collections::BTreeSet::new(),
             door: Door::Local(kind),
             grant: None,
+            shares: std::collections::BTreeMap::new(),
         }
     }
 }
