@@ -20,6 +20,7 @@ use kr_voice::seams::HostReceipt;
 
 use crate::error::{ControllerError, Result};
 use crate::grants::CloseHold;
+use crate::service::net::devices::DeviceRecord;
 use crate::service::net::lifetimes::Anchored;
 use crate::service::net::proxy::Vouched;
 
@@ -83,6 +84,18 @@ impl Controller {
             .ok_or_else(|| ControllerError::PermissionDenied {
                 detail: "the voice grant this action was admitted under has ended".to_owned(),
             })?;
+        // What the refusal the authority feed puts on remote grants is asked of, where the close
+        // waits for the worker's link: the device's pairing grant beside the voice grant the close
+        // travels under. The close runs on a task that outlives the connection it arrived on, so
+        // this is taken before anything is awaited and not read from that connection later.
+        let paired = self
+            .devices
+            .record_for_device(proposal.device_id)?
+            .filter(DeviceRecord::is_paired)
+            .ok_or_else(|| ControllerError::PermissionDenied {
+                detail: "this device is no longer paired with this host".to_owned(),
+            })?;
+        let standing = self.feed_standing(connection_id, &paired.grant, &record.grant);
         match self.lifetimes().stored(self.sharing.grants(), &record)? {
             Anchored::Unlimited => {}
             Anchored::Until(end) => allowed = allowed.min(end.saturating_duration_since(now)),
@@ -145,6 +158,7 @@ impl Controller {
                         // Stopping owned execution does not depend on the remote lease.
                         lease: None,
                     },
+                    &standing,
                     accepted,
                     None,
                     answer,

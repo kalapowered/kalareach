@@ -142,6 +142,42 @@ impl Controller {
             })
     }
 
+    /// The standing a remote request takes with it: its connection's pairing grant, the grant the
+    /// request is decided under, and each share the connection has decided a request under.
+    ///
+    /// Work that outlives its connection asks the authority feed's refusal of this and not of the
+    /// connection table, which no longer holds the connection once it has ended. The pairing grant
+    /// and the acting grant are the caller's to give, so they are never recovered from a table
+    /// that may have lost the entry; the shares are added when the entry is still there.
+    pub(crate) fn feed_standing(
+        &self,
+        connection_id: ConnectionId,
+        pairing: &kr_protocol::grant::Grant,
+        acting: &kr_protocol::grant::Grant,
+    ) -> FeedStanding {
+        let mut grants = BTreeMap::new();
+        for grant in [pairing, acting] {
+            grants.insert(grant.grant_id, grant.clone());
+        }
+        if let Some(connection) = self.admitted_table().get(&connection_id) {
+            for (grant_id, share) in &connection.shares {
+                grants.entry(*grant_id).or_insert_with(|| share.clone());
+            }
+        }
+        FeedStanding { grants }
+    }
+
+    /// The refusal the authority feed puts on any grant of `standing`, when one stands.
+    pub(crate) fn feed_refusal_for(
+        &self,
+        standing: &FeedStanding,
+    ) -> Option<crate::grants::Refusal> {
+        standing
+            .grants
+            .values()
+            .find_map(|grant| self.feed_refusal(Some(grant)))
+    }
+
     /// The admission check a mutation's own effect repeats, when it is carrying an admission.
     ///
     /// A withdrawal is several writes and not all of them are in one store, and each waits for a
@@ -1141,6 +1177,13 @@ pub(super) struct AdmittedConnection {
     grant: Option<kr_protocol::grant::Grant>,
     /// The shares the connection has decided a request under, as the grant store holds them.
     shares: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::grant::Grant>,
+}
+
+/// The grants a remote request stands on, copied when the work starts
+/// ([`Controller::feed_standing`]).
+#[derive(Clone, Debug)]
+pub(crate) struct FeedStanding {
+    grants: BTreeMap<kr_protocol::ids::GrantId, kr_protocol::grant::Grant>,
 }
 
 /// The door a connection came through, which is where a session it creates takes its

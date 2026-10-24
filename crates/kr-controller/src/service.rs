@@ -100,7 +100,9 @@ pub use revocation::Audience;
 pub use routes::local_actor;
 pub use start::{BOOT_FILE, ControllerSetup, JOB_SWEEP_BOUND};
 
-use admission::{AdmittedConnection, LeaseDenied, remaining_deadline, remaining_deadlines};
+use admission::{
+    AdmittedConnection, FeedStanding, LeaseDenied, remaining_deadline, remaining_deadlines,
+};
 use barrier::{Debts, Reach};
 use capabilities::DesktopReading;
 use create::PendingCreate;

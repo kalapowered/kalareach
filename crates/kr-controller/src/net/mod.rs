@@ -75,7 +75,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
-use crate::service::{AdmittedConnection, Controller, LeaseDenied};
+use crate::service::{AdmittedConnection, Controller, FeedStanding, LeaseDenied};
 use config::NetworkSettings;
 use devices::{DeviceDirectory, DeviceRecord};
 use dispatch::RemoteConnection;
@@ -1722,6 +1722,10 @@ impl Controller {
     /// termination until its acceptance has been delivered, and closing this link is what says it
     /// has. A device that disconnects, or a hold that runs out, releases it too.
     ///
+    /// `standing` is what the close stands on, taken when it was admitted: the refusal the
+    /// authority feed puts on remote grants is asked of it where the close waits for the worker's
+    /// link and its write half, and a connection that ended meanwhile does not lift it.
+    ///
     /// `receive` is what the device the close came from said it can receive, which the link the
     /// close opens says to the worker; a close with no device behind it says the usual limits.
     #[allow(clippy::too_many_arguments)]
@@ -1729,6 +1733,7 @@ impl Controller {
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         vouched: proxy::Vouched<'_>,
+        standing: &FeedStanding,
         accepted: AcceptedDeadline,
         observer: Option<&dispatch::ExpiryObserver>,
         answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
@@ -1741,6 +1746,7 @@ impl Controller {
             .close_through(
                 mutation,
                 vouched,
+                standing,
                 accepted,
                 observer,
                 &mut link,
@@ -1769,6 +1775,7 @@ impl Controller {
         self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         vouched: proxy::Vouched<'_>,
+        standing: &FeedStanding,
         accepted: AcceptedDeadline,
         observer: Option<&dispatch::ExpiryObserver>,
         link: &mut Option<Arc<WorkerProxy>>,
@@ -1839,10 +1846,12 @@ impl Controller {
         // device's standing away whole, and a stop that went out under the standing it had would
         // be an act of a device this host no longer hears. Only the refusal is asked, not the
         // registration: another device's revocation leaves a stop alone (section 7), and the owner
-        // at this machine can stop any session.
+        // at this machine can stop any session. It is asked of the standing the close took when it
+        // was admitted, because this task outlives the connection that asked for it, and a
+        // connection that has ended is in no table.
         let answered = proxy
             .forward_mutation(mutation, vouched, deadline, &|| {
-                self.refuse_while_the_feed_refuses(vouched.actor.connection_id)
+                self.refuse_while_the_feed_refuses(standing)
             })
             .await?;
         // Whether this came from the worker's journal rather than from a close it performed now.

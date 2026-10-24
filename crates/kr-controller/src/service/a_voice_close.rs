@@ -552,6 +552,44 @@ async fn a_stop_while_a_close_is_on_its_way_makes_the_worker_refuse_it() {
     call.world.serving.abort();
 }
 
+/// KR-REQ-24.15: a close by voice that waits for the link to the session's worker is refused when
+/// the link opens if the authority feed has raised a refusal on remote grants meanwhile, and the
+/// worker is asked nothing. The close runs on a task of its own, and the connection it arrived on
+/// is not registered here, as one that has ended is not: the refusal is asked of the standing the
+/// close took when it was admitted, which is the device's pairing grant beside the voice grant.
+/// The control, in the cases above, is the same close with no refusal: it reaches the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_by_voice_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
+    let call = Call::start().await;
+    let signed = call.confirmed(&call.saying("item_close")).await;
+    let (arrived, go) = call.controller.before_a_proxy_is_opened.arm();
+
+    let controller = Arc::clone(&call.controller);
+    let principal = call.device.principal();
+    let device_id = call.device.device_id;
+    let asking = tokio::spawn({
+        let signed = signed.clone();
+        async move { ask(&controller, &principal, device_id, &signed).await }
+    });
+    // The close has been held and its authority read; it is about to open its link.
+    arrived.await.expect("the close reaches the link");
+    call.controller
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+
+    go.send(()).expect("the close goes on");
+    let refused = asking
+        .await
+        .expect("the attempt ends")
+        .expect_err("the refusal stops the close");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        call.closes().is_empty(),
+        "a close refused at the link reaches no worker"
+    );
+    call.world.serving.abort();
+}
+
 /// KR-REQ-15.13: a withdrawal of the voice grant that lands between the moment a close is held and
 /// the moment its authority is read again forwards nothing: the read finds the grant gone. The
 /// stop owed the fence because the close was already held.

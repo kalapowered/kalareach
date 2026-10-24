@@ -19,8 +19,8 @@ use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, 
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{KeyId, Nullable, TimestampMs, U64};
 
-use super::Controller;
 use super::revocation::Audience;
+use super::{Controller, FeedStanding};
 use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
 use crate::grants::{AccessRequest, GrantRecord, Refusal, RemoteRefusal, StoredRemoval};
@@ -1134,14 +1134,19 @@ impl Controller {
         self.feed_refusal_of(self.admitted_table().get(&connection))
     }
 
-    /// Refuses with the feed's refusal for `connection` when one stands, for a remote path that
+    /// Refuses with the feed's refusal for `standing` when one stands, for a remote path that
     /// commits after a wait of its own and asks nothing of the registration.
+    ///
+    /// The standing is what the work took with it when it started, so the answer does not depend
+    /// on the connection that asked for the work still being registered: a close or a forwarded
+    /// mutation runs on a task of its own, and a connection that ends while it waits for the
+    /// worker's link or its write half leaves the refusal in force for it.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::ControllerError::PermissionDenied`] with the refusal's words.
-    pub(crate) fn refuse_while_the_feed_refuses(&self, connection: ConnectionId) -> Result<()> {
-        match self.feed_refusal_on(connection) {
+    pub(crate) fn refuse_while_the_feed_refuses(&self, standing: &FeedStanding) -> Result<()> {
+        match self.feed_refusal_for(standing) {
             Some(refusal) => Err(crate::error::ControllerError::PermissionDenied {
                 detail: refusal.detail(),
             }),

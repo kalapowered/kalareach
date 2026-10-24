@@ -6697,9 +6697,12 @@ connection had admitted before either refusal rose is therefore held to the refu
 commits. Every mutation asks for the refusal at its write, beside the admission it asks again there;
 a push registration that waited for the gateway is among them. An answer decided before the refusal
 rose is written as the refusal, whether it waits for the writer or has only been decided, and an
-answer being written when the refusal rises ends with the connection. A device's close, and a read
-or raw input that waited for the link to the session's worker, for its write half or for room in its
-socket, are refused before the first byte of the frame goes. A frame the worker has part of when
+answer being written when the refusal rises ends with the connection. A device's close, a mutation
+forwarded to a worker, and a read or raw input that waited for the link to the session's worker, for
+its write half or for room in its socket, are refused before the first byte of the frame goes. A
+close or a mutation runs on a task that outlives its connection and takes the standing it was
+admitted under with it, so the refusal holds for it when the connection ended meanwhile. A frame the
+worker has part of when
 the refusal rises is not finished: the rest is not written and the link to the worker ends, so that
 the worker reads a frame that stops short and acts on nothing of it, and the call is refused. A refusal
 moves no revision, so a worker would learn of it from nothing else: when a refusal rises, and when the

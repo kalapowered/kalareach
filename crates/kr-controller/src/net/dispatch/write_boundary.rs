@@ -2821,6 +2821,73 @@ async fn a_connection_that_decided_a_request_under_a_share_resting_on_the_feed_i
     }
 }
 
+/// KR-REQ-24.15: work that outlives its connection asks the removal of the feed of the standing it
+/// took, and that standing holds the connection's pairing grant, which the connection table no
+/// longer holds once the connection has ended. A device paired under a grant that requires an
+/// organisation decides a request under a share that requires none; after the connection ends and
+/// the feed removes the host, what the work took is refused, because the pairing grant rests on the
+/// feed, although the share it was decided under does not. The control is the same work with the
+/// feed standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_taken_under_an_organisations_pairing_is_refused_after_the_removal_when_its_connection_has_ended()
+ {
+    for removed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let now = kr_ipc::now_ms().get();
+        let organisation = TestOrganisation::new(0x4b, now - 60 * 60 * 1000);
+        let (member, _) = super::super::tests::leased_member(&controller, &organisation, now);
+        let (mut pairing, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        pairing.recipient_device_id = member.recipient_device_id;
+        pairing.organisation = member.organisation;
+        let device = record_for(&pairing);
+        controller.devices().commit(&device).expect("paired");
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let personal = a_share_of(
+            &controller,
+            device.device_id,
+            session_id,
+            kr_protocol::grant::GrantExpiry::Never,
+        );
+        let stream = HeldStream::new(false);
+        stream.writer.add_permits(1);
+        let connection = super::RemoteConnection::for_test_writing_to(
+            &controller,
+            device.clone(),
+            Box::new(Arc::clone(&stream)),
+        );
+        let asked = connection
+            .ask_naming(
+                Some(session_id),
+                Method::QuestionRead.entry(),
+                false,
+                Some(personal.grant_id),
+            )
+            .expect("the share answers for the session");
+        // What a close or a forwarded mutation decided under that share takes when it starts.
+        let standing = connection.feed_standing(&asked.acting.grant);
+        // The connection ends, as the transport's loss of the control stream ends it.
+        controller.deregister(connection.connection_id);
+
+        if removed {
+            controller
+                .authority_feed_removed("https://feed.example")
+                .await
+                .expect("the removal is written down");
+        }
+        assert_eq!(
+            controller.refuse_while_the_feed_refuses(&standing).is_err(),
+            removed,
+            "the pairing grant rests on the feed, so the work is refused after the removal, and \
+             not before"
+        );
+        drop(controller);
+    }
+}
+
 /// A share of `session_id` issued to `device_id`, active and without an end, as a delegation from
 /// `parent_grant_id`.
 fn a_share_issued_under(
