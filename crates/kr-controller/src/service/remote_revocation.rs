@@ -148,6 +148,9 @@ impl Unverified {
 pub(crate) struct Withheld {
     found: Unverified,
     keys: std::collections::BTreeSet<kr_protocol::scalars::AuthorisationKey>,
+    /// The keys among `keys` that the feed is known not to list as permitted to remove it: the
+    /// feed answered a change of its list that left them out, or showed a list without them.
+    unlisted: std::collections::BTreeSet<kr_protocol::scalars::AuthorisationKey>,
 }
 
 /// What the registry shows of who made a request the feed shows complete.
@@ -807,6 +810,9 @@ impl Controller {
                 .as_ref()
                 .map(|keys| keys.iter().copied().collect())
                 .unwrap_or_default();
+            // Nothing more is known of a key that stays than was.
+            let kept = held.keys.clone();
+            held.unlisted.retain(|key| kept.contains(key));
         }
         self.move_a_feed_refusal(
             WITHDRAWAL_UNVERIFIED,
@@ -821,6 +827,29 @@ impl Controller {
     /// What the host holds of the withdrawals it cannot verify, for `kr doctor` to name.
     pub(crate) fn unverified_withdrawals(&self) -> Unverified {
         self.feed_withheld().found.clone()
+    }
+
+    /// The identifiers of the keys a withdrawal this host cannot verify takes the right to remove
+    /// the feed from.
+    pub(crate) fn withheld_key_ids(&self) -> Vec<KeyId> {
+        self.feed_withheld()
+            .keys
+            .iter()
+            .map(|key| kr_crypto::keys::key_id(KeyPurpose::Authorisation, key.as_bytes()))
+            .collect()
+    }
+
+    /// Notes that the feed lists none of the keys held back now as permitted to remove it.
+    pub(crate) fn feed_lists_no_withheld_key(&self) {
+        let mut held = self.feed_withheld();
+        held.unlisted = held.keys.clone();
+    }
+
+    /// Whether the feed may still list a key that a withdrawal this host cannot verify takes the
+    /// right to remove it from: a device the withdrawal names could then have removed the feed.
+    fn a_withheld_key_may_still_remove_the_feed(&self) -> bool {
+        let held = self.feed_withheld();
+        !held.keys.is_subset(&held.unlisted)
     }
 
     fn feed_withheld(&self) -> std::sync::MutexGuard<'_, Withheld> {
@@ -974,8 +1003,13 @@ impl Controller {
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
-        // A feed that was removed shows nothing to compare, so it cannot keep a withdrawal unverified.
-        let _ = self.settle_unverified_withdrawals(None).await;
+        // A feed that was removed shows nothing to compare, so it cannot keep a withdrawal
+        // unverified, unless a key the withdrawal takes the right from may still have removed it:
+        // the removal says nothing then of an owner having acted, and the refusal stands until the
+        // owner at the machine does, or the host starts again.
+        if !self.a_withheld_key_may_still_remove_the_feed() {
+            let _ = self.settle_unverified_withdrawals(None).await;
+        }
         {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);
