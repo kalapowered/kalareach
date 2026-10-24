@@ -187,16 +187,18 @@ ended() {
 }
 
 # Waits until `$2` (a command line) succeeds, or fails the run naming `$1` after the deadline, or as
-# soon as the process being watched is found gone.
+# soon as the process being watched is found gone. The wait started at `wait_started`, which a
+# condition that keeps its own time reads to know how much of the deadline is left.
+wait_started=0
 wait_for() {
-    local what=$1 started
+    local what=$1
     shift
-    started=$(date +%s)
+    wait_started=$(date +%s)
     until "$@"; do
         if application_has_ended; then
             ended "while waiting for $what"
         fi
-        if [ $(($(date +%s) - started)) -ge "$deadline" ]; then
+        if [ $(($(date +%s) - wait_started)) -ge "$deadline" ]; then
             printf 'android-app-launch: FAIL: gave up waiting for %s\n' "$what" >&2
             [ -z "${mount_answers:-}" ] || printf 'android-app-launch: the page check answered:%s\n' "$mount_answers" >&2
             exit 1
@@ -287,9 +289,10 @@ say "page title: $title"
 # whether its root has children and its body has text. One connection is kept for the whole wait and
 # asked once a second, because the web view's debugging socket takes a connection that ends without
 # a closing frame badly, and a page that is still starting is asked again and not reconnected to.
-# The wait is the one the other waits have, and the whole exchange has that deadline, so a page that
-# keeps sending events cannot hold it past its end. Every distinct answer of a failed wait is
-# printed. The program is kept in a variable, since the system's own bash cannot parse a
+# The wait is the one the other waits have, with one deadline for the whole of it: each exchange is
+# given what is left of it, so neither a page that keeps sending events nor a second exchange, after
+# a first that ended early, can hold the wait past its end. Every distinct answer of a failed wait
+# is printed. The program is kept in a variable, since the system's own bash cannot parse a
 # here-document inside a command substitution.
 mount_answers=""
 started_at=$(date +%s)
@@ -415,8 +418,9 @@ except (OSError, ValueError, KeyError, TypeError) as error:
     refuse(f"the debugging exchange failed: {type(error).__name__}: {error}; the last answer: {last}")
 PYTHON
 interface_mounted() {
-    local answer status
-    answer="$(python3 -I -c "$mount_program" "$port" "$deadline" 2>&1)"
+    local answer status left=$((deadline - ($(date +%s) - wait_started)))
+    [ "$left" -gt 0 ] || return 1
+    answer="$(python3 -I -c "$mount_program" "$port" "$left" 2>&1)"
     status=$?
     case "$mount_answers" in
         *"$answer"*) ;;
