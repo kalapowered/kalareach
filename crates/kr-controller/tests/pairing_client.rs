@@ -730,6 +730,14 @@ impl HostLink for WatchedLink {
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
         self.inner.hold(network)
     }
+
+    fn visit_hold<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
+    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
+        self.inner.visit_hold(network, in_use)
+    }
 }
 
 /// A pre-authorisation surface that does to the host's answers what its link says.

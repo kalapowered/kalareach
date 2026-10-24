@@ -40,6 +40,21 @@ pub fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().expect("loopback")
 }
 
+/// A host's endpoint on the loopback network whose configuration names `relay` and resolves
+/// through `resolver`. Nothing answers at either, so a device reaches the host at its direct
+/// address; what the two services decide is which of this device's endpoints may be open at once.
+pub fn on_relay(relay: &str, resolver: &str) -> kr_transport::config::EndpointConfig {
+    kr_transport::config::EndpointConfig {
+        bind_addr: Some(loopback()),
+        relay_urls: vec![relay.parse().expect("a relay URL")],
+        discovery: kr_transport::config::DiscoveryConfig {
+            pkarr_resolver_url: Some(resolver.parse().expect("a resolver URL")),
+            ..kr_transport::config::DiscoveryConfig::default()
+        },
+        ..kr_transport::config::EndpointConfig::default()
+    }
+}
+
 /// Everything the page could have been sent, as the text it would have received.
 #[derive(Default)]
 pub struct Capture(Mutex<Vec<String>>);
@@ -1221,6 +1236,17 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
     > {
         self.own.hold(network)
+    }
+
+    fn visit_hold<'a>(
+        &'a self,
+        network: &'a kr_protocol::pairing::NetworkConfig,
+        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
+    > {
+        self.own.visit_hold(network, in_use)
     }
 }
 
