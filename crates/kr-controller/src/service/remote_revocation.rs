@@ -818,6 +818,11 @@ impl Controller {
         keys.map(|_| ())
     }
 
+    /// What the host holds of the withdrawals it cannot verify, for `kr doctor` to name.
+    pub(crate) fn unverified_withdrawals(&self) -> Unverified {
+        self.feed_withheld().found.clone()
+    }
+
     fn feed_withheld(&self) -> std::sync::MutexGuard<'_, Withheld> {
         self.feed_withheld
             .lock()
