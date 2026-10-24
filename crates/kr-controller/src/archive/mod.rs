@@ -440,17 +440,50 @@ impl From<OwnershipRefusal> for ControllerError {
     }
 }
 
+/// What a daemon tells its archive about the workers of its sessions: whether one may still own a
+/// session's stores, by everything the daemon holds (the registry's worker row, closure and
+/// reservation, and the published descriptor).
+#[derive(Clone)]
+struct WorkerEvidence(std::sync::Arc<dyn Fn(SessionId) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for WorkerEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WorkerEvidence")
+    }
+}
+
 /// The environment's archive service.
 #[derive(Clone, Debug)]
 pub struct ArchiveService {
     paths: kr_ipc::paths::EnvironmentPaths,
+    /// The daemon's answer to whether a worker may remain, where the archive is a daemon's. It is
+    /// asked only when a migration is due, and a migration it answers yes to is not made.
+    evidence: Option<WorkerEvidence>,
 }
 
 impl ArchiveService {
     /// Builds an archive over one environment's stores.
     #[must_use]
     pub const fn new(paths: kr_ipc::paths::EnvironmentPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            evidence: None,
+        }
+    }
+
+    /// Makes the archive ask `a_worker_may_remain` before it migrates a store it does not own.
+    ///
+    /// The archive alone can tell only what the published descriptor says. A daemon knows more: a
+    /// worker hands its closure over before it exits, and the closure erases the registry's row of
+    /// it and retires its descriptor, so the process the launch ran is the only evidence left that
+    /// the worker is still there.
+    #[must_use]
+    pub fn asking(
+        mut self,
+        a_worker_may_remain: impl Fn(SessionId) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.evidence = Some(WorkerEvidence(std::sync::Arc::new(a_worker_may_remain)));
+        self
     }
 
     /// Returns the environment this archive serves.
@@ -610,6 +643,10 @@ impl ArchiveService {
     /// A store already at the current version is not opened at all. A store older than the ladder
     /// is left alone and reported by the reader, because restoring one in part is worse than
     /// saying it cannot be read.
+    ///
+    /// An archive that belongs to a daemon ([`Self::asking`]) also asks the daemon, once a
+    /// migration is due, whether a worker of the session may remain, and leaves the store where it
+    /// is when one may.
     pub fn bring_forward(&self, session_id: SessionId) {
         self.bring_forward_with(session_id, None);
     }
@@ -640,6 +677,16 @@ impl ArchiveService {
         };
         if recorded == kr_worker::persistence::migration::CURRENT
             || kr_worker::persistence::migration::plan(recorded).is_err()
+        {
+            return;
+        }
+        // The daemon's evidence is asked only now that there is something to write, and not for the
+        // recovery that owns the store: its death was validated by the kernel.
+        if owned.is_none()
+            && self
+                .evidence
+                .as_ref()
+                .is_some_and(|ask| (ask.0)(session_id))
         {
             return;
         }
@@ -1374,10 +1421,10 @@ pub(crate) mod while_migrating {
 }
 
 impl crate::service::Controller {
-    /// Returns this environment's archive.
+    /// Returns this environment's archive, asking this daemon's evidence before it migrates a store.
     #[must_use]
     pub fn archive(&self) -> ArchiveService {
-        ArchiveService::new(self.paths().clone())
+        ArchiveService::new(self.paths().clone()).asking(self.asker_of_a_worker_that_may_remain())
     }
 
     /// Returns the sessions whose archives still keep what was submitted to them.

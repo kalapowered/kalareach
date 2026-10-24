@@ -4040,15 +4040,24 @@ the fence is made and its failure refuses the ownership, and it is not what the 
 A session whose stores are collected without a death to validate (one that has closed) is owned the
 same way: the lock first, and then every piece of evidence the host holds that no worker remains,
 asked with the lock held. The registry's worker row, the closure's own list of a worker it never saw
-end and the published descriptor are all asked, and a session whose registry row has no closure, or
-whose launch is still under way, is a recovery's and not a collection's.
+end, the process the session's launch ran and the published descriptor are all asked, and a session
+whose registry row has no closure, or whose launch is still under way, is a recovery's and not a
+collection's. A worker hands its closure over before it exits, and the closure erases its row and
+retires its descriptor, so the launch's process is what says the worker is still there: until the
+kernel says it has ended, the worker may still write what a collection or a migration would open.
 
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
 describes, because a worker this daemon failed to verify at startup is absent from its directory
-and not absent from the machine. Reads take no lock and need no ownership: they only read what is
-there, and the writes that could change it (a recovery, a collection, a migration) take the lock and
-the value.
+and not absent from the machine; so is a session whose launch's process still runs. Reads take no
+lock and need no ownership: they only read what is there, and the writes that could change it (a
+recovery, a collection, a migration) take the lock and the value. A migration is held back the same
+way wherever it is asked for, by a session list, by the attention store's reading of a closed
+journal or by the transfer sweep: while a worker of the session may remain, the store is left as it
+is, and the sweep keeps what was submitted to the session without reading its archive. On Linux a
+process of a later boot that repeats the launch process's identifier and start tick reads as the
+worker for as long as it runs, because an identity carries no boot; the reads and the collection
+leave the session alone until it ends.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
@@ -4197,9 +4206,9 @@ that cannot lose a file), while it has a summary and no closure (a session still
 whose end was never recorded), and until thirty days after its closure. The thirty days are a
 decision of the wall clock and are made only on a clock the host can prove: without a proved
 reading the answer is *kept*, and a range that aged out is a gap and not a reason to keep a file for
-ever. A session the registry holds with a worker or a launch under way, or with no closure, keeps
-what was submitted to it; one neither the registry nor the archive knows about
-keeps nothing.
+ever. A session the registry holds with a worker or a launch under way, or with no closure, or whose
+launch's process has not ended, keeps what was submitted to it; one neither the registry nor the
+archive knows about keeps nothing.
 
 ## The backup service
 
