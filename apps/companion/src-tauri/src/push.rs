@@ -25,6 +25,11 @@
 //! and is never kept: a registration whose answer was lost is made again under a new action with a
 //! fresh credential, which is what the host expects.
 //!
+//! A record that cannot be read (damaged, or written by a build this one does not know) is moved
+//! aside, never written over, because it holds each host's authorisation identifier. The desk then
+//! starts from an empty record, logs the failure, and shows every host with nothing kept as needing
+//! the person until that host is turned on again, since what was on is no longer known.
+//!
 //! # What repeats
 //!
 //! Each step is safe to repeat, so a restart, a lost answer or a changed token is mended by doing
@@ -98,6 +103,11 @@ const CHALLENGE_WAIT: Duration = Duration::from_millis(CHALLENGE_WITHIN_MS + 30_
 /// or the gateway again at every foreground would be a loop with a person in it.
 const RETRY_AFTER_MS: u64 = 60 * 1000;
 
+/// What a host with nothing kept is shown as when the record could not be read.
+const RECORD_LOST: &str = "This phone could not read what it had kept about notifications, so it \
+                           cannot say whether this host has them on. Choose Try again to start \
+                           over.";
+
 /// How far a host's notifications stand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +148,16 @@ struct Record {
     version: u32,
     /// By the host's device identifier.
     hosts: BTreeMap<String, HostPush>,
+}
+
+impl Record {
+    /// A record with no host in it.
+    fn empty() -> Self {
+        Self {
+            version: VERSION,
+            hosts: BTreeMap::new(),
+        }
+    }
 }
 
 /// What the page is shown of one host's notifications.
@@ -319,6 +339,10 @@ struct State {
     observed: BTreeMap<DeviceId, BTreeSet<Digest256>>,
     /// The number the next claim is given.
     next_run: u64,
+    /// Whether the record the desk found at its start could not be read. What it said of each host
+    /// is not known, so a host with nothing kept is shown as needing the person and not as off,
+    /// until the person turns it on from the start.
+    lost: bool,
 }
 
 impl State {
@@ -400,7 +424,14 @@ impl PushDesk {
                 CommandError::local_failure(format!("the gateway's origin: {error}"))
             })?;
         let file = data.join(DIRECTORY).join(RECORD);
-        let record = after_a_restart(read_record(&file), (wiring.clock)());
+        let now = (wiring.clock)();
+        let (record, lost) = match read_record(&file) {
+            Loaded::Record(record) => (after_a_restart(record, now), false),
+            Loaded::Unreadable(why) => {
+                set_aside(&file, &why, now);
+                (Record::empty(), true)
+            }
+        };
         Ok(Arc::new(Self {
             file,
             data: data.to_path_buf(),
@@ -415,6 +446,7 @@ impl PushDesk {
                 asking: BTreeSet::new(),
                 observed: BTreeMap::new(),
                 next_run: 0,
+                lost,
             }),
             registering: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
@@ -435,15 +467,22 @@ impl PushDesk {
             .rev()
             .map(|host| {
                 let kept = state.record.hosts.get(&host.host_device_id.to_string());
+                let (push_state, words) = match kept {
+                    Some(kept) => (
+                        match kept.phase {
+                            Phase::Working => PushState::Working,
+                            Phase::On => PushState::On,
+                            Phase::Attention => PushState::NeedsAttention,
+                        },
+                        kept.words.clone(),
+                    ),
+                    None if state.lost => (PushState::NeedsAttention, RECORD_LOST.to_owned()),
+                    None => (PushState::Off, String::new()),
+                };
                 HostPushView {
                     reference: reference_of(host),
-                    state: match kept.map(|kept| kept.phase) {
-                        None => PushState::Off,
-                        Some(Phase::Working) => PushState::Working,
-                        Some(Phase::On) => PushState::On,
-                        Some(Phase::Attention) => PushState::NeedsAttention,
-                    },
-                    words: kept.map_or_else(String::new, |kept| kept.words.clone()),
+                    state: push_state,
+                    words,
                     settings: kept.is_some_and(|kept| kept.settings),
                 }
             })
@@ -1133,20 +1172,48 @@ struct Versioned<'a> {
     record: &'a Record,
 }
 
-/// The record on disk, or an empty one when there is none or it is one this build does not read.
-fn read_record(file: &Path) -> Record {
-    let Ok(Some(bytes)) = read_owner_only_file(file, RECORD_LIMIT) else {
-        return Record {
-            version: VERSION,
-            hosts: BTreeMap::new(),
-        };
+/// What the record file holds.
+enum Loaded {
+    /// The record, which is empty where there is no file.
+    Record(Record),
+    /// A file that is there and is not a record this build reads: what is wrong with it.
+    Unreadable(String),
+}
+
+/// The record on disk.
+fn read_record(file: &Path) -> Loaded {
+    let bytes = match read_owner_only_file(file, RECORD_LIMIT) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Loaded::Record(Record::empty()),
+        Err(error) => return Loaded::Unreadable(error.to_string()),
     };
     match serde_json::from_slice::<Record>(&bytes) {
-        Ok(record) if record.version == VERSION => record,
-        _ => Record {
-            version: VERSION,
-            hosts: BTreeMap::new(),
-        },
+        Ok(record) if record.version == VERSION => Loaded::Record(record),
+        Ok(record) => Loaded::Unreadable(format!(
+            "version {} is not one this build reads",
+            record.version
+        )),
+        Err(error) => Loaded::Unreadable(error.to_string()),
+    }
+}
+
+/// Moves a record that cannot be read out of the way and says so in the log. It holds each host's
+/// authorisation identifier, so it is kept and not written over: the desk starts from an empty
+/// record, and the file stays as it was found. Renaming and writing need the same permission on
+/// the directory, so a file that cannot be moved cannot be written over either.
+fn set_aside(file: &Path, why: &str, now_ms: u64) {
+    let aside = file.with_file_name(format!("push.unreadable-{now_ms}.json"));
+    match std::fs::rename(file, &aside) {
+        Ok(()) => tracing::error!(
+            why,
+            kept_as = %aside.display(),
+            "the notifications record could not be read and was set aside"
+        ),
+        Err(error) => tracing::error!(
+            why,
+            %error,
+            "the notifications record could not be read, and could not be set aside"
+        ),
     }
 }
 
