@@ -1277,7 +1277,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 .and_then(|packages| {
                     packages
                         .get(kr_shell_integration::contract::qualification::ShellKind::PowerShell)
-                        .map(|package| package.executable())
+                        .map(kr_shell_integration::host::startup::PowerShell::of_package)
                 })
                 .map_or_else(HomeLayout::from_environment, |powershell| {
                     HomeLayout::from_environment().launching(powershell)

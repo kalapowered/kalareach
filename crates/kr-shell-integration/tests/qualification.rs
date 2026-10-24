@@ -3247,11 +3247,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
     let shell = root.path().join(ShellKind::Zsh.as_str());
     std::fs::create_dir_all(&shell).expect("an installation directory");
     for build in [&installed, &older] {
-        let directory = build
-            .executable
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the package directory");
+        let directory = build.directory();
         std::os::unix::fs::symlink(directory, shell.join(&build.identity))
             .expect("an installed build");
     }
@@ -3334,11 +3330,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
     // belongs to and leaves the packages beside it alone. The Bash package is put into this same
     // installation to check that, rather than to say it.
     let beside = Package::built(ShellKind::Bash);
-    let directory = beside
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = beside.directory();
     let bash = root.path().join(ShellKind::Bash.as_str());
     std::fs::create_dir_all(&bash).expect("an installation directory");
     std::os::unix::fs::symlink(directory, bash.join(&beside.identity)).expect("an installed build");
@@ -3368,12 +3360,7 @@ fn a_live_session_keeps_the_package_it_started_with() {
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_package_binds_into_the_editor_it_was_qualified_against() {
     let package = Package::built(ShellKind::PowerShell);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory")
-        .to_owned();
+    let directory = package.directory().to_owned();
 
     // A copy of the package, because what is driven here is its own record and the installed one
     // is what every other case in this run qualifies against.
@@ -3562,12 +3549,7 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
 fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
     let package = Package::built(ShellKind::PowerShell);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory")
-        .to_owned();
+    let directory = package.directory().to_owned();
 
     // Release, then the advisory and the first fixed release it names, or nothing.
     let table: [(&str, Option<(&str, &str)>); 13] = [
@@ -3601,7 +3583,8 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
            if ($r) {{ Write-Output \"kr-release=[$v|$($r.Id)|$($r.FirstFixed)]\" }} \
            else {{ Write-Output \"kr-release=[$v||]\" }} }} }}"
     );
-    let asked = std::process::Command::new(&package.executable)
+    let asked = package
+        .command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .expect("the package's host runs");
@@ -3798,10 +3781,11 @@ fn refusal(package: &Package, package_root: &std::path::Path) -> String {
          $answer = & (Get-Module KalaReach.ShellBridge) {{ Test-KrQualifiedEditor }}; \
          Write-Output \"kr-editor=[$($answer.Reason)]\""
     );
-    // The package's own launcher, which is how a session starts this host: the runtime location
-    // the host needs is the launcher's to pass, not this test's to guess. Nothing of a session's
-    // is in this environment, so the module answers the question and attempts no handshake.
-    let asked = std::process::Command::new(&package.executable)
+    // The package's own launch, which is how a session starts this host: the runtime location the
+    // host needs is the record's to give, not this test's to guess. Nothing of a session's is in
+    // this environment, so the module answers the question and attempts no handshake.
+    let asked = package
+        .command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env_remove("KR_SHELL_BRIDGE")
         .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -3844,11 +3828,7 @@ fn resolved_executable(root: &std::path::Path) -> std::path::PathBuf {
 /// different inputs has two real builds of it. A host with one build has one, and the test that
 /// uses this says so rather than copying the same bytes twice and calling them two packages.
 fn another_build(current: &Package) -> Option<Package> {
-    let root = current
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .and_then(std::path::Path::parent)?;
+    let root = current.directory().parent()?;
     let mut others: Vec<std::path::PathBuf> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -5224,17 +5204,30 @@ fn an_installation_holding_every_package_still_resolves_each_of_them() {
             package.kind.as_str(),
             executable.display()
         );
-        // Every path a package records is its own, so the one the host would launch is inside the
-        // package it came from rather than in somebody else's installation.
         let directory = shellpkg::package_root()
             .join(package.kind.as_str())
             .join(&package.identity);
-        assert!(
-            executable.starts_with(&directory),
-            "the {} package would launch {}, which is outside {}",
-            package.kind.as_str(),
-            executable.display(),
-            directory.display()
-        );
+        if package.kind == ShellKind::PowerShell {
+            // This package builds no shell: it names the PowerShell it qualified, by an absolute
+            // path to a `pwsh`, and every other path it records is its own.
+            assert!(
+                executable.is_absolute()
+                    && executable
+                        .file_stem()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("pwsh")),
+                "the powershell package would launch {}, which is not an absolute path to pwsh",
+                executable.display()
+            );
+        } else {
+            // Every path a package records is its own, so the one the host would launch is inside
+            // the package it came from rather than in somebody else's installation.
+            assert!(
+                executable.starts_with(&directory),
+                "the {} package would launch {}, which is outside {}",
+                package.kind.as_str(),
+                executable.display(),
+                directory.display()
+            );
+        }
     }
 }

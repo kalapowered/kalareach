@@ -27,6 +27,7 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::hostinfo::configuration::platform_variable_name;
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
@@ -252,6 +253,16 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(fault));
         }
     };
+    // A shell whose profile carries no entry never opens the bridge, so the create would only
+    // learn that when the qualification bound ran out. The install's record says it at once.
+    if let Some(package) = &package
+        && let Some(refusal) = missing_startup_entry(paths.state_root(), package)
+    {
+        writer
+            .write_message(&ControlFrame::WorkerFailed(refusal.clone()))
+            .await?;
+        return Err(refusal.message.into());
+    }
 
     let display_number = DisplayNumber::new(arguments.display);
     let endpoint = environment.worker_endpoint(display_number)?;
@@ -410,7 +421,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // hooks live, this session is authenticated rather than qualified, and it reports nothing
     // ready. A failure here closes the session that was being created and records why.
     if bridge_server.is_some()
-        && let Err(error) = runtime.await_qualification(QUALIFICATION_DEADLINE).await
+        && let Err(error) = runtime
+            .await_qualification(kr_worker::runtime::QUALIFICATION_DEADLINE)
+            .await
     {
         // The failure is reported if it can be, and the session is closed either way: a create that
         // could not deliver the managed contract leaves a closure record rather than a shell nobody
@@ -525,13 +538,6 @@ async fn finish(
     let _ = serving.await;
 }
 
-/// How long a managed session waits for the user's startup files to finish.
-///
-/// It is a bound rather than a latency: the integration reports its hooks live the moment the
-/// startup files are done, and this is only what stops a profile that blocks forever from leaving
-/// a create request unanswered.
-const QUALIFICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Reads the parts of the first snapshot of plugin admissions a specification announced, each of
 /// its frame and in its order.
 ///
@@ -587,6 +593,30 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
                     .to_owned(),
             })?;
     ShellPackage::read(std::path::Path::new(directory)).map(Some)
+}
+
+/// Why a managed session whose shell has no startup entry is not started, when it is not.
+///
+/// The record `kr shell install` keeps says which files hold the entry. A record that cannot be
+/// read says nothing, and the handshake then decides as it always has.
+fn missing_startup_entry(
+    state_root: &std::path::Path,
+    package: &ShellPackage,
+) -> Option<ProtocolError> {
+    use kr_shell_integration::host::startup::{EntryInPlace, EntryRecord};
+
+    let record = EntryRecord::in_state_directory(state_root);
+    (record.opening_entry(package.kind()) == EntryInPlace::No).then(|| {
+        ProtocolError::new(
+            ErrorCode::ShellIntegrationUnsupported,
+            format!(
+                "no startup entry for {} is installed, so the shell would never open its bridge to \
+                 this session; run `kr shell install`, or create the session with --shell-mode \
+                 native_compat",
+                package.kind()
+            ),
+        )
+    })
 }
 
 /// Returns this installation's launcher, the `kr-hook` beside this executable in every packaged
@@ -681,6 +711,13 @@ fn session_config(
         launch_environment.sources.terminfo.describe()
     );
     let mut environment_pairs = launch_environment.to_pairs();
+    // What the package's own launch sets: the runtime a shell that is not built here needs to
+    // find, and the directory its module is found in by name, put first. It goes in before the
+    // bootstrap pair below, so nothing a record names can stand in the way of the two values the
+    // worker owns, and it replaces the creator's own value of a name it sets.
+    if let Some(package) = package {
+        apply_launch(&mut environment_pairs, package);
+    }
     if let Some(bridge) = bridge {
         // The two reserved bootstrap values, and the only two. They come from the worker, they name
         // this session's own endpoint, and the integration removes them from the exported
@@ -748,6 +785,16 @@ fn session_config(
         }),
     };
     (config, sources)
+}
+
+/// Puts what a package's launch sets over a session's environment: each name it sets replaces the
+/// value the environment had under that name, however the platform spells the name.
+fn apply_launch(environment: &mut Vec<(String, String)>, package: &ShellPackage) {
+    for (name, value) in package.launch_environment(environment, cfg!(windows)) {
+        let folded = platform_variable_name(&name);
+        environment.retain(|(held, _)| platform_variable_name(held) != folded);
+        environment.push((name, value));
+    }
 }
 
 /// Why a session whose root is a command is not started, when it is not.
@@ -929,6 +976,69 @@ mod tests {
         assert_eq!(
             startup_mode(&profile(ShellStartup::Login)),
             StartupMode::Login
+        );
+    }
+
+    /// A package's launch is set over the environment the session built: its runtime
+    /// location replaces the creator's, its module directory goes first on the creator's list, and
+    /// nothing else is touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_packages_launch_is_set_over_the_environment_the_session_built() {
+        let root = tempfile::tempdir().expect("a directory");
+        let host = root.path().join("host/pwsh");
+        std::fs::create_dir_all(host.parent().expect("a directory")).expect("the host's place");
+        std::fs::write(&host, b"#!/bin/sh\n").expect("the host");
+        let package = root.path().join("powershell/identity-1");
+        std::fs::create_dir_all(package.join("modules")).expect("the package");
+        std::fs::write(
+            package.join("kr-shell-identity.json"),
+            serde_json::json!({
+                "identity": "identity-1",
+                "shell": {
+                    "kind": "powershell", "executable": host, "upstream_version": "7.6.6",
+                    "editor_abi": "psreadline-2.4", "integration_version": "1", "patches": [],
+                    "modules": [{
+                        "name": "KalaReach.ShellBridge",
+                        "search_path": package.join("modules"),
+                        "editor_abi": "psreadline-2.4",
+                    }],
+                },
+                "startup_entry": { "file": "startup/kr-profile.ps1" },
+                "launch": {
+                    "environment": { "DOTNET_ROOT": "/packages/dotnet" },
+                    "search_paths": { "PSModulePath": [package.join("modules")] },
+                },
+            })
+            .to_string(),
+        )
+        .expect("the record");
+        let package = kr_shell_integration::host::package::ShellPackage::read(&package)
+            .expect("the package reads");
+
+        let mut environment = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("DOTNET_ROOT".to_owned(), "/creators".to_owned()),
+            ("PSModulePath".to_owned(), "/competing:/mine".to_owned()),
+        ];
+        super::apply_launch(&mut environment, &package);
+        let held = |name: &str| {
+            environment
+                .iter()
+                .filter(|(held, _)| held == name)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(held("DOTNET_ROOT"), ["/packages/dotnet"]);
+        let modules = root.path().join("powershell/identity-1/modules");
+        assert_eq!(
+            held("PSModulePath"),
+            [format!("{}:/competing:/mine", modules.display())]
+        );
+        assert_eq!(
+            held("PATH"),
+            ["/usr/bin"],
+            "nothing the launch does not name is touched"
         );
     }
 

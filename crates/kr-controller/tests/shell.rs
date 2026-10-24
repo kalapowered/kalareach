@@ -165,6 +165,7 @@ fn install_package(root: &Path, kind: ShellKind) {
         startup_entry: PackageStartupEntry {
             file: "startup/entry".to_owned(),
         },
+        launch: kr_shell_integration::host::package::PackageLaunch::default(),
     };
     std::fs::write(
         directory.join(MANIFEST_BASENAME),
@@ -1848,6 +1849,7 @@ fn a_package_that_patches_nothing_is_qualified_only_as_the_psreadline_package() 
             startup_entry: PackageStartupEntry {
                 file: "startup/entry".to_owned(),
             },
+            launch: kr_shell_integration::host::package::PackageLaunch::default(),
         },
         directory: std::path::PathBuf::from("/nonexistent/package"),
     };

@@ -137,54 +137,71 @@ function Get-KrPackageRoot {
     $root
 }
 
-function Get-KrLauncherName {
-    'pwsh'
-}
-
-function ConvertTo-KrShellWord {
+function Get-KrRunningImage {
     <#
     .SYNOPSIS
-    One literal word for a POSIX shell, whatever it holds.
+    The program this process is, as the system spells it.
 
     .DESCRIPTION
-    Single quotes make everything literal except a single quote, which is written by closing the
-    quoting, escaping the character and opening it again. A path with an apostrophe in it is a
-    path, not a syntax error.
+    A host started by a path is the image at that path, spelt as it was started (a forward slash
+    becomes a backslash on Windows), so the path a package records is the one the process reports.
     #>
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
-    "'" + $Value.Replace("'", "'\''") + "'"
+    try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+    catch { Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' }) }
+}
+
+function Get-KrPublishedModules {
+    <#
+    .SYNOPSIS
+    The module tree the installed package this module was imported from states, or nothing.
+
+    .DESCRIPTION
+    A package states its module tree as the publish wrote it, the way a compiled bridge states the
+    build it was compiled in: a package that has been moved is the package it was published as,
+    and the worker that starts it puts the moved package's own directories first on the module
+    path. A module imported from the source tree belongs to no package and answers with nothing.
+    #>
+    $root = Get-KrPackageRoot
+    if ($null -eq $root) { return $null }
+    $record = try { Get-Content -Raw -Path (Join-Path $root 'kr-shell-identity.json') | ConvertFrom-Json } catch { $null }
+    if ($null -eq $record) { return $null }
+    $modules = try { @($record.shell.modules) } catch { @() }
+    $stated = @()
+    foreach ($module in $modules) {
+        if ($null -eq $module -or $module.name -isnot [string] -or $module.search_path -isnot [string] -or
+            $module.editor_abi -isnot [string]) {
+            return $null
+        }
+        $stated += @{ name = $module.name; search_path = $module.search_path; editor_abi = $module.editor_abi }
+    }
+    if ($stated.Count -eq 0) { return $null }
+    , $stated
 }
 
 function Get-KrPackageIdentity {
     <#
     .SYNOPSIS
-    What this package declares about itself.
+    What this process declares about the package it runs in.
 
     .DESCRIPTION
-    Every path here is the package's own. This package builds no shell: what it installs is the
-    launcher that starts the host it was qualified against, the module that binds into that host's
-    editor, and the marked startup entry. The host and the editor it qualified are recorded as
-    what was qualified rather than as things this package ships, because they are the person's.
+    This package builds no shell. The executable is the host this process is, which is the host
+    the package qualified and the program the worker started, so the declaration is the process's
+    own evidence and not a path worked out from where this module sits. The module tree is the one
+    the package states, and the editor and the versions are the ones in this process.
     #>
     $version = Get-KrPSReadLineVersion
     $abi = if ($null -eq $version) { 'psreadline-unknown' } else { "psreadline-$($version.Major).$($version.Minor)" }
-    $root = Get-KrPackageRoot
-    $executable = if ($null -eq $root) {
-        try { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
-        catch { Join-Path $PSHOME 'pwsh' }
-    } else {
-        Join-Path (Join-Path $root 'bin') (Get-KrLauncherName)
+    $modules = Get-KrPublishedModules
+    if ($null -eq $modules) {
+        $modules = @(@{ name = 'KalaReach.ShellBridge'; search_path = $script:ModuleRoot; editor_abi = $abi })
     }
-    $searchPath = if ($null -eq $root) { $script:ModuleRoot } else { Join-Path $root 'modules' }
     @{
-        executable          = $executable
+        executable          = Get-KrRunningImage
         upstream_version    = $PSVersionTable.PSVersion.ToString()
         editor_abi          = $abi
         integration_version = $script:IntegrationVersion
         patches             = @()
-        modules             = @(
-            @{ name = 'KalaReach.ShellBridge'; search_path = $searchPath; editor_abi = $abi }
-        )
+        modules             = $modules
     }
 }
 
@@ -193,13 +210,8 @@ function Get-KrQualifiedHost {
     .SYNOPSIS
     The host and the editor this package was qualified against, as this process found them.
     #>
-    $executable = try {
-        [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    } catch {
-        Join-Path $PSHOME 'pwsh'
-    }
     $psrlPath = try { (Get-Module PSReadLine).ModuleBase } catch { '' }
-    @{ executable = $executable; psreadline_module_base = "$psrlPath" }
+    @{ executable = (Get-KrRunningImage); psreadline_module_base = "$psrlPath" }
 }
 
 function Get-KrPublishedQualification {
@@ -466,7 +478,7 @@ function Test-KrQualifiedEditor {
             return @{
                 Ok     = $false
                 Reason = 'psreadline_not_the_qualified_editor'
-                Detail = "PSReadLine $version at '$base' is not the $($published.Version) at '$($published.ModuleBase)' this package was qualified against"
+                Detail = "PSReadLine $version at '$base' is not the $($published.Version) at '$($published.ModuleBase)' this package was qualified against; run Publish-KalaReachQualification to qualify it"
             }
         }
     }
@@ -1495,6 +1507,14 @@ function Write-KalaReachLoss {
 
 function Get-KrCacheRoot {
     if ($env:KR_SHELL_PREFIX) { return $env:KR_SHELL_PREFIX }
+    if ($IsWindows) {
+        # Where the host looks for packages on Windows, beside its state under the local
+        # application data folder: HOME is not set there.
+        if ([string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
+            throw 'kalareach: the local application data folder is not set, so there is nowhere to publish the package'
+        }
+        return (Join-Path (Join-Path $env:LOCALAPPDATA 'KalaReach') 'shells')
+    }
     if ($IsMacOS) { return (Join-Path $HOME 'Library/Caches/kalareach/shells') }
     if ($env:XDG_CACHE_HOME) { return (Join-Path $env:XDG_CACHE_HOME 'kalareach/shells') }
     Join-Path $HOME '.cache/kalareach/shells'
@@ -1518,6 +1538,37 @@ function Get-KrLaunchEnvironment {
     $environment
 }
 
+function Test-KrHostCanBeStarted {
+    <#
+    .SYNOPSIS
+    Whether the host this process is can be named in a package, or why it cannot.
+
+    .DESCRIPTION
+    A package names the host it qualified by an absolute path to a program called pwsh, which a
+    session then starts by that path and by no search. A Microsoft Store build is installed under
+    WindowsApps, whose programs this account does not start by their path, so a package cannot be
+    made for one.
+    #>
+    param([string]$Executable)
+    if ([string]::IsNullOrEmpty($Executable) -or -not [System.IO.Path]::IsPathFullyQualified($Executable)) {
+        return @{ Reason = 'powershell_host_unnamed'; Detail = 'this PowerShell does not say where its program is, so a package cannot name it' }
+    }
+    $leaf = [System.IO.Path]::GetFileName($Executable)
+    if (-not ($leaf -ieq 'pwsh' -or $leaf -ieq 'pwsh.exe')) {
+        return @{ Reason = 'powershell_host_not_pwsh'; Detail = "$Executable is not a program called pwsh, which is the only PowerShell a package names" }
+    }
+    if ($IsWindows -and $Executable.IndexOf('\WindowsApps\', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return @{
+            Reason = 'powershell_store_build'
+            Detail = "$Executable is a Microsoft Store build of PowerShell, installed under WindowsApps, whose programs this account does not start by their path; install PowerShell from its MSI package or its zip archive, or create sessions with --shell-mode native_compat"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+        return @{ Reason = 'powershell_host_missing'; Detail = "$Executable is not a file" }
+    }
+    $null
+}
+
 function Publish-KalaReachQualification {
     <#
     .SYNOPSIS
@@ -1528,6 +1579,11 @@ function Publish-KalaReachQualification {
     shell's own tree. What it publishes instead is the qualification: the editor it binds into, the
     versions it was qualified against, and a digest of the module and the manifest that were
     qualified, so the same inputs name the same package and a rebuilt module is a different one.
+
+    Run it again after PowerShell or PSReadLine is updated: a package is the editor and the host it
+    qualified, and a session declines any other. A package is published for the account that runs
+    this, under its own cache, and an elevated session reads the elevated account's package as it
+    reads that account's profile.
     #>
     [CmdletBinding()]
     param([string]$Prefix)
@@ -1573,50 +1629,22 @@ function Publish-KalaReachQualification {
     Copy-Item -Path (Join-Path $script:ModuleRoot '*') -Destination $modules -Recurse -Force
     Copy-Item -Path $startupSource -Destination (Join-Path $destination 'startup') -Force
 
-    # The launcher this package installs, and the only executable it has of its own. It starts the
-    # host this qualification found, with the runtime location that host needs: the host itself is
-    # the person's and lives wherever they installed it, and a package that recorded their path as
-    # its own would be describing an installation it does not hold.
+    # This package builds no shell and holds no program: the shell a session starts is the host
+    # this qualification ran in, named by its absolute path in the record, and the package's own
+    # files (the module, the startup entry, the record) are inside the package. What a start adds
+    # to the host's environment is the launch block below.
     $qualifiedHost = Get-KrQualifiedHost
+    $unstartable = Test-KrHostCanBeStarted $qualifiedHost.executable
+    if ($null -ne $unstartable) {
+        throw "kalareach: $($unstartable.Reason): $($unstartable.Detail)"
+    }
     $launchEnvironment = Get-KrLaunchEnvironment
-    if ($IsWindows) {
-        # A launcher on this platform has to be something the host can start directly, and a batch
-        # file is not: the process that starts is the interpreter, and the bridge would then speak
-        # from a child of the root process rather than from it. This platform's launch shape is
-        # not settled yet, so this publishes no package here rather than one that cannot be
-        # launched.
-        throw 'kalareach: this package has no Windows launcher yet, so there is nothing to publish on this platform'
-    }
-    $binaries = Join-Path $destination 'bin'
-    New-Item -ItemType Directory -Force -Path $binaries | Out-Null
-    $launcher = Join-Path $binaries (Get-KrLauncherName)
-    $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add('#!/bin/sh')
-    $lines.Add('# Starts the PowerShell host this package was qualified against, with the runtime')
-    $lines.Add('# location that host needs, and the module this package holds where the host looks')
-    $lines.Add('# for modules by name. `exec` keeps the process, so the shell the worker started is')
-    $lines.Add('# the one the bridge speaks from.')
-    foreach ($name in $launchEnvironment.Keys) {
-        $lines.Add("$name=$(ConvertTo-KrShellWord $launchEnvironment[$name]); export $name")
-    }
-    # Added only when it is not already there. A host started with this package's modules already
-    # on its search path would otherwise find the module under two paths, load it twice, and run
-    # two sets of hooks over one editor.
-    $packageModules = Join-Path $destination 'modules'
-    $quotedModules = ConvertTo-KrShellWord $packageModules
-    $lines.Add("case `":`${PSModulePath:-}:`" in")
-    $lines.Add("    *`":`"$quotedModules`":`"*) ;;")
-    $lines.Add("    *) PSModulePath=$quotedModules`"`${PSModulePath:+:`$PSModulePath}`"; export PSModulePath ;;")
-    $lines.Add('esac')
-    $lines.Add("exec $(ConvertTo-KrShellWord $qualifiedHost.executable) `"`$@`"")
-    Set-Content -Path $launcher -Value $lines -Encoding utf8NoBOM
-    if (Get-Command chmod -ErrorAction SilentlyContinue) { & chmod 755 $launcher | Out-Null }
 
     $record = [ordered]@{
         identity      = $identity
         shell         = [ordered]@{
             kind                = $manifest.shell
-            executable          = $launcher
+            executable          = $qualifiedHost.executable
             upstream_version    = $identityInfo.upstream_version
             editor_abi          = $identityInfo.editor_abi
             integration_version = $identityInfo.integration_version
@@ -1672,14 +1700,15 @@ function Publish-KalaReachQualification {
                     $entry
                 })
             psreadline_found       = "$psrl"
-            powershell_executable  = $qualifiedHost.executable
             psreadline_module_base = $qualifiedHost.psreadline_module_base
         }
-        # The host's own image needs its runtime's location, which the launcher that started this
-        # one passed in. The launcher this package installs sets it, and it is recorded here as
-        # well so a worker can see what the launcher does.
+        # What a start of the host adds to its environment, which the worker that starts it sets:
+        # the host's own image needs its runtime's location, which the process that qualified it
+        # was given, and the module is found by name in the package's directory, put first on the
+        # list of module directories.
         launch        = [ordered]@{
-            environment = $launchEnvironment
+            environment  = $launchEnvironment
+            search_paths = [ordered]@{ PSModulePath = @((Join-Path $destination 'modules')) }
         }
     }
     $record | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $destination 'kr-shell-identity.json')
