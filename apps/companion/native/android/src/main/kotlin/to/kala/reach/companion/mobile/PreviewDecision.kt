@@ -134,8 +134,9 @@ class PreviewDecider(
             }
 
         // The opener is the Rust library, reached through JNI. A library that does not load, or one
-        // that fails or panics, leaves the generic alert and not a message that is lost. The seed is
-        // cleared when the call ends, as the challenge's is.
+        // that fails or panics, leaves the generic alert and not a message that is lost. The copy of
+        // the seed this call was handed is cleared when the call ends; the keys it was read from
+        // are held for the one message only.
         val opened =
             try {
                 opener.open(
