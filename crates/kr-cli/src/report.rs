@@ -363,7 +363,9 @@ pub fn power(state: &SleepInhibitionState) -> Document {
 }
 
 /// The line host status and `kr status` print about sleep, in the words the power state describes
-/// itself with, the assertion's name and why none is held said as their class and length.
+/// itself with. The assertion's name and what the platform said about holding none are the
+/// platform's text, said as their class and length; why none is held is said in this build's own
+/// words, from what the state says of itself.
 #[must_use]
 pub fn power_line(state: &SleepInhibitionState) -> Shown {
     if state.active {
@@ -388,12 +390,45 @@ pub fn power_line(state: &SleepInhibitionState) -> Shown {
         setting => shown!(
             "sleep policy unchanged ({}): {}",
             setting.as_str(),
-            state.withheld_reason.as_ref().map_or_else(
-                || Shown::said("nothing currently justifies an assertion"),
-                |reason| crate::shown::exported("SleepInhibitionState", "withheld_reason", reason)
-            )
+            unheld_reason(state)
         ),
     }
+}
+
+/// What the line says when the setting covers the power source and nothing the host has justifies
+/// an assertion.
+pub const NOTHING_JUSTIFIES_AN_ASSERTION: &str = "nothing currently justifies an assertion";
+
+/// What the line says when work justifies an assertion and the platform held none, before the
+/// platform's own words about it.
+pub const PLATFORM_HELD_NOTHING: &str = "the platform did not hold an assertion";
+
+/// Why a host that is to stay awake for its work holds no assertion.
+///
+/// Said from the state's typed members: the host's own sentence arrives as text, and text that
+/// arrived is said as its class and length, which would leave a person unable to read why. The
+/// reasons are the three the host has: the power source the setting does not cover, no work that
+/// justifies one, and a platform that held nothing for work that does.
+fn unheld_reason(state: &SleepInhibitionState) -> Shown {
+    if !state.setting.permits(state.power_source) {
+        return shown!(
+            "this setting keeps the host awake on mains power only, and it is on {} power",
+            state.power_source.as_str()
+        );
+    }
+    if state.sessions_with_work.get() == 0 && state.pending_requests.get() == 0 {
+        return Shown::said(NOTHING_JUSTIFIES_AN_ASSERTION);
+    }
+    state.withheld_reason.as_ref().map_or_else(
+        || Shown::said(PLATFORM_HELD_NOTHING),
+        |platform| {
+            shown!(
+                "{}: {}",
+                PLATFORM_HELD_NOTHING,
+                crate::shown::exported("SleepInhibitionState", "withheld_reason", platform)
+            )
+        },
+    )
 }
 
 /// Renders one desktop execution context.

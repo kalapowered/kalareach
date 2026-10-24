@@ -1817,11 +1817,13 @@ about itself: an agent at work, or a decision waiting to be answered. A session 
 neither of those contributes neither, and an idle shell is not work however much output it has
 produced.
 
-That line appears in `kr status` and `kr doctor` too. The assertion's name carries what the
-platform's own listing said of it, and why none is held can carry what its facility said, so the
-line says each as its class and its length; `pmset -g assertions` on macOS lists the assertion
-itself. `docs/host/platforms.md` has the facility each platform uses and what an assertion does not
-promise.
+That line appears in `kr status` and `kr doctor` too. While the setting is on and no assertion is
+held, the line says why, in words of its own: the power source the setting does not cover, no work
+that justifies one, or a platform that held nothing for work that does. The assertion's name
+carries what the platform's own listing said of it, and what the platform said about holding none
+can carry what its facility said, so the line says each as its class and its length;
+`pmset -g assertions` on macOS lists the assertion itself. `docs/host/platforms.md` has the
+facility each platform uses and what an assertion does not promise.
 
 ## `kr host shell-mode`
 
