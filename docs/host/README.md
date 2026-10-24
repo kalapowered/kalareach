@@ -6549,8 +6549,12 @@ as superseded. Whether a device may manage the host is decided as a paired devic
 and member binding, an exclusive management) and by the rights ceiling the configuration puts in
 force. A bounded offline validity is the one thing left out. It stops personal remote access while
 the feed cannot be reached, and the host has just read the feed. A decision that rests on a clock
-reading this host has not written down, or on a clock it has not proven, is not taken: the pass
-stops and asks again, and no request is refused for it. A device whose grant holds no right to
+reading this host has not written down, or on a clock it has not proven, is not taken, and no
+request is refused for it. The request waits, and so does each request behind it that the feed does
+not show complete, because requests are judged in the order the feed holds them. The scan goes on
+for what the feed shows complete, which asks no clock: those are carried out again, and a withdrawal
+this host cannot verify among them raises its refusal as ever. The pass then ends as one this host
+could not finish, so nothing is shown as read, and it asks again after its backoff. A device whose grant holds no right to
 manage the host is turned away whatever the clock says.
 
 A request that passes is written down before it takes effect. It is then carried out through the

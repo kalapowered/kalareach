@@ -2123,6 +2123,223 @@ async fn a_request_of_a_device_the_owner_revoked_at_the_machine_is_refused() {
         .expect("what the request named was not withdrawn");
 }
 
+impl Rig {
+    /// The owner at the machine revokes a device.
+    async fn revokes_at_the_machine(&self, device_id: DeviceId) {
+        let mut local = self.host.client().await;
+        let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+            self.host.environment_id,
+            &mut local,
+            Method::DeviceRevoke,
+            &kr_protocol::sharing::DeviceRevokeParams { device_id },
+        )
+        .await
+        .expect("the owner at the machine revokes the device");
+    }
+
+    /// Whether the host has revoked a device.
+    async fn has_revoked(&self, device_id: DeviceId) -> bool {
+        let mut local = self.host.client().await;
+        let list: DeviceListResult = net_support::pairing::read(
+            &mut local,
+            Method::DeviceList,
+            &DeviceListParams {
+                include_revoked: true,
+            },
+        )
+        .await
+        .expect("the device list");
+        list.devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .expect("the device is paired")
+            .revoked
+    }
+}
+
+/// A request from an owner whose standing the host cannot decide, because the owner's grant expires
+/// and the clock is not proven, with a withdrawal the feed shows complete behind it, and `fillers`
+/// requests from strangers between them. The host is not behind its feed.
+struct Undecidable {
+    rig: Rig,
+    /// The owner whose request cannot be judged.
+    issuer: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The device that request names.
+    target: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The request that cannot be judged.
+    first: RevocationRequest,
+    /// The requests of strangers behind it, which are not complete, with the keys that published
+    /// them.
+    fillers: Vec<(AuthorisationKeyPair, RevocationRequest)>,
+}
+
+/// Pairs an owner whose grant expires, a device its request will name and a device the withdrawal
+/// names, publishes the request, `fillers` requests of strangers and then a withdrawal by an owner
+/// the host does not know, and makes the feed hold that withdrawal as an earlier run of the host
+/// would have left it. The clock is unproven when the host reads the feed.
+async fn a_request_whose_issuer_the_host_cannot_decide(fillers: usize) -> Undecidable {
+    let rig = Rig::start().await;
+    let rights = [ActionRight::HostManage, ActionRight::SessionView];
+    let issuer = rig.pairs(&rights).await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    let named = rig.pairs(&[ActionRight::SessionView]).await;
+    let spare = rig.pairs(&[ActionRight::SessionView]).await;
+    // Every pass the pairings woke has ended, so none reads the feed before the case has made it.
+    rig.until_the_carrier_is_idle().await;
+    rig.host.controller().utc_floor().lose_continuity();
+
+    let issuer_key = issuer.0.keys().authorisation.clone();
+    let first = rig.request_of(
+        &issuer_key,
+        issuer.1.device_id,
+        0xf1,
+        devices(target.1.device_id),
+    );
+    rig.published_as(&issuer_key, &first).await;
+    // The feed keeps a publisher to 32 of what the host has not finished with.
+    let strangers: Vec<_> = (0..3)
+        .map(|_| AuthorisationKeyPair::generate().expect("a key"))
+        .collect();
+    let mut published = Vec::new();
+    for position in 0..fillers {
+        let key = &strangers[position % strangers.len()];
+        let id = 0x20 + u8::try_from(position).expect("few fillers");
+        let stranger = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([id; 16]));
+        let request = rig.request_of(key, stranger, id, devices(named.1.device_id));
+        rig.published_as(key, &request).await;
+        published.push((key.clone(), request));
+    }
+    let withdrawer_key = AuthorisationKeyPair::generate().expect("a key");
+    let withdrawer = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16]));
+    let withdrawal = rig.request_of(
+        &withdrawer_key,
+        withdrawer,
+        0xf2,
+        devices(named.1.device_id),
+    );
+    rig.published_as(&withdrawer_key, &withdrawal).await;
+    rig.an_earlier_run_carried_out(&withdrawal, 0, 1).await;
+    if fillers > 0 {
+        // The feed holds a page of 64, and the request is first on it.
+        rig.runtime().read_at_most_pages(1);
+    }
+    // The registry stands at the feed's revision, so the host is not behind it and judges.
+    rig.revokes_at_the_machine(spare.1.device_id).await;
+    rig.until_the_carrier_is_idle().await;
+    Undecidable {
+        rig,
+        issuer,
+        target,
+        first,
+        fillers: published,
+    }
+}
+
+/// KR-REQ-24.15: a request whose issuer's standing the host cannot decide does not stop the scan
+/// before a withdrawal behind it that the host cannot verify. The scan carries out again what the
+/// feed shows complete, which asks no clock, so the refusal rises; the request waits, and the
+/// scan that follows the clock being proven carries it out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_cannot_decide_does_not_stop_the_scan_before_a_withdrawal_it_cannot_verify()
+ {
+    let Undecidable {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(0).await;
+
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        check.detail().contains("an owner this host does not know"),
+        "the withdrawal behind the request is found: {}",
+        check.detail()
+    );
+    assert!(
+        check.detail().contains("could not finish reading"),
+        "and the pass says it could not finish: {}",
+        check.detail()
+    );
+    let key = issuer.0.keys().authorisation.clone();
+    let waiting = rig.held_as(&key, &first).await;
+    assert_eq!(
+        (waiting.rejected.0, waiting.acknowledgement.0),
+        (None, None),
+        "the request is neither refused nor carried out while the clock is unproven"
+    );
+    assert!(!rig.has_revoked(target.1.device_id).await);
+
+    rig.host.controller().utc_floor().establish_continuity();
+    rig.poll().await;
+    let carried_out = rig.held_as(&key, &first).await;
+    assert_eq!(
+        carried_out
+            .acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "the scan after the clock is proven judges the request at its place: {carried_out:?}"
+    );
+    assert!(rig.has_revoked(target.1.device_id).await);
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        check.detail().contains("an owner this host does not know"),
+        "the withdrawal the host cannot verify still refuses remote access: {}",
+        check.detail()
+    );
+}
+
+/// KR-REQ-24.15: the request that waits for the clock keeps its place across the pages of a scan:
+/// the requests of strangers behind it, on its page and on the next, are not judged before it, and
+/// the withdrawal on the next page is still found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_cannot_decide_holds_the_requests_behind_it_across_the_pages_of_a_scan()
+{
+    let Undecidable {
+        rig,
+        issuer,
+        first,
+        fillers,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(70).await;
+
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        check.detail().contains("an owner this host does not know"),
+        "the withdrawal on the second page is found: {}",
+        check.detail()
+    );
+    for (key, request) in [fillers.first(), fillers.last()].into_iter().flatten() {
+        assert_eq!(
+            rig.held_as(key, request).await.rejected.0,
+            None,
+            "a request behind the one that cannot be judged is not judged before it"
+        );
+    }
+
+    rig.host.controller().utc_floor().establish_continuity();
+    rig.poll().await;
+    let key = issuer.0.keys().authorisation.clone();
+    assert_eq!(
+        rig.held_as(&key, &first)
+            .await
+            .acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "the request is carried out once the clock is proven"
+    );
+    let (key, request) = fillers.last().expect("fillers");
+    assert_eq!(
+        rig.held_as(key, request).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "and the requests behind it are judged then, in order"
+    );
+}
+
 /// What the owner at this machine is shown of the feed, on the local socket.
 struct Shown {
     list: DeviceListResult,
