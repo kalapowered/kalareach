@@ -348,17 +348,12 @@ fn after(terminal: &WorkerTerminal, marker: &str) -> String {
 /// What it is given after `/c` is the command it runs, so a typed line decides what the stand-in
 /// prints and where it stays: it expands the variables its launcher set, and it prints the flags
 /// the integration added after the words that were typed.
-///
-/// The copy is started once where it is placed. The system scans a file it has not seen as it is
-/// first opened and again as its image is first mapped, which can outlast the time an admitted
-/// launch is given to start the program; paid here, it stays out of the launch the case is about,
-/// as it does for the programs the daemon starts.
 fn stand_in(directory: &Path, name: &str) -> PathBuf {
     let cmd = PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
         .join("System32")
         .join("cmd.exe");
     let program = directory.join(format!("{name}.exe"));
-    kr_ipc::testing::place_and_start_once(&cmd, &program, &["/c", "exit"]);
+    kr_ipc::testing::place_program(&cmd, &program);
     program
 }
 
@@ -849,11 +844,18 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     answering(&mut terminal).await;
     first_on_the_path(&mut terminal, programs.path()).await;
 
-    // The program waits for a line to be typed to it, then the line ends; `rem` takes the flags the
+    // The program prints the registration its launcher gave it, which the typed line cannot spell,
+    // and waits for a line to be typed to it, then the line ends; `rem` takes the flags the
     // integration adds after what was typed, so they reach the command shell as a comment. The
     // binding lasts as long as the program does, which is until this case says so.
     terminal
-        .type_line("claude /c 'set /p kr_release=waiting & rem'")
+        .type_line("claude /c 'echo reg=%KR_REGISTRATION% & set /p kr_release=waiting & rem'")
+        .await;
+    // The daemon is asked about the binding only once the launch is committed: a round of the
+    // daemon's that reaches the worker between the answer the program was launched under and its
+    // binding moves the admissions the answer was decided at, and the launch runs as typed.
+    terminal
+        .shown("registration.", "the program started with its registration")
         .await;
 
     let controller = managed.host.controller();
