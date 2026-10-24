@@ -1713,10 +1713,8 @@ mod tests {
             "{launch:?}"
         );
         assert!(
-            launch.contains(&(
-                "PSModulePath".to_owned(),
-                package_directory.join("modules").display().to_string()
-            )),
+            launch.iter().any(|(name, value)| name == "PSModulePath"
+                && Path::new(value) == package_directory.join("modules")),
             "{launch:?}"
         );
 
@@ -1879,13 +1877,15 @@ mod tests {
             "the files this host opens are the moved package's own"
         );
         assert_eq!(
-            package.declaration().modules[0].search_path,
-            built_modules,
+            Path::new(&package.declaration().modules[0].search_path),
+            Path::new(&built_modules),
             "and the record is stated as the build wrote it"
         );
         let launch = package.launch_environment(&[], false);
         assert!(
-            launch.contains(&("PSModulePath".to_owned(), modules.display().to_string())),
+            launch
+                .iter()
+                .any(|(name, value)| name == "PSModulePath" && Path::new(value) == modules),
             "the module a session finds by name is the moved package's: {launch:?}"
         );
     }
