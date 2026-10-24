@@ -826,6 +826,13 @@ impl Host {
         &self.controller
     }
 
+    /// How many connections of `device` the host is serving. A suite that has seen the host serve
+    /// one and then finds none knows the host has recorded that it ended.
+    #[must_use]
+    pub fn connections_of(&self, device: &DeviceRecord) -> u32 {
+        self.network.connections_of(device.device_id)
+    }
+
     /// Signs the owner's confirmation of one sensitive action against this host's own ledger.
     ///
     /// The challenge is the host's, issued here and consumed exactly once when the method presents
