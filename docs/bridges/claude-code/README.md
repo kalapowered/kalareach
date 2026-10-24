@@ -391,8 +391,10 @@ holds, and what the binding may interpret and answer is what the installation wa
 Claude Code tells the channel nothing back. An approval answered in the terminal stays pending here
 until the channel closes, and a written verdict is never acknowledged: whichever answer Claude Code
 takes first wins. When the channel closes, however it closes, the worker settles what it relayed. An
-approval never answered is cancelled; one that was answered is uncertain, because nothing says
-whether its verdict reached Claude Code. The channel's checks are the last ones before the bytes
+approval never answered is cancelled; one whose verdict was written to the channel stays resolved,
+which records that the verdict left KalaReach and not that Claude Code took it; one whose answer was
+claimed and not yet written is uncertain, because nothing says whether its verdict reached Claude
+Code. The channel's checks are the last ones before the bytes
 leave KalaReach. When the worker closes the channel, the channel ends its session with Claude Code
 and exits 1. When Claude Code closes its end, the channel exits 0.
 
