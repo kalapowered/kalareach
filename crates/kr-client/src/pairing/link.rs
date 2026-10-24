@@ -1255,6 +1255,10 @@ mod tests {
                 pool.visit_endpoint(&beside, &in_use).await
             }
         });
+        // The runtime runs one task at a time: the visit runs to the pool's lock and waits there
+        // before the choice is made, so a visit that asked which host was in use before it took
+        // the lock would see no host chosen.
+        tokio::task::yield_now().await;
         *choice.lock().expect("the choice") = Some(chosen.clone());
         drop(turn);
 
