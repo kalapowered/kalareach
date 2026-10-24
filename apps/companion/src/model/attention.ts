@@ -269,8 +269,9 @@ export function contactWords(sinceMs: number | null, nowMs: number): string {
  * and what the person can do, then that this is not lost contact and says nothing of its sessions.
  */
 export function refusalWords(refusal: HostError | null): string {
-  const said = refusal === null ? 'It did not say why.' : failureMessage(refusal)
-  return `${said} It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not.`
+  const said = (refusal === null ? 'It did not say why.' : failureMessage(refusal)).trimEnd()
+  const ended = /[.!?…]$/.test(said) ? said : `${said}.`
+  return `${ended} It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not.`
 }
 
 /** The counts of two inboxes together. */
