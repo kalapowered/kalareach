@@ -125,9 +125,19 @@ fn this_environment() -> Vec<(String, String)> {
     std::env::vars().collect()
 }
 
+/// Whether `left` and `right` name one directory, however each is spelt: the system's own answer,
+/// with a short name and a long one, or a different case, being one place.
 fn same_place(left: &str, right: &Path) -> bool {
-    left.trim_end_matches(['\\', '/'])
-        .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+    let plain = |path: &Path| {
+        let found = std::fs::canonicalize(path)
+            .unwrap_or_else(|error| panic!("{} is not a place: {error}", path.display()));
+        let text = found.to_string_lossy().into_owned();
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(&text)
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    plain(Path::new(left.trim())) == plain(right)
 }
 
 /// A host publishes the package, reads it as a worker does, and the shell a session would start
