@@ -2604,6 +2604,11 @@ fn register_problems(
     }
     let from_register = dated_after(register, "published from ");
     let from_page = dated_after(&section, "published from ");
+    if from_register != Some(REGISTER_STARTED) {
+        problems.push(format!(
+            "the register counts the fish build's advisories from {from_register:?}, and the day the record started is {REGISTER_STARTED:?}"
+        ));
+    }
     if from_register.is_none() || from_register != from_page {
         problems.push(format!(
             "the register and the release page count the fish build's advisories from different days: {from_register:?} and {from_page:?}"
