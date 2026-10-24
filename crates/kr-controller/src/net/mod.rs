@@ -1788,6 +1788,12 @@ impl Controller {
             Err(error) => return Err(error),
         };
         *link = Some(Arc::clone(&proxy));
+        // The close was admitted before the wait for the worker's link. A refusal the authority
+        // feed put on remote grants since takes this device's standing away whole, and a stop that
+        // went out under the standing it had would be an act of a device this host no longer
+        // hears. Only the refusal is asked, not the registration: another device's revocation
+        // leaves a stop alone (section 7), and the owner at this machine can stop any session.
+        self.refuse_while_the_feed_refuses()?;
         let answered = proxy.forward_mutation(mutation, vouched, deadline).await?;
         // Whether this came from the worker's journal rather than from a close it performed now.
         // The connection that asked decides whether it may be told a retained result; the close

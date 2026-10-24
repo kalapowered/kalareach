@@ -412,6 +412,26 @@ impl RemoteOutput {
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
     ) -> Written {
+        self.write_held(frame, under, relaying, false).await
+    }
+
+    /// As [`Self::write`], and, for an answer to a request decided before this write, held to the
+    /// refusal the authority feed puts on remote grants when `answer` says so.
+    ///
+    /// The refusal moves no revision and withdraws no registration, so a decision taken before it
+    /// rose names nothing that has changed. It is read where the other bounds are, before the first
+    /// byte, at every attempt to hand bytes over and in the watch while the write waits: an answer
+    /// that no longer holds before any of it went is decided again, which gives the refusal, and
+    /// once bytes are moving the connection ends. Not the epoch: it moves at every change of the
+    /// policy, and an answer cut for one that touched nothing the decision stood on would end a
+    /// connection for no refusal. A failure frame is not held, so the device is told why.
+    pub(super) async fn write_held(
+        &self,
+        frame: &ControlFrame,
+        under: &[HeldBound],
+        relaying: Option<Relaying<'_>>,
+        answer: bool,
+    ) -> Written {
         #[cfg(test)]
         self.queued.fetch_add(1, Ordering::SeqCst);
         let _turn = self.turn.lock().await;
@@ -429,7 +449,8 @@ impl RemoteOutput {
             return Written::Withdrawn;
         }
         let decided = || {
-            bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
+            !(answer && self.authority.controller.feed_refusal().is_some())
+                && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()
                     .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
