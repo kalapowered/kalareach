@@ -14,16 +14,24 @@
 //! and binds nothing on that relay before then.
 //!
 //! Whatever must not be cut off holds its endpoint ([`EndpointPool::hold`]): a pairing attempt for
-//! as long as it runs, and an owner's review of a confirmation while it runs. A held endpoint is
-//! closed for no other configuration: a request that would close it is refused until the last hold
-//! ends, so a device watching the hosts it owns waits for them rather than cutting the attempt off.
+//! as long as it runs, an owner's review of a confirmation while it runs, and a push registration
+//! the person asked for while its connection is open. A held endpoint is closed for no other
+//! configuration: a request that would close it is refused until the last hold ends, so a device
+//! watching the hosts it owns waits for them rather than cutting the attempt off.
 //!
 //! A visit is a look at a host that is not the one in use, made in the background: the inbox reads
-//! the hosts a device is paired with, and the owner's watcher asks the hosts it owns what they want
-//! confirmed. The host in use is the one the person is working with, and a visit never cuts it off:
-//! a visit to a host whose services differ from the host in use's and share a relay with them is
-//! refused ([`EndpointPool::visit_endpoint`]) as a connection lost, for as long as the other host
-//! is the one in use.
+//! the hosts a device is paired with, the owner's watcher asks the hosts it owns what they want
+//! confirmed, and a push registration that a look started makes the host's phone a destination. The
+//! host in use is the one the person is working with, and a visit never cuts it off: a visit to a
+//! host whose services differ from the host in use's and share a relay with them is refused
+//! ([`EndpointPool::visit_endpoint`]) as a connection lost, for as long as the other host is the one
+//! in use.
+//!
+//! A visit that needs its endpoint to stay open holds it as a visit ([`EndpointPool::visit_hold`]).
+//! That hold stops other visits and nothing the person does: the person choosing a host on the same
+//! relay, an owner's review or a pairing attempt closes the endpoint, the visit's connection ends,
+//! and the background work that made it tries again at its next look. A hold that is not a visit's
+//! stops every request, visits included.
 //!
 //! [`HostLink`] is the whole of what the pairing flows ask of the network, so a test can put a
 //! dialler that reaches another host, or a layer that alters an answer, in its place. [`IrohLink`]
@@ -313,6 +321,17 @@ pub trait HostLink: Send + Sync {
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>>;
 
+    /// Whether a visit to `network` would be refused now because it would cut off the host in use
+    /// ([`Self::visit_hold`] has the rule), asked without binding or holding anything. The answer is
+    /// as of now: the hold is the authority when the visit connects. A link that cannot tell says no.
+    fn would_refuse_visit<'a>(
+        &'a self,
+        _network: &'a NetworkConfig,
+        _in_use: &'a HostInUse<'a>,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
     /// Whether a dial to `endpoint` that failed was held back by the managed service having no free
     /// capacity to admit this device through the relay the dial addresses.
     ///
@@ -447,14 +466,32 @@ struct Endpoints {
 struct Open {
     services: Services,
     endpoint: Endpoint,
-    /// One more reference than there are holds.
+    /// One more reference than there are holds that stop every request.
     holds: Arc<()>,
+    /// One more reference than there are visit holds, which stop only other visits.
+    visits: Arc<()>,
 }
 
 impl Open {
+    /// Whether a hold that stops every request lives on this endpoint.
     fn held(&self) -> bool {
         Arc::strong_count(&self.holds) > 1
     }
+
+    /// Whether a visit holds this endpoint.
+    fn visited(&self) -> bool {
+        Arc::strong_count(&self.visits) > 1
+    }
+}
+
+/// Who asks the pool for an endpoint, which decides what holds on it refuse the request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requester {
+    /// The person's own request, or a pairing attempt's or an owner's review's: a visit's hold
+    /// does not refuse it.
+    Person,
+    /// A visit: any hold refuses it.
+    Visit,
 }
 
 impl Endpoints {
@@ -566,7 +603,9 @@ impl EndpointPool {
     pub async fn endpoint(&self, network: &NetworkConfig) -> Result<Endpoint, LinkError> {
         let config = self.config(network)?;
         let mut endpoints = self.endpoints.lock().await;
-        let open = self.open_for(&mut endpoints, config).await?;
+        let open = self
+            .open_for(&mut endpoints, config, Requester::Person)
+            .await?;
         Ok(open.endpoint.clone())
     }
 
@@ -591,14 +630,18 @@ impl EndpointPool {
         let config = self.config(network)?;
         let mut endpoints = self.endpoints.lock().await;
         self.refuse_beside_the_host_in_use(&config, in_use)?;
-        let open = self.open_for(&mut endpoints, config).await?;
+        let open = self
+            .open_for(&mut endpoints, config, Requester::Visit)
+            .await?;
         Ok(open.endpoint.clone())
     }
 
     /// Holds the endpoint for `network`'s services for a visit, bound now if none is open, until
-    /// the returned hold is dropped: as [`Self::hold`] does, and refused as [`Self::visit_endpoint`]
-    /// refuses. The hold is taken in the same request as the check, so no other request closes the
-    /// endpoint between the two.
+    /// the returned hold is dropped: refused as [`Self::visit_endpoint`] refuses. The hold is taken
+    /// in the same request as the check, so no other request closes the endpoint between the two.
+    ///
+    /// It stops other visits from closing the endpoint, and nothing the person asks: see the module
+    /// documentation.
     ///
     /// # Errors
     ///
@@ -611,10 +654,27 @@ impl EndpointPool {
         let config = self.config(network)?;
         let mut endpoints = self.endpoints.lock().await;
         self.refuse_beside_the_host_in_use(&config, in_use)?;
-        let open = self.open_for(&mut endpoints, config).await?;
+        let open = self
+            .open_for(&mut endpoints, config, Requester::Visit)
+            .await?;
         Ok(EndpointHold {
-            _holds: Arc::clone(&open.holds),
+            _holds: Arc::clone(&open.visits),
         })
+    }
+
+    /// Whether a visit to `network`'s services would be refused now because of the host in use, as
+    /// [`Self::visit_hold`] refuses it, with nothing bound or held. Another request may change the
+    /// answer before the visit asks again; the visit's own request is the one that decides.
+    pub async fn would_refuse_visit(
+        &self,
+        network: &NetworkConfig,
+        in_use: &HostInUse<'_>,
+    ) -> bool {
+        let Ok(config) = self.config(network) else {
+            return false;
+        };
+        let _endpoints = self.endpoints.lock().await;
+        self.refuse_beside_the_host_in_use(&config, in_use).is_err()
     }
 
     /// Refuses `config` when its services are not the host in use's and share a relay with them.
@@ -645,17 +705,22 @@ impl EndpointPool {
     pub async fn hold(&self, network: &NetworkConfig) -> Result<EndpointHold, LinkError> {
         let config = self.config(network)?;
         let mut endpoints = self.endpoints.lock().await;
-        let open = self.open_for(&mut endpoints, config).await?;
+        let open = self
+            .open_for(&mut endpoints, config, Requester::Person)
+            .await?;
         Ok(EndpointHold {
             _holds: Arc::clone(&open.holds),
         })
     }
 
-    /// The open endpoint for `config`'s services, bound now if there is none.
+    /// The open endpoint for `config`'s services, bound now if there is none. A hold on an endpoint
+    /// that shares a relay with the services refuses the request, as the holds of that kind refuse
+    /// `requester`.
     async fn open_for<'a>(
         &self,
         endpoints: &'a mut Endpoints,
         config: EndpointConfig,
+        requester: Requester,
     ) -> Result<&'a Open, LinkError> {
         let services = Services::of(&config);
         if let Some(index) = endpoints
@@ -665,11 +730,10 @@ impl EndpointPool {
         {
             return Ok(&endpoints.open[index]);
         }
-        if endpoints
-            .open
-            .iter()
-            .any(|open| open.held() && open.services.share_a_relay(&services))
-        {
+        if endpoints.open.iter().any(|open| {
+            (open.held() || (requester == Requester::Visit && open.visited()))
+                && open.services.share_a_relay(&services)
+        }) {
             return Err(LinkError::lost(Shown::said(
                 "the relay this host is reached through is in use for another host",
             )));
@@ -683,6 +747,7 @@ impl EndpointPool {
             services,
             endpoint,
             holds: Arc::new(()),
+            visits: Arc::new(()),
         });
         let Some(open) = endpoints.open.last() else {
             unreachable!("an endpoint was just bound");
@@ -901,6 +966,14 @@ impl HostLink for IrohLink {
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
         Box::pin(self.pool.visit_hold(network, in_use))
+    }
+
+    fn would_refuse_visit<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+        in_use: &'a HostInUse<'a>,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(self.pool.would_refuse_visit(network, in_use))
     }
 }
 
@@ -1429,6 +1502,143 @@ mod tests {
         ));
         assert!(!chosen_endpoint.is_closed());
         assert_eq!(binds(&pool), 1, "nothing was bound on its relay");
+        pool.close().await;
+    }
+
+    /// A visit can be asked about before it is made: it would be refused beside the host in use and
+    /// not elsewhere, and asking binds nothing and holds nothing.
+    #[tokio::test]
+    async fn a_visit_is_asked_about_beforehand_and_nothing_is_bound_or_held() {
+        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+            .bound_to("127.0.0.1:0".parse().expect("loopback"));
+        let in_use = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:34/pkarr"),
+            &[],
+        );
+        let beside = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:35/pkarr"),
+            &[],
+        );
+        let elsewhere = network(&[], Some("http://127.0.0.1:36/pkarr"), &[]);
+        pool.endpoint(&in_use).await.expect("the host in use");
+
+        assert!(pool.would_refuse_visit(&beside, &using(&in_use)).await);
+        assert!(!pool.would_refuse_visit(&in_use, &using(&in_use)).await);
+        assert!(!pool.would_refuse_visit(&elsewhere, &using(&in_use)).await);
+        assert!(!pool.would_refuse_visit(&beside, &nobody).await);
+        assert_eq!(binds(&pool), 1, "nothing was bound by asking");
+        assert_eq!(pool.open_endpoints().await, 1);
+        pool.endpoint(&beside)
+            .await
+            .expect("asking held nothing: the person's request closes the host in use's endpoint");
+        pool.close().await;
+    }
+
+    /// The same choice, made while a visit's hold waits for the pool: the hold is refused for the
+    /// host chosen when its turn comes, and not for the host in use when it was asked.
+    #[tokio::test]
+    async fn a_host_chosen_while_a_visit_hold_waits_for_the_pool_is_left_its_relay() {
+        let pool = Arc::new(
+            EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+                .bound_to("127.0.0.1:0".parse().expect("loopback")),
+        );
+        let chosen = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:32/pkarr"),
+            &[],
+        );
+        let beside = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:33/pkarr"),
+            &[],
+        );
+        let chosen_endpoint = pool.endpoint(&chosen).await.expect("the host chosen later");
+
+        let turn = pool.endpoints.lock().await;
+        let choice: Arc<std::sync::Mutex<Option<NetworkConfig>>> = Arc::default();
+        let visit = tokio::spawn({
+            let (pool, beside, choice) = (Arc::clone(&pool), beside.clone(), Arc::clone(&choice));
+            async move {
+                let in_use = || choice.lock().expect("the choice").clone();
+                pool.visit_hold(&beside, &in_use).await
+            }
+        });
+        tokio::task::yield_now().await;
+        *choice.lock().expect("the choice") = Some(chosen.clone());
+        drop(turn);
+
+        assert!(matches!(
+            visit.await.expect("the visit ran"),
+            Err(LinkError::Lost(_))
+        ));
+        assert!(!chosen_endpoint.is_closed());
+        assert_eq!(binds(&pool), 1, "nothing was bound on its relay");
+        pool.close().await;
+    }
+
+    /// KR-REQ-10.27: a visit's hold stops other visits and nothing the person asks. While a visit
+    /// holds an endpoint, the person's own request for another configuration on its relay closes it
+    /// and binds, for an endpoint and for a hold alike; a visit is refused beside the visit's hold,
+    /// and a hold that is not a visit's stops every request.
+    #[tokio::test]
+    async fn a_visit_hold_stops_other_visits_and_not_the_persons_own_requests() {
+        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+            .bound_to("127.0.0.1:0".parse().expect("loopback"));
+        let visited_config = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:29/pkarr"),
+            &[],
+        );
+        let other = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:30/pkarr"),
+            &[],
+        );
+        let another = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:31/pkarr"),
+            &[],
+        );
+
+        let visit = pool
+            .visit_hold(&visited_config, &nobody)
+            .await
+            .expect("a visit's hold");
+        let visited = pool
+            .endpoint(&visited_config)
+            .await
+            .expect("the visited endpoint");
+        assert!(matches!(
+            pool.visit_endpoint(&other, &nobody).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(matches!(
+            pool.visit_hold(&other, &nobody).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(!visited.is_closed(), "another visit cut nothing off");
+
+        pool.endpoint(&other)
+            .await
+            .expect("the person's own request is served beside a visit's hold");
+        assert!(
+            visited.is_closed(),
+            "and it closed the endpoint the visit held"
+        );
+        drop(visit);
+
+        let person = pool.hold(&another).await.expect("the person's own hold");
+        assert!(matches!(
+            pool.visit_endpoint(&other, &nobody).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(matches!(
+            pool.endpoint(&other).await,
+            Err(LinkError::Lost(_))
+        ));
+        drop(person);
         pool.close().await;
     }
 
