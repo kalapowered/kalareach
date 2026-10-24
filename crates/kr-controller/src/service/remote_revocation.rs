@@ -105,6 +105,17 @@ pub(crate) enum Replay {
     Unverified,
 }
 
+/// What the registry shows of who made a request the feed shows complete.
+enum Issuer {
+    /// A device that could have made it, and the host could have carried it out.
+    Could,
+    /// The registry holds the device that made it, or every device that holds its key, and none
+    /// could have: the host would have refused it, or it was not signed by the key it names.
+    CouldNot,
+    /// The registry cannot show who made it.
+    Unknown,
+}
+
 impl Controller {
     /// Judges a request read from the feed: whether this host applies it, and to what.
     ///
@@ -152,6 +163,25 @@ impl Controller {
         Ok(Judged::Apply(plan))
     }
 
+    /// The rights ceiling this host's configuration puts in force, when it puts one.
+    fn configured_rights_ceiling(&self) -> Option<kr_protocol::scalars::CanonicalSet<ActionRight>> {
+        self.rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether `device`'s grant holds the right to manage this host, and the rights `ceiling` this
+    /// host's configuration puts in force leaves it. Nothing of the clock, the policy or the
+    /// device's pairing: what a request of a device that held it is judged by, now or later.
+    fn holds_the_right_to_manage(
+        device: &DeviceRecord,
+        ceiling: Option<&kr_protocol::scalars::CanonicalSet<ActionRight>>,
+    ) -> bool {
+        device.grant.actions.contains(&ActionRight::HostManage)
+            && ceiling.is_none_or(|ceiling| ceiling.contains(&ActionRight::HostManage))
+    }
+
     /// Whether `device` may manage this host now, decided as its own call of [`MANAGEMENT_PROBE`]
     /// is: by its grant, this host's policy and the rights ceiling this host's configuration put
     /// in force.
@@ -163,20 +193,12 @@ impl Controller {
     /// else, the rights, the selectors, an organisation's lease, an exclusive management, the
     /// ceiling and the clock, is decided as it is for the device's own request.
     fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
-        let ceiling = self
-            .rights_ceiling
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let ceiling = self.configured_rights_ceiling();
         // A device whose grant, narrowed by this host's ceiling, holds no right to manage this host
         // is turned away whatever the clock says. Asking the clock first would leave the pass
         // unable to say anything about it while the clock is unproven, and stop every request
         // behind it for a device that could never have been heard.
-        if !device.grant.actions.contains(&ActionRight::HostManage)
-            || ceiling
-                .as_ref()
-                .is_some_and(|ceiling| !ceiling.contains(&ActionRight::HostManage))
-        {
+        if !Self::holds_the_right_to_manage(device, ceiling.as_ref()) {
             return Standing::Not;
         }
         let record = GrantRecord {
@@ -566,17 +588,24 @@ impl Controller {
     /// back to one whose counter stands at the feed's, has lost it.
     ///
     /// The feed is not trusted to say that this host approved a request, so only a request this host
-    /// could have carried out is: one an owner signed with a key the registry holds for a device
-    /// whose pairing grant holds the right to manage this host, and which this host did not refuse.
-    /// The owner is the device the request names, or, when the registry holds no such device, the
-    /// device that holds the key the request names, which is how an owner paired again is found.
-    /// What is already withdrawn is left alone, so a request the registry shows done raises no
-    /// barrier, and carrying one out twice is carrying it out once.
+    /// could have carried out is: one signed with the key of a device the registry holds, that was
+    /// paired with a grant that holds the right to manage this host and a ceiling that leaves it,
+    /// and which this host did not refuse. Neither the clock nor the policy is asked: the request
+    /// took effect when it did, and an owner whose grant has run out since, or whose organisation's
+    /// lease has lapsed, did make it. A device that is revoked proves nothing, because in a history
+    /// that is linear a revoked owner's request took effect before the revocation, and the
+    /// registry, if it holds the revocation, holds what it withdrew. The owner is the device the
+    /// request names, decided alone; when the registry holds no such device, a device that is not
+    /// revoked, holds the key the request names and could have made it, which is how an owner
+    /// paired again is found, and not the first that holds the key. What is already withdrawn is left alone, so a request the
+    /// registry shows done raises no barrier, and carrying one out twice is carrying it out once.
     ///
     /// A request that names a device or grant the registry holds live, and whose owner the registry
-    /// does not know at all, can be neither carried out nor dismissed: it comes back as
-    /// [`Replay::Unverified`], and the host refuses every grant but the owner's at this machine
-    /// until the owner at this machine has revoked what it names or paired the owner again.
+    /// cannot show it to be, because it holds no device of that identity and none that is not
+    /// revoked that holds the key and could have made it, can be neither carried out nor dismissed:
+    /// it comes back as [`Replay::Unverified`], and the host refuses every grant but the owner's at
+    /// this machine until the owner at this machine has revoked what it names or paired the owner
+    /// again. A key held only by a device that is revoked says nothing of who signed.
     ///
     /// # Errors
     ///
@@ -613,31 +642,64 @@ impl Controller {
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(Replay::Done);
         }
-        let issuer = held
-            .iter()
-            .find(|record| record.device_id == request.issuer_device_id)
-            .or_else(|| {
-                held.iter().find(|record| {
-                    kr_crypto::keys::key_id(
-                        KeyPurpose::Authorisation,
-                        record.authorisation.as_bytes(),
-                    ) == request.issuer_key_id
-                })
-            });
-        let Some(issuer) = issuer else {
-            return Ok(Replay::Unverified);
-        };
-        if !issuer.grant.actions.contains(&ActionRight::HostManage)
-            || kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
-                .is_err()
-            || self
-                .authority_feed_record(request.request_id)
-                .is_some_and(|noted| noted.is_refused_by(host))
+        match self.issuer_of_a_completed_request(request, &held) {
+            Issuer::Could => {}
+            Issuer::CouldNot => return Ok(Replay::Done),
+            Issuer::Unknown => return Ok(Replay::Unverified),
+        }
+        if self
+            .authority_feed_record(request.request_id)
+            .is_some_and(|noted| noted.is_refused_by(host))
         {
             return Ok(Replay::Done);
         }
         self.apply_feed_plan(&plan).await?;
         Ok(Replay::Done)
+    }
+
+    /// What the registry shows of who made a request the feed shows complete.
+    fn issuer_of_a_completed_request(
+        &self,
+        request: &RevocationRequest,
+        held: &[DeviceRecord],
+    ) -> Issuer {
+        let host = self.host_device_id();
+        let ceiling = self.configured_rights_ceiling();
+        let signed_by = |record: &DeviceRecord| {
+            kr_pairing::grants::verify_revocation_request(request, host, &record.authorisation)
+                .is_ok()
+        };
+        let could = |record: &DeviceRecord| {
+            Self::holds_the_right_to_manage(record, ceiling.as_ref()) && signed_by(record)
+        };
+        if let Some(record) = held
+            .iter()
+            .find(|record| record.device_id == request.issuer_device_id)
+        {
+            return if record.revoked_at_ms.is_none() && could(record) {
+                Issuer::Could
+            } else {
+                Issuer::CouldNot
+            };
+        }
+        let holders: Vec<&DeviceRecord> = held
+            .iter()
+            .filter(|record| {
+                record.revoked_at_ms.is_none()
+                    && kr_crypto::keys::key_id(
+                        KeyPurpose::Authorisation,
+                        record.authorisation.as_bytes(),
+                    ) == request.issuer_key_id
+            })
+            .collect();
+        if holders.iter().any(|record| could(record)) {
+            Issuer::Could
+        } else if !holders.is_empty() && !holders.iter().any(|record| signed_by(record)) {
+            // Nobody who holds the key signed it: no request this host could have carried out.
+            Issuer::CouldNot
+        } else {
+            Issuer::Unknown
+        }
     }
 
     /// Records whether the feed shows complete a withdrawal this host cannot verify, and moves the
