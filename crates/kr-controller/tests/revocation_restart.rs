@@ -496,6 +496,13 @@ async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
 
 /// KR-REQ-10.45, 09.13: a restarted daemon asks a worker about the newest eight revocations it
 /// acknowledged and no older one.
+///
+/// A worker that is inside a dispatch transition when it is asked answers that it is, and the
+/// daemon asks no further: the walk it makes at a start is eight exchanges at most, none asked
+/// again. The daemon's other links to the worker present their generation as the start goes on,
+/// and that is such a moment, so a walk the worker cut by saying so is not the one the claim is
+/// about. The worker counts the announcements it refused for it; a walk that fell short while that
+/// count grew is made again by a new daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_asks_a_worker_about_the_newest_eight_revocations_only() {
     let Adopted {
@@ -512,24 +519,40 @@ async fn a_restarted_daemon_asks_a_worker_about_the_newest_eight_revocations_onl
     }
     let held = acknowledged_in_the_registry(&host);
     assert!(held > 8, "more revocations than a worker keeps names for");
+    let newest_eight: std::collections::BTreeSet<u64> = (held - 7..=held).collect();
 
-    let stopped = host.shut_down().await;
-    let settings = stopped.settings().clone();
-    let host = stopped.start(settings).await;
-    host.controller()
-        .what_workers_hold_is_read_back_for_tests()
-        .await;
-
-    let asked: std::collections::BTreeSet<u64> = host
-        .controller()
-        .announcements_sent_for_tests()
-        .iter()
-        .filter(|sent| sent.evidence_from == 0)
-        .map(|sent| sent.revision)
-        .collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut stopped = host.shut_down().await;
+    let (host, asked) = loop {
+        let refused = workers[0].service.refusals_for_the_boundary();
+        let settings = stopped.settings().clone();
+        let host = stopped.start(settings).await;
+        host.controller()
+            .what_workers_hold_is_read_back_for_tests()
+            .await;
+        let asked: std::collections::BTreeSet<u64> = host
+            .controller()
+            .announcements_sent_for_tests()
+            .iter()
+            .filter(|sent| sent.evidence_from == 0)
+            .map(|sent| sent.revision)
+            .collect();
+        let cut = workers[0].service.refusals_for_the_boundary() > refused;
+        if asked == newest_eight || !cut {
+            break (host, asked);
+        }
+        assert!(
+            asked.is_subset(&newest_eight),
+            "the worker is asked about no revision older than the newest eight: {asked:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no restarted daemon's walk went uncut by the worker: {asked:?}"
+        );
+        stopped = host.shut_down().await;
+    };
     assert_eq!(
-        asked,
-        (held - 7..=held).collect(),
+        asked, newest_eight,
         "the worker is asked about the newest eight revisions it acknowledged"
     );
     host.stop().await;
