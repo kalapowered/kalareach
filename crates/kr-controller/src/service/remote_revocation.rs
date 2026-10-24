@@ -64,10 +64,6 @@ pub(crate) enum Judged {
     Refuse(RejectionReason),
     /// This host applies it.
     Apply(Plan),
-    /// This host cannot yet say whether the device that made it was revoked by a record later in the
-    /// feed, because no scan of this run has read the feed through: it is judged by the scan that
-    /// follows the first one that has.
-    Wait,
     /// This host cannot decide whether the device that made it may manage the host: the clock is
     /// unproven, or the floor or an expiry the decision stands on is not recorded. The request is
     /// judged again by a scan that can decide.
@@ -165,33 +161,6 @@ pub(crate) struct Withheld {
     keys_unresolved: bool,
 }
 
-/// Where in the feed this run found the devices it revoked, so that a request is judged by the
-/// standing its issuer had at its own place in the feed.
-///
-/// The feed's order is the order the host took requests in. A request the host put off, or could not
-/// judge, while it was behind its feed or could not tell the time is judged later, after the records
-/// that follow it have been carried out again; an issuer revoked by one of those later records was
-/// the owner's when its request was made. The places are read from the feed by the first scan of
-/// every run, which begins at the first record, so nothing is stored for them.
-#[derive(Debug, Default)]
-pub(crate) struct FeedPlaces {
-    /// The earliest place of a complete record this run saw that names the device and that this
-    /// host could have carried out.
-    explained: std::collections::BTreeMap<DeviceId, u64>,
-    /// Whether a scan of this run has read the feed through, so that `explained` holds every
-    /// record the feed has.
-    through: bool,
-}
-
-impl FeedPlaces {
-    fn explain(&mut self, device: DeviceId, place: u64) {
-        self.explained
-            .entry(device)
-            .and_modify(|held| *held = (*held).min(place))
-            .or_insert(place);
-    }
-}
-
 /// What the registry shows of who made a request the feed shows complete.
 enum Issuer {
     /// A device that could have made it, and the host could have carried it out.
@@ -220,23 +189,13 @@ impl Controller {
         if request.host_device_id != host {
             return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
         }
-        let Some(mut issuer) = self.devices.record_for_device(request.issuer_device_id)? else {
+        let Some(issuer) = self
+            .devices
+            .record_for_device(request.issuer_device_id)?
+            .filter(DeviceRecord::is_paired)
+        else {
             return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
         };
-        if issuer.revoked_at_ms.is_some() && issuer.expired_at_ms.is_none() {
-            // A device that is revoked made no request after its revocation. When a record that
-            // follows this request in the feed is what revoked it, it was the owner's at this
-            // place; a revocation no record in the feed explains is the owner's at this machine,
-            // which has no place in the feed, and it refuses the request as ever.
-            match self.revoked_later_in_the_feed(issuer.device_id, place) {
-                Some(true) => issuer.revoked_at_ms = None,
-                Some(false) => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
-                None => return Ok(Judged::Wait),
-            }
-        }
-        if !issuer.is_paired() {
-            return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority));
-        }
         if kr_pairing::grants::verify_revocation_request(request, host, &issuer.authorisation)
             .is_err()
         {
@@ -758,15 +717,6 @@ impl Controller {
         }
         let named = self.plan_of(request)?;
         let held = self.devices.devices()?;
-        let issuer = self.issuer_of_a_completed_request(request, &held);
-        if matches!(issuer, Issuer::Could) {
-            // What this request revoked, or found revoked already, is explained by its place in the
-            // feed, whoever revoked it first in this registry.
-            let mut places = self.feed_places();
-            for device in &named.devices {
-                places.explain(*device, place);
-            }
-        }
         let mut plan = Plan {
             devices: named
                 .devices
@@ -791,7 +741,7 @@ impl Controller {
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(Replay::Done);
         }
-        match issuer {
+        match self.issuer_of_a_completed_request(request, &held) {
             Issuer::Could => {}
             Issuer::CouldNot => return Ok(Replay::Done),
             Issuer::Unknown => {
@@ -1005,40 +955,6 @@ impl Controller {
         .min()
         .copied();
         named_at.is_some_and(|named| place.is_none_or(|place| named < place))
-    }
-
-    fn feed_places(&self) -> std::sync::MutexGuard<'_, FeedPlaces> {
-        self.feed_places
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Whether the device `issuer` was revoked by a record that comes later in the feed than
-    /// `place`: `Some(true)` when the first record this run saw that names it is later,
-    /// `Some(false)` when it is not later or none is and the feed has been read through, and `None`
-    /// while no scan of this run has read it through and nothing explains the revocation yet.
-    fn revoked_later_in_the_feed(&self, issuer: DeviceId, place: u64) -> Option<bool> {
-        let places = self.feed_places();
-        match places.explained.get(&issuer) {
-            Some(named) => Some(*named > place),
-            None if places.through => Some(false),
-            None => None,
-        }
-    }
-
-    /// Notes that a scan of this run has read the feed through: the places it saw are all there
-    /// are, and a request is no longer held back to wait for them.
-    pub(crate) fn feed_read_through(&self) {
-        self.feed_places().through = true;
-    }
-
-    /// Notes the devices a request at `place` revoked when it was carried out, for the places a
-    /// later request is judged by.
-    pub(crate) fn feed_request_revoked(&self, plan: &Plan, place: u64) {
-        let mut places = self.feed_places();
-        for device in &plan.devices {
-            places.explain(*device, place);
-        }
     }
 
     /// Raises or lifts one of the two refusals the feed puts on every remote grant: the policy's
