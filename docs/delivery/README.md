@@ -409,7 +409,7 @@ them; it never writes one into the delivery journal.
 
 ## Rate limits, and what a person is told
 
-The limit is twenty in a burst and sixty an hour, per destination. The burst allowance refills over
+The limit on push is twenty in a burst and sixty an hour, per paired device's destination. The host applies no such budget to an external destination. The burst allowance refills over
 a minute and the hourly allowance over an hour, continuously, so a clock boundary is not a second
 burst. Excess notifications collapse into one attention update every five minutes.
 
@@ -447,10 +447,11 @@ out, and the message says how many were left out and why.
 
 Whatever the kind, the message ends with the sentence that says anyone who can read its destination
 can read it, and configuring a Slack, Discord, Telegram or email destination's credential answers
-with the same fact in that kind's own words. Session text reaches a chat service as text and never
-as markup: Slack's `&`, `<` and `>` are escaped, Discord is told to ping nobody, and Telegram parses
-no entities, so a line of terminal output cannot mention a channel, notify everyone or turn into a
-link the service fetches. Discord takes 2,000 characters and Telegram 4,096, and a Slack message is
+with the same fact in that kind's own words. A chat message is the host's own sentences, sent as text and never as markup the host builds:
+Slack's `&`, `<` and `>` are escaped, Discord is told to ping nobody and to suppress link embeds, and
+Telegram parses no entities, so a name in a sentence cannot mention a channel, notify everyone or
+turn into a link the service fetches. Discord still renders its own Markdown in the text it is
+given. Discord takes 2,000 characters and Telegram 4,096, and a Slack message is
 held well inside Slack's own limit; a longer message keeps its opening, says it was shortened, and
 still ends with that sentence.
 
