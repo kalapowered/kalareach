@@ -203,6 +203,11 @@ impl Archive {
     /// cannot. The age of a closure is a decision the wall clock makes, and an unproved clock is
     /// how a rollback deletes what had not expired, so without a proved reading the answer is yes.
     ///
+    /// The age is counted from the closure's recorded time, which is the wall clock's reading when
+    /// the closure was written, with no record of whether the clock could be proved then. Once
+    /// nothing else keeps the file, a clock that was behind at that moment and has been corrected
+    /// since shortens the thirty days by the error.
+    ///
     /// A lost range does not keep a file: age and the caps leave one behind by design, and a
     /// session whose every byte and receipt aged out would otherwise keep its files for ever. Only
     /// an archive that found nothing at all, and could read everything it looked at, answers no
