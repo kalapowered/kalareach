@@ -61,10 +61,9 @@ manifest states:
 - `patches`: each patch in the order it is applied (the reader patches and the shell's other small
   changes, such as the Zsh patches that resolve a command and the module paths), with its own revision, the upstream
   revision it was applied to (`base_revision`, the package's own), the digest of the patch file
-  and, where the patch is a published upstream change, the upstream commit it was taken from
-  (`source_commit`). The two upstream revisions are kept apart: the terminfo patch of the Zsh
-  package is taken from upstream commit `4c89849c98172c951a9def3690e8647dae76308f` and applied to
-  `zsh-5.9`.
+  and, where the patch is a published upstream change, the upstream commit or patch it was taken from
+  (`source_commit`). The two upstream revisions are kept apart: the official patches of the Bash
+  package are each named by the patch they are (`bash53-011`, for one) and applied to `bash-5.3`.
 - `sources`: the bridge sources the package adds to the shell, each with its digest.
 - `modules`: each module the shell loads, the directory it searches for it, relative to the
   release, and the editor ABI the module was built for. A package that loads no module lists none.

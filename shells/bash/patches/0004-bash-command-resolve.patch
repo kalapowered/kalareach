@@ -33,9 +33,9 @@ or later; see shells/bash/LICENSE.
  #endif
  
  #if defined (HAVE_MBSTR_H) && defined (HAVE_MBSCHR)
-@@ -2636,7 +2644,18 @@
+@@ -2755,7 +2763,18 @@
    if (prev >= 0)
-     add_unwind_protect (close, prev);
+     add_unwind_protect (uw_close, (void *) (intptr_t) prev);
  
 +#if defined (READLINE)
 +  if (lastpipe_flag)
@@ -52,7 +52,7 @@ or later; see shells/bash/LICENSE.
  
    if (prev >= 0)
      close (prev);
-@@ -5600,7 +5619,12 @@
+@@ -5777,7 +5796,12 @@
    pid_t pid;
    SHELL_VAR *hookf;
    WORD_LIST *wl;
@@ -65,11 +65,10 @@ or later; see shells/bash/LICENSE.
    stdpath = (cmdflags & CMD_STDPATH);	/* use command -p path */
    nofork = (cmdflags & CMD_NO_FORK);	/* Don't fork, just exec, if no pipes */
    pathname = words->word->word;
-@@ -5641,7 +5665,19 @@
- 
-       maybe_make_export_env ();
-       put_command_name_into_env (command);
-+    }
+@@ -5821,6 +5845,18 @@
+     }
+   else if (command == 0 && notfound_str == 0)	/* make sure */
+     init_notfound_str ();
 +
 +#if defined (READLINE)
 +  /* A command the root shell is about to start in the foreground, in no pipeline, asks the
@@ -80,12 +79,12 @@ or later; see shells/bash/LICENSE.
 +    {
 +      kr_bash_resolve (words, command, &kr_launch, &kr_launch_env);
 +      QUIT;
-     }
++    }
 +#endif
  
    /* We have to make the child before we check for the non-existence
       of COMMAND, since we want the error messages to be redirected. */
-@@ -5749,6 +5785,11 @@
+@@ -5928,6 +5964,11 @@
  	 leave it there, in the same format that the user used to
  	 type it in. */
        args = strvec_from_word_list (words, 0, 0, (int *)NULL);

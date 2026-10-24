@@ -5,7 +5,7 @@
 //! shell has to load its editor and its modules from where it is, and not from the prefix the build
 //! named. This copies the built package to a new place and starts the copy: its `module_path` and
 //! its `fpath` name the copy, and the editor and a shipped module load from the copy's own
-//! `lib/zsh/5.9`. The managed session of each shell is started over a moved copy as well, which the
+//! `lib/zsh/<version>`. The managed session of each shell is started over a moved copy as well, which the
 //! worker accepts only when it states the package as the build wrote it.
 //!
 //! What proves that the copy's files were the ones loaded, and not the original's that are still
@@ -122,6 +122,16 @@ if [[ -r /proc/$$/maps ]]; then
 fi
 "#;
 
+/// Where the package keeps its modules below its root: a directory named for the Zsh release.
+fn module_tree(package: &Package) -> String {
+    format!(
+        "lib/zsh/{}",
+        package.record["shell"]["upstream_version"]
+            .as_str()
+            .expect("the package's record names its upstream version")
+    )
+}
+
 /// KR-REQ-07.86: the package as it was built finds its own modules, which is the control.
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built"]
@@ -132,7 +142,7 @@ fn the_package_where_it_was_built_finds_its_own_modules() {
     let told = run(&package.executable, None, SCRIPT);
     assert_eq!(
         told.value("module_path"),
-        format!("{}/lib/zsh/5.9", root.display())
+        format!("{}/{}", root.display(), module_tree(&package))
     );
     assert_eq!(told.value("zle"), "loaded");
     assert_eq!(told.value("datetime"), "loaded");
@@ -164,7 +174,7 @@ fn a_moved_tree_loads_its_editor_and_modules_from_where_it_is() {
     let told = run(&moved.join("bin/zsh"), Some(&original), SCRIPT);
     assert_eq!(
         told.value("module_path"),
-        format!("{}/lib/zsh/5.9", moved.display()),
+        format!("{}/{}", moved.display(), module_tree(&package)),
         "the module path names the moved tree; {}",
         told.stderr
     );
@@ -188,8 +198,11 @@ fn a_moved_tree_loads_its_editor_and_modules_from_where_it_is() {
         .find_map(|line| line.strip_prefix("maps="))
     {
         assert!(
-            maps.contains(&format!("{}/lib/zsh/5.9/zsh/zle.so", moved.display()))
-                && !maps.contains(&format!("{}/lib/", original.display())),
+            maps.contains(&format!(
+                "{}/{}/zsh/zle.so",
+                moved.display(),
+                module_tree(&package)
+            )) && !maps.contains(&format!("{}/lib/", original.display())),
             "the editor that is mapped is the moved copy's: {maps}"
         );
     }

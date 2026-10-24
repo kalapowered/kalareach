@@ -10,8 +10,8 @@ documentation, stays under the BSD 3-Clause Licence in the repository root.
 
 No Zsh-licensed code is copied into any crate.
 
-The Zsh licence, as distributed with zsh-5.9
---------------------------------------------
+The Zsh licence, as distributed with zsh-5.9.2
+----------------------------------------------
 
 Unless otherwise noted in the header of specific files, files in this
 distribution have the licence shown below.
