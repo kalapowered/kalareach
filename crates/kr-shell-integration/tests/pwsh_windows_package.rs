@@ -181,7 +181,7 @@ fn the_package_a_windows_host_publishes_is_the_shell_a_session_would_start() {
         competing.path().display().to_string(),
     ));
 
-    let (identity, imported_from) = the_module_in(&package, &base);
+    let (identity, imported_from) = the_module_in(package, &base);
     assert!(
         same_place(
             &imported_from,
