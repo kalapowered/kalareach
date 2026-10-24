@@ -3836,13 +3836,15 @@ read stays faulted until the store itself says its pages are sound.
 
 Migrations are forward-only, transactional and keyed by a schema version.
 `kr_worker::persistence::migration::LADDER` is the list of steps, each one transaction, each moving
-one version, and whatever opens a journal brings it forward through them. The ladder is a window: it
-starts at version 2. A store a newer build wrote is refused rather than read, because reading it
-would mean guessing what a column this build does not know about means. A store older than the
-ladder is refused too, wherever it is opened, and the refusal names `kr host import-journals`: the
-explicit importer, which reads exactly the two shapes the builds recording version 1 wrote and
-brings such a journal to the current schema once, in one transaction, while the environment's daemon
-is stopped and no worker can hold it. Whether a worker may still hold one is read from the
+one version. A worker that opens its own journal brings it forward through them, and so does the
+daemon's archive, under the session's recovery lock, once no worker of the session can remain. A
+reader that opens a closed journal read-only does not: the migration waits for the lock and for the
+worker to be gone. The ladder is a window: it starts at version 2. A store a newer build wrote is
+refused rather than read, because reading it would mean guessing what a column this build does not
+know about means. A store older than the ladder is refused too, wherever it is opened, and the
+refusal names `kr host import-journals`: the explicit importer, which reads exactly the two shapes
+the builds recording version 1 wrote and brings such a journal to the current schema once, in one
+transaction, while the environment's daemon is stopped and no worker can hold it. Whether a worker may still hold one is read from the
 registry's worker rows and closures, with the registry read as it is (`Registry::open_to_read`,
 which reads the file alone as immutable, writes nothing, not even beside it, and refuses a registry
 whose write-ahead log still holds writes or that is reached through a link), and from the

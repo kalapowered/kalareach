@@ -2100,11 +2100,12 @@ host.
 
 ## `kr host import-journals`
 
-A session's journal is brought forward to this build's schema by whatever opens it, but only from
-the oldest version this build's migrations cover. A journal older than that is refused wherever it
-is opened, and the refusal names this command. It imports every such journal in this
-installation's environment once, forward only, each in one transaction, and leaves every other
-journal alone:
+A session's journal is brought forward to this build's schema when its worker opens it, and by the
+daemon once the session has no worker left; a read of a closed session migrates nothing while a
+worker may still own the journal. This happens only from the oldest version this build's
+migrations cover. A journal older than that is refused wherever it is opened, and the refusal names
+this command. It imports every such journal in this installation's environment once, forward only,
+each in one transaction, and leaves every other journal alone:
 
 ```sh
 kr host import-journals           # one line per journal: imported, left alone, or not imported and why
