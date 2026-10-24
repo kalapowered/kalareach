@@ -21,7 +21,8 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const ZSH: ShellKind = ShellKind::Zsh;
 
-/// KR-REQ-07.34, KR-REQ-07.85
+/// KR-REQ-07.34, KR-REQ-07.85, KR-REQ-20.03: the proof the package's own SHA-256 and HMAC-SHA-256
+/// compute is the worker's HMAC-SHA-256 of the same transcript.
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_handshake_declares_the_published_zle_patches_and_the_reader_they_build() {
