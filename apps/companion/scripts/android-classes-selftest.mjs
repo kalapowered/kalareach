@@ -19,7 +19,13 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
 import { dex, zip } from './archive-fixtures.mjs'
-import { definedStrings, missingFrom, packagesOf, requestFrom } from './android-classes.mjs'
+import {
+  definedStrings,
+  missingFrom,
+  packagesOf,
+  requestFrom,
+  sourcesOf
+} from './android-classes.mjs'
 
 const PRESENT = [
   'to.kala.reach.companion.push.KalaReachMessagingService',
@@ -144,6 +150,12 @@ expect(
   'nothing'
 )
 expect(
+  'an application missing only the messaging service is named, not passed',
+  'no-service.apk',
+  zip([filler, { name: 'classes.dex', bytes: dex({ defined: PRESENT.slice(1) }) }]),
+  PRESENT[0]
+)
+expect(
   'an application missing only the preview worker is named, not passed',
   'no-preview-worker.apk',
   zip([
@@ -172,6 +184,22 @@ expect(
   'service-only.apk',
   zip([filler, { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0]] }) }]),
   PRESENT.slice(1).join(', ')
+)
+// The failure names the directory of the class that is missing, and not always the application's.
+held(
+  'a missing plugin sends the reader to the platform library',
+  'apps/companion/native/platform/android/src/main/java',
+  sourcesOf([PRESENT[3]]).join(' and ')
+)
+held(
+  'a missing service or worker sends the reader to the application module',
+  'apps/companion/native/android/android/src/main/java',
+  sourcesOf([PRESENT[0], PRESENT[1], PRESENT[2]]).join(' and ')
+)
+held(
+  'a plugin and a worker missing together name both',
+  'apps/companion/native/android/android/src/main/java and apps/companion/native/platform/android/src/main/java',
+  sourcesOf([PRESENT[1], PRESENT[3]]).join(' and ')
 )
 expect(
   'a dex layout this does not read is refused rather than guessed at',
