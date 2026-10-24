@@ -222,9 +222,6 @@ struct Shared {
     scan_unfinished: AtomicBool,
     /// Whether a record the scan met so far was put off because the host is behind its feed.
     scan_put_off: AtomicBool,
-    /// Whether a request the scan met so far waits for a scan of this run to have read the feed
-    /// through before it can be judged at its place in it.
-    scan_looking: AtomicBool,
     /// What the scan met so far of withdrawals the feed shows complete and this host cannot verify.
     scan_found: Mutex<Unverified>,
     /// Why the first request the scan met so far whose issuer's standing this host could not decide
@@ -295,7 +292,6 @@ impl FeedRuntime {
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
                 scan_put_off: AtomicBool::new(false),
-                scan_looking: AtomicBool::new(false),
                 scan_found: Mutex::default(),
                 scan_undecided: Mutex::default(),
                 observed: Mutex::default(),
@@ -783,7 +779,6 @@ async fn pass(
     let starting = resumed == 0;
     let mut unfinished = shared.scan_unfinished.load(Ordering::SeqCst);
     let mut put_off = !starting && shared.scan_put_off.load(Ordering::SeqCst);
-    let mut looking = !starting && shared.scan_looking.load(Ordering::SeqCst);
     let mut found = if starting {
         Unverified::default()
     } else {
@@ -881,12 +876,6 @@ async fn pass(
                         unfinished = true;
                     }
                 }
-                Settled::Looking => {
-                    // Judged by the scan that follows the first of this run to read the feed
-                    // through, which knows where in the feed each device was revoked.
-                    contiguous = false;
-                    looking = true;
-                }
                 Settled::Undecided(refusal) => {
                     contiguous = false;
                     undecided.get_or_insert(refusal);
@@ -905,7 +894,6 @@ async fn pass(
     }
     shared.scan_unfinished.store(unfinished, Ordering::SeqCst);
     shared.scan_put_off.store(put_off, Ordering::SeqCst);
-    shared.scan_looking.store(looking, Ordering::SeqCst);
     *shared
         .scan_found
         .lock()
@@ -926,7 +914,6 @@ async fn pass(
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
     shared.scan_put_off.store(false, Ordering::SeqCst);
-    shared.scan_looking.store(false, Ordering::SeqCst);
     *shared
         .scan_found
         .lock()
@@ -935,9 +922,6 @@ async fn pass(
         .scan_undecided
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = None;
-    // Every record the feed holds has been seen in this run now, and the places it names are all
-    // there are.
-    controller.feed_read_through();
     // Read through, the scan has seen every withdrawal the feed shows complete that is not settled:
     // the refusal is lifted when it saw none, and stands, naming what they name, when it saw one.
     controller
@@ -961,10 +945,6 @@ async fn pass(
             if put_off {
                 return Ok(Pass::More);
             }
-        }
-        if looking {
-            // The requests that waited for the places are judged by the scan that begins now.
-            return Ok(Pass::More);
         }
         if let Some(refusal) = undecided {
             // The refusal and the catch-up are done, and what the feed shows complete is carried
@@ -1082,9 +1062,6 @@ enum Settled {
     Done,
     /// It waits: a barrier still running, or the host catching up with its feed.
     Waiting,
-    /// It waits for the first scan of this run to read the feed through: its issuer was revoked, and
-    /// whether a later record revoked it is not known yet.
-    Looking,
     /// The feed shows it complete, and this host holds what it names live and cannot tell whose
     /// word it is. It stays unsettled, so every scan reads it again.
     Unverified(Unverified),
@@ -1170,7 +1147,6 @@ async fn settle_request(
         {
             Judged::Refuse(reason) => return refuse(shared, controller, id, reason, latest).await,
             Judged::Apply(plan) => plan,
-            Judged::Wait => return Ok(Settled::Looking),
             Judged::Undecided(refusal) => return Ok(Settled::Undecided(refusal)),
         },
     };
@@ -1187,8 +1163,6 @@ async fn settle_request(
         .apply_feed_plan(&plan)
         .await
         .map_err(Stopped::local)?;
-    // What it revoked is explained by its place in the feed, for the requests judged after it.
-    controller.feed_request_revoked(&plan, place);
     #[cfg(feature = "testing")]
     controller.feed_request_was_carried_out().await;
     // A request is numbered when it takes effect. One not numbered yet that left the registry

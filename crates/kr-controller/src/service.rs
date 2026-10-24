@@ -718,9 +718,6 @@ pub struct Controller {
     /// What a withdrawal the feed shows complete and this host cannot verify names, while one
     /// stands: the devices, and the keys they hold, that keep no standing over the feed.
     feed_withheld: std::sync::Mutex<remote_revocation::Withheld>,
-    /// Where in the authority feed this run found the devices it revoked, for judging a request by
-    /// the standing its issuer had at its own place.
-    feed_places: std::sync::Mutex<remote_revocation::FeedPlaces>,
     /// What this daemon has told its session workers the host's local owner may do, and what each
     /// has acknowledged.
     local_access: local_access::LocalAccessState,

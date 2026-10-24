@@ -6634,16 +6634,22 @@ written under a store version that releases already installed can read; this rel
 holds that is not shown complete waits until the host
 has caught up, and is then judged on the registry as it stands, in a scan of its own that is the
 synchronisation a connection waits for, so the owner is not refused for the host's being behind.
-A request is judged by the standing its issuer had at the request's place in the feed. A withdrawal
-that comes later in the feed than the request took nothing from the issuer yet, so a request that
-the host put off while it was behind is carried out when the issuer was revoked by a later record:
-by a withdrawal the host cannot verify, which only withholds the issuer, or by a withdrawal the
-host carried out again itself. The host reads where in the feed it revoked each device at every
-start, from the first record, so nothing is stored for it, and a request that comes before the
-first scan of a run has read the feed through waits for that scan. A device the owner at the
-machine revoked has no place in the feed, and its request is refused. A device that the owner at
-the machine revoked and that a later record also names is taken to have been revoked by that
-record, and a request it made earlier in the feed is carried out, which only withdraws.
+A request is judged by the standing its issuer holds in the registry, and a device a withdrawal
+the host cannot verify names is withheld from it only for the requests that come after that
+withdrawal in the feed. A withdrawal that comes later in the feed than the request took nothing
+from the issuer yet, so a request that the host put off while it was behind its feed is carried out
+when its issuer is live and a later withdrawal the host cannot verify names it. The host reads the
+places from the feed at every start, from the first record, so nothing is stored for them. The
+place decides only that: the feed gains nothing from it, because it can leave the withdrawal out of
+what it shows or show the request complete. The request of an issuer the registry holds revoked
+is refused wherever it stands in the feed, because the feed sets the order of its records and the
+owner's signature does not cover it. One consequence is a limit. A request that was put off while
+the host was behind, and whose issuer a later withdrawal by an owner the host knows revoked, is
+refused, and what it named is not withdrawn. The same holds for a device the owner at the machine
+revoked, and for a restart that finds the issuer revoked. The request is shown refused to the owner
+who published it, who can publish it again from a device the host holds live or revoke what it
+named at the machine. Carrying it out again by itself needs a record of the host's own that
+survives the restore, which is a stored place.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier
 that fences the workers and withdraws every connection admitted under the earlier state. The next
 revision it issues is then above everything it issued, and it decides again. A pass that stops

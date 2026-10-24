@@ -2130,13 +2130,13 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_cannot_verify_is_carri
         .await;
 }
 
-/// KR-REQ-24.15: a request put off while the host was behind its feed is judged at its place when
-/// the owner who withdrew its issuer after it is one the host knows, and the host revoked the
-/// issuer by carrying that withdrawal out again first: the issuer was an owner where the request
-/// stands in the feed, and the request is carried out, not refused for the issuer's having been
-/// revoked since.
+/// KR-REQ-24.15: a limit. A request put off while the host was behind its feed, whose issuer a later
+/// withdrawal by an owner the host knows revoked, is refused: the registry holds the issuer revoked,
+/// and the host refuses the request of a revoked issuer wherever the feed puts it, because the feed
+/// sets the order and a signature does not cover it. What the request named is not withdrawn. Only
+/// a record the host kept of its own that it had begun the request could finish it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_carried_out() {
+async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_refused() {
     let PutOff {
         rig,
         issuer,
@@ -2148,31 +2148,24 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_c
 
     let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
     assert_eq!(
-        held.rejected.0, None,
-        "the device was an owner where its request stands in the feed: {held:?}"
+        held.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the issuer is revoked, and its request is refused wherever it stands: {held:?}"
     );
-    assert_eq!(
-        held.acknowledgement
-            .0
-            .as_ref()
-            .map(|acknowledged| acknowledged.completion),
-        Some(RevocationCompletion::Complete),
-        "and the host carried it out: {held:?}"
-    );
-    rig.connects_while_a_revocation_is_held(&issuer.0, &issuer.1)
-        .await;
-    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
-        .await;
-    let session = connect(&rig.host, &kept.0, &kept.1).await;
-    rig.doctor_as(&session)
-        .await
-        .expect("the device nothing names is served");
+    assert!(rig.has_revoked(issuer.1.device_id).await);
+    assert!(!rig.has_revoked(target.1.device_id).await);
+    for served in [&target, &kept] {
+        let session = connect(&rig.host, &served.0, &served.1).await;
+        rig.doctor_as(&session)
+            .await
+            .expect("a device the request named is served: it was not withdrawn");
+    }
 }
 
-/// KR-REQ-24.15: where a withdrawal stands in the feed is read from the feed by every run, and no
-/// state of the run before is needed. The host stops after the scan that carried the later
-/// withdrawal out again and before the scan that judges the request, and the run that follows
-/// carries the request out all the same.
+/// KR-REQ-24.15: where a withdrawal the host cannot verify stands in the feed is read from the feed
+/// by every run, and no state of the run before is needed. The host stops after the scan that found
+/// the withdrawal and before the scan that judges the request, and the run that follows carries the
+/// request out all the same: the issuer is still live where its request stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_ahead_of_a_withdrawal_is_carried_out_by_the_run_that_follows_a_stop_between_them()
  {
@@ -2182,9 +2175,9 @@ async fn a_request_ahead_of_a_withdrawal_is_carried_out_by_the_run_that_follows_
         target,
         kept,
         first,
-    } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(true).await;
-    // The first scan reads the feed (1), puts the request off and carries the withdrawal out
-    // again; the feed turns the second scan's read (2) back, and the host stops there.
+    } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(false).await;
+    // The first scan reads the feed (1), puts the request off and finds the withdrawal; the feed
+    // turns the second scan's read (2) back, and the host stops there.
     rig.served
         .web()
         .fail_with_member(AUTHORITY, "read", 2, TURNED_BACK);
@@ -2197,17 +2190,15 @@ async fn a_request_ahead_of_a_withdrawal_is_carried_out_by_the_run_that_follows_
         held.rejected.0, None,
         "the run that follows judges the request at its place: {held:?}"
     );
-    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
-        .await;
-    let session = connect(&rig.host, &kept.0, &kept.1).await;
-    rig.doctor_as(&session)
-        .await
-        .expect("the device nothing names is served");
+    assert!(
+        rig.has_revoked(target.1.device_id).await,
+        "and carries it out: {held:?}"
+    );
+    assert!(!rig.has_revoked(kept.1.device_id).await);
 }
 
-/// KR-REQ-24.15: a device the owner at the machine revoked has no place in the feed, so its
-/// request is refused, however the feed's later records stand: the host holds it for one scan, to
-/// learn that no record explains the revocation, and then refuses it.
+/// KR-REQ-24.15: the request of a device the owner at the machine revoked is refused, wherever it
+/// stands in the feed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_of_a_device_the_owner_revoked_at_the_machine_is_refused() {
     let rig = Rig::start().await;
@@ -2242,6 +2233,107 @@ async fn a_request_of_a_device_the_owner_revoked_at_the_machine_is_refused() {
     rig.doctor_as(&session)
         .await
         .expect("what the request named was not withdrawn");
+}
+
+/// A device revoked at the machine, a request it published, and the live owner's request naming it
+/// after that.
+struct RevokedIssuer {
+    rig: Rig,
+    /// The device revoked at the machine, whose key the request is signed with.
+    issuer: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The device its request names.
+    target: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The request.
+    first: RevocationRequest,
+}
+
+/// Pairs an owner `v` and a device `t`, has the owner at the machine revoke `v`, and publishes a
+/// request of `v` naming `t` and then the host's owner's request naming `v`. The second is made
+/// complete, as an earlier run of the host would have left it, when `complete`.
+async fn a_request_of_a_device_revoked_at_the_machine_ahead_of_a_live_owners_withdrawal(
+    complete: bool,
+) -> RevokedIssuer {
+    let rig = Rig::start().await;
+    let issuer = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.revokes_at_the_machine(issuer.1.device_id).await;
+    rig.until_the_carrier_is_idle().await;
+    let key = issuer.0.keys().authorisation.clone();
+    let first = rig.request_of(&key, issuer.1.device_id, 0xe4, devices(target.1.device_id));
+    rig.published_as(&key, &first).await;
+    let second = rig.owner_publishes(0xe5, devices(issuer.1.device_id)).await;
+    if complete {
+        // The registry stands at the revision the machine's revocation gave it, which is the one
+        // the feed holds, so the host is not behind it.
+        rig.an_earlier_run_carried_out(&second, 0, 1).await;
+    }
+    RevokedIssuer {
+        rig,
+        issuer,
+        target,
+        first,
+    }
+}
+
+/// KR-REQ-24.15: the request of a device the owner at the machine revoked is refused after a restart
+/// as it is without one, when a live owner's request naming the device follows it in the feed and
+/// withdraws nothing, because the device is revoked already. The feed sets the order of its records
+/// and a signature does not cover it, so the place a record holds gives a revoked device no
+/// standing; a restart that lost the reason it was revoked must not give it one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_request_of_a_device_revoked_at_the_machine_is_refused_after_a_restart() {
+    let RevokedIssuer {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_of_a_device_revoked_at_the_machine_ahead_of_a_live_owners_withdrawal(false).await;
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.until_the_carrier_is_idle().await;
+
+    let key = issuer.0.keys().authorisation.clone();
+    assert_eq!(
+        rig.held_as(&key, &first).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "a revoked device's request is refused wherever the feed puts it"
+    );
+    assert!(
+        !rig.has_revoked(target.1.device_id).await,
+        "and what it named is not withdrawn"
+    );
+}
+
+/// KR-REQ-24.15: the request of a device the owner at the machine revoked is refused when a live
+/// owner's complete record that names the device follows it in the feed, as it is without one: the
+/// record the host carries out again names a device that is revoked already, and the host holds
+/// nothing in the record's place against the device's standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_request_of_a_device_revoked_at_the_machine_is_refused_ahead_of_a_complete_record_that_names_it()
+ {
+    let RevokedIssuer {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_of_a_device_revoked_at_the_machine_ahead_of_a_live_owners_withdrawal(true).await;
+    rig.until_the_carrier_is_idle().await;
+
+    let key = issuer.0.keys().authorisation.clone();
+    assert_eq!(
+        rig.held_as(&key, &first).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "a revoked device's request is refused wherever the feed puts it"
+    );
+    assert!(
+        !rig.has_revoked(target.1.device_id).await,
+        "and what it named is not withdrawn"
+    );
 }
 
 impl Rig {
