@@ -434,28 +434,35 @@ function Initialize-KalaReachBridge {
     $script:Kr.Session = $sessionBytes
     $script:Kr.Secret = $secretBytes
     $script:Kr.Endpoint = $endpoint
-    $script:Kr.Identity = Get-KrProcessIdentity
-    $script:Kr.Package = Get-KrPackageIdentity
+    # An error on the way to the proof must not leave the secret in the module for the life of the
+    # process, so everything between holding it and the accepted handshake clears it on a throw.
+    try {
+        $script:Kr.Identity = Get-KrProcessIdentity
+        $script:Kr.Package = Get-KrPackageIdentity
 
-    $script:Kr.Socket = Connect-KrEndpoint $endpoint
-    if ($null -eq $script:Kr.Socket) {
-        Clear-KrSecret
-        return
-    }
+        $script:Kr.Socket = Connect-KrEndpoint $endpoint
+        if ($null -eq $script:Kr.Socket) {
+            Clear-KrSecret
+            return
+        }
 
-    $transcript = Get-KrTranscript $script:Kr.Identity $script:Kr.Package.integration_version
-    $mac = [System.Security.Cryptography.HMACSHA256]::new($script:Kr.Secret)
-    try { $proof = $mac.ComputeHash($transcript) } finally { $mac.Dispose() }
+        $transcript = Get-KrTranscript $script:Kr.Identity $script:Kr.Package.integration_version
+        $mac = [System.Security.Cryptography.HMACSHA256]::new($script:Kr.Secret)
+        try { $proof = $mac.ComputeHash($transcript) } finally { $mac.Dispose() }
 
-    if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $script:Kr.Package) })) {
-        Disconnect-KrEndpoint
+        if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $script:Kr.Package) })) {
+            Disconnect-KrEndpoint
+            Clear-KrSecret
+            return
+        }
+        if (-not (Wait-KrHandshake)) {
+            Disconnect-KrEndpoint
+            Clear-KrSecret
+            return
+        }
+    } catch {
         Clear-KrSecret
-        return
-    }
-    if (-not (Wait-KrHandshake)) {
-        Disconnect-KrEndpoint
-        Clear-KrSecret
-        return
+        throw
     }
     $script:Kr.Registered = $true
     $script:Kr.Managed = $true
