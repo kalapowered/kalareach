@@ -339,10 +339,20 @@ if platform == "android":
     # worker asks carries no sentence of the host's own, so the host seals nothing to show: the real
     # receiver opened the real host's seal, found it authentic and addressed to this phone, and had
     # nothing to put in the alert's place.
-    deliveries = [line.partition("|")[2] for line in read("delivery-outcomes.txt").splitlines() if "|" in line]
+    outcomes = {}
+    for line in read("delivery-outcomes.txt").splitlines():
+        number, _, text = line.partition("|")
+        if number.isdigit():
+            outcomes[int(number)] = text.strip()
+    # The message the host sent with previews off carries none, and its alert stands for that reason.
+    unsealed = {report.get("previews_off_message")} - {None}
+    sealed = [text for number, text in outcomes.items() if number not in unsealed]
     say("the receiver opened each sealed preview the host sent and found nothing to show (16.11, 16.13)",
-        len(deliveries) > 0 and all(outcome.strip() == "delivery: shown (empty_preview)" for outcome in deliveries),
-        f"{deliveries}")
+        len(sealed) > 0 and all(text == "delivery: shown (empty_preview)" for text in sealed), f"{sealed}")
+    say("the receiver showed the generic alert for the message the host sent with previews off, which carried no preview (16.11)",
+        report.get("previews_off_message") in outcomes
+        and outcomes[report["previews_off_message"]] == "delivery: shown (no_preview)",
+        f"{outcomes.get(report.get('previews_off_message'))}")
     cold = read("cold-start.txt")
     before_pid = cold.split("pid before the message: '")[1].split("'")[0] if "pid before the message: '" in cold else "?"
     after_pid = cold.split("pid after the message: '")[1].split("'")[0] if "pid after the message: '" in cold else ""
@@ -401,6 +411,17 @@ else:
     allowance = report.get("burst_policy_burst")
     say("the host's journal retained every one of the burst's events (16.17)",
         report.get("burst_settled") is True and report.get("burst_events_retained") == asked, f"events {report.get('burst_events_retained')} of {asked}")
+    for choice in ("off", "on"):
+        ran = read(f"phone-previews-{choice}.txt")
+        say(f"the phone made the choice of previews {choice} through the command the page's switch uses, and the host was told (16.11)",
+            "the choice of previews was made ok=1" in ran and "done=1" in ran and report.get(f"previews_{choice}_host_told") is True,
+            ran.strip().splitlines()[-2] if ran.strip() else "no result")
+    say("the notification the host sent with previews off carried no preview, and the one with previews on carried one (16.11)",
+        report.get("previews_off_delivered") is True and report.get("previews_off_carries_a_preview") is False
+        and report.get("previews_on_delivered") is True and report.get("previews_on_carries_a_preview") is True,
+        f"off {report.get('previews_off_carries_a_preview')} on {report.get('previews_on_carries_a_preview')}")
+    say("both were put on the phone and shown",
+        report.get("previews_off_put_on_the_phone") is True and report.get("previews_on_put_on_the_phone") is True)
     say("each event is one delivery record, and the host accepted as many as its allowance gives and collapsed the rest (16.17)",
         report.get("burst_deliveries_written") == asked and isinstance(allowance, int) and isinstance(asked, int)
         and report.get("burst_accepted") == min(asked, allowance)
@@ -580,6 +601,15 @@ run_android() {
     if ! avd="$(kr_android_avd "$sdk/emulator/emulator")"; then
         say "$avd"
         return 3
+        for choice in off on; do
+            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
+                : >"$harness/started-previews-$choice"
+                local flag=false
+                [ "$choice" = on ] && flag=true
+                android_launch "$adb" "$serial" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
+                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
+            fi
+        done
     fi
 
     if [ -z "$apk" ]; then
@@ -847,6 +877,15 @@ ios_launch() { # <udid> <name> <json fields>
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
     xcrun simctl launch "$udid" "$app_id" >/dev/null
     while :; do
+        for choice in off on; do
+            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
+                : >"$harness/started-previews-$choice"
+                local flag=false
+                [ "$choice" = on ] && flag=true
+                ios_launch "$udid" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
+                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
+            fi
+        done
         text="$(cat "$support/push-result-$name.txt" 2>/dev/null)"
         case "$text" in *done=1*) break ;; esac
         sleep 2
