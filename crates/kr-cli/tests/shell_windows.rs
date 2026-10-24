@@ -566,45 +566,6 @@ async fn install_package(
     generation_home
 }
 
-/// The forwarder beside this test's executable, where the daemon this process hosts looks for the
-/// one a package's flags name by the placeholder. A build outside an installation keeps its
-/// programs beside its own, and this test's executable is in a directory of its own, so the program
-/// is placed there for the case and taken away again by whoever placed it.
-struct ForwarderBeside {
-    path: PathBuf,
-    placed: bool,
-}
-
-impl ForwarderBeside {
-    /// Places the workspace's `kr-hook` beside this executable unless one is already there.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the program has not been built or cannot be placed.
-    fn place() -> Self {
-        let path = std::env::current_exe()
-            .expect("this test's executable")
-            .parent()
-            .expect("a directory")
-            .join("kr-hook.exe");
-        let placed = !path.exists();
-        if placed {
-            let built = kr_controller::supervision::windows::testing::built_binary("kr-hook")
-                .unwrap_or_else(|missing| panic!("{missing}"));
-            std::fs::copy(&built, &path).expect("the forwarder is placed beside the test");
-        }
-        Self { path, placed }
-    }
-}
-
-impl Drop for ForwarderBeside {
-    fn drop(&mut self) {
-        if self.placed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
 /// KR-REQ-12.07, KR-REQ-07.45: the bundled Claude Code and Qoder CLI packages (the release's own
 /// files, published in a generation of the test's own), with their integrations turned on, launch
 /// the program a person types in the managed shell through the forwarder, which adds the flags
@@ -633,12 +594,12 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
         "Gemini CLI's package is published for Windows"
     );
 
-    let _forwarder = ForwarderBeside::place();
-    let prepared = Prepared::new();
+    // The package's flags name the forwarder by placeholder, which the daemon and the worker have
+    // to write as one path.
+    let prepared = Prepared::beside_the_test();
     let _claude_published =
         install_package(&prepared, &bundled_package("claude-code"), "claude").await;
-    let _qoder_published =
-        install_package(&prepared, &bundled_package("qoder-cli"), "qoder").await;
+    let _qoder_published = install_package(&prepared, &bundled_package("qoder-cli"), "qoder").await;
     let managed = Managed::start(prepared).await;
     managed.install_entries().await;
     for plugin in ["kalareach/claude-code", "kalareach/qoder-cli"] {
@@ -908,7 +869,7 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
              shows: {}",
             terminal.text()
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        terminal.watch(Duration::from_millis(250)).await;
     };
     assert_eq!(registered, [ComponentState::Registered]);
 

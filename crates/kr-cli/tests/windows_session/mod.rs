@@ -208,6 +208,32 @@ impl WorkerTerminal {
         plain
     }
 
+    /// Reads what the session writes for up to `how_long`, so that [`Self::text`] is current.
+    pub async fn watch(&mut self, how_long: Duration) {
+        let deadline = tokio::time::Instant::now() + how_long;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, self.client.recv()).await {
+                Ok(Ok(kr_protocol::envelope::ControlFrame::Notification(notification)))
+                    if notification.event_type.as_str() == "session.output" =>
+                {
+                    if let Ok(event) = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
+                    {
+                        self.seen
+                            .push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => return,
+            }
+        }
+    }
+
     /// Waits until the session has written `pattern`, as [`Self::text`] reads it, and returns it all.
     pub async fn shown(&mut self, pattern: &str, what: &str) -> String {
         let started = tokio::time::Instant::now();
@@ -252,6 +278,8 @@ pub struct WorkerHost {
     _task: kr_controller::supervision::windows::testing::TestTask,
     controller: Option<std::sync::Arc<kr_controller::service::Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
+    /// Last, so the programs placed beside this test's executable go once the workers have ended.
+    _beside: Option<Beside>,
 }
 
 /// A tree with the environment's task registered and the programs a session needs placed on it,
@@ -260,6 +288,31 @@ pub struct Prepared {
     pub tree: teardown::Tree,
     task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
+    beside: Option<Beside>,
+}
+
+/// The worker and the forwarder placed beside this test's executable, where the daemon this process
+/// hosts looks for the programs of its own release; they are taken away when this ends.
+///
+/// An installation runs its daemon and its workers from one release, so the forwarder a package's
+/// flags name by placeholder is the same path to both. A daemon hosted in a test is the test's own
+/// executable, so its release is the directory that executable is in.
+struct Beside {
+    placed: Vec<PathBuf>,
+    /// Held while the programs are there: two cases that placed them at once would replace a
+    /// program the other's worker runs.
+    _only_one: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Held by whoever has programs placed beside this test's executable.
+static BESIDE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl Drop for Beside {
+    fn drop(&mut self) {
+        for program in &self.placed {
+            let _ = std::fs::remove_file(program);
+        }
+    }
 }
 
 impl Prepared {
@@ -267,6 +320,20 @@ impl Prepared {
     /// programs it starts (the forwarder a launch goes through and the plugin host), each when the
     /// workspace has built it.
     pub fn new() -> Self {
+        Self::placed(false)
+    }
+
+    /// As [`Self::new`], with the worker and the forwarder beside this test's executable instead of
+    /// in the tree, so that the daemon and the workers it starts name the same forwarder.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a program is already there and cannot be replaced.
+    pub fn beside_the_test() -> Self {
+        Self::placed(true)
+    }
+
+    fn placed(beside_the_test: bool) -> Self {
         use kr_controller::supervision::windows::testing::{TestTask, built_binary};
 
         let tree = teardown::Tree::create();
@@ -286,29 +353,65 @@ impl Prepared {
         let starter = built_binary("kr-controller").unwrap_or_else(|missing| panic!("{missing}"));
         let task = TestTask::register(&environment, &starter)
             .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
-        let worker = tree.root().join("kr-worker.exe");
-        kr_ipc::testing::place_and_start_once(
-            &built_binary("kr-worker").unwrap_or_else(|missing| panic!("{missing}")),
-            &worker,
-            &["--version"],
-        );
-        for beside in ["kr-hook", "kr-plugin-host"] {
-            if let Ok(built) = built_binary(beside) {
+        let (worker, beside) = if beside_the_test {
+            let only_one = BESIDE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let directory = std::env::current_exe()
+                .expect("this test's executable")
+                .parent()
+                .expect("a directory")
+                .to_path_buf();
+            let mut beside = Beside {
+                placed: Vec::new(),
+                _only_one: only_one,
+            };
+            for program in ["kr-worker", "kr-hook"] {
+                let destination = directory.join(format!("{program}.exe"));
+                kr_ipc::testing::place_and_start_once(
+                    &built_binary(program).unwrap_or_else(|missing| panic!("{missing}")),
+                    &destination,
+                    &["--version"],
+                );
+                beside.placed.push(destination);
+            }
+            (directory.join("kr-worker.exe"), Some(beside))
+        } else {
+            let worker = tree.root().join("kr-worker.exe");
+            kr_ipc::testing::place_and_start_once(
+                &built_binary("kr-worker").unwrap_or_else(|missing| panic!("{missing}")),
+                &worker,
+                &["--version"],
+            );
+            (worker, None)
+        };
+        for program in ["kr-hook", "kr-plugin-host"] {
+            if let Ok(built) = built_binary(program) {
                 kr_ipc::testing::place_and_start_once(
                     &built,
-                    &tree.root().join(format!("{beside}.exe")),
+                    &tree.root().join(format!("{program}.exe")),
                     &["--version"],
                 );
             }
         }
-        Self { tree, task, worker }
+        Self {
+            tree,
+            task,
+            worker,
+            beside,
+        }
     }
 
     /// Starts the daemon on this tree, reading shell packages from `packages` when it is given.
     pub async fn start(self, packages: Option<PathBuf>) -> WorkerHost {
         use kr_controller::service::{Controller, ControllerSetup};
 
-        let Self { tree, task, worker } = self;
+        let Self {
+            tree,
+            task,
+            worker,
+            beside,
+        } = self;
         let environment = tree.environment();
         let environment_id = environment.environment_id();
         let secrets = environment.secrets_dir();
@@ -352,6 +455,7 @@ impl Prepared {
             _task: task,
             controller: Some(controller),
             serving,
+            _beside: beside,
         }
     }
 }
