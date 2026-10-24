@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use companion_platform::notify::Permission;
+use companion_platform::notify::{Permission, PreviewKeys};
 use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::device::Device;
 use companion_tauri::push::{
@@ -73,9 +73,12 @@ struct ReceiverState {
     /// one the platform gave when it was asked, and reaches the asker when the test lets it.
     permission_held: BTreeSet<usize>,
     permission_released: BTreeSet<usize>,
-    /// Whether the filing of the preview key waits to be let go, and whether it has been asked.
-    limited_key_held: bool,
-    limited_key_reached: bool,
+    /// The number of the filing of the preview keys (the first is 1) that waits to be let go, and
+    /// whether it has been let go.
+    keys_hold: Option<usize>,
+    keys_released: bool,
+    /// How many filings of the preview keys have been asked.
+    keys_asked: usize,
     /// The reads of the token, by their number, that wait to be released in the same way.
     token_held: BTreeSet<usize>,
     token_released: BTreeSet<usize>,
@@ -94,8 +97,9 @@ struct ReceiverState {
     answering: bool,
     /// A registration was written while another one's challenge was still waiting.
     overlapped: bool,
-    /// What was filed for the extension: the key identifier and the seed.
-    filed: Vec<([u8; 32], Vec<u8>)>,
+    /// What the receivers hold now, and every set they were handed, in the order they were handed.
+    keys_now: Option<PreviewKeys>,
+    keys_history: Vec<PreviewKeys>,
 }
 
 impl Receiver {
@@ -110,8 +114,9 @@ impl Receiver {
                 permission_panics: false,
                 permission_held: BTreeSet::new(),
                 permission_released: BTreeSet::new(),
-                limited_key_held: false,
-                limited_key_reached: false,
+                keys_hold: None,
+                keys_released: false,
+                keys_asked: 0,
                 token_held: BTreeSet::new(),
                 token_released: BTreeSet::new(),
                 token_reads: 0,
@@ -122,7 +127,8 @@ impl Receiver {
                 reads_of_pending: 0,
                 answering: true,
                 overlapped: false,
-                filed: Vec::new(),
+                keys_now: None,
+                keys_history: Vec::new(),
             }),
         })
     }
@@ -243,24 +249,21 @@ impl Native for Receiver {
         })
     }
 
-    fn limited_key<'a>(
-        &'a self,
-        recipient_key_id: &'a [u8; 32],
-        seed: &'a [u8],
-    ) -> PushFuture<'a, ()> {
+    fn preview_keys<'a>(&'a self, keys: &'a PreviewKeys) -> PushFuture<'a, ()> {
         Box::pin(async move {
-            {
+            let held = {
                 let mut state = self.state.lock().expect("the receiver");
-                state.limited_key_reached = true;
-                state.filed.push((*recipient_key_id, seed.to_vec()));
-            }
-            loop {
-                let held = self.state.lock().expect("the receiver").limited_key_held;
-                if !held {
-                    return Ok(());
-                }
+                state.keys_asked += 1;
+                state.keys_hold == Some(state.keys_asked)
+            };
+            // A held filing is handed over when the test lets it go, and not before.
+            while held && !self.state.lock().expect("the receiver").keys_released {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            let mut state = self.state.lock().expect("the receiver");
+            state.keys_now = Some(keys.clone());
+            state.keys_history.push(keys.clone());
+            Ok(())
         })
     }
 
@@ -753,11 +756,11 @@ async fn a_stop_the_phone_made_itself_is_not_shown_as_the_host_refusing() {
     );
 }
 
-/// KR-REQ-16.11: what is filed for the notification extension is the preview key's seed, the one
-/// the host was told the public half of, under that key's identifier. The authorisation key's seed
-/// is not what is filed.
+/// KR-REQ-16.11: what the receivers hold is this phone's preview seed, the one the host was told the
+/// public half of, under that key's identifier, and the public key of the host that seals to it,
+/// under the identifier its previews name it by. The authorisation key's seed is not what is filed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_host_was_told_of() {
+async fn the_keys_filed_for_the_receivers_are_the_preview_key_the_host_was_told_of_and_the_hosts() {
     let owner = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
@@ -765,23 +768,17 @@ async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_hos
     phone.desk.enable(&reference).expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
 
-    let filed = phone
-        .receiver
-        .state
-        .lock()
-        .expect("the receiver")
-        .filed
-        .clone();
-    assert_eq!(filed.len(), 1, "one key was filed");
-    let (key_id, seed) = &filed[0];
-    // The seed that was filed, read back as the notification extension reads its key.
+    let filed = held_keys(&phone).expect("the receivers were handed keys");
+    assert_eq!(filed.recipients.len(), 1, "one seed was filed");
+    let recipient = &filed.recipients[0];
+    // The seed that was filed, read back as the receivers read their key.
     let store = MemoryStore::new();
     let name = SecretName::device_key(
         companion_platform::secrets::DEVICE_SCOPE,
         KeyPurpose::NotificationPreview,
     )
     .expect("a name");
-    store.set(&name, seed).expect("the seed is kept");
+    store.set(&name, &recipient.seed).expect("the seed is kept");
     let derived = load_notification_preview_key(&store, companion_platform::secrets::DEVICE_SCOPE)
         .expect("the key loads")
         .expect("a key");
@@ -792,9 +789,24 @@ async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_hos
         "the seed filed is the one the host's preview key is made from"
     );
     assert_eq!(
-        key_id,
+        &recipient.id,
         derived.key_id().as_bytes(),
         "under that key's identifier"
+    );
+    // The host's key, under the identifier its sealed previews name it by.
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .remove(0);
+    let key = paired.host_keys.notification_preview;
+    assert_eq!(filed.senders.len(), 1, "one host's key was filed");
+    assert_eq!(filed.senders[0].key, *key.as_bytes());
+    assert_eq!(
+        &filed.senders[0].id,
+        kr_protocol::pairing::key_id(KeyPurpose::NotificationPreview, key.as_bytes()).as_bytes()
     );
     // The control: the installation's authorisation seed is another secret, which the phone holds
     // and the application's secure store gives back, and it is not what is filed.
@@ -813,9 +825,20 @@ async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_hos
         .expect("the phone holds an authorisation seed");
     assert_ne!(
         authorisation.expose(),
-        seed.as_slice(),
+        recipient.seed.as_slice(),
         "the authorisation seed is not what is filed"
     );
+}
+
+/// What the receivers hold now.
+fn held_keys(phone: &Desk) -> Option<PreviewKeys> {
+    phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .keys_now
+        .clone()
 }
 
 /// KR-REQ-16.08: the phone keeps one record of the registration it waits for and the gateway one
@@ -2457,10 +2480,10 @@ async fn a_forgotten_host_that_never_answers_does_not_keep_the_relay_it_was_reac
     phone.registered.lock().expect("what was sent").hold_answer = false;
 }
 
-/// The hold on a host's endpoint ends with the line: the key is filed on the phone after the last
-/// change to the host, and while it is filed another host on the same relay connects.
+/// The keys are filed before the host's endpoint is held, and no host waits behind the platform's
+/// filing: while they are filed, another host on the same relay connects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_endpoint_of_a_host_is_let_go_before_the_preview_key_is_filed() {
+async fn the_endpoint_of_a_host_is_not_held_while_the_preview_keys_are_filed() {
     let owner = DeviceKeys::generate().expect("keys");
     let in_use = Host::start(&owner).await;
     let running = on_the_shared_relay(&owner, 9).await;
@@ -2478,22 +2501,230 @@ async fn the_endpoint_of_a_host_is_let_go_before_the_preview_key_is_filed() {
         .use_host(host(0).host_device_id)
         .expect("the host in use");
     let other_host = host(2);
-    phone.receiver.with(|state| state.limited_key_held = true);
+    phone.receiver.with(|state| state.keys_hold = Some(1));
 
     phone.desk.enable(&references[1]).expect("the person asks");
-    eventually("the run is filing the key", || {
+    eventually("the run is filing the keys", || {
         phone
             .receiver
             .state
             .lock()
             .expect("the receiver")
-            .limited_key_reached
+            .keys_asked
+            >= 1
     })
     .await;
     companion_tauri::connection::Connection::paired(&phone.device, &other_host)
         .await
         .expect("another host on the relay connects while the key is filed");
 
-    phone.receiver.with(|state| state.limited_key_held = false);
+    phone.receiver.with(|state| state.keys_released = true);
     phone.until(|states| states[1] == PushState::On).await;
+}
+
+/// KR-REQ-16.11: the receivers hold the host's key before the host is told to seal anything to this
+/// phone: a notification that arrives the moment the host has the registration is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receivers_hold_a_hosts_key_before_the_host_is_registered() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    phone
+        .registered
+        .lock()
+        .expect("what was handed")
+        .hold_answer = true;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the host has been handed the registration", || {
+        !phone
+            .registered
+            .lock()
+            .expect("what was handed")
+            .credentials
+            .is_empty()
+    })
+    .await;
+    let held = held_keys(&phone).expect("the receivers were handed keys before the registration");
+    assert_eq!(held.senders.len(), 1, "the host's key is among them");
+    phone
+        .registered
+        .lock()
+        .expect("what was handed")
+        .hold_answer = false;
+    phone.until(|states| states == [PushState::On]).await;
+}
+
+/// KR-REQ-16.11: a host the person forgets is taken out of what the receivers hold, and the seed
+/// with the last of them: a receiver opens a preview only for a host this phone is still paired with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receivers_hold_the_keys_of_the_paired_hosts_and_nothing_of_a_forgotten_one() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
+    for reference in phone.references() {
+        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .until(|states| !states.contains(&PushState::Working))
+            .await;
+    }
+    phone
+        .until(|states| states.iter().all(|state| *state == PushState::On))
+        .await;
+    let both = held_keys(&phone).expect("the receivers were handed keys");
+    assert_eq!(both.senders.len(), 2);
+    assert_eq!(both.recipients.len(), 1);
+
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts");
+    for (position, host) in paired.iter().enumerate() {
+        phone
+            .device
+            .forget_host(host.host_device_id)
+            .expect("the pairing is forgotten");
+        phone.desk.forgotten(host.host_device_id);
+        let remaining = 1 - position;
+        eventually("the receivers follow the forgotten host", || {
+            held_keys(&phone).is_some_and(|keys| keys.senders.len() == remaining)
+        })
+        .await;
+    }
+    let none = held_keys(&phone).expect("the receivers were handed the empty set");
+    assert!(
+        none.recipients.is_empty(),
+        "no seed is held for a phone with no host that may use it"
+    );
+}
+
+/// KR-REQ-16.11: the keys are built and handed over under one hold, so a set built before a newer
+/// one is never filed after it: a host forgotten while an earlier filing is still being handed over
+/// is out of what the receivers end up holding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_set_of_keys_is_never_filed_after_a_newer_one() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let third = Host::start(&owner).await;
+    let phone = desk(
+        &[&first, &second, &third],
+        &owner,
+        Receiver::new(FIRST_TOKEN),
+    )
+    .await;
+    for reference in phone.references() {
+        phone.desk.enable(&reference).expect("the person asks");
+        phone
+            .until(|states| !states.contains(&PushState::Working))
+            .await;
+    }
+    phone
+        .until(|states| states.iter().all(|state| *state == PushState::On))
+        .await;
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts");
+
+    // The first host is unpaired elsewhere; a look builds the set without it and is handed over
+    // slowly. The person forgets the second meanwhile, which builds a newer set.
+    let asked = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .keys_asked;
+    phone.receiver.with(|state| {
+        state.keys_hold = Some(asked + 1);
+        state.keys_released = false;
+    });
+    phone
+        .device
+        .forget_host(paired[0].host_device_id)
+        .expect("the pairing is forgotten");
+    let slow_look = {
+        let desk = Arc::clone(&phone.desk);
+        tokio::spawn(async move { desk.refresh().await })
+    };
+    eventually("the look is handing its set over", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_asked
+            == asked + 1
+    })
+    .await;
+    phone
+        .device
+        .forget_host(paired[1].host_device_id)
+        .expect("the pairing is forgotten");
+    phone.desk.forgotten(paired[1].host_device_id);
+    phone.receiver.with(|state| state.keys_released = true);
+    slow_look.await.expect("the look ended").expect("a look");
+
+    eventually("the receivers hold the newer set", || {
+        held_keys(&phone).is_some_and(|keys| keys.senders.len() == 1)
+    })
+    .await;
+    let history = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .keys_history
+        .clone();
+    assert_eq!(
+        history.last().map(|keys| keys.senders.len()),
+        Some(1),
+        "the last set handed over is the newer one: {history:?}"
+    );
+}
+
+/// KR-REQ-16.11: a list of paired hosts that cannot be read is not an empty one: a look on it hands
+/// the receivers nothing, instead of taking every host's previews away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_of_paired_hosts_that_cannot_be_read_leaves_the_receivers_keys_as_they_are() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    let before = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .keys_asked;
+    let held = held_keys(&phone).expect("the receivers were handed keys");
+    assert_eq!(held.senders.len(), 1);
+
+    let file = find(phone._phone.data.path(), "hosts.json").expect("the paired hosts' file");
+    let kept = std::fs::read(&file).expect("the paired hosts");
+    std::fs::write(&file, b"{ not a list").expect("spoiled");
+    assert!(
+        phone.desk.refresh().await.is_err(),
+        "a list that cannot be read is no list"
+    );
+    std::fs::write(&file, kept).expect("mended");
+
+    assert_eq!(
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_asked,
+        before,
+        "nothing was handed over on a list that could not be read"
+    );
+    assert_eq!(held_keys(&phone), Some(held));
 }

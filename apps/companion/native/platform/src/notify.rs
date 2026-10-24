@@ -16,6 +16,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
+use zeroize::Zeroizing;
 
 use crate::PlatformError;
 use crate::push::PendingRegistration;
@@ -57,10 +58,66 @@ struct Record<'a> {
     record: &'a PendingRegistration,
 }
 
+/// The keys a receiver may open a notification preview with, and nothing else.
+///
+/// The set is handed over whole each time it changes ([`preview_keys`]), and the receivers' store is
+/// made equal to it: a host turned off is not in it, and a seed is in it only while some host that
+/// may use it is.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PreviewKeys {
+    /// This device's preview seeds, each with the identifier of its public half, which is what a
+    /// sealed preview names its recipient by.
+    pub recipients: Vec<RecipientKey>,
+    /// The preview public key of each host that may seal a preview to this device, with the
+    /// identifier a sealed preview names its sender by.
+    pub senders: Vec<SenderKey>,
+}
+
+impl std::fmt::Debug for PreviewKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A seed is a secret and is never printed.
+        formatter
+            .debug_struct("PreviewKeys")
+            .field("recipients", &self.recipients.len())
+            .field("senders", &self.senders.len())
+            .finish()
+    }
+}
+
+/// One preview seed of this device.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecipientKey {
+    /// The identifier of the seed's public half.
+    pub id: [u8; 32],
+    /// The seed.
+    pub seed: Zeroizing<Vec<u8>>,
+}
+
+/// The preview public key of one host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SenderKey {
+    /// The key's identifier.
+    pub id: [u8; 32],
+    /// The key.
+    pub key: [u8; 32],
+}
+
 #[derive(Serialize)]
-struct LimitedKey {
-    recipient_key_id: String,
+struct KeysArguments {
+    recipients: Vec<RecipientItem>,
+    senders: Vec<SenderItem>,
+}
+
+#[derive(Serialize)]
+struct RecipientItem {
+    id: String,
     seed: String,
+}
+
+#[derive(Serialize)]
+struct SenderItem {
+    id: String,
+    key: String,
 }
 
 #[cfg(mobile)]
@@ -161,27 +218,40 @@ pub async fn pending_clear<R: Runtime>(app: &AppHandle<R>) -> Result<(), Platfor
         .map(|_| ())
 }
 
-/// Files the notification-preview key in the store a receiver reads, under the identifier of its
-/// public key, replacing any earlier one under that identifier.
+/// Makes the store a receiver reads hold exactly `keys`: whatever it held before and is not in
+/// `keys` is removed, and the rest is filed or replaced.
 ///
-/// The store is the limited one: the key that opens a notification preview and nothing else. The
+/// The store is the limited one: the keys that open a notification preview and nothing else. Each
 /// seed is the item this application's secure store keeps under the key's device-key name.
 ///
 /// # Errors
 ///
-/// Returns an error when the platform cannot file it, and on a computer.
-pub async fn limited_key<R: Runtime>(
+/// Returns an error when the platform cannot file them, and on a computer.
+pub async fn preview_keys<R: Runtime>(
     app: &AppHandle<R>,
-    recipient_key_id: &[u8; 32],
-    seed: &[u8],
+    keys: &PreviewKeys,
 ) -> Result<(), PlatformError> {
     let encoder = base64::engine::general_purpose::STANDARD;
     call::<R, serde_json::Value>(
         app,
-        "pushLimitedKey",
-        LimitedKey {
-            recipient_key_id: encoder.encode(recipient_key_id),
-            seed: encoder.encode(seed),
+        "pushPreviewKeys",
+        KeysArguments {
+            recipients: keys
+                .recipients
+                .iter()
+                .map(|recipient| RecipientItem {
+                    id: encoder.encode(recipient.id),
+                    seed: encoder.encode(recipient.seed.as_slice()),
+                })
+                .collect(),
+            senders: keys
+                .senders
+                .iter()
+                .map(|sender| SenderItem {
+                    id: encoder.encode(sender.id),
+                    key: encoder.encode(sender.key),
+                })
+                .collect(),
         },
     )
     .await

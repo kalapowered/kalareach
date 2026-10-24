@@ -46,6 +46,7 @@ import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
 import to.kala.reach.companion.mobile.NotificationRoute
 import to.kala.reach.companion.mobile.OwnerAuthenticators
+import to.kala.reach.companion.mobile.PreviewKeySet
 import to.kala.reach.companion.mobile.PushStores
 import to.kala.reach.companion.mobile.SecretFiles
 import to.kala.reach.companion.mobile.SignInSession
@@ -91,12 +92,6 @@ class NamedArguments {
 class WrittenArguments {
     lateinit var name: String
     lateinit var value: String
-}
-
-@InvokeArg
-class LimitedKeyArguments {
-    lateinit var recipient_key_id: String
-    lateinit var seed: String
 }
 
 /**
@@ -372,18 +367,23 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    /** Files the notification-preview key in the limited store, by its recipient identifier. */
+    /**
+     * Makes the limited store hold exactly the keys the application hands over: the device's
+     * preview seeds and the public key of each host that may seal a preview to them. A set that is
+     * not made of keys is refused and the store is left as it was.
+     */
     @Command
-    fun pushLimitedKey(invoke: Invoke) {
-        val arguments = invoke.parseArgs(LimitedKeyArguments::class.java)
+    fun pushPreviewKeys(invoke: Invoke) {
+        val keys = PreviewKeySet.parse(invoke.getArgs().toString())
+        if (keys == null) {
+            invoke.reject("the preview keys are not keys")
+            return
+        }
         try {
-            PushStores.limited(noBackup, KeystoreSealer()).write(
-                Base64.decode(arguments.recipient_key_id, Base64.NO_WRAP),
-                Base64.decode(arguments.seed, Base64.NO_WRAP)
-            )
+            PushStores.limited(noBackup, KeystoreSealer()).replace(keys)
             invoke.resolve(done())
         } catch (failure: Exception) {
-            invoke.reject("the preview key could not be filed")
+            invoke.reject("the preview keys could not be filed")
         }
     }
 
