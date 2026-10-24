@@ -569,17 +569,26 @@ mod tests {
         }
     }
 
-    fn gateway(answers: Vec<(u16, serde_json::Value)>) -> (PushGateway, Arc<Gateway>) {
+    /// The gateway client in the push slot of a set of service clients, which is where a process
+    /// holds it, and what it was asked.
+    fn gateway(answers: Vec<(u16, serde_json::Value)>) -> (Arc<dyn PushService>, Arc<Gateway>) {
         let stand_in = Arc::new(Gateway {
             answers: Mutex::new(answers),
             asked: Mutex::new(Vec::new()),
         });
-        let client = PushGateway::new(
-            origin(),
-            Arc::clone(&stand_in) as Arc<dyn ServiceHttp>,
-            Arc::new(installation()),
+        let clients = crate::services::ServiceClients {
+            push: Some(Arc::new(PushGateway::new(
+                origin(),
+                Arc::clone(&stand_in) as Arc<dyn ServiceHttp>,
+                Arc::new(installation()),
+            ))),
+            ..crate::services::ServiceClients::none()
+        };
+        assert!(
+            clients.holds(crate::services::ManagedService::Push),
+            "the slot is filled"
         );
-        (client, stand_in)
+        (clients.push.expect("the push slot"), stand_in)
     }
 
     fn proposal() -> PushRegistrationProposal {
@@ -592,7 +601,8 @@ mod tests {
     }
 
     /// What the gateway answers to each of the installation's three calls is read as the records the
-    /// vectors carry, and each call goes to its own route with a request the gateway can check.
+    /// vectors carry, and each call, made through the push slot, goes to its own route with a
+    /// request the gateway can check.
     #[tokio::test]
     async fn the_gateway_client_reads_what_the_gateway_answers_each_call_with() {
         let records = vectors()["records"].clone();

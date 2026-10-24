@@ -22,6 +22,7 @@
 //! | KR-REQ-17.53 | `a_lease_is_asked_for_no_oftener_than_the_shortest_refresh` |
 //! | KR-REQ-17.53 | `a_chain_the_host_will_not_take_ends_the_keeper_after_a_few_tries` |
 //! | KR-REQ-17.53 | `a_second_connection_presents_the_lease_the_device_holds_and_asks_only_when_the_host_refuses_it` |
+//! | KR-REQ-17.53 | `a_visit_to_a_host_that_holds_no_lease_presents_one_first` |
 //! | KR-REQ-17.53 | `a_token_the_service_turns_back_is_replaced_once_and_the_keeper_goes_on` |
 //! | KR-REQ-17.53 | `a_lease_and_a_stop_belong_to_the_account_that_asked` |
 //! | KR-REQ-17.53 | `a_delay_the_service_names_binds_every_connection_until_it_is_over` |
@@ -555,6 +556,27 @@ impl Rig {
         tokio::time::timeout(WATCHDOG, pairing.link.connect_paired(&host, &identity))
             .await
             .expect("the connection ends one way or the other")
+    }
+
+    /// The device visits the host, as it does a host it is not using: a connection of its own that
+    /// never closes the endpoint of the host in use, of which there is none here.
+    async fn visits(&self) -> Result<Session, LinkError> {
+        let device = self.companion().device();
+        let pairing = device.pairing();
+        let host = pairing
+            .hosts
+            .list()
+            .expect("the paired hosts")
+            .into_iter()
+            .next()
+            .expect("a paired host");
+        let identity = pairing.candidate.paired_identity(host.device_id);
+        tokio::time::timeout(
+            WATCHDOG,
+            pairing.link.visit_paired(&host, &identity, &|| None),
+        )
+        .await
+        .expect("the visit ends one way or the other")
     }
 
     /// The reference the pairing screen lists the host under.
@@ -1168,6 +1190,35 @@ async fn a_lease_the_host_refuses_as_ended_the_moment_it_is_signed_is_not_asked_
         requests + 3,
         "a stop that is held sends nothing"
     );
+}
+
+/// KR-REQ-17.53: a visit to a paired host, which the application makes to read a host it is not
+/// using, is a connection of the device like any other, and the host refuses it every method until
+/// it holds the device's lease. So a visit presents the lease first, and is served. The
+/// application's own connection to the host cannot have done it here: the service holds the
+/// request that connection makes after the host's restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_to_a_host_that_holds_no_lease_presents_one_first() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    // The host forgets the lease when it restarts, and the first request for a new one is held.
+    rig.refuses_the_next_lease(Moment::Hold);
+    let rig = rig.restarted().await;
+    rig.until_lease_requests(requests + 1).await;
+
+    let visit = rig.visits().await.expect("a visit to the host");
+    read_host_info(&visit)
+        .await
+        .expect("the host serves a visit that presented the device's lease");
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 2,
+        "the visit asked for its own lease"
+    );
+    rig.served.web().release_held();
 }
 
 /// The host answers what it is, to a connection that holds a lease.
