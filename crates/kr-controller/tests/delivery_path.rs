@@ -1411,6 +1411,16 @@ impl Phone {
         environment: &Environment,
         credential: &PushDeliveryCredential,
     ) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
+        self.register_choosing(environment, credential, true).await
+    }
+
+    /// The device hands the daemon the credential, and says whether it wants previews.
+    async fn register_choosing(
+        &self,
+        environment: &Environment,
+        credential: &PushDeliveryCredential,
+        previews_enabled: bool,
+    ) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
         self.connection
             .mutate(
                 Method::DevicePushRegister,
@@ -1418,7 +1428,7 @@ impl Phone {
                 ActionTarget::environment(environment.environment_id()),
                 &DevicePushRegisterParams {
                     credential: credential.clone(),
-                    previews_enabled: true,
+                    previews_enabled,
                 },
             )
             .await
@@ -1668,6 +1678,61 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
     })
     .await;
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+/// KR-REQ-16.11: a device that registers again with previews off, after it registered with them on,
+/// is delivered to with the generic alert and nothing sealed: the host takes the choice with each
+/// registration, and the next question carries no preview and names no recipient key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_registers_again_with_previews_off_is_delivered_no_preview() {
+    const WORDS: &str = "Deploy the release to production?";
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x52));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register_choosing(&environment, &credential, true)
+        .await
+        .expect("the daemon registers a credential its gateway confirms");
+
+    environment._worker.ask("deploy-1", WORDS);
+    until("the first question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    let with = environment.gateway.delivered().remove(0);
+    assert!(with.preview.is_present(), "previews on: a sealed preview");
+
+    phone
+        .register_choosing(&environment, &credential, false)
+        .await
+        .expect("the daemon takes the choice with the registration");
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is still a destination");
+    assert!(
+        !destination
+            .as_push()
+            .expect("a push destination")
+            .previews_enabled,
+        "the destination records the choice"
+    );
+
+    environment._worker.ask("deploy-2", WORDS);
+    until("the second question being delivered", || {
+        environment.gateway.delivered().len() == 2
+    })
+    .await;
+    let without = environment.gateway.delivered().remove(1);
+    assert!(
+        !without.preview.is_present(),
+        "previews off: nothing sealed, and no recipient key named"
+    );
+    assert_eq!(without.hints.alert, PushAlert::QuestionWaiting);
+    assert_eq!(without.sender_record_id, sender);
 }
 
 /// KR-REQ-16.08: a daemon takes a credential only from the gateway its managed service stands at.
