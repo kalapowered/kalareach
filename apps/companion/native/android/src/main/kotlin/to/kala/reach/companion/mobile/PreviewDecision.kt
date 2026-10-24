@@ -1,5 +1,8 @@
 package to.kala.reach.companion.mobile
 
+import org.json.JSONException
+import org.json.JSONObject
+
 /**
  * What a notification shows, and why.
  *
@@ -29,10 +32,16 @@ enum class GenericReason(val wireName: String) {
     NOT_FOR_THIS_DEVICE("not_for_this_device"),
     EXPIRED("expired"),
     DECRYPTION_FAILED("decryption_failed"),
-    TIMED_OUT("timed_out")
+    TIMED_OUT("timed_out"),
+
+    /** No key is filed for the host the preview says it came from: previews are off for it. */
+    SENDER_UNKNOWN("sender_unknown"),
+
+    /** The preview opened, authenticated, and had nothing to show. */
+    EMPTY_PREVIEW("empty_preview")
 }
 
-/** Why the preview key is not available. */
+/** Why a preview key is not available. */
 sealed interface PreviewKeyUnavailable {
     object NotProvisioned : PreviewKeyUnavailable
 
@@ -46,16 +55,42 @@ sealed interface PreviewKeyUnavailable {
 class PreviewKeyUnavailableException(val unavailable: PreviewKeyUnavailable) :
     Exception(unavailable.toString())
 
-/** Reads the limited preview key. */
-fun interface PreviewKeyReading {
-    /** The key for one recipient, or the reason there is none. */
-    fun key(recipientKeyId: ByteArray): Result<ByteArray>
+/**
+ * Reads the keys a receiver may open a preview with: this device's own preview seed, and the public
+ * key of each host that may seal one to it. A read of either fails the same way before the first
+ * unlock.
+ */
+interface PreviewKeyReading {
+    /** The seed for one recipient key identifier, or the reason there is none. */
+    fun recipientSeed(recipientKeyId: ByteArray): Result<ByteArray>
+
+    /** The public key for one sender key identifier, or the reason there is none. */
+    fun senderKey(senderKeyId: ByteArray): Result<ByteArray>
+}
+
+/** What opening a sealed preview came to. */
+sealed interface PreviewOpened {
+    /** The text the host sealed to show. */
+    data class Text(val text: String) : PreviewOpened
+
+    /** The preview was refused, for the reason the opener names (never for any of its content). */
+    data class Refused(val reason: String) : PreviewOpened
 }
 
 /** Opens a sealed preview. */
 fun interface PreviewOpening {
-    /** The plaintext, or a failure when the ciphertext does not authenticate. */
-    fun open(envelope: PreviewEnvelope, key: ByteArray): Result<String>
+    /**
+     * Opens `preview`, the text of the sealed envelope as the gateway sent it, with this device's
+     * seed and the sender's public key. `alert` is the generic alert the message is shown with,
+     * which the sealed preview repeats and which has to match.
+     */
+    fun open(
+        preview: String,
+        alert: String,
+        seed: ByteArray,
+        senderKey: ByteArray,
+        nowMillis: Long
+    ): PreviewOpened
 }
 
 /** The whole decision, from the message's data to what is shown. */
@@ -83,42 +118,83 @@ class PreviewDecider(
             return PreviewDecision.Generic(GenericReason.NOT_FOR_THIS_DEVICE)
         }
 
-        val key =
-            keys.key(envelope.routing.recipientKeyId).getOrElse { failure ->
-                val unavailable = (failure as? PreviewKeyUnavailableException)?.unavailable
-                return PreviewDecision.Generic(
-                    if (unavailable is PreviewKeyUnavailable.LockedBeforeFirstUnlock) {
-                        GenericReason.LOCKED_BEFORE_FIRST_UNLOCK
-                    } else {
-                        GenericReason.KEY_UNAVAILABLE
-                    }
-                )
+        val seed =
+            keys.recipientSeed(envelope.routing.recipientKeyId).getOrElse { failure ->
+                return PreviewDecision.Generic(unavailable(failure, GenericReason.KEY_UNAVAILABLE))
+            }
+        // A host this device holds no key for is one whose previews are off here, or one it never
+        // asked for them: nothing it sealed is opened.
+        val senderKey =
+            keys.senderKey(envelope.routing.senderKeyId).getOrElse { failure ->
+                return PreviewDecision.Generic(unavailable(failure, GenericReason.SENDER_UNKNOWN))
             }
 
-        val text =
-            opener.open(envelope, key).getOrElse {
-                return PreviewDecision.Generic(GenericReason.DECRYPTION_FAILED)
+        val opened =
+            opener.open(
+                preview = data.getValue("preview"),
+                alert = data["alert"].orEmpty(),
+                seed = seed,
+                senderKey = senderKey,
+                nowMillis = nowMillis
+            )
+        return when (opened) {
+            is PreviewOpened.Refused -> PreviewDecision.Generic(refusal(opened.reason))
+            is PreviewOpened.Text -> {
+                val trimmed = opened.text.trim()
+                // An envelope that opens to nothing is not a preview. The alert the host chose stands.
+                if (trimmed.isEmpty()) {
+                    PreviewDecision.Generic(GenericReason.EMPTY_PREVIEW)
+                } else {
+                    PreviewDecision.Reveal(trimmed)
+                }
             }
-        val trimmed = text.trim()
-        // An envelope that opens to nothing is not a preview. The alert the host chose stands.
-        return if (trimmed.isEmpty()) {
-            PreviewDecision.Generic(GenericReason.DECRYPTION_FAILED)
-        } else {
-            PreviewDecision.Reveal(trimmed)
         }
     }
+
+    /** Why a key could not be had: the lock is its own reason; anything else is `otherwise`. */
+    private fun unavailable(failure: Throwable, otherwise: GenericReason): GenericReason {
+        val unavailable = (failure as? PreviewKeyUnavailableException)?.unavailable
+        return when (unavailable) {
+            is PreviewKeyUnavailable.LockedBeforeFirstUnlock ->
+                GenericReason.LOCKED_BEFORE_FIRST_UNLOCK
+            is PreviewKeyUnavailable.NotProvisioned -> otherwise
+            else -> GenericReason.KEY_UNAVAILABLE
+        }
+    }
+
+    /** The reason the generic alert stands for a refusal the opener named. */
+    private fun refusal(reason: String): GenericReason =
+        when (reason) {
+            "expired" -> GenericReason.EXPIRED
+            "empty_preview" -> GenericReason.EMPTY_PREVIEW
+            else -> GenericReason.DECRYPTION_FAILED
+        }
 }
 
 /**
- * Opening a sealed preview.
- *
- * The construction is the shared client's, and its implementation lives in the native client
- * library. Until this process links that primitive there is nothing here that can open an
- * envelope, and the honest answer is to say so: the decision then shows the generic alert, which
- * is exactly what the specification asks for when a preview cannot be opened. A second
- * implementation of one sealing construction is how two implementations come to disagree.
+ * The input the opener reads and the answer it gives, as JSON text, so that the Rust function is
+ * the only place a sealed preview is read.
  */
-object SharedClientPreviewOpener : PreviewOpening {
-    override fun open(envelope: PreviewEnvelope, key: ByteArray): Result<String> =
-        Result.failure(UnsupportedOperationException("this build carries no preview opener"))
+object PreviewOpenerJson {
+    /** The input for one preview: the members the Rust opener reads, and no others. */
+    fun input(preview: String, senderKey: ByteArray, alert: String, nowMillis: Long): String =
+        JSONObject()
+            .put("preview", preview)
+            .put("sender_key", java.util.Base64.getEncoder().encodeToString(senderKey))
+            .put("alert", alert)
+            .put("now_ms", nowMillis)
+            .toString()
+
+    /** What the opener's answer says. An answer that is not one of the two shapes is a refusal. */
+    fun answer(text: String): PreviewOpened =
+        try {
+            val answer = JSONObject(text)
+            if (answer.optBoolean("ok", false) && answer.opt("text") is String) {
+                PreviewOpened.Text(answer.getString("text"))
+            } else {
+                PreviewOpened.Refused(answer.optString("reason", "answer"))
+            }
+        } catch (failure: JSONException) {
+            PreviewOpened.Refused("answer")
+        }
 }

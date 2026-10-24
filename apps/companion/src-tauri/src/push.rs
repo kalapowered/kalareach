@@ -53,7 +53,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use companion_platform::notify::Permission;
+use companion_platform::notify::{Permission, PreviewKeys, RecipientKey, SenderKey};
 use companion_platform::push::{PendingRegistration, PendingState};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
@@ -264,12 +264,8 @@ pub trait Native: Send + Sync {
     fn pending_set<'a>(&'a self, record: &'a PendingRegistration) -> PushFuture<'a, ()>;
     /// The record of the registration being waited for, as it stands now.
     fn pending_get(&self) -> PushFuture<'_, Option<PendingRegistration>>;
-    /// Files the notification-preview key in the limited store a receiver reads.
-    fn limited_key<'a>(
-        &'a self,
-        recipient_key_id: &'a [u8; 32],
-        seed: &'a [u8],
-    ) -> PushFuture<'a, ()>;
+    /// Makes the limited store a receiver reads hold exactly these keys.
+    fn preview_keys<'a>(&'a self, keys: &'a PreviewKeys) -> PushFuture<'a, ()>;
     /// The screen a tap on a notification opened the application on, once.
     fn route(&self) -> PushFuture<'_, Option<String>>;
 }
@@ -376,6 +372,9 @@ pub struct PushDesk {
     /// second host's registration would replace the first's: they go one at a time. Never awaited
     /// while `state` is held.
     registering: tokio::sync::Mutex<()>,
+    /// The keys last filed for the receivers, and the hold that keeps filings in order: a set is
+    /// built and handed over under it, so an older set is never filed after a newer one.
+    filed: tokio::sync::Mutex<Option<PreviewKeys>>,
     changed: Box<dyn Fn() + Send + Sync>,
     /// Whether the record on disk is one that could not be read and could not be moved aside, so
     /// that writing would replace it. Nothing is written then, and the page shows what the desk
@@ -543,6 +542,7 @@ impl PushDesk {
                 next_run: 0,
             }),
             registering: tokio::sync::Mutex::new(()),
+            filed: tokio::sync::Mutex::new(None),
             changed: Box::new(changed),
             write_blocked,
         });
@@ -713,6 +713,9 @@ impl PushDesk {
         for (host, run) in claimed {
             self.spawn_run(host, run, Reach::Visit);
         }
+        // What the receivers hold follows the record and the paired hosts, so a look mends a filing
+        // that failed or a host that was unpaired meanwhile.
+        self.file_keys_logged().await;
         Ok(self.view())
     }
 
@@ -724,7 +727,7 @@ impl PushDesk {
     /// Forgets what is kept of `host`, as the person forgetting the host does. A run that is
     /// taking the host up loses its claim with it, writes nothing more, and is ended where it
     /// waits.
-    pub fn forgotten(&self, host: DeviceId) {
+    pub fn forgotten(self: &Arc<Self>, host: DeviceId) {
         {
             let mut state = lock(&self.state);
             state.running.remove(&host);
@@ -740,6 +743,9 @@ impl PushDesk {
             }
         }
         (self.changed)();
+        // The host's key is not the receivers' to open its previews with any more.
+        let desk = Arc::clone(self);
+        tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
     }
 
     /// Runs the sequence for `host`, which `run` holds, and runs it again for as long as the token
@@ -1105,6 +1111,13 @@ impl PushDesk {
         let Some(sender_record_id) = self.sender_record_for(host, Some(run)) else {
             return Err(forgotten_host());
         };
+        // The receivers hold this host's key before the host is told to seal anything to this
+        // phone, and the keys are filed before any hold on the host's endpoint is taken: filing is
+        // the platform's, and no other host waits behind it.
+        self.file_keys().await.map_err(Stop::from)?;
+        if !self.wanted(host.host_device_id, run) {
+            return Err(forgotten_host());
+        }
         let issued = gateway
             .issue(PushSenderIssueRequest {
                 host_endpoint_key: host.host_endpoint_id,
@@ -1142,8 +1155,8 @@ impl PushDesk {
         }
         line.register(DevicePushRegisterParams {
             credential: issued.credential,
-            // The host seals a preview to the key it holds for this phone. The phone shows the
-            // generic alert; the key is filed so a later opener needs no registration.
+            // The host seals a preview to the key it holds for this phone, and the receivers
+            // open it with the keys filed before the host was reached.
             previews_enabled: true,
         })
         .await
@@ -1163,27 +1176,97 @@ impl PushDesk {
         line.update_preview_key(*keys.notification_preview.public(), revision)
             .await
             .map_err(not_taken)?;
-        // The line is not needed any more, and the hold on the host's endpoint goes with it: the
-        // filing of the key below does not use the connection.
+        // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);
+        Ok(pending.token_digest)
+    }
 
+    /// The keys the receivers are to open previews with, from the record and the paired hosts: the
+    /// preview key of each paired host whose record is not lost, and this phone's own seed when at
+    /// least one is. Nothing when what it is built from cannot be read: a list that cannot be read
+    /// is not an empty one, and a set built from it would take every host's previews away.
+    fn wanted_keys(&self) -> std::result::Result<PreviewKeys, String> {
+        let hosts = self.device.pairing().hosts.list().map_err(|error| {
+            tracing::warn!(%error, "the paired hosts could not be read to file the preview keys");
+            "This phone could not read its paired hosts.".to_owned()
+        })?;
+        let senders: Vec<SenderKey> = {
+            let state = lock(&self.state);
+            hosts
+                .iter()
+                .filter(|host| {
+                    state
+                        .record
+                        .hosts
+                        .get(&host.host_device_id.to_string())
+                        .is_some_and(|kept| !kept.lost)
+                })
+                .map(|host| {
+                    let key = host.host_keys.notification_preview;
+                    SenderKey {
+                        id: *kr_protocol::pairing::key_id(
+                            kr_protocol::pairing::KeyPurpose::NotificationPreview,
+                            key.as_bytes(),
+                        )
+                        .as_bytes(),
+                        key: *key.as_bytes(),
+                    }
+                })
+                .collect()
+        };
+        if senders.is_empty() {
+            return Ok(PreviewKeys::default());
+        }
+        let identity = self.device.identity();
         let name = kr_crypto::store::SecretName::device_key(
             crate::device::identity::SCOPE,
             kr_protocol::pairing::KeyPurpose::NotificationPreview,
         )
         .map_err(|_| "This phone could not find its preview key.".to_owned())?;
-        let seed = self
-            .device
-            .identity()
+        let seed = identity
             .secrets
             .get(&name)
             .map_err(|_| "This phone could not read its preview key.".to_owned())?
             .ok_or_else(|| "This phone has no preview key.".to_owned())?;
-        native
-            .limited_key(keys.notification_preview.key_id().as_bytes(), seed.expose())
+        Ok(PreviewKeys {
+            recipients: vec![RecipientKey {
+                id: *identity.keys.notification_preview.key_id().as_bytes(),
+                seed: zeroize::Zeroizing::new(seed.expose().to_vec()),
+            }],
+            senders,
+        })
+    }
+
+    /// Makes the receivers hold the keys the record and the paired hosts say, and nothing else.
+    ///
+    /// The set is built and handed over under one hold, so a set built before a newer one is never
+    /// filed after it. A set the receivers already hold is not filed again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the words for what stopped it.
+    async fn file_keys(&self) -> std::result::Result<(), String> {
+        let mut filed = self.filed.lock().await;
+        let keys = self.wanted_keys()?;
+        if filed.as_ref() == Some(&keys) {
+            return Ok(());
+        }
+        // Whatever the receivers hold is not known until this filing is known to have been made.
+        *filed = None;
+        self.native
+            .preview_keys(&keys)
             .await
             .map_err(|_| "This phone could not file its preview key.".to_owned())?;
-        Ok(pending.token_digest)
+        *filed = Some(keys);
+        Ok(())
+    }
+
+    /// [`Self::file_keys`], for the callers that have nobody to tell: a failure is logged, and the
+    /// next look files again.
+    async fn file_keys_logged(&self) {
+        if let Err(words) = self.file_keys().await {
+            tracing::warn!(%words, "the preview keys could not be filed for the receivers");
+        }
     }
 
     /// The gateway's origin: the managed service's, and in a debug build the one a device run named.
@@ -1571,13 +1654,9 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
         })
     }
 
-    fn limited_key<'a>(
-        &'a self,
-        recipient_key_id: &'a [u8; 32],
-        seed: &'a [u8],
-    ) -> PushFuture<'a, ()> {
+    fn preview_keys<'a>(&'a self, keys: &'a PreviewKeys) -> PushFuture<'a, ()> {
         Box::pin(async move {
-            companion_platform::notify::limited_key(&self.0, recipient_key_id, seed)
+            companion_platform::notify::preview_keys(&self.0, keys)
                 .await
                 .map_err(said)
         })

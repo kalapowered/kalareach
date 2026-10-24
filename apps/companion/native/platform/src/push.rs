@@ -34,8 +34,8 @@
 
 use std::collections::BTreeMap;
 
+use companion_preview::OneSecret;
 use kr_client::services::push::{InstallationSigner, REGISTER_ROUTE, signed_push_request};
-use kr_crypto::secret::SecretVec;
 use kr_crypto::store::{SecretName, SecretStore, load_authorisation_key};
 use kr_protocol::ids::PushRegistrationId;
 use kr_protocol::pairing::KeyPurpose;
@@ -47,7 +47,6 @@ use kr_protocol::scalars::{Digest256, Nonce256, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, installation_id};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zeroize::Zeroizing;
 
 use crate::secrets::DEVICE_SCOPE;
 
@@ -317,44 +316,11 @@ pub fn sign(input: &str, seed: &[u8]) -> String {
     let Ok(name) = SecretName::device_key(DEVICE_SCOPE, KeyPurpose::Authorisation) else {
         return serde_json::json!({ "ok": false, "reason": "key_unavailable" }).to_string();
     };
-    sign_with(
-        input,
-        &OneSecret {
-            name,
-            bytes: Zeroizing::new(seed.to_vec()),
-        },
-    )
+    sign_with(input, &OneSecret::new(name, seed))
 }
 
-/// A store that holds one item, for a receiver that was handed a key and not a store.
-struct OneSecret {
-    name: SecretName,
-    bytes: Zeroizing<Vec<u8>>,
-}
-
-impl SecretStore for OneSecret {
-    fn set(&self, _: &SecretName, _: &[u8]) -> kr_crypto::Result<()> {
-        Err(kr_crypto::CryptoError::SecretStore {
-            message: "a receiver's store is read only".to_owned(),
-        })
-    }
-
-    fn get(&self, name: &SecretName) -> kr_crypto::Result<Option<SecretVec>> {
-        Ok((*name == self.name).then(|| SecretVec::new(self.bytes.to_vec())))
-    }
-
-    fn delete(&self, _: &SecretName) -> kr_crypto::Result<()> {
-        Err(kr_crypto::CryptoError::SecretStore {
-            message: "a receiver's store is read only".to_owned(),
-        })
-    }
-
-    fn describe(&self) -> String {
-        "the one key a receiver was handed".to_owned()
-    }
-}
-
-/// What the JVM calls: the two functions above, by their exported names.
+/// What the JVM calls: the two functions above and the opener of a sealed preview, by their exported
+/// names.
 ///
 /// Exporting a name is an unsafe attribute: the name has to be unique in the process, which the
 /// package and class in it make it. These are the places, with `tls`'s start, this crate allows
@@ -405,6 +371,30 @@ mod android {
             .resolve::<ThrowRuntimeExAndDefault>()
     }
 
+    /// `PreviewOpener.open(input, seed)`: opens a sealed notification preview, in the function the
+    /// phone's receivers share ([`companion_preview::open`]).
+    #[allow(
+        unsafe_code,
+        reason = "the JVM finds a native method by its exported, unmangled name"
+    )]
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_to_kala_reach_companion_push_PreviewOpener_open<'caller>(
+        mut unowned: jni::EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        input: JString<'caller>,
+        seed: JByteArray<'caller>,
+    ) -> JObject<'caller> {
+        unowned
+            .with_env(|env| -> jni::errors::Result<JObject<'caller>> {
+                let text = input.try_to_string(env)?;
+                let held = zeroize::Zeroizing::new(env.convert_byte_array(&seed)?);
+                Ok(env
+                    .new_string(companion_preview::open(&text, &held))?
+                    .into())
+            })
+            .resolve::<ThrowRuntimeExAndDefault>()
+    }
+
     /// Keeps the native methods in the linked library, which the JVM looks them up in by name.
     #[used]
     static CLASSIFY: for<'caller> extern "system" fn(
@@ -421,6 +411,15 @@ mod android {
         JString<'caller>,
         JByteArray<'caller>,
     ) -> JObject<'caller> = Java_to_kala_reach_companion_push_PushAnswer_sign;
+
+    /// Keeps the native methods in the linked library, which the JVM looks them up in by name.
+    #[used]
+    static OPEN: for<'caller> extern "system" fn(
+        jni::EnvUnowned<'caller>,
+        JClass<'caller>,
+        JString<'caller>,
+        JByteArray<'caller>,
+    ) -> JObject<'caller> = Java_to_kala_reach_companion_push_PreviewOpener_open;
 }
 
 /// What Swift calls: the two functions above, by their C names, with the key read from this
@@ -685,10 +684,7 @@ mod tests {
         let now = now_ms();
         let pending = pending(now + 60_000);
         let data = challenge_data();
-        let empty = OneSecret {
-            name: SecretName::new("nothing/here").expect("a name"),
-            bytes: Zeroizing::new(Vec::new()),
-        };
+        let empty = OneSecret::new(SecretName::new("nothing/here").expect("a name"), &[]);
         let mut other_registration = data.clone();
         other_registration.insert(
             REGISTRATION_KEY.to_owned(),
@@ -782,10 +778,7 @@ mod tests {
 
         let missing: Value = serde_json::from_str(&sign_with(
             &input(&data, Some(&pending), now),
-            &OneSecret {
-                name: SecretName::new("nothing/here").expect("a name"),
-                bytes: Zeroizing::new(Vec::new()),
-            },
+            &OneSecret::new(SecretName::new("nothing/here").expect("a name"), &[]),
         ))
         .expect("an answer");
         assert_eq!(missing["reason"], "key_missing");
