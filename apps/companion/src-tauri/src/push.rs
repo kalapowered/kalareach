@@ -1554,6 +1554,21 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
     }
 }
 
+/// How long the phone waits for the host to answer one of the two changes. The host drops a
+/// request that is older than [`crate::commands::MUTATION_TTL`], and an answer later than that is
+/// not one; a host that keeps its connection and never answers must not keep the line, and the
+/// hold on the host's endpoint with it, for ever.
+const ANSWER_WITHIN: Duration = Duration::from_secs(60);
+
+/// `call`, ended with a failure in words when the host has not answered within [`ANSWER_WITHIN`].
+async fn within_the_answer<T>(
+    call: impl Future<Output = std::result::Result<T, String>>,
+) -> std::result::Result<T, String> {
+    tokio::time::timeout(ANSWER_WITHIN, call)
+        .await
+        .unwrap_or_else(|_| Err("the host did not answer in time".to_owned()))
+}
+
 /// The product's way to the host: a connection opened for the host, as the device the host made.
 pub struct ConnectionRegistrar(pub Arc<Device>);
 
@@ -1623,19 +1638,21 @@ impl HostLine for ConnectionLine {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
 
-            let settled = self
-                .connection
-                .session()
-                .mutate(
-                    Method::DevicePushRegister,
-                    ActionTarget::environment(self.connection.environment_id()),
-                    None,
-                    &crate::commands::NoPreconditions {},
-                    &params,
-                    crate::commands::MUTATION_TTL,
-                )
-                .await
-                .map_err(|error| CommandError::from(error).message)?;
+            let settled = within_the_answer(async {
+                self.connection
+                    .session()
+                    .mutate(
+                        Method::DevicePushRegister,
+                        ActionTarget::environment(self.connection.environment_id()),
+                        None,
+                        &crate::commands::NoPreconditions {},
+                        &params,
+                        crate::commands::MUTATION_TTL,
+                    )
+                    .await
+                    .map_err(|error| CommandError::from(error).message)
+            })
+            .await?;
             match settled {
                 kr_client::Settled::Result(value) => value
                     .to_typed()
@@ -1659,23 +1676,26 @@ impl HostLine for ConnectionLine {
             // The key the host seals previews to is the one it recorded when this phone paired. The
             // call says the phone holds it and at which revision: the same key at the same revision
             // is answered as already recorded, and any other is refused rather than taken.
-            self.connection
-                .session()
-                .mutate(
-                    Method::DevicePreviewKeyUpdate,
-                    ActionTarget::environment(self.connection.environment_id()),
-                    None,
-                    &crate::commands::NoPreconditions {},
-                    &DevicePreviewKeyUpdateParams {
-                        device_id: self.device_id,
-                        notification_preview: preview_key,
-                        revision: DeviceKeyRevision::new(1),
-                    },
-                    crate::commands::MUTATION_TTL,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| CommandError::from(error).message)
+            within_the_answer(async {
+                self.connection
+                    .session()
+                    .mutate(
+                        Method::DevicePreviewKeyUpdate,
+                        ActionTarget::environment(self.connection.environment_id()),
+                        None,
+                        &crate::commands::NoPreconditions {},
+                        &DevicePreviewKeyUpdateParams {
+                            device_id: self.device_id,
+                            notification_preview: preview_key,
+                            revision: DeviceKeyRevision::new(1),
+                        },
+                        crate::commands::MUTATION_TTL,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| CommandError::from(error).message)
+            })
+            .await
         })
     }
 }
@@ -1780,5 +1800,21 @@ mod tests {
             b"the record"
         );
         assert!(!file.exists(), "the record is out of the way");
+    }
+
+    /// A host that keeps its connection and never answers a change does not keep the line for ever:
+    /// the call ends in words once the host's own limit on the request has passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_that_never_answers_a_change_does_not_keep_the_line() {
+        let never = within_the_answer(std::future::pending::<std::result::Result<(), String>>());
+        assert_eq!(
+            never.await,
+            Err("the host did not answer in time".to_owned())
+        );
+        assert_eq!(
+            within_the_answer(async { Ok::<_, String>(7) }).await,
+            Ok(7),
+            "an answer in time is the answer"
+        );
     }
 }
