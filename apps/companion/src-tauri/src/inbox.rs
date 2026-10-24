@@ -219,8 +219,7 @@ impl InboxDesk {
     /// Each visit asked about its own host when it ended, and a slower visit has run since: a host
     /// this device forgot, or began to use, in the meantime is not reported either. A list that
     /// cannot be read now decides nothing, and the answers stand as each visit left them.
-    #[must_use]
-    pub fn settled(device: &Device, found: Vec<HostInbox>) -> Vec<HostInbox> {
+    fn settled(device: &Device, found: Vec<HostInbox>) -> Vec<HostInbox> {
         let Ok(listed) = device.pairing().hosts.list() else {
             return found;
         };
