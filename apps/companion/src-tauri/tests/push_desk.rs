@@ -3151,3 +3151,58 @@ async fn a_look_tells_a_host_the_choice_it_was_not_told() {
     );
     let _ = reference;
 }
+
+/// A host whose run the system ended in the middle, `ago_ms` before the application starts again.
+async fn a_phone_whose_run_ended_with_the_application(ago_ms: u64) -> (Host, Desk, Opened) {
+    let (host, phone, _reference) = a_phone_with_notifications_on().await;
+    let file = find(phone._phone.data.path(), "push.json").expect("the record");
+    let mut record: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("json");
+    let now = kr_ipc::now_ms().get();
+    for each in record["hosts"].as_object_mut().expect("hosts").values_mut() {
+        each["phase"] = json!("working");
+        each["updated_ms"] = json!(now - ago_ms);
+    }
+    std::fs::write(&file, serde_json::to_vec(&record).expect("json")).expect("an interrupted run");
+    let restarted = reopened(&phone);
+    (host, phone, restarted)
+}
+
+/// KR-REQ-16.08: a run the application's end cut short is tried again by the first look when it was
+/// last heard of a minute or more before the start, and waits out the rest of the minute when it was
+/// sooner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_cut_short_a_minute_before_the_start_is_tried_again_at_the_first_look() {
+    let (_host, phone, restarted) = a_phone_whose_run_ended_with_the_application(90_000).await;
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+
+    look(&restarted.desk).await;
+
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked, Reach::Visit]
+    );
+}
+
+/// A run cut short ten seconds before the start waits out the rest of its minute: a look starts
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_cut_short_moments_before_the_start_waits_out_its_minute() {
+    let (_host, phone, restarted) = a_phone_whose_run_ended_with_the_application(10_000).await;
+
+    look(&restarted.desk).await;
+
+    assert_eq!(Arc::strong_count(&restarted.desk), 1, "no run was started");
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked]
+    );
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+}
