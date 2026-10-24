@@ -90,7 +90,7 @@ pub use backup_production::{Held as ProductionHeld, ProducerBounds, StopBackupPr
 pub use barrier::DEBT_PASS_INTERVAL;
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
-pub use create::RENDEZVOUS_TIMEOUT;
+pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};
 pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub use local::{
     LOCAL_KEEPALIVE, RETAINED_AUTHORITY_ANSWERS, RETAINED_MACHINE_ANSWERS, WINDOW_RENEWAL,

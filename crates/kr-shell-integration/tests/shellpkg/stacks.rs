@@ -1136,15 +1136,8 @@ impl Session {
         match package.kind {
             ShellKind::PowerShell => {
                 command.arg("-NoLogo");
-                command.env("PSModulePath", module_search_path(package));
-                // The host's own image needs its runtime's location, which the qualification
-                // recorded from the launcher that started the host it qualified.
-                if let Some(environment) = package.record["launch"]["environment"].as_object() {
-                    for (name, value) in environment {
-                        if let Some(value) = value.as_str() {
-                            command.env(name, value);
-                        }
-                    }
+                for (name, value) in package.launch() {
+                    command.env(name, value);
                 }
             }
             _ => {

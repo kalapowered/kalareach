@@ -2343,6 +2343,7 @@ fn write_zsh_package(shells: &Path) {
         startup_entry: PackageStartupEntry {
             file: "startup/kr-zshrc.zsh".to_owned(),
         },
+        launch: kr_shell_integration::host::package::PackageLaunch::default(),
     };
     std::fs::write(
         package.join(MANIFEST_BASENAME),
