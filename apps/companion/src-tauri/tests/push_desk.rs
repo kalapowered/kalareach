@@ -27,7 +27,7 @@ use companion_platform::notify::Permission;
 use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::device::Device;
 use companion_tauri::push::{
-    Native, PushDesk, PushFuture, PushState, PushView, Registrar, StillWanted, Wiring,
+    HostLine, Native, PushDesk, PushFuture, PushState, PushView, Registrar, Wiring,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::ServiceFuture;
@@ -256,50 +256,100 @@ impl Native for Receiver {
     }
 }
 
-/// What the host was handed.
+/// What the host was sent, and where the script waits.
 #[derive(Default)]
 struct Registered {
-    /// The host, the sender record the credential is for and the preview key it was told of.
-    handed: Vec<(
+    /// The hosts the phone opened a connection to.
+    connected: Vec<kr_protocol::ids::DeviceId>,
+    /// The host, and the sender record the credential it was handed is for.
+    credentials: Vec<(kr_protocol::ids::DeviceId, Value)>,
+    /// The host, and the preview key it was told of.
+    keys: Vec<(
         kr_protocol::ids::DeviceId,
-        Value,
         kr_protocol::scalars::NotificationPreviewKey,
     )>,
-    /// What the desk answered each time the registrar asked whether the run was still wanted.
-    asked: Vec<bool>,
+    /// Whether the connection waits to be let through, and whether the host's answer to the
+    /// registration does.
+    hold_connection: bool,
+    hold_answer: bool,
 }
 
-/// The host's side as the product's registrar keeps to it: it asks whether the run is still wanted
-/// before it sends anything, and sends nothing when it is not.
+/// Waits for as long as `held` says of the script that a step is held.
+async fn while_held(script: &Mutex<Registered>, held: impl Fn(&Registered) -> bool) {
+    loop {
+        let now = held(&script.lock().expect("what was handed"));
+        if !now {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The host's side, as a script: a connection, and the two changes made over it.
 struct HostLink(Arc<Mutex<Registered>>);
 
 impl Registrar for HostLink {
-    fn register<'a>(
-        &'a self,
-        host: &'a PairedHost,
-        params: DevicePushRegisterParams,
-        preview_key: kr_protocol::scalars::NotificationPreviewKey,
-        wanted: &'a StillWanted<'a>,
-    ) -> PushFuture<'a, DevicePushRegisterResult> {
+    fn connect<'a>(&'a self, host: &'a PairedHost) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
         Box::pin(async move {
-            let still = wanted();
-            self.0.lock().expect("what was handed").asked.push(still);
-            if !still {
-                return Err("this phone is no longer paired with that host".to_owned());
-            }
-            self.0.lock().expect("what was handed").handed.push((
-                host.host_device_id,
-                json!({ "sender_record_id": params.credential.sender_record_id.to_string() }),
-                preview_key,
-            ));
+            self.0
+                .lock()
+                .expect("what was handed")
+                .connected
+                .push(host.host_device_id);
+            while_held(&self.0, |script| script.hold_connection).await;
+            Ok(Box::new(Line {
+                script: Arc::clone(&self.0),
+                host: host.host_device_id,
+                device: host.device_id.to_string(),
+            }) as Box<dyn HostLine + 'a>)
+        })
+    }
+}
+
+struct Line {
+    script: Arc<Mutex<Registered>>,
+    host: kr_protocol::ids::DeviceId,
+    /// The host's identifier for this phone.
+    device: String,
+}
+
+impl HostLine for Line {
+    fn register(
+        &mut self,
+        params: DevicePushRegisterParams,
+    ) -> PushFuture<'_, DevicePushRegisterResult> {
+        Box::pin(async move {
+            self.script
+                .lock()
+                .expect("what was handed")
+                .credentials
+                .push((
+                    self.host,
+                    json!({ "sender_record_id": params.credential.sender_record_id.to_string() }),
+                ));
+            while_held(&self.script, |script| script.hold_answer).await;
             let records = vectors()["records"].clone();
             Ok(serde_json::from_value(json!({
-                "device_id": host.device_id.to_string(),
+                "device_id": self.device,
                 "installation_id": records["installation_binding"]["installation_id"],
                 "sender_record_id": records["sender_record"]["binding"]["sender_record_id"],
                 "credential_expires_at_ms": "1769817600000",
             }))
             .expect("a result"))
+        })
+    }
+
+    fn update_preview_key(
+        &mut self,
+        preview_key: kr_protocol::scalars::NotificationPreviewKey,
+    ) -> PushFuture<'_, ()> {
+        Box::pin(async move {
+            self.script
+                .lock()
+                .expect("what was handed")
+                .keys
+                .push((self.host, preview_key));
+            Ok(())
         })
     }
 }
@@ -588,12 +638,12 @@ async fn a_host_the_person_asked_for_is_handed_the_credential_the_gateway_issued
 
     let handed = phone.registered.lock().expect("what was handed");
     assert_eq!(
-        handed.handed.len(),
+        handed.credentials.len(),
         1,
         "the host was handed one registration"
     );
     assert_eq!(
-        handed.handed[0].1["sender_record_id"],
+        handed.credentials[0].1["sender_record_id"],
         vectors()["records"]["sender_record"]["binding"]["sender_record_id"],
         "under the authorisation the gateway issued"
     );
@@ -644,7 +694,7 @@ async fn the_key_filed_for_the_notification_extension_is_the_preview_key_the_hos
     let handed = phone.registered.lock().expect("what was handed");
     assert_eq!(
         derived.public(),
-        &handed.handed[0].2,
+        &handed.keys[0].1,
         "the seed filed is the one the host's preview key is made from"
     );
     assert_eq!(
@@ -701,9 +751,9 @@ async fn two_hosts_that_ask_together_register_one_after_the_other() {
         "a registration was written while another's challenge was still waiting"
     );
     let handed = phone.registered.lock().expect("what was handed");
-    let hosts: BTreeSet<_> = handed.handed.iter().map(|each| each.0).collect();
+    let hosts: BTreeSet<_> = handed.credentials.iter().map(|each| each.0).collect();
     assert_eq!(hosts.len(), 2, "each host was handed a credential");
-    for each in &handed.handed {
+    for each in &handed.credentials {
         assert_eq!(
             each.1["sender_record_id"],
             vectors()["records"]["sender_record"]["binding"]["sender_record_id"],
@@ -1111,7 +1161,7 @@ async fn a_host_forgotten_while_its_run_is_waiting_is_not_made_again_by_that_run
             .registered
             .lock()
             .expect("what was handed")
-            .handed
+            .credentials
             .len(),
         1,
         "the run of the forgotten host handed nothing to the host"
@@ -1368,20 +1418,58 @@ async fn a_look_whose_older_answer_arrives_last_does_not_hide_a_change_another_l
     );
 }
 
-/// The person forgets a host while the gateway is issuing the authorisation for it, and then the
-/// gateway answers. `forgets` is what the person did. The run asks the registrar, which asks
-/// whether the run is still wanted; the answer is no, and the host is handed nothing.
-async fn a_host_forgotten_while_the_gateway_issues_for_it(
-    forgets: impl FnOnce(&Desk, &PairedHost),
-) {
+/// The steps of a run that wait on something outside the phone, after the last of which the host
+/// has been told everything.
+#[derive(Clone, Copy)]
+enum Step {
+    /// The gateway's answer to the request for the host's authorisation.
+    GatewayIssue,
+    /// The connection to the host.
+    Connection,
+    /// The host's answer to the registration.
+    HostAnswer,
+}
+
+/// Starts the sequence for the one host, holds it at `step`, lets `forgets` do what the person did,
+/// lets the step go, and waits for the run to end. The desk is returned for what the host was sent.
+async fn the_host_is_forgotten_while(step: Step, forgets: impl FnOnce(&Desk, &PairedHost)) -> Desk {
     let owner = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
-    phone.gateway.hold_issue(true);
+    let hold = |held: bool| match step {
+        Step::GatewayIssue => phone.gateway.hold_issue(held),
+        Step::Connection => {
+            phone
+                .registered
+                .lock()
+                .expect("what was sent")
+                .hold_connection = held;
+        }
+        Step::HostAnswer => phone.registered.lock().expect("what was sent").hold_answer = held,
+    };
+    hold(true);
     let reference = phone.references().remove(0);
     phone.desk.enable(&reference).expect("the person asks");
-    eventually("the gateway was asked to issue", || {
-        phone.gateway.issue_requests() == 1
+    eventually("the run is at the step", || match step {
+        Step::GatewayIssue => phone.gateway.issue_requests() == 1,
+        Step::Connection => {
+            phone
+                .registered
+                .lock()
+                .expect("what was sent")
+                .connected
+                .len()
+                == 1
+        }
+        Step::HostAnswer => {
+            phone
+                .registered
+                .lock()
+                .expect("what was sent")
+                .credentials
+                .len()
+                == 1
+        }
     })
     .await;
 
@@ -1393,47 +1481,71 @@ async fn a_host_forgotten_while_the_gateway_issues_for_it(
         .expect("the paired hosts")
         .remove(0);
     forgets(&phone, &paired);
-    phone.gateway.hold_issue(false);
-
-    eventually("the run asked the registrar", || {
-        !phone
-            .registered
-            .lock()
-            .expect("what was handed")
-            .asked
-            .is_empty()
-    })
-    .await;
-    let registered = phone.registered.lock().expect("what was handed");
-    assert_eq!(registered.asked, [false], "the run was no longer wanted");
-    assert!(registered.handed.is_empty(), "the host was handed nothing");
+    hold(false);
+    // A run holds the desk for as long as its task lives, so only the test's handle is left when
+    // the run has ended.
+    eventually("the run ended", || Arc::strong_count(&phone.desk) == 1).await;
+    phone
 }
 
-/// The person forgets the host (the application's record of it goes with the run's claim): the host
-/// receives neither the registration nor the preview key.
+/// What the host was sent: how many connections, registrations and preview keys.
+fn sent(phone: &Desk) -> (usize, usize, usize) {
+    let script = phone.registered.lock().expect("what was sent");
+    (
+        script.connected.len(),
+        script.credentials.len(),
+        script.keys.len(),
+    )
+}
+
+/// The person forgets the host (the application's record of it goes with the run's claim) while
+/// the gateway issues the host's authorisation: the host is not even connected to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_forgotten_while_the_gateway_issues_for_it_receives_nothing() {
-    a_host_forgotten_while_the_gateway_issues_for_it(|phone, paired| {
+async fn a_host_forgotten_while_the_gateway_issues_for_it_is_not_connected_to() {
+    let phone = the_host_is_forgotten_while(Step::GatewayIssue, |phone, paired| {
         phone.desk.forgotten(paired.host_device_id);
     })
     .await;
+    assert_eq!(sent(&phone), (0, 0, 0));
 }
 
 /// Forgetting a host removes the pairing before the desk drops its claim; a run that wakes between
-/// the two is not wanted either, and the host receives nothing.
+/// the two is not wanted either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_unpaired_while_the_gateway_issues_for_it_receives_nothing() {
-    a_host_forgotten_while_the_gateway_issues_for_it(|phone, paired| {
+async fn a_host_unpaired_while_the_gateway_issues_for_it_is_not_connected_to() {
+    let phone = the_host_is_forgotten_while(Step::GatewayIssue, |phone, paired| {
         phone
             .device
             .forget_host(paired.host_device_id)
             .expect("the pairing is forgotten");
     })
     .await;
+    assert_eq!(sent(&phone), (0, 0, 0));
+}
+
+/// The person forgets the host while the connection to it is made: it is connected to, and told
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_it_is_connected_to_is_told_nothing() {
+    let phone = the_host_is_forgotten_while(Step::Connection, |phone, paired| {
+        phone.desk.forgotten(paired.host_device_id);
+    })
+    .await;
+    assert_eq!(sent(&phone), (1, 0, 0));
+}
+
+/// The person forgets the host while it answers the registration: the preview key is not sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_it_answers_the_registration_is_sent_no_preview_key() {
+    let phone = the_host_is_forgotten_while(Step::HostAnswer, |phone, paired| {
+        phone.desk.forgotten(paired.host_device_id);
+    })
+    .await;
+    assert_eq!(sent(&phone), (1, 1, 0));
 }
 
 /// A run that waits for its turn at the phone's one registration slot, and whose host is forgotten
-/// while it waits, does not take the slot when its turn comes: it proposes nothing to the gateway.
+/// while it waits, proposes nothing to the gateway when its turn comes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_forgotten_while_it_waits_for_its_turn_proposes_nothing() {
     let owner = DeviceKeys::generate().expect("keys");
