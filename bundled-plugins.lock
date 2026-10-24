@@ -482,12 +482,12 @@
     }
   ],
   "source": {
-    "commit": "2e93bc8d82bea7b5ad8021394b08e3768f7ff1e6",
+    "commit": "b88309d78e1a6f82060dcda685db5a535eaab9a4",
     "generation": "3",
     "generation_path": "snapshots/development",
     "produced_at": "1760000000000",
     "repository": "https://github.com/kalapowered/kalareach-plugins",
-    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/2e93bc8d82bea7b5ad8021394b08e3768f7ff1e6/snapshots/development"
+    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/b88309d78e1a6f82060dcda685db5a535eaab9a4/snapshots/development"
   },
   "trust_root": {
     "digest": "d008a8b2f121f112108632aa5e5a99af0bdc0a770431d84865ed34fa3dd9acb7",
