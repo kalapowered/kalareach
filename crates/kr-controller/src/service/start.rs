@@ -689,6 +689,17 @@ impl Controller {
         net::invitations::prepare(&devices)?;
         // Whether the host is exclusively organisation-managed is the policy's, which the owner
         // authority reads when it decides what the terminal can confirm.
+        let feed_refusal = Arc::new(crate::grants::RemoteRefusal::with(
+            if policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .personal_grants_rest_on_the_feed()
+            {
+                crate::grants::RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED
+            } else {
+                0
+            },
+        ));
         let exclusive = {
             let policy = Arc::clone(&policy);
             Arc::new(move || {
@@ -703,7 +714,11 @@ impl Controller {
                 kr_protocol::ids::DeviceId::new(setup.environment_id.get()),
                 *device_keys.transport.public(),
                 net::pairing::HostPairingClock::new(&setup.boot_identity),
-                net::invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes)),
+                net::invitations::InvitationRows::new(
+                    Arc::clone(&devices),
+                    Arc::clone(&lifetimes),
+                    Arc::clone(&feed_refusal),
+                ),
             )
             .with_recovery(
                 setup.environment_id,
@@ -1010,15 +1025,6 @@ impl Controller {
         // What a read of the changes since a visit is answered with, when it asks for a summary,
         // is the descriptions module's to keep.
         attention.attach_descriptions(Arc::clone(&descriptions));
-        let feed_word_at_start = if policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .personal_grants_rest_on_the_feed()
-        {
-            super::remote_revocation::PERSONAL_GRANTS_REST_ON_THE_FEED
-        } else {
-            0
-        };
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -1167,7 +1173,7 @@ impl Controller {
             owner,
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
-            feed_refusal: std::sync::atomic::AtomicU8::new(feed_word_at_start),
+            feed_refusal,
             feed_withheld: std::sync::Mutex::default(),
             feed_places: std::sync::Mutex::default(),
             local_access: super::local_access::LocalAccessState::default(),

@@ -517,7 +517,7 @@ impl FeedRuntime {
             let ends = if status.removed_at_ms.0.is_some() {
                 "until the daemon starts again"
             } else {
-                "until that owner is paired again or the owner at this machine revokes them"
+                "until the owner at this machine has revoked them"
             };
             detail.stated(
                 "; the feed shows complete a revocation by an owner this host does not know, so the \
@@ -605,12 +605,12 @@ impl Drop for FeedRuntime {
 }
 
 /// What a person who finds the host refusing remote access for a withdrawal it cannot verify does:
-/// the devices and the grants the withdrawal names are what to revoke, and the owner who made it,
-/// by the key the check gives, is the one to pair again.
-const UNVERIFIED_REMEDY: &str = "Revoke what the request names, with `kr device revoke <device>` for a \
-     device and `kr share revoke <grant>` for a grant, or pair the owner who made it again, the \
-     one who holds the key named. Remote access returns once the request names nothing live here \
-     or its owner is paired again.";
+/// the devices and the grants the withdrawal names are what to revoke. A revocation at the machine
+/// needs no owner device's confirmation, and none is spent while the refusal stands.
+const UNVERIFIED_REMEDY: &str = "Revoke what the request names, at this machine, with `kr device \
+     revoke <device>` for a device and `kr share revoke <grant>` for a grant. Neither needs a \
+     confirmation. Remote access returns once the request names nothing live here. Until then no \
+     confirmation from an owner device is accepted, so a device cannot be paired.";
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \

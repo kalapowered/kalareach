@@ -705,15 +705,16 @@ pub struct Controller {
     /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
     /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
     authority_epoch: std::sync::atomic::AtomicU64,
-    /// Which of the two refusals the authority feed puts on every remote grant stands now: bit 1
-    /// while this host is behind its feed, bit 2 while the feed shows a withdrawal this host
-    /// cannot verify.
+    /// Which of the refusals the authority feed puts on remote grants stand now: this host is
+    /// behind its feed, the feed shows a withdrawal this host cannot verify, the feed removed this
+    /// host.
     ///
-    /// One word, so a reader sees both refusals in one reading. It mirrors the two flags of the
-    /// policy and is changed with them under the policy's lock, because a check that runs inside
-    /// a transaction cannot take that lock again. Work admitted before a refusal rose is held to
-    /// it here ([`Controller::feed_refusal`]).
-    feed_refusal: std::sync::atomic::AtomicU8,
+    /// One word, so a reader sees them in one reading. It mirrors the flags of the policy and is
+    /// changed with them under the policy's lock, because a check that runs inside a transaction
+    /// cannot take that lock again. Work admitted before a refusal rose is held to it here
+    /// ([`Controller::feed_refusal`]), and the pairing records read it where an owner confirmation
+    /// is spent.
+    feed_refusal: Arc<crate::grants::RemoteRefusal>,
     /// What a withdrawal the feed shows complete and this host cannot verify names, while one
     /// stands: the devices, and the keys they hold, that keep no standing over the feed.
     feed_withheld: std::sync::Mutex<remote_revocation::Withheld>,
