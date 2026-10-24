@@ -29,10 +29,11 @@
 # the message names the condition. A process that ends is not waited out: once the application has a
 # process, every wait stops when that process is found gone and says how it ended, from the device's
 # log (a crash, or a device short of memory that kills the application's web view renderer or the
-# application itself). The device is named by its serial (--serial, or ANDROID_SERIAL), never taken
-# for being the first one listed: it is the caller's, it is not started or stopped here, a copy of
-# the application already on it is uninstalled first, with its data, and the application is
-# uninstalled again when this ends.
+# application itself). A question to the device that it does not answer is asked again, and is not
+# taken for a process that is gone. The device is named by its serial (--serial, or ANDROID_SERIAL),
+# never taken for being the first one listed: it is the caller's, it is not started or stopped
+# here, a copy of the application already on it is uninstalled first, with its data, and the
+# application is uninstalled again when this ends.
 #
 # It needs `adb` (on PATH, or under ANDROID_HOME) and `python3` and `curl`. The debug application is
 # debuggable, which is what lets `run-as` read its process's maps on a device whose build is a user
@@ -95,22 +96,66 @@ trap cleanup EXIT
 # The application's process, once it has one: every wait after that is held to it.
 watched=""
 
+# When the wait that is running began, which a question to the device that it does not answer is
+# held to (a condition that keeps its own time reads it too).
+wait_started=0
+
+# The process numbers the device gives the application, on one line (none when there is no process),
+# and 0 when the device answered. A call of adb that fails (a device that dropped off for a moment, a
+# transport that closed) has answered nothing and returns 1: it is not a process that is not there.
+# The shell on the device prints the status of `pidof` after the numbers, which is what tells an
+# answer of no such process from no answer at all.
+application_pids() {
+    local answer
+    answer="$(dev shell "pidof $package; echo status:\$?" 2> /dev/null | tr -d '\r')" || return 1
+    case "$answer" in
+        *status:[01]) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "${answer%status:*}" | tr '\n' ' '
+}
+
+# 0 when the watched process runs, 1 when the device was asked and it does not, 2 when the device
+# could not be asked.
 application_runs() {
     local pids
-    pids="$(dev shell pidof "$package" 2> /dev/null | tr -d '\r')"
+    pids="$(application_pids)" || return 2
     case " $pids " in
         *" $watched "*) return 0 ;;
     esac
     return 1
 }
 
-# True when the process being watched is gone. One look that fails is looked at again after a
-# second, since a call of adb that fails is not the end of a process.
+# What the device says of the watched process, asked again every second for as long as it does not
+# answer: 0 when the process runs, 1 when it does not. Inside a wait the questions end with the
+# wait's deadline, and outside one (the looks after the screen and the log were read) a deadline of
+# their own: a device that gives no answer until then fails the run, saying so.
+application_answer() {
+    local until answer
+    if [ "$wait_started" -ne 0 ]; then
+        until=$((wait_started + deadline))
+    else
+        until=$(($(date +%s) + deadline))
+    fi
+    while :; do
+        application_runs
+        answer=$?
+        [ "$answer" -eq 2 ] || return "$answer"
+        if [ "$(date +%s)" -ge "$until" ]; then
+            printf "android-app-launch: FAIL: the device gave no answer about the application's process (%s) until the deadline of %s seconds\n" "$watched" "$deadline" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
+
+# True when the process being watched is gone. A look that finds it gone is looked at again after a
+# second.
 application_has_ended() {
     [ -n "$watched" ] || return 1
-    application_runs && return 1
+    application_answer && return 1
     sleep 1
-    ! application_runs
+    ! application_answer
 }
 
 # What the device has to spare: a device that is short of memory ends the application's processes,
@@ -189,7 +234,6 @@ ended() {
 # Waits until `$2` (a command line) succeeds, or fails the run naming `$1` after the deadline, or as
 # soon as the process being watched is found gone. The wait started at `wait_started`, which a
 # condition that keeps its own time reads to know how much of the deadline is left.
-wait_started=0
 wait_for() {
     local what=$1
     shift
@@ -206,6 +250,7 @@ wait_for() {
         fi
         sleep 1
     done
+    wait_started=0
     say "ok: $what"
 }
 
@@ -225,7 +270,7 @@ say "ok: the main activity started"
 
 pid=""
 running() {
-    pid="$(dev shell pidof "$package" 2> /dev/null | tr -d '\r' | awk '{ print $1 }')"
+    pid="$(application_pids | awk '{ print $1 }')"
     [ -n "$pid" ]
 }
 wait_for "the application's process" running
