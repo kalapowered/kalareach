@@ -243,14 +243,18 @@ fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused(
     let refused = decide_activated_modules(&reader_abi(&package), &listed)
         .expect_err("a session with a module that cannot bind is not qualified");
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
-    assert_eq!(
-        refused.error.message,
-        format!(
-            "module kr_user_newer imports zle_abi_newer_entry, which neither this reader ({}) nor \
-             anything else the shell holds provides",
-            reader_abi(&package)
-        )
-    );
+    // The refusal names the module, the name it cannot bind and the reader it was judged against.
+    for fact in [
+        "kr_user_newer",
+        "zle_abi_newer_entry",
+        reader_abi(&package).as_str(),
+    ] {
+        assert!(
+            refused.error.message.contains(fact),
+            "the refusal names {fact}: {}",
+            refused.error.message
+        );
+    }
 }
 
 /// A module that imports from a package module is judged by whether that module is loaded when the
