@@ -12,6 +12,8 @@ final class PreviewDecisionTests: XCTestCase {
     private let now: UInt64 = 1_763_000_000_000
     private let recipient = Data(repeating: 0x91, count: previewKeyIDLength)
     private let sender = Data(repeating: 0x76, count: previewKeyIDLength)
+    /// The generic alert the notification is shown with.
+    private let alert = "A KalaReach session needs attention."
 
     /// The preview as the gateway sends it: FCM data carries only strings, so the sealed envelope
     /// travels as the JSON text of an object and the notification's own user info holds that text.
@@ -62,50 +64,68 @@ final class PreviewDecisionTests: XCTestCase {
 
     func testARevealedPreviewReplacesTheAlert() {
         let decision = decider(keys: ProvidingKeys(), opener: OpeningTo("Allow scripts/release.sh?"))
-            .decide(userInfo: payload(), nowMilliseconds: now)
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .reveal("Allow scripts/release.sh?"))
     }
 
     func testTheGenericAlertStandsWhenNoKeyHasBeenProvisioned() {
         let decision = decider(keys: FailingKeys(.notProvisioned))
-            .decide(userInfo: payload(), nowMilliseconds: now)
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.keyUnavailable))
     }
 
-    func testTheGenericAlertStandsBeforeTheFirstUnlock() {
+    func testTheGenericAlertStandsBeforeTheFirstUnlockWhicheverKeyIsAskedFirst() {
         let decision = decider(keys: FailingKeys(.lockedBeforeFirstUnlock))
-            .decide(userInfo: payload(), nowMilliseconds: now)
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.lockedBeforeFirstUnlock))
+        // The seed is there and the host's key cannot be read yet: the same answer, not a missing key.
+        let senderLocked = decider(keys: SenderFailingKeys(.lockedBeforeFirstUnlock))
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
+        XCTAssertEqual(senderLocked, .generic(.lockedBeforeFirstUnlock))
+    }
+
+    func testAHostThisDeviceHoldsNoKeyForIsNotOpened() {
+        var opened = 0
+        let counting = CountingOpener { opened += 1 }
+        let decision = decider(keys: SenderFailingKeys(.notProvisioned), opener: counting)
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
+        XCTAssertEqual(decision, .generic(.senderUnknown))
+        XCTAssertEqual(opened, 0)
+    }
+
+    func testARefusalIsReportedByTheCheckThatMadeIt() {
+        XCTAssertEqual(
+            decider(keys: ProvidingKeys(), opener: RefusingOpener("expired"))
+                .decide(userInfo: payload(), alert: alert, nowMilliseconds: now),
+            .generic(.expired))
+        XCTAssertEqual(
+            decider(keys: ProvidingKeys(), opener: RefusingOpener("empty_preview"))
+                .decide(userInfo: payload(), alert: alert, nowMilliseconds: now),
+            .generic(.emptyPreview))
     }
 
     func testTheGenericAlertStandsWhenDecryptionFails() {
         let decision = decider(keys: ProvidingKeys(), opener: RefusingOpener())
-            .decide(userInfo: payload(), nowMilliseconds: now)
-        XCTAssertEqual(decision, .generic(.decryptionFailed))
-    }
-
-    func testTheGenericAlertStandsWhenThisBuildCarriesNoOpener() {
-        let decision = decider(keys: ProvidingKeys(), opener: SharedClientPreviewOpener())
-            .decide(userInfo: payload(), nowMilliseconds: now)
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.decryptionFailed))
     }
 
     func testAPayloadWithNoPreviewIsTheOrdinaryGenericAlert() {
         let decision = decider(keys: ProvidingKeys())
-            .decide(userInfo: ["aps": ["alert": "Something needs you"]], nowMilliseconds: now)
+            .decide(userInfo: ["aps": ["alert": "Something needs you"]], alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.noPreview))
     }
 
     func testAMalformedPreviewIsNeverInterpreted() {
         let decision = decider(keys: ProvidingKeys())
-            .decide(userInfo: payload(nonceLength: 12), nowMilliseconds: now)
+            .decide(userInfo: payload(nonceLength: 12), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.malformedPreview))
     }
 
     func testAnExpiredPreviewIsNotOpened() {
         let keys = ProvidingKeys()
         let decision = decider(keys: keys, opener: OpeningTo("secret"))
-            .decide(userInfo: payload(expiresAtMilliseconds: now - 1), nowMilliseconds: now)
+            .decide(userInfo: payload(expiresAtMilliseconds: now - 1), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.expired))
         XCTAssertEqual(keys.reads, 0, "an expired preview never reaches the keychain")
     }
@@ -118,7 +138,7 @@ final class PreviewDecisionTests: XCTestCase {
             deviceKeyIDs: [recipient]
         ).decide(
             userInfo: payload(recipientKeyID: Data(repeating: 0x33, count: previewKeyIDLength)),
-            nowMilliseconds: now
+            alert: alert, nowMilliseconds: now
         )
         XCTAssertEqual(decision, .generic(.notForThisDevice))
         XCTAssertEqual(keys.reads, 0)
@@ -126,8 +146,8 @@ final class PreviewDecisionTests: XCTestCase {
 
     func testAnEmptyPlaintextIsNotShownAsAPreview() {
         let decision = decider(keys: ProvidingKeys(), opener: OpeningTo("   "))
-            .decide(userInfo: payload(), nowMilliseconds: now)
-        XCTAssertEqual(decision, .generic(.decryptionFailed))
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
+        XCTAssertEqual(decision, .generic(.emptyPreview))
     }
 
     func testABuildThatStatesNoSharedGroupHasNoKeyToFind() throws {
@@ -137,7 +157,7 @@ final class PreviewDecisionTests: XCTestCase {
         XCTAssertNil(PreviewKeyLocation.resolvedGroup(bundle: unstated))
 
         let decision = decider(keys: FailingKeys(.groupNotConfigured))
-            .decide(userInfo: payload(), nowMilliseconds: now)
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.keyUnavailable))
     }
 
@@ -152,14 +172,14 @@ final class PreviewDecisionTests: XCTestCase {
         {"ciphertext":"\(ciphertext)","nonce":"\(nonce)","routing":{"envelope_id":"7d0c2c9a-5ad3-4d63-8c27-0e8e9a2a1b11","expires_at_ms":"1763000060000","payload_type":"notification_preview","recipient_key_id":"\(recipientID)","sender_key_id":"\(senderID)","size_bucket_bytes":"1024","thread_id":null}}
         """
         let decision = decider(keys: ProvidingKeys(), opener: OpeningTo("Allow scripts/release.sh?"))
-            .decide(userInfo: ["preview": text], nowMilliseconds: now)
+            .decide(userInfo: ["preview": text], alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .reveal("Allow scripts/release.sh?"))
     }
 
     func testAPreviewThatIsNotJSONIsNeverInterpreted() {
         for text in ["not json", "", "[]", "\"a string\"", "{\"routing\":"] {
             let decision = decider(keys: ProvidingKeys())
-                .decide(userInfo: ["preview": text], nowMilliseconds: now)
+                .decide(userInfo: ["preview": text], alert: alert, nowMilliseconds: now)
             XCTAssertEqual(decision, .generic(.malformedPreview), "preview text \(text)")
         }
     }
@@ -196,7 +216,7 @@ final class PreviewDecisionTests: XCTestCase {
         // FCM data carries strings, so an object here is not what the gateway sent.
         let object = try! JSONSerialization.jsonObject(with: Data(previewText().utf8))
         let decision = decider(keys: ProvidingKeys())
-            .decide(userInfo: ["preview": object], nowMilliseconds: now)
+            .decide(userInfo: ["preview": object], alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.malformedPreview))
     }
 
@@ -253,28 +273,56 @@ final class SigningGateTests: XCTestCase {
 
 private final class ProvidingKeys: PreviewKeyReading {
     private(set) var reads = 0
-    func key(forRecipient recipientKeyID: Data) throws -> Data {
+    func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data {
         reads += 1
         return Data(repeating: 0x44, count: 32)
+    }
+    func senderKey(forSender senderKeyID: Data) throws -> Data {
+        reads += 1
+        return Data(repeating: 0x55, count: 32)
     }
 }
 
 private struct FailingKeys: PreviewKeyReading {
     let failure: PreviewKeyUnavailable
     init(_ failure: PreviewKeyUnavailable) { self.failure = failure }
-    func key(forRecipient recipientKeyID: Data) throws -> Data { throw failure }
+    func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data { throw failure }
+    func senderKey(forSender senderKeyID: Data) throws -> Data { throw failure }
+}
+
+/// The seed is there; the host's key is not to be had.
+private struct SenderFailingKeys: PreviewKeyReading {
+    let failure: PreviewKeyUnavailable
+    init(_ failure: PreviewKeyUnavailable) { self.failure = failure }
+    func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data { Data(repeating: 0x44, count: 32) }
+    func senderKey(forSender senderKeyID: Data) throws -> Data { throw failure }
 }
 
 private struct RefusingOpener: PreviewOpening {
-    func open(envelope: PreviewEnvelope, key: Data) throws -> String {
-        throw PreviewOpenFailure.authentication
-    }
+    let reason: String
+    init(_ reason: String = "authentication") { self.reason = reason }
+    func open(preview: String, alert: String, seed: Data, senderKey: Data, nowMilliseconds: UInt64)
+        -> PreviewOpened
+    { .refused(reason) }
 }
 
 private struct OpeningTo: PreviewOpening {
     let text: String
     init(_ text: String) { self.text = text }
-    func open(envelope: PreviewEnvelope, key: Data) throws -> String { text }
+    func open(preview: String, alert: String, seed: Data, senderKey: Data, nowMilliseconds: UInt64)
+        -> PreviewOpened
+    { .text(text) }
+}
+
+private struct CountingOpener: PreviewOpening {
+    let opened: () -> Void
+    init(_ opened: @escaping () -> Void) { self.opened = opened }
+    func open(preview: String, alert: String, seed: Data, senderKey: Data, nowMilliseconds: UInt64)
+        -> PreviewOpened
+    {
+        opened()
+        return .text("secret")
+    }
 }
 
 private func base64URL(_ data: Data) -> String {

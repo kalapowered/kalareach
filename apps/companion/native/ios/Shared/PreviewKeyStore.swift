@@ -1,13 +1,17 @@
 //
-//  The limited preview key, and the four reasons it may not be usable.
+//  The limited preview keys, and the four reasons they may not be usable.
 //
-//  The extension holds one key and no other: a key that opens a notification preview and cannot
-//  open anything else. It lives in the Keychain access group both the application and this
-//  extension are in, written by the application after its own authentication and read here.
+//  The extension holds the keys that open a notification preview and no other: this device's
+//  preview seed, which cannot open anything else, and the public key of each host that may seal a
+//  preview to it. They live in the Keychain access group both the application and this extension
+//  are in, written by the application after its own authentication and read here: a seed under the
+//  identifier of its public half, which is what a sealed preview names its recipient by, and a
+//  host's key under the identifier a sealed preview names its sender by.
 //
-//  It is stored with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Before the first unlock
-//  after a restart the item is unreadable by design, and that is not an error: it is the device
-//  saying it has not been opened yet, and the right answer is the generic alert.
+//  They are stored with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. Before the first unlock
+//  after a restart the items are unreadable by design, and that is not an error: it is the device
+//  saying it has not been opened yet, and the right answer is the generic alert. A seed and a host's
+//  key are read the same way, so they fail the same way.
 //
 
 import Foundation
@@ -33,8 +37,10 @@ struct PreviewKeyLocation {
     /// than a device with no key: every read then refuses by name instead of quietly searching the
     /// process's own default group and finding nothing.
     let accessGroup: String?
-    /// The service the item is filed under.
+    /// The service a preview seed is filed under.
     let service: String
+    /// The service a host's public key is filed under.
+    let senderService: String
 
     /// The key the build writes the shared group under.
     static let groupKey = "KRSharedKeychainGroup"
@@ -49,7 +55,8 @@ struct PreviewKeyLocation {
     /// the build wrote rather than written here and silently left unexpanded.
     static let shared = PreviewKeyLocation(
         accessGroup: resolvedGroup(),
-        service: "to.kala.reach.notification-preview"
+        service: "to.kala.reach.notification-preview",
+        senderService: "to.kala.reach.notification-preview-sender"
     )
 
     /// Reads the group the build resolved, refusing anything still carrying a build variable.
@@ -73,9 +80,12 @@ struct PreviewKeyLocation {
     }
 }
 
-/// Reads the limited preview key.
+/// Reads the limited preview keys.
 protocol PreviewKeyReading {
-    func key(forRecipient recipientKeyID: Data) throws -> Data
+    /// The seed for the recipient key identifier a sealed preview names.
+    func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data
+    /// The public key for the sender key identifier a sealed preview names.
+    func senderKey(forSender senderKeyID: Data) throws -> Data
 }
 
 /// The keychain-backed reader the extension uses.
@@ -86,7 +96,15 @@ struct KeychainPreviewKeyStore: PreviewKeyReading {
         self.location = location
     }
 
-    func key(forRecipient recipientKeyID: Data) throws -> Data {
+    func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data {
+        try read(service: location.service, identifier: recipientKeyID)
+    }
+
+    func senderKey(forSender senderKeyID: Data) throws -> Data {
+        try read(service: location.senderService, identifier: senderKeyID)
+    }
+
+    private func read(service: String, identifier: Data) throws -> Data {
         guard let group = location.accessGroup else {
             // Searching without a group would search this process's own default group, find
             // nothing, and report a device with no key. This build simply has no group.
@@ -94,8 +112,8 @@ struct KeychainPreviewKeyStore: PreviewKeyReading {
         }
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: location.service,
-            kSecAttrAccount as String: recipientKeyID.base64EncodedString(),
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: identifier.base64EncodedString(),
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]

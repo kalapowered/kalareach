@@ -14,8 +14,26 @@
 
 import UserNotifications
 
+/// What the extension reads keys from, opens a preview with, and tells the time by. The system builds
+/// the extension itself, so a test cannot hand it these: it replaces them here, in one place.
+struct ExtensionParts {
+    var keys: PreviewKeyReading
+    var opener: PreviewOpening
+    var nowMilliseconds: () -> UInt64
+
+    /// The shared keychain group, the Rust library's opener and the system clock.
+    static let production = ExtensionParts(
+        keys: KeychainPreviewKeyStore(),
+        opener: RustPreviewOpener(),
+        nowMilliseconds: { UInt64(Date().timeIntervalSince1970 * 1000) }
+    )
+}
+
 /// The extension the system starts for every notification this application receives.
 final class NotificationService: UNNotificationServiceExtension {
+    /// The parts the extension is built from.
+    static var parts = ExtensionParts.production
+
     private var deliver: ((UNNotificationContent) -> Void)?
     private var original: UNNotificationContent?
 
@@ -26,14 +44,13 @@ final class NotificationService: UNNotificationServiceExtension {
         deliver = contentHandler
         original = request.content
 
-        let decider = PreviewDecider(
-            keys: KeychainPreviewKeyStore(),
-            opener: SharedClientPreviewOpener(),
-            deviceKeyIDs: []
-        )
+        let parts = Self.parts
+        let decider = PreviewDecider(keys: parts.keys, opener: parts.opener, deviceKeyIDs: [])
+        // The generic alert the notification is shown with is the one the sealed preview repeats.
         let decision = decider.decide(
             userInfo: request.content.userInfo,
-            nowMilliseconds: UInt64(Date().timeIntervalSince1970 * 1000)
+            alert: request.content.body,
+            nowMilliseconds: parts.nowMilliseconds()
         )
 
         switch decision {
@@ -63,7 +80,7 @@ final class NotificationService: UNNotificationServiceExtension {
         // A device run reads this to see that the extension ran: the reason it showed what it showed,
         // and nothing of the notification.
         NSLog("KalaReachExtension: ran, %@", decision.reasonName)
-        let probe = ExtensionProbe(keys: KeychainPreviewKeyStore(), private: KeychainProbeReader())
+        let probe = ExtensionProbe(keys: Self.parts.keys, private: KeychainProbeReader())
         if let added = probe.additions(for: request.content.userInfo, reason: decision.reasonName),
             let answered = content.mutableCopy() as? UNMutableNotificationContent
         {
