@@ -113,12 +113,16 @@ with this action is not known, so the device can try to register again, but with
 the first registration attempt is not yet finished, the device is informed that it should ask again.
 
 Both questions come out of the gateway's allowances for this host, so the host rations them. One
-device may have a credential confirmed three times in a burst and then six times an hour. The status
-question comes out of the sweep's share of the status allowance. The nonce comes out of the sixty
+device may have a credential confirmed three times in a burst and then six times an hour. A
+registration that keeps the authorisation and installation of the destination in service and only
+changes the choice of previews has an allowance of its own of the same size, so that changing the
+choice does not spend what the next token refresh needs; its bearer is confirmed like any other, and
+it spends the same nonce allowance below. The status question comes out of the sweep's share of the
+status allowance. The nonce comes out of the sixty
 requests an hour that the gateway takes from this host for renewing and revoking together, where
 every renewal and every revocation takes two, so all devices together may ask for six nonces in a
 burst and six an hour, and only for a bearer that passed the first question. A device over any of
-the three limits is told to wait (`RATE_LIMITED`), and the gateway is not asked the question that
+these limits is told to wait (`RATE_LIMITED`), and the gateway is not asked the question that
 limit covers: a host that has spent its nonces has still asked the status question first.
 A registration that replaces an authorisation also owes the gateway a revocation, which is two
 requests more, outside these limits.
