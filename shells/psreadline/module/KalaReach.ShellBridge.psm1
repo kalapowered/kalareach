@@ -52,6 +52,18 @@ $script:Hooks = @{
     InnerIsEditors     = $true
     Wrapper            = $null
     ReadLineInstalled  = $false
+    # The command-lookup handler this module puts in front of the person's own, the person's own
+    # (called first, and left standing when this module goes), and the handler as the engine holds
+    # it, to tell whether the person has replaced it since.
+    LookupPrior        = $null
+    LookupInstalled    = $null
+    # Held while this module asks the engine what a name is, which looks the name up again.
+    LookupBusy         = $false
+    # The name of the one lookup this module makes after its work, to put the status back; the
+    # handler passes it over so that the person's handler is not asked about the module's own.
+    LookupRestoring    = $null
+    # What the one substituted command runs: the program, the vector it was asked about, the answer.
+    Substitution       = $null
 }
 
 # The operations whose key wait this module observes by wrapping them. Each runs its own read loop
@@ -676,6 +688,7 @@ function Enable-KalaReachHooks {
     Write-KrTrace ("wrapped " + ((@($installed) | ForEach-Object { "$($_.Chord)=$($_.Function)" }) -join ' '))
     $gesture = Install-KrGestureHandler
     Write-KrTrace ("gesture chord=$($script:Hooks.GestureChord) ok=$($gesture.Ok) $($gesture.Reason) $($gesture.Detail)")
+    Install-KrLookupHandler
     Send-KrHooksActivated ([uint64]($script:State.PromptGeneration + 1))
 
     if (-not $gesture.Ok) {
@@ -909,6 +922,9 @@ function Invoke-KalaReachReadLine {
     if (-not $script:Hooks.Activated) {
         # The profile has run by the time the host asks for a line, and the reader has not started.
         Enable-KalaReachHooks
+    } elseif ($script:Kr.Registered) {
+        # Says in the trace when the person has replaced the lookup handler since the last prompt.
+        Install-KrLookupHandler
     }
     # A reader a running line starts is not a new prompt: the generation the worker holds the line
     # under stays the line's.
@@ -1013,6 +1029,7 @@ function Start-KrLine {
     $line.Active = $false
     $line.Route = $null
     $line.RouteRead = $false
+    $line.RouteWords = $null
     Send-KrCommandBlock $line $null $null
     # A capability an earlier line left, or one the environment held, is not this line's.
     $token = Get-KrLineToken
@@ -1067,7 +1084,7 @@ function Complete-KrLine {
 # anywhere in it (a script block, a subexpression and a nested pipeline all hide one), not run in
 # the background and without a redirection or `--%`, which lose the byte stream a native command is
 # given. The name has to be a constant: a variable's value is not what the person typed.
-function Get-KrRouteName {
+function Get-KrRouteParts {
     param([string]$Text)
     $language = [System.Management.Automation.Language.Parser]
     $tokens = $null
@@ -1093,7 +1110,53 @@ function Get-KrRouteName {
     }
     $first = $command.CommandElements[0]
     if ($first -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $null }
-    $first.Value
+    @{ Name = $first.Value; Words = (Get-KrConstantWords @($command.CommandElements | Select-Object -Skip 1)) }
+}
+
+function Get-KrRouteName {
+    param([string]$Text)
+    $parts = Get-KrRouteParts $Text
+    if ($null -eq $parts) { return $null }
+    $parts.Name
+}
+
+# The words a native command would be given, when every one of them is a constant the person typed
+# and the shell passes on exactly as it is written; nothing at all when one is not.
+#
+# A word that is a variable, an expansion, a list, a subexpression or anything else the shell works
+# out is not what was typed. A bareword that the shell would expand (a pattern, a leading tilde, an
+# escape) is not either, and a parameter that is given a value the shell splits in two is passed as
+# two words rather than the one it is written as. The route is for the line whose vector is plain.
+function Get-KrConstantWords {
+    param([object[]]$Elements)
+    $words = [System.Collections.Generic.List[string]]::new()
+    foreach ($element in $Elements) {
+        if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+            if ($element.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::BareWord) {
+                $text = $element.Extent.Text
+                if ($text -ne $element.Value -or $text -match '[*?\[`~{}@]' ) { return $null }
+            }
+            $words.Add($element.Value)
+        } elseif ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+            $text = $element.Extent.Text
+            if ($text.EndsWith(':')) { return $null }
+            if ($null -ne $element.Argument) {
+                $argument = $element.Argument
+                if ($argument -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                    $argument.StringConstantType -ne [System.Management.Automation.Language.StringConstantType]::BareWord -or
+                    $argument.Extent.Text -ne $argument.Value -or $text -match '\s|[`$]') {
+                    return $null
+                }
+            }
+            $words.Add($text)
+        } elseif ($element -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+                  $element.Extent.Text -match '^(0|[1-9][0-9]*)$') {
+            $words.Add($element.Extent.Text)
+        } else {
+            return $null
+        }
+    }
+    , $words.ToArray()
 }
 
 # Whether the entry points may speak for the line that is running now, and the name of the one
@@ -1107,7 +1170,10 @@ function Get-KrRoute {
     if ($script:Kr.Owed -ne 0) { return $null }
     if (-not $line.RouteRead) {
         $line.RouteRead = $true
-        $line.Route = try { Get-KrRouteName $line.Text } catch { $null }
+        $parts = try { Get-KrRouteParts $line.Text } catch { $null }
+        $line.Route = if ($null -ne $parts) { $parts.Name } else { $null }
+        # The comma keeps a vector of one word, or of none, an array when it is assigned.
+        $line.RouteWords = if ($null -ne $parts -and $null -ne $parts.Words) { , $parts.Words } else { $null }
     }
     $line.Route
 }
@@ -1246,6 +1312,152 @@ function Resolve-KalaReachCommand {
     } finally {
         $line.Active = $false
     }
+}
+
+# ---- the command-lookup handler ---------------------------------------------------------------------
+
+# Whether a program of this name is on the search path at all, found without asking the engine:
+# asking it about a name that is nowhere runs the person's own command-not-found handler, which the
+# real lookup then runs again.
+function Test-KrApplicationOnPath {
+    param([string]$Name)
+    $extensions = @('')
+    if ($IsWindows -and [System.IO.Path]::GetExtension($Name).Length -eq 0) {
+        $extensions = @(($env:PATHEXT -split ';') | Where-Object { $_ })
+        if ($extensions.Count -eq 0) { $extensions = @('.COM', '.EXE') }
+    }
+    foreach ($directory in ($env:PATH -split [System.IO.Path]::PathSeparator)) {
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        foreach ($extension in $extensions) {
+            if ([System.IO.File]::Exists([System.IO.Path]::Combine($directory, $Name + $extension))) { return $true }
+        }
+    }
+    $false
+}
+
+# The block that runs one integrated command, or nothing when the command is to run as it was typed.
+#
+# What decides is the line and what the engine would have run for it: the line is one command whose
+# words are plain constants, the command the engine finds first for the name is a program, and the
+# worker answers with a launch. Anything else is left to the engine untouched, which is what keeps
+# an alias, a function or a script of that name winning as it always has, and the status a command
+# leaves exactly the one it left.
+function Get-KrLookupSubstitute {
+    param([string]$Name)
+    if (-not (Test-KrCommandName $Name)) { return $null }
+    $route = Get-KrRoute
+    if ($null -eq $route -or -not [string]::Equals($route, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $line = $script:Line
+    if ($null -eq $line.RouteWords) { return $null }
+    [string[]]$words = @($line.RouteWords)
+    if (-not (Test-KrApplicationOnPath $Name)) { return $null }
+    $types = [System.Management.Automation.CommandTypes]
+    $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $types::All)
+    if ($null -eq $found -or $found.CommandType -ne $types::Application) { return $null }
+    $program = "$($found.Source)"
+    $launch = Resolve-KalaReachCommand -Origin 'Runspace' -Name $Name -Arguments $words -Executable $program
+    if ($null -eq $launch) {
+        # Nothing was substituted, so the engine runs the command and its status is the command's.
+        $line.Called = $false
+        return $null
+    }
+    $script:Hooks.Substitution = @{ Program = $program; Words = $words; Launch = $launch }
+    {
+        $substitution = $script:Hooks.Substitution
+        $script:Hooks.Substitution = $null
+        $words = $substitution.Words
+        $started = $true
+        $saved = @{}
+        foreach ($variable in $substitution.Launch.Environment.Keys) {
+            $saved[$variable] = [System.Environment]::GetEnvironmentVariable($variable)
+            [System.Environment]::SetEnvironmentVariable($variable, $substitution.Launch.Environment[$variable])
+        }
+        try {
+            & $substitution.Launch.Launcher @($substitution.Launch.Arguments)
+        } catch [System.Management.Automation.NativeCommandExitException] {
+            # The launcher ran and the program failed: that is the program's failure, once.
+            throw
+        } catch {
+            # The launcher could not be started, so nothing ran.
+            $started = $false
+        } finally {
+            foreach ($variable in $saved.Keys) {
+                $before = if ($null -eq $saved[$variable]) { [NullString]::Value } else { $saved[$variable] }
+                [System.Environment]::SetEnvironmentVariable($variable, $before)
+            }
+        }
+        if (-not $started) { & $substitution.Program @words }
+    }
+}
+
+# The handler the engine calls before it looks a name up. The person's own handler, if there was
+# one, runs first and its answer stands; this one acts only on the command a running line is, typed
+# at the prompt, and never changes what it does not substitute.
+$script:LookupHandler = {
+    param($CommandName, $EventArgs)
+    $kept = $?
+    # A lookup this module makes itself, to see what a name is, is not one the person's handler is
+    # asked about again.
+    if ($script:Hooks.LookupBusy) { return }
+    if ($null -ne $script:Hooks.LookupRestoring) {
+        $own = $script:Hooks.LookupRestoring
+        $script:Hooks.LookupRestoring = $null
+        if ($CommandName -ieq $own) { return }
+    }
+    $prior = $script:Hooks.LookupPrior
+    if ($null -ne $prior) { $prior.Invoke($CommandName, $EventArgs) }
+    if ($EventArgs.StopSearch -or $null -ne $EventArgs.Command -or $null -ne $EventArgs.CommandScriptBlock) { return }
+    if (-not $script:Line.Running -or "$($EventArgs.CommandOrigin)" -cne 'Runspace') { return }
+    $script:Hooks.LookupBusy = $true
+    try {
+        $block = Get-KrLookupSubstitute ([string]$CommandName)
+        if ($null -ne $block) {
+            $EventArgs.CommandScriptBlock = $block
+            $EventArgs.StopSearch = $true
+        }
+    } catch {
+        Write-KrTrace "lookup failed: $($_.Exception.GetType().FullName)"
+    } finally {
+        # What the lookups above ran must not have changed the status the person's line reads. The
+        # last statement puts it back, and the lookup that statement makes is this module's own and
+        # nobody's to answer.
+        $script:Hooks.LookupBusy = $false
+        if (-not $kept) {
+            $script:Hooks.LookupRestoring = 'Write-Error'
+            Write-Error 'kalareach' -ErrorAction Ignore
+        }
+    }
+}
+
+# Puts the handler in front of whatever handler the engine holds, remembering that one to call first.
+# Done once, when the hooks go live. A handler the person sets after that is theirs and stays where
+# they put it: it is not taken out or put behind this one again, because a handler that calls the one
+# it replaced would then be called by the one it is behind, for ever. If theirs calls this module's,
+# this module's still answers; if it does not, the commands it would have asked about run as typed,
+# and the trace says so.
+function Install-KrLookupHandler {
+    $current = $ExecutionContext.InvokeCommand.PreCommandLookupAction
+    if ($null -ne $script:Hooks.LookupInstalled) {
+        if (-not [object]::ReferenceEquals($current, $script:Hooks.LookupInstalled)) {
+            Write-KrTrace 'the lookup handler was replaced by the person''s own; commands run as typed unless it calls this one'
+        }
+        return
+    }
+    $script:Hooks.LookupPrior = $current
+    $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:LookupHandler
+    $script:Hooks.LookupInstalled = $ExecutionContext.InvokeCommand.PreCommandLookupAction
+    Write-KrTrace ("lookup handler installed in front of " + $(if ($null -eq $current) { 'nothing' } else { 'the person''s own' }))
+}
+
+# Takes the handler off, and puts back the person's own only if this module's is still the one the
+# engine holds.
+function Remove-KrLookupHandler {
+    if ($null -eq $script:Hooks.LookupInstalled) { return }
+    if ([object]::ReferenceEquals($ExecutionContext.InvokeCommand.PreCommandLookupAction, $script:Hooks.LookupInstalled)) {
+        $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:Hooks.LookupPrior
+    }
+    $script:Hooks.LookupInstalled = $null
+    $script:Hooks.LookupPrior = $null
 }
 
 function Invoke-KalaReachService {
@@ -1635,6 +1847,7 @@ function Remove-KalaReachHooks {
     param()
     Restore-KrGestureHandler
     Restore-KrObservedHandlers
+    Remove-KrLookupHandler
     # A capability belongs to the line that is running, and nothing runs once the bridge is gone.
     if ($script:Line.Running) {
         $script:Line.Running = $false
