@@ -273,7 +273,7 @@ resource when the request arrived.
 
 After these checks the call is admitted as the answer it is: its one transmission is reserved before
 anything is marked, and it goes out on the connection the request arrived on, written as the verdict
-the table maps. Its result names the action and what the application did with the answer. A call
+the table maps. Its result names the action and says that the verdict was written on the connection; it does not say what the application did with it. A call
 refused by any check leaves the request pending for another answer, such as the one a person gives
 in the terminal.
 
