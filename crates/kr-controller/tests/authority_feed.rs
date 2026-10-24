@@ -2279,8 +2279,8 @@ async fn a_request_of_a_device_revoked_at_the_machine_ahead_of_a_live_owners_wit
 }
 
 /// KR-REQ-24.15: the request of a device the owner at the machine revoked is refused after a restart
-/// as it is without one, when a live owner's request naming the device follows it in the feed and
-/// withdraws nothing, because the device is revoked already. The feed sets the order of its records
+/// as it is without one, when a live owner's request naming the device follows it in the feed, is
+/// not complete, and withdraws nothing, because the device is revoked already. The feed sets the order of its records
 /// and a signature does not cover it, so the place a record holds gives a revoked device no
 /// standing; a restart that lost the reason it was revoked must not give it one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2310,8 +2310,8 @@ async fn the_request_of_a_device_revoked_at_the_machine_is_refused_after_a_resta
 
 /// KR-REQ-24.15: the request of a device the owner at the machine revoked is refused when a live
 /// owner's complete record that names the device follows it in the feed, as it is without one: the
-/// record the host carries out again names a device that is revoked already, and the host holds
-/// nothing in the record's place against the device's standing.
+/// record the host carries out again names a device that is revoked already, and a run that starts
+/// with both records in the feed holds nothing in the record's place against the device's standing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_request_of_a_device_revoked_at_the_machine_is_refused_ahead_of_a_complete_record_that_names_it()
  {
@@ -2322,6 +2322,8 @@ async fn the_request_of_a_device_revoked_at_the_machine_is_refused_ahead_of_a_co
         first,
         ..
     } = a_request_of_a_device_revoked_at_the_machine_ahead_of_a_live_owners_withdrawal(true).await;
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
     rig.until_the_carrier_is_idle().await;
 
     let key = issuer.0.keys().authorisation.clone();
