@@ -62,7 +62,7 @@ use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
-use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
+use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId, RevocationRequestId};
 use kr_protocol::pairing::{
     AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, RevocationAcknowledgement,
     RevocationCompletion,
@@ -664,6 +664,13 @@ const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again.
 /// How many of each of the issuers, devices and grants a withdrawal names a check says by name.
 const MOST_NAMED: usize = 8;
 
+/// Names `grant` in a sentence. A grant is identified by a UUID this host generated, as a device is,
+/// and the identifiers a sentence may name in full are a closed list that does not hold the
+/// grant's, so the UUID is named through the device identifier, which prints the same text.
+fn named_grant(sentence: Sentence, grant: &GrantId) -> Sentence {
+    sentence.identifier(&DeviceId::new(grant.get()))
+}
+
 /// The sentence that says whose withdrawal the host cannot verify and what it names: the identifier
 /// and key each request gives for its issuer, in sixteen hexadecimal digits of the key's
 /// identifier, and the devices and grants it would withdraw.
@@ -691,13 +698,14 @@ fn names_of(found: &Unverified) -> Sentence {
             .identifier(device);
     }
     for (position, grant) in found.grants.iter().take(MOST_NAMED).enumerate() {
-        sentence = sentence
-            .stated(if position == 0 {
+        sentence = named_grant(
+            sentence.stated(if position == 0 {
                 "; it names grant "
             } else {
                 ", grant "
-            })
-            .identifier(grant);
+            }),
+            grant,
+        );
     }
     let beyond = found.issuers.len().saturating_sub(MOST_NAMED)
         + found.devices.len().saturating_sub(MOST_NAMED)
