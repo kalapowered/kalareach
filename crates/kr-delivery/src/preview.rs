@@ -61,11 +61,12 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use kr_crypto::envelope::PreviewRefusal;
 use kr_crypto::keys::{NotificationPreviewKeyPair, key_id};
 use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
 use kr_protocol::mailbox::{
     EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType, SEAL_OVERHEAD_BYTES,
-    granularity_for_bucket, mailbox_granularity, mailbox_size_bucket, notification_granularity,
+    mailbox_granularity,
 };
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::push::{
@@ -236,12 +237,13 @@ pub fn seal_preview(
 
 /// Opens a preview, checking the untrusted routing record against what the seal authenticated.
 ///
-/// It is the same three-part check `kr_crypto::envelope::open_envelope` makes, for the key pair
-/// that function does not take: the ciphertext authenticates under the two keys the caller
-/// supplies, the key identifiers inside the sealed plaintext name those two keys under the
-/// notification-preview purpose, and the routing record a service could have altered matches the
-/// authenticated fields. The declared bucket is checked against the padded length, and an envelope
-/// whose own expiry has passed is refused rather than opened.
+/// The checks are `kr_crypto::envelope::open_notification_envelope`'s, which a phone's receiver
+/// opens through too: the ciphertext authenticates under the two keys the caller supplies, the key
+/// identifiers inside the sealed plaintext name those two keys under the notification-preview
+/// purpose, the routing record a service could have altered matches the authenticated fields, the
+/// declared bucket is the one the notification rule produces for what was sealed, and an envelope
+/// whose own expiry has passed is refused rather than opened. What this adds is the decode of the
+/// body.
 ///
 /// # Errors
 ///
@@ -254,71 +256,21 @@ pub fn open_preview(
     envelope: &kr_protocol::mailbox::SealedEnvelope,
     now_ms: u64,
 ) -> Result<PreviewBody> {
-    if now_ms >= envelope.routing.expires_at_ms.get() {
-        return Err(DeliveryError::Expiry("this preview envelope has expired"));
-    }
-    if envelope.routing.payload_type != MailboxPayloadType::NotificationPreview {
-        return Err(DeliveryError::JournalUnreadable(
-            "a routing record that does not declare a notification preview",
-        ));
-    }
-    let bucket = envelope.routing.size_bucket_bytes.get();
-    if granularity_for_bucket(bucket) != Some(notification_granularity())
-        || envelope.ciphertext.as_slice().len() as u64 != sealed_length(bucket)
-    {
-        return Err(DeliveryError::JournalUnreadable(
-            "a preview's declared size bucket is not one the notification rule produces",
-        ));
-    }
-    let opened = kr_crypto::sealed::open_notification_preview(
-        recipient,
-        sender,
-        &envelope.nonce,
-        envelope.ciphertext.as_slice(),
-    )?;
-    let padded = opened.expose();
-    if padded.len() as u64 != bucket {
-        return Err(DeliveryError::JournalUnreadable(
-            "a preview's declared size bucket is not the length that was sealed",
-        ));
-    }
-    let unpadded = kr_crypto::envelope::unpad_notification_preview(padded)?;
-    if mailbox_size_bucket(unpadded.len() as u64) != bucket {
-        return Err(DeliveryError::JournalUnreadable(
-            "a preview's declared size bucket is not the one its plaintext rounds to",
-        ));
-    }
-    let plaintext: EnvelopePlaintext =
-        kr_cbor::from_canonical_slice(unpadded, &kr_cbor::Limits::DEFAULT)
-            .map_err(|error| DeliveryError::Encoding(error.to_string()))?;
-    if plaintext.payload_type != MailboxPayloadType::NotificationPreview {
-        return Err(DeliveryError::JournalUnreadable(
-            "a sealed preview does not carry a notification preview",
-        ));
-    }
-    if plaintext.sender_key_id != key_id(KeyPurpose::NotificationPreview, sender.as_bytes())
-        || plaintext.recipient_key_id
-            != key_id(
-                KeyPurpose::NotificationPreview,
-                recipient.public().as_bytes(),
-            )
-    {
-        return Err(DeliveryError::JournalUnreadable(
-            "a preview's authenticated key identifiers do not name the keys that opened it",
-        ));
-    }
-    if plaintext.envelope_id != envelope.routing.envelope_id
-        || plaintext.expires_at_ms != envelope.routing.expires_at_ms
-        || plaintext.sender_key_id != envelope.routing.sender_key_id
-        || plaintext.recipient_key_id != envelope.routing.recipient_key_id
-        || plaintext.thread_id != envelope.routing.thread_id
-    {
-        return Err(DeliveryError::JournalUnreadable(
-            "a preview's routing record does not match what was sealed",
-        ));
-    }
+    let plaintext =
+        kr_crypto::envelope::open_notification_envelope(recipient, sender, envelope, now_ms)
+            .map_err(refused)?;
     kr_cbor::from_canonical_slice(plaintext.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
         .map_err(|error| DeliveryError::Encoding(error.to_string()))
+}
+
+/// What a refusal of the shared opener is here.
+fn refused(refusal: PreviewRefusal) -> DeliveryError {
+    match refusal {
+        PreviewRefusal::Expired => DeliveryError::Expiry(refusal.words()),
+        PreviewRefusal::Malformed => DeliveryError::Encoding(refusal.words().to_owned()),
+        PreviewRefusal::Crypto(error) => DeliveryError::Crypto(error),
+        other => DeliveryError::JournalUnreadable(other.words()),
+    }
 }
 
 /// How many bytes are reserved for the registration token the gateway will add.
@@ -590,29 +542,6 @@ mod tests {
             open_preview(&other, host.public(), &preview.envelope, 1_700_000_000_000).is_err(),
             "a preview opens for its own recipient key only"
         );
-    }
-
-    #[test]
-    fn an_altered_routing_record_does_not_yield_a_body() {
-        let host = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let device = NotificationPreviewKeyPair::generate().expect("a keypair");
-        let preview = sealed(&host, &device, &body("x"), TimestampMs::new(EXPIRES))
-            .expect("a sealed preview");
-
-        let mut moved = preview.envelope.clone();
-        moved.routing.envelope_id = EnvelopeId::new(Uuid::from_bytes([9; 16]));
-        assert!(
-            open_preview(&device, host.public(), &moved, 1_700_000_000_000).is_err(),
-            "the untrusted routing record is checked against what was sealed"
-        );
-
-        let mut relabelled = preview.envelope.clone();
-        relabelled.routing.size_bucket_bytes = U64::new(4 * 1024);
-        assert!(open_preview(&device, host.public(), &relabelled, 1_700_000_000_000).is_err());
-
-        let mut restamped = preview.envelope.clone();
-        restamped.routing.expires_at_ms = TimestampMs::new(EXPIRES + 1_000);
-        assert!(open_preview(&device, host.public(), &restamped, 1_700_000_000_000).is_err());
     }
 
     #[test]
