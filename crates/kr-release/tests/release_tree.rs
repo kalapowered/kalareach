@@ -265,6 +265,13 @@ fn the_manifest_of_a_tree_names_the_pins_and_the_identity_the_build_recorded() {
             );
             // An upstream patch kept as published is pinned by the digest its publisher's file has,
             // and the release records that digest.
+            if pin["upstream_revision"].is_string() {
+                assert!(
+                    pin["sha256"].is_string(),
+                    "{} names its upstream source and carries no digest",
+                    patch.name
+                );
+            }
             if let Some(published) = pin["sha256"].as_str() {
                 let recorded: String = patch
                     .sha256
