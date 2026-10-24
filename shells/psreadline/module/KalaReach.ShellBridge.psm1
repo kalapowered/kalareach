@@ -26,11 +26,12 @@ $script:QualifiedFrom = [version]'2.3.4'
 $script:QualifiedBefore = [version]'3.0.0'
 $script:IntegrationVersion = '1'
 
-# The advisories against PowerShell itself that this package refuses to run under. Each names the
-# first fixed release of every series it lists; a release of a listed series below that, a
-# pre-release of the fixed release included, is affected. A series the advisory does not list is
-# judged by the advisory's own ranges and is not refused here. shells/psreadline/manifest.json
-# holds the same list for the identity record, and a test holds the two equal.
+# The advisories against PowerShell itself, or against the .NET runtime it carries, that this
+# package refuses to run under. Each names the first fixed release of every series it lists; a
+# release of a listed series below that, a pre-release of the fixed release included, is affected.
+# A series the advisory does not list is judged by the advisory's own ranges and is not refused
+# here. shells/psreadline/manifest.json holds the same list for the identity record, and a test
+# holds the two equal.
 $script:HostAdvisories = @(
     @{
         Id         = 'CVE-2026-62801'
@@ -39,6 +40,28 @@ $script:HostAdvisories = @(
             '7.4' = [System.Management.Automation.SemanticVersion]'7.4.20'
             '7.5' = [System.Management.Automation.SemanticVersion]'7.5.11'
             '7.6' = [System.Management.Automation.SemanticVersion]'7.6.6'
+        }
+    }
+    # The named mutex PSReadLine creates for its history file lives in the shared memory directory
+    # that CVE-2026-96225 and CVE-2026-96231 describe, on Linux and macOS. They are judged by the
+    # .NET runtime the host runs on, whatever the PowerShell release says: a self-contained release
+    # carries the runtime it was built with, and a framework-dependent host or a preview takes
+    # the one it finds. FirstFixed names the first release of each PowerShell series that carries
+    # the fixed runtime, for the register and the advisories check.
+    @{
+        Id                = 'CVE-2026-96225'
+        Url               = 'https://github.com/dotnet/announcements/issues/476'
+        Platforms         = @('linux', 'macos')
+        RuntimeFirstFixed = [ordered]@{
+            '8.0'  = [System.Management.Automation.SemanticVersion]'8.0.32'
+            '9.0'  = [System.Management.Automation.SemanticVersion]'9.0.21'
+            '10.0' = [System.Management.Automation.SemanticVersion]'10.0.13'
+            '11.0' = [System.Management.Automation.SemanticVersion]'11.0.0-rc.2'
+        }
+        FirstFixed        = [ordered]@{
+            '7.4' = [System.Management.Automation.SemanticVersion]'7.4.21'
+            '7.5' = [System.Management.Automation.SemanticVersion]'7.5.12'
+            '7.6' = [System.Management.Automation.SemanticVersion]'7.6.7'
         }
     }
 )
@@ -312,6 +335,7 @@ function Test-KrPowerShellRelease {
 
     $series = "$($Version.Major).$($Version.Minor)"
     foreach ($advisory in $script:HostAdvisories) {
+        if ($advisory.ContainsKey('RuntimeFirstFixed')) { continue }
         if (-not $advisory.FirstFixed.Contains($series)) { continue }
         $fixed = $advisory.FirstFixed[$series]
         if ($Version -lt $fixed) {
@@ -321,13 +345,77 @@ function Test-KrPowerShellRelease {
     $null
 }
 
+function ConvertFrom-KrFrameworkDescription {
+    <#
+    .SYNOPSIS
+    The .NET runtime version a runtime describes itself with, or nothing.
+
+    .DESCRIPTION
+    The description reads ".NET 10.0.13", or ".NET 11.0.0-rc.1.26425.128" for a prerelease, and the
+    prerelease label counts: 11.0.0-rc.1 is below 11.0.0-rc.2.
+    #>
+    param([string]$Text)
+    if ($Text -notmatch '^\.NET (\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$') { return $null }
+    try { [System.Management.Automation.SemanticVersion]$Matches[1] } catch { $null }
+}
+
+function Test-KrRuntimeRelease {
+    <#
+    .SYNOPSIS
+    The advisory a .NET runtime is affected by on this platform, or nothing.
+
+    .DESCRIPTION
+    A runtime is affected by an advisory that lists its platform and its series when it sorts below
+    that series' first fixed runtime. A series or a platform the advisory does not list is judged
+    by the advisory's own ranges and is not refused here. The platform is linux, macos or windows.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.SemanticVersion]$Runtime,
+        [Parameter(Mandatory)][string]$Platform
+    )
+
+    $series = "$($Runtime.Major).$($Runtime.Minor)"
+    foreach ($advisory in $script:HostAdvisories) {
+        if (-not $advisory.ContainsKey('RuntimeFirstFixed')) { continue }
+        if ($advisory.Platforms -notcontains $Platform) { continue }
+        if (-not $advisory.RuntimeFirstFixed.Contains($series)) { continue }
+        $fixed = $advisory.RuntimeFirstFixed[$series]
+        if ($Runtime -lt $fixed) {
+            return @{ Id = $advisory.Id; Url = $advisory.Url; FirstFixed = "$fixed"; Series = $series }
+        }
+    }
+    $null
+}
+
+function Get-KrClearingRelease {
+    # The newest first fixed release of this PowerShell series among all the advisories, which is
+    # the release that clears every one of them.
+    param([string]$Series)
+    $newest = $null
+    foreach ($advisory in $script:HostAdvisories) {
+        if (-not $advisory.FirstFixed.Contains($Series)) { continue }
+        if ($null -eq $newest -or $advisory.FirstFixed[$Series] -gt $newest) { $newest = $advisory.FirstFixed[$Series] }
+    }
+    "$newest"
+}
+
 function Test-KrQualifiedEditor {
     $affected = Test-KrPowerShellRelease $PSVersionTable.PSVersion
     if ($null -ne $affected) {
         return @{
             Ok     = $false
             Reason = 'powershell_release_affected'
-            Detail = "PowerShell $($PSVersionTable.PSVersion) is affected by $($affected.Id) ($($affected.Url)); $($affected.FirstFixed) is the first fixed release of the $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor) series; update PowerShell"
+            Detail = "PowerShell $($PSVersionTable.PSVersion) is affected by $($affected.Id) ($($affected.Url)); $($affected.FirstFixed) is the first fixed release of the $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor) series, and $(Get-KrClearingRelease "$($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)") is the first that clears every advisory; update PowerShell"
+        }
+    }
+    $platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+    $runtime = ConvertFrom-KrFrameworkDescription ([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription)
+    $affected = if ($null -ne $runtime) { Test-KrRuntimeRelease $runtime $platform }
+    if ($null -ne $affected) {
+        return @{
+            Ok     = $false
+            Reason = 'powershell_release_affected'
+            Detail = "PowerShell $($PSVersionTable.PSVersion) runs on .NET $runtime, which $($affected.Id) ($($affected.Url)) affects; $($affected.FirstFixed) is the first fixed runtime of .NET $($affected.Series); update PowerShell, or the .NET runtime it uses"
         }
     }
     $version = Get-KrPSReadLineVersion
@@ -1573,7 +1661,15 @@ function Publish-KalaReachQualification {
             powershell_advisories  = @($script:HostAdvisories | ForEach-Object {
                     $first = [ordered]@{}
                     foreach ($series in $_.FirstFixed.Keys) { $first[$series] = "$($_.FirstFixed[$series])" }
-                    [ordered]@{ id = $_.Id; url = $_.Url; first_fixed = $first }
+                    $entry = [ordered]@{ id = $_.Id; url = $_.Url }
+                    if ($_.ContainsKey('Platforms')) { $entry['platforms'] = @($_.Platforms) }
+                    $entry['first_fixed'] = $first
+                    if ($_.ContainsKey('RuntimeFirstFixed')) {
+                        $runtime = [ordered]@{}
+                        foreach ($series in $_.RuntimeFirstFixed.Keys) { $runtime[$series] = "$($_.RuntimeFirstFixed[$series])" }
+                        $entry['runtime_first_fixed'] = $runtime
+                    }
+                    $entry
                 })
             psreadline_found       = "$psrl"
             powershell_executable  = $qualifiedHost.executable
