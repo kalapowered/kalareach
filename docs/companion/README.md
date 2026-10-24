@@ -495,12 +495,24 @@ stops notifications on this phone, and only the host ends a destination. A stop 
 and offers "Try again", and "Open settings" when the system's setting is what the person has to
 change. A computer has no notifications to turn on and the row does not appear.
 
-The page asks four commands of the backend: `push_view`, `push_enable`, `push_refresh` and
-`notification_route`, and is told of a change on the `kr://push` event. `push.rs` sequences the
-steps for the host the person chose and holds the result in `push/push.json` under the data
-directory: per host, whether the person asked, the authorisation identifier this phone issued for it
-(so that asking again issues under the same one), the digest of the token the registration that last
-turned the host on proposed, and the last outcome in words. The file holds no token, no key and no credential. A file that cannot be read, damaged or
+Below those words, once the person has asked for notifications, a switch named "Previews" chooses
+what a notification shows: what needs the person (on, which is the default), or only that something
+does. The switch reads as changed at once and waits while a step runs. Turning it off takes the host's
+key out of what the phone's receivers hold before the host is told, so a preview already on its way is
+not opened; turning it on files the key first. The host is then told with `device.push.register`,
+which carries the choice: a host seals nothing and names no recipient key in later notifications when
+it is off. Only that registration is repeated, under the authorisation identifier the phone already
+keeps and with no new token proposal. A host that cannot be told leaves the row needing the person,
+the choice stays recorded, and "Try again" runs the whole sequence with it.
+
+The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
+`push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. `push.rs`
+sequences the steps for the host the person chose and holds the result in `push/push.json` under the
+data directory: per host, whether the person asked, the authorisation identifier this phone issued for
+it (so that asking again issues under the same one), the digest of the token the registration that
+last turned the host on proposed, the choice of previews and the choice the host was last told (a
+record from before the choice existed reads as on), and the last outcome in words. The file holds no
+token, no key and no credential. A file that cannot be read, damaged or
 written by a build this one does not know, is moved aside as `push/push.unreadable-<time>.json`
 and never written over, and the failure is logged. The new record marks each host paired at that
 moment as lost: the page shows it as needing the person, in place of off, across restarts, until the
@@ -514,14 +526,24 @@ of paired hosts that cannot be read marks none: once it can be read, those hosts
 as off, with no words, and none is started until the application is opened again. `docs/delivery/README.md` ("What the phone does first") says what
 the steps are. A run changes a member's host only under the account its connection was opened under:
 when that account has signed out or been replaced, the run stops before its next change, in words that
-say so. The application looks again with `push_refresh` when it starts and each time it
+say so. A run the person starts reaches its host as the person's own choice, and may take the relay
+another host's endpoint uses. A run a look starts is a visit: it holds the endpoint of its host while
+its connection is open, which stops other visits and nothing the person asks, and it never cuts off the
+host in use. A host it could not reach without that is asked before anything else, so the gateway and
+the host are asked nothing; the row needs the person, in words that name the relay, and "Try again"
+reaches it as the person's own choice. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
 comes back to the screen they left. A tap on a notification opens the application, and
 `notification_route` hands the page the screen once; the page goes to the attention screen, where
 what needs the person is.
 
 The platform plugin carries the commands the steps need to native code: the permission, the token,
-the record of the registration being waited for, the limited key store, and the route of a tap. Its
+the record of the registration being waited for, the set of preview keys the receivers hold, and the
+route of a tap. The set is built from the record and the paired hosts under one hold, whole each time
+(this phone's preview seed, and the preview key of each paired host whose record is not lost and whose
+previews are on), and handed over before the host is reached, when a host is forgotten, when the
+choice changes and at each look; the receivers' store is made equal to it, and a list of paired hosts
+that cannot be read hands over nothing. Its
 Android half is `PlatformPlugin.kt` and the receiver in `native/android`; its iOS half forwards to
 the application target through an adapter found by name (`KRPushAdapter`), as the voice call does.
 The receivers answer a registration challenge through one function of the Rust library
