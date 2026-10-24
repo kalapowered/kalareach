@@ -4397,6 +4397,7 @@ name = "kr-attention"
 version = "0.1.0"
 dependencies = [
  "hmac 0.13.0",
+ "kr-crypto",
  "kr-flush",
  "kr-protocol",
  "rusqlite",

@@ -411,7 +411,7 @@ pub struct PendingInput {
 }
 
 /// The attention engine.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Engine {
     items: BTreeMap<AttentionKey, Item>,
     acks: BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>,
@@ -481,10 +481,23 @@ fn automation_subject(subject: &AttentionAutomationSubject) -> (Subject, String)
 }
 
 impl Engine {
-    /// Builds an engine with nothing consumed and nothing in the inbox.
+    /// Builds an engine with nothing consumed and nothing in the inbox, which derives its item keys
+    /// under `keys`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(keys: crate::key::KeySecret) -> Self {
+        Self {
+            items: BTreeMap::new(),
+            acks: BTreeMap::new(),
+            consumed: BTreeMap::new(),
+            gaps: Vec::new(),
+            pending_inputs: BTreeMap::new(),
+            quiet: None,
+            dropped: 0,
+            next_announcement: 0,
+            next_revision: 0,
+            finalised: BTreeSet::new(),
+            keys,
+        }
     }
 
     /// Returns the configured quiet hours.
@@ -1060,7 +1073,6 @@ impl Engine {
             .map(|item| item.revision)
             .fold(restored.next_revision, u64::max);
         self.finalised = restored.finalised;
-        self.keys = restored.keys;
     }
 
     /// Re-anchors every interval at `reading`, from the anchors the store kept.
@@ -1833,5 +1845,4 @@ pub(crate) struct Restored {
     pub(crate) next_announcement: u64,
     pub(crate) next_revision: u64,
     pub(crate) finalised: BTreeSet<SessionId>,
-    pub(crate) keys: crate::key::KeySecret,
 }
