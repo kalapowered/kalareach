@@ -29,6 +29,7 @@
 
 mod collection;
 mod paired;
+mod preview;
 mod sync;
 
 use std::collections::BTreeMap;
@@ -53,6 +54,7 @@ pub use collection::{
     wrap_collection_key,
 };
 pub use paired::{PairedSenders, open_delivered_envelope};
+pub use preview::{PreviewRefusal, open_notification_envelope};
 pub use sync::{SYNC_OBJECT_DOMAIN, open_sync_object, seal_sync_object};
 
 /// Seals one envelope for one recipient.
