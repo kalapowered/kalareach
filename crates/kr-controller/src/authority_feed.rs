@@ -74,6 +74,7 @@ use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
 use crate::error::{ControllerError, Result};
+use crate::grants::Refusal;
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
 use crate::quiet::{Quiet, Timer};
 use crate::service::Controller;
@@ -226,6 +227,9 @@ struct Shared {
     scan_looking: AtomicBool,
     /// What the scan met so far of withdrawals the feed shows complete and this host cannot verify.
     scan_found: Mutex<Unverified>,
+    /// Why the first request the scan met so far whose issuer's standing this host could not decide
+    /// could not be judged.
+    scan_undecided: Mutex<Option<Refusal>>,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
     /// How many passes have finished, for whatever waits on one.
@@ -293,6 +297,7 @@ impl FeedRuntime {
                 scan_put_off: AtomicBool::new(false),
                 scan_looking: AtomicBool::new(false),
                 scan_found: Mutex::default(),
+                scan_undecided: Mutex::default(),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
                 passes: tokio::sync::watch::channel(0).0,
@@ -788,6 +793,17 @@ async fn pass(
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     };
+    // Why a request earlier in this scan could not be judged: the requests after it are judged by a
+    // later scan, in the order the feed holds them.
+    let mut undecided = if starting {
+        None
+    } else {
+        shared
+            .scan_undecided
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
     let mut cursor = if starting {
         shared.settled_through.load(Ordering::SeqCst)
     } else {
@@ -819,6 +835,14 @@ async fn pass(
             shared.observed().catching_up = behind;
         }
         for record in &state.records {
+            // A request is judged by its issuer's standing, and judgment stays in the order the feed
+            // holds the requests: one behind a request whose issuer's standing could not be decided
+            // waits for the scan that can decide it. What the feed shows complete is only carried
+            // out again, which asks no clock, and finds the withdrawals this host cannot verify.
+            if undecided.is_some() && !shown_complete(record) {
+                contiguous = false;
+                continue;
+            }
             match settle(shared, controller, record, &mut now).await? {
                 Settled::Done => {
                     if contiguous {
@@ -863,6 +887,10 @@ async fn pass(
                     contiguous = false;
                     looking = true;
                 }
+                Settled::Undecided(refusal) => {
+                    contiguous = false;
+                    undecided.get_or_insert(refusal);
+                }
             }
         }
         cursor = state.next_after_sequence.get();
@@ -882,6 +910,10 @@ async fn pass(
         .scan_found
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = found.clone();
+    *shared
+        .scan_undecided
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = undecided.clone();
     if !read_through {
         // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
         // as read, the bounded offline validity is not extended from it, and nothing waits for
@@ -899,6 +931,10 @@ async fn pass(
         .scan_found
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = Unverified::default();
+    *shared
+        .scan_undecided
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = None;
     // Every record the feed holds has been seen in this run now, and the places it names are all
     // there are.
     controller.feed_read_through();
@@ -929,6 +965,13 @@ async fn pass(
         if looking {
             // The requests that waited for the places are judged by the scan that begins now.
             return Ok(Pass::More);
+        }
+        if let Some(refusal) = undecided {
+            // The refusal and the catch-up are done, and what the feed shows complete is carried
+            // out again. A pass that could not judge a request is no synchronisation: nothing is
+            // shown as read, the owners' list is left as it was and the next pass waits out its
+            // backoff, then judges the request again.
+            return Err(Stopped::local(Controller::undecided_standing(&refusal)));
         }
         if name_owners(shared, controller, &latest).await? == Delegation::Removed {
             return removed(shared, controller).await;
@@ -1045,6 +1088,19 @@ enum Settled {
     /// The feed shows it complete, and this host holds what it names live and cannot tell whose
     /// word it is. It stays unsettled, so every scan reads it again.
     Unverified(Unverified),
+    /// This host cannot yet decide whether the device that made it may manage the host, for the
+    /// reason given. It stays unsettled, and a later scan judges it again.
+    Undecided(Refusal),
+}
+
+/// Whether the feed shows the record's request completed by this host, and not refused.
+fn shown_complete(record: &AuthorityFeedRecord) -> bool {
+    record.rejected.0.is_none()
+        && record
+            .acknowledgement
+            .0
+            .as_ref()
+            .is_some_and(|held| held.completion == RevocationCompletion::Complete)
 }
 
 /// Settles one record the feed holds: refuses it, or carries it out and acknowledges it.
@@ -1054,10 +1110,7 @@ async fn settle(
     record: &AuthorityFeedRecord,
     latest: &mut Latest,
 ) -> std::result::Result<Settled, Stopped> {
-    if record.rejected.0.is_none()
-        && let Some(held) = record.acknowledgement.0.as_ref()
-        && held.completion == RevocationCompletion::Complete
-    {
+    if shown_complete(record) {
         // A registry restored to an earlier state has lost what this host carried out for the
         // request, which the feed still shows complete: what the registry does not show done is
         // carried out again, whatever its counter says.
@@ -1118,6 +1171,7 @@ async fn settle_request(
             Judged::Refuse(reason) => return refuse(shared, controller, id, reason, latest).await,
             Judged::Apply(plan) => plan,
             Judged::Wait => return Ok(Settled::Looking),
+            Judged::Undecided(refusal) => return Ok(Settled::Undecided(refusal)),
         },
     };
     let held = controller

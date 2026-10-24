@@ -83,6 +83,10 @@ pub(crate) enum Judged {
     /// feed, because no scan of this run has read the feed through: it is judged by the scan that
     /// follows the first one that has.
     Wait,
+    /// This host cannot decide whether the device that made it may manage the host: the clock is
+    /// unproven, or the floor or an expiry the decision stands on is not recorded. The request is
+    /// judged again by a scan that can decide.
+    Undecided(Refusal),
 }
 
 /// Whether a paired device may, now, manage this host.
@@ -256,21 +260,25 @@ impl Controller {
         match self.standing_to_manage(&issuer, now_ms, Some(place)) {
             Standing::Holds => {}
             Standing::Not => return Ok(Judged::Refuse(RejectionReason::NoOwnerAuthority)),
-            Standing::Undecided(Refusal::ClockUnproven) => {
-                return Err(crate::grants::continuity_lost());
-            }
-            Standing::Undecided(refusal) => {
-                return Err(crate::error::ControllerError::Storage {
-                    operation: "decide who may manage this host",
-                    detail: refusal.detail(),
-                });
-            }
+            Standing::Undecided(refusal) => return Ok(Judged::Undecided(refusal)),
         }
         let plan = self.plan_of(request)?;
         if plan.devices.is_empty() && plan.grants.is_empty() {
             return Ok(Judged::Refuse(RejectionReason::UnknownTarget));
         }
         Ok(Judged::Apply(plan))
+    }
+
+    /// The error a standing this host could not decide comes to, for the pass that could not
+    /// finish because of it.
+    pub(crate) fn undecided_standing(refusal: &Refusal) -> crate::error::ControllerError {
+        match refusal {
+            Refusal::ClockUnproven => crate::grants::continuity_lost(),
+            other => crate::error::ControllerError::Storage {
+                operation: "decide who may manage this host",
+                detail: other.detail(),
+            },
+        }
     }
 
     /// The rights ceiling this host's configuration puts in force, when it puts one.
