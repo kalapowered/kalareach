@@ -415,7 +415,9 @@ The snapshot is the native equivalent of Zsh's `$KEYS`, `$PENDING` and `$KEYS_QU
 sequence that invoked the current operation, the bytes still unread in the reader's own queue, and
 the keys still queued ahead of the terminal. Two reads taken a moment apart describe two different
 instants, which is the ambiguity a fence exists to remove, so a qualified package takes them
-together.
+together. A reader cannot tell a byte a person typed from one the host put into the terminal for
+an application, such as the answer to a device query, and it does not try: what it has not read is
+unread input, and its queues are not drained until it has.
 
 A launch is never written into the pseudo-terminal. There is no wake marker and no launch string,
 because the process reading the terminal may not be the shell. A rejection installs nothing.
