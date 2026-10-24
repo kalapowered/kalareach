@@ -2334,9 +2334,12 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_r
 }
 
 /// KR-REQ-24.15: where a withdrawal the host cannot verify stands in the feed is read from the feed
-/// by every run, and no state of the run before is needed. The host stops after the scan that found
-/// the withdrawal and before the scan that judges the request, and the run that follows carries the
-/// request out all the same: the issuer is still live where its request stands.
+/// by every run, and no state of the run before is needed. The first run puts the request off,
+/// because the registry stands behind the feed, and finds the withdrawal; the feed turns back the
+/// change the host makes to its list of keys, and the run stops there, before the registry has
+/// caught up. The run that follows starts behind its feed as well, finds the withdrawal in its
+/// first scan and judges the request in the scan after the catch-up, and carries it out all the
+/// same: the issuer is still live where its request stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_ahead_of_a_withdrawal_is_carried_out_by_the_run_that_follows_a_stop_between_them()
  {
@@ -2347,12 +2350,19 @@ async fn a_request_ahead_of_a_withdrawal_is_carried_out_by_the_run_that_follows_
         kept,
         first,
     } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(false).await;
-    // The first scan reads the feed (1), puts the request off and finds the withdrawal; the feed
-    // turns the second scan's read (2) back, and the host stops there.
+    // The first scan reads the feed, puts the request off and finds the withdrawal, which names a
+    // key the feed lists as permitted to remove it; the feed turns the change back, and the host
+    // stops there.
     rig.served
         .web()
-        .fail_with_member(AUTHORITY, "read", 2, TURNED_BACK);
+        .fail_with_member(AUTHORITY, "delegate", 1, TURNED_BACK);
     rig.poll().await;
+    let stopped = rig.shown().await.check.expect("the feed check");
+    assert!(
+        stopped.detail().contains("catching up with it"),
+        "the registry is still behind the feed when the run stops: {}",
+        stopped.detail()
+    );
     let rig = rig.restarted(false, |_| {}).await;
     rig.until_the_carrier_is_idle().await;
 
