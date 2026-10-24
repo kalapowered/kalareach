@@ -865,6 +865,7 @@ async fn a_ceiling_naming_a_right_the_grant_lacks_adds_nothing() {
 
 /// KR-REQ-26.15: an edit that narrows the ceiling fences a paired device's dispatch before it is
 /// acknowledged, and the device's next connection is decided under the narrower ceiling.
+/// KR-REQ-26.16: a change affecting authority fences dispatch before the edit is acknowledged.
 /// KR-REQ-10.40, the part about the policy intersection on every request: after the ceiling is
 /// narrowed the connection admitted under the wider one is fenced, and the next connection's
 /// requests are decided under the narrower ceiling.
@@ -2195,6 +2196,7 @@ async fn an_unacknowledged_fence_is_reported_rather_than_called_done() {
 }
 
 /// KR-REQ-26.15: a session ceiling the registry cannot record is refused before it is written.
+/// KR-REQ-26.16: an edit is validated before a revision is applied, and a refused one applies none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_ceiling_outside_the_recordable_range_is_refused() {
     let owner = DeviceKeys::generate().expect("owner keys");
