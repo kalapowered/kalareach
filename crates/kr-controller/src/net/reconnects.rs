@@ -79,6 +79,17 @@ impl Reconnects {
         }
     }
 
+    /// How many connections of `device` the host is serving, for this host's own tests: a test
+    /// that waits for it to reach none knows the host has recorded that the connection ended.
+    #[cfg(feature = "testing")]
+    pub(crate) fn serving(&self, device: DeviceId) -> u32 {
+        self.devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device)
+            .map_or(0, |presence| presence.live)
+    }
+
     /// Records that a connection of `device` ended at `now`.
     pub(crate) fn departed(&self, device: DeviceId, now: ContinuousInstant) {
         let mut devices = self

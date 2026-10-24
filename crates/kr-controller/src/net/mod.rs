@@ -378,6 +378,13 @@ impl Network {
         self.guard.iroh_endpoint()
     }
 
+    /// Returns how many connections of `device` the host is serving, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn connections_of(&self, device: DeviceId) -> u32 {
+        self.guard.host.reconnects.serving(device)
+    }
+
     /// Returns the host's pairing service.
     #[must_use]
     pub fn pairing(&self) -> &Arc<PairingHost> {
@@ -508,7 +515,7 @@ impl NetworkHost {
     /// which authority can be withdrawn, and a connection registered in that gap would pass every
     /// later check. The registry lock is taken first and the connection table second, which is the
     /// order a revocation uses, so neither can interleave with the other.
-    async fn admit(&self, session: &AuthorisedSession) -> Result<DeviceRecord> {
+    async fn admit(&self, session: &AuthorisedSession) -> Result<(DeviceRecord, Arc<Controller>)> {
         let controller = self.daemon()?;
         #[cfg(feature = "testing")]
         controller.before_a_connection_is_registered.wait().await;
@@ -551,7 +558,7 @@ impl NetworkHost {
         );
         drop(admitted);
         drop(registry);
-        Ok(record)
+        Ok((record, controller))
     }
 
     /// Serves one authorised connection until it ends.
@@ -568,8 +575,8 @@ impl NetworkHost {
             self.reconnects
                 .arrived(device_id, arrived_at, transport, MetricOutcome::Refused)
         };
-        let device = match self.admit(&session).await {
-            Ok(device) => device,
+        let (device, controller) = match self.admit(&session).await {
+            Ok(admitted) => admitted,
             Err(error) => {
                 refused();
                 let _ = session
@@ -578,10 +585,6 @@ impl NetworkHost {
                     .await;
                 return;
             }
-        };
-        let Ok(controller) = self.daemon() else {
-            refused();
-            return;
         };
         // Section 10: synchronise the authority feed at reconnect before affected remote access.
         // A revocation the feed holds for this device is carried out before anything it asks is
