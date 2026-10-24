@@ -55,10 +55,10 @@ use std::time::Duration;
 
 use companion_platform::notify::Permission;
 use companion_platform::push::{PendingRegistration, PendingState};
-use kr_client::Shown;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
 use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
+use kr_client::{Said as _, Shown};
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
 use kr_protocol::ids::DeviceKeyRevision;
 use kr_protocol::ids::{DeviceId, PushRegistrationId, PushSenderRecordId};
@@ -261,10 +261,28 @@ pub trait Native: Send + Sync {
     fn route(&self) -> PushFuture<'_, Option<String>>;
 }
 
+/// How a run reaches its host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// The person asked for it. The host's endpoint is held while the connection is open, and
+    /// reaching the host may close the endpoint of another host that shares its relay, as the
+    /// person's own choice of the host would.
+    Asked,
+    /// A look at where notifications stand started it, in the background. It is a visit: it never
+    /// closes the endpoint of the host in use, and is refused when the host cannot be reached
+    /// without that. The host's endpoint is held while the connection is open.
+    Visit,
+}
+
 /// How this phone reaches a host it is paired with, to hand it a delivery credential.
 pub trait Registrar: Send + Sync {
-    /// Opens the paired connection to `host`.
-    fn connect<'a>(&'a self, host: &'a PairedHost) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
+    /// Opens the paired connection to `host`, and holds its endpoint until the connection is
+    /// dropped, so nothing this phone does for another host closes it in between.
+    fn connect<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        reach: Reach,
+    ) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
 }
 
 /// An open connection to a host, and the two changes the phone makes there. The desk asks whether
@@ -579,7 +597,7 @@ impl PushDesk {
         };
         if let Some(run) = run {
             (self.changed)();
-            self.spawn_run(host, run);
+            self.spawn_run(host, run, Reach::Asked);
         }
         Ok(self.view())
     }
@@ -664,7 +682,7 @@ impl PushDesk {
             (self.changed)();
         }
         for (host, run) in claimed {
-            self.spawn_run(host, run);
+            self.spawn_run(host, run, Reach::Visit);
         }
         Ok(self.view())
     }
@@ -690,8 +708,9 @@ impl PushDesk {
     }
 
     /// Runs the sequence for `host`, which `run` holds, and runs it again for as long as the token
-    /// the provider holds is not the one the registration just made proposed.
-    fn spawn_run(self: &Arc<Self>, host: PairedHost, run: u64) {
+    /// the provider holds is not the one the registration just made proposed. The host is reached
+    /// as `reach` says.
+    fn spawn_run(self: &Arc<Self>, host: PairedHost, run: u64, reach: Reach) {
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             let mut guard = RunGuard {
@@ -701,7 +720,7 @@ impl PushDesk {
                 armed: true,
             };
             loop {
-                match desk.sequence(&host, run).await {
+                match desk.sequence(&host, run, reach).await {
                     Ok(registered) => {
                         desk.about_to_compare(host.host_device_id, run);
                         let current = desk.current_digest().await;
@@ -874,7 +893,12 @@ impl PushDesk {
     /// # Errors
     ///
     /// Returns the words for whatever stopped it.
-    async fn sequence(&self, host: &PairedHost, run: u64) -> std::result::Result<Digest256, Stop> {
+    async fn sequence(
+        &self,
+        host: &PairedHost,
+        run: u64,
+        reach: Reach,
+    ) -> std::result::Result<Digest256, Stop> {
         let native = &self.native;
         let mut permission = native
             .permission()
@@ -1038,7 +1062,11 @@ impl PushDesk {
         if !wanted() {
             return Err(forgotten_host());
         }
-        let mut line = self.registrar.connect(host).await.map_err(not_taken)?;
+        let mut line = self
+            .registrar
+            .connect(host, reach)
+            .await
+            .map_err(not_taken)?;
         if !wanted() {
             return Err(forgotten_host());
         }
@@ -1486,14 +1514,48 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
 pub struct ConnectionRegistrar(pub Arc<Device>);
 
 impl Registrar for ConnectionRegistrar {
-    fn connect<'a>(&'a self, host: &'a PairedHost) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
+    fn connect<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        reach: Reach,
+    ) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
         Box::pin(async move {
-            let connection = crate::connection::Connection::paired(&self.0, host)
-                .await
-                .map_err(|error| error.message)?;
+            // The endpoint is held from before the connection is made until the line is dropped:
+            // a visit to another host that shares its relay would close it, and so would the
+            // host in use reconnecting. A look's run asks the pool whether the host in use allows
+            // it, in the same request as the hold.
+            let link = &self.0.pairing().link;
+            let unreached = |_| "the host did not answer in time".to_owned();
+            let held = match reach {
+                Reach::Asked => {
+                    tokio::time::timeout(
+                        crate::connection::CONNECT_WITHIN,
+                        link.hold(&host.network_config),
+                    )
+                    .await
+                }
+                Reach::Visit => {
+                    let in_use = || self.0.host_in_use().map(|using| using.network_config);
+                    tokio::time::timeout(
+                        crate::connection::CONNECT_WITHIN,
+                        link.visit_hold(&host.network_config, &in_use),
+                    )
+                    .await
+                }
+            }
+            .map_err(unreached)?
+            .map_err(|error| error.said().into_string())?;
+            let connection = match reach {
+                Reach::Asked => crate::connection::Connection::paired(&self.0, host).await,
+                Reach::Visit => crate::connection::Connection::visited(&self.0, host)
+                    .await
+                    .map_err(crate::connection::Unopened::into_error),
+            }
+            .map_err(|error| error.message)?;
             Ok(Box::new(ConnectionLine {
                 connection,
                 device_id: host.device_id,
+                _held: held,
             }) as Box<dyn HostLine + 'a>)
         })
     }
@@ -1504,6 +1566,8 @@ struct ConnectionLine {
     connection: crate::connection::Connection,
     /// The host's identifier for this phone.
     device_id: DeviceId,
+    /// The hold on the host's endpoint, kept until the line is dropped.
+    _held: kr_client::pairing::link::EndpointHold,
 }
 
 impl HostLine for ConnectionLine {
