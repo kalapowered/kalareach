@@ -28,6 +28,18 @@ pub fn reference_of(host: &PairedHost) -> String {
 /// The name a host is shown by when it gave none this computer could read.
 pub const UNNAMED_HOST: &str = "your host";
 
+/// How this computer found its contact with a host it keeps watch on, the last time it looked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Contact {
+    /// The host answered.
+    In,
+    /// The host could not be reached, or did not answer in time.
+    Out,
+    /// The host was reached, and this computer could not give it the lease its organisation signs
+    /// for it, so it was asked nothing: the words say why.
+    Refused(String),
+}
+
 /// One paired host, as the page lists it. It holds no key, no identifier and nothing the page
 /// could build a request from: the reference below names the host to this application and to no
 /// one else.
@@ -49,12 +61,17 @@ pub struct HostRow {
     /// Whether this computer is in contact with the host now, for a host it keeps a connection
     /// to: the ones it is an owner of, which it watches for confirmations.
     pub in_contact: Option<bool>,
+    /// Why this computer could not use the host though it reached it: the words of what stopped
+    /// the lease its organisation signs for it. A host that was reached and is refused is in
+    /// contact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 impl HostRow {
     /// The row for `host`, with its contact as this computer last saw it.
     #[must_use]
-    pub fn of(host: &PairedHost, in_use: bool, in_contact: Option<bool>) -> Self {
+    pub fn of(host: &PairedHost, in_use: bool, contact: Option<&Contact>) -> Self {
         Self {
             reference: reference_of(host),
             in_use,
@@ -68,7 +85,11 @@ impl HostRow {
                 GrantExpiry::Never => None,
                 GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
             },
-            in_contact,
+            in_contact: contact.map(|contact| !matches!(contact, Contact::Out)),
+            refusal: match contact {
+                Some(Contact::Refused(words)) => Some(words.clone()),
+                _ => None,
+            },
         }
     }
 }

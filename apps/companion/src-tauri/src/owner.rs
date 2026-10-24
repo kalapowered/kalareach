@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use kr_client::pairing::link::LinkError;
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, FIELD_CHARS, Listed, OwnerConfirmations, ReviewOutcome,
     STATEMENT_CHARS, SessionChannel, Subject, describe_rights, is_plain_text,
@@ -37,8 +38,8 @@ use kr_protocol::ids::{ConfirmationId, DeviceId};
 use kr_protocol::pairing::{OwnerConfirmationRequest, SensitiveAction, group_verification_value};
 use serde::{Deserialize, Serialize};
 
-use crate::device::Device;
 use crate::device::hosts::UNNAMED_HOST;
+use crate::device::{Contact, Device};
 use crate::error::{CommandError, Result};
 
 /// How often each owned host is asked what it wants confirmed.
@@ -260,7 +261,8 @@ impl Owner {
         .ok_or_else(out_of_contact)?;
         // A session that answers now, and the challenge as the host holds it now: one the host
         // no longer holds open cannot be confirmed any more.
-        let (confirmations, holding) = self.reach(&host, false).await.ok_or_else(out_of_contact)?;
+        let (confirmations, holding) =
+            self.reach(&host, false).await.map_err(Missed::into_error)?;
         let outcome = match held_now(&holding, &listed) {
             Held::Unchanged(current) => confirmations.review(current, &*self.ceremony).await,
             Held::Changed => ReviewOutcome::CannotCheck,
@@ -295,15 +297,21 @@ impl Owner {
     /// visit leaves the host in use's connection alone; the answer to a review, which the person
     /// asked for, does not.
     async fn refresh(&self, host: &PairedHost, visiting: bool) {
-        let listed = self.visit(host, visiting).await;
-        self.device
-            .set_contact(host.host_device_id, listed.is_some());
-        self.show(host, listed.unwrap_or_default());
+        let (found, listed) = match self.visit(host, visiting).await {
+            Ok(listed) => (Contact::In, listed),
+            Err(Missed::OutOfContact) => (Contact::Out, Vec::new()),
+            Err(Missed::Refused(words)) => (Contact::Refused(words), Vec::new()),
+        };
+        self.device.set_contact(host.host_device_id, found);
+        self.show(host, listed);
     }
 
-    /// One visit to `host`: what it holds open, or `None` when it could not be reached and asked
-    /// in time.
-    async fn visit(&self, host: &PairedHost, visiting: bool) -> Option<Vec<Listed>> {
+    /// One visit to `host`: what it holds open, or why nothing was found.
+    async fn visit(
+        &self,
+        host: &PairedHost,
+        visiting: bool,
+    ) -> std::result::Result<Vec<Listed>, Missed> {
         self.reach(host, visiting).await.map(|(_, listed)| listed)
     }
 
@@ -314,44 +322,52 @@ impl Owner {
         &self,
         host: &PairedHost,
         visiting: bool,
-    ) -> Option<(Arc<OwnerConfirmations>, Vec<Listed>)> {
+    ) -> std::result::Result<(Arc<OwnerConfirmations>, Vec<Listed>), Missed> {
         let deadline = tokio::time::Instant::now() + VISIT_WITHIN;
         if let Some(open) = self.session(host.host_device_id) {
             match tokio::time::timeout_at(deadline, open.pending()).await {
-                Ok(Ok(listed)) => return Some((open, listed)),
+                Ok(Ok(listed)) => return Ok((open, listed)),
                 _ => self.forget(host.host_device_id, &open),
             }
         }
         let opened = tokio::time::timeout_at(deadline, self.open(host, visiting))
             .await
-            .ok()??;
+            .map_err(|_| Missed::OutOfContact)??;
         let listed = tokio::time::timeout_at(deadline, opened.pending())
             .await
-            .ok()?
-            .ok()?;
+            .map_err(|_| Missed::OutOfContact)?
+            .map_err(|_| Missed::OutOfContact)?;
         self.keep(host.host_device_id, &opened);
-        Some((opened, listed))
+        Ok((opened, listed))
     }
 
     /// A session to `host`, opened now: connected as the device this computer is there, through
     /// the host's own network configuration, and aimed at the host's environment. A visit never
     /// cuts off the connection to the host in use.
-    async fn open(&self, host: &PairedHost, visiting: bool) -> Option<Arc<OwnerConfirmations>> {
+    async fn open(
+        &self,
+        host: &PairedHost,
+        visiting: bool,
+    ) -> std::result::Result<Arc<OwnerConfirmations>, Missed> {
         let pairing = self.device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
         let session = if visiting {
             let device = &self.device;
             let in_use = || device.host_in_use().map(|using| using.network_config);
-            pairing
-                .link
-                .visit_paired(host, &identity, &in_use)
-                .await
-                .ok()?
+            pairing.link.visit_paired(host, &identity, &in_use).await
         } else {
-            pairing.link.connect_paired(host, &identity).await.ok()?
-        };
-        let channel = SessionChannel::open(Arc::new(session)).await.ok()?;
-        Some(Arc::new(OwnerConfirmations::new(
+            pairing.link.connect_paired(host, &identity).await
+        }
+        .map_err(|error| match error {
+            // The host was reached and was asked nothing: this computer could not give it the
+            // lease it needs, and the words say why.
+            LinkError::Membership(refusal) => Missed::Refused(refusal.message),
+            _ => Missed::OutOfContact,
+        })?;
+        let channel = SessionChannel::open(Arc::new(session))
+            .await
+            .map_err(|_| Missed::OutOfContact)?;
+        Ok(Arc::new(OwnerConfirmations::new(
             host.clone(),
             self.device.identity().keys.authorisation.clone(),
             Arc::new(channel),
@@ -415,6 +431,25 @@ impl Owner {
         drop(references);
         if before != after {
             (self.changed)();
+        }
+    }
+}
+
+/// Why a visit to an owned host found nothing.
+enum Missed {
+    /// The host could not be reached, or did not answer in time.
+    OutOfContact,
+    /// The host was reached, and this computer could not give it the lease it needs: the words say
+    /// why.
+    Refused(String),
+}
+
+impl Missed {
+    /// What a person who asked for a review is told.
+    fn into_error(self) -> CommandError {
+        match self {
+            Self::OutOfContact => CommandError::unavailable("the host is not in contact"),
+            Self::Refused(words) => CommandError::unavailable(words),
         }
     }
 }
