@@ -804,6 +804,24 @@ impl NetworkHost {
         }
     }
 
+    /// Releases what each live connection holds at its worker, for the connections `refused`
+    /// selects.
+    ///
+    /// A refusal the authority feed puts on a grant moves no revision, so a worker learns of it
+    /// from nothing but the link ending: closing the link detaches the connection's attachments,
+    /// and detaching ends the input lease and discards the input the worker holds for it. A
+    /// connection stays up and refused, and a request it makes after the refusal ends opens a link
+    /// again.
+    fn release_the_links_that(&self, refused: impl Fn(&RemoteConnection) -> bool) {
+        for remote in self.live_connections(refused) {
+            // Releasing the worker link waits for a socket, so it belongs to a task rather than to
+            // the critical section a refusal is raised in.
+            tokio::spawn(async move {
+                remote.release().await;
+            });
+        }
+    }
+
     fn daemon(&self) -> Result<Arc<Controller>> {
         self.controller
             .upgrade()
@@ -1672,6 +1690,21 @@ impl Controller {
         self.network
             .get()
             .map_or(0, |guard| guard.host.connections_served())
+    }
+
+    /// Releases what the connections the authority feed refuses hold at their workers.
+    ///
+    /// Called when a refusal rises or the feed removes this host. A refused connection can have
+    /// handed a worker input the worker has not yet delivered, and nothing the refusal changes
+    /// reaches the worker, so the link is what carries it: the worker detaches the connection's
+    /// attachments and discards the input it holds for them. Every remote attachment a refusal
+    /// reaches ends, and the device attaches again once the refusal has ended.
+    pub(crate) fn release_the_links_the_feed_refuses(&self) {
+        if let Some(guard) = self.network.get() {
+            guard
+                .host
+                .release_the_links_that(|remote| self.feed_refusal(Some(remote.grant())).is_some());
+        }
     }
 
     /// Fences every network connection whose registration a revocation has withdrawn.

@@ -547,3 +547,39 @@ fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
     found.sort();
     found
 }
+
+/// KR-REQ-24.15: when the authority feed raises a refusal on remote grants, what a remote device
+/// holds at a worker is released, as a revocation releases it: its attachment, and with it the
+/// input lease, whose release discards the input the worker still holds for it. The refusal moves
+/// no revision, so nothing else would tell the worker; without this the input a device sent before
+/// the refusal rose reaches the application after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_refusal_the_feed_raises_releases_what_a_remote_device_holds_at_its_worker() {
+    let net_support::worker::Adopted {
+        host,
+        owner,
+        workers,
+    } = net_support::worker::Adopted::start(1).await;
+    let worker = &workers[0];
+    let (session, _typist) =
+        net_support::worker::type_into(&host, &owner, worker.session_id, "x").await;
+    assert_eq!(
+        worker.attachments(),
+        1,
+        "the control: the device holds an attachment at the worker"
+    );
+
+    host.controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while worker.attachments() > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the worker lets go of what the device held");
+    drop(session);
+    host.stop().await;
+    drop(workers);
+}
