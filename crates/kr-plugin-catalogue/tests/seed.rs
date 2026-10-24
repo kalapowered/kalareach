@@ -1111,6 +1111,10 @@ async fn an_expired_seed_is_reported_and_a_fresh_sync_replaces_it() {
         .expect("a fresh generation is taken");
 }
 
+// ---------------------------------------------------------------------------------------------
+// A network that moved on
+// ---------------------------------------------------------------------------------------------
+
 /// KR-REQ-11.08: one generation number names one index. A store that holds generation two refuses a
 /// repository that publishes other bytes under two, keeps the index it holds and what it installed
 /// from it, and takes the same repository once it publishes the change as generation three.
@@ -1140,6 +1144,9 @@ async fn a_store_holding_generation_two_refuses_another_index_under_two_and_take
         .update_enrolment(official, false)
         .expect("the owner points it at a mirror");
 
+    let held = catalogue.index(&id).expect("activated");
+    assert_eq!(held.generation.get(), 2);
+
     // The repository is rebuilt under the number the store holds, with a different package.
     generation
         .rewrite_with(GenerationSpec {
@@ -1157,9 +1164,9 @@ async fn a_store_holding_generation_two_refuses_another_index_under_two_and_take
         "{refusal}"
     );
     assert_eq!(
-        catalogue.index(&id).expect("still active").generation.get(),
-        2,
-        "the generation the store holds stays in use"
+        catalogue.index(&id).expect("still active"),
+        held,
+        "the index the store holds stays in use"
     );
     assert_eq!(
         installed(&catalogue).expect("still installed").version,
@@ -1174,12 +1181,16 @@ async fn a_store_holding_generation_two_refuses_another_index_under_two_and_take
         })
         .await;
     catalogue.sync(&id).await.expect("the next number is taken");
-    assert_eq!(catalogue.index(&id).expect("activated").generation.get(), 3);
+    let taken = catalogue.index(&id).expect("activated");
+    assert_eq!(taken.generation.get(), 3);
+    assert!(
+        taken
+            .entries
+            .iter()
+            .any(|entry| entry.version.to_string() == "0.2.0"),
+        "the index taken is the rebuilt one"
+    );
 }
-
-// ---------------------------------------------------------------------------------------------
-// A network that moved on
-// ---------------------------------------------------------------------------------------------
 
 /// Marks the release revoked, as a later generation publishes it.
 fn revoked(entry: &mut kr_plugin_sdk::catalogue::IndexEntry) {
