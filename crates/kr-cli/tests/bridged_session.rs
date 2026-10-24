@@ -1389,6 +1389,11 @@ async fn what_was_typed_while_a_create_asked_for_colours_reaches_the_bridged_she
 /// KR-REQ-25.26: `kr bridge enrol --access ssh --probe` learns the destination's identity from its
 /// helper over ssh, and a refresh then registers the helper's scoped channel for the record. The
 /// destination has to be running: asking over ssh starts nothing.
+///
+/// KR-REQ-18.11, the part about a named SSH environment: it is enrolled under a label with the
+/// target, user and helper the person names, the probe takes its identity from the helper there
+/// and refuses a user or an identity the person did not name, and a refresh registers the
+/// helper's scoped channel. Not shown here: a connection that fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ssh_host_is_enrolled_by_asking_its_helper_and_registers_its_channel() {
     let world = World::start().await;
@@ -1704,6 +1709,11 @@ impl PrivateSshd {
 /// the channel for that record. An identity the person did not give is refused and recorded
 /// nowhere, and a host whose key this login does not trust registers nothing and takes back what
 /// an earlier answer had registered, which the same host's key puts right again.
+///
+/// KR-REQ-18.11, the part about a named SSH environment reached through a real `ssh` and `sshd`:
+/// the probe takes its identity from the helper there, a refresh registers the helper's scoped
+/// channel and the user it answers as, an identity the person did not give is refused and recorded
+/// nowhere, and a host whose key this login does not trust registers nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ssh_host_registers_its_identity_and_channel_through_a_real_ssh_to_a_real_sshd() {
     let world = World::start().await;
@@ -3024,6 +3034,10 @@ impl World {
 /// daemon has, the host holds a record of the channel, and a session made through it is in the
 /// container and nowhere else. The Linux `kr`, `kr-controller` and `kr-worker` run inside a real
 /// container; nothing stands in for the runtime.
+///
+/// KR-REQ-18.11, the part about a named container environment: it is enrolled by the identifier its
+/// runtime issued, a refresh finds it running and its own daemon answering as the controller with
+/// its channel scoped, and a session made in it is the container's and no other environment's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_lives_there() {
     if !runtime_available() {

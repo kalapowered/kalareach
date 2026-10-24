@@ -1929,6 +1929,9 @@ mod tests {
         );
     }
 
+    /// KR-REQ-18.11, the part about the connection diagnostic: each class of failure of a bridge to
+    /// a named environment is worded differently from every other, so what a person reads names
+    /// its own cause and not another's. Not shown here: the words reaching the person.
     #[test]
     fn every_failure_class_says_something_different() {
         // A diagnostic that named two causes the same way would send whoever reads it to the wrong

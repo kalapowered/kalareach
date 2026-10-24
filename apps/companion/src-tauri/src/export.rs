@@ -636,6 +636,9 @@ mod tests {
         }
     }
 
+    /// KR-REQ-25.25, the part about the companion's semantic archive: it carries the time it was
+    /// exported at, the terminal's dimensions, the time of a node and its declared omissions. Not
+    /// shown here: the file it is written to.
     #[test]
     fn a_semantic_archive_carries_its_time_its_dimensions_and_its_omissions() {
         let archive = semantic_archive(
@@ -662,6 +665,10 @@ mod tests {
         assert_eq!(archive.nodes[0].at_ms, 1_700_000_000_000);
     }
 
+    /// KR-REQ-25.25, the part about the companion's asciicast recording: its header carries the
+    /// version, the dimensions, the timestamp and the omissions, the one the caller supplied and
+    /// the clipboard write the recording held back, each with its kind, words and count, and a
+    /// frame carries the time it was drawn at. Not shown here: the file it is written to.
     #[test]
     fn an_asciicast_header_carries_the_dimensions_the_timestamp_and_the_omissions() {
         // One omission the caller supplies, and one the recording causes by holding a clipboard

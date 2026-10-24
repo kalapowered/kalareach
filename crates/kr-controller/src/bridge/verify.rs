@@ -215,6 +215,9 @@ mod tests {
     const THE_CASE: &str =
         "bridge::verify::tests::a_helper_that_cannot_be_started_says_which_program_it_was";
 
+    /// KR-REQ-18.11, the part about the connection diagnostic: a refresh whose helper cannot be
+    /// started is refused as not started, with the program it could not run named, here the
+    /// container runtime. Not shown here: the other causes a bridge can fail by.
     #[tokio::test]
     async fn a_helper_that_cannot_be_started_says_which_program_it_was() {
         // A host without the platform's launcher reports the program it could not run, rather than
