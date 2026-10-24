@@ -1,0 +1,106 @@
+10-24 01:04:37.967   736  3160 I ActivityManager: Process com.google.android.rkpdapp (pid 9454) has died: prcl TRNB
+10-24 01:04:37.967   736  3160 I am_proc_died: [0,9454,com.google.android.rkpdapp,250,8]
+10-24 01:04:37.967   534   534 I Zygote  : Process 9454 exited due to signal 9 (Killed)
+10-24 01:04:37.967   736  3160 W ActivityManager: Scheduling restart of crashed service com.google.android.rkpdapp/androidx.work.impl.background.systemjob.SystemJobService in 88573ms for connection
+10-24 01:04:37.967   736  3160 I am_schedule_service_restart: [0,com.google.android.rkpdapp/androidx.work.impl.background.systemjob.SystemJobService,88573]
+10-24 01:04:37.967   736  3160 I am_uid_stopped: 10197
+10-24 01:04:37.968   200   200 I lowmemorykiller: Kill 'com.google.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0' (8495), uid 99000, oom_score_adj 1 to free 239812kB rss, 29624kB swap; reason: min watermark is breached even after kill
+10-24 01:04:37.968   200   200 I killinfo: [8495,99000,1,0,239812,0,128720,1582544,8512,5120,13616,39440,1899200,1658064,295232,142272,785344,801136,54960,122768,20560,43328,0,0,0,1040,100,11,0,29624,0,0,0,10.430000,1.390000,26.250000,0.490000,88.080002]
+10-24 01:04:37.969  9447  9447 I PhenotypeModule: PhenotypeModule.onCreate():171 onCreate()
+10-24 01:04:37.970  9447  9447 I PhenotypeModule: PhenotypeModule.maybeFetchAndUpdate():220 maybeFetchAndUpdate: start new task to fetch
+10-24 01:04:37.971  9447  9602 I DeviceModeNotification: DeviceModeNotification.getCurrentDeviceMode():75 device mode is unknown before initializing the notification.
+10-24 01:04:37.971  9447  9602 I PhenotypeModule: PhenotypeModule.maybeSetRuntimeProperties():353 Skip register runtime properties as device mode is unknown.
+10-24 01:04:37.980  9447  9447 I LatinApp: LatinApp.initialize():202 initialize()
+10-24 01:04:37.985  9447  9447 I DeviceModeNotification: DeviceModeNotification.getCurrentDeviceMode():75 device mode is unknown before initializing the notification.
+10-24 01:04:37.987   736   736 D CompatChangeReporter: Compat change id reported: 311208629; UID 10197; state: ENABLED
+10-24 01:04:37.990  9447  9604 D CompatChangeReporter: Compat change id reported: 279646685; UID 10160; state: ENABLED
+10-24 01:04:37.998   200   205 E lowmemorykiller: process_mrelease 8495 failed: No such process
+10-24 01:04:37.999  9447  9447 I BrellaConfigModule: BrellaConfigModule.onCreate():33 set BrellaInit fields for in-app training.
+10-24 01:04:38.001   736   818 I ActivityManager: Process com.google.android.ext.services (pid 9077) has died: vis BFGS
+10-24 01:04:38.001   736   818 I am_proc_died: [0,9077,com.google.android.ext.services,100,5]
+10-24 01:04:38.002   736   818 W ActivityManager: Scheduling restart of crashed service com.google.android.ext.services/android.ext.services.autofill.InlineSuggestionRenderServiceImpl in 88539ms for connection
+10-24 01:04:38.002   736   818 I am_schedule_service_restart: [0,com.google.android.ext.services/android.ext.services.autofill.InlineSuggestionRenderServiceImpl,88539]
+10-24 01:04:38.002  8161  8480 W cr_ChildProcessConn: onServiceDisconnected (crash or killed by oom): pid=8495 bindings:W  S
+10-24 01:04:38.004  9447  9447 I ShortcutKeyAvailableChecker: ShortcutKeyAvailableChecker.updateShortcutKeysBlocklist():66 ShortcutKeysBlocklist: 
+10-24 01:04:38.005   534   534 I Zygote  : Process 9077 exited due to signal 9 (Killed)
+10-24 01:04:38.005  9447  9447 I DeviceModeModule: DeviceModeModule.calculateAndNotify():196 Window metrics is not available, fallback to app context.
+10-24 01:04:38.006  9447  9447 I DeviceModeModule: DeviceModeModule.calculateAndNotify():223 Device mode 'phone' from display metrics 'DisplayMetrics{density=0.0, width=1080, height=1920, scaledDensity=0.0, xdpi=420.0, ydpi=420.0}' or smallestScreenWidthDp: 411
+10-24 01:04:38.007   736   818 I am_uid_stopped: 10210
+10-24 01:04:38.009  1203  1203 I Zygote  : Process 8495 exited due to signal 9 (Killed)
+10-24 01:04:38.010   736  1005 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+10-24 01:04:38.021   736  1005 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+10-24 01:04:38.023   736   820 I ActivityManager: Process com.google.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0 (pid 8495) has died: fg +1 BTOP
+10-24 01:04:38.024   736   820 I am_proc_died: [0,8495,com.google.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0,1,3]
+10-24 01:04:38.024   736   820 W ActivityManager: Scheduling restart of crashed service to.kala.reach/org.chromium.content.app.SandboxedProcessService0:0 in 135330ms for connection
+10-24 01:04:38.025   736   820 I am_schedule_service_restart: [0,to.kala.reach/org.chromium.content.app.SandboxedProcessService0:0,135330]
+10-24 01:04:38.025   736  1709 W AppSearchIcing: status-util.h:31: Error: 5, Message: Document (com.google.android.googlequicksearchbox$OmniDynamicInvocationParams/omni, dynamic_invocation) not found.
+10-24 01:04:38.025   736   820 I am_uid_stopped: 99000
+10-24 01:04:38.027  8161  8161 E chromium: [ERROR:aw_browser_terminator.cc(165)] Renderer process (8495) crash detected (code -1).
+10-24 01:04:38.027  8845  8845 I NearbySharing: NearbySharingService created
+10-24 01:04:38.028  8161  8275 I RustStdoutStderr: [ERROR:aw_browser_terminator.cc(165)] Renderer process (8495) crash detected (code -1).
+10-24 01:04:38.031  8845  9228 I FontLog : (REDACTED) Download finished for %s; checking size and hash
+10-24 01:04:38.032  8161  8161 E chromium: [ERROR:aw_browser_terminator.cc(113)] Render process (8495) kill (OOM or update) wasn't handed by all associated webviews, killing application.
+10-24 01:04:38.032  8161  8275 I RustStdoutStderr: [ERROR:aw_browser_terminator.cc(113)] Render process (8495) kill (OOM or update) wasn't handed by all associated webviews, killing application.
+10-24 01:04:38.034  8845  9229 I GmsCoreXrpcWrapper: (REDACTED) Returning a channel provider with trafficStatsTag=%d trafficStatsUid=%d
+10-24 01:04:38.040   736   736 I am_uid_running: 10140
+10-24 01:04:38.047   736  1005 D InetDiagMessage: Destroyed live tcp sockets for uids={10210} in 14ms
+10-24 01:04:38.047   736  1005 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+10-24 01:04:38.047   736  1005 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+10-24 01:04:38.047   736  1005 D InetDiagMessage: Destroyed live tcp sockets for uids={20210} in 1ms
+10-24 01:04:38.054   736   736 V GrammaticalInflectionUtils: AttributionSource: android.content.AttributionSource@fc480bfc does not have READ_SYSTEM_GRAMMATICAL_GENDER permission.
+10-24 01:04:38.062  9447  9447 W NotificationCenter: NotificationCenter$NotificationQueue.notifyPendingNotificationsOnExecutor():877 Heavy notify work detected on UI thread: [irt->lhf, irt->lhf, mds->lhf, lua->dbm] takes 63ms
+10-24 01:04:38.062  9528  9549 D StatsLog: LAUNCHER_READ_OMNI_AVAILABILITY_FROM_APP_SEARCH_FAILED
+10-24 01:04:38.063  9447  9447 I ThemePreferenceMigrationUtil: ThemePreferenceMigrationUtil.doMigration():19 doMigration.
+10-24 01:04:38.064  9447  9447 I SystemHapticSettings: SystemHapticSettings.flagUpdated():83 vibration enabled: null
+10-24 01:04:38.065  8845  8845 D BoundBrokerSvc: onBind: Intent { act=com.google.android.gms.libs.gmscorelogger.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
+10-24 01:04:38.065  8845  8845 D BoundBrokerSvc: Loading bound service for intent: Intent { act=com.google.android.gms.libs.gmscorelogger.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
+10-24 01:04:38.067   534   534 D Zygote  : Forked child process 9611
+10-24 01:04:38.068   736   766 I am_proc_start: [0,9611,10140,com.google.android.partnersetup,service,{com.google.android.partnersetup/com.google.android.partnersetup.PhenotypeJobService}]
+10-24 01:04:38.068   736   766 I ActivityManager: Start proc 9611:com.google.android.partnersetup/u0a140 for service {com.google.android.partnersetup/com.google.android.partnersetup.PhenotypeJobService}
+10-24 01:04:38.068   736   766 I ActivityManager: ProcessObserver broadcast disabled
+10-24 01:04:38.069  9528  9528 I s.nexuslauncher: AssetManager2(0x7a60703bd958) locale list changing from [] to [en-US]
+10-24 01:04:38.071  9447  9447 I FirebaseApp: Device unlocked: initializing all Firebase APIs for app [DEFAULT]
+10-24 01:04:38.074  8845  8845 D BoundBrokerSvc: onBind: Intent { act=com.google.android.gms.findmydevice.spot.service.locationreport.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }
+10-24 01:04:38.074  8845  8845 D BoundBrokerSvc: Loading bound service for intent: Intent { act=com.google.android.gms.findmydevice.spot.service.locationreport.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }
+10-24 01:04:38.078   736   736 W AutofillManagerServiceImpl: remote service died: RemoteInlineSuggestionRenderService[ComponentInfo{com.google.android.ext.services/android.ext.services.autofill.InlineSuggestionRenderServiceImpl} 143660819 (unbound)]
+10-24 01:04:38.081  9575  9575 D nativeloader: InitLlndkLibrariesProduct: libEGL.so:libGLESv1_CM.so:libGLESv2.so:libGLESv3.so:libRS.so:libandroid_net.so:libapexsupport.so:libavf.so:libbinder_ndk.so:libc.so:libcgrouprc.so:libclang_rt.asan-x86_64-android.so:libcom.android.tethering.connectivity_native
+10-24 01:04:38.081  8845  8845 D BoundBrokerSvc: onBind: Intent { act=com.google.android.gms.icing.LIGHTWEIGHT_INDEX_SERVICE dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }
+10-24 01:04:38.081  8845  8845 D BoundBrokerSvc: Loading bound service for intent: Intent { act=com.google.android.gms.icing.LIGHTWEIGHT_INDEX_SERVICE dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentApiService }
+10-24 01:04:38.082  9575  9575 D nativeloader: Configuring product-clns-10 for unbundled product apk /product/priv-app/Velvet/Velvet.apk. target_sdk_version=35, uses_libraries=, library_path=/product/priv-app/Velvet/lib/x86_64:/product/priv-app/Velvet/Velvet.apk!/lib/x86_64:/product/lib64:/system/pr
+10-24 01:04:38.083  9575  9575 D nativeloader: InitVndkspLibrariesProduct: VNDK is deprecated with product
+10-24 01:04:38.084  9532  9532 I AiAi    : chip type: STANDARD, hardware: ranchu, revision: , sdk: 36
+10-24 01:04:38.088  9575  9575 D CompatChangeReporter: Compat change id reported: 202956589; UID 10148; state: ENABLED
+10-24 01:04:38.097  9611  9611 I id.partnersetup: Using CollectorTypeCC GC.
+10-24 01:04:38.097  9528  9528 D TaskbarManager: TaskbarManager constructor displayId=0 isDefaultDisplay=true
+10-24 01:04:38.097  9528  9528 D TaskbarManager: createWindowContext:  displayId=0 isDefaultDisplay=true
+10-24 01:04:38.097  9528  9528 D TaskbarManager: createWindowContext: windowType=TYPE_NAVIGATION_BAR displayId=0 isDefaultDisplay=true
+10-24 01:04:38.098  9528  9528 D TaskbarManager: createTaskbarRootLayout:  displayId=0 isDefaultDisplay=true
+10-24 01:04:38.098  9611  9611 W id.partnersetup: Unexpected CPU variant for x86: x86_64.
+10-24 01:04:38.098  9611  9611 W id.partnersetup: Known variants: atom, sandybridge, silvermont, goldmont, goldmont-plus, goldmont-without-sha-xsaves, tremont, kabylake, alderlake, default
+10-24 01:04:38.099  9528  9528 D TaskbarManager: createTaskbarRootLayout: adding to map displayId=0 isDefaultDisplay=true
+10-24 01:04:38.100  9611  9611 E id.partnersetup: Not starting debugger since process cannot load the jdwp agent.
+10-24 01:04:38.101   736   767 I libprocessgroup: Removed cgroup /sys/fs/cgroup/apps/uid_10197/pid_9454
+10-24 01:04:38.101  8845  8845 I NearbyDiscovery: (REDACTED) DiscoveryService onStartCommand action: %s
+10-24 01:04:38.101   736   767 I libprocessgroup: Removed cgroup /sys/fs/cgroup/apps/uid_10210/pid_9077
+10-24 01:04:38.101   736   767 I libprocessgroup: Removed cgroup /sys/fs/cgroup/apps/uid_99000/pid_8495
+10-24 01:04:38.102  8845  9426 I Nearby  : (REDACTED) is blocked device type %s, isAuto=%s, isIot=%s, isLatchsky=%s, isChinaWearable=%s, isTv=%s, isWearable=%s (supportWearOs=%s), isChromeOsDevice=%s (supportChromeOs=%s)
+10-24 01:04:38.102  8845  9530 I NearbyDiscovery: (REDACTED) FastPairScanner: Start scanning internally, %s
+10-24 01:04:38.102  8845  9530 D BluetoothAdapter: isLeEnabled(): ON
+10-24 01:04:38.103  9528  9528 D TaskbarManager: addTaskbarRootLayoutToMap:  displayId=0 isDefaultDisplay=true
+10-24 01:04:38.103  9528  9528 D TaskbarManager: addTaskbarRootLayoutToMap: finished! mRootLayouts.size()=1 displayId=0 isDefaultDisplay=true
+10-24 01:04:38.104  8845  9377 I Nearby  : (REDACTED) is blocked device type %s, isAuto=%s, isIot=%s, isLatchsky=%s, isChinaWearable=%s, isTv=%s, isWearable=%s (supportWearOs=%s), isChromeOsDevice=%s (supportChromeOs=%s)
+10-24 01:04:38.105   736   847 W InputDispatcher: channel 'bffe595 to.kala.reach/to.kala.reach.MainActivity' ~ Consumer closed input channel or an error occurred.  events=0x9
+10-24 01:04:38.105   736   847 E InputDispatcher: channel 'bffe595 to.kala.reach/to.kala.reach.MainActivity' ~ Channel is unrecoverably broken and will be disposed!
+10-24 01:04:38.105  9611  9611 D nativeloader: Load libframework-connectivity-tiramisu-jni.so using APEX ns com_android_tethering for caller /apex/com.android.tethering/javalib/framework-connectivity-t.jar: ok
+10-24 01:04:38.105   736   847 I WindowManager: WINDOW DIED Window{bffe595 u0 to.kala.reach/to.kala.reach.MainActivity}
+10-24 01:04:38.108   736   760 I input_focus: [Requesting to set focus to null window,reason=UpdateInputWindows]
+10-24 01:04:38.109   736  1873 I ActivityManager: Process to.kala.reach (pid 8161) has died: fg  TOP 
+10-24 01:04:38.109   736  1873 I am_proc_died: [0,8161,to.kala.reach,0,2]
+10-24 01:04:38.112   534   534 I Zygote  : Process 8161 exited due to signal 9 (Killed)
+10-24 01:04:38.112   736  1169 I ImeTracker: to.kala.reach:3bee524d: onRequestHide at ORIGIN_SERVER reason HIDE_REMOVE_CLIENT fromUser false
+10-24 01:04:38.112   736  1169 I ImeTracker: to.kala.reach:3bee524d: onCancelled at PHASE_SERVER_SHOULD_HIDE
+10-24 01:04:38.113  1385  1385 I adbd    : Remote process closed the socket (on MSG_PEEK)
+10-24 01:04:38.114   736  1873 I am_uid_stopped: 10213
+10-24 01:04:38.114   736  1873 W ActivityTaskManager: Force removing ActivityRecord{158154917 u0 to.kala.reach/.MainActivity t8}: app died, no saved state
+10-24 01:04:38.114   736  1873 I wm_finish_activity: [0,158154917,8,to.kala.reach/.MainActivity,proc died without state saved]
+10-24 01:04:38.116   736  1873 I wm_task_removed: [8,8,0,removeChild, last child = ActivityRecord{158154917 u0 to.kala.reach/.MainActivity t-1 f}} in Task{77fcc0b #8 type=standard A=10213:to.kala.reach}]

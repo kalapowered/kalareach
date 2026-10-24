@@ -1790,8 +1790,14 @@ jobs:
           fi
           sed -i '/^disk\.dataPartition\.size=/d' "$config"
           echo "disk.dataPartition.size=8192M" >> "$config"
+          # The device profile's memory is less than this system image runs in (the emulator raises
+          # it to 2560 MB by itself), and Google Play's own processes fill what is left. A device
+          # short of memory has its low-memory killer end the application's web view, which ends
+          # the application, or the application itself, so the launch check failed on those runs.
+          # The hosted runner has 16 GB, which the next line prints.
+          free -m
           "$ANDROID_HOME/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot \
-            -gpu swiftshader_indirect -accel on > "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log" 2>&1 &
+            -memory 4096 -gpu swiftshader_indirect -accel on > "$KR_TEST_ARTIFACTS_DIR/android-app/emulator.log" 2>&1 &
           emulator=$!
           trap 'kill "$emulator" 2> /dev/null || true' EXIT
           serial="emulator-5554"

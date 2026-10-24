@@ -20,14 +20,19 @@
 #     protocol;
 #   * the screen shows the page: below the status bar it is more than a blank field;
 #   * the system logged no fatal exception or signal for the application's own process (a crash of
-#     another process of the device is not looked for);
+#     another process of the device is not looked for), and the process is still the one that was
+#     started;
 #
-# and then saves a screenshot of the screen to the path given. Each wait ends when its condition
-# holds; the deadline (KR_LAUNCH_DEADLINE, 240 seconds) only ends a step that is hung, and the
-# message names the condition. The device is named by its serial (--serial, or ANDROID_SERIAL),
-# never taken for being the first one listed: it is the caller's, it is not started or stopped
-# here, a copy of the application already on it is uninstalled first, with its data, and the
-# application is uninstalled again when this ends.
+# and saves a screenshot of the screen to the path given: the very frame that was found to show the
+# page, so it is taken while that condition holds and not after other checks. Each wait ends when its
+# condition holds; the deadline (KR_LAUNCH_DEADLINE, 240 seconds) only ends a step that is hung, and
+# the message names the condition. A process that ends is not waited out: once the application has a
+# process, every wait stops when that process is found gone and says how it ended, from the device's
+# log (a crash, or a device short of memory that kills the application's web view renderer or the
+# application itself). The device is named by its serial (--serial, or ANDROID_SERIAL), never taken
+# for being the first one listed: it is the caller's, it is not started or stopped here, a copy of
+# the application already on it is uninstalled first, with its data, and the application is
+# uninstalled again when this ends.
 #
 # It needs `adb` (on PATH, or under ANDROID_HOME) and `python3` and `curl`. The debug application is
 # debuggable, which is what lets `run-as` read its process's maps on a device whose build is a user
@@ -87,13 +92,111 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Waits until `$2` (a command line) succeeds, or fails the run naming `$1` after the deadline.
+# The application's process, once it has one: every wait after that is held to it.
+watched=""
+
+application_runs() {
+    local pids
+    pids="$(dev shell pidof "$package" 2> /dev/null | tr -d '\r')"
+    case " $pids " in
+        *" $watched "*) return 0 ;;
+    esac
+    return 1
+}
+
+# True when the process being watched is gone. One look that fails is looked at again after a
+# second, since a call of adb that fails is not the end of a process.
+application_has_ended() {
+    [ -n "$watched" ] || return 1
+    application_runs && return 1
+    sleep 1
+    ! application_runs
+}
+
+# What the device has to spare: a device that is short of memory ends the application's processes,
+# which is how this check has failed on a hosted runner.
+device_memory() {
+    printf 'device memory: %s' "$(dev shell cat /proc/meminfo 2> /dev/null | tr -d '\r' | awk '/^(MemTotal|MemAvailable):/ { printf "%s %d MiB  ", $1, $2 / 1024 }')"
+}
+
+# Reads the device's log for how the process `$1` of the package `$2` ended, and says it.
+IFS= read -r -d '' ended_program << 'PYTHON' || true
+import re
+import sys
+
+pid, package = sys.argv[1], sys.argv[2]
+lines = sys.stdin.read().splitlines()
+# The renderer processes of the application's own web view, which it names when one is lost.
+renderers = set()
+for line in lines:
+    fields = line.split(None, 5)
+    if len(fields) == 6 and fields[2] == pid and ("aw_browser_terminator" in line or "onServiceDisconnected" in line):
+        named = re.search(r"[Rr]ender(?:er)? process \((\d+)\)|pid=(\d+)", line)
+        if named:
+            renderers.add(named.group(1) or named.group(2))
+crashed = application_killed = renderer_killed = renderer_lost = ended_from_outside = False
+evidence = []
+for number, line in enumerate(lines):
+    fields = line.split(None, 5)
+    if len(fields) < 6:
+        continue
+    kill = re.search(r"lowmemorykiller: Kill '[^']*' \((\d+)\)", line)
+    if "FATAL EXCEPTION" in line and any("Process: " + package + ", PID: " + pid in near for near in lines[number : number + 6]):
+        crashed = True
+        evidence.extend(lines[number : number + 8])
+    elif "Fatal signal" in line and "pid " + pid + " (" + package + ")" in line:
+        crashed = True
+        evidence.append(line)
+    elif kill and kill.group(1) == pid:
+        application_killed = True
+        evidence.append(line)
+    elif kill and kill.group(1) in renderers:
+        renderer_killed = True
+        evidence.append(line)
+    elif fields[2] == pid and ("aw_browser_terminator" in line or "onServiceDisconnected" in line):
+        renderer_lost = renderer_lost or "killing application" in line
+        evidence.append(line)
+    elif re.search(r"Process " + pid + r" exited due to signal \d+", line) or (
+        "ActivityManager" in line and "Process " + package + " (pid " + pid + ") has died" in line
+    ):
+        ended_from_outside = True
+        evidence.append(line)
+if crashed:
+    print("the application crashed: the system logged a fatal exception or signal for it")
+elif application_killed:
+    print("the low-memory killer of the system ended the application: the device is short of memory")
+elif renderer_killed and renderer_lost:
+    print("the low-memory killer of the system ended the renderer of the web view and the web view then ended the application: the device is short of memory")
+elif renderer_lost:
+    print("the web view lost its renderer process and ended the application with it")
+elif ended_from_outside:
+    print("the process was ended from outside, and the log names no reason")
+else:
+    print("the log names no reason")
+for line in evidence[:14]:
+    print("    " + line.strip()[:200])
+PYTHON
+
+# Fails the run because the watched process ended `$1` (a phrase that says when), with how it ended
+# as far as the device's log tells.
+ended() {
+    printf "android-app-launch: FAIL: the application's process (%s) ended %s\n" "$watched" "$1" >&2
+    dev logcat -d -b all | tr -d '\r' | python3 -I -c "$ended_program" "$watched" "$package" >&2
+    printf 'android-app-launch: %s\n' "$(device_memory)" >&2
+    exit 1
+}
+
+# Waits until `$2` (a command line) succeeds, or fails the run naming `$1` after the deadline, or as
+# soon as the process being watched is found gone.
 wait_for() {
     local what=$1 started
     shift
     started=$(date +%s)
     until "$@"; do
-        if [ $(($(date +%s) - started)) -gt "$deadline" ]; then
+        if application_has_ended; then
+            ended "while waiting for $what"
+        fi
+        if [ $(($(date +%s) - started)) -ge "$deadline" ]; then
             printf 'android-app-launch: FAIL: gave up waiting for %s\n' "$what" >&2
             [ -z "${mount_answers:-}" ] || printf 'android-app-launch: the page check answered:%s\n' "$mount_answers" >&2
             exit 1
@@ -123,6 +226,7 @@ running() {
     [ -n "$pid" ]
 }
 wait_for "the application's process" running
+watched="$pid"
 
 # At least a mebibyte of the package mapped as code.
 native_code_mapped() {
@@ -185,12 +289,11 @@ say "page title: $title"
 # a closing frame badly, and a page that is still starting is asked again and not reconnected to.
 # The wait is the one the other waits have, and the whole exchange has that deadline, so a page that
 # keeps sending events cannot hold it past its end. Every distinct answer of a failed wait is
-# printed.
+# printed. The program is kept in a variable, since the system's own bash cannot parse a
+# here-document inside a command substitution.
 mount_answers=""
 started_at=$(date +%s)
-interface_mounted() {
-    local answer status
-    answer="$(python3 -I - "$port" "$deadline" 2>&1 << 'PYTHON'
+IFS= read -r -d '' mount_program << 'PYTHON' || true
 import base64
 import json
 import os
@@ -311,7 +414,9 @@ try:
 except (OSError, ValueError, KeyError, TypeError) as error:
     refuse(f"the debugging exchange failed: {type(error).__name__}: {error}; the last answer: {last}")
 PYTHON
-)"
+interface_mounted() {
+    local answer status
+    answer="$(python3 -I -c "$mount_program" "$port" "$deadline" 2>&1)"
     status=$?
     case "$mount_answers" in
         *"$answer"*) ;;
@@ -323,17 +428,30 @@ wait_for "the interface to have drawn into the document's root" interface_mounte
 
 # The device's screen as the raw pixels `screencap` writes: a small header and then four bytes a
 # pixel. The page is drawn when more than half a percent of the sampled pixels below the status bar
-# differ from the colour that covers most of them.
+# differ from the colour that covers most of them. The frame that shows it is written out as the
+# screenshot (a PNG made from those same pixels), so the picture kept is the one the condition was
+# found to hold on, and no later look at the screen can find the application gone. The frame is the
+# application's only if its process was there when the frame was read, which is looked at at once.
+# The program says 0 when the page is drawn and the picture is written, 1 when the page is not
+# drawn, and 2 when the screen's frames cannot be read (a pixel format that is not RGBA_8888) or the
+# picture cannot be kept, which no later frame would change.
+mkdir -p "$(dirname "$screenshot")"
 screen_shows_the_page() {
+    local status
     dev exec-out screencap 2> /dev/null | python3 -I -c '
+import binascii
 import collections
 import struct
 import sys
+import zlib
 
 data = sys.stdin.buffer.read()
 if len(data) < 16:
     sys.exit(1)
-width, height = struct.unpack_from("<II", data, 0)
+width, height, pixel_format = struct.unpack_from("<III", data, 0)
+if pixel_format != 1:
+    print(f"the screen is in pixel format {pixel_format}, and only RGBA_8888 is read", file=sys.stderr)
+    sys.exit(2)
 header = len(data) - width * height * 4
 if header not in (12, 16) or width == 0 or height == 0:
     sys.exit(1)
@@ -344,10 +462,39 @@ for row in range(height * 12 // 100, height, 4):
     sampled.extend(line[i : i + 3] for i in range(0, len(line), 16))
 common = collections.Counter(sampled).most_common(1)[0][0]
 different = sum(1 for pixel in sampled if max(abs(a - b) for a, b in zip(pixel, common)) > 30)
-sys.exit(0 if different * 200 > len(sampled) else 1)
-'
+if different * 200 <= len(sampled):
+    sys.exit(1)
+
+
+def chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", binascii.crc32(kind + body))
+
+
+rows = b"".join(
+    b"\0" + data[header + row * width * 4 : header + (row + 1) * width * 4] for row in range(height)
+)
+try:
+    with open(sys.argv[1], "wb") as image:
+        image.write(b"\x89PNG\r\n\x1a\n")
+        image.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)))
+        image.write(chunk(b"IDAT", zlib.compress(rows, 6)))
+        image.write(chunk(b"IEND", b""))
+except OSError as error:
+    print(f"the screenshot could not be written: {error}", file=sys.stderr)
+    sys.exit(2)
+' "$screenshot"
+    status=${PIPESTATUS[1]}
+    if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+        echo "android-app-launch: FAIL: the screen cannot be read as a picture, or the screenshot cannot be written" >&2
+        exit 1
+    fi
+    [ "$status" -eq 0 ] || return 1
+    if application_has_ended; then
+        ended "when the screen was read"
+    fi
 }
 wait_for "the screen to show the page" screen_shows_the_page
+say "$(device_memory)"
 
 log="$(dev logcat -d -b all | tr -d '\r')" || { echo "android-app-launch: FAIL: the device's log could not be read" >&2; exit 1; }
 # A Java crash logs `FATAL EXCEPTION` and, within the next lines, `Process: <package>, PID: ...`; a
@@ -365,9 +512,10 @@ if [ -n "$crashed" ]; then
     exit 1
 fi
 say "ok: no fatal exception or signal for the application in the log"
-running || { echo "android-app-launch: FAIL: the application's process ended before the screenshot" >&2; exit 1; }
+if application_has_ended; then
+    ended "after the log was read"
+fi
+say "ok: the application's process ($watched) is still the one that started"
 
-mkdir -p "$(dirname "$screenshot")"
-dev exec-out screencap -p > "$screenshot"
 [ "$(head -c 8 "$screenshot" | od -An -tx1 | tr -d ' \n')" = 89504e470d0a1a0a ] || { echo "android-app-launch: FAIL: the screenshot is not a PNG image" >&2; exit 1; }
 say "screenshot: $screenshot ($(wc -c < "$screenshot" | tr -d ' ') bytes)"
