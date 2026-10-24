@@ -58,7 +58,9 @@ use companion_platform::push::{PendingRegistration, PendingState};
 use kr_client::Shown;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
-use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
+use kr_client::services::{
+    HttpDeadlines, HttpService, PushService as _, ServiceHttp, managed_response_limits,
+};
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
 use kr_protocol::ids::DeviceKeyRevision;
 use kr_protocol::ids::{DeviceId, PushRegistrationId, PushSenderRecordId};

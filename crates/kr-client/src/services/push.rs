@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{SignedService, malformed, unreadable_answer};
+use super::{PushService, ServiceFuture};
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
@@ -326,42 +327,6 @@ impl PushGateway {
         }
     }
 
-    /// Proposes a provider token: the gateway records the attempt and sends a challenge through
-    /// the provider to that token.
-    ///
-    /// # Errors
-    ///
-    /// Returns the gateway's refusal, or why nothing was answered.
-    pub async fn propose(&self, proposal: PushRegistrationProposal) -> Result<Registration> {
-        self.call(&PushRequest::InstallationRegister {
-            request: PushRegistrationRequest::Propose { proposal },
-        })
-        .await
-    }
-
-    /// Presents the signed answer to a challenge and activates the binding.
-    ///
-    /// # Errors
-    ///
-    /// Returns the gateway's refusal, or why nothing was answered.
-    pub async fn answer(&self, answer: PushRegistrationAnswer) -> Result<Registration> {
-        self.call(&PushRequest::InstallationRegister {
-            request: PushRegistrationRequest::Answer { answer },
-        })
-        .await
-    }
-
-    /// Authorises one paired host and takes the credential to hand it. Asking again under the same
-    /// authorisation identifier for the same host gives a fresh credential and keeps the one
-    /// authorisation.
-    ///
-    /// # Errors
-    ///
-    /// Returns the gateway's refusal, or why nothing was answered.
-    pub async fn issue(&self, request: PushSenderIssueRequest) -> Result<Issued> {
-        self.call(&PushRequest::SenderIssue { request }).await
-    }
-
     async fn call<T: for<'de> Deserialize<'de>>(&self, body: &PushRequest) -> Result<T> {
         let data = self
             .service
@@ -369,6 +334,34 @@ impl PushGateway {
             .await?;
         serde_json::from_value(data)
             .map_err(|error| unreadable_answer("what a push gateway answered", &error))
+    }
+}
+
+/// Every call returns the gateway's refusal, or why nothing was answered.
+impl PushService for PushGateway {
+    fn propose<'a>(
+        &'a self,
+        proposal: PushRegistrationProposal,
+    ) -> ServiceFuture<'a, Registration> {
+        Box::pin(async move {
+            self.call(&PushRequest::InstallationRegister {
+                request: PushRegistrationRequest::Propose { proposal },
+            })
+            .await
+        })
+    }
+
+    fn answer<'a>(&'a self, answer: PushRegistrationAnswer) -> ServiceFuture<'a, Registration> {
+        Box::pin(async move {
+            self.call(&PushRequest::InstallationRegister {
+                request: PushRegistrationRequest::Answer { answer },
+            })
+            .await
+        })
+    }
+
+    fn issue<'a>(&'a self, request: PushSenderIssueRequest) -> ServiceFuture<'a, Issued> {
+        Box::pin(async move { self.call(&PushRequest::SenderIssue { request }).await })
     }
 }
 
@@ -380,7 +373,6 @@ mod tests {
     use kr_protocol::scalars::Digest256;
 
     use super::*;
-    use crate::services::ServiceFuture;
     use crate::services::relay::ServiceHttpAnswer;
 
     const VECTORS: &str = include_str!("../../../../fixtures/push/push.json");

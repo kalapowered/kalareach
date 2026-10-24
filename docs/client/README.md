@@ -926,9 +926,10 @@ is built and signed, for whichever side sends it: the installation's key signs t
 issue calls, and the host's key signs renewal and revocation. The daemon's senders and a phone's
 installation both build through it, so their requests cannot differ. `InstallationSigner` signs a
 managed-service request and the answer to a registration challenge, and refuses a statement under any
-other domain. `PushGateway` is what an installation calls: `propose` sends a registration token and
-says whether the gateway sent its challenge, `answer` presents the signed answer and activates the
-binding, and `issue` asks for a delivery credential scoped to one host. The credential comes back once, and a rendering of it or of
+other domain. `PushService` is the push slot of `ServiceClients`, and `PushGateway` implements it. It
+is what an installation calls: `propose` sends a registration token and says whether the gateway sent
+its challenge, `answer` presents the signed answer and activates the binding, and `issue` asks for a
+delivery credential scoped to one host. The credential comes back once, and a rendering of it or of
 the request that asked for it carries none of it. A phone's receiver does not use this client. It
 reaches the same builder through one Rust function and reads only the installation's authorisation key
 from its store (`kr_crypto::store::load_authorisation_key`).
