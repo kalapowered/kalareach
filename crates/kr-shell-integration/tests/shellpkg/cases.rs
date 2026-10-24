@@ -3372,3 +3372,83 @@ fn linux_start_value(pid: u64) -> Option<u64> {
     let tail = text.rsplit_once(')')?.1;
     tail.split_whitespace().nth(19)?.parse().ok()
 }
+
+/// The libraries a built executable asks the loader for, by the name or path the file records.
+///
+/// # Panics
+///
+/// Panics when the platform's tool for reading them is missing or fails, because a list that
+/// could not be read proves nothing.
+fn linked_libraries(executable: &Path) -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        let output = std::process::Command::new("otool")
+            .arg("-L")
+            .arg(executable)
+            .output()
+            .expect("otool to run");
+        assert!(
+            output.status.success(),
+            "otool could not read {}",
+            executable.display()
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect()
+    } else {
+        let output = std::process::Command::new("readelf")
+            .arg("-d")
+            .arg(executable)
+            .output()
+            .expect("readelf to run");
+        assert!(
+            output.status.success(),
+            "readelf could not read {}",
+            executable.display()
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("(NEEDED)"))
+            .filter_map(|line| line.split('[').nth(1))
+            .filter_map(|rest| rest.split(']').next())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// KR-REQ-07.88: a built shell depends on no library that the machine which built it happened to
+/// have.
+///
+/// A package is requalified once and distributed to machines that are not the builder. The Fish
+/// build asks for the PCRE2 the machine offers unless it is told to build its own, so a package
+/// built beside Homebrew's or a distribution's PCRE2 would name that library in its dependencies
+/// and fail to start where there is none. The case reads the executable's own list of
+/// dependencies: none names PCRE2, and on macOS every one is a library of the system.
+///
+/// # Panics
+///
+/// Panics when the built executable names a library of the build machine.
+pub fn the_shell_links_no_library_of_the_machine_that_built_it(kind: ShellKind) {
+    let package = Package::built(kind);
+    let libraries = linked_libraries(&package.executable);
+    assert!(
+        !libraries.is_empty(),
+        "no dependency was read from {}",
+        package.executable.display()
+    );
+    for library in &libraries {
+        assert!(
+            !library.to_ascii_lowercase().contains("pcre"),
+            "the {} executable depends on {library}, a library the build machine had: {libraries:?}",
+            kind.as_str()
+        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                library.starts_with("/usr/lib/") || library.starts_with("/System/"),
+                "the {} executable depends on {library}, which is not a library of the system: {libraries:?}",
+                kind.as_str()
+            );
+        }
+    }
+}
