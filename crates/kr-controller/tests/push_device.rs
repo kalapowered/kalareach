@@ -920,6 +920,61 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     .await;
     report.insert("delivery_resumed_on_the_new_token".to_owned(), json!(back));
 
+    // ---- The Previews choice (16.11) ---------------------------------------------------------
+    // The person turns previews off on the phone: the phone takes the host's key out of what its
+    // receiver holds and tells the host, and the next notification carries no preview. Turned on
+    // again, the next carries a sealed one. Each is put on the phone, whose receiver says what it
+    // made of it.
+    for (step, on) in [("previews-off", false), ("previews-on", true)] {
+        let key = step.replace('-', "_");
+        run.ask_step(step);
+        report.insert(
+            format!("{key}_step"),
+            json!(run.step_done(step, REGISTRATION_WAIT).await),
+        );
+        let told = until(REGISTRATION_WAIT.min(run.left()), || {
+            destination_of(&host, &id).is_some_and(|record| {
+                matches!(
+                    &record.destination,
+                    kr_delivery::destination::Destination::Push(push) if push.previews_enabled == on
+                )
+            })
+        })
+        .await;
+        report.insert(format!("{key}_host_told"), json!(told));
+        let before = fcm.sent().len();
+        asked_questions.push(worker.ask_with_context(
+            &format!("{step}-1"),
+            "the person chose what a notification shows",
+        ));
+        let delivered = until(DELIVERY_WAIT.min(run.left()), || {
+            fcm.sent()
+                .iter()
+                .skip(before)
+                .any(|sent| is_delivery(sent, &replacement))
+        })
+        .await;
+        report.insert(format!("{key}_delivered"), json!(delivered));
+        if delivered {
+            let sent = fcm
+                .sent()
+                .into_iter()
+                .skip(before)
+                .find(|sent| is_delivery(sent, &replacement))
+                .expect("the delivery");
+            report.insert(
+                format!("{key}_carries_a_preview"),
+                json!(data_of(&sent.body).get("preview").is_some_and(|preview| !preview.is_null())),
+            );
+            n += 1;
+            report.insert(format!("{key}_message"), json!(n));
+            report.insert(
+                format!("{key}_put_on_the_phone"),
+                json!(run.inject(n, "delivery", "a question", &sent.body).await),
+            );
+        }
+    }
+
     // ---- A burst (16.17) --------------------------------------------------------------------
     // Twenty-two questions at once. The host keeps every request; what reaches the provider is what
     // the host's own limits and the gateway's let through, and the host's journal accounts for
