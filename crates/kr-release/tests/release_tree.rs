@@ -263,6 +263,18 @@ fn the_manifest_of_a_tree_names_the_pins_and_the_identity_the_build_recorded() {
                 patch.source_commit.as_deref(),
                 pin["upstream_revision"].as_str()
             );
+            // An upstream patch kept as published is pinned by the digest its publisher's file has,
+            // and the release records that digest.
+            if let Some(published) = pin["sha256"].as_str() {
+                assert_eq!(
+                    serde_json::to_value(&patch.sha256)
+                        .expect("a digest")
+                        .as_str(),
+                    Some(published),
+                    "{} is recorded with the digest it is pinned to",
+                    patch.name
+                );
+            }
         }
         assert!(!listed.sources.is_empty());
         assert!(!listed.profile_order.is_empty());

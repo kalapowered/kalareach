@@ -886,8 +886,9 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
                 |held| held.pending.vi_motion || held.pending.multikey_sequence,
             );
         } else {
-            // The readers that wait out a lone escape in their own poll are not asked while they
-            // do, since a question restarts the wait and an escape that is asked about never ends.
+            // Zsh waits out a lone escape in its own poll and is not asked while it does, since a
+            // question restarts the wait and an escape that is asked about never ends. Its drive
+            // and bash's keep the delays, which decide nothing here.
             session.type_bytes(ESCAPE);
             std::thread::sleep(Duration::from_millis(120));
             session.type_bytes(b"d");
@@ -3911,6 +3912,7 @@ fn linked_libraries(file: &Path) -> Vec<String> {
                         "LC_LOAD_WEAK_DYLIB",
                         "LC_REEXPORT_DYLIB",
                         "LC_LOAD_UPWARD_DYLIB",
+                        "LC_LAZY_LOAD_DYLIB",
                     ]
                     .contains(&command);
                 }
@@ -3968,7 +3970,12 @@ fn native_files(directory: &Path) -> Vec<std::path::PathBuf> {
                     && (magic == *b"\x7fELF"
                         || matches!(
                             u32::from_be_bytes(magic),
-                            0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe
+                            0xfeed_face
+                                | 0xfeed_facf
+                                | 0xcefa_edfe
+                                | 0xcffa_edfe
+                                | 0xcafe_babe
+                                | 0xcafe_babf
                         ));
                 if native {
                     found.push(entry.path());
