@@ -1926,12 +1926,14 @@ impl Controller {
         let destination_id = kr_delivery::destination::DestinationId::new(device_id.to_string())
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         self.refuse_a_destination_held_by_another(&destination_id, &offered)?;
+        let registering =
+            self.what_is_registered(&destination_id, &offered, params.previews_enabled)?;
         let credentials = std::sync::Arc::clone(self.delivery_runtime().credentials());
         // The gateway is asked off the runtime's threads and outside every lock this host holds:
         // it can take as long as its deadlines allow, and nothing else waits for it.
         let runtime = std::sync::Arc::clone(self.delivery_runtime());
         let for_gateway = offered.clone();
-        tokio::task::spawn_blocking(move || runtime.confirm(device_id, &for_gateway))
+        tokio::task::spawn_blocking(move || runtime.confirm(device_id, &for_gateway, registering))
             .await
             .map_err(|_| ControllerError::Refused {
                 code: ErrorCode::ResourceUnavailable,
@@ -2062,6 +2064,40 @@ impl Controller {
             sender_record_id: offered.sender_record_id,
             credential_expires_at_ms: offered.expires_at_ms,
         })
+    }
+
+    /// Says which allowance a registration is counted in: a change of the choice of previews when
+    /// it keeps the authorisation and installation the destination in service names and takes the
+    /// other choice, and a new credential otherwise. The bearer is confirmed either way. Read
+    /// before the gateway is asked and not held, so a destination that moves meanwhile has only
+    /// been counted in the other allowance.
+    fn what_is_registered(
+        &self,
+        destination_id: &kr_delivery::destination::DestinationId,
+        offered: &kr_protocol::push::PushDeliveryCredential,
+        previews_enabled: bool,
+    ) -> Result<crate::push::runtime::Registering> {
+        use crate::push::runtime::Registering::{NewCredential, PreviewsChoice};
+
+        let held = self.delivery.with(|producer| {
+            producer
+                .journal()
+                .destination(destination_id)
+                .map_err(|error| ControllerError::Storage {
+                    operation: "read a delivery destination",
+                    detail: error.to_string(),
+                })
+        })?;
+        Ok(held
+            .filter(|record| record.enabled)
+            .as_ref()
+            .and_then(kr_delivery::destination::DestinationRecord::as_push)
+            .filter(|held| {
+                held.sender_record_id == offered.sender_record_id
+                    && held.installation_id == offered.installation_id
+                    && held.previews_enabled != previews_enabled
+            })
+            .map_or(NewCredential, |_| PreviewsChoice))
     }
 
     /// Refuses a registration whose installation or authorisation another device's destination
