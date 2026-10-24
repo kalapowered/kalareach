@@ -1313,6 +1313,50 @@ async fn the_terminal_still_confirms_the_first_owner_while_the_host_refuses_remo
     assert!(record.grant.permits(ActionRight::HostManage));
 }
 
+/// A withdrawal by an owner the host does not know that names more devices than the doctor says by
+/// name is said by name for eight of them, and the rest are counted: a person reads a few names and
+/// how many more there are, and not a line as long as the withdrawal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doctor_names_eight_of_the_devices_a_withdrawal_names_and_counts_the_rest() {
+    let rig = Rig::start().await;
+    let mut named = Vec::new();
+    for _ in 0..9 {
+        named.push(rig.pairs(&[ActionRight::SessionView]).await.1.device_id);
+    }
+    let spare = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let stranger = AuthorisationKeyPair::generate().expect("a key");
+    let withdrawal = rig.request_of(
+        &stranger,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        RevocationTarget::Devices {
+            device_ids: named.iter().copied().collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&stranger, &withdrawal).await;
+    rig.an_earlier_run_carried_out(&withdrawal, 0, 1).await;
+    // The registry stands at the feed's revision, so the host is not behind it and finds the
+    // withdrawal complete.
+    rig.revokes_at_the_machine(spare.1.device_id).await;
+    rig.until_the_carrier_is_idle().await;
+
+    let check = rig.shown().await.check.expect("the feed check");
+    let detail = check.detail();
+    assert_eq!(
+        named
+            .iter()
+            .filter(|device| detail.contains(&device.to_string()))
+            .count(),
+        8,
+        "eight of the nine devices are named: {detail}"
+    );
+    assert!(
+        detail.contains("; 1 more are not listed"),
+        "and the ninth is counted: {detail}"
+    );
+}
+
 /// KR-REQ-24.15: a device a withdrawal the host cannot verify names keeps no standing over the
 /// feed. It is not among the keys the host names as permitted to remove the feed, so removing the
 /// feed does not end the refusal for it, while another owner's key is named and does. Else the
