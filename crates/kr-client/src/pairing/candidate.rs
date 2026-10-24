@@ -2816,6 +2816,14 @@ mod tests {
         ) -> BoxFuture<'a, Result<super::super::link::EndpointHold, LinkError>> {
             unreachable!("a waiting device holds no endpoint of its own")
         }
+
+        fn visit_hold<'a>(
+            &'a self,
+            _network: &'a kr_protocol::pairing::NetworkConfig,
+            _in_use: &'a super::super::link::HostInUse<'a>,
+        ) -> BoxFuture<'a, Result<super::super::link::EndpointHold, LinkError>> {
+            unreachable!("a waiting device holds no endpoint of its own")
+        }
     }
 
     /// A room a waiting device never opens.
