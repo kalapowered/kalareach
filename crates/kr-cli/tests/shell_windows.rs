@@ -348,12 +348,17 @@ fn after(terminal: &WorkerTerminal, marker: &str) -> String {
 /// What it is given after `/c` is the command it runs, so a typed line decides what the stand-in
 /// prints and where it stays: it expands the variables its launcher set, and it prints the flags
 /// the integration added after the words that were typed.
+///
+/// The copy is started once where it is placed. The system scans a file it has not seen as it is
+/// first opened and again as its image is first mapped, which can outlast the time an admitted
+/// launch is given to start the program; paid here, it stays out of the launch the case is about,
+/// as it does for the programs the daemon starts.
 fn stand_in(directory: &Path, name: &str) -> PathBuf {
     let cmd = PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
         .join("System32")
         .join("cmd.exe");
     let program = directory.join(format!("{name}.exe"));
-    kr_ipc::testing::place_program(&cmd, &program);
+    kr_ipc::testing::place_and_start_once(&cmd, &program, &["/c", "exit"]);
     program
 }
 
