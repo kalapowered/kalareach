@@ -25,11 +25,18 @@
 //!
 //! The organisation's service allows an account a hundred and twenty lease requests an hour, and
 //! the same account's other devices spend from it. So the keeper sends no lease request sooner than
-//! a minute after the last wait it began while it keeps a lease, and no connection asks while it
-//! waits. A stop that a person or an administrator mends is remembered: the keeper answers a later
-//! connection with the same stop and sends nothing until the stop has been held for the time
-//! [`LeaseStop::holds_for`] names. A token the service rejects is replaced once by the service
-//! client before the keeper hears of it, so a second rejection ends in `TokenRefused`.
+//! a minute after the last wait it began while it keeps a lease, and no connection asks, for a
+//! lease or for the chain of keys, while it waits. A request its caller gave up on counts as one
+//! the service did not answer, and the keeper sends none for a minute after it. A stop that a
+//! person or an administrator mends is remembered: the keeper answers a later connection with the
+//! same stop and sends nothing until the stop has been held for the time [`LeaseStop::holds_for`]
+//! names. A token the service rejects is replaced once by the service client before the keeper
+//! hears of it, so a second rejection ends in `TokenRefused`.
+//!
+//! A keeper belongs to the account that was signed in when it was made. The service client checks
+//! which account is signed in before the keeper asks for a lease and again before it presents one,
+//! and asks only under that account's token, so a lease that arrives after the account changed is
+//! not presented, and a refresh that begins after it does not begin.
 
 use std::fmt;
 use std::future::Future;
@@ -48,7 +55,7 @@ use kr_transport::reconnect::Backoff;
 
 use crate::error::ClientError;
 use crate::retry::UserAction;
-use crate::services::MembershipLeaseService;
+use crate::services::{AccountNow, MembershipLeaseService};
 use crate::session::Session;
 use crate::shown::{Said, Shown};
 
@@ -73,17 +80,21 @@ const FIRST_LEASE_TRIES: u32 = 3;
 /// the service reject its token, before the keeper stops.
 const UNEXPLAINED_REFUSALS: u32 = 3;
 
-/// The longest delay the service may name that a connection waits out: a connection is given
-/// twenty seconds, and a longer delay is reported to the person and remembered instead.
-const LONGEST_WAIT_AT_CONNECT: Duration = Duration::from_secs(10);
+/// The longest delay the service may name that a connection waits out: a visit is given as little
+/// as ten seconds, dial and reads included, and a longer delay is reported to the person and
+/// remembered instead.
+const LONGEST_WAIT_AT_CONNECT: Duration = Duration::from_secs(5);
 
-/// How much of a lease must be left, beyond the interval to the next one, for the keeper to
-/// present it again rather than ask for another.
+/// How much of a lease must be left, beyond the interval to the first refresh of the connection
+/// that keeps it, for the keeper to present it again rather than ask for another.
 const LEASE_MARGIN: Duration = Duration::from_secs(30);
 
 /// The most a connection's first presentation takes in all, counting its requests to the service
-/// and its waits. The callers that wait for it allow twelve seconds at the least.
-const PRESENT_WITHIN: Duration = Duration::from_secs(8);
+/// and its waits: the longest delay it waits out and one request of the service client, which is
+/// given five seconds at the most. A caller may give less (a visit and a listing give ten seconds
+/// for the dial, the presentation and the reads together); a presentation it cuts off while a
+/// request is under way holds the service off for itself.
+const PRESENT_WITHIN: Duration = Duration::from_secs(10);
 
 /// How much earlier than a wait ends, by the wall clock, a request may go: a clock that was set
 /// during the wait is not a reason to wait again.
@@ -142,9 +153,12 @@ pub enum LeaseStop {
     /// that opens another connection presents again before it asks the host anything.
     ConnectionEnded,
     /// The first lease could not be got in the few tries a connection is given, because the
-    /// organisation's service or the host did not answer well enough. A caller that tries again
-    /// later may succeed.
+    /// organisation's service or the host did not answer well enough, or a request to the service
+    /// was given up on before it answered. A caller that tries again later may succeed.
     Unreachable,
+    /// Another account is signed in than the one this keeper asks as. The work begun for the first
+    /// ends, and a connection that opens again asks as the second.
+    AccountChanged,
 }
 
 impl LeaseStop {
@@ -157,7 +171,9 @@ impl LeaseStop {
             }
             Self::Unusable => ErrorCode::InvalidArgument,
             Self::Later(_) => ErrorCode::RateLimited,
-            Self::ConnectionEnded | Self::Unreachable => ErrorCode::ResourceUnavailable,
+            Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged => {
+                ErrorCode::ResourceUnavailable
+            }
         }
     }
 
@@ -168,7 +184,9 @@ impl LeaseStop {
             Self::SignIn | Self::TokenRefused => UserAction::SignIn,
             Self::NotAMember | Self::Refused(_) => UserAction::Nothing,
             Self::Unusable => UserAction::Update,
-            Self::Later(_) | Self::ConnectionEnded | Self::Unreachable => UserAction::Wait,
+            Self::Later(_) | Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged => {
+                UserAction::Wait
+            }
         }
     }
 
@@ -178,7 +196,7 @@ impl LeaseStop {
     #[must_use]
     pub fn holds_for(&self) -> Duration {
         match self {
-            Self::SignIn | Self::ConnectionEnded => Duration::ZERO,
+            Self::SignIn | Self::ConnectionEnded | Self::AccountChanged => Duration::ZERO,
             Self::TokenRefused | Self::Unreachable => SHORTEST_REFRESH,
             Self::NotAMember | Self::Refused(_) | Self::Unusable => HELD_FOR_AN_ADMINISTRATOR,
             Self::Later(delay) => (*delay).min(LONGEST_HOLD),
@@ -242,6 +260,10 @@ impl Said for LeaseStop {
             Self::Unreachable => Shown::said(
                 "your organisation's service did not give this device the lease it needs just \
                  now; this app asks again",
+            ),
+            Self::AccountChanged => Shown::said(
+                "the account signed in on this device changed; this app asks for the lease again \
+                 as the new one",
             ),
         }
     }
@@ -321,10 +343,16 @@ struct Held {
 }
 
 impl Held {
-    /// Whether this lease is worth presenting again at `now_ms`.
+    /// Whether this lease is worth presenting again at `now_ms`: it lasts until the first refresh of
+    /// the connection that keeps it, which is the wait [`LeaseKeeper::keep`] begins with, and the
+    /// margin beyond.
     fn usable(&self, now_ms: u64, reuse: Reuse) -> bool {
-        let margin = u64::try_from(LEASE_MARGIN.as_millis()).unwrap_or(u64::MAX);
-        self.ends_at_ms > now_ms.saturating_add(margin)
+        let to_the_first_refresh = match self.due_at_ms {
+            Some(due) => clamp(Duration::from_millis(due.saturating_sub(now_ms))),
+            None => clamp(self.advised),
+        };
+        let needs = millis(to_the_first_refresh + LEASE_MARGIN);
+        self.ends_at_ms > now_ms.saturating_add(needs)
             && (reuse == Reuse::Held || self.due_at_ms.is_none())
     }
 }
@@ -578,6 +606,55 @@ impl LeaseKeeper {
         stop
     }
 
+    /// Whether the account signed in is still the one this keeper asks as.
+    fn account_is_the_same(&self) -> Result<(), Next> {
+        match self.leases.account_now() {
+            Ok(AccountNow::Same) | Err(_) => Ok(()),
+            Ok(AccountNow::Replaced) => Err(Next::Stop(LeaseStop::AccountChanged)),
+            Ok(AccountNow::SignedOut) => Err(Next::Stop(LeaseStop::SignIn)),
+        }
+    }
+
+    /// No request goes to the service while a delay it named, or a failure the keeper is waiting out,
+    /// has time to run. Asked before a lease and before the chain of keys alike.
+    fn must_wait(&self) -> Result<(), Next> {
+        let now = self.timer.now_ms();
+        let not_before = self.kept().not_before_ms;
+        if not_before > now.saturating_add(CLOCK_SLACK_MS) {
+            return Err(Next::After(Duration::from_millis(not_before - now)));
+        }
+        Ok(())
+    }
+
+    /// What a refusal from the service calls for. A request that found no token to make may do so
+    /// because another account signed in, which is another stop than that the person signs in.
+    fn service_refused(&self, error: &ClientError) -> Next {
+        let next = from_the_service(error);
+        if next == Next::Stop(LeaseStop::SignIn)
+            && matches!(self.leases.account_now(), Ok(AccountNow::Replaced))
+        {
+            return Next::Stop(LeaseStop::AccountChanged);
+        }
+        next
+    }
+
+    /// A request to the service is given up on before it answers: the service did not answer, as
+    /// far as the next caller can tell, and is not asked again at once.
+    fn unanswered(&self) {
+        let until = self
+            .timer
+            .now_ms()
+            .saturating_add(millis(LeaseStop::Unreachable.holds_for()));
+        let mut kept = self.kept();
+        if kept
+            .held_back
+            .as_ref()
+            .is_none_or(|(held, _)| *held < until)
+        {
+            kept.held_back = Some((until, LeaseStop::Unreachable));
+        }
+    }
+
     /// One lease presented, got from the service first when none is held to present. Returns the
     /// interval the service advised.
     async fn step(
@@ -586,6 +663,7 @@ impl LeaseKeeper {
         force_chain: bool,
         reuse: Reuse,
     ) -> Result<Duration, Next> {
+        self.account_is_the_same()?;
         let reusable = {
             let now = self.timer.now_ms();
             self.kept()
@@ -598,16 +676,11 @@ impl LeaseKeeper {
         let mut held = if let Some(held) = reusable {
             held
         } else {
-            let now = self.timer.now_ms();
-            let not_before = self.kept().not_before_ms;
-            if not_before > now.saturating_add(CLOCK_SLACK_MS) {
-                return Err(Next::After(Duration::from_millis(not_before - now)));
-            }
-            let issued = self
-                .leases
-                .lease(self.organisation, self.device_key)
-                .await
-                .map_err(|error| from_the_service(&error))?;
+            self.must_wait()?;
+            let asking = Asking::of(self);
+            let issued = self.leases.lease(self.organisation, self.device_key).await;
+            asking.answered();
+            let issued = issued.map_err(|error| self.service_refused(&error))?;
             let payload = &issued.lease.payload;
             let lasts = payload
                 .expires_at_ms
@@ -627,13 +700,14 @@ impl LeaseKeeper {
         let newer = revision > self.kept().followed;
         // A chain the host refused for being behind is fetched again, not presented as it was.
         if force_chain || (held.authority.is_none() && newer) {
-            held.authority = Some(
-                self.leases
-                    .authority(self.organisation)
-                    .await
-                    .map_err(|error| from_the_service(&error))?,
-            );
+            self.must_wait()?;
+            let asking = Asking::of(self);
+            let chain = self.leases.authority(self.organisation).await;
+            asking.answered();
+            held.authority = Some(chain.map_err(|error| self.service_refused(&error))?);
         }
+        // Whatever was waited for, the lease is presented only for the account that asked for it.
+        self.account_is_the_same()?;
         let presented = Presented {
             fresh,
             with_chain: force_chain,
@@ -671,6 +745,35 @@ impl LeaseKeeper {
             expires_at_ms: taken.expires_at_ms.get(),
         });
         Ok(held.advised)
+    }
+}
+
+/// A request to the service that is under way. If it is dropped before [`Self::answered`], its
+/// caller gave up on it.
+struct Asking<'a> {
+    keeper: &'a LeaseKeeper,
+    answered: bool,
+}
+
+impl<'a> Asking<'a> {
+    fn of(keeper: &'a LeaseKeeper) -> Self {
+        Self {
+            keeper,
+            answered: false,
+        }
+    }
+
+    /// The request ended, with an answer or with a failure.
+    fn answered(mut self) {
+        self.answered = true;
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.keeper.unanswered();
+        }
     }
 }
 

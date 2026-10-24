@@ -2708,6 +2708,10 @@ impl ForkServices {
 }
 
 impl kr_client::services::MembershipLeaseService for ForkServices {
+    fn account_now(&self) -> kr_client::Result<kr_client::services::AccountNow> {
+        Ok(kr_client::services::AccountNow::Same)
+    }
+
     fn lease<'a>(
         &'a self,
         _organisation: kr_protocol::ids::OrganisationId,

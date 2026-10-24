@@ -2744,7 +2744,9 @@ impl SignedInAccount {
     }
 
     /// The token for `scope`, with the mark of the account it belongs to at the service at
-    /// `origin`, both from one read of the grant.
+    /// `origin`, both from one read of the grant. With `renew` the access token is replaced by a
+    /// refresh whether or not it is near its end, for a caller whose service refused it as one that
+    /// may have ended in transit.
     ///
     /// A caller that checks the mark of the grant and then asks for a token has read the grant
     /// twice, and the account can change between the two reads. This is one read.
@@ -2756,9 +2758,10 @@ impl SignedInAccount {
         &'a self,
         scope: &'a str,
         origin: &'a str,
+        renew: bool,
     ) -> ServiceFuture<'a, (AccountToken, AccountMark)> {
         Box::pin(async move {
-            self.token_for(scope, false, |grant, token| (token, grant.mark_at(origin)))
+            self.token_for(scope, renew, |grant, token| (token, grant.mark_at(origin)))
                 .await
         })
     }

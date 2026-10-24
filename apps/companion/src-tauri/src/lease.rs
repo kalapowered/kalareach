@@ -15,6 +15,11 @@
 //! lease for the device, not one for each connection, so the desk keeps one keeper for each host
 //! and every connection to it presents the lease that keeper holds again while it lasts, asking the
 //! organisation's service for another only when none is held or the host refuses the one that is.
+//!
+//! A keeper belongs to the account signed in when it was made, and to that sign-in: when another
+//! account signs in, or the account signs out, the keeper of a connection that keeps a lease ends
+//! it at once, and no lease or request of the first is presented for the second. A person who signs
+//! in again as the same account gets a keeper with nothing held against it.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -26,6 +31,7 @@ use kr_client::organisation::{LeaseEvent, LeaseKeeper, LeaseStop, LeaseTimer, Re
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::{LinkError, MembershipPresenter};
 use kr_client::pairing::paired::PairedHost;
+use kr_client::services::account::AccountStatus;
 use kr_client::services::{
     AccountMark, HttpDeadlines, HttpService, ManagedMembershipLeaseService, managed_response_limits,
 };
@@ -50,6 +56,10 @@ struct Kept {
     /// account, and the application keeps one `Account` whoever is signed in to it, so another
     /// account gets a keeper of its own.
     account: AccountMark,
+    /// Which sign-in the keeper was made under, the same through a grant's refreshes and another
+    /// for any later sign-in, even of the same account: what the keeper has held against the
+    /// account is not held against a sign-in made since.
+    sign_in: String,
 }
 
 impl Kept {
@@ -58,9 +68,20 @@ impl Kept {
         organisation: OrganisationId,
         key: AuthorisationKey,
         account: AccountMark,
+        sign_in: &str,
     ) -> bool {
-        self.organisation == organisation && self.key == key && self.account == account
+        self.organisation == organisation
+            && self.key == key
+            && self.account == account
+            && self.sign_in == sign_in
     }
+}
+
+/// A keeper and the account it asks as.
+struct Keeping {
+    keeper: Arc<LeaseKeeper>,
+    account: Arc<Account>,
+    mark: AccountMark,
 }
 
 struct Inner {
@@ -83,9 +104,13 @@ impl std::fmt::Debug for LeaseDesk {
 
 /// The failure a lease that cannot be got is reported as, which the connection says to the person.
 /// It is not the host's word about what it was asked: a stop can be the organisation's service, this
-/// device's account, or the host's refusal of the lease it was given.
+/// device's account, or the host's refusal of the lease it was given. A connection that ended under
+/// the presentation is the one thing it says of the host: it was lost.
 fn failed(stop: &LeaseStop) -> LinkError {
-    LinkError::Membership(ProtocolError::new(stop.code(), stop.to_string()))
+    match stop {
+        LeaseStop::ConnectionEnded => LinkError::Lost(stop.to_string()),
+        other => LinkError::Membership(ProtocolError::new(other.code(), other.to_string())),
+    }
 }
 
 impl LeaseDesk {
@@ -130,14 +155,23 @@ impl LeaseDesk {
         self.hosts().remove(&host);
     }
 
+    /// Lets go of what is kept for `host` when it was kept for the account `mark`: that account
+    /// signed out, or another signed in.
+    fn forget_account(&self, host: DeviceId, mark: AccountMark) {
+        let mut hosts = self.hosts();
+        if hosts.get(&host).is_some_and(|kept| kept.account == mark) {
+            hosts.remove(&host);
+        }
+    }
+
     /// The keeper of `host`'s lease, made the first time it is asked for and again when the
     /// organisation, this device's key or the account signed in is not the one it was made for, or
-    /// none for a host whose grant answers to no organisation.
+    /// when the person has signed in since; none for a host whose grant answers to no organisation.
     async fn keeper_of(
         &self,
         host: &PairedHost,
         key: AuthorisationKey,
-    ) -> Result<Option<Arc<LeaseKeeper>>, LeaseStop> {
+    ) -> Result<Option<Keeping>, LeaseStop> {
         let Some(requirement) = host.proposed_grant.organisation.as_ref() else {
             return Ok(None);
         };
@@ -145,18 +179,35 @@ impl LeaseDesk {
         let Some(account) = (self.inner.account)().await else {
             return Err(LeaseStop::SignIn);
         };
-        let mark = match account.tokens().mark(account.origin().as_str()) {
-            Ok(Some(mark)) => mark,
-            Ok(None) => return Err(LeaseStop::SignIn),
-            Err(error) => {
-                tracing::warn!(%error, "this device cannot read which account is signed in");
-                return Err(LeaseStop::Unreachable);
+        let tokens = account.tokens();
+        let unreadable = |error: &dyn std::fmt::Display| {
+            tracing::warn!(%error, "this device cannot read which account is signed in");
+            LeaseStop::Unreachable
+        };
+        let sign_in = match tokens.status() {
+            Ok(AccountStatus::SignedIn { generation, .. }) => generation,
+            Ok(_) => {
+                self.forget(host.host_device_id);
+                return Err(LeaseStop::SignIn);
             }
+            Err(error) => return Err(unreadable(&error)),
+        };
+        let mark = match tokens.mark(account.origin().as_str()) {
+            Ok(Some(mark)) => mark,
+            Ok(None) => {
+                self.forget(host.host_device_id);
+                return Err(LeaseStop::SignIn);
+            }
+            Err(error) => return Err(unreadable(&error)),
         };
         if let Some(kept) = self.hosts().get(&host.host_device_id)
-            && kept.is_for(organisation, key, mark)
+            && kept.is_for(organisation, key, mark, &sign_in)
         {
-            return Ok(Some(Arc::clone(&kept.keeper)));
+            return Ok(Some(Keeping {
+                keeper: Arc::clone(&kept.keeper),
+                account,
+                mark,
+            }));
         }
         // A first presentation is waited for by a person and by callers that allow ten seconds, so
         // one request is not given the twenty seconds a background request is.
@@ -173,8 +224,12 @@ impl LeaseDesk {
             tracing::warn!(%error, "this device cannot reach its organisation's service");
             LeaseStop::Unreachable
         })?;
-        let leases =
-            ManagedMembershipLeaseService::new(account.origin(), Arc::new(http), account.tokens());
+        let leases = ManagedMembershipLeaseService::new(
+            account.origin(),
+            Arc::new(http),
+            account.tokens(),
+            mark,
+        );
         let made = Arc::new(
             LeaseKeeper::new(
                 Arc::new(leases),
@@ -197,9 +252,13 @@ impl LeaseDesk {
         // one both use, so they share the lease it holds and the stop it remembers.
         let mut hosts = self.hosts();
         if let Some(kept) = hosts.get(&host.host_device_id)
-            && kept.is_for(organisation, key, mark)
+            && kept.is_for(organisation, key, mark, &sign_in)
         {
-            return Ok(Some(Arc::clone(&kept.keeper)));
+            return Ok(Some(Keeping {
+                keeper: Arc::clone(&kept.keeper),
+                account,
+                mark,
+            }));
         }
         hosts.insert(
             host.host_device_id,
@@ -208,24 +267,62 @@ impl LeaseDesk {
                 organisation,
                 key,
                 account: mark,
+                sign_in,
             },
         );
-        Ok(Some(made))
+        Ok(Some(Keeping {
+            keeper: made,
+            account,
+            mark,
+        }))
     }
 
     /// Keeps the lease the host holds for this device for as long as `session` lasts, and says why
-    /// it stopped, among them that no account can ask for it. Returns at once, with nothing to say,
-    /// when the host's grant answers to no organisation.
+    /// it stopped, among them that no account can ask for it, or that the account it is kept for
+    /// signed out or was replaced by another, which ends it at once. Returns at once, with nothing
+    /// to say, when the host's grant answers to no organisation.
     pub async fn keep(
         &self,
         session: &Session,
         host: &PairedHost,
         key: AuthorisationKey,
     ) -> Option<LeaseStop> {
-        match self.keeper_of(host, key).await {
-            Ok(Some(keeper)) => Some(keeper.keep(session).await),
-            Ok(None) => None,
-            Err(stop) => Some(stop),
+        let keeping = match self.keeper_of(host, key).await {
+            Ok(Some(keeping)) => keeping,
+            Ok(None) => return None,
+            Err(stop) => return Some(stop),
+        };
+        let Keeping {
+            keeper,
+            account,
+            mark,
+        } = keeping;
+        let stop = tokio::select! {
+            stop = keeper.keep(session) => stop,
+            stop = account_left(&account, mark) => {
+                self.forget_account(host.host_device_id, mark);
+                stop
+            }
+        };
+        Some(stop)
+    }
+}
+
+/// Returns when the account signed in is no longer the one `mark` marks: it signed out, or another
+/// signed in. Never returns while it is, and never returns if the account is not read.
+async fn account_left(account: &Account, mark: AccountMark) -> LeaseStop {
+    let tokens = account.tokens();
+    let mut changes = tokens.subscribe();
+    loop {
+        match tokens.mark(account.origin().as_str()) {
+            Ok(Some(signed_in)) if signed_in == mark => {}
+            Ok(Some(_)) => return LeaseStop::AccountChanged,
+            Ok(None) => return LeaseStop::SignIn,
+            // Unreadable now: the keeper's own requests find out when they are made.
+            Err(_) => {}
+        }
+        if changes.changed().await.is_err() {
+            return std::future::pending().await;
         }
     }
 }
@@ -238,14 +335,15 @@ impl MembershipPresenter for LeaseDesk {
         key: AuthorisationKey,
     ) -> BoxFuture<'a, Result<(), LinkError>> {
         Box::pin(async move {
-            let Some(keeper) = self
+            let Some(keeping) = self
                 .keeper_of(host, key)
                 .await
                 .map_err(|stop| failed(&stop))?
             else {
                 return Ok(());
             };
-            keeper
+            keeping
+                .keeper
                 .present_first(session)
                 .await
                 .map_err(|stop| failed(&stop))

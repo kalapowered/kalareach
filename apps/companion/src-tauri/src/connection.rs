@@ -240,6 +240,9 @@ impl Connection {
             .map_err(|_| Unopened::unreached("the host did not answer in time"))?
             .map_err(|error| match error {
                 LinkError::Refused(refusal) => Unopened::Refused(CommandError::from(refusal)),
+                // The host was reachable and was not asked for anything: the device could not give
+                // it the lease it needs, and the words say why.
+                LinkError::Membership(refusal) => Unopened::Refused(CommandError::from(refusal)),
                 other => Unopened::unreached(other.said().into_string()),
             })?;
         let info: kr_protocol::hostinfo::HostInfoResult = tokio::time::timeout(
@@ -339,7 +342,9 @@ async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionR
 /// Why a connection to a paired host was not opened.
 #[derive(Debug)]
 pub enum Unopened {
-    /// The host answered, and refused: it is in contact, and the refusal is its own.
+    /// The host answered, and refused: it is in contact, and the refusal is its own. Or this device
+    /// could not give the host the lease its organisation signs for it, which a host that holds
+    /// none refuses everything for, and the words are the reason.
     Refused(CommandError),
     /// The host could not be reached, did not answer in time, or failed in a way that is no
     /// refusal of the host's.
