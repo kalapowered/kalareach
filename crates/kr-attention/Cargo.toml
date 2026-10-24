@@ -12,6 +12,8 @@ publish.workspace = true
 # An item's key is a keyed digest, so a reader who is served the record without the session's text
 # cannot try candidate texts against the key and find out which one it was.
 hmac.workspace = true
+# The secret that digest is taken under is drawn from the cryptography crate's random source.
+kr-crypto.workspace = true
 # The store is opened the way every store is, waiting out a previous holder that is letting go.
 kr-flush = { workspace = true, features = ["sqlite"] }
 kr-protocol.workspace = true
@@ -23,8 +25,8 @@ rusqlite = { workspace = true, features = ["bundled"] }
 # deterministic across a replay and bounded whatever it covers.
 sha2.workspace = true
 thiserror.workspace = true
-# The key secret is random and lives as long as the store. A version-four identifier is the
-# workspace's random source, and two of them are what the secret is built from.
+# The store's claim on its file is a random token, which is an identifier and not a secret, so a
+# version-four identifier supplies it.
 uuid.workspace = true
 
 # A database is journalled under the name it was opened by, so the store asks the file SQLite has

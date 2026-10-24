@@ -3131,11 +3131,13 @@ impl DeliveryJournal {
     ///
     /// It never leaves this store. A collapse identifier travels to a provider in the clear, so it
     /// is a keyed digest of what the host groups by rather than the thing itself: a provider that
-    /// sees two equal values learns that they group, and nothing about what they group.
+    /// sees two equal values learns that they group, and nothing about what they group. A new
+    /// secret is 256 bits from the cryptography crate's random source.
     ///
     /// # Errors
     ///
-    /// Returns [`DeliveryError::JournalUnavailable`] when the read or the write fails.
+    /// Returns [`DeliveryError::JournalUnavailable`] when the read or the write fails, and
+    /// [`DeliveryError::Crypto`] when the random source is unavailable.
     pub fn collapse_secret(&mut self) -> Result<[u8; 32]> {
         let stored: Option<Vec<u8>> = self
             .connection
@@ -3151,8 +3153,7 @@ impl DeliveryJournal {
             });
         }
         let mut secret = [0u8; 32];
-        secret[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        secret[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        kr_crypto::random_bytes(&mut secret)?;
         self.connection.execute(
             "INSERT INTO delivery_secret (id, secret) VALUES (0, ?1)",
             params![secret.as_slice()],
@@ -6605,6 +6606,26 @@ mod tests {
         other
             .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
             .expect("the write lock is free");
+    }
+
+    /// A new collapse secret is 256 bits from the random source: over 64 journals every bit of it
+    /// is set in some and clear in others. A secret built from two version-four identifiers fixes
+    /// twelve of its bits, the identifiers' version and variant, and fails here; a fair source
+    /// leaves a bit fixed in 64 draws with a chance of 2^-63.
+    #[test]
+    fn a_new_collapse_secret_takes_all_256_bits_from_the_random_source() {
+        let mut ever_set = [0u8; 32];
+        let mut ever_clear = [0xffu8; 32];
+        for _ in 0..64 {
+            let mut journal = DeliveryJournal::in_memory().expect("a journal");
+            let secret = journal.collapse_secret().expect("a secret");
+            for (index, byte) in secret.iter().enumerate() {
+                ever_set[index] |= byte;
+                ever_clear[index] &= byte;
+            }
+        }
+        assert_eq!(ever_set, [0xff; 32], "a bit that was never set");
+        assert_eq!(ever_clear, [0; 32], "a bit that was never clear");
     }
 
     #[test]
