@@ -2343,26 +2343,44 @@ pub(crate) mod tests {
         .await
     }
 
-    /// As [`daemon_on`], once the sweep the daemon makes as it starts is over, and the first pass
-    /// of the attention store's maintenance.
-    ///
-    /// Each reads the host's clocks to decide whether a record may be forgotten, and a reading
-    /// taken after a test has moved the continuous clock puts the moment that clock implies into
-    /// the host's floor. A test that moves its clocks starts its daemon here, so that no such
-    /// reading comes after its first step. Both are bounded, so a pass that never ends fails the
-    /// test with a message and does not hold it.
+    /// As [`daemon_on`], once the first passes of the daemon's own tasks are over
+    /// ([`until_its_first_passes_are_over`]). A test that moves its clocks by hand starts its
+    /// daemon here, so that no reading of them comes after its first step.
     pub(in crate::service) async fn daemon_on_clocks_to_move(
         temp: &kr_ipc::testing::TempHost,
         clocks: crate::service::Clocks,
     ) -> Arc<Controller> {
         let controller = daemon_on(temp, clocks).await;
+        until_its_first_passes_are_over(&controller).await;
+        controller
+    }
+
+    /// As [`daemon`], once the first passes of the daemon's own tasks are over
+    /// ([`until_its_first_passes_are_over`]). A test that arranges the host's floor, by a worker's
+    /// reading or a failed write, starts its daemon here, so that no pass of the daemon writes the
+    /// floor as it stands after that first step.
+    async fn daemon_after_its_first_passes(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+        let controller = daemon(temp).await;
+        until_its_first_passes_are_over(&controller).await;
+        controller
+    }
+
+    /// Waits until the sweep the daemon makes as it starts is over, and so is the first pass of
+    /// the attention store's maintenance.
+    ///
+    /// Each asks the host whether its clock may be trusted to let a record go. The answer reads the
+    /// clocks, puts the reading into the host's floor, and writes the floor down as it then
+    /// stands: a reading taken after a test has moved the continuous clock puts the moment that
+    /// clock implies into the floor, and one taken after a worker has raised the floor writes that
+    /// raise to the host's record. Both are bounded, so a pass that never ends fails the test with
+    /// a message and does not hold it.
+    async fn until_its_first_passes_are_over(controller: &Arc<Controller>) {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
             controller.transfer().until_a_sweep_has_ended().await;
             controller.attention().until_maintenance_has_waited().await;
         })
         .await
         .expect("the daemon's first sweep and first maintenance pass end");
-        controller
     }
 
     /// Starts a daemon with `start`, and again while a daemon this test let go still holds the
@@ -2688,7 +2706,7 @@ pub(crate) mod tests {
         temp: &kr_ipc::testing::TempHost,
     ) -> Arc<Controller> {
         stopped(controller).await;
-        daemon(temp).await
+        daemon_after_its_first_passes(temp).await
     }
 
     /// The host's floor is one word for the boot. A daemon's floor and a worker's mapping of it
@@ -2799,7 +2817,7 @@ pub(crate) mod tests {
     ) {
         use kr_worker::action::time::{ManualWallClock, TimeContract, TimeSources, UtcDeadline};
 
-        let controller = daemon(temp).await;
+        let controller = daemon_after_its_first_passes(temp).await;
         let revision = controller.policy().authority_revision();
         let now = kr_ipc::now_ms().get();
         let expires = now + 60 * 60 * 1000;
@@ -3066,7 +3084,7 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_shared_floor_keeps_the_record_rule_at_the_device_door() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let controller = daemon_after_its_first_passes(&temp).await;
         let worker = worker_mapping(&temp);
         let revision = controller.policy().authority_revision();
         let now = kr_ipc::now_ms().get();
