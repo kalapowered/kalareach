@@ -110,8 +110,9 @@ pub struct Pass {
 
 /// Starts the collection that runs for as long as the daemon does.
 ///
-/// The task holds the daemon weakly between passes, and strongly only while a pass runs, as the
-/// transfer sweep does: a daemon whose owner lets it go lives on for one running pass at most.
+/// The task holds the daemon weakly between passes and while a pass waits for a blocking thread,
+/// and strongly only while a pass runs, as the transfer sweep does: a daemon whose owner lets it go
+/// lives on for one running pass at most.
 ///
 /// # Errors
 ///
@@ -133,23 +134,38 @@ async fn run(daemon: Weak<Controller>) {
     let mut next_session_pass = tokio::time::Instant::now();
     loop {
         tick.tick().await;
-        let Some(controller) = daemon.upgrade() else {
-            return;
-        };
         let sessions_due = tokio::time::Instant::now() >= next_session_pass;
         if sessions_due {
             next_session_pass = tokio::time::Instant::now() + SESSION_INTERVAL;
         }
-        let working = Arc::clone(&controller);
-        let _ = tokio::task::spawn_blocking(move || {
-            working.collect_closed_sessions(OutputRetention::DEFAULT, sessions_due)
-        })
-        .await;
+        if matches!(queue_pass(&daemon, sessions_due).await, Ok(None)) {
+            return;
+        }
+        let Some(controller) = daemon.upgrade() else {
+            return;
+        };
         controller
             .collection()
             .passes
             .send_modify(|passes| *passes += 1);
     }
+}
+
+/// Queues one pass on a blocking thread, as it is asked for.
+///
+/// The queued pass holds the daemon weakly and upgrades it when it runs, so a pass that waits for
+/// a thread keeps nothing of the daemon, and a daemon let go meanwhile goes at once. The pass whose
+/// turn comes after that finds the daemon gone, does nothing and answers none.
+pub(crate) fn queue_pass(
+    daemon: &Weak<Controller>,
+    sessions: bool,
+) -> tokio::task::JoinHandle<Option<Pass>> {
+    let daemon = Weak::clone(daemon);
+    tokio::task::spawn_blocking(move || {
+        daemon.upgrade().map(|controller| {
+            controller.collect_closed_sessions(OutputRetention::DEFAULT, sessions)
+        })
+    })
 }
 
 impl Controller {

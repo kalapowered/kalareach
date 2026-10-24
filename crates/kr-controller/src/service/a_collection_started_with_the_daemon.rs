@@ -498,3 +498,54 @@ async fn a_submitted_file_follows_its_sessions_retention_on_a_clock_the_host_can
         "{answer:?}"
     );
 }
+
+/// KR-REQ-20.21: a pass of the collection that waits for a blocking thread keeps nothing of the
+/// daemon, and with it the environment's lock, once the daemon's owner has let it go. When its turn
+/// comes it finds the daemon gone and does nothing.
+///
+/// The runtime here has one blocking thread, which the case takes once the daemon's own first pass
+/// has ended. A pass is queued as it is asked for, so from then on it waits for that thread.
+#[test]
+fn a_pass_waiting_to_run_does_not_keep_its_daemon() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let temp = TempHost::create();
+        let controller = daemon(&temp).await;
+        after_passes(&controller, 1).await;
+
+        // The runtime's one blocking thread, taken until the case lets it go.
+        let (taken, taking) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let occupied = tokio::task::spawn_blocking(move || {
+            let _ = taken.send(());
+            let _ = held.recv();
+        });
+        taking.await.expect("the blocking thread is taken");
+
+        let daemon = std::sync::Arc::downgrade(&controller);
+        let pass = crate::collection::queue_pass(&daemon, true);
+
+        drop(controller);
+        let dropped = std::time::Instant::now();
+        while daemon.strong_count() > 0 && dropped.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            daemon.strong_count(),
+            0,
+            "a pass waiting for its thread keeps nothing of the daemon"
+        );
+
+        let _ = release.send(());
+        occupied.await.expect("the blocking thread is let go");
+        assert!(
+            pass.await.expect("the pass ends").is_none(),
+            "a pass whose daemon has gone does nothing"
+        );
+    });
+}
