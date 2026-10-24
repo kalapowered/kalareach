@@ -1368,6 +1368,18 @@ fn windows() -> Vec<Step> {
                 "pwsh_windows",
             ],
         ),
+        Step::cargo(
+            Group::Rust,
+            "the PowerShell package a Windows host publishes",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-shell-integration",
+                "--test",
+                "pwsh_windows_package",
+            ],
+        ),
         qualified_only(
             "the reference bridge over a real endpoint",
             &[

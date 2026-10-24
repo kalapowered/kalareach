@@ -565,7 +565,8 @@ user change to the gesture: the bridge records it with the prompt it takes effec
 character typed at the current prompt is still judged by the gesture that was in force when it was
 typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. Windows uses the
 configured PSReadLine gesture, which is a chord rather than a byte, and the worker supplies it in the
-accept.
+accept. PSReadLine's Windows edit mode binds no end-of-file chord, so there the module reports the
+gesture as disabled at the first prompt, and no key detaches the session until the person binds one.
 
 ## The fence and detach state machine
 

@@ -288,11 +288,7 @@ public class KrEditorNotAQueue { private static KrEditorNotAQueue _singleton = n
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
     let package = shellpkg::Package::built(PWSH);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     let module = directory
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
@@ -310,7 +306,8 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
              Write-Output \"kr-queue[$name]=[$($answer.Reason)] keys=[$($answer.Keys)]\" \
          }}"
     );
-    let asked = std::process::Command::new(&package.executable)
+    let asked = package
+        .command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env_remove("KR_SHELL_BRIDGE")
         .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -374,11 +371,7 @@ fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
            & (Get-Module PSReadLine) { param($text) Set-Item function:script:PSConsoleHostReadLine -Value ([scriptblock]::Create($text)) } $text;
            Import-Module PSReadLine;"#;
     let package = shellpkg::Package::built(PWSH);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     let module = directory
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
@@ -389,7 +382,8 @@ fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
              Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
              {after}"
         );
-        let output = std::process::Command::new(&package.executable)
+        let output = package
+            .command()
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .env_remove("KR_SHELL_BRIDGE")
             .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -467,11 +461,7 @@ fn the_editors_read_line_function_is_judged_against_the_editors_own_file() {
 /// functions and reads the editor's own table back, which is all these cases need.
 fn in_the_package_host(script: &str) -> String {
     let package = shellpkg::Package::built(PWSH);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     let module = directory
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
@@ -480,7 +470,8 @@ fn in_the_package_host(script: &str) -> String {
         "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
          $module = Get-Module KalaReach.ShellBridge; {script}"
     );
-    let asked = std::process::Command::new(&package.executable)
+    let asked = package
+        .command()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env_remove("KR_SHELL_BRIDGE")
         .env_remove("KR_SHELL_BRIDGE_SECRET")
@@ -507,6 +498,30 @@ fn said(output: &str, name: &str) -> String {
         .strip_suffix(']')
         .expect("the line's shape")
         .to_owned()
+}
+
+/// A package is published only for a host it can name: a file, called `pwsh`, at an absolute path.
+/// The refusal is by name, and the host the publish runs in is the control that is accepted.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_host_a_package_cannot_name_is_refused_by_name() {
+    let output = in_the_package_host(
+        r#"foreach ($case in @(@('another', '/bin/sh'), @('relative', 'pwsh'), @('missing', '/nonexistent/directory/pwsh'))) {
+               $answer = & $module { param($path) Test-KrHostCanBeStarted $path } $case[1];
+               Write-Output "kr-key[$($case[0])]=[$($answer.Reason)]"
+           }
+           $own = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName;
+           $answer = & $module { param($path) Test-KrHostCanBeStarted $path } $own;
+           Write-Output "kr-key[own]=[$($answer.Reason)]""#,
+    );
+    assert_eq!(said(&output, "another"), "powershell_host_not_pwsh");
+    assert_eq!(said(&output, "relative"), "powershell_host_unnamed");
+    assert_eq!(said(&output, "missing"), "powershell_host_missing");
+    assert_eq!(
+        said(&output, "own"),
+        "",
+        "the host this runs in can be named"
+    );
 }
 
 /// KR-REQ-07.73: the module binds only a chord the editor stores under the spelling it was given,
@@ -830,12 +845,12 @@ fn the_child_probe_starts_a_package_whose_path_holds_a_quote_and_a_space() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let awkward = directory.path().join("it's here");
     std::fs::create_dir_all(&awkward).expect("a directory with a quote in its name");
-    // The launcher names the host and the module by absolute paths, so a copy of it starts the
-    // same package from wherever it lies.
+    // A link to the package's host, which starts the same host from wherever it lies.
     let copy = awkward.join("pwsh");
-    std::fs::copy(&package.executable, &copy).expect("a copy of the package's launcher");
+    std::os::unix::fs::symlink(&package.executable, &copy).expect("a link to the package's host");
     let probe = shellpkg::child_probe(PWSH, &copy);
-    let asked = std::process::Command::new(&package.executable)
+    let asked = package
+        .command()
         .args([
             "-NoLogo",
             "-NoProfile",
