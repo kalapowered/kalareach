@@ -53,66 +53,66 @@ pub const FILES: &[(&str, &[u8])] = &[
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/README.md",
+        "targets/packages/kalareach/claude-code/0.5.0/README.md",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/README.md"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/README.md"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/bridge/hooks.json",
+        "targets/packages/kalareach/claude-code/0.5.0/bridge/hooks.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/bridge/hooks.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/bridge/hooks.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/bridge/mcp-servers.json",
+        "targets/packages/kalareach/claude-code/0.5.0/bridge/mcp-servers.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/bridge/mcp-servers.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/bridge/mcp-servers.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/bridge/plugin-manifest.json",
+        "targets/packages/kalareach/claude-code/0.5.0/bridge/plugin-manifest.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/bridge/plugin-manifest.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/bridge/plugin-manifest.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/connector.json",
+        "targets/packages/kalareach/claude-code/0.5.0/connector.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/connector.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/connector.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/fixtures/conformance.json",
+        "targets/packages/kalareach/claude-code/0.5.0/fixtures/conformance.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/fixtures/conformance.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/fixtures/conformance.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/fixtures/frames.json",
+        "targets/packages/kalareach/claude-code/0.5.0/fixtures/frames.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/fixtures/frames.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/fixtures/frames.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/plugin.json",
+        "targets/packages/kalareach/claude-code/0.5.0/plugin.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/plugin.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/plugin.json"
         )),
     ),
     (
-        "targets/packages/kalareach/claude-code/0.4.0/presentation.json",
+        "targets/packages/kalareach/claude-code/0.5.0/presentation.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.4.0/presentation.json"
+            "/../../bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/presentation.json"
         )),
     ),
     (
@@ -186,66 +186,66 @@ pub const FILES: &[(&str, &[u8])] = &[
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/README.md",
+        "targets/packages/kalareach/gemini-cli/0.5.0/README.md",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/README.md"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/README.md"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/bridge/gemini-extension-install.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/bridge/gemini-extension-install.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/bridge/gemini-extension-install.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/bridge/gemini-extension-install.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/bridge/gemini-extension.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/bridge/gemini-extension.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/bridge/gemini-extension.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/bridge/gemini-extension.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/bridge/hooks.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/bridge/hooks.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/bridge/hooks.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/bridge/hooks.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/connector.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/connector.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/connector.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/connector.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/fixtures/conformance.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/fixtures/conformance.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/fixtures/conformance.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/fixtures/conformance.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/fixtures/frames.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/fixtures/frames.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/fixtures/frames.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/fixtures/frames.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/plugin.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/plugin.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/plugin.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/plugin.json"
         )),
     ),
     (
-        "targets/packages/kalareach/gemini-cli/0.4.0/presentation.json",
+        "targets/packages/kalareach/gemini-cli/0.5.0/presentation.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.4.0/presentation.json"
+            "/../../bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/presentation.json"
         )),
     ),
     (
@@ -417,45 +417,45 @@ pub const FILES: &[(&str, &[u8])] = &[
         )),
     ),
     (
-        "targets/packages/kalareach/qoder-cli/0.4.0/README.md",
+        "targets/packages/kalareach/qoder-cli/0.5.0/README.md",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.4.0/README.md"
+            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/README.md"
         )),
     ),
     (
-        "targets/packages/kalareach/qoder-cli/0.4.0/connector.json",
+        "targets/packages/kalareach/qoder-cli/0.5.0/connector.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.4.0/connector.json"
+            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/connector.json"
         )),
     ),
     (
-        "targets/packages/kalareach/qoder-cli/0.4.0/fixtures/conformance.json",
+        "targets/packages/kalareach/qoder-cli/0.5.0/fixtures/conformance.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.4.0/fixtures/conformance.json"
+            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/fixtures/conformance.json"
         )),
     ),
     (
-        "targets/packages/kalareach/qoder-cli/0.4.0/fixtures/frames.json",
+        "targets/packages/kalareach/qoder-cli/0.5.0/fixtures/frames.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.4.0/fixtures/frames.json"
+            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/fixtures/frames.json"
         )),
     ),
     (
-        "targets/packages/kalareach/qoder-cli/0.4.0/plugin.json",
+        "targets/packages/kalareach/qoder-cli/0.5.0/plugin.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.4.0/plugin.json"
+            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/plugin.json"
         )),
     ),
     (
-        "targets/packages/kalareach/qoder-cli/0.4.0/presentation.json",
+        "targets/packages/kalareach/qoder-cli/0.5.0/presentation.json",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.4.0/presentation.json"
+            "/../../bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/presentation.json"
         )),
     ),
 ];
