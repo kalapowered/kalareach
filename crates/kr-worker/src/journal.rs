@@ -3056,8 +3056,9 @@ impl Journal {
     /// is a durable commit of its own, and a test that needs more than one page of them would
     /// otherwise spend as many commits as a page holds, twice over.
     #[cfg(feature = "testing")]
-    pub const fn limit_evidence_page_for_tests(&mut self, names: usize) {
-        self.evidence_page_names = Some(names);
+    pub fn limit_evidence_page_for_tests(&mut self, names: usize) {
+        self.evidence_page_names =
+            Some(names.clamp(1, kr_protocol::action::MAX_NAMED_FENCED_ACTIONS));
     }
 
     /// Stops the commit of the next dispatch marker, for this host's own tests.
