@@ -561,8 +561,9 @@ mod tests {
         }
     }
 
-    /// The gateway client in the push slot of a set of service clients, which is where a process
-    /// holds it, and what it was asked.
+    /// The gateway client in the push slot of a set of service clients, as a process that held it
+    /// there would, and what it was asked. No product process fills the slot: the companion names the
+    /// gateway client itself, and the daemon leaves the slot empty.
     fn gateway(answers: Vec<(u16, serde_json::Value)>) -> (Arc<dyn PushService>, Arc<Gateway>) {
         let stand_in = Arc::new(Gateway {
             answers: Mutex::new(answers),
