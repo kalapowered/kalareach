@@ -3726,39 +3726,61 @@ pub fn an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered() {
     );
 }
 
-/// The libraries a built executable asks the loader for, by the name or path the file records.
+/// The libraries a native file asks the loader for, by the name or path the file records.
+///
+/// On macOS they are the load commands that name a library the file needs, read with `otool -l`:
+/// the listing `otool -L` prints starts with the install name of a dynamic library, which is the
+/// file's own name and no dependency, so a loadable module would be taken for needing itself. On
+/// Linux they are the `NEEDED` entries of the dynamic section.
 ///
 /// # Panics
 ///
 /// Panics when the platform's tool for reading them is missing or fails, because a list that
 /// could not be read proves nothing.
-fn linked_libraries(executable: &Path) -> Vec<String> {
+fn linked_libraries(file: &Path) -> Vec<String> {
     if cfg!(target_os = "macos") {
         let output = std::process::Command::new("otool")
-            .arg("-L")
-            .arg(executable)
+            .arg("-l")
+            .arg(file)
             .output()
             .expect("otool to run");
         assert!(
             output.status.success(),
             "otool could not read {}",
-            executable.display()
+            file.display()
         );
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
-            .collect()
+        let mut needed = false;
+        let mut libraries = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("cmd"), Some(command)) => {
+                    needed = [
+                        "LC_LOAD_DYLIB",
+                        "LC_LOAD_WEAK_DYLIB",
+                        "LC_REEXPORT_DYLIB",
+                        "LC_LOAD_UPWARD_DYLIB",
+                    ]
+                    .contains(&command);
+                }
+                (Some("name"), Some(path)) if needed => {
+                    libraries.push(path.to_owned());
+                    needed = false;
+                }
+                _ => {}
+            }
+        }
+        libraries
     } else {
         let output = std::process::Command::new("readelf")
             .arg("-d")
-            .arg(executable)
+            .arg(file)
             .output()
             .expect("readelf to run");
         assert!(
             output.status.success(),
             "readelf could not read {}",
-            executable.display()
+            file.display()
         );
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -3770,37 +3792,107 @@ fn linked_libraries(executable: &Path) -> Vec<String> {
     }
 }
 
+/// Every Mach-O or ELF file under a package, found by its magic number and not by its name: a
+/// zsh module is a `.so`, a bash loadable has no extension, and a text file beside them is none.
+/// A link is not followed, so a file is read once under the name it is installed by.
+fn native_files(directory: &Path) -> Vec<std::path::PathBuf> {
+    use std::io::Read as _;
+
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let entries = std::fs::read_dir(&next)
+            .unwrap_or_else(|error| panic!("{} cannot be listed: {error}", next.display()));
+        for entry in entries {
+            let entry = entry.expect("a directory entry");
+            let kind = entry.file_type().expect("a file type");
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let mut magic = [0u8; 4];
+                let read = std::fs::File::open(entry.path())
+                    .and_then(|mut file| file.read_exact(&mut magic))
+                    .is_ok();
+                let native = read
+                    && (magic == *b"\x7fELF"
+                        || matches!(
+                            u32::from_be_bytes(magic),
+                            0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe
+                        ));
+                if native {
+                    found.push(entry.path());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The libraries a Linux package may need of the machine it runs on: the C library and its
+/// companions, the compiler's runtime and the terminal-information library. A shell is built where
+/// it is built and run where it is installed, so a name outside this list is a library the build
+/// machine happened to have, and the feature that asked for it is switched off in the manifest.
+const LINUX_LIBRARIES: [&str; 12] = [
+    "libc.so.6",
+    "libm.so.6",
+    "libdl.so.2",
+    "libpthread.so.0",
+    "librt.so.1",
+    "libutil.so.1",
+    "libgcc_s.so.1",
+    "libtinfo.so.6",
+    "libncurses.so.6",
+    "libncursesw.so.6",
+    "ld-linux-x86-64.so.2",
+    "ld-linux-aarch64.so.1",
+];
+
 /// KR-REQ-07.88: a built shell depends on no library that the machine which built it happened to
 /// have.
 ///
-/// A package is requalified once and distributed to machines that are not the builder. The Fish
-/// build asks for the PCRE2 the machine offers unless it is told to build its own, so a package
-/// built beside Homebrew's or a distribution's PCRE2 would name that library in its dependencies
-/// and fail to start where there is none. The case reads the executable's own list of
-/// dependencies: none names PCRE2, and on macOS every one is a library of the system.
+/// A package is requalified once and distributed to machines that are not the builder. A build
+/// that asks the machine for a library (the PCRE2 of the Fish build, the message-catalogue library
+/// of Bash on a runner whose package manager keeps it beside the compiler's default paths) names
+/// it in the executable or in a module, and the package then fails to start, or to load a module,
+/// where there is none. The case reads the load commands or dynamic section of every native file
+/// of the package: on macOS each library is one of the system's (`/usr/lib` or `/System`), and on
+/// Linux each is one of a short list of names.
 ///
 /// # Panics
 ///
-/// Panics when the built executable names a library of the build machine.
+/// Panics when the executable names no library at all, or when a native file of the package names
+/// a library of the build machine.
 pub fn the_shell_links_no_library_of_the_machine_that_built_it(kind: ShellKind) {
     let package = Package::built(kind);
-    let libraries = linked_libraries(&package.executable);
+    let directory = package
+        .executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("the package directory");
     assert!(
-        !libraries.is_empty(),
+        !linked_libraries(&package.executable).is_empty(),
         "no dependency was read from {}",
         package.executable.display()
     );
-    for library in &libraries {
-        assert!(
-            !library.to_ascii_lowercase().contains("pcre"),
-            "the {} executable depends on {library}, a library the build machine had: {libraries:?}",
-            kind.as_str()
-        );
-        if cfg!(target_os = "macos") {
+    let files = native_files(directory);
+    assert!(
+        files.contains(&package.executable),
+        "the package's executable {} was not found among its native files {files:?}",
+        package.executable.display()
+    );
+    for file in files {
+        for library in linked_libraries(&file) {
+            let system = if cfg!(target_os = "macos") {
+                library.starts_with("/usr/lib/") || library.starts_with("/System/")
+            } else {
+                LINUX_LIBRARIES.contains(&library.as_str())
+            };
             assert!(
-                library.starts_with("/usr/lib/") || library.starts_with("/System/"),
-                "the {} executable depends on {library}, which is not a library of the system: {libraries:?}",
-                kind.as_str()
+                system,
+                "{} depends on {library}, a library the build machine had and the machine the \
+                 package is installed on may not",
+                file.display()
             );
         }
     }

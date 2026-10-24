@@ -22,6 +22,13 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const BASH: ShellKind = ShellKind::Bash;
 
+/// KR-REQ-07.88: no native file of the package depends on a library of the machine that built it.
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_bash_package_links_no_library_of_the_machine_that_built_it() {
+    shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(BASH);
+}
+
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
