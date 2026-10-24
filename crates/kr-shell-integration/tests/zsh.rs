@@ -28,6 +28,13 @@ fn the_zsh_package_links_no_library_of_the_machine_that_built_it() {
     shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(ZSH);
 }
 
+/// KR-REQ-08.49: bytes the host put into the terminal are input the reader has not taken.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_taken() {
+    shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(ZSH);
+}
+
 /// KR-REQ-07.34, KR-REQ-07.85, KR-REQ-20.03: the proof the package's own SHA-256 and HMAC-SHA-256
 /// compute is the worker's HMAC-SHA-256 of the same transcript.
 #[test]
