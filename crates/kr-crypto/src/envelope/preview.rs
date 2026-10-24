@@ -17,7 +17,7 @@
 
 use kr_protocol::mailbox::{
     EnvelopePlaintext, MailboxPayloadType, SEAL_OVERHEAD_BYTES, SealedEnvelope,
-    granularity_for_bucket, mailbox_size_bucket, notification_granularity,
+    granularity_for_bucket, notification_granularity,
 };
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::scalars::NotificationPreviewKey;
@@ -128,10 +128,9 @@ pub fn open_notification_envelope(
     if padded.len() as u64 != bucket {
         return Err(PreviewRefusal::Size);
     }
+    // The padding must end in the last block of the bucket and the content must be that bucket's:
+    // both are refused here, so there is nothing to compare again afterwards.
     let unpadded = unpad_notification_preview(padded)?;
-    if mailbox_size_bucket(unpadded.len() as u64) != bucket {
-        return Err(PreviewRefusal::Size);
-    }
     let plaintext: EnvelopePlaintext =
         kr_cbor::from_canonical_slice(unpadded, &kr_cbor::Limits::DEFAULT)
             .map_err(|_| PreviewRefusal::Malformed)?;
