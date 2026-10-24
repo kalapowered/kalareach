@@ -831,13 +831,22 @@ If the first dial attempt of a route fails with `host_unreachable`, and the rela
 Each host is reached through the relay and discovery services its own configuration names, with one
 dialling endpoint for each set of services. A key holds one endpoint on a relay at a time, so two
 configurations that share a relay are never open together, and binding one closes the other. An
-attempt holds its host's endpoint from its first dial to its end, and an owner's review holds its
-host's while it runs. Nothing else the device does closes a held endpoint, and a connection that
+attempt holds its host's endpoint from its first dial to its end, an owner's review holds its
+host's while it runs, and a push registration that the person asked for holds its host's while its
+connection is open. Nothing else the device does closes a held endpoint, and a connection that
 would have to is refused until the hold ends. A visit, a look in the background at a host that is
 not the one in use (`HostLink::visit_paired`), leaves the host in use's relay to it: a visit to a
 host whose services (its relays and address lookups) differ from the host in use's and share a relay
 with them is refused as a connection lost, whether or not the host in use's endpoint is open at that
-moment. Which host is in use is asked when the visit's turn at the pool comes.
+moment. Which host is in use is asked when the visit's turn at the pool comes. A visit's refusal can
+be asked for beforehand (`HostLink::would_refuse_visit`), which binds and holds nothing; the hold
+decides when the visit connects.
+
+A visit that needs its endpoint to stay open holds it as a visit (`HostLink::visit_hold`), as a
+push registration that a look started does while its connection is open. That hold stops other
+visits and nothing the person does: choosing a host on the same relay, an owner's review and a
+pairing attempt close the endpoint, the visit's connection ends, and the background work that made
+it starts again at its next look. A hold that is not a visit's stops every request, visits included.
 
 The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
 function the host and the command line use. The device shows it only once the host's answer to
