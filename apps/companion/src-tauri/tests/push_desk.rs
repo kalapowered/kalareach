@@ -27,8 +27,8 @@ use companion_platform::notify::Permission;
 use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::device::Device;
 use companion_tauri::push::{
-    ConnectionRegistrar, HostLine, Native, PushDesk, PushFuture, PushState, PushView, Reach,
-    Registrar, Wiring,
+    ConnectionRegistrar, HostLine, LineFuture, LineStop, Native, PushDesk, PushFuture, PushState,
+    PushView, Reach, Registrar, Wiring,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::ServiceFuture;
@@ -287,6 +287,8 @@ struct Registered {
     /// registration does.
     hold_connection: bool,
     hold_answer: bool,
+    /// What the registration ends in instead of the host's answer.
+    register_stops: Option<LineStop>,
 }
 
 /// Waits for as long as `held` says of the script that a step is held.
@@ -348,18 +350,21 @@ impl HostLine for Line {
     fn register(
         &mut self,
         params: DevicePushRegisterParams,
-    ) -> PushFuture<'_, DevicePushRegisterResult> {
+    ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
-            self.script
-                .lock()
-                .expect("what was handed")
-                .credentials
-                .push((
+            let stop = {
+                let mut script = self.script.lock().expect("what was handed");
+                script.credentials.push((
                     self.host,
                     json!({ "sender_record_id": params.credential.sender_record_id.to_string() }),
                 ));
+                script.register_stops.clone()
+            };
             while_held(&self.script, |script| script.hold_answer).await;
-            Ok(registration_answer(&self.device))
+            match stop {
+                Some(stop) => Err(stop),
+                None => Ok(registration_answer(&self.device)),
+            }
         })
     }
 
@@ -367,7 +372,7 @@ impl HostLine for Line {
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
         _revision: DeviceKeyRevision,
-    ) -> PushFuture<'_, ()> {
+    ) -> LineFuture<'_, ()> {
         Box::pin(async move {
             self.script
                 .lock()
@@ -711,6 +716,40 @@ async fn a_host_the_person_asked_for_is_handed_the_credential_the_gateway_issued
             .as_slice(),
         [FIRST_TOKEN],
         "the gateway was proposed the token the provider gave"
+    );
+}
+
+/// KR-REQ-16.08: a registration the phone stopped itself, as it does for an account that has left,
+/// is shown in the phone's own words; only a host's refusal or silence is shown as the host not
+/// taking the phone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_the_phone_made_itself_is_not_shown_as_the_host_refusing() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+
+    let own = "Sign in again: the account on this phone changed.";
+    phone.registered.lock().expect("the script").register_stops =
+        Some(LineStop::Phone(own.to_owned()));
+    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    assert_eq!(phone.view().hosts[0].words, own);
+
+    let refusal = "the host did not answer in time";
+    phone.registered.lock().expect("the script").register_stops =
+        Some(LineStop::Host(refusal.to_owned()));
+    phone
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    phone.until_words("The host did not take this phone").await;
+    assert!(
+        phone.view().hosts[0].words.ends_with(refusal),
+        "{:?}",
+        phone.view().hosts[0].words
     );
 }
 
@@ -2064,7 +2103,7 @@ impl HostLine for WatchedLine<'_> {
     fn register(
         &mut self,
         params: DevicePushRegisterParams,
-    ) -> PushFuture<'_, DevicePushRegisterResult> {
+    ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
             self.script
                 .lock()
@@ -2081,7 +2120,7 @@ impl HostLine for WatchedLine<'_> {
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
         revision: DeviceKeyRevision,
-    ) -> PushFuture<'_, ()> {
+    ) -> LineFuture<'_, ()> {
         self.real.update_preview_key(preview_key, revision)
     }
 }
