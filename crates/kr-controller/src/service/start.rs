@@ -1010,6 +1010,15 @@ impl Controller {
         // What a read of the changes since a visit is answered with, when it asks for a summary,
         // is the descriptions module's to keep.
         attention.attach_descriptions(Arc::clone(&descriptions));
+        let feed_word_at_start = if policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .personal_grants_rest_on_the_feed()
+        {
+            super::remote_revocation::PERSONAL_GRANTS_REST_ON_THE_FEED
+        } else {
+            0
+        };
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -1158,7 +1167,7 @@ impl Controller {
             owner,
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
-            feed_refusal: std::sync::atomic::AtomicU8::new(0),
+            feed_refusal: std::sync::atomic::AtomicU8::new(feed_word_at_start),
             feed_withheld: std::sync::Mutex::default(),
             feed_places: std::sync::Mutex::default(),
             local_access: super::local_access::LocalAccessState::default(),

@@ -6626,8 +6626,11 @@ things remain. A mutation already forwarded runs for what is left of its dispatc
 seconds at most. A voice call a device started is not ended, as a revocation ends it, and runs to
 its deadline. An owner confirmation that a remote owner device
 signed, spent at the machine after the refusal rose, is spent under the standing the signer had. The
-refusal a removed feed puts on the grants that rest on it applies by kind of grant and stays with
-the policy's epoch, so work admitted before the removal is not held to it. The owner at the machine
+refusal a removed feed puts on the grants that rest on it applies by kind of grant: work that a
+connection under such a grant had admitted before the removal is held to it where it commits and
+where its answer is written, as it is for the two refusals above, and the default owner grant is
+not refused. It is not held in a worker that already has it, and it stays with the policy's epoch
+for a relayed batch. The owner at the machine
 is never refused, and can stop any session locally.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage

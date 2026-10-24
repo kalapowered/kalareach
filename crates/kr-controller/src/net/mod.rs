@@ -554,7 +554,8 @@ impl NetworkHost {
         let mut admitted = controller.admitted_table();
         admitted.insert(
             session.connection_id,
-            AdmittedConnection::new(record.principal(), admitted_revision),
+            AdmittedConnection::new(record.principal(), admitted_revision)
+                .under(record.grant.clone()),
         );
         drop(admitted);
         drop(registry);
@@ -1818,7 +1819,7 @@ impl Controller {
         // at this machine can stop any session.
         let answered = proxy
             .forward_mutation(mutation, vouched, deadline, &|| {
-                self.refuse_while_the_feed_refuses()
+                self.refuse_while_the_feed_refuses(vouched.actor.connection_id)
             })
             .await?;
         // Whether this came from the worker's journal rather than from a close it performed now.
