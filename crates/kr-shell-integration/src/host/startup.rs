@@ -1763,6 +1763,50 @@ pub fn holds_an_entry(path: &Path) -> bool {
     })
 }
 
+/// Whether the entry that opens a shell's bridge is in place, as the record of an install says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryInPlace {
+    /// A file the record names for the shell holds the entry.
+    Yes,
+    /// The record could be read and no file it names for the shell holds the entry: no install
+    /// was made for the shell, or the entry was taken out of its file since.
+    No,
+    /// The record could not be read, so it says nothing either way.
+    Unknown,
+}
+
+impl EntryRecord {
+    /// Whether a file this record names for `kind` holds the entry that opens the bridge.
+    ///
+    /// This is the one question a session asks before it starts a shell: a shell whose profile
+    /// carries no entry never opens the bridge, and the create would otherwise wait out the whole
+    /// of its qualification bound to learn that. It reads the record and the files it names, and
+    /// asks no shell, so it costs a few file reads on every platform. A person who put the entry
+    /// in a file by hand has no record of it, and gets the refusal until `kr shell install`
+    /// records it.
+    #[must_use]
+    pub fn opening_entry(&self, kind: ShellKind) -> EntryInPlace {
+        let Ok(files) = self.files(kind) else {
+            return EntryInPlace::Unknown;
+        };
+        let mut unreadable = false;
+        for file in &files {
+            match read_or_empty(file) {
+                Ok(contents) if strip(&contents, MARKER_BEGIN, MARKER_END).is_some() => {
+                    return EntryInPlace::Yes;
+                }
+                Ok(_) => {}
+                Err(_) => unreadable = true,
+            }
+        }
+        if unreadable {
+            EntryInPlace::Unknown
+        } else {
+            EntryInPlace::No
+        }
+    }
+}
+
 /// Splits a file around its KalaReach entry: what comes before it, the entry itself, and what comes
 /// after it.
 ///
@@ -4982,6 +5026,79 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0, "the record is the owner's alone: {mode:o}");
         }
+    }
+
+    /// The record says whether the entry that opens a shell's bridge is in place, so that a create
+    /// whose shell has none is refused before the shell starts. Nothing recorded, an entry taken
+    /// out of its file and a file that holds only the reader check all say it is not there; a
+    /// record or a file that cannot be read says nothing.
+    #[test]
+    fn the_record_says_whether_the_entry_that_opens_the_bridge_is_in_place() {
+        let root = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&root.path().join("state"));
+        assert_eq!(
+            record.opening_entry(ShellKind::Zsh),
+            EntryInPlace::No,
+            "no install was made"
+        );
+
+        let zshrc = root.path().join(".zshrc");
+        std::fs::write(&zshrc, "alias ll='ls -l'\n").expect("the person's file");
+        hold_the_record(&record)
+            .expect("holds")
+            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+            .expect("records");
+        assert_eq!(
+            record.opening_entry(ShellKind::Zsh),
+            EntryInPlace::No,
+            "recorded, with no entry in the file"
+        );
+
+        let target = StartupTarget {
+            kind: ShellKind::Zsh,
+            path: zshrc.clone(),
+            reason: "the file the case writes",
+            shared: false,
+            placement: Placement::End,
+        };
+        let body = entry(&target, Path::new("/opt/kr/entry"), false).expect("the path is text");
+        super::install(&zshrc, &body, &target.placement, &record).expect("the entry goes in");
+        assert_eq!(record.opening_entry(ShellKind::Zsh), EntryInPlace::Yes);
+        assert_eq!(
+            record.opening_entry(ShellKind::Bash),
+            EntryInPlace::No,
+            "another shell's files are not this one's"
+        );
+
+        let reader_check = root.path().join("current-host.ps1");
+        std::fs::write(
+            &reader_check,
+            format!("{CHECK_MARKER_BEGIN}\n$null\n{CHECK_MARKER_END}\n"),
+        )
+        .expect("a file that holds only the reader check");
+        hold_the_record(&record)
+            .expect("holds")
+            .add(ShellKind::PowerShell, std::slice::from_ref(&reader_check))
+            .expect("records");
+        assert_eq!(
+            record.opening_entry(ShellKind::PowerShell),
+            EntryInPlace::No,
+            "the reader check does not open the bridge"
+        );
+
+        // A name that cannot be read as a file says nothing about the entry.
+        hold_the_record(&record)
+            .expect("holds")
+            .add(ShellKind::Fish, &[root.path().to_path_buf()])
+            .expect("records");
+        assert_eq!(record.opening_entry(ShellKind::Fish), EntryInPlace::Unknown);
+
+        std::fs::write(record.path(), b"not a record").expect("rewritten");
+        assert_eq!(
+            record.opening_entry(ShellKind::Zsh),
+            EntryInPlace::Unknown,
+            "a record that cannot be read says nothing"
+        );
     }
 
     /// A name that is not text is kept byte for byte, and it is not the name its text makes of it,

@@ -342,7 +342,11 @@ does is inside a test for Bash that is not in its POSIX mode, which is what `/bi
 platforms where that file is Bash.
 
 Whether the integration actually loaded is established at run time by the handshake, never by
-reading a file back.
+reading a file back. One read comes before the shell starts, to refuse early: a managed create reads
+the record described below and, when no file the record names for the shell holds the entry that
+opens the bridge, is refused at once with the words "run `kr shell install`", instead of waiting out
+the qualification bound for a hello that cannot come. A record that cannot be read refuses nothing,
+and an entry put in a file by hand has no record until `kr shell install` runs.
 
 `kr shell install` records each startup file it puts an entry in, by the file's exact name, before
 it writes any of them, in `shell-entries.json` in the installation's state directory. `kr shell

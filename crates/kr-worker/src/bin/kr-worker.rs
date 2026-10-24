@@ -253,6 +253,16 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(fault));
         }
     };
+    // A shell whose profile carries no entry never opens the bridge, so the create would only
+    // learn that when the qualification bound ran out. The install's record says it at once.
+    if let Some(package) = &package
+        && let Some(refusal) = missing_startup_entry(paths.state_root(), package)
+    {
+        writer
+            .write_message(&ControlFrame::WorkerFailed(refusal.clone()))
+            .await?;
+        return Err(refusal.message.into());
+    }
 
     let display_number = DisplayNumber::new(arguments.display);
     let endpoint = environment.worker_endpoint(display_number)?;
@@ -588,6 +598,30 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
                     .to_owned(),
             })?;
     ShellPackage::read(std::path::Path::new(directory)).map(Some)
+}
+
+/// Why a managed session whose shell has no startup entry is not started, when it is not.
+///
+/// The record `kr shell install` keeps says which files hold the entry. A record that cannot be
+/// read says nothing, and the handshake then decides as it always has.
+fn missing_startup_entry(
+    state_root: &std::path::Path,
+    package: &ShellPackage,
+) -> Option<ProtocolError> {
+    use kr_shell_integration::host::startup::{EntryInPlace, EntryRecord};
+
+    let record = EntryRecord::in_state_directory(state_root);
+    (record.opening_entry(package.kind()) == EntryInPlace::No).then(|| {
+        ProtocolError::new(
+            ErrorCode::ShellIntegrationUnsupported,
+            format!(
+                "no startup entry for {} is installed, so the shell would never open its bridge to \
+                 this session; run `kr shell install`, or create the session with --shell-mode \
+                 native_compat",
+                package.kind()
+            ),
+        )
+    })
 }
 
 /// Returns this installation's launcher, the `kr-hook` beside this executable in every packaged
