@@ -681,8 +681,8 @@ jobs:
             echo 'share\signatures.txt inside each archive records the signer of each file that'
             echo 'carries one. Check one signature for yourself after unpacking:'
             echo
-            echo '    Get-AuthenticodeSignature .\bin\kr.exe | Format-List'
-            echo '    signtool verify /pa /v .\bin\kr.exe'
+            printf '%s\n' '    Get-AuthenticodeSignature .\bin\kr.exe | Format-List'
+            printf '%s\n' '    signtool verify /pa /v .\bin\kr.exe'
             echo
             echo 'Verify the archive itself against the sum:'
             echo
