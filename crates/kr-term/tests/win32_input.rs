@@ -2,10 +2,7 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-08.51 | The byte-preservation promise starts at ConPTY's output pipe |
-//! | KR-REQ-08.52 | The encoding, the final underscore, the six fields and their defaults |
 //! | KR-REQ-08.53 | The worker records its owned backend's input encoding from what that backend asked for |
-//! | KR-REQ-08.54 | Legacy VT input is accepted without claiming scan-code fidelity |
 //! | KR-REQ-08.55 | Every mode request and reset stops at this boundary and is never broadcast |
 //! | KR-REQ-08.56 | The encoding of composition, dead keys, AltGr, paste, mouse and ordering. **Not** the record path's own qualification: nothing here drives a console, an IME or a keyboard, so that stays open for a machine which can |
 //!
@@ -76,6 +73,11 @@ fn the_worker_records_what_its_own_backend_asked_for(/* KR-REQ-08.53 */) {
     assert_eq!(engine.modes().backend_input_fidelity(), Fidelity::LegacyVt);
 }
 
+/// KR-REQ-08.52, the part about `CSI ?9001h` and `CSI ?9001l`: a request, a repeated request, a
+/// disable and a repeated disable, in any order, leave the recorded state as the last word said,
+/// and none of them is forwarded to a client or listed in a snapshot. Not shown here: the
+/// encoding of a record, and what happens between two consoles inside a session, which is the
+/// console's own behaviour.
 #[test]
 fn a_nested_transition_never_forwards_a_mode_change_across_this_boundary(/* KR-REQ-08.55 */) {
     // A session runs `wsl.exe`, an `ssh` client, or another ConPTY, and each asks for win32 input
@@ -151,6 +153,10 @@ fn a_unix_backend_never_enters_the_mode_however_often_it_is_asked(/* KR-REQ-08.5
     assert_eq!(engine.modes().backend_input_fidelity(), Fidelity::LegacyVt);
 }
 
+/// KR-REQ-08.52, the part about the form of the encoding and its UTF-16 code unit field: a
+/// composed character is written as `CSI Vk;Sc;Uc;Kd;Cs;Rc_` with all six fields and the final
+/// underscore (`\x1b[0;0;12354;1;0;1_`) and reads back as the record it was written from, and a
+/// character outside the basic plane is two records. Not shown here: omitted fields.
 #[test]
 fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08.56 */) {
     // Windows IME composition ends in one `WM_CHAR` per UTF-16 code unit, which the console
@@ -217,6 +223,10 @@ fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.56 */) {
     );
 }
 
+/// KR-REQ-08.52, the part about the control-key state field: right Alt with left Ctrl is written
+/// with all six fields and the final underscore (`\x1b[50;3;64;1;9;1_`), its virtual key, scan
+/// code, code unit and control-key state as the console reported them, and reads back as the
+/// record it was written from.
 #[test]
 fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.56 */) {
     // On a keyboard with an AltGr key the console reports right Alt and left Ctrl together. An
@@ -238,6 +248,9 @@ fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.56 */) {
     assert!(read_back.is_alt_graph());
 }
 
+/// KR-REQ-08.52, the part about the key-down and repeat-count fields: a held key is one record
+/// with its count and a key coming up is a record of its own after it, each written with all six
+/// fields and the final underscore (`\x1b[65;30;97;1;0;4_\x1b[65;30;97;0;0;1_`).
 #[test]
 fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts(/* KR-REQ-08.56 */) {
     // A held key is one record with a count. A key coming up is a record of its own, and it comes
@@ -289,8 +302,12 @@ fn paste_and_mouse_stay_the_separate_operations_they_are(/* KR-REQ-08.56 */) {
     assert!(engine.modes().is_set(ModeKind::Dec, 1006));
 }
 
+/// KR-REQ-08.54, the part about the claim made for legacy VT input: it is described as having no
+/// Windows scan-code fidelity and is not said to carry console scan codes, while records are
+/// described as the console reported them, with no claim of a hardware scan code. Not shown here:
+/// the bytes the legacy input path sends for a record, which the console reader's cases show.
 #[test]
-fn legacy_input_is_accepted_without_claiming_a_fidelity_it_has_not_got(/* KR-REQ-08.54 */) {
+fn legacy_input_is_accepted_without_claiming_a_fidelity_it_has_not_got() {
     // Microsoft's contract lets a terminal ignore mode 9001, so a client that sends no records is
     // behaving correctly. What must never happen is this host describing that input as carrying
     // Windows scan codes.
@@ -311,8 +328,12 @@ fn legacy_input_is_accepted_without_claiming_a_fidelity_it_has_not_got(/* KR-REQ
     );
 }
 
+/// KR-REQ-08.51, the fixture leg: on an engine whose backend is the pseudo-console the worker
+/// owns, every byte the console's output pipe produced is forwarded unchanged, so the promise is
+/// about the bytes the session was handed. Not shown here: the document's statement of where the
+/// promise begins.
 #[test]
-fn the_byte_preservation_promise_starts_at_the_consoles_output_pipe(/* KR-REQ-08.51 */) {
+fn the_byte_preservation_promise_starts_at_the_consoles_output_pipe() {
     // What the engine sees on this backend is already what ConPTY rendered. An application that
     // wrote through the console API produced no bytes at all, and the ones that arrive are the
     // console's rendering of what it did. So the promise this session makes is about the bytes it

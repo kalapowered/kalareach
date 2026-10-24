@@ -7,7 +7,6 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-25.09 | `the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision` |
 //! | KR-REQ-23.32 | `an_answer_to_a_revision_that_is_no_longer_current_is_refused` |
 //! | KR-REQ-06.08, KR-REQ-23.32 | `a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revision` |
 //! | KR-REQ-23.31 | `a_caller_token_works_only_for_the_helper_it_was_issued_to` |
@@ -56,6 +55,9 @@ fn create(session_id: SessionId) -> QuestionCreateParams {
     }
 }
 
+/// KR-REQ-25.09: the agent that asked reads its answer through its own caller token with the
+/// answer, the verified principal that answered, the paired device it came from and the exact
+/// revision the person was shown.
 #[test]
 fn the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision() {
     let session_id = SessionId::new(Uuid::from_bytes([4; 16]));

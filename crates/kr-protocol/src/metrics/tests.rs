@@ -13,8 +13,9 @@ use crate::envelope::ParamsValue;
 use crate::hostinfo::{EffectiveConfiguration, HostDoctorResult};
 use crate::scalars::U64;
 
-/// The committed vector is the one the declaration writes, so the service's suite and this one
-/// hold their declarations to the same document.
+/// KR-REQ-26.43, the part about the metric set and its label lists: the committed vector is the
+/// one the declaration writes, so the service's suite and this one hold their declarations to the
+/// same document. Not shown here: what any list holds, which the next case reads.
 #[test]
 fn the_committed_vector_is_the_one_the_declaration_writes() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -27,8 +28,9 @@ fn the_committed_vector_is_the_one_the_declaration_writes() {
     assert_eq!(committed, vector());
 }
 
-/// The vector names each host metric once, in the order section 26 names them, with the labels it
-/// may carry, and gives every label that any of them carries its shape and every value it may take.
+/// KR-REQ-26.43, the part about the metric set and the label lists: the vector names each host
+/// metric once, in the order section 26 names them, with the labels it may carry, and gives every
+/// label that any of them carries its shape and every value it may take.
 #[test]
 fn the_vector_lists_each_metric_and_every_value_each_of_its_labels_may_take() {
     let vector = vector();
@@ -101,9 +103,10 @@ fn an_attempt_falls_in_the_range_that_holds_it() {
     }
 }
 
-/// A package is one of the bundled adapters only by its exact identifier, and the adapters are the
-/// agent connectors the product bundles: a package that merely ends in one of their names, or
-/// belongs to another publisher, counts under no name.
+/// KR-REQ-26.43, the part about the adapter label: a package is one of the bundled adapters only
+/// by its exact identifier, and the adapters are the agent connectors the product bundles: a
+/// package that merely ends in one of their names, or belongs to another publisher, counts under
+/// no name.
 #[test]
 fn a_package_is_an_adapter_only_by_its_exact_identifier() {
     assert_eq!(
@@ -226,8 +229,9 @@ fn a_recorder_counts_each_series_and_reports_them_in_a_fixed_order() {
     assert!(Recorder::new(Environment::Production).report().is_empty());
 }
 
-/// A report is made of this build's own words, so one that names something else does not parse:
-/// there is nowhere in it for a line of output, a prompt or a file's name to go.
+/// KR-REQ-26.43, the part about what a label may hold: a report is made of this build's own words,
+/// so one that names something else does not parse: there is nowhere in it for a line of output, a
+/// prompt or a file's name to go.
 #[test]
 fn a_report_naming_a_word_this_build_does_not_have_does_not_parse() {
     let ok = json!({
@@ -390,9 +394,10 @@ fn a_hosts_metrics_are_counted_or_withheld_and_nothing_else_decodes() {
     }
 }
 
-/// A worker says its counts in words and the daemon keeps the ones this build has: each word of
-/// this build's own lists comes back as the value it spells, in the daemon's environment, and a
-/// word it has not is left out, so a list that grows on one side does not break the other.
+/// KR-REQ-26.43, the part about the counts a worker reports: a worker says its counts in words and
+/// the daemon keeps the ones this build has: each word of this build's own lists comes back as the
+/// value it spells, in the daemon's environment, and a word it has not is left out, so a list that
+/// grows on one side does not break the other.
 #[test]
 fn what_a_worker_says_is_read_against_this_builds_own_lists() {
     let recorder = Recorder::new(Environment::Production);

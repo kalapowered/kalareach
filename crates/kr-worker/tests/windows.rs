@@ -5,8 +5,6 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-03.03 | PowerShell 7 is the root shell, inside a pseudo-console this worker owns |
-//! | KR-REQ-07.62 | The per-session job object: kill-on-close, breakaway disabled, joined before execution |
 //! | KR-REQ-07.63 | A process started outside the job is not held by it and survives its closure; the broker that records it as an external resource is not in this build |
 //! | KR-ACC-010 | Resize, draining, the text the console carries, the interrupt, the process tree, and PowerShell itself |
 //! | KR-REQ-02.04, KR-REQ-05.02 | Each worker keeps a write-ahead-logged SQLite journal of its own and is reached on a named pipe of its own, whose list is protected and its owner's |
@@ -164,8 +162,13 @@ fn powershell_in_a_console(command: &str) -> (Pty, Box<dyn Read + Send>, RootShe
     (pty, reader, shell)
 }
 
+/// KR-REQ-03.03, the part about PowerShell 7 as the shell inside a pseudo-console the worker owns:
+/// the console opens, the program asked for by name is `pwsh.exe` and not Windows PowerShell 5.1,
+/// the shell started in it reports the Core edition at major version 7, and it ends of its own
+/// accord. Not shown here: which shell a session that names none starts, since this case starts
+/// PowerShell 7 directly and no session is made.
 #[test]
-fn powershell_seven_is_the_shell_that_runs_inside_the_console(/* KR-REQ-03.03 */) {
+fn powershell_seven_is_the_shell_that_runs_inside_the_console() {
     // KR-REQ-04.01: the worker's terminal is `portable-pty`'s native backend, which on Windows is
     // a pseudo-console, and a shell runs inside it.
     // The program is asked for by name, so what answers has to be PowerShell 7 rather than the
@@ -309,8 +312,12 @@ fn an_interrupt_reaches_the_application_in_the_console(/* KR-ACC-010 */) {
     drain_until_it_ends(&pty, &mut reader, &mut shell);
 }
 
+/// KR-REQ-07.62, the limits of the per-session job: read back from the job, kill-on-close is set
+/// and breakaway is not permitted, and the ownership boundary the shell is recorded under is that
+/// job and a complete boundary. Not shown here: that closing the last handle ends what the job
+/// holds, which the case further down runs.
 #[test]
-fn the_session_job_kills_on_close_and_refuses_breakaway(/* KR-REQ-07.62 */) {
+fn the_session_job_kills_on_close_and_refuses_breakaway() {
     let (_pty, _reader, mut shell) = powershell_in_a_console("Start-Sleep -Seconds 120");
     let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
     let job = kr_worker::windows::job::holding(root).expect("the session's job");
@@ -340,8 +347,13 @@ fn the_session_job_kills_on_close_and_refuses_breakaway(/* KR-REQ-07.62 */) {
 
 /// KR-REQ-07.56: a process that detaches itself from its parent as far as Windows allows is still
 /// held by the session's job, so it cannot outlive the session by leaving its parent chain.
+///
+/// KR-REQ-07.62, the part about what the per-session job holds: the root shell and a process the
+/// shell started and hid are both in the job, the session records that tree, and closing the
+/// boundary empties the job. Not shown here: the job's kill-on-close and breakaway limits, which
+/// the cases beside it read back and run.
 #[test]
-fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010, KR-REQ-07.62 */) {
+fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010 */) {
     // The shell starts a grandchild that detaches itself from its parent as far as this platform
     // allows, then reports both identifiers. Neither may be outside the job: that is what makes
     // the boundary a boundary rather than a parent chain.
@@ -433,8 +445,11 @@ fn the_job_names_its_members_by_the_handle_it_asked_and_refuses_a_stranger(/* KR
     shell.wait().expect("the shell ends");
 }
 
+/// KR-REQ-07.62, the part about kill-on-close as behaviour: with the console dropped, which drops
+/// the only handle to the session's job, a process the shell started ends and nothing holds the
+/// job any more.
 #[test]
-fn closing_the_last_handle_ends_what_the_job_holds(/* KR-REQ-07.62 */) {
+fn closing_the_last_handle_ends_what_the_job_holds() {
     // Kill-on-close is the promise that a worker which crashes, is killed, or exits without
     // closing its session still takes the session's processes with it. Reading the limit back
     // says it was asked for; this is the behaviour. The console is dropped, which drops the only
