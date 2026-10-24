@@ -728,6 +728,12 @@ answer; it says so of every package that ships a component, whether or not the p
 An action whose implementation is `component` runs in two passes, so that the call to another
 process never happens inside the boundary that revalidates an action and writes its dispatch marker.
 
+How far the plan reaches is the connector table's. The host writes a plan only as an operation the
+table spells, which today is a cancellation: a component's plan for a prompt, a steer, an
+attachment, terminal text or a method of its own is refused as `UNSUPPORTED_CAPABILITY` before the
+marker, a package's action is refused on a Claude Code channel, and no connector table in the bundled
+generation declares operations ([Agent methods](../host/README.md#agent-methods)).
+
 1. The first pass is the admission. The request goes through everything any mutation goes through
    up to the receipt's `accepted` state: the envelope, the action window, the limits, the rights of
    the action's class, and the arguments read against the parameters the action declares. It also
@@ -833,6 +839,10 @@ holds a handle of its own until the binding is unbound or its owner goes, and on
 go signals the thread.
 
 ### An action that offers an attachment
+
+No connector installed from a package carries this offer today: the host's frame for it is kept
+until a connector table can spell an attachment, and a package's table is compiled to a closed table
+that lists only what it spells. What follows describes the offer as the worker prepares it.
 
 An action that offers an attachment from a draft is a component action that also names a draft. The
 action's package must declare that it offers attachments by uploading them to the upstream. That's
