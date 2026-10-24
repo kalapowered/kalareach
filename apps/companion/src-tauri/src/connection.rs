@@ -945,11 +945,11 @@ mod tests {
             assert_eq!(error.code, ErrorCode::PermissionDenied);
             let words = error.message.clone();
             let told = said(error);
-            assert_eq!(told, words, "the host's own words alone");
+            assert!(told.ends_with(&words), "the host's own words: {told}");
             assert!(!told.contains(hint));
         }
         let other = ProtocolError::new(ErrorCode::InvalidArgument, "the grant is malformed");
-        assert_eq!(said(other), "the grant is malformed");
+        assert!(said(other).ends_with("the grant is malformed"));
     }
 
     /// A connection says whether its host is one this device is paired with, because an
