@@ -72,6 +72,9 @@ struct ReceiverState {
     /// one the platform gave when it was asked, and reaches the asker when the test lets it.
     permission_held: BTreeSet<usize>,
     permission_released: BTreeSet<usize>,
+    /// Whether the filing of the preview key waits to be let go, and whether it has been asked.
+    limited_key_held: bool,
+    limited_key_reached: bool,
     /// The reads of the token, by their number, that wait to be released in the same way.
     token_held: BTreeSet<usize>,
     token_released: BTreeSet<usize>,
@@ -106,6 +109,8 @@ impl Receiver {
                 permission_panics: false,
                 permission_held: BTreeSet::new(),
                 permission_released: BTreeSet::new(),
+                limited_key_held: false,
+                limited_key_reached: false,
                 token_held: BTreeSet::new(),
                 token_released: BTreeSet::new(),
                 token_reads: 0,
@@ -243,12 +248,18 @@ impl Native for Receiver {
         seed: &'a [u8],
     ) -> PushFuture<'a, ()> {
         Box::pin(async move {
-            self.state
-                .lock()
-                .expect("the receiver")
-                .filed
-                .push((*recipient_key_id, seed.to_vec()));
-            Ok(())
+            {
+                let mut state = self.state.lock().expect("the receiver");
+                state.limited_key_reached = true;
+                state.filed.push((*recipient_key_id, seed.to_vec()));
+            }
+            loop {
+                let held = self.state.lock().expect("the receiver").limited_key_held;
+                if !held {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         })
     }
 
@@ -2307,4 +2318,45 @@ async fn a_forgotten_host_that_never_answers_does_not_keep_the_relay_it_was_reac
     .expect("another host on the relay connects once the forgotten host's run has ended");
     eventually("the run ended", || Arc::strong_count(&phone.desk) == 1).await;
     phone.registered.lock().expect("what was sent").hold_answer = false;
+}
+
+/// The hold on a host's endpoint ends with the line: the key is filed on the phone after the last
+/// change to the host, and while it is filed another host on the same relay connects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_endpoint_of_a_host_is_let_go_before_the_preview_key_is_filed() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let in_use = Host::start(&owner).await;
+    let running = on_the_shared_relay(&owner, 9).await;
+    let other = on_the_shared_relay(&owner, 10).await;
+    let phone = desk_over_the_product_registrar(&[&in_use, &running, &other], &owner).await;
+    let references = phone.references();
+    let host = |number: usize| {
+        phone
+            .device
+            .host_by_reference(&references[number])
+            .expect("a paired host")
+    };
+    phone
+        .device
+        .use_host(host(0).host_device_id)
+        .expect("the host in use");
+    let other_host = host(2);
+    phone.receiver.with(|state| state.limited_key_held = true);
+
+    phone.desk.enable(&references[1]).expect("the person asks");
+    eventually("the run is filing the key", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .limited_key_reached
+    })
+    .await;
+    companion_tauri::connection::Connection::paired(&phone.device, &other_host)
+        .await
+        .expect("another host on the relay connects while the key is filed");
+
+    phone.receiver.with(|state| state.limited_key_held = false);
+    phone.until(|states| states[1] == PushState::On).await;
 }
