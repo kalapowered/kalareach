@@ -42,10 +42,11 @@ question afterwards, on every wake of its supervision: is the process that owns 
 still running, with the same start value? That is one kernel query, which is what lets it be asked
 that often.
 
-A worker that is already gone cannot be asked, so the host reads the desktop from that session's own
-journal and asks the platform about that login session by its own identifier. Which desktop the host
-has now is a different question: one user can hold several logins at once, and a worker that crashed
-while its own login carried on is a crash rather than a logout.
+A worker that is already gone cannot be asked, so the host reads the desktop the worker reported
+from the registry's row of the worker, without opening the session's journal, and asks the platform
+about that login session by its own identifier. Which desktop the host has now is a different
+question: one user can hold several logins at once, and a worker that crashed while its own login
+carried on is a crash rather than a logout.
 
 ## What logout does
 
