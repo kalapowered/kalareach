@@ -26,7 +26,9 @@ use std::time::Duration;
 use companion_platform::notify::Permission;
 use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::device::Device;
-use companion_tauri::push::{Native, PushDesk, PushFuture, PushState, PushView, Registrar, Wiring};
+use companion_tauri::push::{
+    Native, PushDesk, PushFuture, PushState, PushView, Registrar, StillWanted, Wiring,
+};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::ServiceFuture;
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
@@ -267,8 +269,12 @@ struct Registered {
         Value,
         kr_protocol::scalars::NotificationPreviewKey,
     )>,
+    /// What the desk answered each time the registrar asked whether the run was still wanted.
+    asked: Vec<bool>,
 }
 
+/// The host's side as the product's registrar keeps to it: it asks whether the run is still wanted
+/// before it sends anything, and sends nothing when it is not.
 struct HostLink(Arc<Mutex<Registered>>);
 
 impl Registrar for HostLink {
@@ -277,8 +283,14 @@ impl Registrar for HostLink {
         host: &'a PairedHost,
         params: DevicePushRegisterParams,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        wanted: &'a StillWanted<'a>,
     ) -> PushFuture<'a, DevicePushRegisterResult> {
         Box::pin(async move {
+            let still = wanted();
+            self.0.lock().expect("what was handed").asked.push(still);
+            if !still {
+                return Err("this phone is no longer paired with that host".to_owned());
+            }
             self.0.lock().expect("what was handed").handed.push((
                 host.host_device_id,
                 json!({ "sender_record_id": params.credential.sender_record_id.to_string() }),
@@ -304,6 +316,33 @@ fn vectors() -> Value {
 /// issues the credential the vectors record. It keeps the tokens it was proposed.
 struct Gateway {
     proposed: Mutex<Vec<String>>,
+    /// Whether the answer to an authorisation request is held until released, and how many such
+    /// requests have reached the gateway.
+    issue: Mutex<Issue>,
+}
+
+#[derive(Default)]
+struct Issue {
+    held: bool,
+    reached: usize,
+}
+
+impl Gateway {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            proposed: Mutex::new(Vec::new()),
+            issue: Mutex::new(Issue::default()),
+        })
+    }
+
+    /// Holds (or lets go) the answers to authorisation requests.
+    fn hold_issue(&self, held: bool) {
+        self.issue.lock().expect("the issue script").held = held;
+    }
+
+    fn issue_requests(&self) -> usize {
+        self.issue.lock().expect("the issue script").reached
+    }
 }
 
 impl fmt::Debug for Gateway {
@@ -321,7 +360,8 @@ impl ServiceHttp for Gateway {
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let sent: Value = serde_json::from_slice(body).expect("a request");
         let records = vectors()["records"].clone();
-        let answer = if url.ends_with("/api/push/sender/issue") {
+        let is_issue = url.ends_with("/api/push/sender/issue");
+        let answer = if is_issue {
             json!({ "ok": true, "data": {
                 "record": records["sender_record"],
                 "credential": records["delivery_credential"],
@@ -342,6 +382,17 @@ impl ServiceHttp for Gateway {
             }})
         };
         Box::pin(async move {
+            if is_issue {
+                self.issue.lock().expect("the issue script").reached += 1;
+                // The answer reaches the phone when the test lets it go.
+                loop {
+                    let held = self.issue.lock().expect("the issue script").held;
+                    if !held {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
             Ok(ServiceHttpAnswer {
                 status: 200,
                 body: serde_json::to_vec(&answer).expect("an answer"),
@@ -499,9 +550,7 @@ fn open_over(
     registered: &Arc<Mutex<Registered>>,
     ends: Arc<AtomicBool>,
 ) -> Opened {
-    let gateway = Arc::new(Gateway {
-        proposed: Mutex::new(Vec::new()),
-    });
+    let gateway = Gateway::new();
     let http = Arc::clone(&gateway);
     let clock_ahead_ms = Arc::new(AtomicU64::new(0));
     let ahead = Arc::clone(&clock_ahead_ms);
@@ -1324,5 +1373,107 @@ async fn a_look_whose_older_answer_arrives_last_does_not_hide_a_change_another_l
         proposed(&phone.gateway),
         [FIRST_TOKEN, SECOND_TOKEN],
         "the run went round again with the token the second look saw"
+    );
+}
+
+/// The person forgets a host while the gateway is issuing the authorisation for it, and then the
+/// gateway answers. `forgets` is what the person did. The run asks the registrar, which asks
+/// whether the run is still wanted; the answer is no, and the host is handed nothing.
+async fn a_host_forgotten_while_the_gateway_issues_for_it(
+    forgets: impl FnOnce(&Desk, &PairedHost),
+) {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    phone.gateway.hold_issue(true);
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    eventually("the gateway was asked to issue", || {
+        phone.gateway.issue_requests() == 1
+    })
+    .await;
+
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .remove(0);
+    forgets(&phone, &paired);
+    phone.gateway.hold_issue(false);
+
+    eventually("the run asked the registrar", || {
+        !phone
+            .registered
+            .lock()
+            .expect("what was handed")
+            .asked
+            .is_empty()
+    })
+    .await;
+    let registered = phone.registered.lock().expect("what was handed");
+    assert_eq!(registered.asked, [false], "the run was no longer wanted");
+    assert!(registered.handed.is_empty(), "the host was handed nothing");
+}
+
+/// The person forgets the host (the application's record of it goes with the run's claim): the host
+/// receives neither the registration nor the preview key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_the_gateway_issues_for_it_receives_nothing() {
+    a_host_forgotten_while_the_gateway_issues_for_it(|phone, paired| {
+        phone.desk.forgotten(paired.host_device_id);
+    })
+    .await;
+}
+
+/// Forgetting a host removes the pairing before the desk drops its claim; a run that wakes between
+/// the two is not wanted either, and the host receives nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_unpaired_while_the_gateway_issues_for_it_receives_nothing() {
+    a_host_forgotten_while_the_gateway_issues_for_it(|phone, paired| {
+        phone
+            .device
+            .forget_host(paired.host_device_id)
+            .expect("the pairing is forgotten");
+    })
+    .await;
+}
+
+/// A run that waits for its turn at the phone's one registration slot, and whose host is forgotten
+/// while it waits, does not take the slot when its turn comes: it proposes nothing to the gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_it_waits_for_its_turn_proposes_nothing() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    // The first host's challenge is not answered, so it keeps the slot.
+    receiver.with(|state| state.answering = false);
+    let phone = desk(&[&first, &second], &owner, receiver).await;
+    let references = phone.references();
+    phone.desk.enable(&references[0]).expect("the person asks");
+    eventually("the first token was proposed", || {
+        proposed(&phone.gateway) == [FIRST_TOKEN]
+    })
+    .await;
+    phone.desk.enable(&references[1]).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::Working, PushState::Working])
+        .await;
+    // The second host's run waits for the slot. Its host is forgotten, and the first run finishes.
+    let second_host = phone
+        .device
+        .host_by_reference(&references[1])
+        .expect("the second host");
+    phone.desk.forgotten(second_host.host_device_id);
+    phone.receiver.with(|state| state.answering = true);
+
+    // Only the test's own handle is left when both runs have ended.
+    eventually("both runs ended", || Arc::strong_count(&phone.desk) == 1).await;
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN],
+        "the run that was not wanted proposed nothing"
     );
 }
