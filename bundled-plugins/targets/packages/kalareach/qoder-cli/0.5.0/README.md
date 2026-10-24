@@ -87,7 +87,8 @@ integration, below.
 When a person runs `qodercli` in a KalaReach session with the integration on, the host adds two
 arguments, in this order: `--settings`, and inline settings that hold hooks and nothing else. They
 are the two elements the core repository keeps in `fixtures/bridges/qoder-cli/flags.json`, byte for
-byte: `kr-hook qoder-cli hook`, the KalaReach forwarder, in exec form and with no matcher, for
+byte: the KalaReach forwarder, written as `{kr_hook}` for KalaReach to replace with the full path of
+the copy it installed, with `qoder-cli hook` as its arguments, in exec form and with no matcher, for
 `SessionStart`, `SessionEnd`, `PostToolUse`, `PostToolUseFailure` and `Notification`, with a timeout
 of one second for `SessionEnd` and five for the rest. On these five events only exit code 2 refuses
 anything, and the forwarder never exits with it.
