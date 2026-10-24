@@ -408,7 +408,7 @@ impl Unwritable {
                 }
                 ErrorCode::CannotOpen => "the registry file cannot be opened",
                 ErrorCode::DatabaseLocked => "a table of the registry is locked",
-                ErrorCode::FileLockingProtocolFailed => "the registry's lock could not be taken",
+                ErrorCode::FileLockingProtocolFailed => "the registry's file locks failed",
                 _ => "the registry gave an error this build does not name",
             },
             _ => "the registry gave an error this build does not name",

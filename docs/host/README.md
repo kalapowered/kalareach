@@ -6730,7 +6730,7 @@ ended. A spend holds the lock for a few milliseconds; the wait goes on past that
 that does not end, or a registry that cannot take a write at all. The refusal stands meanwhile, the
 carrier reads no more of the feed, and `kr doctor` shows the check as a warning that says the
 refusal waits for the registry to take a write, since when, and why; the log says it when the
-wait starts and when its reason changes. The
+wait is first found stuck and when its reason changes. The
 wait asks again by itself and goes on when the registry takes a write. A start that restores a
 removal waits for nothing, since no endpoint is bound yet and no confirmation can be under way. What
 a spend that had committed before the refusal rose goes on

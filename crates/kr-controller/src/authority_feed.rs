@@ -509,8 +509,9 @@ impl FeedRuntime {
             // The registry is the likely cause only when the pass was not stopped by the feed.
             (DoctorStatus::Warning, Some(CATCHING_UP_REMEDY))
         } else if stuck.is_some() {
-            // The feed's own state is stale or a pass stopped because this host could not finish
-            // it, and the wait for the registry is why: its remedy replaces theirs.
+            // The feed's own state is stale, or a pass stopped (the feed turned a request back, or
+            // this host could not finish it), and the wait for the registry is why nothing more is
+            // read: its remedy replaces theirs.
             (DoctorStatus::Warning, Some(STUCK_DRAIN_REMEDY))
         } else {
             (state, remedy)
@@ -574,6 +575,10 @@ impl FeedRuntime {
                             "a write to the pairing records has held the registry's write lock \
                              for at least ",
                         )
+                        .number(waited)
+                        .stated(" seconds"),
+                    DrainWhy::Unanswered => detail
+                        .stated("the ask for the registry's write lock has not been answered for at least ")
                         .number(waited)
                         .stated(" seconds"),
                     DrainWhy::Failed(kind) => detail
