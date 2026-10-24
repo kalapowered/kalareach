@@ -3769,6 +3769,112 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     );
 }
 
+/// A journal of an earlier build for a closed session: the session's own record in it, at the schema
+/// that build wrote.
+fn journal_of_an_earlier_build(
+    host: &kr_ipc::testing::TempHost,
+    session_id: kr_protocol::ids::SessionId,
+) {
+    use kr_protocol::ids::SessionEpoch;
+    use kr_protocol::session::{
+        Dimensions, DisplayNumber, SessionState, SessionSummary, ShellMode,
+    };
+
+    let path = host.environment().journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
+    let mut journal = kr_worker::journal::Journal::open(&path).expect("the journal opens");
+    journal
+        .record_session(&SessionSummary {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: DisplayNumber::new(1),
+            state: SessionState::Live,
+            shell_mode: ShellMode::NativeCompat,
+            shell_path: "/bin/sh".to_owned(),
+            cwd: "/recovered".to_owned(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1_000),
+            dimensions: Dimensions::new(80, 24),
+            attachment_count: kr_protocol::scalars::U64::new(1),
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+            environment_sources: None,
+            root: None,
+            application: None,
+        })
+        .expect("records the session");
+    drop(journal);
+    rusqlite::Connection::open(&path)
+        .expect("opens the store")
+        .execute_batch(
+            "DROP TABLE privacy;
+             DROP TABLE outbox;
+             DROP TABLE outbox_cursors;
+             DROP TABLE journal_gaps;
+             UPDATE schema_version SET version = 3;",
+        )
+        .expect("puts it back to the earlier shape");
+}
+
+/// KR-REQ-24.18: a session whose journal is of an earlier schema, and cannot be brought forward
+/// while another recovery holds the session, is packed with the summary the closure alone gives.
+/// A day on, with the session free, the generation is made again with what the session's own
+/// record says, however little else changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_packed_while_its_journal_was_held_back_is_packed_again_once_it_can_be_read() {
+    use kr_protocol::session::DisplayNumber;
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let mut recovery = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        journal_of_an_earlier_build(host, session);
+        recovery = Some(
+            kr_controller::archive::ArchiveService::new(host.environment())
+                .take_ownership(
+                    session,
+                    DisplayNumber::new(1),
+                    &kr_ipc::identity::ended_process_identity(4_000_031),
+                )
+                .expect("a recovery holds the session"),
+        );
+        closed = Some(session);
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let cwd_of = |members: &std::collections::BTreeMap<String, Vec<u8>>| {
+        let document: serde_json::Value =
+            serde_json::from_slice(&members[&format!("sessions/{session}.json")])
+                .expect("a session export");
+        document["session"]["cwd"].clone()
+    };
+    assert!(
+        cwd_of(&opened_members(&rig, 1)).is_null(),
+        "built from the closure alone while another recovery holds the session"
+    );
+
+    drop(recovery);
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    timer.run_by_itself();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    assert_eq!(
+        cwd_of(&opened_members(&rig, 2)),
+        "/recovered",
+        "and made again from the session's own record once nothing holds it"
+    );
+}
+
 /// The sizes a generation is held to are the convention's, which a restore accepts: an external
 /// fact the producer and the restore must agree on, so the production value is written out here.
 #[test]

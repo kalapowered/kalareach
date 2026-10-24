@@ -491,16 +491,20 @@ impl Controller {
         journal.read_closure(session_id).ok().flatten()
     }
 
-    /// Reads the session a worker described, when its journal survived it.
-    fn recovered_summary(&self, session_id: SessionId) -> Option<SessionSummary> {
+    /// Reads the session a worker described, when its journal survived it, and says whether the
+    /// journal was held back from being brought forward and so could not be read.
+    fn recovered_summary(&self, session_id: SessionId) -> (Option<SessionSummary>, bool) {
         // A session that closed before this build shipped wrote an earlier schema. The archive
         // brings such a store forward once, under this daemon's ownership of a session with no
         // worker, so the shell, the directory, the geometry and the creation time it holds are
         // still what a person is shown.
-        self.archive().bring_forward(session_id);
+        let forward = self.archive().bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
-        let journal = kr_worker::journal::Journal::open_read_only(&path).ok()?;
-        journal.read_session(session_id).ok().flatten()
+        let summary = kr_worker::journal::Journal::open_read_only(&path)
+            .ok()
+            .and_then(|journal| journal.read_session(session_id).ok().flatten());
+        let held_back = summary.is_none() && forward == crate::archive::Forward::HeldBack;
+        (summary, held_back)
     }
 
     /// Describes a closed session from what its worker recorded, or from what is left.
@@ -509,6 +513,19 @@ impl Controller {
         closure: &ClosureRecord,
         display_number: kr_protocol::session::DisplayNumber,
     ) -> SessionSummary {
+        self.described_closed_session(closure, display_number)
+            .await
+            .summary
+    }
+
+    /// Describes a closed session as [`Self::closed_session`] does, and says whether its journal
+    /// was held back for now, so that the summary is built from the closure alone and a later look
+    /// may describe the session better.
+    pub(super) async fn described_closed_session(
+        &self,
+        closure: &ClosureRecord,
+        display_number: kr_protocol::session::DisplayNumber,
+    ) -> DescribedSession {
         // The worker recorded what its session was. Using it keeps the shell, the directory, the
         // geometry and the creation time a person sees after the session has closed - but only
         // where this host established that the worker ended. A closure this host wrote over a
@@ -519,21 +536,38 @@ impl Controller {
             .iter()
             .any(|resource| resource.kind == UNACCOUNTED_WORKER)
         {
-            return closed_summary(closure, self.paths.environment_id(), display_number);
+            return DescribedSession {
+                summary: closed_summary(closure, self.paths.environment_id(), display_number),
+                held_back: false,
+            };
         }
-        self.recovered_summary(closure.session_id).map_or_else(
-            || closed_summary(closure, self.paths.environment_id(), display_number),
-            |mut summary| {
+        match self.recovered_summary(closure.session_id) {
+            (Some(mut summary), _) => {
                 summary.state = SessionState::Closed;
                 summary.attachment_count = U64::ZERO;
                 summary.application_state = Nullable::null();
                 summary.application = None;
                 summary.root_process = Nullable::null();
                 summary.closure = Nullable::some(closure.clone());
-                summary
+                DescribedSession {
+                    summary,
+                    held_back: false,
+                }
+            }
+            (None, held_back) => DescribedSession {
+                summary: closed_summary(closure, self.paths.environment_id(), display_number),
+                held_back,
             },
-        )
+        }
     }
+}
+
+/// A closed session as it is described, with whether its journal was held back for now.
+pub(super) struct DescribedSession {
+    pub(super) summary: SessionSummary,
+    /// The journal is of an earlier schema and could not be brought forward yet, so `summary` is
+    /// built from the closure alone.
+    pub(super) held_back: bool,
 }
 
 /// The sessions a list describes, one for each session identifier.
