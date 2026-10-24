@@ -221,6 +221,9 @@ struct Shared {
     scan_unfinished: AtomicBool,
     /// Whether a record the scan met so far was put off because the host is behind its feed.
     scan_put_off: AtomicBool,
+    /// Whether a request the scan met so far waits for a scan of this run to have read the feed
+    /// through before it can be judged at its place in it.
+    scan_looking: AtomicBool,
     /// What the scan met so far of withdrawals the feed shows complete and this host cannot verify.
     scan_found: Mutex<Unverified>,
     observed: Mutex<Observed>,
@@ -288,6 +291,7 @@ impl FeedRuntime {
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
                 scan_put_off: AtomicBool::new(false),
+                scan_looking: AtomicBool::new(false),
                 scan_found: Mutex::default(),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
@@ -628,7 +632,7 @@ fn names_of(found: &Unverified) -> Sentence {
             .stated(" with key ")
             .hexadecimal(digits);
     }
-    for (position, device) in found.devices.iter().take(MOST_NAMED).enumerate() {
+    for (position, device) in found.devices.keys().take(MOST_NAMED).enumerate() {
         sentence = sentence
             .stated(if position == 0 {
                 "; it names device "
@@ -774,6 +778,7 @@ async fn pass(
     let starting = resumed == 0;
     let mut unfinished = shared.scan_unfinished.load(Ordering::SeqCst);
     let mut put_off = !starting && shared.scan_put_off.load(Ordering::SeqCst);
+    let mut looking = !starting && shared.scan_looking.load(Ordering::SeqCst);
     let mut found = if starting {
         Unverified::default()
     } else {
@@ -856,6 +861,12 @@ async fn pass(
                         unfinished = true;
                     }
                 }
+                Settled::Looking => {
+                    // Judged by the scan that follows the first of this run to read the feed
+                    // through, which knows where in the feed each device was revoked.
+                    contiguous = false;
+                    looking = true;
+                }
             }
         }
         cursor = state.next_after_sequence.get();
@@ -870,6 +881,7 @@ async fn pass(
     }
     shared.scan_unfinished.store(unfinished, Ordering::SeqCst);
     shared.scan_put_off.store(put_off, Ordering::SeqCst);
+    shared.scan_looking.store(looking, Ordering::SeqCst);
     *shared
         .scan_found
         .lock()
@@ -886,10 +898,14 @@ async fn pass(
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
     shared.scan_put_off.store(false, Ordering::SeqCst);
+    shared.scan_looking.store(false, Ordering::SeqCst);
     *shared
         .scan_found
         .lock()
         .unwrap_or_else(PoisonError::into_inner) = Unverified::default();
+    // Every record the feed holds has been seen in this run now, and the places it names are all
+    // there are.
+    controller.feed_read_through();
     // Read through, the scan has seen every withdrawal the feed shows complete that is not settled:
     // the refusal is lifted when it saw none, and stands, naming what they name, when it saw one.
     controller
@@ -913,6 +929,10 @@ async fn pass(
             if put_off {
                 return Ok(Pass::More);
             }
+        }
+        if looking {
+            // The requests that waited for the places are judged by the scan that begins now.
+            return Ok(Pass::More);
         }
         name_owners(shared, controller, &latest).await?;
     }
@@ -995,6 +1015,9 @@ enum Settled {
     Done,
     /// It waits: a barrier still running, or the host catching up with its feed.
     Waiting,
+    /// It waits for the first scan of this run to read the feed through: its issuer was revoked, and
+    /// whether a later record revoked it is not known yet.
+    Looking,
     /// The feed shows it complete, and this host holds what it names live and cannot tell whose
     /// word it is. It stays unsettled, so every scan reads it again.
     Unverified(Unverified),
@@ -1016,7 +1039,7 @@ async fn settle(
         // carried out again, whatever its counter says.
         let id = record.request.request_id;
         return match controller
-            .replay_feed_request(&record.request)
+            .replay_feed_request(&record.request, record.sequence.get())
             .await
             .map_err(Stopped::local)?
         {
@@ -1027,38 +1050,33 @@ async fn settle(
             Replay::Unverified(found) => Ok(Settled::Unverified(found)),
         };
     }
-    Ok(
-        if settle_request(shared, controller, record, latest).await? {
-            Settled::Done
-        } else {
-            Settled::Waiting
-        },
-    )
+    settle_request(shared, controller, record, latest).await
 }
 
 /// Settles a record the feed does not show complete: refuses it, or carries it out and
-/// acknowledges it. Returns whether the feed has nothing more to wait for on it.
+/// acknowledges it. Says whether the feed has nothing more to wait for on it.
 async fn settle_request(
     shared: &Arc<Shared>,
     controller: &Arc<Controller>,
     record: &AuthorityFeedRecord,
     latest: &mut Latest,
-) -> std::result::Result<bool, Stopped> {
+) -> std::result::Result<Settled, Stopped> {
     let request = &record.request;
     let id = request.request_id;
+    let place = record.sequence.get();
     if record.rejected.0.is_some() {
         // Only this host refuses a request, so a note it kept of this one is a refusal.
         controller
             .authority_feed_refusal_noted(id, shared.host_device_id)
             .map_err(Stopped::local)?;
-        return Ok(true);
+        return Ok(Settled::Done);
     }
     // A request the registry does not show completed waits until the host has caught up: it is
     // judged, numbered and carried out on the registry as it will stand then, not on the earlier
     // state it was restored to, and the owner who issued it is not refused for the host's being
     // behind.
     if controller.policy().behind_its_feed() {
-        return Ok(false);
+        return Ok(Settled::Waiting);
     }
     let now = controller.wall_now_ms();
     let noted = controller.authority_feed_record(id);
@@ -1070,11 +1088,12 @@ async fn settle_request(
         }
         Some(_) => controller.plan_of(request).map_err(Stopped::local)?,
         None => match controller
-            .judge_feed_request(request, now)
+            .judge_feed_request(request, now, place)
             .map_err(Stopped::local)?
         {
             Judged::Refuse(reason) => return refuse(shared, controller, id, reason, latest).await,
             Judged::Apply(plan) => plan,
+            Judged::Wait => return Ok(Settled::Looking),
         },
     };
     let held = controller
@@ -1090,6 +1109,8 @@ async fn settle_request(
         .apply_feed_plan(&plan)
         .await
         .map_err(Stopped::local)?;
+    // What it revoked is explained by its place in the feed, for the requests judged after it.
+    controller.feed_request_revoked(&plan, place);
     #[cfg(feature = "testing")]
     controller.feed_request_was_carried_out().await;
     // A request is numbered when it takes effect. One not numbered yet that left the registry
@@ -1145,9 +1166,9 @@ async fn settle_request(
     *latest = Latest::of(&state);
     if applied.completion == RevocationCompletion::Complete {
         controller.authority_feed_settled(id, shared.host_device_id);
-        Ok(true)
+        Ok(Settled::Done)
     } else {
-        Ok(false)
+        Ok(Settled::Waiting)
     }
 }
 
@@ -1193,7 +1214,7 @@ async fn refuse(
     id: RevocationRequestId,
     reason: RejectionReason,
     latest: &mut Latest,
-) -> std::result::Result<bool, Stopped> {
+) -> std::result::Result<Settled, Stopped> {
     // Written down before it is sent: a refusal that never arrives is made again, and the same
     // request published again after the feed dropped it is refused again and not carried out.
     controller
@@ -1205,7 +1226,7 @@ async fn refuse(
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
     *latest = Latest::of(&state);
-    Ok(true)
+    Ok(Settled::Done)
 }
 
 /// The revision this host issues for one request, from what it wrote down before it began, so the
