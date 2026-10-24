@@ -1561,8 +1561,8 @@ mod tests {
         assert_eq!(identity.editor_abi, "zle-5.9");
         assert_eq!(identity.patches.len(), 1);
         assert_eq!(
-            identity.modules[0].search_path,
-            root.path().join("zsh/identity-1/lib").display().to_string()
+            Path::new(&identity.modules[0].search_path),
+            root.path().join("zsh/identity-1/lib")
         );
         assert_eq!(
             package.startup_entry(),
@@ -1700,8 +1700,8 @@ mod tests {
             "and what the package states of its executable"
         );
         assert_eq!(
-            package.identity().modules[0].search_path,
-            package_directory.join("modules").display().to_string()
+            Path::new(&package.identity().modules[0].search_path),
+            package_directory.join("modules")
         );
         assert_eq!(
             package.startup_entry(),
@@ -1874,8 +1874,8 @@ mod tests {
         let package = set.select(Some("pwsh")).expect("qualified");
         let modules = moved.path().join("powershell/identity-1/modules");
         assert_eq!(
-            package.identity().modules[0].search_path,
-            modules.display().to_string(),
+            Path::new(&package.identity().modules[0].search_path),
+            modules,
             "the files this host opens are the moved package's own"
         );
         assert_eq!(
