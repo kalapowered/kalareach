@@ -377,6 +377,7 @@ export function tauriPort(): HostPort {
     inboxHosts: () => call<readonly HostInbox[]>('inbox_hosts', {}),
     pushView: () => call<PushView>('push_view', {}),
     pushEnable: (reference) => call<PushView>('push_enable', { reference }),
+    pushPreviews: (reference, on) => call<PushView>('push_previews', { reference, on }),
     pushRefresh: () => call<PushView>('push_refresh', {}),
     notificationRoute: () => call<string | null>('notification_route', {}),
     onPush: (listener) => listening<PushView>(PUSH_EVENT, listener),

@@ -668,6 +668,8 @@ export interface FakeHostControls {
   setPush(view: PushView): void
   /** The references the person turned notifications on for, in order. */
   readonly pushEnabled: string[]
+  /** The choices the person made about the text of the notifications, in order. */
+  readonly pushPreviewChoices: { readonly reference: string; readonly on: boolean }[]
   /** How many times the page asked native code to look again at where notifications stand. */
   readonly pushLooks: { count: number }
   /** The screen the next tap on a notification will have opened the application on, or none. */
@@ -980,7 +982,7 @@ export function fakeHost(
       typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('push')
     const row = (state: PushHostView['state'], words: string, settings = false): PushView => ({
       available: true,
-      hosts: [{ reference: 'studio-reference', state, words, settings }]
+      hosts: [{ reference: 'studio-reference', state, words, settings, previews: true }]
     })
     switch (asked) {
       case 'on':
@@ -1003,6 +1005,7 @@ export function fakeHost(
     }
   })()
   const pushEnabled: string[] = []
+  const pushPreviewChoices: { reference: string; on: boolean }[] = []
   const pushLooks = { count: 0 }
   const pushListeners = new Set<(view: PushView) => void>()
   let routeNext: string | null = null
@@ -2220,8 +2223,28 @@ export function fakeHost(
         ...push,
         hosts: [
           ...push.hosts.filter((host) => host.reference !== reference),
-          { reference, state: 'working', words: 'Asking for permission.', settings: false }
+          {
+            reference,
+            state: 'working',
+            words: 'Asking for permission.',
+            settings: false,
+            previews: true
+          }
         ]
+      })
+      return Promise.resolve(push)
+    },
+    pushPreviews: (reference, on) => {
+      const held = push.hosts.find((host) => host.reference === reference)
+      if (held === undefined) {
+        refuse('INVALID_ARGUMENT', 'This computer is not paired with that host.')
+      }
+      pushPreviewChoices.push({ reference, on })
+      publishPush({
+        ...push,
+        hosts: push.hosts.map((host) =>
+          host.reference === reference ? { ...host, previews: on, state: 'working' } : host
+        )
       })
       return Promise.resolve(push)
     },
@@ -3408,6 +3431,7 @@ export function fakeHost(
       publishPush(view)
     },
     pushEnabled,
+    pushPreviewChoices,
     pushLooks,
     routeNextTapTo(route) {
       routeNext = route

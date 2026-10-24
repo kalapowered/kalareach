@@ -695,6 +695,11 @@ export interface PushHostView {
   readonly words: string
   /** True when what stopped it is the system's notification setting, which only the person changes. */
   readonly settings: boolean
+  /**
+   * What the person chose for the notification's text: true shows what needs them, false shows only
+   * that something does. It is the choice as recorded, which the host is told when it is on.
+   */
+  readonly previews: boolean
 }
 
 /** What the screen shows of notifications: whether this device has any, and each paired host's. */
@@ -1931,6 +1936,13 @@ export interface HostPort {
    * stand at once; later changes arrive through {@link HostPort.onPush}.
    */
   pushEnable(reference: string): Promise<PushView>
+  /**
+   * Chooses whether the notifications of the host `reference` name show what needs the person
+   * (`on`) or only that something does. Resolves with where they stand at once: the choice is
+   * recorded and the host is told; a host that cannot be told shows the words, and the choice
+   * stays recorded.
+   */
+  pushPreviews(reference: string, on: boolean): Promise<PushView>
   /** Looks again at where notifications stand, and mends what changed since the last look. */
   pushRefresh(): Promise<PushView>
   /**
