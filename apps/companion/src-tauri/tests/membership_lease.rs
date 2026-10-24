@@ -2069,6 +2069,29 @@ async fn a_link_does_not_open_again_for_a_switch_to_an_account_the_host_refuses(
     assert_eq!(again["state"], "reconnecting", "{again}");
 }
 
+/// KR-REQ-17.53: a link rides on the lease the application's connection keeps. A link that opens
+/// after a sign-in, before that connection has had the host take its lease, ends and says the
+/// device is still presenting the lease: the organisation's service has done nothing wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_opened_before_the_host_has_taken_the_lease_says_it_is_still_being_presented() {
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let session = rig.session();
+
+    // The person signs in again. The application's connection presents the lease of the new
+    // sign-in, and its presentation is held before the host has seen it.
+    rig.control.hold_next_request(Method::MembershipPresent);
+    rig.signs_in_as(ACCOUNT).await;
+    rig.control.until_request_held().await;
+
+    let standing = open(rig.companion(), session, "screen").expect("the opening stands");
+    assert_eq!(standing["state"], "reconnecting", "{standing}");
+    let said = standing["reason"].as_str().expect("the words").to_owned();
+    assert!(said.contains("presenting"), "{said}");
+    assert!(!said.contains("service"), "{said}");
+    rig.control.release_request();
+}
+
 /// What a host asks its owner to confirm: an invitation for a viewer, offered on its network.
 fn an_invitation() -> ConfirmationSubject {
     ConfirmationSubject::IssueInvitation {
