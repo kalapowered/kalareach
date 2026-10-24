@@ -25,10 +25,13 @@
 //! and is never kept: a registration whose answer was lost is made again under a new action with a
 //! fresh credential, which is what the host expects.
 //!
-//! A record that cannot be read (damaged, or written by a build this one does not know) is moved
-//! aside, never written over, because it holds each host's authorisation identifier. The desk then
-//! starts from an empty record, logs the failure, and shows every host with nothing kept as needing
-//! the person until that host is turned on again, since what was on is no longer known.
+//! A record that cannot be read (damaged, or written by a build this one does not know) holds each
+//! host's authorisation identifier, so it is moved aside whole and never written over. The desk
+//! then starts a record of its own that marks every host paired at that moment as lost: the page
+//! shows it as needing the person, a look leaves it alone, and the mark stays across restarts
+//! until the person turns that host on again, since what was on is no longer known. A record that
+//! cannot be read for want of the system (a read that failed) is left where it is, and nothing is
+//! written until a start can read it.
 //!
 //! # What repeats
 //!
@@ -50,6 +53,7 @@ use std::time::Duration;
 
 use companion_platform::notify::Permission;
 use companion_platform::push::{PendingRegistration, PendingState};
+use kr_client::Shown;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
 use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
@@ -139,6 +143,10 @@ struct HostPush {
     /// (written before it was kept) is registered again at the next look.
     #[serde(default)]
     registered: Option<Digest256>,
+    /// Whether what this phone knew of the host was lost with a record that could not be read. A
+    /// look leaves such a host alone: only the person turning it on again starts it over.
+    #[serde(default)]
+    lost: bool,
 }
 
 /// What is kept on disk.
@@ -316,6 +324,10 @@ pub struct PushDesk {
     /// while `state` is held.
     registering: tokio::sync::Mutex<()>,
     changed: Box<dyn Fn() + Send + Sync>,
+    /// Whether the record on disk is one that could not be read and could not be moved aside, so
+    /// that writing would replace it. Nothing is written then, and the page shows what the desk
+    /// holds in memory until a start can read the record.
+    write_blocked: bool,
 }
 
 /// What the desk changes together.
@@ -339,10 +351,6 @@ struct State {
     observed: BTreeMap<DeviceId, BTreeSet<Digest256>>,
     /// The number the next claim is given.
     next_run: u64,
-    /// Whether the record the desk found at its start could not be read. What it said of each host
-    /// is not known, so a host with nothing kept is shown as needing the person and not as off,
-    /// until the person turns it on from the start.
-    lost: bool,
 }
 
 impl State {
@@ -425,14 +433,24 @@ impl PushDesk {
             })?;
         let file = data.join(DIRECTORY).join(RECORD);
         let now = (wiring.clock)();
-        let (record, lost) = match read_record(&file) {
-            Loaded::Record(record) => (after_a_restart(record, now), false),
-            Loaded::Unreadable(why) => {
-                set_aside(&file, &why, now);
-                (Record::empty(), true)
+        let (record, write_blocked, lost) = match read_record(&file) {
+            Loaded::Record(record) => (after_a_restart(record, now), false, false),
+            Loaded::Unreadable { why, read_failed } => {
+                // What the record said of each host is gone. One the system failed to read may be
+                // fine at the next start, so it stays where it is; one that was read and is not a
+                // record this build knows is moved aside. Either way nothing is written over it.
+                let kept = !read_failed && set_aside(&file, &why, now);
+                if !kept {
+                    tracing::error!(
+                        why = %why,
+                        "the notifications record could not be read, and was left in place"
+                    );
+                }
+                let hosts = device.pairing().hosts.list().unwrap_or_default();
+                (record_after_a_loss(&hosts, now), !kept, true)
             }
         };
-        Ok(Arc::new(Self {
+        let desk = Arc::new(Self {
             file,
             data: data.to_path_buf(),
             device,
@@ -446,11 +464,17 @@ impl PushDesk {
                 asking: BTreeSet::new(),
                 observed: BTreeMap::new(),
                 next_run: 0,
-                lost,
             }),
             registering: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
-        }))
+            write_blocked,
+        });
+        if lost {
+            // The marks that say which hosts were lost are kept, so that they outlast this start.
+            let state = lock(&desk.state);
+            desk.keep(&state.record);
+        }
+        Ok(desk)
     }
 
     /// What the page is shown: each paired host and where its notifications stand.
@@ -467,22 +491,15 @@ impl PushDesk {
             .rev()
             .map(|host| {
                 let kept = state.record.hosts.get(&host.host_device_id.to_string());
-                let (push_state, words) = match kept {
-                    Some(kept) => (
-                        match kept.phase {
-                            Phase::Working => PushState::Working,
-                            Phase::On => PushState::On,
-                            Phase::Attention => PushState::NeedsAttention,
-                        },
-                        kept.words.clone(),
-                    ),
-                    None if state.lost => (PushState::NeedsAttention, RECORD_LOST.to_owned()),
-                    None => (PushState::Off, String::new()),
-                };
                 HostPushView {
                     reference: reference_of(host),
-                    state: push_state,
-                    words,
+                    state: match kept.map(|kept| kept.phase) {
+                        None => PushState::Off,
+                        Some(Phase::Working) => PushState::Working,
+                        Some(Phase::On) => PushState::On,
+                        Some(Phase::Attention) => PushState::NeedsAttention,
+                    },
+                    words: kept.map_or_else(String::new, |kept| kept.words.clone()),
                     settings: kept.is_some_and(|kept| kept.settings),
                 }
             })
@@ -580,9 +597,10 @@ impl PushDesk {
                         true,
                     ),
                     Phase::Working => (false, false),
-                    Phase::Attention => {
-                        (now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS), false)
-                    }
+                    Phase::Attention => (
+                        !kept.lost && now >= kept.updated_ms.saturating_add(RETRY_AFTER_MS),
+                        false,
+                    ),
                 };
                 if !due {
                     continue;
@@ -774,7 +792,9 @@ impl PushDesk {
                 settings: false,
                 updated_ms: now,
                 registered: None,
+                lost: false,
             });
+        entry.lost = false;
         entry.phase = phase;
         entry.words = words.to_owned();
         entry.settings = settings;
@@ -1146,6 +1166,7 @@ impl PushDesk {
                 settings: false,
                 updated_ms: now,
                 registered: None,
+                lost: false,
             });
             entry.sender_record_id = Some(sender);
             self.keep(&state.record);
@@ -1153,9 +1174,13 @@ impl PushDesk {
         Some(sender)
     }
 
-    /// Writes the record whole. A failure is logged and not raised: what the person sees is the
-    /// memory, and the next change writes it again.
+    /// Writes the record whole, unless it would replace a record that could not be read and is
+    /// still in place. A failure is logged and not raised: what the person sees is the memory, and
+    /// the next change writes it again.
     fn keep(&self, record: &Record) {
+        if self.write_blocked {
+            return;
+        }
         let Some(directory) = self.file.parent() else {
             return;
         };
@@ -1184,8 +1209,13 @@ struct Versioned<'a> {
 enum Loaded {
     /// The record, which is empty where there is no file.
     Record(Record),
-    /// A file that is there and is not a record this build reads: what is wrong with it.
-    Unreadable(String),
+    /// A file that is there and is not a record this build reads.
+    Unreadable {
+        /// What is wrong with it, in words that quote nothing the file held.
+        why: Shown,
+        /// Whether the system failed to read it, which a later start may not.
+        read_failed: bool,
+    },
 }
 
 /// The record on disk.
@@ -1193,36 +1223,79 @@ fn read_record(file: &Path) -> Loaded {
     let bytes = match read_owner_only_file(file, RECORD_LIMIT) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Loaded::Record(Record::empty()),
-        Err(error) => return Loaded::Unreadable(error.to_string()),
+        Err(error) => {
+            return Loaded::Unreadable {
+                why: Shown::ipc(&error),
+                read_failed: matches!(error, kr_ipc::IpcError::Io { .. }),
+            };
+        }
     };
     match serde_json::from_slice::<Record>(&bytes) {
         Ok(record) if record.version == VERSION => Loaded::Record(record),
-        Ok(record) => Loaded::Unreadable(format!(
-            "version {} is not one this build reads",
-            record.version
-        )),
-        Err(error) => Loaded::Unreadable(error.to_string()),
+        Ok(_) => Loaded::Unreadable {
+            why: Shown::said("it is a record of another version"),
+            read_failed: false,
+        },
+        Err(error) => Loaded::Unreadable {
+            why: Shown::json(&error),
+            read_failed: false,
+        },
     }
 }
 
-/// Moves a record that cannot be read out of the way and says so in the log. It holds each host's
-/// authorisation identifier, so it is kept and not written over: the desk starts from an empty
-/// record, and the file stays as it was found. Renaming and writing need the same permission on
-/// the directory, so a file that cannot be moved cannot be written over either.
-fn set_aside(file: &Path, why: &str, now_ms: u64) {
-    let aside = file.with_file_name(format!("push.unreadable-{now_ms}.json"));
+/// Moves a record that cannot be read out of the way, under a name no earlier one has, and says so
+/// in the log. It holds each host's authorisation identifier, so it is kept as it was found.
+/// Returns whether it was moved.
+fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
+    let aside = (0_u32..)
+        .map(|attempt| {
+            let name = match attempt {
+                0 => format!("push.unreadable-{now_ms}.json"),
+                _ => format!("push.unreadable-{now_ms}-{attempt}.json"),
+            };
+            file.with_file_name(name)
+        })
+        .find(|each| !each.exists())
+        .expect("a name is free");
     match std::fs::rename(file, &aside) {
-        Ok(()) => tracing::error!(
-            why,
-            kept_as = %aside.display(),
-            "the notifications record could not be read and was set aside"
-        ),
-        Err(error) => tracing::error!(
-            why,
-            %error,
-            "the notifications record could not be read, and could not be set aside"
-        ),
+        Ok(()) => {
+            tracing::error!(
+                why = %why,
+                set_aside_at_ms = now_ms,
+                "the notifications record could not be read and was set aside"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                why = %why,
+                error = %Shown::io(&error),
+                "the notifications record could not be set aside"
+            );
+            false
+        }
     }
+}
+
+/// The record a desk starts from when the one it found cannot be read: each host paired now is
+/// marked as lost, which the page shows as needing the person.
+fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64) -> Record {
+    let mut record = Record::empty();
+    for host in hosts {
+        record.hosts.insert(
+            host.host_device_id.to_string(),
+            HostPush {
+                sender_record_id: None,
+                phase: Phase::Attention,
+                words: RECORD_LOST.to_owned(),
+                settings: false,
+                updated_ms: now_ms,
+                registered: None,
+                lost: true,
+            },
+        );
+    }
+    record
 }
 
 /// What a record says when the application starts. A run that was under way then ended with the
@@ -1469,6 +1542,7 @@ mod tests {
             settings,
             updated_ms: 7,
             registered: None,
+            lost: false,
         }
     }
 

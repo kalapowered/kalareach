@@ -1601,33 +1601,40 @@ fn set_aside(data: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// A record that cannot be read, damaged or written by a build this one does not know, holds each
-/// host's authorisation identifier. It is kept aside whole and not written over; the page does not
-/// show its hosts as off but as needing the person, who starts over with Try again.
+/// host's authorisation identifier. It is moved aside whole, and the hosts paired then are marked
+/// lost: they show as needing the person, across restarts, until the person turns each on again.
+/// A look leaves them alone, and a host paired later is off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_record_that_cannot_be_read_is_set_aside_reported_and_not_written_over() {
+async fn a_record_that_cannot_be_read_is_set_aside_and_its_hosts_are_marked_lost() {
     let unreadable: [(&str, &[u8]); 2] = [
         ("damaged", b"{\"version\": 1, \"hosts\": {"),
         ("another version", br#"{"version":2,"hosts":{}}"#),
     ];
     for (kind, bytes) in unreadable {
         let owner = DeviceKeys::generate().expect("keys");
-        let host = Host::start(&owner).await;
+        let first = Host::start(&owner).await;
+        let second = Host::start(&owner).await;
+        let third = Host::start(&owner).await;
         let receiver = Receiver::new(FIRST_TOKEN);
-        let phone = desk(&[&host], &owner, Arc::clone(&receiver)).await;
-        let reference = phone.references().remove(0);
-        phone.desk.enable(&reference).expect("the person asks");
-        phone.until(|states| states == [PushState::On]).await;
+        let phone = desk(&[&first, &second], &owner, Arc::clone(&receiver)).await;
+        let references = phone.references();
+        phone.desk.enable(&references[0]).expect("the person asks");
+        phone
+            .until(|states| states == [PushState::Off, PushState::On])
+            .await;
         let data = phone._phone.data.path();
         let record = data.join("push").join("push.json");
         kr_ipc::paths::write_owner_only_file(&record, bytes).expect("the record is spoiled");
 
-        let restarted = open_over(
-            data,
-            &phone.device,
-            &receiver,
-            &phone.registered,
-            Arc::new(AtomicBool::new(false)),
-        );
+        let open = || {
+            open_over(
+                data,
+                &phone.device,
+                &receiver,
+                &phone.registered,
+                Arc::new(AtomicBool::new(false)),
+            )
+        };
         let states = |opened: &Opened| {
             opened
                 .desk
@@ -1637,10 +1644,11 @@ async fn a_record_that_cannot_be_read_is_set_aside_reported_and_not_written_over
                 .map(|each| each.state)
                 .collect::<Vec<_>>()
         };
+        let restarted = open();
         assert_eq!(
             states(&restarted),
-            [PushState::NeedsAttention],
-            "{kind}: a host whose notifications are not known is not shown as off"
+            [PushState::NeedsAttention, PushState::NeedsAttention],
+            "{kind}: neither host is shown as off"
         );
         let aside = set_aside(data);
         assert_eq!(aside.len(), 1, "{kind}: the record was set aside");
@@ -1649,25 +1657,111 @@ async fn a_record_that_cannot_be_read_is_set_aside_reported_and_not_written_over
             bytes,
             "{kind}: whole"
         );
+        let kept = std::fs::read(&record).expect("the marks were kept");
+        drop(restarted);
 
-        // A look writes nothing and registers nothing, however long the person has left it.
-        restarted.let_time_pass();
-        look(&restarted.desk).await;
-        assert_eq!(states(&restarted), [PushState::NeedsAttention]);
-        assert!(!record.exists(), "{kind}: no record was written");
-        assert!(proposed(&restarted.gateway).is_empty());
+        // The marks outlast the start that made them, and the record is set aside once.
+        let again = open();
+        assert_eq!(
+            states(&again),
+            [PushState::NeedsAttention, PushState::NeedsAttention],
+            "{kind}: after another start"
+        );
+        assert_eq!(set_aside(data), aside, "{kind}: set aside once");
+        // A look leaves them alone, however long they have waited: it starts no run, and writes
+        // nothing.
+        again.let_time_pass();
+        look(&again.desk).await;
+        assert_eq!(
+            Arc::strong_count(&again.desk),
+            1,
+            "{kind}: a look started a run"
+        );
+        assert_eq!(std::fs::read(&record).expect("the record"), kept);
 
-        // The person starts over, and what is set aside stays as it was.
-        restarted
+        // A host paired after the loss is off, and the person starts one host over.
+        pair(&phone._phone, &third, &owner, &[ActionRight::SessionView]).await;
+        assert_eq!(
+            states(&again),
+            [
+                PushState::Off,
+                PushState::NeedsAttention,
+                PushState::NeedsAttention
+            ],
+            "{kind}: a host paired later"
+        );
+        again
             .desk
-            .enable(&reference)
+            .enable(&references[0])
             .expect("the person asks again");
-        states_until(&restarted.desk, |states| states == [PushState::On]).await;
-        assert!(record.exists(), "{kind}: the new record is written");
+        states_until(&again.desk, |states| {
+            states == [PushState::Off, PushState::NeedsAttention, PushState::On]
+        })
+        .await;
+        drop(again);
+
+        // That one stays on across a start, the other is still lost, and the old record is as it was.
+        assert_eq!(
+            states(&open()),
+            [PushState::Off, PushState::NeedsAttention, PushState::On],
+            "{kind}: a host started over and one not"
+        );
         assert_eq!(
             std::fs::read(&aside[0]).expect("the file set aside"),
             bytes,
             "{kind}: still whole"
         );
     }
+}
+
+/// A record that the system fails to read may be fine at the next start: it is left where it is,
+/// nothing is written until a start can read it, and the person can still turn a host on, in
+/// memory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    let phone = desk(&[&host], &owner, Arc::clone(&receiver)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    let data = phone._phone.data.path();
+    let record = data.join("push").join("push.json");
+    let original = std::fs::read(&record).expect("the record");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000))
+        .expect("the record is made unreadable");
+    if std::fs::read(&record).is_ok() {
+        // An account that ignores file permissions reads it all the same: nothing to show.
+        return;
+    }
+
+    let restarted = open_over(
+        data,
+        &phone.device,
+        &receiver,
+        &phone.registered,
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+    assert!(set_aside(data).is_empty(), "it was left where it is");
+    restarted
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
+        .expect("the record is made readable");
+    assert_eq!(
+        std::fs::read(&record).expect("the record"),
+        original,
+        "nothing was written over it"
+    );
 }
