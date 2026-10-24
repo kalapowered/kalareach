@@ -1840,6 +1840,121 @@ async fn a_devices_input_waiting_for_the_workers_writer_is_refused_once_a_feed_r
     }
 }
 
+/// KR-REQ-24.15: a frame the worker has part of when the check a call is admitted under refuses,
+/// which is the refusal the authority feed raises on remote grants, is not finished. The rest of it
+/// is not written, the link ends, and the call is refused: the worker reads a frame that stops
+/// short and acts on nothing of it. The control: when the check allows it, the same frame goes
+/// whole and is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_the_worker_has_part_of_when_a_feed_refusal_rises_is_cut_and_the_call_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, InputSequence};
+    use kr_protocol::scalars::Bytes;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for refused in [false, true] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(move |request: &kr_protocol::envelope::Request| {
+                (request.method.method()? == Method::InputWrite).then(ParamsValue::empty)
+            }),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let device = paired_with_every_right(controller, 27);
+        let connection = super::RemoteConnection::for_test(controller, device);
+        let input = |id: u64, size: usize| {
+            device_request(
+                id,
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: world.session_id,
+                    attachment_id: AttachmentId::new(Uuid::from_bytes([9; 16])),
+                    epoch: InputLeaseEpoch::new(1),
+                    sequence: InputSequence::new(id),
+                    bytes: Bytes::new(vec![b'x'; size]),
+                },
+            )
+        };
+        // The first input opens the link and shows the actor the host vouches for.
+        let first = connection.read(&input(1, 1)).await;
+        assert!(
+            matches!(
+                first,
+                kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Ok(_),
+                    ..
+                })
+            ),
+            "{first:?}"
+        );
+        let proxy = connection
+            .proxy
+            .lock()
+            .await
+            .clone()
+            .expect("the first input opened the link");
+        let actor = forwarded_reads(&recorded)[0].actor.clone();
+
+        // A frame of nine hundred kilobytes goes in pieces. The check refuses from the second piece
+        // on, as the refusal the feed raises does once it has risen: the first piece has gone by
+        // then, so the worker has part of the frame, whatever the socket takes at once.
+        let asked = AtomicU32::new(0);
+        let check = || {
+            if refused && asked.fetch_add(1, Ordering::SeqCst) >= 1 {
+                return Err(crate::error::ControllerError::PermissionDenied {
+                    detail: "the authority feed refuses remote grants".to_owned(),
+                });
+            }
+            Ok(())
+        };
+        let big = input(2, 900 * 1024);
+        let answer = proxy
+            .forward_read(
+                &big,
+                &actor,
+                kr_protocol::scalars::Nullable::null(),
+                None,
+                &check,
+            )
+            .await;
+        if refused {
+            let error = answer.expect_err("the call is refused");
+            assert!(
+                matches!(
+                    error,
+                    crate::error::ControllerError::PermissionDenied { .. }
+                ),
+                "{error:?}"
+            );
+            assert!(
+                !proxy.is_open(),
+                "the link ends, as it does for a frame cut short"
+            );
+            assert_eq!(
+                forwarded_reads(&recorded).len(),
+                1,
+                "the frame that stopped short reached the worker as nothing"
+            );
+        } else {
+            let response = answer.expect("the frame goes whole");
+            assert!(
+                matches!(response.outcome, kr_protocol::envelope::Outcome::Ok(_)),
+                "{response:?}"
+            );
+            assert!(proxy.is_open());
+            assert_eq!(forwarded_reads(&recorded).len(), 2);
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-09.12: a paired device that reads a session that has closed is told that it closed,
 /// whether its read names the session or only an action it performed there, and not that the
 /// session is unknown: the closure is on record. A session this host never held is unknown, which
