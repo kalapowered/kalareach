@@ -1236,6 +1236,83 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
     );
 }
 
+impl Rig {
+    /// The rig's owner device signs the confirmation for issuing a session invitation, and the host
+    /// is asked to issue it.
+    async fn owner_device_invites(
+        &self,
+        client: &mut kr_ipc::client::LocalClient,
+    ) -> Result<kr_protocol::invitation::PairInviteResult, kr_protocol::error::ProtocolError> {
+        net_support::pairing::invite_direct(
+            self.host.environment_id,
+            client,
+            kr_protocol::invitation::InviteGrantKind::SessionInvitation,
+            &proposal(&[ActionRight::SessionView]),
+            &net_support::pairing::Signer::OwnerDevice(&self.owner),
+        )
+        .await
+    }
+}
+
+/// KR-REQ-24.15: an owner confirmation a remote owner device signed is not spent while a
+/// withdrawal the host cannot verify refuses remote grants: the device's standing is taken away
+/// whole, and what it signed waits with it. The owner at the machine ends the refusal by revoking
+/// what the withdrawals name, which needs no confirmation, and a confirmation signed after that is
+/// spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_confirmation_a_remote_owner_device_signed_is_not_spent_while_the_host_refuses_remote_grants()
+ {
+    let Unverifiable {
+        rig, victim, share, ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView], &[], true)
+        .await;
+    let mut local = rig.host.client().await;
+    let refused = rig
+        .owner_device_invites(&mut local)
+        .await
+        .expect_err("a confirmation is not spent while the host refuses remote grants");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("an owner this host does not know"),
+        "refused for the refusal and in its words: {refused:?}"
+    );
+
+    // The owner at the machine revokes what the withdrawals name, which needs no confirmation.
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: victim.1.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+    net_support::worker::revoke(&rig.host, share.grant_id).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.owner_device_invites(&mut local)
+        .await
+        .expect("a confirmation signed once the refusal has ended is spent");
+}
+
+/// KR-REQ-24.15: the terminal confirms the pairing of a host's first owner while the host refuses
+/// remote grants, as it does otherwise: a host with no owner has no remote owner device to
+/// confirm, and no device to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_terminal_still_confirms_the_first_owner_while_the_host_refuses_remote_grants() {
+    let host = Host::start_unowned().await;
+    host.controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    assert!(
+        host.controller().policy().withdrawal_unverified(),
+        "the control: the refusal stands"
+    );
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let (_device, record) = net_support::bootstrap_owner(&host, &owner).await;
+    assert!(record.grant.permits(ActionRight::HostManage));
+}
+
 /// KR-REQ-24.15: a device a withdrawal the host cannot verify names keeps no standing over the
 /// feed. It is not among the keys the host names as permitted to remove the feed, so removing the
 /// feed does not end the refusal for it, while another owner's key is named and does. Else the

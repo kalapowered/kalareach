@@ -6607,8 +6607,8 @@ does not know. `kr doctor` shows the feed check as a warning with a remedy. It n
 request says made it, the key the request gives for that device, and the devices and grants the
 request names, up to eight of each. Every scan reads such a record again, so a restart does not lose
 the refusal while the feed holds the record, and nothing is stored for it. It ends when the owner at the machine revokes what the
-request names, or pairs the owner again, whose key the request names and whose request is then
-carried out. A feed that shows a revocation complete that no owner made can only keep remote access
+request names, which needs no confirmation. Pairing the owner again is no way to end it, because
+pairing waits for an owner device's confirmation, which is refused while the refusal stands. A feed that shows a revocation complete that no owner made can only keep remote access
 refused this way. It cannot revive a device, and the owner at the machine can always end it. While
 the refusal stands, the devices the request names keep no standing over the feed, and neither does a
 device that holds a key one of them holds. A feed removes the host by a key, so the host takes those
@@ -6673,11 +6673,23 @@ moves no revision, so a worker would learn of it from nothing else: when a refus
 feed removes the host, the host ends the link to its worker of each connection the refusal reaches. The
 worker then detaches the connection's attachments, which ends their input lease and discards the input
 it holds for them. Input the terminal has already taken is not taken back. The connection stays up and
-refused, and the device attaches again once the refusal has ended. Three things remain. A mutation already forwarded runs for what is left of its dispatch lease, five
-seconds at most. A voice call a device started is not ended, as a revocation ends it, and runs to
-its deadline. An owner confirmation that a remote owner device
-signed, spent at the machine after the refusal rose, is spent under the standing the signer had. The
-refusal a removed feed puts on the grants that rest on it applies by kind of grant: work that a
+refused, and the device attaches again once the refusal has ended. Two things remain. A mutation
+already forwarded runs for what is left of its dispatch lease, five seconds at most. A voice call a
+device started is not ended, as a revocation ends it, and runs to its deadline.
+
+An owner confirmation that a remote owner device signed is not spent while either refusal stands.
+Issuing an invitation, confirming a pairing and establishing the clock by the confirmation of an
+owner device are refused with `PERMISSION_DENIED` and the refusal's words, because the refusal takes
+that device's standing away whole. The confirmation is checked inside the write that spends it, and
+a refusal that rises waits for each such write that began before it, so none is spent under a
+standing the refusal took away. The terminal is left as it is: it confirms the pairing of a first
+owner and the end of exclusive organisation management, and on a host that has an owner it confirms
+nothing else, so a refusal never turns into a weaker way to confirm. What the owner at the machine
+can do meanwhile is revoke the devices and grants a withdrawal names, which needs no confirmation
+and ends the refusal for a withdrawal the host cannot verify; a host behind its feed ends that
+refusal by itself.
+
+The refusal a removed feed puts on the grants that rest on it applies by kind of grant: work that a
 connection under such a grant had admitted before the removal is held to it where it commits and
 where its answer is written, as it is for the two refusals above, and the default owner grant is
 not refused. A relayed batch stays with the policy's epoch. The owner at the machine
