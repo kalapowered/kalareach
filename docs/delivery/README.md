@@ -117,7 +117,8 @@ device may have a credential confirmed three times in a burst and then six times
 registration that keeps the authorisation and installation of the destination in service and only
 changes the choice of previews has an allowance of its own of the same size, so that changing the
 choice does not spend what the next token refresh needs; its bearer is confirmed like any other, and
-it spends the same nonce allowance below. The status question comes out of the sweep's share of the
+it spends the same nonce allowance below, so one device can spend the whole of the host's burst of
+nonces between its two allowances. The status question comes out of the sweep's share of the
 status allowance. The nonce comes out of the sixty
 requests an hour that the gateway takes from this host for renewing and revoking together, where
 every renewal and every revocation takes two, so all devices together may ask for six nonces in a
