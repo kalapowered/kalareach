@@ -379,6 +379,8 @@ struct Kept {
     followed: u64,
     /// The lease last got, and whether the host took it.
     lease: Option<Held>,
+    /// Whether the host has taken a lease from this keeper that nothing has spoiled since.
+    took_a_lease: bool,
     /// A stop that sends nothing until the moment it names, in UTC milliseconds.
     held_back: Option<(u64, LeaseStop)>,
     /// No request goes to the service before this moment, in UTC milliseconds: the keeper is
@@ -442,6 +444,21 @@ impl LeaseKeeper {
 
     fn kept(&self) -> MutexGuard<'_, Kept> {
         self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the host has taken a lease from this keeper that no stop has spoiled since. A
+    /// connection that presents no lease of its own serves the person only while it is.
+    #[must_use]
+    pub fn took_a_lease(&self) -> bool {
+        self.kept().took_a_lease
+    }
+
+    /// Why this keeper holds no lease the host took: the stop that is held against the service,
+    /// and otherwise that the service has not given one yet.
+    #[must_use]
+    pub fn why_no_lease(&self) -> LeaseStop {
+        self.held_back()
+            .map_or(LeaseStop::Unreachable, |(stop, _)| stop)
     }
 
     /// Presents a lease as the first thing on the connection.
@@ -664,6 +681,7 @@ impl LeaseKeeper {
             let mut kept = self.kept();
             if stop.spoils_the_lease() {
                 kept.lease = None;
+                kept.took_a_lease = false;
             }
             let held = stop.holds_for();
             if !held.is_zero() {
@@ -814,6 +832,7 @@ impl LeaseKeeper {
             let mut kept = self.kept();
             kept.followed = kept.followed.max(taken.key_revision.get()).max(revision);
             kept.lease = Some(held.clone());
+            kept.took_a_lease = true;
         }
         (self.report)(LeaseEvent::Held {
             expires_at_ms: taken.expires_at_ms.get(),

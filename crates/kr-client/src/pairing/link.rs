@@ -164,8 +164,25 @@ pub enum Presentation {
     IfDue,
 }
 
-/// What gives a host the membership lease a member's device needs on a connection to it.
+/// What gives a host the membership lease a member's device needs on a connection to it, and
+/// binds each such connection to the account it was opened under.
 pub trait MembershipPresenter: Send + Sync {
+    /// Opens a connection to `host` under the account signed in now, by running `dial`, and returns
+    /// its transport ended at the moment that account signs out or another signs in, whatever
+    /// opened it: a connection of the application's, a visit, a session link, a terminal view.
+    /// Refuses before dialling when no account is signed in. Runs `dial` and returns its transport
+    /// as it is for a host whose grant answers to no organisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no connection under an account can be made, or `dial`'s own failure.
+    fn bind<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        identity: &'a LocalIdentity,
+        dial: BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>,
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
+
     /// Presents the lease `host`'s grant needs, as `presentation` says, on `session`, which proves
     /// `device_key`, or does nothing for a host whose grant answers to no organisation.
     ///
@@ -755,6 +772,21 @@ impl IrohLink {
     pub fn pool(&self) -> &Arc<EndpointPool> {
         &self.pool
     }
+
+    /// `dial`, bound to the account signed in when it is made when the link binds connections to a
+    /// member's account. Every connection to a paired host is made by one of the two methods that
+    /// call this, so what is bound here is every session the device opens to such a host.
+    fn bound<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        identity: &'a LocalIdentity,
+        dial: BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>,
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
+        match &self.membership {
+            Some(presenter) => presenter.bind(host, identity, dial),
+            None => dial,
+        }
+    }
 }
 
 impl HostLink for IrohLink {
@@ -828,11 +860,15 @@ impl HostLink for IrohLink {
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        Box::pin(connect_paired_over(
+        self.bound(
             host,
             identity,
-            self.pool.endpoint(&host.network_config),
-        ))
+            Box::pin(connect_paired_over(
+                host,
+                identity,
+                self.pool.endpoint(&host.network_config),
+            )),
+        )
     }
 
     fn visit_paired_transport<'a>(
@@ -841,11 +877,15 @@ impl HostLink for IrohLink {
         identity: &'a LocalIdentity,
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        Box::pin(connect_paired_over(
+        self.bound(
             host,
             identity,
-            self.pool.visit_endpoint(&host.network_config, in_use),
-        ))
+            Box::pin(connect_paired_over(
+                host,
+                identity,
+                self.pool.visit_endpoint(&host.network_config, in_use),
+            )),
+        )
     }
 
     fn hold<'a>(

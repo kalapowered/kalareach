@@ -291,32 +291,40 @@ impl InboxDesk {
 /// may have lost the lease, and is given the lease the device holds, or a new one if the host
 /// refuses that, before the read is made once more.
 ///
-/// A connection is the account's that was signed in when it was dialled. A fresh one is refused when
-/// another has signed in since ([`Connection::visited`]); a kept one opened under another is let go,
-/// and the visit goes on over a fresh connection; and after a presentation the account is asked
-/// about again before the host is read, so that nothing is read of a host under the lease of an
-/// account that has signed out or been replaced.
+/// A connection is bound to the account signed in when it was dialled, and ends when that account
+/// signs out or another signs in ([`crate::bound`]). A pass decides once, at its end, whether its
+/// connection is still that account's: if not, nothing it read is published, the connection is
+/// closed, a kept one is replaced by a fresh one (which is refused with the words when no account
+/// is signed in, and is the new account's otherwise), and a fresh one shows the words.
 async fn read_host(
     device: &Arc<Device>,
     host: &PairedHost,
     held: Option<Arc<Connection>>,
 ) -> Visited {
     if let Some(connection) = held {
-        match read_kept(device, host, &connection).await {
-            Ok((result, sessions)) => return Visited::Read((connection, result, sessions)),
-            Err(missed) => {
-                connection.session().close();
-                if let Missed::Refused(refusal) = missed {
+        let read = read_kept(device, host, &connection).await;
+        if connection.ended_by_this_device().is_none() {
+            match read {
+                Ok((result, sessions)) => return Visited::Read((connection, result, sessions)),
+                Err(Missed::Refused(refusal)) => {
+                    connection.session().close();
                     return Visited::Refused(refusal);
                 }
+                Err(Missed::Unreached) => {}
             }
         }
+        connection.session().close();
     }
     let connection = match Connection::visited(device, host).await {
         Ok(connection) => Arc::new(connection),
         Err(unopened) => return Missed::from(unopened).into(),
     };
-    match read_over(&connection).await {
+    let read = read_over(&connection).await;
+    if let Some(refusal) = connection.ended_by_this_device() {
+        connection.session().close();
+        return Visited::Refused(refusal);
+    }
+    match read {
         Ok((result, sessions)) => Visited::Read((connection, result, sessions)),
         Err(missed) => {
             connection.session().close();
@@ -331,19 +339,12 @@ async fn read_kept(
     host: &PairedHost,
     connection: &Connection,
 ) -> Result<(AttentionReadResult, Vec<NumberedSession>), Missed> {
-    // Opened under another account: not this one's to read with. The visit goes on over a fresh
-    // connection, which presents the lease of the account signed in.
-    if connection.account_unchanged(device).await.is_err() {
-        return Err(Missed::Unreached);
-    }
     present(device, host, connection, Presentation::IfDue).await?;
-    bound(device, connection).await?;
     match read_over(connection).await {
         Err(Missed::Refused(refusal)) if lease_is_refused(refusal.code, &refusal.message) => {
             // The lease the host holds ended on its clock before this device's said it was due, or
             // the host lost it: it is presented again at once, whatever the lease is due.
             present(device, host, connection, Presentation::First).await?;
-            bound(device, connection).await?;
             read_over(connection).await
         }
         read => read,
@@ -373,14 +374,6 @@ async fn present(
         })
 }
 
-/// Whether `connection` is still the account's that is signed in, as the words of why not.
-async fn bound(device: &Arc<Device>, connection: &Connection) -> Result<(), Missed> {
-    connection
-        .account_unchanged(device)
-        .await
-        .map_err(Missed::Refused)
-}
-
 /// Reads the whole inbox and the session numbers over `connection`.
 async fn read_over(
     connection: &Connection,
@@ -393,7 +386,7 @@ async fn read_over(
     };
     // A host that answers its inbox and refuses its session list (a guest's grant may) still gave
     // its inbox: the rows then say "a session" for want of its number.
-    let listed: Option<SessionListResult> = session
+    let listed: Result<SessionListResult, ClientError> = session
         .read(
             Method::SessionList,
             &SessionListParams {
@@ -401,20 +394,21 @@ async fn read_over(
                 include_closed: false,
             },
         )
-        .await
-        .ok();
-    let sessions = listed
-        .map(|listed| {
-            listed
-                .sessions
-                .iter()
-                .map(|each| NumberedSession {
-                    session_id: each.session_id,
-                    display_number: each.display_number,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .await;
+    let sessions = match listed {
+        Ok(listed) => listed
+            .sessions
+            .iter()
+            .map(|each| NumberedSession {
+                session_id: each.session_id,
+                display_number: each.display_number,
+            })
+            .collect(),
+        // The host refused its session list: its answer, and the rows say "a session".
+        Err(ClientError::Host(_)) => Vec::new(),
+        // Anything else is the connection failing, and the inbox read beside it is not published.
+        Err(other) => return Err(Unopened::of_read(other).into()),
+    };
     Ok((result, sessions))
 }
 

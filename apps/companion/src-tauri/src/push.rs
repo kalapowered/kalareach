@@ -1616,7 +1616,6 @@ impl Registrar for ConnectionRegistrar {
             .map_err(|error| error.message)?;
             Ok(Box::new(ConnectionLine {
                 connection,
-                device: Arc::clone(&self.0),
                 device_id: host.device_id,
                 _held: held,
             }) as Box<dyn HostLine + 'a>)
@@ -1627,9 +1626,6 @@ impl Registrar for ConnectionRegistrar {
 /// The paired connection to one host.
 struct ConnectionLine {
     connection: crate::connection::Connection,
-    /// This phone, which says whether the account the connection was opened under is still the one
-    /// signed in.
-    device: Arc<Device>,
     /// The host's identifier for this phone.
     device_id: DeviceId,
     /// The hold on the host's endpoint, kept until the line is dropped.
@@ -1640,11 +1636,11 @@ impl ConnectionLine {
     /// Fails, in the words of why, when the account the connection was opened under has signed out
     /// or been replaced: a change made to a host under the lease of an account that has left is
     /// made for no one.
-    async fn still_the_account(&self) -> std::result::Result<(), String> {
-        self.connection
-            .account_unchanged(&self.device)
-            .await
-            .map_err(|refusal| refusal.message)
+    fn still_the_account(&self) -> std::result::Result<(), String> {
+        match self.connection.ended_by_this_device() {
+            Some(refusal) => Err(refusal.message),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1657,7 +1653,7 @@ impl HostLine for ConnectionLine {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
 
-            self.still_the_account().await?;
+            self.still_the_account()?;
             let settled = within_the_answer(async {
                 self.connection
                     .session()
@@ -1695,7 +1691,7 @@ impl HostLine for ConnectionLine {
 
             // The registration that came before may have been made under an account that has since
             // left: the key goes to the host only for the account that is signed in now.
-            self.still_the_account().await?;
+            self.still_the_account()?;
             // The key the host seals previews to is the one it recorded when this phone paired. The
             // call says the phone holds it and at which revision: the same key at the same revision
             // is answered as already recorded, and any other is refused rather than taken.

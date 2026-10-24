@@ -274,8 +274,13 @@ impl Dial {
                 return Err(Failure::Refused(refusal));
             }
             Ok(Err(other)) => {
+                // An account that left ended the connection, and says so.
+                let words = session
+                    .transport()
+                    .ended_by_this_device()
+                    .map_or_else(|| other.said().into_string(), |refusal| refusal.message);
                 session.close();
-                return Err(Failure::Unreached(other.said().into_string()));
+                return Err(Failure::Unreached(words));
             }
             Err(_) => {
                 session.close();
@@ -1171,7 +1176,10 @@ impl PairedLinks {
                 held.session.closed().await;
                 // An opening that is over, or was left or replaced, is not reached again.
                 let lost = SessionStanding::Reconnecting {
-                    reason: "contact with this session was lost".to_owned(),
+                    reason: held.session.transport().ended_by_this_device().map_or_else(
+                        || "contact with this session was lost".to_owned(),
+                        |refusal| refusal.message,
+                    ),
                 };
                 if !self.tell_standing(&emit, session_id, &opening, lost) {
                     return;

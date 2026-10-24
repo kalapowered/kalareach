@@ -118,6 +118,17 @@ impl Drop for Paired {
 }
 
 impl Wire {
+    /// Why this device ended the connection, when it did: the account it was opened under left.
+    pub(super) fn ended_by_this_device(&self) -> Option<String> {
+        match self {
+            Self::Local(_) => None,
+            Self::Paired(paired) => paired
+                .transport
+                .ended_by_this_device()
+                .map(|refusal| refusal.message),
+        }
+    }
+
     /// The next frame, keeping the action window current.
     pub(super) async fn recv(&mut self) -> Result<ControlFrame, Lost> {
         match self {

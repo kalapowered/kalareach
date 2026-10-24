@@ -1385,7 +1385,9 @@ before this device's clock said it was due, and the inbox presents the lease the
 the refusal says the host holds no lease it will answer under (`organisation::lease_is_refused`), and
 not for any other refusal, which a presentation does not mend. The standing links the companion opens to a
 host's sessions use `connect_paired_transport`, present nothing, and rely on the lease the
-application's own connection keeps. The companion keeps one keeper for each host, and makes another
+application's own connection keeps; they serve the person only while the keeper of their sign-in
+holds a lease the host took, and a request made before then ends the link (see the next
+paragraph). The companion keeps one keeper for each host, and makes another
 when the organisation, the device's key or the account signed in differs, or when the person has
 signed in since, so that nothing held against the earlier sign-in is held against the later.
 
@@ -1393,14 +1395,30 @@ A keeper belongs to the account that was signed in when it was made. The lease c
 account is signed in before the keeper asks for a lease or for the chain of keys and again before it
 presents a lease, and asks only under the token of the account it was made for, so a lease that
 arrives after the account changed is not presented (`LeaseStop::AccountChanged`), and a refresh
-that begins after a sign-out does not begin (`SignIn`). A connection is the account's that was signed
-in before it was dialled (`LeaseDesk::account_of`), and not whichever account is signed in when its
-keeper starts: a connection that finds another account signed in once it has presented is refused
-where it opens, the companion's connection to the host ends at once when that account signs out or
-is replaced, whatever the keeper is doing and though the replacement came before the keeper began,
-and its reason says which. A caller that uses a connection for more than its opening asks again, after it
-has presented a lease on it, whether the account is still the one (`Connection::account_unchanged`):
-the inbox does before each read, and lets go of a kept connection that another account has replaced.
+that begins after a sign-out does not begin (`SignIn`).
+
+Every connection to such a host belongs to the sign-in in force when it was opened, and the link
+binds it: `IrohLink` makes each connection to a paired host through `connect_paired_transport` or
+`visit_paired_transport`, and passes the dial to `MembershipPresenter::bind`. The main connection,
+a visit, a session link, a terminal view, the owner watcher's session and a push run's line are
+all connections of that kind, and each ends at once when the account signs out, another account
+signs in, or the same account signs in again; none is opened while no account is signed in (an account store that cannot be read is told as `Unreachable`, whose words name the organisation's service though the cause is on the device). The
+end is decided from the status the account publishes, asked at every send and at every frame read,
+so a call made after a sign-out has returned reaches nothing and a frame read after it is not
+handed on. The reason (`SignIn` or `AccountChanged`) is kept before the connection is closed, and
+`ControlTransport::ended_by_this_device` gives it to whoever finds the connection closed: the
+application's connection state, a link's `reconnecting`, a terminal view's ending, the inbox's
+refusal and the push run's stop. A pass of the inbox asks once, at its end, whether its connection
+ended, and publishes nothing it read if it did; a failed session list fails the pass instead of
+leaving the rows without numbers, and only the host's own refusal of the list does that. A
+connection that presents no lease of its own (a link, a view) serves the person only while the
+keeper of its sign-in holds a lease the host took (`LeaseKeeper::took_a_lease`): the host binds a
+device to the first account that presents a lease, so a link opened after a switch to an account
+whose lease the host refuses is ended with the keeper's held stop and not served on the lease of
+the account before. The binding hears what the account object publishes. A change another process
+of the application makes in the shared store of a desktop, and one whose status could not be read
+when it was published, are not heard: the old account's sessions then end at the keeper's next
+request, and at the latest when the lease ends, up to fifteen minutes.
 
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
 service answers. A lease that has ended, that the host installed before its restart, or that a newer

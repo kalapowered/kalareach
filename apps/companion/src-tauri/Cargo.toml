@@ -50,6 +50,8 @@ kr-ipc.workspace = true
 # The candidate's attempt budget, kept on this computer's disk under its own secret store.
 kr-pairing.workspace = true
 kr-protocol.workspace = true
+# The identity a connection to a paired host is made as, which the link hands the account binding.
+kr-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -123,7 +125,6 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # The sync service the recovery suite talks to over loopback, answering as the Worker did when it
 # was recorded.
 kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }
-kr-transport.workspace = true
 # The voice service's stand-in, which serves the control socket of a call on the daemon's behalf: its
 # route is kr-client's, included by path.
 futures-util.workspace = true

@@ -530,11 +530,13 @@ impl Ending {
         }
     }
 
-    /// The link is gone, and the attachment with it.
-    fn lost() -> Self {
+    /// The link is gone, and the attachment with it. `reason` says why when this device ended it.
+    fn lost(reason: Option<String>) -> Self {
         Self {
             cause: Cause::Lost,
-            ..Self::over("The connection to this session ended.")
+            ..Self::over(
+                reason.unwrap_or_else(|| "The connection to this session ended.".to_owned()),
+            )
         }
     }
 }
@@ -578,6 +580,12 @@ enum Next {
 }
 
 impl View {
+    /// The end of a view whose link is gone, in the account's words when this device ended the
+    /// link because the account it was opened under left.
+    fn lost(&self) -> Ending {
+        Ending::lost(self.wire.ended_by_this_device())
+    }
+
     /// Reads the link and the page's commands until the view ends.
     async fn serve(&mut self, commands: &mut UnboundedReceiver<Command>) -> Ending {
         loop {
@@ -602,14 +610,14 @@ impl View {
                     None
                 }
                 Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken).await,
-                Next::Command(Some(Command::Lose)) => Some(Ending::lost()),
+                Next::Command(Some(Command::Lose)) => Some(self.lost()),
                 Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
                 Next::Frame(Ok(ControlFrame::Notification(notification))) => {
                     self.notification(notification).await
                 }
                 Next::Frame(Ok(ControlFrame::Response(response))) => self.response(response).await,
                 Next::Frame(Ok(_)) => None,
-                Next::Frame(Err(_)) => Some(Ending::lost()),
+                Next::Frame(Err(_)) => Some(self.lost()),
             };
             if let Some(ended) = ended {
                 return ended;
@@ -762,7 +770,7 @@ impl View {
             params,
         };
         if !self.wire.send(&ControlFrame::Request(request)).await {
-            return Some(Ending::lost());
+            return Some(self.lost());
         }
         self.resubscription = Some(request_id);
         self.replaced_stream = true;
@@ -784,7 +792,7 @@ impl View {
                 .mutation(request_id, Method::AttachmentViewport, &params)
                 .await
             {
-                return Some(Ending::lost());
+                return Some(self.lost());
             }
             self.window.sent(request_id);
         }
@@ -812,7 +820,7 @@ impl View {
                 }
             };
             if !sent {
-                return Some(Ending::lost());
+                return Some(self.lost());
             }
             self.lease.sent(owed, request_id);
         }
@@ -1071,7 +1079,7 @@ impl View {
             params,
         };
         if !self.wire.send(&ControlFrame::Request(request)).await {
-            return Some(Ending::lost());
+            return Some(self.lost());
         }
         self.lease.written(request_id, writing.epoch);
         None

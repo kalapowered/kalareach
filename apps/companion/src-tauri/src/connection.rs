@@ -16,7 +16,6 @@ use std::sync::Arc;
 use kr_client::organisation::LeaseStop;
 use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
-use kr_client::services::AccountMark;
 use kr_client::{Said as _, Session};
 use kr_protocol::ids::{BuildId, DeviceId, EnvironmentId};
 use kr_protocol::rights::ActionRight;
@@ -92,10 +91,6 @@ pub struct Connection {
     /// actor its actions are claimed under from it.
     local_user: Option<u64>,
     reopen: Option<Reopen>,
-    /// The account signed in when the connection was opened, for a host whose grant answers to an
-    /// organisation: the lease the connection presented is that account's, and the connection is
-    /// the account's for as long as it lasts.
-    leased_to: Option<AccountMark>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -125,7 +120,6 @@ impl Connection {
             standing: Standing::Owner,
             local_user: Some(local_user),
             reopen: None,
-            leased_to: None,
         })
     }
 
@@ -147,37 +141,19 @@ impl Connection {
             standing,
             local_user,
             reopen,
-            leased_to: None,
         }
     }
 
-    /// The account the connection was opened under, when the host's grant answers to an
-    /// organisation and an account was signed in.
+    /// Why this device ended the connection, when it did: the account it was opened under signed
+    /// out or was replaced (see [`crate::bound`]), in the words of why. Asking also finds out
+    /// whether it should have ended already, so a caller that publishes what it read over the
+    /// connection asks last, and publishes nothing of an account that has left.
     #[must_use]
-    pub const fn leased_to(&self) -> Option<AccountMark> {
-        self.leased_to
-    }
-
-    /// Whether the account signed in is still the one the connection was opened under, which a
-    /// caller that uses the connection for more than its opening asks again after it has presented
-    /// a lease on it. A connection to a host whose grant answers to no organisation is under no
-    /// account.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the connection is no longer the account's: it signed out, or another account is
-    /// signed in, in the lease stop's words.
-    pub async fn account_unchanged(
-        &self,
-        device: &Device,
-    ) -> std::result::Result<(), CommandError> {
-        match (&self.standing, device.leases()) {
-            (Standing::Paired { host, .. }, Some(desk)) => desk
-                .still_under(host, self.leased_to)
-                .await
-                .map_err(|stop| stopped_as_error(&stop)),
-            _ => Ok(()),
-        }
+    pub fn ended_by_this_device(&self) -> Option<CommandError> {
+        self.session
+            .transport()
+            .ended_by_this_device()
+            .map(CommandError::from)
     }
 
     /// This connection, with the way another to the same host is opened.
@@ -264,49 +240,54 @@ impl Connection {
         let pairing = device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
         let connecting = async {
-            // The connection is the account's that is signed in before it is dialled: an account
-            // that signs in while it is dialled and presented is not the one its lease was got for.
-            let leased_to = match device.leases() {
-                Some(desk) => desk.account_of(host).await,
-                None => None,
-            };
-            let session = if visiting {
+            if visiting {
                 let in_use = || device.host_in_use().map(|using| using.network_config);
                 pairing.link.visit_paired(host, &identity, &in_use).await
             } else {
                 pairing.link.connect_paired(host, &identity).await
-            }?;
-            Ok::<_, LinkError>((session, leased_to))
+            }
         };
-        let (session, leased_to) = tokio::time::timeout(CONNECT_WITHIN, connecting)
+        let session = tokio::time::timeout(CONNECT_WITHIN, connecting)
             .await
             .map_err(|_| Unopened::unreached("the host did not answer in time"))?
             .map_err(|error| match error {
                 LinkError::Refused(refusal) => Unopened::Refused(CommandError::from(refusal)),
                 // The host was reachable and was not asked for anything: the device could not give
-                // it the lease it needs, and the words say why.
+                // it the lease it needs, or the account it was to be opened under left, and the
+                // words say why.
                 LinkError::Membership(refusal) => Unopened::Refused(CommandError::from(refusal)),
                 other => Unopened::unreached(other.said().into_string()),
             })?;
-        // The lease the connection presented is the account's that was signed in when it was
-        // dialled: if another has signed in since, nothing is asked of the host under it.
-        if let Some(desk) = device.leases()
-            && let Err(stop) = desk.still_under(host, leased_to).await
-        {
-            session.close();
-            return Err(Unopened::Refused(stopped_as_error(&stop)));
+        // The connection is bound to the account signed in when it was dialled (`crate::bound`): if
+        // that account left while the host was asked who it is, or at any time before this
+        // returns, nothing is opened, and the words say why.
+        let asked = async {
+            let info: kr_protocol::hostinfo::HostInfoResult = tokio::time::timeout(
+                CONNECT_WITHIN,
+                session.read(
+                    kr_protocol::method::Method::HostInfo,
+                    &crate::commands::NoParams {},
+                ),
+            )
+            .await
+            .map_err(|_| Unopened::unreached("the host did not say which environment it is"))?
+            .map_err(Unopened::of_read)?;
+            let rights = open_for_the_host(&session).await?;
+            Ok::<_, Unopened>((info, rights))
         }
-        let info: kr_protocol::hostinfo::HostInfoResult = tokio::time::timeout(
-            CONNECT_WITHIN,
-            session.read(
-                kr_protocol::method::Method::HostInfo,
-                &crate::commands::NoParams {},
-            ),
-        )
-        .await
-        .map_err(|_| Unopened::unreached("the host did not say which environment it is"))?
-        .map_err(Unopened::of_read)?;
-        let rights = open_for_the_host(&session).await?;
+        .await;
+        let left = session.transport().ended_by_this_device();
+        let (info, rights) = match (asked, left) {
+            (Ok(asked), None) => asked,
+            (_, Some(refusal)) => {
+                session.close();
+                return Err(Unopened::Refused(CommandError::from(refusal)));
+            }
+            (Err(failed), None) => {
+                session.close();
+                return Err(failed);
+            }
+        };
         Ok(Self {
             session: Arc::new(session),
             environment_id: info.environment_id,
@@ -317,7 +298,6 @@ impl Connection {
             },
             local_user: None,
             reopen: None,
-            leased_to,
         })
     }
 
@@ -389,14 +369,6 @@ async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionR
             "the host answered that this connection has ended",
         ))),
     }
-}
-
-/// A lease stop, as the failure a person is shown: the stop's words, under its code.
-fn stopped_as_error(stop: &LeaseStop) -> CommandError {
-    CommandError::from(kr_protocol::error::ProtocolError::new(
-        stop.code(),
-        stop.to_string(),
-    ))
 }
 
 /// Why a connection to a paired host was not opened.
@@ -618,7 +590,7 @@ pub async fn keep<R, A, F>(
                     Standing::Paired { host, .. }
                         if host.proposed_grant.organisation.as_ref().is_some() =>
                     {
-                        Some(((**host).clone(), connection.leased_to()))
+                        Some((**host).clone())
                     }
                     _ => None,
                 };
@@ -640,7 +612,7 @@ pub async fn keep<R, A, F>(
                 // no longer kept. When something only a person can mend stops it, the connection
                 // says so and ends, and the next attempt presents the lease first and says the
                 // same until it is mended.
-                let leased = leased.and_then(|(host, under)| {
+                let leased = leased.and_then(|host| {
                     let device = state.device().ok()?;
                     let desk = device.leases()?.clone();
                     let key = *device
@@ -649,7 +621,7 @@ pub async fn keep<R, A, F>(
                         .paired_identity(host.device_id)
                         .authorisation
                         .public();
-                    Some((desk, host, key, under))
+                    Some((desk, host, key))
                 });
                 // A connection that did not last is not a recovery: a host that accepts and then
                 // closes is waited for as one that does not answer.
@@ -657,8 +629,8 @@ pub async fn keep<R, A, F>(
                 let ended =
                     forward_events(app.clone(), Arc::clone(&session), environment_id, events);
                 tokio::pin!(ended);
-                if let Some((desk, host, key, under)) = leased {
-                    let kept = desk.keep(&session, &host, key, under);
+                if let Some((desk, host, key)) = leased {
+                    let kept = desk.keep(&session, &host, key);
                     tokio::select! {
                         () = &mut ended => {}
                         stopped = kept => {
@@ -805,7 +777,15 @@ pub async fn forward_events<R: Runtime>(
             }
             () = session.closed() => {
                 let state = app.state::<AppState>();
-                state.disconnected_from(&session, "the connection to this host ended");
+                // An account that left ended it, and says so: not that the connection was lost.
+                let why = session
+                    .transport()
+                    .ended_by_this_device()
+                    .map_or_else(
+                        || "the connection to this host ended".to_owned(),
+                        |refusal| refusal.message,
+                    );
+                state.disconnected_from(&session, why);
                 let _ = app.emit(CONNECTION_EVENT, state.connection_state());
                 return;
             }
