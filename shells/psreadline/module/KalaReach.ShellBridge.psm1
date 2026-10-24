@@ -88,6 +88,16 @@ function Get-KrPSReadLineVersion {
     $module.Version
 }
 
+function Clear-KrSecret {
+    # The bootstrap secret's bytes are overwritten in place before the reference goes. The
+    # runtime's own copies of the environment variable's text and of the key an HMAC object
+    # held cannot be reached from here.
+    if ($null -ne $script:Kr.Secret -and $script:Kr.Secret.Length -gt 0) {
+        [System.Array]::Clear($script:Kr.Secret, 0, $script:Kr.Secret.Length)
+    }
+    $script:Kr.Secret = [byte[]]::new(0)
+}
+
 function Get-KrPackageRoot {
     <#
     .SYNOPSIS
@@ -429,7 +439,7 @@ function Initialize-KalaReachBridge {
 
     $script:Kr.Socket = Connect-KrEndpoint $endpoint
     if ($null -eq $script:Kr.Socket) {
-        $script:Kr.Secret = [byte[]]::new(0)
+        Clear-KrSecret
         return
     }
 
@@ -439,21 +449,23 @@ function Initialize-KalaReachBridge {
 
     if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $script:Kr.Package) })) {
         Disconnect-KrEndpoint
-        $script:Kr.Secret = [byte[]]::new(0)
+        Clear-KrSecret
         return
     }
     if (-not (Wait-KrHandshake)) {
         Disconnect-KrEndpoint
-        $script:Kr.Secret = [byte[]]::new(0)
+        Clear-KrSecret
         return
     }
     $script:Kr.Registered = $true
     $script:Kr.Managed = $true
     Write-KrTrace 'registered'
 
-    # The secret leaves the exported environment and stays in this module's own memory, where a
-    # child process and a user's profile cannot reach it. The integration keeps it because a reader
-    # re-established inside the same shell needs it again.
+    # The proof is accepted and nothing reads the secret again: this function is its only reader
+    # and returns at once while the bridge is registered. The module's copy is cleared, and the
+    # variables that carried it leave the exported environment, where a child process and a
+    # user's profile could read them.
+    Clear-KrSecret
     Remove-Item -Path ('Env:' + $script:KR_ENDPOINT_VARIABLE) -ErrorAction SilentlyContinue
     Remove-Item -Path ('Env:' + $script:KR_SECRET_VARIABLE) -ErrorAction SilentlyContinue
 
