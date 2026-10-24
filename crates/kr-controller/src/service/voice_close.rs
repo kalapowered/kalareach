@@ -95,7 +95,7 @@ impl Controller {
             .ok_or_else(|| ControllerError::PermissionDenied {
                 detail: "this device is no longer paired with this host".to_owned(),
             })?;
-        let standing = self.feed_standing(connection_id, &paired.grant, &record.grant);
+        let standing = self.feed_standing(connection_id, &paired, &record.grant);
         match self.lifetimes().stored(self.sharing.grants(), &record)? {
             Anchored::Unlimited => {}
             Anchored::Until(end) => allowed = allowed.min(end.saturating_duration_since(now)),

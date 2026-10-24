@@ -62,7 +62,7 @@ impl RemoteConnection {
     /// `acting`, and the shares it has decided a request under.
     pub(super) fn feed_standing(&self, acting: &kr_protocol::grant::Grant) -> FeedStanding {
         self.controller
-            .feed_standing(self.connection_id, &self.device.grant, acting)
+            .feed_standing(self.connection_id, &self.device, acting)
     }
 
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
