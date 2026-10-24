@@ -120,6 +120,25 @@ const CONNECT_WAIT: Duration = Duration::from_secs(10);
 /// How soon a closed session the store could not finish is tried again.
 const CLOSURE_RETRY: Duration = Duration::from_secs(5);
 
+/// The longest a closed session whose journal is held back waits between tries. Each try that
+/// finds it held back doubles the wait from [`CLOSURE_RETRY`] up to this.
+const CLOSURE_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// How long a closed session whose journal has been held back `holds` times waits for its next try.
+fn held_back_wait(holds: u32) -> Duration {
+    CLOSURE_RETRY
+        .saturating_mul(1_u32 << holds.saturating_sub(1).min(16))
+        .min(CLOSURE_RETRY_MAX)
+}
+
+/// A closed session whose journal is held back: how many tries found it so, and the moment on the
+/// continuous clock before which it is not tried again.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    holds: u32,
+    not_before_ms: u64,
+}
+
 /// How often the records of expired actions are let go of.
 const FORGET_EVERY_MS: u64 = 60 * 60 * 1_000;
 
@@ -357,6 +376,8 @@ struct Origins {
     ended: BTreeSet<SessionId>,
     /// Closed sessions the store could not finish yet, which the maintenance loop tries again.
     unfinished: BTreeSet<SessionId>,
+    /// The closed sessions among those whose journal is held back for now, with how long they wait.
+    held_back: BTreeMap<SessionId, Held>,
 }
 
 /// How far the store has read each origin, as a timer pass is told it: the moment up to which it
@@ -2531,6 +2552,17 @@ impl AttentionModule {
     /// write now is kept and tried again by the maintenance loop; the session stays closing until
     /// it is finished.
     pub async fn session_closed(self: &Arc<Self>, reach: &dyn Reach, session_id: SessionId) {
+        self.session_closed_at(reach, session_id, kr_ipc::clock::boot_elapsed_ms())
+            .await;
+    }
+
+    /// [`Self::session_closed`] at the reading `now_ms` of the continuous clock.
+    async fn session_closed_at(
+        self: &Arc<Self>,
+        reach: &dyn Reach,
+        session_id: SessionId,
+        now_ms: u64,
+    ) {
         {
             // With the store held, so a page being applied finishes first and a page read after
             // this finds its link gone.
@@ -2560,19 +2592,25 @@ impl AttentionModule {
                 .or_default()
                 .unaccounted = true;
         }
-        self.finish(reach, session_id, unaccounted);
+        self.finish(reach, session_id, unaccounted, now_ms);
     }
 
     /// Finishes a closed session as far as the store can now, and keeps it for the next pass when
-    /// it cannot.
-    fn finish(&self, reach: &dyn Reach, session_id: SessionId, unaccounted: bool) {
+    /// it cannot. A session whose journal is held back waits longer after each try that finds it
+    /// so, up to [`CLOSURE_RETRY_MAX`]; while it waits its items are held back as they are while
+    /// its closure is under way.
+    fn finish(&self, reach: &dyn Reach, session_id: SessionId, unaccounted: bool, now_ms: u64) {
         if self.finalised(session_id) {
             let mut origins = self.origins();
             origins.closing.remove(&session_id);
             origins.ended.remove(&session_id);
             origins.unfinished.remove(&session_id);
+            origins.held_back.remove(&session_id);
             return;
         }
+        // Taken out here and put back only by a try that finds the journal held back again, so a
+        // session whose hold has lifted keeps no wait.
+        let earlier = self.origins().held_back.remove(&session_id);
         let finished = if unaccounted {
             // Marked first, so no text is served for the session from here on.
             self.origins().unaccounted.insert(session_id);
@@ -2583,10 +2621,7 @@ impl AttentionModule {
             self.origins().closing.insert(session_id);
             let read = match reach.closed_journal(session_id) {
                 ClosedJournal::Open(journal) => self.read_to_the_end(session_id, &journal),
-                ClosedJournal::HeldBack => Err(Unfinished::Store(ProtocolError::new(
-                    ErrorCode::StorageUnavailable,
-                    "a closed session's journal cannot be brought forward yet",
-                ))),
+                ClosedJournal::HeldBack => Err(Unfinished::HeldBack),
                 ClosedJournal::Unreadable => Err(Unfinished::Journal),
             };
             match read {
@@ -2595,6 +2630,22 @@ impl AttentionModule {
                     .gaps_without_end(session_id)
                     .and_then(|()| self.finalise(session_id)),
                 Err(Unfinished::Store(error)) => Err(error),
+                Err(Unfinished::HeldBack) => {
+                    let mut origins = self.origins();
+                    let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
+                    let wait = u64::try_from(held_back_wait(holds).as_millis()).unwrap_or(u64::MAX);
+                    origins.held_back.insert(
+                        session_id,
+                        Held {
+                            holds,
+                            not_before_ms: now_ms.saturating_add(wait),
+                        },
+                    );
+                    Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "a closed session's journal cannot be brought forward yet",
+                    ))
+                }
             }
         };
         let changed = {
@@ -2618,11 +2669,51 @@ impl AttentionModule {
 
     /// Tries again to finish every closed session the store could not finish before.
     async fn finish_again(&self, reach: &dyn Reach) {
-        let unfinished: Vec<SessionId> = self.origins().unfinished.iter().copied().collect();
+        self.finish_again_at(reach, kr_ipc::clock::boot_elapsed_ms())
+            .await;
+    }
+
+    /// [`Self::finish_again`] at the reading `now_ms` of the continuous clock: a session whose
+    /// journal is held back is left until its wait has passed.
+    async fn finish_again_at(&self, reach: &dyn Reach, now_ms: u64) {
+        let unfinished: Vec<SessionId> = {
+            let origins = self.origins();
+            origins
+                .unfinished
+                .iter()
+                .copied()
+                .filter(|session_id| {
+                    origins
+                        .held_back
+                        .get(session_id)
+                        .is_none_or(|held| held.not_before_ms <= now_ms)
+                })
+                .collect()
+        };
         for session_id in unfinished {
             let unaccounted = reach.unaccounted(session_id).await;
-            self.finish(reach, session_id, unaccounted);
+            self.finish(reach, session_id, unaccounted, now_ms);
         }
+    }
+
+    /// How long the maintenance loop may wait before a closed session the store could not finish
+    /// is due to be tried again.
+    fn closure_retry_wait(&self, now_ms: u64) -> Duration {
+        let origins = self.origins();
+        origins
+            .unfinished
+            .iter()
+            .map(|session_id| {
+                origins
+                    .held_back
+                    .get(session_id)
+                    .map_or(CLOSURE_RETRY, |held| {
+                        Duration::from_millis(held.not_before_ms.saturating_sub(now_ms))
+                            .max(Duration::from_millis(50))
+                    })
+            })
+            .min()
+            .unwrap_or(MAINTENANCE)
     }
 
     /// Reads a closed session's journal from the store's cursors to the head of every source.
@@ -3027,7 +3118,7 @@ impl AttentionModule {
                             .clamp(Duration::from_millis(50), MAINTENANCE)
                     });
                 if !held.origins().unfinished.is_empty() {
-                    wait = wait.min(CLOSURE_RETRY);
+                    wait = wait.min(held.closure_retry_wait(kr_ipc::clock::boot_elapsed_ms()));
                 }
                 if held.clock_owed.load(Ordering::Relaxed) {
                     wait = wait.min(CLOCK_WRITE_RETRY);
@@ -3157,6 +3248,9 @@ enum Unfinished {
     Journal,
     /// The store could not take what was read: the session is tried again later.
     Store(ProtocolError),
+    /// The journal is of an earlier schema and cannot be brought forward yet: the session is tried
+    /// again after a wait that grows with each try.
+    HeldBack,
 }
 
 // ----- The link --------------------------------------------------------------------------------
@@ -4220,8 +4314,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// A reach whose closed journal is held back for now.
-    struct HeldBack;
+    /// A reach whose closed journal is held back for now, and which counts the looks at it.
+    #[derive(Default)]
+    struct HeldBack {
+        looks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeldBack {
+        fn looks(&self) -> usize {
+            self.looks.load(Ordering::SeqCst)
+        }
+    }
 
     impl Reach for HeldBack {
         fn connect<'a>(
@@ -4240,6 +4343,7 @@ pub(crate) mod tests {
         }
 
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            self.looks.fetch_add(1, Ordering::SeqCst);
             ClosedJournal::HeldBack
         }
 
@@ -4258,7 +4362,7 @@ pub(crate) mod tests {
         let held = SessionId::new(kr_ipc::new_uuid());
         let unreadable = SessionId::new(kr_ipc::new_uuid());
 
-        module.session_closed(&HeldBack, held).await;
+        module.session_closed(&HeldBack::default(), held).await;
         module
             .session_closed(&Stub { unaccounted: false }, unreadable)
             .await;
@@ -4274,6 +4378,50 @@ pub(crate) mod tests {
         assert!(
             module.finalised(unreadable),
             "control: a journal that cannot be read is finished with gaps"
+        );
+    }
+
+    /// A journal that stays held back is looked at less often each time, up to five minutes
+    /// apart, on the continuous clock the case gives; the session's items stay held while it waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_held_back_for_good_is_looked_at_less_often_each_time() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = HeldBack::default();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let seconds = |seconds: u64| seconds * 1_000;
+
+        module
+            .session_closed_at(&reach, session_id, seconds(100))
+            .await;
+        assert_eq!(reach.looks(), 1, "the closure looks once");
+        module.finish_again_at(&reach, seconds(104)).await;
+        assert_eq!(reach.looks(), 1, "and not again before five seconds");
+        module.finish_again_at(&reach, seconds(105)).await;
+        assert_eq!(reach.looks(), 2);
+        module.finish_again_at(&reach, seconds(114)).await;
+        assert_eq!(reach.looks(), 2, "the second wait is ten seconds");
+        module.finish_again_at(&reach, seconds(115)).await;
+        assert_eq!(reach.looks(), 3);
+        assert_eq!(
+            module.closure_retry_wait(seconds(115)),
+            Duration::from_secs(20),
+            "the third wait is twenty seconds, and the loop sleeps no less"
+        );
+        assert!(
+            module.origins().closing.contains(&session_id),
+            "the session stays closing, and its items stay held, while the journal is held back"
+        );
+
+        let mut now = seconds(115);
+        for _ in 0..12 {
+            now += module.closure_retry_wait(now).as_millis() as u64;
+            module.finish_again_at(&reach, now).await;
+        }
+        assert_eq!(
+            module.closure_retry_wait(now),
+            CLOSURE_RETRY_MAX,
+            "the wait stops growing at five minutes"
         );
     }
 

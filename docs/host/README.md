@@ -4063,7 +4063,12 @@ recovery, a collection, a migration) take the lock and the value. A migration is
 way wherever it is asked for, by a session list, by the attention store's reading of a closed
 journal or by the transfer sweep: while a worker of the session may remain, or the registry is busy
 for the moment, the store is left as it is and a later look makes the migration. The attention store
-keeps a session it could not read for that reason to try again, and does not finish it with gaps. On Linux a
+keeps a session it could not read for that reason to try again, and does not finish it with gaps.
+It looks again after five seconds, then after ten, and so on, doubling up to five minutes between
+looks for as long as the hold lasts. Until the store reads the journal the session stays closing,
+so the announcements about its pending questions and approvals are held back from delivery, as
+they are while any closure is under way. While the hold lasts none of the session's text is
+served; a read that finds the journal can be brought forward serves it at once. On Linux a
 process of a later boot that repeats the launch process's identifier and start tick reads as the
 worker for as long as it runs, because an identity carries no boot; the reads and the collection
 leave the session alone until it ends.
