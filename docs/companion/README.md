@@ -512,7 +512,9 @@ record where it is: nothing is written and no host is started until a start can 
 the page says to close the application and open it again for each host that was paired then. A list
 of paired hosts that cannot be read marks none: once it can be read, those hosts show notifications
 as off, with no words, and none is started until the application is opened again. `docs/delivery/README.md` ("What the phone does first") says what
-the steps are. The application looks again with `push_refresh` when it starts and each time it
+the steps are. A run changes a member's host only under the account its connection was opened under:
+when that account has signed out or been replaced, the run stops before its next change, in words that
+say so. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
 comes back to the screen they left. A tap on a notification opens the application, and
 `notification_route` hands the page the screen once; the page goes to the attention screen, where
