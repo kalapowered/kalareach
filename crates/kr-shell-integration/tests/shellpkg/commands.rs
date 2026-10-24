@@ -185,10 +185,25 @@ impl Probes {
         );
         // A launcher that is an executable file the system cannot start.
         place(&root.join("launcher").join("kr-hook-broken"), &[0, 1, 2, 3]);
-        // A launcher that starts and ends with a status of its own.
+        // A launcher that starts, records that it did and ends with a status of its own.
         let failing = root.join("launcher").join("kr-hook-fails");
-        place(&failing, b"#!/bin/sh\nexit 7\n");
+        place(
+            &failing,
+            format!(
+                "#!/bin/sh\nprintf 'run\\nend\\n' >> '{}'\nexit 7\n",
+                told(&root.join("failing-launcher.record"))
+            )
+            .as_bytes(),
+        );
         start_once(&failing, 7);
+        let _ = std::fs::remove_file(root.join("failing-launcher.record"));
+        // A program on the search path that prints a word and ends with a status of its own.
+        let failing_program = root.join("bin").join("kr-probe-fails");
+        place(
+            &failing_program,
+            b"#!/bin/sh\nprintf '%s%s\\n' 'fails-' 'ran'\nexit 7\n",
+        );
+        start_once(&failing_program, 7);
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         std::fs::write(root.join("script.ps1"), "kr-probe from-a-script\n").expect("a script");
         std::fs::write(root.join("exits.ps1"), "exit -1\n").expect("a script");
@@ -298,6 +313,12 @@ impl Probes {
     pub fn launches(&self) -> Vec<ProbeRun> {
         read_runs(&self.root.join("launcher.record"))
     }
+
+    /// Every start of the launcher that ends with a status of 7 so far.
+    #[must_use]
+    pub fn failing_launches(&self) -> Vec<ProbeRun> {
+        read_runs(&self.root.join("failing-launcher.record"))
+    }
 }
 
 impl Default for Probes {
@@ -305,60 +326,6 @@ impl Default for Probes {
         Self::new()
     }
 }
-
-/// A lookup handler of the case's own, standing in for the one a host installs for PowerShell.
-///
-/// The host's handler asks the module about a command typed alone on a line, and runs it through
-/// the launcher the answer names. This one does the same for a native command, and runs the
-/// command as typed when the module answers nothing or the launcher cannot start.
-///
-/// Two things a handler has to do that have nothing to do with the question. A lookup the handler
-/// makes itself calls the handler again, so it holds a flag while it runs. And it runs before the
-/// read-line entry point reads `$?`, which is the status of the line that has just run and which
-/// any script a lookup runs replaces: the handler reads it first and puts it back last, with a
-/// failure that adds no record of its own to `$Error`.
-const LOOKUP_STAND_IN: &str = r#"
-$ExecutionContext.InvokeCommand.PreCommandLookupAction = {
-    param($CommandName, $EventArgs)
-    $kept = $?
-    try {
-        if ($global:KrLookupBusy) { return }
-        $global:KrLookupBusy = $true
-        try {
-            $origin = $EventArgs.CommandOrigin
-            if (-not (Test-KalaReachCommand -Origin $origin -Name $CommandName)) { return }
-            $application = $ExecutionContext.InvokeCommand.GetCommand($CommandName, [System.Management.Automation.CommandTypes]::Application)
-            if ($null -eq $application) { return }
-            $typed = $CommandName
-            $program = $application.Source
-        } finally {
-            $global:KrLookupBusy = $false
-        }
-        $EventArgs.CommandScriptBlock = {
-            $answer = Resolve-KalaReachCommand -Origin $origin -Name $typed -Arguments ([string[]]@($args)) -Executable $program
-            if ($null -eq $answer) { & $program @args; return }
-            $saved = @{}
-            foreach ($variable in $answer.Environment.Keys) {
-                $saved[$variable] = [Environment]::GetEnvironmentVariable($variable)
-                [Environment]::SetEnvironmentVariable($variable, $answer.Environment[$variable])
-            }
-            $started = $false
-            try {
-                try { & $answer.Launcher @($answer.Arguments); $started = $true } catch { }
-            } finally {
-                foreach ($variable in $saved.Keys) {
-                    $before = if ($null -eq $saved[$variable]) { [NullString]::Value } else { $saved[$variable] }
-                    [Environment]::SetEnvironmentVariable($variable, $before)
-                }
-            }
-            if (-not $started) { & $program @args }
-        }.GetNewClosure()
-        $EventArgs.StopSearch = $true
-    } finally {
-        if (-not $kept) { Write-Error 'the status before the lookup' -ErrorAction Ignore }
-    }
-}
-"#;
 
 /// A session of this package's own with the probes on its search path, at an answering prompt.
 pub(super) fn a_session_with_probes(package: &Package, probes: &Probes) -> Session {
@@ -368,13 +335,12 @@ pub(super) fn a_session_with_probes(package: &Package, probes: &Probes) -> Sessi
 /// [`a_session_with_probes`], with `more` run in the person's PowerShell profile after the lookup
 /// handler is installed.
 pub(super) fn a_session_with_probes_and(package: &Package, probes: &Probes, more: &str) -> Session {
-    let profile = format!("{LOOKUP_STAND_IN}\n{more}");
     let mut session = if package.kind == ShellKind::PowerShell {
         Session::start_with_environment_and_profile(
             package,
             &probes.environment(),
             Profile {
-                after_entry: &profile,
+                after_entry: more,
                 ..Profile::ORDINARY
             },
         )
@@ -751,6 +717,22 @@ fn powershell_forms_that_never_ask(session: &mut Session, probes: &Probes) {
         "the name was not held in a variable:\n{}",
         session.terminal_output()
     );
+    // A word the shell works out is not what the person typed, so a line with one is left as typed:
+    // a variable, a string that holds one, a list and a pattern.
+    for (form, command) in [
+        ("an argument that is a variable", "kr-probe $kr_held"),
+        (
+            "an argument that holds a variable",
+            "kr-probe \"with $kr_held inside\"",
+        ),
+        ("an argument that is a list", "kr-probe one,two"),
+        ("an argument that is a pattern", "kr-probe *.nothing"),
+    ] {
+        let runs = probes.runs().len();
+        let asked = session.run_asking(command, "probe-ran");
+        assert!(asked.is_empty(), "{form} asked: {asked:?}");
+        assert_eq!(probes.runs().len(), runs + 1, "{form} ran the program once");
+    }
     for (form, command) in [
         (
             "the name repeated in a subexpression",
@@ -1342,6 +1324,131 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
     assert_eq!(ran.arguments, ["afterwards"]);
     assert_eq!(ran.names(), control.names());
     assert!(!ran.environment.contains_key("KR_REGISTRATION"));
+}
+
+/// A lookup handler of the person's own, which answers `kr-probe` while it is switched on.
+const OWN_LOOKUP_HANDLER: &str = r#"
+$global:KrOwn = $false
+$ExecutionContext.InvokeCommand.PreCommandLookupAction = {
+    param($CommandName, $EventArgs)
+    if ($global:KrOwn -and $CommandName -eq 'kr-probe') {
+        $EventArgs.CommandScriptBlock = { 'own-' + 'handler-ran' }
+        $EventArgs.StopSearch = $true
+    }
+}
+"#;
+
+/// KR-REQ-12.07, KR-REQ-07.45: the root shell asks about a program only when the program is what
+/// the shell would run for the name. An alias, a function or a script that has the name, ahead of
+/// the program, is what runs and the worker is never asked; so is the answer of a lookup handler
+/// the person set, which the module leaves standing and calls first.
+///
+/// The control is the program itself: with the same backend, it is asked about and the launcher
+/// runs in its place.
+pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
+    assert_eq!(
+        kind,
+        ShellKind::PowerShell,
+        "only PowerShell looks names up"
+    );
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let backend = ResolvePolicy::Backend {
+        launcher: told(&probes.launcher()),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let defined = |session: &mut Session, definition: &str| {
+        let line = format!("{definition}; {}", print_assembled(kind, "kr-defined"));
+        assert!(
+            session.run(&line, "kr-defined"),
+            "{definition:?} was not accepted:\n{}",
+            session.terminal_output()
+        );
+    };
+    let mut session = a_session_with_probes(&package, &probes);
+    session.commands.policy = backend.clone();
+
+    let scripts = probes.path("scripts");
+    std::fs::create_dir(&scripts).expect("a directory for the script");
+    std::fs::write(scripts.join("kr-probe.ps1"), "'script-' + 'ran'\n").expect("a script");
+    let steps = [
+        (
+            "a function",
+            "function kr-probe { 'function-' + 'ran' }".to_owned(),
+            "function-ran",
+            "Remove-Item Function:kr-probe".to_owned(),
+        ),
+        (
+            "an alias",
+            "function kr-aliased { 'alias-' + 'ran' }; Set-Alias -Name kr-probe -Value kr-aliased"
+                .to_owned(),
+            "alias-ran",
+            "Remove-Item Alias:kr-probe".to_owned(),
+        ),
+        (
+            "a script ahead of the program on the search path",
+            format!(
+                "$kr_path = $env:PATH; $env:PATH = '{}' + [System.IO.Path]::PathSeparator + $env:PATH",
+                told(&scripts)
+            ),
+            "script-ran",
+            "$env:PATH = $kr_path".to_owned(),
+        ),
+    ];
+    for (form, definition, marker, removal) in steps {
+        defined(&mut session, &definition);
+        let (runs, launches) = (probes.runs().len(), probes.launches().len());
+        let asked = session.run_asking("kr-probe", marker);
+        assert!(asked.is_empty(), "{form} was asked about: {asked:?}");
+        assert_eq!(probes.runs().len(), runs, "{form}: the program ran");
+        assert_eq!(
+            probes.launches().len(),
+            launches,
+            "{form}: the launcher ran"
+        );
+        defined(&mut session, &removal);
+    }
+    let asked = session.run_asking("kr-probe control", "launcher-ran");
+    assert_eq!(asked.len(), 1, "the program itself asks once: {asked:?}");
+
+    // The person's own handler, set before the module's, answers first and its answer stands. With
+    // it switched off, the module's handler is still there and the program is asked about.
+    let mut session = a_session_with_probes_and(&package, &probes, OWN_LOOKUP_HANDLER);
+    session.commands.policy = backend;
+    defined(&mut session, "$global:KrOwn = $true");
+    let (runs, launches) = (probes.runs().len(), probes.launches().len());
+    let asked = session.run_asking("kr-probe", "own-handler-ran");
+    assert!(
+        asked.is_empty(),
+        "the person's handler was passed over: {asked:?}"
+    );
+    assert_eq!(probes.runs().len(), runs);
+    assert_eq!(probes.launches().len(), launches);
+    defined(&mut session, "$global:KrOwn = $false");
+    let asked = session.run_asking("kr-probe afterwards", "launcher-ran");
+    assert_eq!(
+        asked.len(),
+        1,
+        "the person's handler removed the module's: {asked:?}"
+    );
+
+    // A handler the person sets after the module's replaces it for the rest of that line; from the
+    // next prompt the module's is in front again, and the person's still answers first.
+    defined(
+        &mut session,
+        "$ExecutionContext.InvokeCommand.PreCommandLookupAction = { param($n, $e) \
+         if ($n -eq 'kr-probe') { $e.CommandScriptBlock = { 'late-' + 'handler-ran' }; \
+         $e.StopSearch = $true } }",
+    );
+    let (runs, launches) = (probes.runs().len(), probes.launches().len());
+    let asked = session.run_asking("kr-probe", "late-handler-ran");
+    assert!(
+        asked.is_empty(),
+        "the handler set later was passed over: {asked:?}"
+    );
+    assert_eq!(probes.runs().len(), runs);
+    assert_eq!(probes.launches().len(), launches);
 }
 
 /// The shell's own `read` reading a line through the editor.
