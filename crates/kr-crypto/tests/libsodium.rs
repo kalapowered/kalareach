@@ -429,8 +429,12 @@ fn repository_files(root: &Path) -> Vec<String> {
         .map(|path| {
             // A name that is not UTF-8 cannot be turned into a path here and then read, and a
             // file skipped for that would be a file the tripwire never looks inside.
-            String::from_utf8(path.to_vec())
-                .unwrap_or_else(|_| panic!("a file name that is not UTF-8: {path:?}"))
+            String::from_utf8(path.to_vec()).unwrap_or_else(|_| {
+                panic!(
+                    "a file name that is not UTF-8: {}",
+                    String::from_utf8_lossy(path)
+                )
+            })
         })
         .collect();
     files.into_iter().collect()
@@ -445,8 +449,20 @@ fn carriers(root: &Path) -> std::collections::BTreeMap<String, Vec<&'static str>
     let mut found = std::collections::BTreeMap::new();
     for path in repository_files(root) {
         let file = root.join(&path);
-        let Ok(metadata) = std::fs::symlink_metadata(&file) else {
-            continue;
+        let metadata = match std::fs::symlink_metadata(&file) {
+            Ok(metadata) => metadata,
+            // A file that is gone, or whose parent is no longer a directory, has nothing left to
+            // carry; a file that cannot be examined for any other reason is one the tripwire
+            // cannot vouch for.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => panic!("{}: {error}", file.display()),
         };
         if !metadata.is_file() {
             continue;
@@ -512,28 +528,31 @@ fn no_source_file_carries_the_constants_of_a_primitive() {
 fn the_tripwire_reads_every_tree_and_every_kind_of_file() {
     let directory = tempfile::tempdir().expect("a scratch repository");
     let root = directory.path();
-    let git = |arguments: &[&str]| {
-        let status = std::process::Command::new("git")
+    let git = || {
+        let mut command = std::process::Command::new("git");
+        command
             .arg("-C")
             .arg(root)
-            .args(arguments)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .status()
-            .expect("git runs");
-        assert!(status.success(), "git {arguments:?}");
+            .env_remove("GIT_INDEX_FILE");
+        command
     };
-    git(&["init", "-q"]);
-    // The person's own global ignore rules are not part of what this repository ignores: a
-    // `*.bin` there would hide a plant, so the scratch repository points at a file that is not
+    // The person's own ignore rules are not part of what this repository ignores: a `*.bin` in
+    // their global rules or in the template a new repository is copied from would hide a plant.
+    // The repository is made from no template, and its own rules point at a file that is not
     // there.
-    let no_global_rules = root.join("no-global-ignore-rules");
-    git(&[
-        "config",
-        "core.excludesFile",
-        no_global_rules.to_str().expect("a UTF-8 path"),
-    ]);
+    let status = git()
+        .args(["init", "-q", "--template="])
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git init");
+    let status = git()
+        .args(["config", "core.excludesFile"])
+        .arg(root.join("no-global-ignore-rules"))
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git config");
 
     let planted = [
         "shells/zsh/src/other.c",
