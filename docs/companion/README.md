@@ -506,9 +506,10 @@ keeps and with no new token proposal. A host that cannot be told leaves the row 
 the choice stays recorded, and "Try again" runs the whole sequence with it. A choice that the record
 cannot keep, or whose key cannot be filed for the receivers, is not made: the switch goes back and the
 person is told, so that off is never off in name only. The choice a run tells the host is the one
-recorded when the run begins to tell it, before the keys are filed, so the host is told off only after
-the receivers have let the key go; a choice made after that is told by the run when it goes round
-again.
+recorded when the run begins to tell it, before the keys are filed, so the host is told off after the
+receivers were asked to let the key go, whether or not they did (a filing that failed is said at the
+end of the run, and the next look files again); a choice made after that is told by the run when it
+goes round again.
 
 The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
 `push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. `push.rs`
