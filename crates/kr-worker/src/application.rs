@@ -10,12 +10,15 @@
 //! The producer holds two kinds of fact and joins them without reading anything:
 //!
 //! * **Evidence**, which the worker already keeps. An approval is pending when the broker holds a
-//!   request that a connector's table answered and a binding interpreted, and has not settled it.
-//!   A question is open when the question ledger holds one that has not been answered, cancelled or
-//!   expired. A turn is running when an instance's connector table named a turn start and no turn
-//!   end has followed. [`follow_evidence`] reads these when something that can change them
-//!   wakes it, never at a look at the terminal, and re-reads while a question is open because a
-//!   question can run out of time with nothing to wake it.
+//!   request that a connector's table answered and a binding interpreted, which nothing has
+//!   settled and whose deadline, where the upstream put one on it, has not passed (an answer
+//!   already in flight is pending whatever the deadline says). A question is open when the
+//!   question ledger holds one that has not been answered, cancelled or expired. A turn is running
+//!   when an instance's connector table named a turn start and no turn end has followed.
+//!   [`follow_evidence`] reads these when something that can change them wakes it, never at a look
+//!   at the terminal, and re-reads while a question is open because a question can run out of time
+//!   with nothing to wake it, and at the next deadline of a waiting approval, or in fifteen
+//!   seconds if that comes first, for the same reason.
 //! * **The holder of the terminal**, which the adoption watch reads on its own pace. `Following`
 //!   turns each of its looks into a [`Holder`]: the root shell, or a program with the name a person
 //!   knows it by. A program is published once two looks in a row have seen the same group, so the
@@ -50,9 +53,49 @@ use crate::runtime::SessionRuntime;
 /// demand would have noticed. A session with no question open is never read on a timer.
 pub const QUESTION_RECHECK: Duration = Duration::from_secs(15);
 
+/// The longest a wait for an approval's deadline goes before the clock is read again.
+///
+/// A deadline is a time on the wall clock and the wait is on a clock that stops while the machine
+/// sleeps and knows nothing of a wall clock that is stepped, so a long wait is looked at again at
+/// this pace.
+pub const DEADLINE_RECHECK: Duration = Duration::from_secs(15);
+
 /// The longest name a program is given, in bytes.
 #[cfg(unix)]
 const NAME_BYTES: usize = 64;
+
+/// The wall clock the producer measures an approval's deadline against.
+///
+/// In this host's own tests a test can move it forward, which is how a case reaches a deadline
+/// without waiting for the real time to pass it.
+#[derive(Clone, Debug, Default)]
+pub struct DeadlineClock {
+    #[cfg(feature = "testing")]
+    moved_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DeadlineClock {
+    /// The time now, in UTC milliseconds.
+    #[must_use]
+    pub fn now(&self) -> kr_protocol::scalars::TimestampMs {
+        let now = kr_ipc::now_ms();
+        #[cfg(feature = "testing")]
+        let now = kr_protocol::scalars::TimestampMs::new(
+            now.get()
+                .saturating_add(self.moved_ms.load(std::sync::atomic::Ordering::Acquire)),
+        );
+        now
+    }
+
+    /// Moves the clock forward by `by`.
+    #[cfg(feature = "testing")]
+    pub fn move_forward(&self, by: Duration) {
+        self.moved_ms.fetch_add(
+            u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+    }
+}
 
 /// What the worker holds that says what the application is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -249,6 +292,7 @@ pub async fn follow_evidence(
     questions: Arc<Questions>,
     journal_changes: Option<Arc<tokio::sync::Notify>>,
     now: impl Fn() -> Now,
+    deadlines: DeadlineClock,
 ) {
     let closed = runtime.wait_closed();
     tokio::pin!(closed);
@@ -257,10 +301,12 @@ pub async fn follow_evidence(
         let moved_questions = questions.subscribe();
         let moved_journal = journal_changes.as_ref().map(|journal| journal.notified());
         let moved_broker = changes.notified();
-        let facts = broker.application();
+        let current = now();
+        let reading = deadlines.now();
+        let facts = broker.application(reading);
         // A ledger that cannot be read says nothing, so it is taken for no question: a session is
         // not kept awake by a record that cannot be read.
-        let question_open = questions.any_open(now()).unwrap_or(false);
+        let question_open = questions.any_open(current).unwrap_or(false);
         producer.observe_evidence(Evidence {
             approval_pending: facts.approval_pending,
             question_open,
@@ -283,6 +329,20 @@ pub async fn follow_evidence(
                     tokio::time::sleep(QUESTION_RECHECK).await;
                 } else {
                     std::future::pending::<()>().await;
+                }
+            } => {}
+            // An approval stops being answerable at the deadline the upstream put on it, and
+            // nothing else says so: this is the read that lifts it. The timer counts the time
+            // the machine is awake, which a suspended machine does not, and the deadline is a
+            // wall clock time, so the wait is cut short to look again.
+            () = async {
+                match facts.next_deadline {
+                    Some(deadline) => {
+                        let left = deadline.get().saturating_sub(reading.get());
+                        tokio::time::sleep(Duration::from_millis(left).min(DEADLINE_RECHECK))
+                            .await;
+                    }
+                    None => std::future::pending::<()>().await,
                 }
             } => {}
             _ = &mut closed => return,

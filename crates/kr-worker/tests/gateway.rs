@@ -424,6 +424,79 @@ fn approval(
     )
 }
 
+/// One approval the upstream asked for and a binding interpreted, whose answer the upstream will
+/// take until `deadline`.
+fn approval_until(
+    broker: &Broker,
+    id: &str,
+    deadline: Option<u64>,
+    now: u64,
+) -> kr_protocol::gateway::PendingResource {
+    let body = frame(id, "session/request_permission");
+    let (_, opaque) = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            body.as_bytes(),
+            TimestampMs::new(now),
+        )
+        .expect("the request is recorded");
+    broker
+        .interpret(
+            binding(9),
+            opaque.expect("this method expects a response").resource_id,
+            projection(),
+            deadline.map(TimestampMs::new),
+            TimestampMs::new(now + 1),
+        )
+        .expect("the interpretation is accepted")
+}
+
+/// An approval is one the host is waiting on only while it can be answered: at the upstream's
+/// deadline an answer is refused, so the request is no longer one a person is on the way to, and
+/// the instant it stops being answerable is what the worker is told to look again at. An approval
+/// whose answer is in flight is still counted, and one with no deadline always is.
+#[test]
+fn an_approval_is_waited_on_only_while_it_can_be_answered() {
+    let (broker, _upstream) = gateway_recording(None);
+    let deadline = 1_000;
+    approval_until(&broker, "1", Some(deadline), 2);
+    let before = broker.application(TimestampMs::new(deadline - 1));
+    assert!(before.approval_pending);
+    assert_eq!(
+        before.next_deadline,
+        Some(TimestampMs::new(deadline)),
+        "the worker is told when to look again"
+    );
+    for now in [deadline, deadline + 1] {
+        let after = broker.application(TimestampMs::new(now));
+        assert!(
+            !after.approval_pending,
+            "an approval is not waited on at {now}, when the deadline is {deadline}"
+        );
+        assert_eq!(after.next_deadline, None);
+    }
+
+    // The answer is in flight when the deadline passes: the claim decides, not the deadline.
+    let (broker, _upstream) = gateway_recording(None);
+    let claimed = approval_until(&broker, "2", Some(deadline), 2);
+    let _admitted = reserve(&broker, claimed.resource_id, "allow", 3)
+        .expect("the answer is admitted before the deadline");
+    assert_eq!(
+        broker.pending(claimed.resource_id).expect("held").state,
+        PendingState::Claimed
+    );
+    let late = broker.application(TimestampMs::new(deadline + 1));
+    assert!(late.approval_pending, "an answer in flight is waited on");
+    assert_eq!(late.next_deadline, None, "and has no deadline to look at");
+
+    // The control: a request the upstream set no deadline on is waited on for as long as it is open.
+    let (broker, _upstream) = gateway_recording(None);
+    approval_until(&broker, "3", None, 2);
+    let always = broker.application(TimestampMs::new(u64::MAX / 2));
+    assert!(always.approval_pending);
+    assert_eq!(always.next_deadline, None);
+}
+
 /// KR-REQ-11.30: the qualified declarative table is interpreted by core code, and any request it
 /// does not classify is presumed mutating and suspends rich mutations.
 #[test]

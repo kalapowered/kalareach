@@ -1659,7 +1659,9 @@ not have rather than as one it does.
 What a session's worker reports is what holds the session's terminal and what its agents wait for,
 and it is the worker's own account, not a guess from the output. A request counts once a connector's
 table has answered its method and a binding with the decoding grant has interpreted it as an
-approval, until it is settled; a reverse request that nothing interpreted is not one a person can
+approval, until it is settled or the deadline the upstream put on it passes, since an answer is
+refused from then on and nobody is on the way to the request (an answer already in flight counts
+whatever the deadline says); a reverse request that nothing interpreted is not one a person can
 decide, and counts for nothing. A question counts while it is open, which ends when it is answered,
 withdrawn or expired, or when the program that asked has gone. An agent counts as at work for a turn
 that its connector's table names the start and the end of; a program with no turn routes in its
