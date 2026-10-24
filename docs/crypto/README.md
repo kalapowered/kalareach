@@ -515,9 +515,9 @@ flags and the `CPPFLAGS` and `LDFLAGS` of the build, twice (once with the platfo
 once with the portable one), and runs it. A wrong answer stops the build and installs nothing. The
 check runs for Bash, Fish and Zsh whatever the shell's own test options say, so the build box and
 the `shell-packages` job run it too. Zsh and Bash compile the file under their own makefiles, which
-add defines and include paths the file does not read, so the check builds what they build. Fish
-compiles it through the `cc` crate, which adds flags of its own, so for Fish the check builds it
-closely.
+add defines and include paths the file does not read and, for Zsh's loadable module, `-fPIC`. Fish
+compiles it through the `cc` crate, which adds flags of its own. The check builds the same source
+with the same compiler and flags as far as the file depends on them.
 
 The SHA-256 cases are the examples in FIPS 180-2 (`abc`, the 448-bit message and one million `a`)
 and the NIST CAVP byte-oriented vectors for the empty message and for 55, 56, 57, 63 and 64 bytes,

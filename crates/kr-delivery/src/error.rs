@@ -57,7 +57,8 @@ pub enum DeliveryError {
     /// The destination has no usable `notification_preview` key.
     #[error("{0}")]
     NoPreviewKey(&'static str),
-    /// A cryptographic operation failed: sealing or opening a preview, or drawing a secret.
+    /// A cryptographic operation failed, for example sealing or opening a preview or an envelope,
+    /// or drawing a secret.
     #[error("a cryptographic operation failed: {0}")]
     Crypto(#[from] kr_crypto::CryptoError),
     /// A value could not be represented in KR-CBOR-1.

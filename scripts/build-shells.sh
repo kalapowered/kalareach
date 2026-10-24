@@ -603,8 +603,8 @@ check_bridge_crypto() {
  * Each case names where its answer comes from. NIST's examples and the byte-oriented vectors of
  * its Cryptographic Algorithm Validation Program are copied as published; where NIST publishes
  * none for a length that the code treats separately, the answer was taken from OpenSSL and from
- * Perl's Digest::SHA, which agree. Every message is hashed three ways: whole, one byte at a time and
- * in uneven pieces, which reach every state of the 64-byte buffer.
+ * Perl's Digest::SHA, which agree. Every message is hashed three ways: whole, one byte at a time
+ * and in uneven pieces, which reach every state of the 64-byte buffer.
  */
 
 #include <stdio.h>
