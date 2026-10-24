@@ -326,11 +326,12 @@ alone. An invocation that runs as typed, because the integration bypassed it or 
 keeps the person's own environment, their own value of a declared variable included. Nothing is read
 from the flags to decide what a launch admits. A package that installs a native bridge gets the
 bridge its installation put in place, or none where the installation did not. A package that
-installs none gets a hook bridge of its own; the bundled Qoder CLI package's inline settings, for example, register its
-hook by naming `kr-hook` as a bare command (the plugins repository's newer package uses the forwarder's placeholder). Where a hook is registered and how its command is spelt
-decide nothing: a bridge is admitted only when it says it is for the application the package
-declares (its recipe's, or its plugin name where it has no recipe) and runs this installation's own `kr-hook`, under the launch's registration and
-credential.
+installs none gets a hook bridge of its own; Qoder CLI's inline settings, for example, register its
+hook by naming the forwarder with the placeholder, which the host replaces with its full path.
+Where a hook is registered and how its command is spelt decide nothing: a bridge is admitted only
+when it says it is for the application the package declares (its recipe's, or its plugin name
+where it has no recipe) and runs this installation's own `kr-hook`, under the launch's
+registration and credential.
 
 ### The launch probe
 
