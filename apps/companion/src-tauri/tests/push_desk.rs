@@ -1562,8 +1562,10 @@ async fn a_host_forgotten_while_it_waits_for_its_turn_proposes_nothing() {
     })
     .await;
     phone.desk.enable(&references[1]).expect("the person asks");
+    // The second host is the newest, which the page lists first: its run says it is waiting for the
+    // slot once it has passed every check before it.
     phone
-        .until(|states| states == [PushState::Working, PushState::Working])
+        .until_words("Waiting for the notification service")
         .await;
     // The second host's run waits for the slot. Its host is forgotten, and the first run finishes.
     let second_host = phone
