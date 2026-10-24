@@ -4031,10 +4031,12 @@ read as unmigrated. The offline importer holds the environment's singleton lock 
 can be running under.
 
 **A session closed on request is closed the same way.** Where the worker accepts a close and its
-closure comes later, the daemon watches the worker it asked to close, looking every 200 milliseconds for a minute, and when the kernel says the worker has ended it
-takes the ownership and records the closure under it, whether or not the worker wrote a closure of
-its own in its journal. When another recovery holds the session, or the lock cannot be taken,
-nothing is recorded in that look. After the minute, the next list or read of the session that
+closure comes later, the daemon watches the worker it asked to close. It looks, waits 200
+milliseconds and looks again until a minute has passed, a deadline it checks between looks, so a
+look that is under way when the minute ends is finished. When the kernel says the worker has ended
+it takes the ownership and records the closure under it, whether or not the worker wrote a closure
+of its own in its journal. When another recovery holds the session, or the lock cannot be taken,
+nothing is recorded in that look. After the deadline, the next list or read of the session that
 cannot reach its worker tries again, and so does the next start; each closes the session when it
 can take the lock.
 
