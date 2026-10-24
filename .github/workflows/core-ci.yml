@@ -1147,6 +1147,15 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-shell-integration --test pwsh_windows
 
+      # The package a Windows host publishes for the PowerShell it has, read as a worker reads it:
+      # the shell a session would start is the host the package qualified, started by its path,
+      # the package's module is the one found by name even beside a competing module of the same
+      # name, and a package that has been moved starts its own. The suite writes into a temporary
+      # directory only and reads no profile.
+      - name: The PowerShell package a Windows host publishes
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-shell-integration --test pwsh_windows_package
+
       # The reference bridge against a real endpoint on this platform. The published Windows
       # address carries the pipe prefix and the endpoint layer supplies it again, so a client that
       # passes the address through unchanged asks for a name no listener holds.

@@ -2790,7 +2790,7 @@ impl RealShell {
             let record =
                 kr_shell_integration::host::startup::EntryRecord::in_state_directory(&state);
             for target in kr_shell_integration::host::startup::powershell_targets(
-                &package.executable(),
+                &kr_shell_integration::host::startup::PowerShell::of_package(package),
                 all_hosts,
                 current_host,
             ) {
@@ -2857,6 +2857,12 @@ impl RealShell {
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value)),
         );
+        // What the package's launch sets over the environment built above: the runtime location
+        // the qualification recorded, and the package's module directory first on the module path.
+        for (name, value) in package.launch_environment(&variables, cfg!(windows)) {
+            variables.retain(|(held, _)| *held != name);
+            variables.push((name, value));
+        }
         config.shell = kr_worker::pty::ShellCommand {
             program: package.executable().display().to_string(),
             arguments: package
@@ -3885,6 +3891,111 @@ fn installed_package() -> kr_shell_integration::host::package::ShellPackage {
     set.select(None)
         .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"))
         .clone()
+}
+
+/// Copies a directory tree.
+#[cfg(unix)]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("a directory for the copy");
+    for entry in std::fs::read_dir(from)
+        .expect("a directory to copy")
+        .flatten()
+    {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("a file to copy");
+        }
+    }
+}
+
+/// KR-REQ-07.86: a PowerShell package that has been moved, with the directory it was published in
+/// removed, qualifies a real session with its own module, and that module is the one the session
+/// imports when a module of the same name is first on the creator's own module path.
+///
+/// The package states its record as it was published, so the worker that reads the moved package
+/// expects the module tree it was published with, and the session reports that same record from
+/// the moved module. What differs is where the files are, and the launch puts the moved package's
+/// directory first on the module path whatever else the creator listed.
+///
+/// It needs a PowerShell on the path, which only a run that has one can use, so an ordinary run
+/// leaves it out.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a PowerShell on the path; it runs with --ignored in a run that has one, as the build box's verification does"]
+async fn a_moved_powershell_package_qualifies_with_its_own_module_over_a_competing_one() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../shells/psreadline/module")
+        .canonicalize()
+        .expect("the module's source");
+    let published = tempfile::tempdir().expect("a directory on the internal disk");
+    let published_by = std::process::Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Import-Module '{}'; Publish-KalaReachQualification -Prefix '{}' | Out-Null",
+                source.join("KalaReach.ShellBridge.psd1").display(),
+                published.path().display()
+            ),
+        ])
+        .output()
+        .expect("PowerShell publishes the package");
+    assert!(
+        published_by.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published_by.stderr)
+    );
+    let identity = std::fs::read_to_string(published.path().join("powershell/current"))
+        .expect("the published package is current")
+        .trim()
+        .to_owned();
+
+    // Moved: the package's directory is copied elsewhere and the place it was published in goes.
+    let moved = tempfile::tempdir().expect("a directory on the internal disk");
+    let package_directory = moved.path().join("powershell").join(&identity);
+    copy_tree(
+        &published.path().join("powershell").join(&identity),
+        &package_directory,
+    );
+    let original = published.path().join("powershell").join(&identity);
+    drop(published);
+    assert!(!original.exists(), "the place it was published in is gone");
+
+    // A module of the same name that a creator lists first on its own module path.
+    let competing = tempfile::tempdir().expect("a directory on the internal disk");
+    copy_tree(&source, &competing.path().join("KalaReach.ShellBridge"));
+
+    let package = kr_shell_integration::host::package::ShellPackage::read(&package_directory)
+        .expect("the moved package reads");
+    let shell = RealShell::start(
+        &package,
+        kr_protocol::session::LaunchProfile::default(),
+        vec![(
+            "PSModulePath".to_owned(),
+            competing.path().display().to_string(),
+        )],
+        None,
+    )
+    .await;
+    assert_eq!(
+        shell.qualified,
+        Some(ShellKind::PowerShell),
+        "the moved package qualified the session"
+    );
+    let own = package_directory.join("modules");
+    let mut keys = shell.keys();
+    keys.type_line(
+        &shell,
+        &format!(
+            "'kr-own=' + (Get-Module KalaReach.ShellBridge).ModuleBase.StartsWith('{}')",
+            own.display()
+        ),
+    );
+    shell.produced(b"kr-own=True", 1).await;
+    shell.close().await;
 }
 
 /// KR-REQ-01.14, KR-REQ-22.05: a real managed shell that ran `cd` is described by the directory it

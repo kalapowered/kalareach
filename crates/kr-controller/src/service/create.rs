@@ -29,6 +29,17 @@ const NO_DESKTOP_TO_BIND: &str = "this host has no graphical login session to bi
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a caller of another door waits for a create's answer before it is told the outcome is
+/// unknown.
+///
+/// The longest the daemon waits for a session's worker is a managed create's rendezvous and then
+/// its shell's qualification, and a margin covers what comes before them: the reservation and the
+/// start of the worker. A door that gave up sooner would answer that the outcome is unknown before
+/// the reason the worker gives for a shell that never qualified could reach the caller.
+pub const CREATE_WAIT: std::time::Duration = std::time::Duration::from_secs(
+    RENDEZVOUS_TIMEOUT.as_secs() + kr_worker::runtime::QUALIFICATION_DEADLINE.as_secs() + 15,
+);
+
 /// How long a create gives its worker to describe the session it has made, the wait for this
 /// daemon's one link to the worker included.
 ///
@@ -784,7 +795,15 @@ impl Controller {
             registry.record_launch(reservation.reservation_id, &identity)?;
         }
 
-        let ready = match tokio::time::timeout(RENDEZVOUS_TIMEOUT, receiver).await {
+        // A worker that launches a managed shell reports itself only once the shell has qualified,
+        // which it gives its own bound; the create waits for that as well, so that when the worker
+        // gives up it is its reason the caller gets and not that the worker was late.
+        let wait = if matches!(create.shell_mode, kr_protocol::session::ShellMode::Managed) {
+            RENDEZVOUS_TIMEOUT + kr_worker::runtime::QUALIFICATION_DEADLINE
+        } else {
+            RENDEZVOUS_TIMEOUT
+        };
+        let ready = match tokio::time::timeout(wait, receiver).await {
             Ok(Ok(Ok(ready))) => ready,
             // A worker that failed its rendezvous, or never reported, has no session to close, so
             // no closure removes its job. It goes once the worker has ended.

@@ -260,10 +260,7 @@ fn qualification_inputs(root: &Path, record: &serde_json::Value) -> Result<Strin
     ));
     lines.push(format!(
         "executable={}",
-        fact(
-            &record["qualified"]["powershell_executable"],
-            "qualified PowerShell host"
-        )?
+        fact(&record["shell"]["executable"], "qualified PowerShell host")?
     ));
     Ok(format!("{}\n", lines.join("\n")))
 }

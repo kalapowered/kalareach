@@ -75,6 +75,7 @@ impl Setup {
                     .expect("the package root is text")
                     .to_owned(),
             },
+            launch: kr_shell_integration::host::package::PackageLaunch::default(),
         };
         std::fs::write(
             package.join(MANIFEST_BASENAME),

@@ -290,7 +290,17 @@ impl Host {
             .collect()
     }
 
-    fn with_shell_package(mut self) -> Self {
+    fn with_shell_package(self) -> Self {
+        self.shell_package(false)
+    }
+
+    /// Installs a qualified Zsh package whose shell starts and stays, and never says a word to the
+    /// worker: a session that cannot qualify, as one whose profile never opens the bridge is.
+    fn with_a_silent_shell_package(self) -> Self {
+        self.shell_package(true)
+    }
+
+    fn shell_package(mut self, silent: bool) -> Self {
         use kr_shell_integration::contract::qualification::ShellKind;
         use kr_shell_integration::host::package::{
             CURRENT_BASENAME, MANIFEST_BASENAME, PackageManifest, PackageShell, PackageStartupEntry,
@@ -301,16 +311,23 @@ impl Host {
         let directory = root.join(ShellKind::Zsh.as_str()).join(identity);
         std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
         let executable = directory.join("bin").join("zsh");
-        kr_ipc::testing::place_program(std::path::Path::new("/bin/cat"), &executable);
-        // A file the package record can name and the worker cannot run. Both the daemon's check
-        // and the worker's read ask whether the executable is a file, which it is; what fails is
-        // starting it, which is the worker's own work and the only part of it this test is about.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
+        if silent {
+            let script = directory.join("bin").join("silent.sh");
+            std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").expect("writes the shell");
+            kr_ipc::testing::place_program(&script, &executable);
+        } else {
+            kr_ipc::testing::place_program(std::path::Path::new("/bin/cat"), &executable);
+            // A file the package record can name and the worker cannot run. Both the daemon's
+            // check and the worker's read ask whether the executable is a file, which it is; what
+            // fails is starting it, which is the worker's own work and the only part of it this
+            // test is about.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
 
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600))
-                .expect("a program this worker cannot execute");
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600))
+                    .expect("a program this worker cannot execute");
+            }
         }
         std::fs::create_dir_all(directory.join("startup")).expect("creates the entry directory");
         std::fs::write(
@@ -332,6 +349,7 @@ impl Host {
             startup_entry: PackageStartupEntry {
                 file: "startup/entry".to_owned(),
             },
+            launch: kr_shell_integration::host::package::PackageLaunch::default(),
         };
         std::fs::write(
             directory.join(MANIFEST_BASENAME),
@@ -353,6 +371,41 @@ impl Host {
         std::fs::create_dir_all(&empty).expect("creates an empty package root");
         self.worker_packages = Some(empty);
         self.shell_packages = Some(root);
+        self
+    }
+
+    /// Records an install of Zsh's startup entry, as `kr shell install` leaves it: the entry in a
+    /// file of the person's, and that file in the installation's record.
+    fn with_the_startup_entry(self) -> Self {
+        use kr_shell_integration::contract::qualification::ShellKind;
+        use kr_shell_integration::host::startup::{
+            ENTRY_WRITTEN, EntryRecord, Placement, StartupTarget, entry, install,
+        };
+
+        let home = self.temp.root().join("home");
+        std::fs::create_dir_all(&home).expect("creates the person's home");
+        let zshrc = home.join(".zshrc");
+        let record = EntryRecord::in_state_directory(self.paths().state_root());
+        let target = StartupTarget {
+            kind: ShellKind::Zsh,
+            path: zshrc.clone(),
+            reason: "the file this host's test writes",
+            shared: false,
+            placement: Placement::End,
+        };
+        let body = entry(&target, Path::new("startup/entry"), false).expect("the path is text");
+        install(&zshrc, &body, &target.placement, &record).expect("the entry goes in");
+        let writers = kr_ipc::install::hold_writers(
+            &kr_ipc::install::Writing::in_roots(self.temp.root(), self.temp.root()),
+            &mut || {},
+        )
+        .expect("a test outside a store holds nothing");
+        let permit = writers.permit(&ENTRY_WRITTEN).expect("permitted");
+        record
+            .hold(&permit)
+            .expect("holds the record")
+            .add(ShellKind::Zsh, &[zshrc])
+            .expect("records the file");
         self
     }
 
@@ -1497,7 +1550,7 @@ fn processes() -> Vec<(u32, u32)> {
     ignore = "it places a POSIX /bin/cat as a stand-in shell binary, which this platform has not got"
 )]
 async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
-    let host = Host::create().with_shell_package();
+    let host = Host::create().with_shell_package().with_the_startup_entry();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let mut params = create_params(host.environment_id, host.temp.root());
@@ -1540,6 +1593,94 @@ async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// A managed create whose shell has no startup entry is refused by the worker as soon as it has
+/// the package, with the command that installs the entry, and the reservation it held goes back.
+///
+/// The shell would never open its bridge, so the create would otherwise wait out the whole of the
+/// worker's qualification bound, and the daemon would answer first, with an outcome that names
+/// nothing the person can do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "it places a POSIX /bin/cat as a stand-in shell binary, which this platform has not got"
+)]
+async fn a_managed_create_whose_shell_has_no_startup_entry_is_refused_naming_the_install() {
+    let host = Host::create().with_shell_package();
+    let _controller = host.start().await;
+    let mut client = host.client().await;
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params.shell_mode = ShellMode::Managed;
+    params.shell = Nullable::some("zsh".to_owned());
+
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a shell with no startup entry cannot be managed");
+    // The daemon reports that it could not start a worker, and carries the worker's own words.
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+    assert!(
+        refused.message.contains("kr shell install"),
+        "the worker's own words reach the caller: {refused}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let left = worker_dirs(&host);
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the directory prepared for a worker that never started is still there: {left:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A managed create whose shell starts and never opens the bridge is answered with the worker's
+/// own reason, not with an outcome nobody can act on.
+///
+/// The worker waits for the shell to qualify for a bound of its own, and gives up with words that
+/// say what the person can do. The daemon has to wait for those words, which come after the shell
+/// has started, so its bound on a create whose worker qualifies a shell is longer than the worker's.
+/// A daemon whose bound ended first would answer that the worker did not report itself, and the
+/// worker's words would reach nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "it places a POSIX shell script as the shell, which this platform has not got"
+)]
+async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_workers_reason() {
+    let host = Host::create()
+        .with_a_silent_shell_package()
+        .with_the_startup_entry();
+    let _controller = host.start().await;
+    let mut client = host.client().await;
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params.shell_mode = ShellMode::Managed;
+    params.shell = Nullable::some("zsh".to_owned());
+
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a shell that never qualifies cannot be managed");
+    assert!(
+        refused.message.contains("did not qualify"),
+        "the worker's own words do not reach the caller: {refused}"
+    );
 }
 
 /// Returns the sessions that still have a directory under this environment's workers folder.
