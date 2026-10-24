@@ -3488,7 +3488,35 @@ fn an_issued_grant(hosted: &Hosted) -> kr_protocol::ids::GrantId {
 }
 
 /// A real revocation of a grant, sent by the local owner, whose answer leaves names to come.
+///
+/// A worker that is busy for a moment refuses the announcement, and the answer is then pending
+/// (section 9): nothing has been fenced, so nothing is left unasked, and a later announcement
+/// does not change the answer the daemon kept of the mutation. The cases that use this read that
+/// answer itself, so when it is pending the arrangement is made again on a new worker, until an
+/// answer holds. One deadline bounds the attempts.
 async fn a_revocation_that_left_names_unasked() -> Unasked {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let left = loop {
+        let left = a_revocation_answered_once().await;
+        if left.given.barrier.holds() {
+            break left;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no answer to a revocation held within a minute of attempts: {:?}",
+            left.given.barrier
+        );
+    };
+    let reported = worker_report(&left.given.barrier, left.hosted.session_id);
+    assert!(
+        reported.names_pending.get() > 0 && reported.rejected_actions.len() < left.affected,
+        "the worker still owes names when the revocation is answered: {reported:?}"
+    );
+    left
+}
+
+/// One attempt of [`a_revocation_that_left_names_unasked`]: the answer, whatever it says.
+async fn a_revocation_answered_once() -> Unasked {
     let hosted = hosted_worker().await;
     let granted = an_issued_grant(&hosted);
     hosted.controller.limit_evidence_pages_for_tests(0);
@@ -3516,12 +3544,6 @@ async fn a_revocation_that_left_names_unasked() -> Unasked {
             .expect("the grant is revoked")
             .to_typed()
             .expect("a revocation result");
-    assert!(given.barrier.holds(), "{:?}", given.barrier);
-    let reported = worker_report(&given.barrier, hosted.session_id);
-    assert!(
-        reported.names_pending.get() > 0 && reported.rejected_actions.len() < affected,
-        "the worker still owes names when the revocation is answered: {reported:?}"
-    );
     Unasked {
         hosted,
         client,
