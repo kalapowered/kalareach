@@ -133,6 +133,9 @@ pub fn initialise() -> Result<()> {
 ///
 /// * Identifiers and file names that must be unique and that nothing treats as secret are
 ///   version-four UUIDs, which the `uuid` crate fills from the operating system.
+/// * The worker's detach token, which one accepted line presents (as `KR_DETACH_TOKEN`) to detach
+///   the attachment it came from, is a version-four UUID from `kr_ipc::new_uuid`: 122 random bits
+///   from the operating system, compared in constant time, and alive only while that line runs.
 /// * The release tool's development keys and its signatures use the `SystemRandom` of `aws-lc-rs`,
 ///   on a build machine.
 /// * The libraries the cryptography guide lists draw their own: the pairing exchange, TLS and the
