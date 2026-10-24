@@ -2343,18 +2343,25 @@ pub(crate) mod tests {
         .await
     }
 
-    /// As [`daemon_on`], once the sweep the daemon makes as it starts is over.
+    /// As [`daemon_on`], once the sweep the daemon makes as it starts is over, and the first pass
+    /// of the attention store's maintenance.
     ///
-    /// That sweep reads the host's clocks to decide whether a record may be forgotten, and a
-    /// reading taken after a test has moved the continuous clock puts the moment that clock implies
-    /// into the host's floor. A test that moves its clocks starts its daemon here, so that no such
-    /// reading comes after its first step.
+    /// Each reads the host's clocks to decide whether a record may be forgotten, and a reading
+    /// taken after a test has moved the continuous clock puts the moment that clock implies into
+    /// the host's floor. A test that moves its clocks starts its daemon here, so that no such
+    /// reading comes after its first step. Both are bounded, so a pass that never ends fails the
+    /// test with a message and does not hold it.
     pub(in crate::service) async fn daemon_on_clocks_to_move(
         temp: &kr_ipc::testing::TempHost,
         clocks: crate::service::Clocks,
     ) -> Arc<Controller> {
         let controller = daemon_on(temp, clocks).await;
-        controller.transfer().until_a_sweep_has_ended().await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            controller.transfer().until_a_sweep_has_ended().await;
+            controller.attention().until_maintenance_has_waited().await;
+        })
+        .await
+        .expect("the daemon's first sweep and first maintenance pass end");
         controller
     }
 

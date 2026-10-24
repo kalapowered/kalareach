@@ -691,7 +691,7 @@ pub struct AttentionModule {
     /// How many times the maintenance loop has gone into its wait, which a test reads to know the
     /// loop is waiting.
     #[cfg(test)]
-    maintenance_waits: AtomicU64,
+    maintenance_waits: tokio::sync::watch::Sender<u64>,
     /// Where this host's own tests stop a pass that decides announcements once it holds the
     /// privacy state's read side, before it decides. Compiled away in every shipped build.
     #[cfg(any(test, feature = "testing"))]
@@ -811,7 +811,7 @@ impl AttentionModule {
             #[cfg(test)]
             after_the_clock_answer: Pause::default(),
             #[cfg(test)]
-            maintenance_waits: AtomicU64::new(0),
+            maintenance_waits: tokio::sync::watch::channel(0).0,
             #[cfg(any(test, feature = "testing"))]
             after_privacy_read: Pause::default(),
             #[cfg(test)]
@@ -3013,11 +3013,19 @@ impl AttentionModule {
                 let wake = Arc::clone(&held.wake);
                 let notified = wake.notified();
                 #[cfg(test)]
-                held.maintenance_waits.fetch_add(1, Ordering::SeqCst);
+                held.maintenance_waits.send_modify(|waits| *waits += 1);
                 drop(held);
                 let _ = tokio::time::timeout(wait, notified).await;
             }
         });
+    }
+
+    /// Waits until the maintenance loop has been through its first pass, which asks the host
+    /// whether its clock may be trusted to let a record go, and has gone into its wait.
+    #[cfg(test)]
+    pub(crate) async fn until_maintenance_has_waited(&self) {
+        let mut waits = self.maintenance_waits.subscribe();
+        let _ = waits.wait_for(|waits| *waits > 0).await;
     }
 
     /// Runs the store's timers once, and lets go of the action records that have outlived their
@@ -6341,7 +6349,7 @@ pub(crate) mod tests {
         let module = module_on(&temp, &adapter, Some(&clock));
         assert!(module.reading().wall_proven);
         module.maintain(Arc::new(Counting::default()) as Arc<dyn Reach>);
-        let waits = || module.maintenance_waits.load(Ordering::SeqCst);
+        let waits = || *module.maintenance_waits.borrow();
         let passes = || {
             module
                 .decided_on
