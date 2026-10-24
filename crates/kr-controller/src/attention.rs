@@ -1315,7 +1315,7 @@ impl AttentionModule {
         records: &[EventCursor],
     ) -> (Vec<Option<String>>, Ticket) {
         let indexed: Vec<(usize, EventCursor)> = records.iter().copied().enumerate().collect();
-        let (texts, ticket) = self.texts(reach, &indexed).await;
+        let (texts, ticket, _) = self.texts(reach, &indexed).await;
         let mut ordered = vec![None; records.len()];
         for (index, text) in texts {
             if let Some(slot) = ordered.get_mut(index) {
@@ -1370,7 +1370,7 @@ impl AttentionModule {
                 .map_err(refusal)?;
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, ticket) = self.texts(reach, &page.texts).await;
+                let (texts, ticket, _) = self.texts(reach, &page.texts).await;
                 for (index, text) in texts {
                     if let Some(item) = result.items.get_mut(index) {
                         item.summary = Nullable(text);
@@ -1455,7 +1455,7 @@ impl AttentionModule {
                 self.after_page.wait();
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, mut ticket) = self.texts(reach, &page.texts).await;
+                let (texts, mut ticket, _) = self.texts(reach, &page.texts).await;
                 for (index, text) in texts {
                     if let Some(change) = result.changes.get_mut(index) {
                         change.summary = Nullable(text);
@@ -1551,6 +1551,11 @@ impl AttentionModule {
     /// The text of the newest changes is read from its owner as a read of them is, and what is
     /// carried to the host is the generation that text was decided under: a host that finds
     /// privacy mode has moved since refuses the request. Nothing here is released to anybody.
+    ///
+    /// Nothing is asked while the text of a closed session's change is held back for now (see
+    /// [`Self::texts`]): text that no owner will ever serve leaves the change without it, but text
+    /// that a later look can read is waited for. A live worker that does not answer in time is not
+    /// held back.
     async fn ask_for_summary(
         &self,
         reach: &dyn Reach,
@@ -1564,7 +1569,12 @@ impl AttentionModule {
             .enumerate()
             .filter_map(|(index, change)| change.text.record().map(|record| (index, record)))
             .collect();
-        let (texts, ticket) = self.texts(reach, &records).await;
+        let (texts, ticket, held_back) = self.texts(reach, &records).await;
+        // A summary written without text that is only held back for now would reach the head and
+        // be served as that interval's summary from then on. The next read asks again.
+        if held_back {
+            return;
+        }
         let Ok(generation) = ticket.generation_of(session_id) else {
             return;
         };
@@ -1616,6 +1626,11 @@ impl AttentionModule {
     /// session that is neither, or whose owner does not answer in time, serves none. Each request
     /// names at most as many records as a text request carries.
     ///
+    /// The last of the three answers says whether the text of a closed session is held back for
+    /// now rather than absent: its journal cannot be brought forward yet. A session closed over a
+    /// worker this host could not account for, a journal that cannot be read, a session that serves
+    /// no text and a live worker that does not answer are not held back.
+    ///
     /// What was read is looked at again once every owner has answered, under the same lock a
     /// closure is recorded under: a session found closed over a worker this host could not account
     /// for serves nothing it answered, and neither does a link that no longer speaks for its
@@ -1628,7 +1643,7 @@ impl AttentionModule {
         &self,
         reach: &dyn Reach,
         records: &[(usize, EventCursor)],
-    ) -> (Vec<(usize, Option<String>)>, Ticket) {
+    ) -> (Vec<(usize, Option<String>)>, Ticket, bool) {
         let mut by_session: BTreeMap<SessionId, Vec<(usize, EventCursor)>> = BTreeMap::new();
         for (index, record) in records {
             // What an approval asks is the application's to show: a broker transition has no text
@@ -1647,10 +1662,15 @@ impl AttentionModule {
         // Every live session is asked at once, so a read waits for the slowest worker rather than
         // for each in turn.
         let mut read = Vec::new();
+        let mut journals_held_back = BTreeSet::new();
         for (session_id, wanted) in by_session {
             let owner = self.text_owner(session_id);
             let journal = if matches!(owner, TextOwner::Journal) {
-                reach.closed_journal(session_id).open()
+                let closed = reach.closed_journal(session_id);
+                if matches!(closed, ClosedJournal::HeldBack) {
+                    journals_held_back.insert(session_id);
+                }
+                closed.open()
             } else {
                 None
             };
@@ -1734,8 +1754,10 @@ impl AttentionModule {
         let origins = self.origins();
         let mut served = Vec::new();
         let mut ticket = Ticket::default();
+        let mut held_back = false;
         for (session_id, owner, wanted, texts, lease) in answered {
-            let still = !origins.unaccounted.contains(&session_id)
+            let unaccounted = origins.unaccounted.contains(&session_id);
+            let still = !unaccounted
                 && match &owner {
                     TextOwner::Link(link) => {
                         origins
@@ -1749,6 +1771,7 @@ impl AttentionModule {
                     TextOwner::Nobody => false,
                 };
             let texts = texts.filter(|_| still);
+            held_back |= !unaccounted && journals_held_back.contains(&session_id);
             if let (Some(texts), Some((generation, release_until))) = (&texts, lease)
                 && texts.iter().any(Option::is_some)
             {
@@ -1760,7 +1783,7 @@ impl AttentionModule {
             }
             served.extend(serve(&wanted, texts));
         }
-        (served, ticket)
+        (served, ticket, held_back)
     }
 
     /// Returns the privacy generation this daemon has recorded for a session.
@@ -4648,13 +4671,20 @@ pub(crate) mod tests {
 
         /// What `caller` is answered when it asks what changed and asks for a summary.
         async fn changed_for(&self, actor: &ActorId, caller: &Caller) -> VisitChangedResult {
+            self.changed_through(&Stub { unaccounted: false }, actor, caller)
+                .await
+        }
+
+        /// What `caller` is answered as [`Self::changed_for`] has it, with the session's text read
+        /// through `reach`.
+        async fn changed_through(
+            &self,
+            reach: &dyn Reach,
+            actor: &ActorId,
+            caller: &Caller,
+        ) -> VisitChangedResult {
             self.module
-                .read(
-                    &Stub { unaccounted: false },
-                    caller,
-                    actor,
-                    &self.visit_changed(),
-                )
+                .read(reach, caller, actor, &self.visit_changed())
                 .await
                 .expect("the changes are served")
                 .to_typed()
@@ -4774,6 +4804,89 @@ pub(crate) mod tests {
             (asked[0].interval.from, asked[0].interval.to),
             (0, 2),
             "the interval of the page, not of the visit that came after it"
+        );
+    }
+
+    /// A reach whose closed journal can be read, as it can once nothing holds it back.
+    struct Readable {
+        path: std::path::PathBuf,
+    }
+
+    impl Reach for Readable {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            ClosedJournal::Open(Box::new(
+                kr_worker::journal::Journal::open(&self.path).expect("the journal opens"),
+            ))
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// KR-REQ-18.02: a summary is written from the text of the changes it covers, and one written
+    /// while that text is only held back for now would reach the head and be served for the
+    /// interval from then on. So none is asked for while the closed journal the text is read from
+    /// is held back, and the next read asks once it can be read. Text that no owner will ever serve
+    /// does not hold a summary back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_the_text_it_covers_is_held_back() {
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        world
+            .module
+            .session_closed(&HeldBack::default(), world.session_id)
+            .await;
+        assert!(
+            world.module.origins().closing.contains(&world.session_id),
+            "the session is closing, and its text is read from its journal"
+        );
+
+        world
+            .changed_through(&HeldBack::default(), &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked(),
+            Vec::new(),
+            "the text is held back, so no summary is asked for"
+        );
+
+        let readable = Readable {
+            path: world.temp.environment().state_dir().join("closed.sqlite3"),
+        };
+        world
+            .changed_through(&readable, &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(world.asked().len(), 1, "once it can be read, it is");
+
+        let mut never = Summarised::start();
+        never.record_commands(&[1_000, 1_010], true);
+        never
+            .module
+            .session_closed(&Stub { unaccounted: false }, never.session_id)
+            .await;
+        never
+            .changed_through(&Stub { unaccounted: false }, &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            never.asked().len(),
+            1,
+            "control: text that cannot be read at all does not hold a summary back"
         );
     }
 
@@ -5279,7 +5392,7 @@ pub(crate) mod tests {
         }
         sizes.sort_unstable();
         assert_eq!(sizes, vec![44, 256]);
-        let (mut served, ticket) = asking.await.expect("the texts are read");
+        let (mut served, ticket, _) = asking.await.expect("the texts are read");
         assert_eq!(
             ticket.entries.len(),
             2,
