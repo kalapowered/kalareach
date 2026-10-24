@@ -1790,13 +1790,17 @@ fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64, words: &str) -> Record
 /// What a record says when the application starts. A run that was under way then ended with the
 /// process, and nothing is running it now, so it is a stop the person can mend and not a state that
 /// says it is working for ever. A run that reached an end stays as it was.
+///
+/// The stop keeps the time the run was last heard of, so a start a minute or more after it retries
+/// at its first look and one sooner waits out the rest of the minute, as a stop that happened while
+/// the application ran would. A time later than now is a clock set back, and counts as now.
 fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
     for kept in record.hosts.values_mut() {
         if kept.phase == Phase::Working {
             kept.phase = Phase::Attention;
             "Turning on notifications was interrupted. Try again.".clone_into(&mut kept.words);
             kept.settings = false;
-            kept.updated_ms = now_ms;
+            kept.updated_ms = kept.updated_ms.min(now_ms);
         }
     }
     record
@@ -2157,7 +2161,10 @@ mod tests {
         let working = &started.hosts["working"];
         assert_eq!(working.phase, Phase::Attention);
         assert!(!working.settings, "nothing the system's setting can mend");
-        assert_eq!(working.updated_ms, 99);
+        assert_eq!(
+            working.updated_ms, 7,
+            "the stop is from when the run was last heard of"
+        );
         assert_eq!(
             working.sender_record_id,
             Some(kept_id),
@@ -2165,6 +2172,21 @@ mod tests {
         );
         assert_eq!(started.hosts["on"], on);
         assert_eq!(started.hosts["stopped"], stopped);
+    }
+
+    /// A time later than the start's own is a clock set back: the retry is not delayed by it.
+    #[test]
+    fn a_run_last_heard_of_in_the_future_is_taken_to_have_stopped_now() {
+        let mut working = host(Phase::Working, false);
+        working.updated_ms = 500;
+        let record = Record {
+            version: VERSION,
+            hosts: BTreeMap::from([("working".to_owned(), working)]),
+        };
+
+        let started = after_a_restart(record, 99);
+
+        assert_eq!(started.hosts["working"].updated_ms, 99);
     }
 
     /// A record is set aside under a name no earlier one has: one left from an earlier loss, a link
