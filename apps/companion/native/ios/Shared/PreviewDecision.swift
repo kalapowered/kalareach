@@ -113,17 +113,19 @@ struct PreviewDecider {
             return .generic(.notForThisDevice)
         }
 
-        let seed: Data
-        do {
-            seed = try keys.recipientSeed(forRecipient: envelope.routing.recipientKeyID)
-        } catch {
-            return .generic(Self.reason(for: error, whenAbsent: .keyUnavailable))
-        }
+        // The host's key is asked first: a phone whose every host has previews off holds no seed
+        // either, and the reason is then that no key is held for the host.
         let senderKey: Data
         do {
             senderKey = try keys.senderKey(forSender: envelope.routing.senderKeyID)
         } catch {
             return .generic(Self.reason(for: error, whenAbsent: .senderUnknown))
+        }
+        let seed: Data
+        do {
+            seed = try keys.recipientSeed(forRecipient: envelope.routing.recipientKeyID)
+        } catch {
+            return .generic(Self.reason(for: error, whenAbsent: .keyUnavailable))
         }
 
         // The envelope was read as a payload that parsed, so both members are text.

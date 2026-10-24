@@ -28,7 +28,8 @@ class KeystorePreviewKeys(private val context: Context) : PreviewKeyReading {
     override fun recipientSeed(recipientKeyId: ByteArray): Result<ByteArray> =
         load().fold(
             { keys ->
-                keys.recipientSeed(recipientKeyId)?.let { Result.success(it) } ?: notProvisioned()
+                keys.recipientSeed(recipientKeyId)?.let { Result.success(it.copyOf()) }
+                    ?: notProvisioned()
             },
             { Result.failure(it) }
         )
