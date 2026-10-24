@@ -1797,11 +1797,16 @@ clock neither drops a reply early nor holds one longer.
 The terminal on Windows is a pseudo-console. It is the same session, the same lease and the same
 retained history; what differs is the three things this platform does its own way.
 
-**The console, and where byte preservation begins.** ConPTY renders an application's console-API
-output into VT sequences before the host sees any of it. So the promise this host makes starts at
-ConPTY's output pipe: every byte that arrives there is carried through unchanged, and what an
-application did through the console API rather than by writing bytes is whatever ConPTY made of it.
-A session never claims to have preserved writes it was never handed.
+**The console, and where byte preservation begins.** ConPTY draws the screen itself. It renders what
+an application does, whether it writes bytes or calls the console API, into VT sequences before the
+host sees any of it, and it answers the terminal's queries itself, holds back an unfinished sequence
+and a lone Escape, and adds sequences of its own ([Running the Windows tests](#running-the-windows-tests), below). So the promise
+this host makes starts at ConPTY's output pipe: the retained history keeps every byte that arrives
+there, and the cursor the host quotes is a position in it. What an attached terminal is given of
+those bytes is what *The terminal* describes: a query is answered once and not forwarded, and
+win32 input mode requests stop at the worker. The host makes no claim about what an application
+wrote before ConPTY rendered it. A session never claims to have preserved writes it was never
+handed.
 
 **A link near the length bound.** ConPTY passes a hyperlink on under an identifier it writes
 itself, which makes the link up to 23 bytes longer. The host refuses a link whose parameters,
@@ -5851,9 +5856,9 @@ has proxy set, the connection will be made via it, using a tunnel; the operating
 checks the server's certificate. As with the other services, if the daemon is started with an
 unusable configuration document, no attempt will be made to connect.
 
-External destinations are different in one respect: their recipients can read what arrives, every
-message says so, and nothing in this host claims otherwise. A destination needs a configured address
-**and** an explicit rule or grant, and the content is intersected with the recipient's own authority
+External destinations differ from a paired device's push in who can read what arrives: their
+recipients can read it, every message says so, and nothing in this host claims otherwise. A
+destination needs a configured address **and** a rule that names a grant, and the content is intersected with the recipient's own authority
 rather than assumed from the address.
 
 The owner creates, lists and removes a destination on this host's own socket, with
@@ -6623,11 +6628,19 @@ cannot create a request, however accurate they are, so a permission prompt read 
 from a notification is never an approval.
 
 The order of preference is native protocols and hooks, then documented machine output, then
-terminal text. The host does not rank the sources by itself: the grants hold the order. A package
-gets the broker's semantic events within the default ceiling, while `terminal.stream`,
+terminal text. The host does not enforce that order or choose between the sources for a package:
+the grants decide which streams a component is offered, each event carries the provenance it came
+from, and the package decides what it uses. A package gets the broker's semantic events (the
+connector's native frames) within the default ceiling, while `terminal.stream`,
 `terminal.transcript_tail` and `process.observe` are outside it, so each needs an explicit package
-or repository grant, and only a native connection can carry an approval. The reading of terminal
-text never turns into approval authority.
+or repository grant, and only a native connection can carry an approval. This host offers a
+component events of two provenances only, native protocol and terminal text; machine output is a
+provenance the vocabulary names and no producer sends. The reading of terminal text never turns
+into approval authority, and it never settles an image's acceptance or a mutation's result: an
+attachment is accepted only on the upstream's typed acknowledgement of the offer
+([Offering an attachment to an agent](../transfer/README.md#offering-an-attachment-to-an-agent)), a
+mutation's result comes from the upstream's typed answer, and an inferred screen never moves a
+receipt ([Journals and the receipt contract](#journals-and-the-receipt-contract)).
 
 ### Decoding trust
 
