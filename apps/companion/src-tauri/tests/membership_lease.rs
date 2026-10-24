@@ -1748,7 +1748,7 @@ async fn an_owner_that_cannot_get_its_lease_is_shown_why_and_is_not_out_of_conta
 /// the preview key is not sent: the host would take it under the lease of the account that left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_opened_under() {
-    use companion_tauri::push::{ConnectionRegistrar, Reach, Registrar as _};
+    use companion_tauri::push::{ConnectionRegistrar, LineStop, Reach, Registrar as _};
 
     let rig = Rig::start().await;
     rig.connection(true).await;
@@ -1774,7 +1774,10 @@ async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_
         .update_preview_key(key, kr_protocol::ids::DeviceKeyRevision::new(1))
         .await
         .expect_err("the key is not sent for an account that has left");
-    assert!(refused.contains("changed"), "{refused}");
+    assert!(
+        matches!(&refused, LineStop::Phone(words) if words.contains("changed")),
+        "the phone stopped itself, in the lease's words: {refused:?}"
+    );
 }
 
 /// The host answers what it is, to a connection that holds a lease.
