@@ -62,9 +62,10 @@ pub const START_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// How long this host waits for the answer to one mutation.
 ///
-/// A create waits for its worker for up to thirty seconds inside the destination's daemon, which
-/// says nothing until it has the answer. This is the bound the network door puts on the same wait.
-pub const MUTATION_LIMIT: std::time::Duration = std::time::Duration::from_secs(45);
+/// A create waits for its worker inside the destination's daemon, which says nothing until it has
+/// the answer: up to a managed create's rendezvous and its shell's qualification. This is the bound
+/// the network door puts on the same wait.
+pub const MUTATION_LIMIT: std::time::Duration = crate::service::CREATE_WAIT;
 
 /// How long an attached stream may go without any frame at all, a keepalive included.
 ///
@@ -2962,6 +2963,11 @@ mod tests {
         // daemon, and a mutation waits for the destination's own bound on a create.
         assert!(START_LIMIT > SILENCE_LIMIT);
         assert!(MUTATION_LIMIT > SILENCE_LIMIT);
+        assert!(
+            MUTATION_LIMIT
+                > crate::service::RENDEZVOUS_TIMEOUT + kr_worker::runtime::QUALIFICATION_DEADLINE,
+            "a mutation that is a managed create outlasts what its worker takes"
+        );
         let opening = open_for_person(
             &enrolment(),
             here(),

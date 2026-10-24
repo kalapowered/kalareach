@@ -765,7 +765,10 @@ impl RemoteConnection {
                         .session_create(&actor_id, &mutation, carried)
                         .await
                 });
-                let answer = settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await);
+                let answer = settled(
+                    request_id,
+                    tokio::time::timeout(crate::service::CREATE_WAIT, effect).await,
+                );
                 // A create the daemon answered from the reservation an earlier submission made is
                 // the same read of somebody's result as a retained answer anywhere else, and it
                 // says so: `deduplicated` is what distinguishes it from a session made now.

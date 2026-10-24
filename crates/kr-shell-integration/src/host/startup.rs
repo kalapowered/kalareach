@@ -18,6 +18,7 @@ use kr_ipc::install::{Permit, WriteRefused, Written};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::qualification::ShellKind;
+use crate::host::package::ShellPackage;
 use crate::host::refusal::Refusal;
 
 /// The line that opens a KalaReach entry.
@@ -60,6 +61,44 @@ pub struct StartupTarget {
     pub placement: Placement,
 }
 
+/// A PowerShell, and the variables its start sets on top of the environment of whoever starts it.
+///
+/// Every PowerShell this host runs is run through this: the one a session starts, and the ones
+/// that are asked where a profile is, that place an entry in it and that check what they placed.
+/// A package whose shell finds its runtime and its module through variables has them set for all
+/// of those alike, so what a question is answered by is the shell a session would start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PowerShell {
+    /// The program that is started.
+    pub executable: PathBuf,
+    /// The variables its start sets, by name and value.
+    pub environment: Vec<(String, String)>,
+}
+
+impl PowerShell {
+    /// A PowerShell that is started in the environment it is asked in, as it stands.
+    #[must_use]
+    pub const fn plain(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            environment: Vec::new(),
+        }
+    }
+
+    /// The PowerShell a qualified package starts, with what its launch sets over this process's
+    /// own environment.
+    #[must_use]
+    pub fn of_package(package: &ShellPackage) -> Self {
+        let base: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        Self {
+            executable: package.executable(),
+            environment: package.launch_environment(&base, cfg!(windows)),
+        }
+    }
+}
+
 /// What a home directory looks like to setup.
 ///
 /// Passed in rather than read from the process, because setup runs for the user it is configuring
@@ -79,7 +118,7 @@ pub struct HomeLayout {
     /// move it anywhere. Two editions answer differently, so this has to be the executable a
     /// session would actually start: [`Self::launching`] is how a caller that has resolved a
     /// package says which.
-    pub powershell: Option<PathBuf>,
+    pub powershell: Option<PowerShell>,
 }
 
 impl HomeLayout {
@@ -102,7 +141,7 @@ impl HomeLayout {
     /// two can be different editions, and on Windows they keep their profiles in different
     /// directories, so an entry written for one is never read by the other.
     #[must_use]
-    pub fn launching(mut self, powershell: PathBuf) -> Self {
+    pub fn launching(mut self, powershell: PowerShell) -> Self {
         self.powershell = Some(powershell);
         self
     }
@@ -172,7 +211,7 @@ impl HomeLayout {
             // everything the person configured has run.
             ShellKind::PowerShell => self
                 .powershell
-                .as_deref()
+                .as_ref()
                 .and_then(|shell| {
                     self.powershell_profiles().map(|(all_hosts, current_host)| {
                         powershell_targets(shell, all_hosts, current_host)
@@ -255,7 +294,7 @@ impl HomeLayout {
 /// that checks the reader at its end.
 #[must_use]
 pub fn powershell_targets(
-    shell: &Path,
+    shell: &PowerShell,
     all_hosts: PathBuf,
     current_host: PathBuf,
 ) -> Vec<StartupTarget> {
@@ -268,7 +307,7 @@ pub fn powershell_targets(
                      rather than replaces it",
             shared: false,
             placement: Placement::AfterPrologue {
-                shell: shell.to_path_buf(),
+                shell: shell.clone(),
             },
         },
         StartupTarget {
@@ -278,7 +317,7 @@ pub fn powershell_targets(
                      the user configured has run; the entry adds to it rather than replaces it",
             shared: false,
             placement: Placement::Last {
-                shell: shell.to_path_buf(),
+                shell: shell.clone(),
             },
         },
     ]
@@ -301,7 +340,7 @@ const PLACEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6
 /// a descendant that inherited the handle holds nothing of this host's open. The wait is bounded,
 /// and a program that outlasts it is terminated and reaped: a shell that will not start must not
 /// hold `kr shell` open.
-fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
+fn ask(program: &PowerShell, arguments: &[&str]) -> Option<String> {
     ask_with(program, arguments, &[], ASK_DEADLINE)
 }
 
@@ -311,7 +350,7 @@ fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
 /// the call's private directory and the variable holds the file's path, so the program reads the
 /// text exactly as it is, whatever it contains, and nothing has to be quoted into its arguments.
 fn ask_with(
-    program: &Path,
+    program: &PowerShell,
     arguments: &[&str],
     inputs: &[(&str, &str)],
     allowed: std::time::Duration,
@@ -353,9 +392,15 @@ fn ask_with(
         }
         variables.push((*name, file));
     }
-    let mut command = std::process::Command::new(program);
+    let mut command = std::process::Command::new(&program.executable);
     command
         .args(arguments)
+        .envs(
+            program
+                .environment
+                .iter()
+                .map(|(name, value)| (name, value)),
+        )
         .envs(variables)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(to))
@@ -424,18 +469,21 @@ fn read_answer(path: &Path) -> Option<String> {
 ///
 /// The name differs by platform: `pwsh` is PowerShell 6 and later everywhere, and Windows also
 /// ships `powershell.exe`, the edition that came with it.
-fn powershell_on_path() -> Option<PathBuf> {
+fn powershell_on_path() -> Option<PowerShell> {
     let names: &[&str] = if cfg!(windows) {
         &["pwsh.exe", "powershell.exe"]
     } else {
         &["pwsh"]
     };
     let path = std::env::var_os("PATH")?;
-    names.iter().find_map(|name| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join(name))
-            .find(|candidate| candidate.is_file())
-    })
+    names
+        .iter()
+        .find_map(|name| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+        .map(PowerShell::plain)
 }
 
 /// What the entry at the end of a PowerShell profile runs: the module's own check of the reader,
@@ -612,14 +660,14 @@ pub enum Placement {
     /// after the entry, and everything else is as it was.
     AfterPrologue {
         /// The PowerShell that answers, which is the one this profile belongs to.
-        shell: PathBuf,
+        shell: PowerShell,
     },
     /// After everything the user wrote, in a PowerShell profile: the same end as `End`, checked the
     /// same way as `AfterPrologue` is, so that an entry can never land inside a statement the
     /// profile leaves open, and every statement of the profile's own comes before it.
     Last {
         /// The PowerShell that answers, which is the one this profile belongs to.
-        shell: PathBuf,
+        shell: PowerShell,
     },
 }
 
@@ -634,7 +682,7 @@ impl Placement {
     }
 
     /// Returns the PowerShell that places and checks an entry put this way, when it takes one.
-    fn shell(&self) -> Option<&Path> {
+    fn shell(&self) -> Option<&PowerShell> {
         match self {
             Self::End => None,
             Self::AfterPrologue { shell } | Self::Last { shell } => Some(shell),
@@ -771,7 +819,7 @@ fn appended(existing: &str, body: &str, begin: &str) -> String {
 /// entry keeps the note only if it goes in the same place, and an entry that moves does not take a
 /// line break with it.
 fn after_the_prologue(
-    shell: &Path,
+    shell: &PowerShell,
     theirs: &str,
     body: &str,
     placement: &Placement,
@@ -957,7 +1005,7 @@ const VERIFY_SCRIPT: &str = concat!(
 );
 
 /// Returns the byte offset in `text` at which PowerShell says an entry goes.
-fn prologue_end(shell: &Path, text: &str) -> std::io::Result<usize> {
+fn prologue_end(shell: &PowerShell, text: &str) -> std::io::Result<usize> {
     let said = ask_with(
         shell,
         &[
@@ -1715,6 +1763,50 @@ pub fn holds_an_entry(path: &Path) -> bool {
     })
 }
 
+/// Whether the entry that opens a shell's bridge is in place, as the record of an install says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryInPlace {
+    /// A file the record names for the shell holds the entry.
+    Yes,
+    /// The record could be read and no file it names for the shell holds the entry: no install
+    /// was made for the shell, or the entry was taken out of its file since.
+    No,
+    /// The record could not be read, so it says nothing either way.
+    Unknown,
+}
+
+impl EntryRecord {
+    /// Whether a file this record names for `kind` holds the entry that opens the bridge.
+    ///
+    /// This is the one question a session asks before it starts a shell: a shell whose profile
+    /// carries no entry never opens the bridge, and the create would otherwise wait out the whole
+    /// of its qualification bound to learn that. It reads the record and the files it names, and
+    /// asks no shell, so it costs a few file reads on every platform. A person who put the entry
+    /// in a file by hand has no record of it, and gets the refusal until `kr shell install`
+    /// records it.
+    #[must_use]
+    pub fn opening_entry(&self, kind: ShellKind) -> EntryInPlace {
+        let Ok(files) = self.files(kind) else {
+            return EntryInPlace::Unknown;
+        };
+        let mut unreadable = false;
+        for file in &files {
+            match read_or_empty(file) {
+                Ok(contents) if strip(&contents, MARKER_BEGIN, MARKER_END).is_some() => {
+                    return EntryInPlace::Yes;
+                }
+                Ok(_) => {}
+                Err(_) => unreadable = true,
+            }
+        }
+        if unreadable {
+            EntryInPlace::Unknown
+        } else {
+            EntryInPlace::No
+        }
+    }
+}
+
 /// Splits a file around its KalaReach entry: what comes before it, the entry itself, and what comes
 /// after it.
 ///
@@ -2433,8 +2525,8 @@ mod tests {
 
     /// The PowerShell a test that places an entry in a profile asks, which is whichever one is on
     /// the path. A test that only reads what an entry contains never starts it.
-    fn a_powershell() -> PathBuf {
-        powershell_on_path().unwrap_or_else(|| PathBuf::from("pwsh"))
+    fn a_powershell() -> PowerShell {
+        powershell_on_path().unwrap_or_else(|| PowerShell::plain(PathBuf::from("pwsh")))
     }
 
     /// Where the entry that opens the bridge goes, for a test that places one.
@@ -2701,19 +2793,20 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let file = directory.path().join("profile.ps1");
         std::fs::write(&file, text.trim_start_matches('\u{feff}')).expect("writes");
-        let asked = std::process::Command::new(powershell_on_path().expect("a PowerShell"))
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$t = $null; $e = $null; \
+        let asked =
+            std::process::Command::new(powershell_on_path().expect("a PowerShell").executable)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$t = $null; $e = $null; \
                  $null = [System.Management.Automation.Language.Parser]::ParseInput(\
                      [System.IO.File]::ReadAllText($env:KR_PROFILE), [ref]$t, [ref]$e); \
                  $e | ForEach-Object { $_.ErrorId }",
-            ])
-            .env("KR_PROFILE", &file)
-            .output()
-            .expect("PowerShell runs");
+                ])
+                .env("KR_PROFILE", &file)
+                .output()
+                .expect("PowerShell runs");
         let mut found = String::from_utf8_lossy(&asked.stdout)
             .lines()
             .map(str::to_owned)
@@ -2733,16 +2826,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let file = directory.path().join("profile.ps1");
         std::fs::write(&file, text.trim_start_matches('\u{feff}')).expect("writes");
-        let asked = std::process::Command::new(powershell_on_path().expect("a PowerShell"))
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$global:order = @(); . $env:KR_PROFILE; $global:order -join ','",
-            ])
-            .env("KR_PROFILE", &file)
-            .output()
-            .expect("PowerShell runs");
+        let asked =
+            std::process::Command::new(powershell_on_path().expect("a PowerShell").executable)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$global:order = @(); . $env:KR_PROFILE; $global:order -join ','",
+                ])
+                .env("KR_PROFILE", &file)
+                .output()
+                .expect("PowerShell runs");
         String::from_utf8_lossy(&asked.stdout).trim().to_owned()
     }
 
@@ -3629,10 +3723,10 @@ mod tests {
         let check =
             format!("{CHECK_MARKER_BEGIN}\nConfirm-KalaReachReadLine\n{CHECK_MARKER_END}\n");
         let first = Placement::AfterPrologue {
-            shell: PathBuf::from("pwsh"),
+            shell: PowerShell::plain(PathBuf::from("pwsh")),
         };
         let last = Placement::Last {
-            shell: PathBuf::from("pwsh"),
+            shell: PowerShell::plain(PathBuf::from("pwsh")),
         };
         std::fs::write(&path, format!("Get-Date\n{load}")).expect("writes");
         assert!(installed(&path, &first) && installed(&path, &Placement::End));
@@ -4351,7 +4445,7 @@ mod tests {
         std::fs::remove_file(&text).expect("the program's text goes once it is in place");
 
         let asking = HomeLayout {
-            powershell: Some(program),
+            powershell: Some(PowerShell::plain(program)),
             ..layout(&home)
         };
         let targets = asking.targets(ShellKind::PowerShell);
@@ -4378,7 +4472,7 @@ mod tests {
     /// holds the program open for writing, and a child another test starts is never handed a
     /// descriptor that would keep the program from starting.
     #[cfg(unix)]
-    fn fake_powershell(root: &Path, says: &str) -> PathBuf {
+    fn fake_powershell(root: &Path, says: &str) -> PowerShell {
         use std::hash::{Hash as _, Hasher as _};
 
         // Named by what it says, so two programs that say different things are never one file.
@@ -4394,7 +4488,72 @@ mod tests {
         // deadline of its own.
         kr_ipc::testing::place_and_start_once(&text, &path, &["--version"]);
         std::fs::remove_file(&text).expect("the program's text goes once it is in place");
-        path
+        PowerShell::plain(path)
+    }
+
+    /// Every PowerShell this host runs for a package is started as the package's
+    /// shell is, with what its launch sets: the one asked where a profile is, the one that places
+    /// an entry in it and the one that checks what was placed.
+    ///
+    /// The program here answers only where the variable the launch sets is set, so a question
+    /// asked of it in the host's own environment gets nothing, and an entry it was to place is
+    /// refused.
+    #[cfg(unix)]
+    #[test]
+    fn every_powershell_this_host_runs_is_started_with_what_the_packages_launch_sets() {
+        let root = tempfile::tempdir().expect("a directory");
+        let program = root.path().join("pwsh-gated");
+        let text = root.path().join("pwsh-gated.text");
+        let (all_hosts, current_host) = (
+            root.path().join("profile.ps1"),
+            root.path().join("host-profile.ps1"),
+        );
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\n[ \"${{1:-}}\" = --version ] && exit 0\n\
+                 [ \"${{KR_TEST_LAUNCH:-}}\" = set ] || exit 1\n\
+                 case \"$5\" in\n*kr-verified*) printf kr-verified ;;\n\
+                 *kr-placed*) printf 'kr-placed 0' ;;\n\
+                 *) printf '%s\\n%s\\n' '{}' '{}' ;;\nesac\n",
+                all_hosts.display(),
+                current_host.display()
+            ),
+        )
+        .expect("writes the program's text");
+        kr_ipc::testing::place_and_start_once(&text, &program, &["--version"]);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+        let launched = PowerShell {
+            executable: program.clone(),
+            environment: vec![("KR_TEST_LAUNCH".to_owned(), "set".to_owned())],
+        };
+        let plain = PowerShell::plain(program);
+
+        // The question: where the profiles are.
+        let asking = |shell: &PowerShell| HomeLayout {
+            powershell: Some(shell.clone()),
+            ..layout(root.path())
+        };
+        assert_eq!(asking(&launched).targets(ShellKind::PowerShell).len(), 2);
+        assert!(
+            asking(&plain).targets(ShellKind::PowerShell).is_empty(),
+            "the control: the same program, started without the launch, answers nothing"
+        );
+
+        // The placement of an entry, and the check of it.
+        for (shell, placed) in [(&launched, true), (&plain, false)] {
+            let targets = powershell_targets(shell, all_hosts.clone(), current_host.clone());
+            for target in &targets {
+                let body = entry(target, Path::new("/opt/kr/entry"), false).expect("text");
+                let path = root.path().join(format!(
+                    "{placed}-{}",
+                    target.path.display().to_string().len()
+                ));
+                std::fs::write(&path, "$x = 1\n").expect("a profile");
+                let result = install(&path, &body, &target.placement);
+                assert_eq!(result.is_ok(), placed, "{:?}: {result:?}", target.placement);
+            }
+        }
     }
 
     #[test]
@@ -4867,6 +5026,79 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0, "the record is the owner's alone: {mode:o}");
         }
+    }
+
+    /// The record says whether the entry that opens a shell's bridge is in place, so that a create
+    /// whose shell has none is refused before the shell starts. Nothing recorded, an entry taken
+    /// out of its file and a file that holds only the reader check all say it is not there; a
+    /// record or a file that cannot be read says nothing.
+    #[test]
+    fn the_record_says_whether_the_entry_that_opens_the_bridge_is_in_place() {
+        let root = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&root.path().join("state"));
+        assert_eq!(
+            record.opening_entry(ShellKind::Zsh),
+            EntryInPlace::No,
+            "no install was made"
+        );
+
+        let zshrc = root.path().join(".zshrc");
+        std::fs::write(&zshrc, "alias ll='ls -l'\n").expect("the person's file");
+        hold_the_record(&record)
+            .expect("holds")
+            .add(ShellKind::Zsh, std::slice::from_ref(&zshrc))
+            .expect("records");
+        assert_eq!(
+            record.opening_entry(ShellKind::Zsh),
+            EntryInPlace::No,
+            "recorded, with no entry in the file"
+        );
+
+        let target = StartupTarget {
+            kind: ShellKind::Zsh,
+            path: zshrc.clone(),
+            reason: "the file the case writes",
+            shared: false,
+            placement: Placement::End,
+        };
+        let body = entry(&target, Path::new("/opt/kr/entry"), false).expect("the path is text");
+        super::install(&zshrc, &body, &target.placement, &record).expect("the entry goes in");
+        assert_eq!(record.opening_entry(ShellKind::Zsh), EntryInPlace::Yes);
+        assert_eq!(
+            record.opening_entry(ShellKind::Bash),
+            EntryInPlace::No,
+            "another shell's files are not this one's"
+        );
+
+        let reader_check = root.path().join("current-host.ps1");
+        std::fs::write(
+            &reader_check,
+            format!("{CHECK_MARKER_BEGIN}\n$null\n{CHECK_MARKER_END}\n"),
+        )
+        .expect("a file that holds only the reader check");
+        hold_the_record(&record)
+            .expect("holds")
+            .add(ShellKind::PowerShell, std::slice::from_ref(&reader_check))
+            .expect("records");
+        assert_eq!(
+            record.opening_entry(ShellKind::PowerShell),
+            EntryInPlace::No,
+            "the reader check does not open the bridge"
+        );
+
+        // A name that cannot be read as a file says nothing about the entry.
+        hold_the_record(&record)
+            .expect("holds")
+            .add(ShellKind::Fish, &[root.path().to_path_buf()])
+            .expect("records");
+        assert_eq!(record.opening_entry(ShellKind::Fish), EntryInPlace::Unknown);
+
+        std::fs::write(record.path(), b"not a record").expect("rewritten");
+        assert_eq!(
+            record.opening_entry(ShellKind::Zsh),
+            EntryInPlace::Unknown,
+            "a record that cannot be read says nothing"
+        );
     }
 
     /// A name that is not text is kept byte for byte, and it is not the name its text makes of it,
