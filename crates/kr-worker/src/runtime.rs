@@ -28,6 +28,15 @@ use crate::session::{
 };
 use crate::trace::Site;
 
+/// How long a managed session waits for the user's startup files to finish.
+///
+/// It is a bound rather than a latency: the integration reports its hooks live the moment the
+/// startup files are done, and this is only what stops a profile that blocks forever from leaving
+/// a create request unanswered. The control daemon waits this long on top of the time a worker
+/// takes to report itself otherwise, so that the reason the worker gives when the bound ends is
+/// the answer the person gets.
+pub const QUALIFICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
 

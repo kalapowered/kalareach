@@ -421,7 +421,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // hooks live, this session is authenticated rather than qualified, and it reports nothing
     // ready. A failure here closes the session that was being created and records why.
     if bridge_server.is_some()
-        && let Err(error) = runtime.await_qualification(QUALIFICATION_DEADLINE).await
+        && let Err(error) = runtime
+            .await_qualification(kr_worker::runtime::QUALIFICATION_DEADLINE)
+            .await
     {
         // The failure is reported if it can be, and the session is closed either way: a create that
         // could not deliver the managed contract leaves a closure record rather than a shell nobody
@@ -535,13 +537,6 @@ async fn finish(
     serving.abort();
     let _ = serving.await;
 }
-
-/// How long a managed session waits for the user's startup files to finish.
-///
-/// It is a bound rather than a latency: the integration reports its hooks live the moment the
-/// startup files are done, and this is only what stops a profile that blocks forever from leaving
-/// a create request unanswered.
-const QUALIFICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Reads the parts of the first snapshot of plugin admissions a specification announced, each of
 /// its frame and in its order.
