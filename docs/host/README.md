@@ -6638,9 +6638,10 @@ component events of two provenances only, native protocol and terminal text; mac
 provenance the vocabulary names and no producer sends. The reading of terminal text never turns
 into approval authority, and it never settles an image's acceptance or a mutation's result: an
 attachment is accepted only on the upstream's typed acknowledgement of the offer
-([Offering an attachment to an agent](../transfer/README.md#offering-an-attachment-to-an-agent)), a
-mutation's result comes from the upstream's typed answer, and an inferred screen never moves a
-receipt ([Journals and the receipt contract](#journals-and-the-receipt-contract)).
+([Offering an attachment to an agent](../transfer/README.md#offering-an-attachment-to-an-agent)), the
+result of a request to the upstream comes from its typed answer, an approval's answer is resolved by
+the completed write of the verdict on the native connection (which says the verdict left KalaReach
+and never that the vendor took it), and an inferred screen never moves a receipt ([Journals and the receipt contract](#journals-and-the-receipt-contract)).
 
 ### Decoding trust
 
