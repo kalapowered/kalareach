@@ -484,6 +484,9 @@ impl FeedRuntime {
                     None,
                 )
             };
+        // A refusal this host raised may be waiting for the registry to take a write, and the pass
+        // that raised it goes no further until it has: the refusal stands and nothing more is read.
+        let stuck = controller.stuck_drain();
         // A refusal the feed puts on every remote grant is a warning whatever else the check found,
         // and its remedy is the one that ends it.
         let (state, remedy) = if status.removed_at_ms.0.is_some() {
@@ -505,6 +508,10 @@ impl FeedRuntime {
         {
             // The registry is the likely cause only when the pass was not stopped by the feed.
             (DoctorStatus::Warning, Some(CATCHING_UP_REMEDY))
+        } else if stuck.is_some() {
+            // The feed's own state is stale or a pass stopped because this host could not finish
+            // it, and the wait for the registry is why: its remedy replaces theirs.
+            (DoctorStatus::Warning, Some(STUCK_DRAIN_REMEDY))
         } else {
             (state, remedy)
         };
@@ -554,14 +561,12 @@ impl FeedRuntime {
         } else {
             detail
         };
-        // A refusal this host raised waits for the registry to take a write, and the pass that
-        // raised it goes no further until it has: the refusal stands and nothing more is read.
-        let stuck = controller.stuck_drain();
         let detail = match stuck {
             Some(stuck) => {
+                let waited = now.saturating_sub(stuck.since_ms) / 1000;
                 let detail = detail.stated(
-                    "; a refusal this host raised on remote grants waits for the registry to \
-                         take a write, so this host reads no more of the feed until it has: ",
+                    "; a refusal this host raised on remote grants waits for the registry to take \
+                     a write, so this host reads no more of the feed until it has: ",
                 );
                 match stuck.why {
                     DrainWhy::Held => detail
@@ -569,19 +574,16 @@ impl FeedRuntime {
                             "a write to the pairing records has held the registry's write lock \
                              for at least ",
                         )
-                        .number(now.saturating_sub(stuck.since_ms) / 1000)
+                        .number(waited)
                         .stated(" seconds"),
                     DrainWhy::Failed(kind) => detail
-                        .stated("the registry could not take the write, because ")
+                        .stated("the registry could not take the write for at least ")
+                        .number(waited)
+                        .stated(" seconds, because ")
                         .stated(kind),
                 }
             }
             None => detail,
-        };
-        let (state, remedy) = match (stuck, remedy) {
-            (Some(_), None) => (DoctorStatus::Warning, Some(STUCK_DRAIN_REMEDY)),
-            (Some(_), remedy) => (DoctorStatus::Warning, remedy),
-            (None, remedy) => (state, remedy),
         };
         let detail = if observed.unnamed_owners > 0 {
             detail
