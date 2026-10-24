@@ -3426,12 +3426,19 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
         let mut offset = start;
         let mut carried: Vec<u8> = Vec::new();
         let mut found = false;
+        let mut refused = String::new();
         while offset < end {
             let want =
                 usize::try_from(end - offset).map_or(chunk.len(), |left| left.min(chunk.len()));
-            let read = match memory.seek(SeekFrom::Start(offset)) {
-                Ok(_) => memory.read(&mut chunk[..want]).unwrap_or(0),
-                Err(_) => 0,
+            let outcome = memory
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| memory.read(&mut chunk[..want]));
+            let read = match outcome {
+                Ok(read) => read,
+                Err(error) => {
+                    refused = format!(" (at {offset:x}: {error})");
+                    0
+                }
             };
             if read == 0 {
                 break;
@@ -3448,7 +3455,7 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
             offset += read as u64;
         }
         if !found && offset < end {
-            scan.unread.push(line.to_owned());
+            scan.unread.push(format!("{line}{refused}"));
         }
     }
     scan
