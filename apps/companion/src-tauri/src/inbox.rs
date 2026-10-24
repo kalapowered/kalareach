@@ -200,21 +200,9 @@ impl InboxDesk {
                 found.push(each);
             }
         }
-        // Each visit asked about its own host when it ended, and a slower visit has run since: a
-        // host this device forgot, or began to use, in the meantime is not reported either. A list
-        // that cannot be read now decides nothing, and the answers stand as each visit left them.
-        if let Ok(listed) = device.pairing().hosts.list() {
-            let in_use = device.host_in_use().map(|host| host.host_device_id);
-            let others: BTreeSet<String> = listed
-                .iter()
-                .filter(|host| Some(host.host_device_id) != in_use)
-                .map(reference_of)
-                .collect();
-            found = still_others(found, &others);
-        }
         // The answer waits for the slowest host, so an account may have left since the pass that
         // read a host ended. What was read for it is not handed on.
-        found
+        let read: Vec<HostInbox> = found
             .into_iter()
             .filter(|each| {
                 each.read_over
@@ -222,6 +210,29 @@ impl InboxDesk {
                     .is_none_or(|connection| connection.ended_by_this_device().is_none())
             })
             .map(|each| each.inbox)
+            .collect();
+        Self::settled(device, read)
+    }
+
+    /// The answers of a pass that are still for one of the other hosts when the pass ends.
+    ///
+    /// Each visit asked about its own host when it ended, and a slower visit has run since: a host
+    /// this device forgot, or began to use, in the meantime is not reported either. A list that
+    /// cannot be read now decides nothing, and the answers stand as each visit left them.
+    #[must_use]
+    pub fn settled(device: &Device, found: Vec<HostInbox>) -> Vec<HostInbox> {
+        let Ok(listed) = device.pairing().hosts.list() else {
+            return found;
+        };
+        let in_use = device.host_in_use().map(|host| host.host_device_id);
+        let others: BTreeSet<String> = listed
+            .iter()
+            .filter(|host| Some(host.host_device_id) != in_use)
+            .map(reference_of)
+            .collect();
+        found
+            .into_iter()
+            .filter(|each| others.contains(&each.reference))
             .collect()
     }
 
@@ -311,15 +322,6 @@ impl InboxDesk {
     fn kept(&self) -> MutexGuard<'_, BTreeMap<DeviceId, Kept>> {
         self.kept.lock().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// The answers that are for a host in `others`, the references of the paired hosts that are not the
-/// one in use.
-fn still_others(found: Vec<Found>, others: &BTreeSet<String>) -> Vec<Found> {
-    found
-        .into_iter()
-        .filter(|each| others.contains(&each.inbox.reference))
-        .collect()
 }
 
 /// Reads `host`'s inbox over the connection held, or over a fresh one when there is none or it no
@@ -495,41 +497,4 @@ async fn pages(session: &kr_client::Session) -> Result<Option<AttentionReadResul
         page.items = items;
         page
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn answer(reference: &str) -> HostInbox {
-        HostInbox {
-            reference: reference.to_owned(),
-            name: reference.to_owned(),
-            state: HostInboxState::OutOfContact,
-            read_at_ms: None,
-            lost_since_ms: Some(1),
-            refusal: None,
-            result: None,
-            sessions: Vec::new(),
-        }
-    }
-
-    /// A pass reports only hosts that are still paired and not in use when it ends, whatever each
-    /// visit found when it ended: a host chosen or forgotten while a slower visit ran is dropped.
-    #[test]
-    fn a_host_that_is_no_longer_one_of_the_others_is_not_reported() {
-        let others = BTreeSet::from(["second".to_owned()]);
-
-        let found = |reference: &str| Found {
-            inbox: answer(reference),
-            read_over: None,
-        };
-        let kept = still_others(vec![found("first"), found("second")], &others);
-
-        let names: Vec<&str> = kept
-            .iter()
-            .map(|each| each.inbox.reference.as_str())
-            .collect();
-        assert_eq!(names, ["second"]);
-    }
 }
