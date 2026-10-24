@@ -5,7 +5,9 @@ each shell change, what the added sources are, how a package is built and identi
 which licence each part travels.
 
 Three of the four are built from an upstream release the manifest pins by URL and SHA-256. Nothing
-upstream is copied into this repository. What lives here is the patch sets, the bridge sources the
+upstream is copied into this repository, except the twenty official patches of Bash 5.3, which GNU
+publishes as separate files and no tarball includes: each is kept exactly as ftp.gnu.org publishes
+it, and the manifest pins its SHA-256. What lives here is the patch sets, the bridge sources the
 patches bring with them, the guarded startup entry and the manifest that ties them together:
 
 ```
@@ -45,13 +47,12 @@ cleanly.
 
 ## What Zsh changes
 
-There are five patches, against `zsh-5.9`.
+There are four patches, against `zsh-5.9.2`.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
 | `0001-zle-reader-mailbox` | `Src/Zle/zle.mdd`, `Src/Zle/zle_main.c` | The mailbox and everything that hangs off it |
 | `0002-zle-reader-state` | `Src/Zle/zle_misc.c` | Three reader states the detach condition needs |
-| `0003-terminfo-variable-checks` | `configure.ac`, `configure` | The published upstream fix for the terminfo capability-name probes |
 | `0004-exec-command-resolve` | `Src/exec.c`, `Src/zsh.h`, `Src/Zle/zle_main.c` | The question in front of each command a line starts, and the launcher its answer can name |
 | `0005-module-paths-from-executable` | `Src/init.c` | The default module path and function path, read from where the executable is |
 
@@ -117,10 +118,13 @@ afterwards and win.
 
 ## What Bash changes
 
-There are four patches, against `bash-5.2.37`, which bundles Readline 8.2.
+There are twenty-four patches, against `bash-5.3`, which bundles Readline 8.3: the twenty official
+patches of the 5.3 series, `bash53-001` to `bash53-020`, applied first with `patch -p0` as GNU
+publishes them, and four of the package's own.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
+| `bash53-001` to `bash53-020` | `patches/upstream/` | The fixes the Bash project published for 5.3, unchanged |
 | `0001-readline-reader-mailbox` | `lib/readline/{Makefile.in,input.c,macro.c,readline.c}` | The mailbox, the reader's private counts, the cancellation and the pre-EOF decision |
 | `0002-readline-reader-state` | `lib/readline/{text.c,kill.c}` | Two reader states Readline keeps no flag for |
 | `0003-bash-bridge-activation` | `Makefile.in`, `shell.c`, `builtins/{Makefile.in,read.def}` | Loading the bridge, the prompt context and the builtin |
@@ -452,13 +456,11 @@ declared mechanisms, and the build's own inputs and compiler. The record also st
 shell's own test suite did, and holds as `build.inputs` the exact text the identity is a digest of,
 so which of the inputs were the tree's and which the machine's can be read back line by line.
 
-The manifest's compilation flags are part of the package rather than a local preference. Zsh 5.9
+The manifest's compilation flags are part of the package rather than a local preference. Zsh
 writes some of its configure probes in pre-C99 style, and a compiler that rejects implicit `int`
 answers "missing" where the truth is "did not compile": that is how a build ends up with
 `BROKEN_POSIX_SIGSUSPEND` and a shell that hangs on every command substitution. The manifest pins
-`-std=gnu17` and the two warning flags that keep those probes compiling, and `--with-tcsetpgrp=yes`
-states the platform assumption the probe cannot check without a controlling terminal. Both
-assumptions hold on the platforms these packages are built for.
+`-std=gnu17` and the two warning flags that keep those probes compiling.
 
 A package is built on one machine and installed on others, so none of its native files may depend
 on a library that only the builder had. fish builds its own PCRE2. Bash is configured with
@@ -470,10 +472,10 @@ module or loadable builtin, and fails on a macOS library outside `/usr/lib` and 
 Linux library outside the C library, the compiler's runtime and the terminal-information library.
 
 There are two notes on that last field. Bash's `make tests` passes with these patches. Zsh's
-`make check` runs 64 scripts and one of them, `A04redirect`, fails on macOS on arm64 over
+`make check` runs 64 scripts and, for 5.9, one of them, `A04redirect`, failed on macOS on arm64 over
 `print foo >&-`, which writes to a closed descriptor and prints where the test expects silence. An
-unpatched 5.9 built from the same tarball and the same flags fails the same single script, so this
-is how the release behaves on this host rather than anything the patches do. The build script runs
+unpatched 5.9 built from the same tarball and the same flags failed the same single script, so a
+release's own suite can fail on a platform for reasons that have nothing to do with the patches. The build script runs
 each suite in its own process group, ends it at a bound, records the outcome and its summary line in
 the identity, and carries on; `--require-upstream-tests` turns anything but a pass into a build
 failure, which is what continuous integration uses on Linux.

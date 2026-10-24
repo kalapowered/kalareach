@@ -45,6 +45,15 @@ fn fixture() -> PathBuf {
     repository_root().join("tests/shells/zsh/native-module-abi")
 }
 
+/// The editor ABI the built package declares, which is what a decision about a module is made
+/// against.
+fn reader_abi(package: &Package) -> String {
+    package.record["shell"]["editor_abi"]
+        .as_str()
+        .expect("the package's record names its editor ABI")
+        .to_owned()
+}
+
 /// The one case these tests run, described here rather than in the corpus: it has two outcomes,
 /// and the corpus runner asks every case for one.
 fn case() -> QualificationCase {
@@ -201,7 +210,10 @@ fn a_module_built_for_the_packages_editor_binds_and_the_session_may_qualify() {
         "the report says where the shell found it: {}",
         ours.path
     );
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// KR-REQ-07.87, KR-REQ-07.88: a module built against a newer editor calls a function this one
@@ -228,13 +240,16 @@ fn a_module_that_needs_what_the_editor_lacks_is_named_in_the_report_and_refused(
         module(&listed, "kr_user_newer").imports,
         ModuleImports::Missing("zle_abi_newer_entry".to_owned())
     );
-    let refused = decide_activated_modules("zle-5.9", &listed)
+    let refused = decide_activated_modules(&reader_abi(&package), &listed)
         .expect_err("a session with a module that cannot bind is not qualified");
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
     assert_eq!(
         refused.error.message,
-        "module kr_user_newer imports zle_abi_newer_entry, which neither this reader (zle-5.9) nor \
-         anything else the shell holds provides"
+        format!(
+            "module kr_user_newer imports zle_abi_newer_entry, which neither this reader ({}) nor \
+             anything else the shell holds provides",
+            reader_abi(&package)
+        )
     );
 }
 
@@ -256,7 +271,7 @@ fn a_module_that_imports_from_a_package_module_is_judged_by_whether_that_module_
         ModuleImports::Missing("asklist".to_owned()),
         "the provider is not loaded, and the module would end the shell at its first call"
     );
-    let refused = decide_activated_modules("zle-5.9", &listed)
+    let refused = decide_activated_modules(&reader_abi(&package), &listed)
         .expect_err("a module that imports what is not there is not qualified");
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
     drop(session);
@@ -275,7 +290,10 @@ fn a_module_that_imports_from_a_package_module_is_judged_by_whether_that_module_
         "the provider is loaded: {}",
         refusals(&setup)
     );
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// A module that calls the C library, whose names carry a version on Linux, binds: a versioned name
@@ -295,7 +313,10 @@ fn a_module_that_imports_versioned_names_from_the_c_library_binds() {
         "{}",
         refusals(&setup)
     );
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// A name a module imports weakly is one it is content to lose, and is not judged.
@@ -312,7 +333,10 @@ fn a_module_that_only_weakly_imports_a_missing_name_binds() {
         module(&listed, "kr_user_weak").imports,
         ModuleImports::Bound
     );
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// A file the loader refuses is the loader's to report: the shell does not hold it, so the report
@@ -335,7 +359,10 @@ fn a_file_the_loader_refuses_is_the_loaders_to_report_and_is_not_listed() {
         listed.iter().all(|module| module.name != "kr_wrong_abi"),
         "a module the loader refused is the loader's to diagnose: {listed:?}"
     );
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// The shell runs the image it loaded, so that image is what is judged: a configuration that removes
@@ -396,7 +423,7 @@ fn a_module_is_judged_as_the_shell_loaded_it_and_not_as_its_file_is_now() {
         ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
         "a replacement that binds was taken for the module that loaded"
     );
-    let refused = decide_activated_modules("zle-5.9", &listed)
+    let refused = decide_activated_modules(&reader_abi(&package), &listed)
         .expect_err("the shell holds a module that cannot bind");
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
     drop(session);
@@ -434,7 +461,7 @@ fn a_module_is_judged_as_the_shell_loaded_it_and_not_as_its_file_is_now() {
         ModuleImports::Missing("zle_abi_newer_entry".to_owned()),
         "a link into the package's tree made the module the package's"
     );
-    let refused = decide_activated_modules("zle-5.9", &listed)
+    let refused = decide_activated_modules(&reader_abi(&package), &listed)
         .expect_err("the shell holds a module that cannot bind");
     assert_eq!(refused.reason, QualificationReason::ModuleTreeUnsupported);
     drop(session);
@@ -456,7 +483,10 @@ fn a_module_is_judged_as_the_shell_loaded_it_and_not_as_its_file_is_now() {
         module(&listed, "kr_user_compatible").imports,
         ModuleImports::Bound
     );
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// A copy of the editor that a person puts first on their module path is not the package's: where
@@ -488,7 +518,7 @@ fn a_copy_of_the_editor_does_not_make_the_modules_beside_it_the_packages() {
         "a module beside a copy of the editor was taken for the package's"
     );
     assert_eq!(
-        decide_activated_modules("zle-5.9", &listed)
+        decide_activated_modules(&reader_abi(&package), &listed)
             .expect_err("the shell holds a module that cannot bind")
             .reason,
         QualificationReason::ModuleTreeUnsupported
@@ -543,7 +573,7 @@ fn each_of_the_packages_own_modules_binds_when_it_is_the_only_one_loaded() {
             );
         }
         assert_eq!(
-            decide_activated_modules("zle-5.9", &listed),
+            decide_activated_modules(&reader_abi(&package), &listed),
             Ok(()),
             "{name}"
         );
@@ -631,7 +661,10 @@ fn the_packages_own_modules_loaded_from_elsewhere_all_bind() {
             "a module of the package's own tree was not judged to bind: {module:?}"
         );
     }
-    assert_eq!(decide_activated_modules("zle-5.9", &listed), Ok(()));
+    assert_eq!(
+        decide_activated_modules(&reader_abi(&package), &listed),
+        Ok(())
+    );
 }
 
 /// Loads each of `names` once in a shell of its own, where nothing is timed. The operating system

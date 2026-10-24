@@ -12,8 +12,8 @@ the BSD 3-Clause Licence in the repository root.
 No GPL-licensed code is copied into any crate. The crates speak to this package over a socket, and
 nothing here is linked into anything else.
 
-The GNU General Public Licence, version 3, as distributed with bash-5.2.37
---------------------------------------------------------------------------
+The GNU General Public Licence, version 3, as distributed with bash-5.3
+-----------------------------------------------------------------------
 
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007

@@ -1,16 +1,16 @@
 {
   "shell": "bash",
   "integration_version": "1",
-  "editor_abi": "readline-8.2",
+  "editor_abi": "readline-8.3",
   "mailbox_mechanism": "idle_reader_mailbox",
   "pre_eof_mechanism": "native_hook",
   "upstream": {
-    "version": "5.2.37",
-    "revision": "bash-5.2.37",
-    "archive": "bash-5.2.37.tar.gz",
-    "url": "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
-    "sha256": "9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff",
-    "directory": "bash-5.2.37"
+    "version": "5.3.20",
+    "revision": "bash-5.3",
+    "archive": "bash-5.3.tar.gz",
+    "url": "https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz",
+    "sha256": "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba",
+    "directory": "bash-5.3"
   },
   "configure": [
     "--without-bash-malloc",
@@ -28,6 +28,186 @@
   "source_directory": "lib/readline",
   "modules": [],
   "patches": [
+    {
+      "name": "bash53-001",
+      "file": "patches/upstream/bash53-001",
+      "revision": "1",
+      "upstream_revision": "bash53-001",
+      "strip": 0,
+      "sha256": "1f608434364af86b9b45c8b0ea3fb3b165fb830d27697e6cdfc7ac17dee3287f",
+      "purpose": "The official patch bash53-001 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: In posix mode, `wait -n' with pid arguments does not restrict the set of processes it considers to those arguments."
+    },
+    {
+      "name": "bash53-002",
+      "file": "patches/upstream/bash53-002",
+      "revision": "1",
+      "upstream_revision": "bash53-002",
+      "strip": 0,
+      "sha256": "e385548a00130765ec7938a56fbdca52447ab41fabc95a25f19ade527e282001",
+      "purpose": "The official patch bash53-002 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: There are too many differences in the various implementations of shm_open(2) to rely on it for bash's use."
+    },
+    {
+      "name": "bash53-003",
+      "file": "patches/upstream/bash53-003",
+      "revision": "1",
+      "upstream_revision": "bash53-003",
+      "strip": 0,
+      "sha256": "f245d9c7dc3f5a20d84b53d249334747940936f09dc97e1dcb89fc3ab37d60ed",
+      "purpose": "The official patch bash53-003 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: Bash leaves internal quoting in place when expanding array subscripts that appear inside array subscripts in an arithmetic context, causing expansion failures."
+    },
+    {
+      "name": "bash53-004",
+      "file": "patches/upstream/bash53-004",
+      "revision": "1",
+      "upstream_revision": "bash53-004",
+      "strip": 0,
+      "sha256": "9591d245045529f32f0812f94180b9d9ce9023f5a765c039b852e5dfc99747d0",
+      "purpose": "The official patch bash53-004 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: The Linux kernel reports incorrect sizes for files in /sys/block/*/uevent, leading bash to report a read error when the byte count does not agree with the file size from fstat(2)."
+    },
+    {
+      "name": "bash53-005",
+      "file": "patches/upstream/bash53-005",
+      "revision": "1",
+      "upstream_revision": "bash53-005",
+      "strip": 0,
+      "sha256": "cca1ef52dbbf433bc98e33269b64b2c814028efe2538be1e2c9a377da90bc99d",
+      "purpose": "The official patch bash53-005 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: Restoring the default disposition in a subshell for a signal bash treats specially can cause a crash."
+    },
+    {
+      "name": "bash53-006",
+      "file": "patches/upstream/bash53-006",
+      "revision": "1",
+      "upstream_revision": "bash53-006",
+      "strip": 0,
+      "sha256": "29119addefed8eff91ae37fd51822c31780ee30d4a28376e96002706c995ff10",
+      "purpose": "The official patch bash53-006 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: When `globasciiranges' is enabled, glob patterns with ranges in bracket expressions can produce incorrect matches for character ranges whose start and end are non-ascii characters."
+    },
+    {
+      "name": "bash53-007",
+      "file": "patches/upstream/bash53-007",
+      "revision": "1",
+      "upstream_revision": "bash53-007",
+      "strip": 0,
+      "sha256": "c0976bbfffa1453c7cfdd62058f206a318568ff2d690f5d4fa048793fa3eb299",
+      "purpose": "The official patch bash53-007 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: No-fork command substitutions can perform redirections that act on the enclosing command as well."
+    },
+    {
+      "name": "bash53-008",
+      "file": "patches/upstream/bash53-008",
+      "revision": "1",
+      "upstream_revision": "bash53-008",
+      "strip": 0,
+      "sha256": "097cd723cbfb8907674ac32214063a3fd85282657ec5b4e544d2c0f719653fb4",
+      "purpose": "The official patch bash53-008 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: Bash tries to consume entire multibyte characters when looking for backslash escapes in $'...' strings, and treats too many characters as potentially beginning a multibyte character in UTF-8 locales. Being more selective about when to call mbrtowc() can lead to optimized string processing and script speedups. This patch also handles the unlikely situation of a locale encoding null wide characters with non-null bytes."
+    },
+    {
+      "name": "bash53-009",
+      "file": "patches/upstream/bash53-009",
+      "revision": "1",
+      "upstream_revision": "bash53-009",
+      "strip": 0,
+      "sha256": "eee30fe78a4b0cb2fe20e010e00308899cfc613e0774ebb3c8557a1552f24f8c",
+      "purpose": "The official patch bash53-009 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: A SIGINT during a reverse i-search can cause a segmentation fault due to accessing data freed by a signal handler."
+    },
+    {
+      "name": "bash53-010",
+      "file": "patches/upstream/bash53-010",
+      "revision": "1",
+      "upstream_revision": "bash53-010",
+      "strip": 0,
+      "sha256": "cf76f1cce2ea300c18bff9f002d21f280cc931acd17c28518110b93fe6e72569",
+      "purpose": "The official patch bash53-010 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: "
+    },
+    {
+      "name": "bash53-011",
+      "file": "patches/upstream/bash53-011",
+      "revision": "1",
+      "upstream_revision": "bash53-011",
+      "strip": 0,
+      "sha256": "0298df8f5ea2a31d3be43ed7d269c5b3c7c342dd5b570bea7f64d66dcbbe7531",
+      "purpose": "The official patch bash53-011 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: If a `mapfile' callback unsets the array variable `mapfile' is using to save the lines it reads, `mapfile' can try to reference freed memory, which can cause corruption or shell crashes."
+    },
+    {
+      "name": "bash53-012",
+      "file": "patches/upstream/bash53-012",
+      "revision": "1",
+      "upstream_revision": "bash53-012",
+      "strip": 0,
+      "sha256": "d71379b39bebaedaf123414414e77fb458a0a43b9ad3116594c6df7ca6754573",
+      "purpose": "The official patch bash53-012 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: If a subshell with an inherited EXIT trap receives a fatal signal before it clears the exit trap, and before it restores its original signal handlers, it's possible for it to inappropriately run the inherited EXIT trap."
+    },
+    {
+      "name": "bash53-013",
+      "file": "patches/upstream/bash53-013",
+      "revision": "1",
+      "upstream_revision": "bash53-013",
+      "strip": 0,
+      "sha256": "042f9cda967e24bf4211944697441e93d06ff42b4b998629a98a1b249279f200",
+      "purpose": "The official patch bash53-013 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: Comparing the value of a pointer returned from realloc/xrealloc to the original pointer passed is technically undefined behavior, which matters under some circumstances."
+    },
+    {
+      "name": "bash53-014",
+      "file": "patches/upstream/bash53-014",
+      "revision": "1",
+      "upstream_revision": "bash53-014",
+      "strip": 0,
+      "sha256": "bd4360b401d38507e358783dcad8536a99c6789f0d3a5bd0cfb8c4a34144696c",
+      "purpose": "The official patch bash53-014 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: Bash-5.3 patch 11 included an inadvertent extra line, which this patch removes. This also takes the opportunity to improve that patch, by looking up the variable each time through the line-reading loop only if there is a callback and it is invoked."
+    },
+    {
+      "name": "bash53-015",
+      "file": "patches/upstream/bash53-015",
+      "revision": "1",
+      "upstream_revision": "bash53-015",
+      "strip": 0,
+      "sha256": "55b79ceee2fc27f6767eed697e939a7eb2fe2a28c01556bd75f18d581014f46e",
+      "purpose": "The official patch bash53-015 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: There are circumstances under which index -1 is used to reference into the input buffer used by the `read' builtin."
+    },
+    {
+      "name": "bash53-016",
+      "file": "patches/upstream/bash53-016",
+      "revision": "1",
+      "upstream_revision": "bash53-016",
+      "strip": 0,
+      "sha256": "9ea29b266b7d24cb34d0ff3f1c4631e4d527bfe2d1ef15d17cdb924bf31ef767",
+      "purpose": "The official patch bash53-016 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: On recent versions of macOS, the pipe size is dynamic and changes due to system-wide total pipe usage, so we have to check whether or not bash can use the size determined at compile time."
+    },
+    {
+      "name": "bash53-017",
+      "file": "patches/upstream/bash53-017",
+      "revision": "1",
+      "upstream_revision": "bash53-017",
+      "strip": 0,
+      "sha256": "443b927b45c1558ca72052410f8b8f6e5152b617ed707061a2781d4375b0d1c3",
+      "purpose": "The official patch bash53-017 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: If readline is invoked with the cursor somewhere other than column 0, and the prompt contains multibyte characters, the display algorithm needs to use a buffer offset, instead of the physical prompt length, to determine whether or not to reprint the prompt from column 0 because the cursor is before the last invisible character in the prompt string."
+    },
+    {
+      "name": "bash53-018",
+      "file": "patches/upstream/bash53-018",
+      "revision": "1",
+      "upstream_revision": "bash53-018",
+      "strip": 0,
+      "sha256": "ae715d76c50341d7d7095e9a8d2eeed1ca9546152c2ac7289206f90cf30ac697",
+      "purpose": "The official patch bash53-018 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: "
+    },
+    {
+      "name": "bash53-019",
+      "file": "patches/upstream/bash53-019",
+      "revision": "1",
+      "upstream_revision": "bash53-019",
+      "strip": 0,
+      "sha256": "a25c581e4d0057dea3833918438a930e2e86ee4c6dc17fe15267b7f04cbc4e3d",
+      "purpose": "The official patch bash53-019 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: On some systems, macOS in particular, isalpha(3) returns true for bytes between 128 and 255. Bash uses this to determine whether or not these characters are permitted to be part of a shell identifier, and can consume one byte too many when determining the end of a variable name."
+    },
+    {
+      "name": "bash53-020",
+      "file": "patches/upstream/bash53-020",
+      "revision": "1",
+      "upstream_revision": "bash53-020",
+      "strip": 0,
+      "sha256": "df217ed3a9122aa2286d9b67bbe348661b6a9db262b580c29150dae55d532896",
+      "purpose": "The official patch bash53-020 to GNU Bash 5.3, byte for byte as ftp.gnu.org publishes it: If readline handles a SIGWINCH and resizes its idea of the screen dimensions, it needs to recompute the columns where the prompt wraps lines every time, not just when the screen width decreases."
+    },
     {
       "name": "readline-reader-mailbox",
       "file": "patches/0001-readline-reader-mailbox.patch",

@@ -40,7 +40,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  
  /* Flags for last argument of addvars */
  
-@@ -662,6 +675,81 @@
+@@ -675,6 +688,81 @@
  	}
      }
      return NULL;
@@ -122,16 +122,16 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  }
  
  /* execute an external command */
-@@ -740,6 +828,8 @@
+@@ -753,6 +841,8 @@
  	zerr("command too long: %s", arg0);
- 	_exit(1);
+ 	_exit(127);
      }
 +    if (kr_launch_argv)
 +	kr_exec_launcher(newenvp);
      for (s = arg0; *s; s++)
  	if (*s == '/') {
  	    int lerrno = zexecve(arg0, argv, newenvp);
-@@ -3572,11 +3662,35 @@
+@@ -3624,11 +3714,35 @@
  	    (((is_builtin || is_shfunc) && output) ||
  	     (!is_cursh && (last1 != 1 || nsigtrapped || havefiles() ||
  			    fdtable_flocks)))) {
@@ -169,7 +169,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  		return;
 --- a/Src/zsh.h
 +++ b/Src/zsh.h
-@@ -3245,7 +3245,15 @@
+@@ -3232,7 +3232,15 @@
  /* ZLE entry point pointer */
  
  typedef char * (*ZleEntryPoint)(int cmd, va_list ap);
@@ -180,14 +180,14 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
 + * variables to add, or leaves both null for a command that runs as it was typed.
 + */
  
-+typedef int (*KrResolveHook) _((char **, char *, char ***, char ***));
++typedef int (*KrResolveHook)(char **, char *, char ***, char ***);
 +
  /* Commands to pass to entry point */
  
  enum {
 --- a/Src/Zle/zle_main.c
 +++ b/Src/Zle/zle_main.c
-@@ -2405,6 +2405,9 @@
+@@ -2404,6 +2404,9 @@
      zle_entry_ptr = (ZleEntryPoint)0;
      zle_load_state = 0;
  

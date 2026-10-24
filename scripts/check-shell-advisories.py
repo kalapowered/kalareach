@@ -771,7 +771,6 @@ def routes():
     for tag in ("zsh-5.9.1", "zsh-5.9.2"):
         table["/repos/zsh-users/zsh/commits/" + tag] = fixture("github-zsh-commit-%s.json" % tag)
     table["/gnu/bash/"] = fixture("gnu-bash-listing.html")
-    table["/gnu/bash/bash-5.2-patches/"] = fixture("gnu-bash-5.2-patches.html")
     table["/gnu/bash/bash-5.3-patches/"] = fixture("gnu-bash-5.3-patches.html")
     return table
 
@@ -908,11 +907,13 @@ def run_self_test():
         findings, problems, waiting = outcome
         expect("the control passes", not problems, "; ".join(problems))
         needing = [item["id"] for item in findings if item["needs_row"]]
-        for identifier in (
-            "GHSA-r9hj-j2rw-4q3m", "RUSTSEC-2026-0204", "RUSTSEC-2026-0253", "v7.6.8", "zsh-5.9.2", "bash-5.3",
-            "bash53-020",
-        ):
+        for identifier in ("GHSA-r9hj-j2rw-4q3m", "RUSTSEC-2026-0204", "RUSTSEC-2026-0253", "v7.6.8"):
             expect("the control reads " + identifier, identifier in needing, str(needing))
+        # What the packages pin is not news: the zsh releases and the bash release and patches the recorded
+        # sources hold are the pin or older, so none of them needs a row.
+        read = [item["id"] for item in findings]
+        for identifier in ("zsh-5.9.1", "zsh-5.9.2", "bash-5.3", "bash53-020"):
+            expect("the control reads nothing of the pin " + identifier, identifier not in read, str(read))
         # The releases at the module's bound are the ones it accepts, and only a release above one needs a row.
         expect("a release at the bound needs no row", not {"v7.4.21", "v7.5.12", "v7.6.7"} & set(needing), str(needing))
 
@@ -922,8 +923,6 @@ def run_self_test():
             ("GHSA-r9hj-j2rw-4q3m", "PCRE2 JIT stack row"),
             ("RUSTSEC-2026-0253", "RustSec row"),
             ("v7.6.8", "PowerShell release row"),
-            ("zsh-5.9.2", "zsh tag row"),
-            ("bash-5.3", "bash release row"),
         ):
             outcome = attempt(routes(), now="2026-11-02", text=without(needle))
             expect("without the " + name, says(outcome, "no triage row"), str(outcome))
@@ -1071,59 +1070,27 @@ def run_self_test():
         outcome = attempt(routes(), now="2026-10-05", text=text)
         expect("past the allowance", says(outcome, "GHSA-r9hj-j2rw-4q3m"), str(outcome))
         # A zsh tag and a bash patch are dated by their sources, and a RustSec advisory has no allowance.
-        outcome = attempt(routes(), now="2026-07-13", text=without("zsh-5.9.2"))
-        expect("a zsh tag inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "zsh-5.9.2"), str(outcome))
-        table = routes()
-        table["/gnu/bash/bash-5.3-patches/"] = table["/gnu/bash/bash-5.3-patches/"] + (
-            b'<tr><td><a href="bash53-021">bash53-021</a></td><td align="right">2026-10-23 10:00  </td></tr>\n'
-        )
-        outcome = attempt(table, now="2026-10-28")
-        expect("a patch of the newer bash series", says(outcome, "bash53-021", "no triage row"), str(outcome))
+        # The packages pin zsh 5.9.2 and bash 5.3 with its twenty patches, so what is newer than those is
+        # synthesised here: a tag after 5.9.2, a patch after the twentieth, and a bash series after 5.3.
+        def zsh_tag(table, tag, day):
+            table = edited(table, "/repos/zsh-users/zsh/tags", lambda items: items + [{"name": tag}])
+            table["/repos/zsh-users/zsh/commits/" + tag] = json.dumps({"commit": {"committer": {"date": day}}}).encode()
+            return table
+        table = zsh_tag(routes(), "zsh-5.9.3", "2026-10-01T10:00:00Z")
+        outcome = attempt(table, now="2026-11-02")
+        expect("a zsh tag past the pin", says(outcome, "zsh-5.9.3", "no triage row"), str(outcome))
+        outcome = attempt(table, now="2026-10-02")
+        expect("a zsh tag inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "zsh-5.9.3"), str(outcome))
         five_three = "/gnu/bash/bash-5.3-patches/"
-        # A series has patches when the root listing names its directory or the register names one of
-        # them, and then the directory has to answer, whatever the series' age.
-        table = routes()
-        del table[five_three]
-        outcome = attempt(table)
-        expect("a patch directory that went missing", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
-        unnamed = register.replace("bash53-", "bash 5.3 patch ")
-        outcome = attempt(table, text=unnamed)
-        expect("a listed directory that went missing, no patch named", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
-        unlisted = routes()
-        unlisted["/gnu/bash/"] = b"".join(
-            line for line in unlisted["/gnu/bash/"].splitlines(keepends=True) if b"bash-5.3-patches/" not in line
+        row = lambda text: b'<tr><td><a href="%s">%s</a></td><td align="right">%s  </td></tr>\n' % tuple(
+            part.encode() for part in text
         )
-        del unlisted[five_three]
-        outcome = attempt(unlisted)
-        expect("a directory the register has patches of, gone from the listing", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
         table = routes()
-        table[five_three] = b"<html>no listing</html>"
-        outcome = attempt(table)
-        expect("a patch listing with nothing in it, patches named", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
-        outcome = attempt(table, text=unnamed)
-        expect("a patch listing with nothing in it, none named", not isinstance(outcome, SourceError), str(outcome))
-        table = routes()
-        del table["/gnu/bash/bash-5.2-patches/"]
-        outcome = attempt(table)
-        expect("the pinned series' patch directory missing", isinstance(outcome, SourceError) and "bash-5.2-patches" in str(outcome), str(outcome))
-        table = routes()
-        table["/gnu/bash/"] += b'<a href="bash-5.4.tar.gz">bash-5.4.tar.gz</a> 2026-10-20 10:00  11M\n'
-        outcome = attempt(table, now="2026-10-24", text=with_row(
-            "| 2026-10-24 | bash-5.4, the series after 5.3; released 2026-10-20 | bash | Read. | 2026-11-03 | not-affected |"))
-        expect("a new series with no patch yet", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
-        # A series that has gone a long time with no patch is not a source that failed: nothing names
-        # a patch of it.
-        table = routes()
-        table["/gnu/bash/"] += b'<a href="bash-5.4.tar.gz">bash-5.4.tar.gz</a> 2026-07-01 10:00  11M\n'
-        outcome = attempt(table, now="2026-10-24", text=with_row(
-            "| 2026-10-24 | bash-5.4, the series after 5.3; released 2026-07-01 | bash | Read. | 2026-07-15 | not-affected |"))
-        expect("an old series with no patch", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
+        table[five_three] += row(("bash53-021", "bash53-021", "2026-10-23 10:00"))
+        outcome = attempt(table, now="2026-10-28")
+        expect("a patch of the pinned bash series past the pin", says(outcome, "bash53-021", "no triage row"), str(outcome))
         # A patch is judged against the allowance from the day it was put there: a Friday patch waits
         # through Monday, the one working day the register allows, and has no row by Tuesday.
-        table = routes()
-        table[five_three] += (
-            b'<tr><td><a href="bash53-021">bash53-021</a></td><td align="right">2026-10-23 10:00  </td></tr>\n'
-        )
         outcome = attempt(table, now="2026-10-26")
         expect(
             "a new patch inside its allowance",
@@ -1132,6 +1099,50 @@ def run_self_test():
         )
         outcome = attempt(table, now="2026-10-27")
         expect("a new patch past its allowance", says(outcome, "bash53-021", "no triage row"), str(outcome))
+        # The pinned series' patch directory has to be there and hold patches.
+        table = routes()
+        del table[five_three]
+        outcome = attempt(table)
+        expect("the pinned series' patch directory missing", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        table = routes()
+        table[five_three] = b"<html>no listing</html>"
+        outcome = attempt(table)
+        expect("the pinned series' patch listing empty", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+
+        # A series after the pinned one has patches when the root listing names its directory or the
+        # register names one of them, and then the directory has to answer, whatever the series' age.
+        four_route = "/gnu/bash/bash-5.4-patches/"
+        def series_four(released, listed, patch=None):
+            table = routes()
+            table["/gnu/bash/"] += b'<a href="bash-5.4.tar.gz">bash-5.4.tar.gz</a> %s 10:00  11M\n' % released.encode()
+            if listed:
+                table["/gnu/bash/"] += row(("bash-5.4-patches/", "bash-5.4-patches/", released + " 10:00"))
+            if patch:
+                table[four_route] = row((patch[0], patch[0], patch[1]))
+            return table
+        def series_row(released, patch_named):
+            named = ", and its patch bash54-001" if patch_named else ""
+            return with_row(
+                "| 2026-10-24 | bash-5.4, the series after 5.3%s; released %s | bash | Read. | 2026-11-03 | not-affected |" % (named, released)
+            )
+        released = "2026-10-20"
+        outcome = attempt(series_four(released, False), text=series_row(released, False))
+        expect("a new series with no patch yet", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
+        outcome = attempt(series_four("2026-07-01", False), text=series_row("2026-07-01", False))
+        expect("an old series with no patch, none named", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
+        outcome = attempt(series_four("2026-07-01", True), text=series_row("2026-07-01", False))
+        expect("a listed patch directory that went missing", isinstance(outcome, SourceError) and "bash-5.4-patches" in str(outcome), str(outcome))
+        outcome = attempt(series_four("2026-07-01", False), text=series_row("2026-07-01", True))
+        expect("a directory the register has patches of, not in the listing", isinstance(outcome, SourceError) and "bash-5.4-patches" in str(outcome), str(outcome))
+        table = series_four("2026-07-01", True)
+        table[four_route] = b"<html>no listing</html>"
+        outcome = attempt(table, text=series_row("2026-07-01", False))
+        expect("a listed patch directory with nothing in it, no patch named", not isinstance(outcome, SourceError), str(outcome))
+        outcome = attempt(table, text=series_row("2026-07-01", True))
+        expect("a patch directory with nothing in it, patches named", isinstance(outcome, SourceError) and "bash-5.4-patches" in str(outcome), str(outcome))
+        table = series_four("2026-10-20", True, ("bash54-001", "2026-10-23 10:00"))
+        outcome = attempt(table, now="2026-10-28", text=series_row("2026-10-20", False))
+        expect("a patch of a newer series", says(outcome, "bash54-001", "no triage row"), str(outcome))
         with open(audit) as handle:
             report = json.load(handle)
         report["warnings"]["unsound"].append({

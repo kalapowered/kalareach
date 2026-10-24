@@ -17,7 +17,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 
 --- a/lib/readline/Makefile.in
 +++ b/lib/readline/Makefile.in
-@@ -88,7 +88,9 @@
+@@ -90,7 +90,9 @@
  	   $(srcdir)/shell.c $(srcdir)/tilde.c $(srcdir)/savestring.c \
  	   $(srcdir)/text.c $(srcdir)/misc.c $(srcdir)/compat.c \
  	   $(srcdir)/colors.c $(srcdir)/parse-colors.c \
@@ -28,7 +28,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  
  # The header files for this library.
  HSOURCES = readline.h rldefs.h chardefs.h keymaps.h history.h histlib.h \
-@@ -104,7 +106,8 @@
+@@ -106,7 +108,8 @@
  	  rltty.o complete.o bind.o isearch.o display.o signals.o \
  	  util.o kill.o undo.o macro.o input.o callback.o terminal.o \
  	  text.o nls.o misc.o $(HISTOBJ) $(TILDEOBJ) $(COLORSOBJ) \
@@ -40,7 +40,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  DOCSOURCE = doc/rlman.texinfo doc/rltech.texinfo doc/rluser.texinfo
 --- a/lib/readline/input.c
 +++ b/lib/readline/input.c
-@@ -74,6 +74,9 @@
+@@ -81,6 +81,9 @@
  #include "rlshell.h"
  #include "xmalloc.h"
  
@@ -50,7 +50,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* What kind of non-blocking I/O do we have? */
  #if !defined (O_NDELAY) && defined (O_NONBLOCK)
  #  define O_NDELAY O_NONBLOCK	/* Posix style */
-@@ -192,6 +195,19 @@
+@@ -193,6 +196,19 @@
    return (push_index != pop_index);
  }
  
@@ -70,7 +70,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* Return the amount of space available in the buffer for stuffing
     characters. */
  static int
-@@ -331,6 +347,7 @@
+@@ -350,6 +366,7 @@
  
    if (result != -1)
      {
@@ -78,7 +78,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
        while (chars_avail--)
  	{
  	  RL_CHECK_SIGNALS ();
-@@ -340,6 +357,7 @@
+@@ -359,6 +376,7 @@
  	  if (k == NEWLINE || k == RETURN)
  	    break;
  	}
@@ -86,7 +86,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
      }
    else
      {
-@@ -759,12 +777,16 @@
+@@ -787,12 +805,16 @@
      {
        c = rl_pending_input;	/* XXX - cast to unsigned char if > 0? */
        rl_clear_pending_input ();
@@ -104,7 +104,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  
        /* If the user has an event function, then call it periodically. */
        if (rl_event_hook)
-@@ -786,13 +808,25 @@
+@@ -814,13 +836,25 @@
  	      RL_CHECK_SIGNALS ();
  	      if (rl_done)		/* XXX - experimental */
  		return ('\n');
@@ -131,7 +131,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
  	  RL_CHECK_SIGNALS ();
  	}
-@@ -809,10 +843,22 @@
+@@ -837,10 +871,22 @@
    int fd;
  #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
    sigset_t empty_set;
@@ -154,8 +154,8 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +    return (KR_RL_CANCEL);
    while (1)
      {
-       RL_CHECK_SIGNALS ();
-@@ -828,16 +874,38 @@
+       osig = _rl_caught_signal;
+@@ -870,16 +916,38 @@
        /* At this point, if we have pselect, we're using select/pselect for the
  	 timeouts. We handled MinGW above. */
        FD_ZERO (&readfds);
@@ -236,7 +236,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  
  #if defined (COLOR_SUPPORT)
  #  include "parse-colors.h"
-@@ -627,6 +630,34 @@
+@@ -642,6 +645,34 @@
  	  RL_SETSTATE(RL_STATE_EOF);
  	  eof_found = 1;
  	  break;
@@ -271,7 +271,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  #endif
  	}
  
-@@ -730,7 +761,10 @@
+@@ -746,7 +777,10 @@
  readline_internal (void)
  {
    readline_internal_setup ();
