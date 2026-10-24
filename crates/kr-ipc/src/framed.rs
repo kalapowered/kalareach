@@ -1059,8 +1059,10 @@ mod tests {
 
     /// A check that refuses after a wait for room, with the peer holding part of the frame, cuts it:
     /// the writer fills a socket the peer does not read, the permission lapses while it waits, the
-    /// peer then reads, and the attempt that follows the wait asks the check again, is refused, and
-    /// writes nothing more. The control is the attempt before the wait, which the check allowed.
+    /// peer then reads, and the write, which asks the check again before the attempt that follows
+    /// the wait, is refused and writes nothing more. The write is the checked write as a caller
+    /// makes it, so the wait and the attempt after it are its own. The control is the attempt before
+    /// the wait, which the check allowed.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_check_that_refuses_after_a_wait_for_room_cuts_the_frame() {
@@ -1102,31 +1104,36 @@ mod tests {
             asked.fetch_add(1, Ordering::SeqCst);
             allowed.load(Ordering::SeqCst)
         };
-        let first = writer
-            .begin_frame_checked(&frame, &mut check)
-            .expect("the peer is there");
-        assert_eq!(
-            first,
-            CheckedWrite::Blocked,
+        let mut writing = Box::pin(writer.write_frame_while(&frame, &mut check));
+        // Polled once by hand, the write goes on until it has to wait, and the test task is the only
+        // one that polls it. With a peer that reads nothing it waits for room, and a poll that
+        // returns pending means it is in that wait.
+        let first = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(writing.as_mut(), context))
+        })
+        .await;
+        assert!(
+            first.is_pending(),
             "the control: a peer that reads nothing leaves the frame waiting for room, with part of \
              it sent"
         );
-        assert!(writer.has_sent_any());
+        assert!(
+            asked.load(Ordering::SeqCst) >= 2,
+            "the check allowed a piece, and was asked again before the next"
+        );
 
         allowed.store(false, Ordering::SeqCst);
         let before = asked.load(Ordering::SeqCst);
         read_now.send(()).expect("the peer waits");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            writer.writable().ready(),
-        )
-        .await
-        .expect("the peer's reading opens room")
-        .expect("the peer is there");
-        let second = writer
-            .resume_frame_checked(&mut check)
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), writing)
+            .await
+            .expect("the wait for room ends once the peer reads")
             .expect("the peer is there");
-        assert_eq!(second, CheckedWrite::Refused);
+        assert_eq!(
+            outcome,
+            FrameWhile::Cut,
+            "the check was asked after the wait, and refused"
+        );
         assert!(
             asked.load(Ordering::SeqCst) > before,
             "the check was asked after the wait"
