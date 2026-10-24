@@ -239,6 +239,17 @@ impl From<String> for Stop {
 pub type PushFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, String>> + Send + 'a>>;
 
+/// Why a change made over the line to a host did not happen, in words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LineStop {
+    /// This phone stopped itself before it asked the host, or after it was answered: the words are
+    /// its own, and the host refused nothing.
+    Phone(String),
+    /// The host refused the change, did not answer it, or answered with what this phone does not
+    /// read.
+    Host(String),
+}
+
 /// What only the platform can say or do about notifications.
 ///
 /// The product's is the plugin ([`companion_platform::notify`]); a test gives its own.
@@ -287,6 +298,10 @@ pub trait Registrar: Send + Sync {
     ) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
 }
 
+/// A boxed future for a change made over the line.
+pub type LineFuture<'a, T> =
+    Pin<Box<dyn Future<Output = std::result::Result<T, LineStop>> + Send + 'a>>;
+
 /// An open connection to a host, and the two changes the phone makes there. The desk asks whether
 /// its run is still wanted before it makes the connection and before each change, so a host the
 /// person forgot meanwhile is sent nothing.
@@ -295,7 +310,7 @@ pub trait HostLine: Send {
     fn register(
         &mut self,
         params: DevicePushRegisterParams,
-    ) -> PushFuture<'_, DevicePushRegisterResult>;
+    ) -> LineFuture<'_, DevicePushRegisterResult>;
     /// Sends `device.preview_key.update`, which says which preview key this phone holds and at
     /// which revision. When the host answers, the line records the revision, since a connection
     /// offers the revision the host holds and is refused at another.
@@ -307,7 +322,7 @@ pub trait HostLine: Send {
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
         revision: DeviceKeyRevision,
-    ) -> PushFuture<'_, ()>;
+    ) -> LineFuture<'_, ()>;
 }
 
 /// How the gateway at an origin is reached.
@@ -1103,11 +1118,15 @@ impl PushDesk {
         // sent nothing until the run is asked about again: before the connection, after it, and
         // before each of the two changes.
         let wanted = || self.wanted(host.host_device_id, run);
-        let not_taken = |words: String| -> Stop {
-            if wanted() {
-                format!("The host did not take this phone as a destination: {words}").into()
-            } else {
-                forgotten_host()
+        let not_taken = |stop: LineStop| -> Stop {
+            if !wanted() {
+                return forgotten_host();
+            }
+            match stop {
+                LineStop::Phone(words) => words.into(),
+                LineStop::Host(words) => {
+                    format!("The host did not take this phone as a destination: {words}").into()
+                }
             }
         };
         if !wanted() {
@@ -1117,7 +1136,7 @@ impl PushDesk {
             .registrar
             .connect(host, reach)
             .await
-            .map_err(not_taken)?;
+            .map_err(|words| not_taken(LineStop::Host(words)))?;
         if !wanted() {
             return Err(forgotten_host());
         }
@@ -1657,9 +1676,9 @@ impl ConnectionLine {
     /// Fails, in the words of why, when the account the connection was opened under has signed out
     /// or been replaced: a change made to a host under the lease of an account that has left is
     /// made for no one.
-    fn still_the_account(&self) -> std::result::Result<(), String> {
+    fn still_the_account(&self) -> std::result::Result<(), LineStop> {
         match self.connection.ended_by_this_device() {
-            Some(refusal) => Err(refusal.message),
+            Some(refusal) => Err(LineStop::Phone(refusal.message)),
             None => Ok(()),
         }
     }
@@ -1669,7 +1688,7 @@ impl HostLine for ConnectionLine {
     fn register(
         &mut self,
         params: DevicePushRegisterParams,
-    ) -> PushFuture<'_, DevicePushRegisterResult> {
+    ) -> LineFuture<'_, DevicePushRegisterResult> {
         Box::pin(async move {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
@@ -1689,14 +1708,15 @@ impl HostLine for ConnectionLine {
                     .await
                     .map_err(|error| CommandError::from(error).message)
             })
-            .await?;
+            .await
+            .map_err(LineStop::Host)?;
             match settled {
-                kr_client::Settled::Result(value) => value
-                    .to_typed()
-                    .map_err(|_| "its answer was not one this phone reads".to_owned()),
-                kr_client::Settled::Receipt(_) => {
-                    Err("it did not say it had taken the registration".to_owned())
-                }
+                kr_client::Settled::Result(value) => value.to_typed().map_err(|_| {
+                    LineStop::Host("its answer was not one this phone reads".to_owned())
+                }),
+                kr_client::Settled::Receipt(_) => Err(LineStop::Host(
+                    "it did not say it had taken the registration".to_owned(),
+                )),
             }
         })
     }
@@ -1705,7 +1725,7 @@ impl HostLine for ConnectionLine {
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
         revision: DeviceKeyRevision,
-    ) -> PushFuture<'_, ()> {
+    ) -> LineFuture<'_, ()> {
         Box::pin(async move {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
@@ -1736,13 +1756,18 @@ impl HostLine for ConnectionLine {
                     .map(|_| ())
                     .map_err(|error| CommandError::from(error).message)
             })
-            .await?;
+            .await
+            .map_err(LineStop::Host)?;
             // The host holds the revision now, and the next connection has to offer it.
             self.device
                 .pairing()
                 .hosts
                 .raise_revision(self.host_device_id, self.device_id, revision)
-                .map_err(|_| "this phone could not keep the revision the host took".to_owned())
+                .map_err(|_| {
+                    LineStop::Phone(
+                        "this phone could not keep the revision the host took".to_owned(),
+                    )
+                })
         })
     }
 }
