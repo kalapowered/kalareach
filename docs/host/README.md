@@ -6619,10 +6619,12 @@ a push registration that waited for the gateway is among them. An answer decided
 rose is written as the refusal, whether it waits for the writer or has only been decided, and an
 answer being written when the refusal rises ends with the connection. A device's close, and a read
 or raw input that waited for the link to the session's worker, for its write half or for room in its
-socket, are refused before the first byte of the frame goes. Four things remain. A frame the worker
-has part of when the refusal rises is finished, and a mutation already forwarded runs for what is
-left of its dispatch lease, five seconds at most. A voice call a device started is not ended, as a
-revocation ends it, and runs to its deadline. An owner confirmation that a remote owner device
+socket, are refused before the first byte of the frame goes. A frame the worker has part of when
+the refusal rises is not finished: the rest is not written and the link to the worker ends, so that
+the worker reads a frame that stops short and acts on nothing of it, and the call is refused. Three
+things remain. A mutation already forwarded runs for what is left of its dispatch lease, five
+seconds at most. A voice call a device started is not ended, as a revocation ends it, and runs to
+its deadline. An owner confirmation that a remote owner device
 signed, spent at the machine after the refusal rose, is spent under the standing the signer had. The
 refusal a removed feed puts on the grants that rest on it applies by kind of grant and stays with
 the policy's epoch, so work admitted before the removal is not held to it. The owner at the machine
