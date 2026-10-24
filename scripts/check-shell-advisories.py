@@ -828,20 +828,23 @@ def run_self_test():
         expect("the control passes", not problems, "; ".join(problems))
         needing = [item["id"] for item in findings if item["needs_row"]]
         for identifier in (
-            "GHSA-r9hj-j2rw-4q3m", "RUSTSEC-2026-0204", "RUSTSEC-2026-0253", "v7.6.7", "zsh-5.9.2", "bash-5.3",
+            "GHSA-r9hj-j2rw-4q3m", "RUSTSEC-2026-0204", "RUSTSEC-2026-0253", "v7.6.8", "zsh-5.9.2", "bash-5.3",
             "bash53-020",
         ):
             expect("the control reads " + identifier, identifier in needing, str(needing))
+        # The releases at the module's bound are the ones it accepts, and only a release above one needs a row.
+        expect("a release at the bound needs no row", not {"v7.4.21", "v7.5.12", "v7.6.7"} & set(needing), str(needing))
 
-        # Each mutation takes away a row the recorded data needs, and the check names the change.
+        # Each mutation takes away a row the recorded data needs, and the check names the change. It is read
+        # on a day after every triage allowance has passed, since v7.6.8 (2026-10-22) is still inside its own on the day the recorded sources were taken.
         for needle, name in (
             ("GHSA-r9hj-j2rw-4q3m", "PCRE2 JIT stack row"),
             ("RUSTSEC-2026-0253", "RustSec row"),
-            ("v7.6.7", "PowerShell release row"),
+            ("v7.6.8", "PowerShell release row"),
             ("zsh-5.9.2", "zsh tag row"),
             ("bash-5.3", "bash release row"),
         ):
-            outcome = attempt(routes(), text=without(needle))
+            outcome = attempt(routes(), now="2026-11-02", text=without(needle))
             expect("without the " + name, says(outcome, "no triage row"), str(outcome))
 
         # A row that is still scheduled after its target.

@@ -19,6 +19,13 @@
         "id": "CVE-2026-62801",
         "url": "https://github.com/PowerShell/Announcements/issues/98",
         "first_fixed": { "7.4": "7.4.20", "7.5": "7.5.11", "7.6": "7.6.6" }
+      },
+      {
+        "id": "CVE-2026-96225",
+        "url": "https://github.com/dotnet/announcements/issues/476",
+        "platforms": ["linux", "macos"],
+        "first_fixed": { "7.4": "7.4.21", "7.5": "7.5.12", "7.6": "7.6.7" },
+        "runtime_first_fixed": { "8.0": "8.0.32", "9.0": "9.0.21", "10.0": "10.0.13", "11.0": "11.0.0-rc.2" }
       }
     ],
     "psreadline_from": "2.3.4",

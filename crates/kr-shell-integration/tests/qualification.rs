@@ -3626,6 +3626,95 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
         );
     }
 
+    // The .NET runtime, on a platform, and the advisory and the first fixed runtime it names, or
+    // nothing. A runtime is judged whatever PowerShell release carries it, so a preview built on
+    // .NET 11 and a framework-dependent host on an old shared runtime are named as well.
+    type RuntimeCase = (
+        &'static str,
+        &'static str,
+        Option<(&'static str, &'static str)>,
+    );
+    let runtimes: [RuntimeCase; 15] = [
+        ("8.0.31", "linux", Some(("CVE-2026-96225", "8.0.32"))),
+        ("8.0.32", "linux", None),
+        ("9.0.20", "macos", Some(("CVE-2026-96225", "9.0.21"))),
+        ("9.0.21", "macos", None),
+        ("10.0.12", "linux", Some(("CVE-2026-96225", "10.0.13"))),
+        ("10.0.13", "linux", None),
+        ("10.0.14", "macos", None),
+        (
+            "11.0.0-rc.1.26425.128",
+            "linux",
+            Some(("CVE-2026-96225", "11.0.0-rc.2")),
+        ),
+        ("11.0.0-rc.2", "linux", None),
+        ("11.0.0", "macos", None),
+        ("8.0.31", "windows", None),
+        ("10.0.12", "windows", None),
+        ("6.0.36", "linux", None),
+        ("12.0.0-preview.1", "linux", None),
+        ("8.0.0", "macos", Some(("CVE-2026-96225", "8.0.32"))),
+    ];
+    let pairs = runtimes
+        .iter()
+        .map(|(runtime, platform, _)| format!("@('{runtime}','{platform}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let described = [
+        (".NET 10.0.13", "10.0.13"),
+        (".NET 11.0.0-rc.1.26425.128", "11.0.0-rc.1.26425.128"),
+        (".NET Framework 4.8", ""),
+        ("", ""),
+    ];
+    let texts = described
+        .iter()
+        .map(|(text, _)| format!("'{text}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         & (Get-Module KalaReach.ShellBridge) {{ \
+           foreach ($p in @({pairs})) {{ \
+             $r = Test-KrRuntimeRelease ([System.Management.Automation.SemanticVersion]$p[0]) $p[1]; \
+             if ($r) {{ Write-Output \"kr-runtime=[$($p[0])|$($p[1])|$($r.Id)|$($r.FirstFixed)]\" }} \
+             else {{ Write-Output \"kr-runtime=[$($p[0])|$($p[1])||]\" }} }}; \
+           foreach ($t in @({texts})) {{ \
+             Write-Output \"kr-described=[$t|$(ConvertFrom-KrFrameworkDescription $t)]\" }} }}"
+    );
+    let asked = std::process::Command::new(&package.executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    for (runtime, platform, expected) in runtimes {
+        let prefix = format!("kr-runtime=[{runtime}|{platform}|");
+        let line = said
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the module said nothing of .NET {runtime} on {platform}:\n{said}\n{}",
+                    String::from_utf8_lossy(&asked.stderr)
+                )
+            });
+        let found = line.trim_start_matches(&prefix).trim_end_matches(']');
+        let wanted = expected.map_or_else(
+            || "|".to_owned(),
+            |(advisory, fixed)| format!("{advisory}|{fixed}"),
+        );
+        assert_eq!(
+            found, wanted,
+            ".NET {runtime} on {platform}: the advisory and the first fixed runtime the module names"
+        );
+    }
+    for (text, version) in described {
+        assert!(
+            said.lines()
+                .any(|line| line == format!("kr-described=[{text}|{version}]")),
+            "the module read {text:?} as something other than {version:?}:\n{said}"
+        );
+    }
+
     // The list the package publishes is the one the manifest pins.
     let record: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(directory.join("kr-shell-identity.json")).expect("the record"),

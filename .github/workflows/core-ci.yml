@@ -1394,8 +1394,8 @@ jobs:
       # The release is pinned by version and checked against the digest its release notes publish.
       - name: Install the pinned PowerShell
         env:
-          POWERSHELL_VERSION: "7.6.6"
-          POWERSHELL_SHA256: "ddbc4a2d113bbd46d283cfedcbcd117a70caefd7673f41f2b4e0000badf103bc"
+          POWERSHELL_VERSION: "7.6.7"
+          POWERSHELL_SHA256: "6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431"
         run: |
           set -euo pipefail
           archive="powershell-$POWERSHELL_VERSION-linux-x64.tar.gz"
