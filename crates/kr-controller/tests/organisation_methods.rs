@@ -77,6 +77,7 @@ fn paired_host(host: &Host) -> PairedHost {
         proposed_grant: kr_pairing::grants::personal_owner_grant(),
         name: Some("studio".to_owned()),
         paired_at_ms: owner.paired_at_ms.get(),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
     }
 }
 

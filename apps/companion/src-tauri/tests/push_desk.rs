@@ -35,6 +35,7 @@ use kr_client::services::ServiceFuture;
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore, load_notification_preview_key};
+use kr_protocol::ids::DeviceKeyRevision;
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::push::{DevicePushRegisterParams, DevicePushRegisterResult};
 use kr_protocol::rights::ActionRight;
@@ -365,6 +366,7 @@ impl HostLine for Line {
     fn update_preview_key(
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        _revision: DeviceKeyRevision,
     ) -> PushFuture<'_, ()> {
         Box::pin(async move {
             self.script
@@ -2078,8 +2080,9 @@ impl HostLine for WatchedLine<'_> {
     fn update_preview_key(
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        revision: DeviceKeyRevision,
     ) -> PushFuture<'_, ()> {
-        self.real.update_preview_key(preview_key)
+        self.real.update_preview_key(preview_key, revision)
     }
 }
 
@@ -2111,6 +2114,101 @@ async fn answers(connection: &companion_tauri::connection::Connection) -> bool {
     .await
     .expect("the host answers or the connection ends");
     read.is_ok()
+}
+
+/// The host takes this phone's preview key at `revision` over the product's own line, as a
+/// rotation would send it.
+async fn the_host_takes_revision(phone: &Desk, host: &PairedHost, revision: u64) {
+    let registrar = ConnectionRegistrar(Arc::clone(&phone.device));
+    let mut line = registrar
+        .connect(host, Reach::Asked)
+        .await
+        .expect("the line to the host");
+    let key = *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+        .expect("a key")
+        .public();
+    line.update_preview_key(key, DeviceKeyRevision::new(revision))
+        .await
+        .expect("the host takes the revision");
+}
+
+/// A phone whose host took a higher revision of its preview key is not refused at its next
+/// connection: every way of connecting offers the revision the records hold, read at that
+/// connection and not taken from a copy of the host's record made before the update. The copies
+/// are the ones that outlive an update: the loop that keeps the host in use, the second connection
+/// a connection opens from itself, and a connection opened from a record made earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phone_whose_host_took_a_higher_revision_is_not_refused_at_its_next_connection() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk_over_the_product_registrar(&[&host], &owner).await;
+    let before = phone
+        .device
+        .host_by_reference(&phone.references()[0])
+        .expect("the paired host");
+    let opened_before = companion_tauri::connection::Connection::paired(&phone.device, &before)
+        .await
+        .expect("connected at the first revision");
+    assert!(answers(&opened_before).await);
+
+    the_host_takes_revision(&phone, &before, 2).await;
+
+    let held = phone
+        .device
+        .pairing()
+        .hosts
+        .by_device(before.host_device_id)
+        .expect("readable")
+        .expect("the host");
+    assert_eq!(held.device_key_revision.get(), 2, "the phone kept it");
+    let from_the_old_copy = companion_tauri::connection::Connection::paired(&phone.device, &before)
+        .await
+        .expect("a connection made from a record made before the update is not refused");
+    assert!(answers(&from_the_old_copy).await);
+    let from_itself = opened_before
+        .another()
+        .await
+        .expect("the connection opened before the update opens another");
+    assert!(answers(&from_itself).await);
+}
+
+/// The same key at the revision the host holds is answered as recorded and moves nothing; a
+/// revision behind the host's is refused, and the phone's record does not go back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_the_host_already_holds_is_recorded_once_and_one_behind_it_is_refused() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk_over_the_product_registrar(&[&host], &owner).await;
+    let paired = phone
+        .device
+        .host_by_reference(&phone.references()[0])
+        .expect("the paired host");
+    the_host_takes_revision(&phone, &paired, 2).await;
+
+    let current = paired.clone();
+    let registrar = ConnectionRegistrar(Arc::clone(&phone.device));
+    let mut line = registrar
+        .connect(&current, Reach::Asked)
+        .await
+        .expect("the line, offering the revision the host holds");
+    let key = *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+        .expect("a key")
+        .public();
+    line.update_preview_key(key, DeviceKeyRevision::new(1))
+        .await
+        .expect_err("a revision behind the host's is refused");
+    let held = || {
+        phone
+            .device
+            .pairing()
+            .hosts
+            .by_device(paired.host_device_id)
+            .expect("readable")
+            .expect("the host")
+            .device_key_revision
+            .get()
+    };
+    assert_eq!(held(), 2, "the phone's record does not go back");
 }
 
 /// A visit to another host on the relay a run is using cannot close the endpoint the run holds,

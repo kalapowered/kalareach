@@ -1672,6 +1672,7 @@ mod tests {
             proposed_grant: grant(&[ActionRight::HostManage], GrantExpiry::Never),
             name: Some("studio".to_owned()),
             paired_at_ms: NOW,
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
         }
     }
 
@@ -2892,6 +2893,7 @@ mod tests {
             proposed_grant: grant(&[ActionRight::HostManage], GrantExpiry::Never),
             name: Some("studio".to_owned()),
             paired_at_ms: NOW,
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
         };
         let request = OwnerConfirmationRequest {
             confirmation_id: ConfirmationId::new(Uuid::from_bytes([4; 16])),
