@@ -27,7 +27,8 @@ use companion_platform::notify::Permission;
 use companion_platform::push::{PendingRegistration, PendingState};
 use companion_tauri::device::Device;
 use companion_tauri::push::{
-    HostLine, Native, PushDesk, PushFuture, PushState, PushView, Registrar, Wiring,
+    ConnectionRegistrar, HostLine, Native, PushDesk, PushFuture, PushState, PushView, Reach,
+    Registrar, Wiring,
 };
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::ServiceFuture;
@@ -261,6 +262,8 @@ impl Native for Receiver {
 struct Registered {
     /// The hosts the phone opened a connection to.
     connected: Vec<kr_protocol::ids::DeviceId>,
+    /// How each run reached its host, in the order the runs asked.
+    reaches: Vec<Reach>,
     /// The host, and the sender record the credential it was handed is for.
     credentials: Vec<(kr_protocol::ids::DeviceId, Value)>,
     /// The host, and the preview key it was told of.
@@ -289,13 +292,17 @@ async fn while_held(script: &Mutex<Registered>, held: impl Fn(&Registered) -> bo
 struct HostLink(Arc<Mutex<Registered>>);
 
 impl Registrar for HostLink {
-    fn connect<'a>(&'a self, host: &'a PairedHost) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
+    fn connect<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        reach: Reach,
+    ) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
         Box::pin(async move {
-            self.0
-                .lock()
-                .expect("what was handed")
-                .connected
-                .push(host.host_device_id);
+            {
+                let mut script = self.0.lock().expect("what was handed");
+                script.reaches.push(reach);
+                script.connected.push(host.host_device_id);
+            }
             while_held(&self.0, |script| script.hold_connection).await;
             Ok(Box::new(Line {
                 script: Arc::clone(&self.0),
@@ -547,6 +554,20 @@ async fn look(desk: &Arc<PushDesk>) {
 }
 
 async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> Desk {
+    desk_reaching(hosts, owner, receiver, |_, script| {
+        Arc::new(HostLink(Arc::clone(script))) as Arc<dyn Registrar>
+    })
+    .await
+}
+
+/// A desk over a phone paired with `hosts`, whose registrar `registrar` makes from the phone's
+/// device and the script it records into.
+async fn desk_reaching(
+    hosts: &[&Host],
+    owner: &DeviceKeys,
+    receiver: Arc<Receiver>,
+    registrar: impl FnOnce(&Arc<Device>, &Arc<Mutex<Registered>>) -> Arc<dyn Registrar>,
+) -> Desk {
     let phone = phone_paired_with(hosts[0], owner, &[ActionRight::SessionView]).await;
     for other in &hosts[1..] {
         pair(&phone, other, owner, &[ActionRight::SessionView]).await;
@@ -554,11 +575,11 @@ async fn desk(hosts: &[&Host], owner: &DeviceKeys, receiver: Arc<Receiver>) -> D
     let device = phone.companion.device();
     let registered = Arc::new(Mutex::new(Registered::default()));
     let ends = Arc::new(AtomicBool::new(false));
-    let opened = open_over(
+    let opened = open_with(
         phone.data.path(),
         &device,
         &receiver,
-        &registered,
+        registrar(&device, &registered),
         Arc::clone(&ends),
     );
     Desk {
@@ -596,6 +617,22 @@ fn open_over(
     registered: &Arc<Mutex<Registered>>,
     ends: Arc<AtomicBool>,
 ) -> Opened {
+    open_with(
+        data,
+        device,
+        receiver,
+        Arc::new(HostLink(Arc::clone(registered))),
+        ends,
+    )
+}
+
+fn open_with(
+    data: &Path,
+    device: &Arc<Device>,
+    receiver: &Arc<Receiver>,
+    registrar: Arc<dyn Registrar>,
+    ends: Arc<AtomicBool>,
+) -> Opened {
     let gateway = Gateway::new();
     let http = Arc::clone(&gateway);
     let clock_ahead_ms = Arc::new(AtomicU64::new(0));
@@ -604,7 +641,7 @@ fn open_over(
         data,
         Arc::clone(device),
         Arc::clone(receiver) as Arc<dyn Native>,
-        Arc::new(HostLink(Arc::clone(registered))),
+        registrar,
         Wiring {
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
@@ -1910,4 +1947,244 @@ async fn a_record_that_could_not_be_set_aside_is_not_written_over() {
         "nothing was written over it"
     );
     assert!(set_aside(data).is_empty());
+}
+
+/// A run the person starts reaches its host as asked, and one a look starts reaches it as a visit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_reaches_its_host_as_the_person_asked_and_a_look_as_a_visit() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+
+    phone.receiver.token_is(SECOND_TOKEN);
+    look(&phone.desk).await;
+    eventually("the look's run registered the new token", || {
+        proposed(&phone.gateway) == [FIRST_TOKEN, SECOND_TOKEN]
+    })
+    .await;
+    phone.until(|states| states == [PushState::On]).await;
+    eventually("both runs ended", || Arc::strong_count(&phone.desk) == 1).await;
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked, Reach::Visit]
+    );
+}
+
+/// The relay two hosts share, and the services that tell their endpoints apart.
+const SHARED_RELAY: &str = "https://relay.push.test";
+
+/// A host on `SHARED_RELAY` that resolves through the resolver at `port`.
+async fn on_the_shared_relay(owner: &DeviceKeys, port: u16) -> Host {
+    Host::start_with_endpoint(
+        owner,
+        support::on_relay(SHARED_RELAY, &format!("http://127.0.0.1:{port}/pkarr")),
+    )
+    .await
+}
+
+/// The product's registrar, with a test's hand on the connection it opens: it records how each run
+/// reached its host and holds the line open, endpoint hold and all, until the test lets it go.
+struct Watched {
+    real: ConnectionRegistrar,
+    script: Arc<Mutex<Registered>>,
+}
+
+impl Registrar for Watched {
+    fn connect<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        reach: Reach,
+    ) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
+        Box::pin(async move {
+            self.script
+                .lock()
+                .expect("what was sent")
+                .reaches
+                .push(reach);
+            let line = self.real.connect(host, reach).await?;
+            self.script
+                .lock()
+                .expect("what was sent")
+                .connected
+                .push(host.host_device_id);
+            while_held(&self.script, |script| script.hold_connection).await;
+            Ok(line)
+        })
+    }
+}
+
+/// A desk over the product's registrar, for a phone paired with `hosts` in the order given.
+async fn desk_over_the_product_registrar(hosts: &[&Host], owner: &DeviceKeys) -> Desk {
+    desk_reaching(
+        hosts,
+        owner,
+        Receiver::new(FIRST_TOKEN),
+        |device, script| {
+            Arc::new(Watched {
+                real: ConnectionRegistrar(Arc::clone(device)),
+                script: Arc::clone(script),
+            }) as Arc<dyn Registrar>
+        },
+    )
+    .await
+}
+
+/// Whether a host answers over a connection to it, which it does only while the endpoint the
+/// connection was made through is open.
+async fn answers(connection: &companion_tauri::connection::Connection) -> bool {
+    let read: Result<kr_protocol::hostinfo::HostInfoResult, _> = tokio::time::timeout(
+        WATCHDOG,
+        connection
+            .session()
+            .read(kr_protocol::method::Method::HostInfo, &json!({})),
+    )
+    .await
+    .expect("the host answers or the connection ends");
+    read.is_ok()
+}
+
+/// A visit to another host on the relay a run is using cannot close the endpoint the run holds,
+/// whether the person started the run or a look did: the host in use is on no relay, the run's
+/// host and the visited host share one and differ in the services the endpoint uses, so reaching
+/// either closes the endpoint the other was reached through unless it is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_beside_a_run_cannot_close_the_endpoint_the_run_holds() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let in_use = Host::start(&owner).await;
+    let running = on_the_shared_relay(&owner, 9).await;
+    let visited = on_the_shared_relay(&owner, 10).await;
+    let phone = desk_over_the_product_registrar(&[&in_use, &running, &visited], &owner).await;
+    let references = phone.references();
+    let host = |number: usize| {
+        phone
+            .device
+            .host_by_reference(&references[number])
+            .expect("a paired host")
+    };
+    phone
+        .device
+        .use_host(host(0).host_device_id)
+        .expect("the host in use");
+    let visited_host = host(2);
+    let holding = |held: bool| {
+        phone
+            .registered
+            .lock()
+            .expect("what was sent")
+            .hold_connection = held;
+    };
+    let connections = || {
+        phone
+            .registered
+            .lock()
+            .expect("what was sent")
+            .connected
+            .len()
+    };
+
+    // The person asks, and the run is held with its connection open.
+    holding(true);
+    phone.desk.enable(&references[1]).expect("the person asks");
+    eventually("the run connected", || connections() == 1).await;
+    assert!(
+        companion_tauri::connection::Connection::visited(&phone.device, &visited_host)
+            .await
+            .is_err(),
+        "a visit closed the endpoint a run asked for holds"
+    );
+    holding(false);
+    eventually("the run ended", || Arc::strong_count(&phone.desk) == 1).await;
+
+    // A look starts the run, and the same holds.
+    phone.receiver.token_is(SECOND_TOKEN);
+    phone.let_time_pass();
+    holding(true);
+    look(&phone.desk).await;
+    eventually("the look's run connected", || connections() == 2).await;
+    assert!(
+        companion_tauri::connection::Connection::visited(&phone.device, &visited_host)
+            .await
+            .is_err(),
+        "a visit closed the endpoint a run a look started holds"
+    );
+    holding(false);
+    eventually("the run ended", || Arc::strong_count(&phone.desk) == 1).await;
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked, Reach::Visit]
+    );
+}
+
+/// A run a look starts for a host that is not in use never closes the endpoint the host in use is
+/// reached through, though the two hosts share a relay and differ in the services their endpoints
+/// use: the host in use keeps answering. A run the person starts is the person's own choice and
+/// may take the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_never_cuts_off_the_host_in_use_for_a_host_beside_it() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let in_use = on_the_shared_relay(&owner, 9).await;
+    let beside = on_the_shared_relay(&owner, 10).await;
+    let phone = desk_over_the_product_registrar(&[&in_use, &beside], &owner).await;
+    let references = phone.references();
+    let host = |number: usize| {
+        phone
+            .device
+            .host_by_reference(&references[number])
+            .expect("a paired host")
+    };
+    phone
+        .device
+        .use_host(host(0).host_device_id)
+        .expect("the host in use");
+
+    // The person turns notifications on for the host beside the host in use.
+    phone.desk.enable(&references[1]).expect("the person asks");
+    eventually("the run ended", || {
+        phone
+            .registered
+            .lock()
+            .expect("what was sent")
+            .reaches
+            .len()
+            == 1
+            && Arc::strong_count(&phone.desk) == 1
+    })
+    .await;
+
+    // The host in use is connected, and a look finds the host beside it due.
+    let connection = companion_tauri::connection::Connection::paired(&phone.device, &host(0))
+        .await
+        .expect("the host in use");
+    assert!(answers(&connection).await, "the host in use answers");
+    phone.receiver.token_is(SECOND_TOKEN);
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    eventually("the look's run ended", || {
+        phone
+            .registered
+            .lock()
+            .expect("what was sent")
+            .reaches
+            .len()
+            == 2
+            && Arc::strong_count(&phone.desk) == 1
+    })
+    .await;
+
+    assert!(
+        answers(&connection).await,
+        "the run for the host beside it closed the endpoint the host in use is reached through"
+    );
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked, Reach::Visit]
+    );
+    assert_eq!(
+        phone.view().hosts[0].state,
+        PushState::NeedsAttention,
+        "the host beside it is left for the person"
+    );
 }
