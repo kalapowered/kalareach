@@ -144,8 +144,8 @@ expect(
   'nothing'
 )
 expect(
-  'an application missing the worker is named, not passed',
-  'partial.apk',
+  'an application missing only the preview worker is named, not passed',
+  'no-preview-worker.apk',
   zip([
     filler,
     { name: 'classes.dex', bytes: dex({ defined: [PRESENT[0], PRESENT[2], PRESENT[3]] }) }
