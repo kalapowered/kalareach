@@ -39,10 +39,11 @@ Two checks hold that second path:
 - `pnpm -C apps/companion android` reads back each package the build asked for, meaning the variant
   and the formats its own arguments name. It fails when one of them is not there, when the
   packager's record beside it belongs to another variant, or when the dex the application loads
-  does not define the two classes the system resolves by name: the messaging service, from the
-  manifest, and the background worker, from the request the receiver enqueues. Those two names
-  survive a shrinking build, which may rename or remove a class only other code reaches, and
-  neither exists unless the module compiled the tree.
+  does not define the four classes the system resolves by name: the messaging service, from the
+  manifest; the preview worker and the challenge worker, from the requests the receiver enqueues;
+  and the platform plugin, which Tauri instantiates by its class name. Those four names survive a
+  shrinking build, which may rename or remove a class only other code reaches, and none exists
+  unless the module that holds it compiled it.
 
 The application's merged manifest declares what the compiled code needs: the messaging service
 against `com.google.firebase.MESSAGING_EVENT`, unexported, and `POST_NOTIFICATIONS` from the

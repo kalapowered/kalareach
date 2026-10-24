@@ -508,10 +508,11 @@ jobs:
     strategy:
       fail-fast: false
       # Two runners, one definition, as the macos job has. They set up the same way and the daemon,
-      # the worker and the forwarder are built on both, which the suites find beside them; then the
-      # steps divide in the order they are written. `first` compiles the whole workspace and its
-      # tests and runs the steps down to the forwarder's tests; `second` runs the steps after them,
-      # the ARM64 compile and the documentation. A step that names neither is both's.
+      # the worker and the forwarder are built on both, which the suites find beside them; then
+      # each step's `if` names its leg. `first` compiles the whole workspace and its tests, runs
+      # the steps down to the forwarder's tests and builds the desktop application; `second` runs
+      # the steps after the forwarder's tests, the ARM64 compile and the documentation. A step that
+      # names neither is both's.
       matrix:
         include:
           - name: windows
