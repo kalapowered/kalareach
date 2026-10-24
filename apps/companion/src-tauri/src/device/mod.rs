@@ -43,7 +43,7 @@ use kr_protocol::pairing::RendezvousOrigin;
 use serde::Serialize;
 use tokio::sync::watch;
 
-pub use hosts::HostRow;
+pub use hosts::{Contact, HostRow};
 pub use identity::DeviceIdentity;
 
 use crate::error::{CommandError, Result};
@@ -173,7 +173,7 @@ pub struct Device {
     sources: Mutex<Sources>,
     running: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     progress: watch::Sender<AttemptState>,
-    contact: Mutex<BTreeMap<DeviceId, bool>>,
+    contact: Mutex<BTreeMap<DeviceId, Contact>>,
     /// The host this application's commands go to, remembered across runs in `use_file`.
     in_use: Mutex<Option<DeviceId>>,
     use_file: PathBuf,
@@ -432,10 +432,11 @@ impl Device {
             .iter()
             .rev()
             .map(|host| {
-                let in_contact = host
+                // A host this computer keeps watch on is out of contact until a look finds it is not.
+                let contact = host
                     .is_owner()
-                    .then(|| contact.get(&host.host_device_id).copied().unwrap_or(false));
-                HostRow::of(host, in_use == Some(host.host_device_id), in_contact)
+                    .then(|| contact.get(&host.host_device_id).unwrap_or(&Contact::Out));
+                HostRow::of(host, in_use == Some(host.host_device_id), contact)
             })
             .collect();
         PairingView {
@@ -573,10 +574,10 @@ impl Device {
             .collect()
     }
 
-    /// Records whether this computer is in contact with the host `host`.
-    pub fn set_contact(&self, host: DeviceId, in_contact: bool) {
-        let before = lock(&self.contact).insert(host, in_contact);
-        if before != Some(in_contact) {
+    /// Records how this computer found its contact with the host `host`.
+    pub fn set_contact(&self, host: DeviceId, found: Contact) {
+        let before = lock(&self.contact).insert(host, found.clone());
+        if before != Some(found) {
             (self.changed)();
         }
     }

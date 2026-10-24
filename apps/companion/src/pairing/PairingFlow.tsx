@@ -879,6 +879,11 @@ function PairedHosts({
                   ? 'Owner'
                   : `Can ${host.authority}${until(host.grant_expires_at_ms)}`}
               </p>
+              {host.refusal === undefined ? null : (
+                <p className="small" data-testid="host-refusal">
+                  {host.refusal}
+                </p>
+              )}
               {notifications === undefined ? null : (
                 <HostNotifications host={host} notifications={notifications} />
               )}
