@@ -1128,6 +1128,9 @@ impl PushDesk {
         line.update_preview_key(*keys.notification_preview.public())
             .await
             .map_err(not_taken)?;
+        // The line is not needed any more, and the hold on the host's endpoint goes with it: the
+        // filing of the key below does not use the connection.
+        drop(line);
 
         let name = kr_crypto::store::SecretName::device_key(
             crate::device::identity::SCOPE,
