@@ -1750,6 +1750,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The script that reads the package back is held to its answers first, on archives made for the
+      # purpose: a check that passes whatever it is given would be found by nothing else here.
+      - name: Check the class check
+        run: node apps/companion/scripts/android-classes-selftest.mjs
+
       # The package is built the way a person builds it, and the script reads it back: the classes
       # the system resolves by name, among them the Tauri plugin, and the application identifier in
       # the manifest, the code and the libraries.
