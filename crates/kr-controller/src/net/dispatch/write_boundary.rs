@@ -40,6 +40,8 @@ struct HeldStream {
     /// One permit each time a write starts to wait: for the writer, or for the peer.
     waits: tokio::sync::Semaphore,
     reached: std::sync::Mutex<Vec<Reached>>,
+    /// The frames that reached the peer whole.
+    frames: std::sync::Mutex<Vec<ControlFrame>>,
     closed: AtomicBool,
 }
 
@@ -50,8 +52,16 @@ impl HeldStream {
             room: peer_stops_reading.then(|| tokio::sync::Semaphore::new(0)),
             waits: tokio::sync::Semaphore::new(0),
             reached: std::sync::Mutex::new(Vec::new()),
+            frames: std::sync::Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
         })
+    }
+
+    fn frames(&self) -> Vec<ControlFrame> {
+        self.frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns once writes have started to wait `times` times, and fails the test when they
@@ -81,7 +91,7 @@ impl HeldStream {
 impl FrameSink for Arc<HeldStream> {
     fn send_while<'a>(
         &'a self,
-        _frame: &'a ControlFrame,
+        frame: &'a ControlFrame,
         admits: &'a (dyn Fn() -> bool + Send + Sync),
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
     {
@@ -106,6 +116,10 @@ impl FrameSink for Arc<HeldStream> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(Reached::Whole);
+            self.frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame.clone());
             Ok(true)
         })
     }
@@ -1171,6 +1185,128 @@ async fn an_answer_whose_lease_ran_out_is_answered_with_its_refusal() {
     }
 }
 
+/// What happens between the moment an answer is decided and the moment it is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Between {
+    /// Nothing.
+    Nothing,
+    /// The authority feed raises a refusal on every remote grant.
+    AFeedRefusal,
+    /// This host's policy changes in a way that touches nothing the answer stood on, which moves
+    /// the epoch.
+    AnUnrelatedPolicyChange,
+}
+
+/// KR-REQ-24.15: an answer decided before the authority feed raised a refusal on remote grants is
+/// answered with the refusal when it is written, and the connection stands: the refusal moves no
+/// revision, so nothing else would stop an answer decided under the standing the device had. The
+/// controls: with nothing between, and with a policy change that touches nothing the answer stood
+/// on, the answer itself goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_decided_before_a_feed_refusal_rose_is_answered_with_the_refusal() {
+    for between in [
+        Between::Nothing,
+        Between::AnUnrelatedPolicyChange,
+        Between::AFeedRefusal,
+    ] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (connection, recording) =
+            paired_connection(&controller, 63, &[ActionRight::SessionView]);
+        let answered = connection
+            .answer_now(ControlFrame::Request(listing(1)))
+            .await
+            .expect("an answer");
+        match between {
+            Between::Nothing => {}
+            Between::AFeedRefusal => controller.authority_feed_withdrawal_unverified(true).await,
+            Between::AnUnrelatedPolicyChange => controller.advance_authority_epoch(),
+        }
+        assert!(
+            connection.write_answer(answered).await,
+            "the connection stands ({between:?})"
+        );
+        let written = recording.frames();
+        assert_eq!(written.len(), 1, "one answer ({between:?})");
+        match &written[0] {
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(refusal),
+                ..
+            }) => {
+                assert_eq!(between, Between::AFeedRefusal, "refused: {refusal:?}");
+                assert_eq!(
+                    refusal.code,
+                    kr_protocol::error::ErrorCode::PermissionDenied
+                );
+            }
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            }) => assert_ne!(
+                between,
+                Between::AFeedRefusal,
+                "the listing went past the refusal"
+            ),
+            other => panic!("not an answer: {other:?}"),
+        }
+        drop(controller);
+    }
+}
+
+/// KR-REQ-24.15: an answer held at the writer when the authority feed raises a refusal on remote
+/// grants is not written when the writer comes free: nothing of it went, so the stream is whole and
+/// the device is written the refusal instead. With the epoch moved by a change that touches nothing
+/// the answer stood on, the answer itself goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_held_at_the_writer_is_not_written_once_a_feed_refusal_rises() {
+    for refused in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let connection = paired_connection_writing_to(
+            &controller,
+            64,
+            &[ActionRight::SessionView],
+            Box::new(Arc::clone(&stream)),
+        );
+        let answered = connection
+            .answer_now(ControlFrame::Request(listing(1)))
+            .await
+            .expect("an answer");
+        let (stands, ()) = tokio::join!(connection.write_answer(answered), async {
+            stream.waited(1).await;
+            if refused {
+                controller.authority_feed_withdrawal_unverified(true).await;
+            } else {
+                controller.advance_authority_epoch();
+            }
+            // The answer, and the refusal that replaces it when the answer is not written.
+            stream.writer.add_permits(2);
+        });
+        assert!(stands, "the connection stands");
+        let frames = stream.frames();
+        assert_eq!(frames.len(), 1, "one frame reached the peer: {frames:?}");
+        match &frames[0] {
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(refusal),
+                ..
+            }) => {
+                assert!(refused, "refused with nothing raised: {refusal:?}");
+                assert_eq!(
+                    refusal.code,
+                    kr_protocol::error::ErrorCode::PermissionDenied
+                );
+            }
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            }) => assert!(!refused, "the answer went past the refusal"),
+            other => panic!("not an answer: {other:?}"),
+        }
+        drop(controller);
+    }
+}
+
 /// A response decided under a lease that has ended is never written under a lease installed
 /// after that end, which is a new run of the device's lease and can grant less: installed after
 /// the end, a replacement that drops the right the response needed is not a narrowing the host
@@ -1317,6 +1453,19 @@ fn paired_connection(
     byte: u8,
     actions: &[ActionRight],
 ) -> (super::RemoteConnection, Arc<Recording>) {
+    let recording = Arc::new(Recording::default());
+    let connection =
+        paired_connection_writing_to(controller, byte, actions, Box::new(Arc::clone(&recording)));
+    (connection, recording)
+}
+
+/// As [`paired_connection`], writing to `sink`.
+fn paired_connection_writing_to(
+    controller: &Arc<Controller>,
+    byte: u8,
+    actions: &[ActionRight],
+    sink: Box<dyn FrameSink>,
+) -> super::RemoteConnection {
     let (mut grant, _) = super::super::tests::granted(
         kr_protocol::grant::GrantExpiry::Never,
         controller.policy().authority_revision(),
@@ -1326,13 +1475,7 @@ fn paired_connection(
     device.endpoint_id = kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]);
     device.authorisation = kr_protocol::scalars::AuthorisationKey::from_bytes([byte; 32]);
     controller.devices().commit(&device).expect("paired");
-    let recording = Arc::new(Recording::default());
-    let connection = super::RemoteConnection::for_test_writing_to(
-        controller,
-        device,
-        Box::new(Arc::clone(&recording)),
-    );
-    (connection, recording)
+    super::RemoteConnection::for_test_writing_to(controller, device, sink)
 }
 
 /// KR-REQ-26.43: a caller that is given no counts costs no worker a read. A diagnostics request of

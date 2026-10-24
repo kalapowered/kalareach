@@ -94,7 +94,7 @@ impl RemoteConnection {
             );
             match self
                 .output
-                .write(&shown, &asked.decision.bounds(), None)
+                .write_held(&shown, &asked.decision.bounds(), None, true)
                 .await
             {
                 Written::Sent => return true,
@@ -246,7 +246,11 @@ impl RemoteConnection {
             kr_protocol::grant::GrantExpiry::Never => None,
         };
         let mut until: Option<kr_transport::clock::ContinuousInstant> = None;
-        let mut passed = false;
+        // The refusal the authority feed puts on remote grants is a bound that has passed: a read
+        // or raw input that waited for the worker's link is forwarded after the wait, and the
+        // refusal moves no revision for the worker to find. Decided again, it is refused as the
+        // decision refuses.
+        let mut passed = self.controller.feed_refusal().is_some();
         let mut bound_by = |deadline: kr_transport::clock::ContinuousInstant| {
             passed |= now >= deadline;
             until = Some(until.map_or(deadline, |earliest| earliest.min(deadline)));

@@ -37,6 +37,13 @@ use crate::service::net::devices::DeviceRecord;
 /// holds it to that.
 pub const MANAGEMENT_PROBE: Method = Method::DeviceList;
 
+/// The bit of the refusal word that stands while this host is behind its feed.
+const BEHIND_ITS_FEED: u8 = 1;
+
+/// The bit of the refusal word that stands while the feed shows a withdrawal this host cannot
+/// verify.
+const WITHDRAWAL_UNVERIFIED: u8 = 2;
+
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
 
@@ -541,17 +548,17 @@ impl Controller {
     /// Returns an error when the registry cannot be read.
     pub(crate) async fn authority_feed_behind(&self, feed_revision: u64) -> Result<bool> {
         let registry = self.authority_revision().await?;
-        let mut policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if feed_revision > registry.get() && !policy.behind_its_feed() {
-            policy.set_behind_its_feed(true);
-            drop(policy);
-            self.advance_authority_epoch();
+        if feed_revision > registry.get() {
+            self.move_a_feed_refusal(
+                BEHIND_ITS_FEED,
+                true,
+                crate::grants::HostPolicy::behind_its_feed,
+                crate::grants::HostPolicy::set_behind_its_feed,
+            )
+            .await;
             return Ok(true);
         }
-        Ok(policy.behind_its_feed())
+        Ok(self.policy().behind_its_feed())
     }
 
     /// Carries out again a request the feed shows this host completed, for what the registry does
@@ -635,16 +642,101 @@ impl Controller {
 
     /// Records whether the feed shows complete a withdrawal this host cannot verify, and moves the
     /// authority epoch when that changes what a remote grant is decided to be.
-    pub(crate) fn authority_feed_withdrawal_unverified(&self, unverified: bool) {
+    pub(crate) async fn authority_feed_withdrawal_unverified(&self, unverified: bool) {
+        self.move_a_feed_refusal(
+            WITHDRAWAL_UNVERIFIED,
+            unverified,
+            crate::grants::HostPolicy::withdrawal_unverified,
+            crate::grants::HostPolicy::set_withdrawal_unverified,
+        )
+        .await;
+    }
+
+    /// Raises or lifts one of the two refusals the feed puts on every remote grant: the policy's
+    /// flag and the word that mirrors it change together, under the policy's lock, and the epoch
+    /// moves after.
+    ///
+    /// A raise first takes the registry's guard and then the connection table, the order a
+    /// withdrawal takes them in (registry, policy, table), so a write that holds either from its
+    /// check to its commit is wholly before the raise or wholly after it: nothing admitted before
+    /// the refusal rose completes under the standing it was admitted under. A lift needs no order.
+    /// Nothing is taken when the word already says what is asked.
+    async fn move_a_feed_refusal(
+        &self,
+        bit: u8,
+        raised: bool,
+        flag: fn(&crate::grants::HostPolicy) -> bool,
+        set: fn(&mut crate::grants::HostPolicy, bool),
+    ) {
+        let stands = |word: u8| word & bit != 0;
+        if stands(self.feed_refusal.load(std::sync::atomic::Ordering::SeqCst)) == raised {
+            return;
+        }
+        let registry = if raised {
+            Some(self.registry.lock().await)
+        } else {
+            None
+        };
         let mut policy = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if policy.withdrawal_unverified() != unverified {
-            policy.set_withdrawal_unverified(unverified);
-            drop(policy);
-            self.advance_authority_epoch();
+        if flag(&policy) == raised {
+            return;
         }
+        {
+            let _table = raised.then(|| self.admitted_table());
+            set(&mut policy, raised);
+            if raised {
+                self.feed_refusal
+                    .fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                self.feed_refusal
+                    .fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        drop(policy);
+        drop(registry);
+        self.advance_authority_epoch();
+    }
+
+    /// The refusal the authority feed puts on every remote grant now, if one stands.
+    ///
+    /// Work a remote connection had admitted before the refusal rose asks this where it commits:
+    /// the refusal takes a remote device's standing away whole, so what was admitted under the
+    /// standing it had does not complete under the one it has. The owner at this machine is never
+    /// refused, as the policy keeps it.
+    pub(crate) fn feed_refusal(&self) -> Option<crate::grants::Refusal> {
+        let word = self.feed_refusal.load(std::sync::atomic::Ordering::SeqCst);
+        if word & BEHIND_ITS_FEED != 0 {
+            Some(crate::grants::Refusal::BehindItsFeed)
+        } else if word & WITHDRAWAL_UNVERIFIED != 0 {
+            Some(crate::grants::Refusal::WithdrawalUnverified)
+        } else {
+            None
+        }
+    }
+
+    /// Refuses with the feed's refusal when one stands, for a remote path that commits after a
+    /// wait of its own and asks nothing of the registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ControllerError::PermissionDenied`] with the refusal's words.
+    pub(crate) fn refuse_while_the_feed_refuses(&self) -> Result<()> {
+        match self.feed_refusal() {
+            Some(refusal) => Err(crate::error::ControllerError::PermissionDenied {
+                detail: refusal.detail(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Raises the refusal a withdrawal this host cannot verify puts on remote grants, as a scan of
+    /// the feed does, for a suite that checks what a request admitted before it comes to.
+    #[cfg(feature = "testing")]
+    pub async fn raise_the_unverified_withdrawal_refusal(&self) {
+        self.authority_feed_withdrawal_unverified(true).await;
     }
 
     /// Raises the registry to the revision the feed holds, in one barrier, and then lets the host
@@ -658,15 +750,13 @@ impl Controller {
     pub(crate) async fn authority_feed_caught_up(&self, feed_revision: u64) -> Result<()> {
         self.catch_up_with_the_feed(AuthorityRevision::new(feed_revision))
             .await?;
-        let mut policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if policy.behind_its_feed() {
-            policy.set_behind_its_feed(false);
-            drop(policy);
-            self.advance_authority_epoch();
-        }
+        self.move_a_feed_refusal(
+            BEHIND_ITS_FEED,
+            false,
+            crate::grants::HostPolicy::behind_its_feed,
+            crate::grants::HostPolicy::set_behind_its_feed,
+        )
+        .await;
         Ok(())
     }
 
@@ -685,7 +775,7 @@ impl Controller {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
         // A feed that was removed shows nothing to compare, so it cannot keep a withdrawal unverified.
-        self.authority_feed_withdrawal_unverified(false);
+        self.authority_feed_withdrawal_unverified(false).await;
         {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);
