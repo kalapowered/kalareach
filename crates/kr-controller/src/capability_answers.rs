@@ -9,7 +9,7 @@
 //!
 //! The record holds an answer until the host lets go of it: it counts no age of its own. Forgetting
 //! is a decision about the clock, which every collection of this host takes through the one check
-//! in [`crate::service::Controller::forget_old_capability_answers`], and a row that is still here
+//! in `crate::service::Controller::forget_old_capability_answers`, and a row that is still here
 //! is the record of its action.
 //!
 //! The record is a database of its own, and not a table of the registry: the registry's schema is

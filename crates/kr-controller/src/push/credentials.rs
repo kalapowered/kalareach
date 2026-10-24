@@ -52,7 +52,7 @@
 //! # Asking again after a refusal
 //!
 //! A renewal the gateway refuses or does not answer is asked for again after a wait that doubles
-//! with each refusal ([`renewal_backoff_ms`]). A credential's expiry is the device's word, and one
+//! with each refusal (`renewal_backoff_ms`). A credential's expiry is the device's word, and one
 //! that says it is due when the gateway holds a longer life is refused at every ask: asked at
 //! every question tick, that costs the gateway's allowance for the host twenty-four requests an
 //! hour for as long as the credential lasts. The wait holds for a credential past its expiry too,

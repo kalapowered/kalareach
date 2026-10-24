@@ -1483,7 +1483,7 @@ struct InstallationRecord {
 pub const ACTION_RECORD_VERSION: u32 = 1;
 
 /// The shape of the installation record this build writes, recorded in it as `version`. A record
-/// that states none is one of two earlier shapes, which [`read_record`] converts.
+/// that states none is one of two earlier shapes, which `read_record` converts.
 pub const INSTALLATION_RECORD_VERSION: u32 = InstallationRecord::VERSION;
 
 impl InstallationRecord {

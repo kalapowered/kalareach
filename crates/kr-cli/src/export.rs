@@ -109,7 +109,7 @@ pub fn check_bound(max_bytes: u64) -> Result<()> {
 
 /// Reads one closed session's retained output and composes the export of it.
 ///
-/// Nothing is written: the file is made by [`write`] once this has passed.
+/// Nothing is written: the file is made by [`write()`] once this has passed.
 ///
 /// # Errors
 ///
@@ -346,7 +346,7 @@ fn decode<T: kr_protocol::wire::WireMessage>(answer: crate::bridge::link::Answer
 
 /// Refuses an output name that is already taken, before anything is read.
 ///
-/// [`write`] refuses it again where the file is made, which is the check that holds: a name taken
+/// [`write()`] refuses it again where the file is made, which is the check that holds: a name taken
 /// between the two is still refused there.
 ///
 /// # Errors

@@ -59,7 +59,7 @@ pub const fn serves(method: Method) -> bool {
 
 /// What a pairing mutation carries to its effect so that the effect can hold its registration
 /// standing through its commit: runs the commit it is handed while the registration, the fence and
-/// the deadline it was admitted under are held ([`Controller::pairing_guard`]).
+/// the deadline it was admitted under are held (`Controller::pairing_guard`).
 pub type CommitGuard = Arc<CommitFn>;
 
 impl Controller {

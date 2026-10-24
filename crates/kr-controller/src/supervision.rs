@@ -381,7 +381,7 @@ pub trait WorkerSupervisor: Send + Sync + std::fmt::Debug {
     /// A supervisor that depends on something a person sets up, as the Windows one depends on the
     /// environment's scheduled task, says so here, so that a daemon that cannot start a worker is
     /// not reported as one that can. It may ask the platform, so a caller does not hold a thread
-    /// the daemon's other tasks run on while it waits ([`blocking_start`]). The default is ready.
+    /// the daemon's other tasks run on while it waits (`blocking_start`). The default is ready.
     fn readiness(&self) -> Readiness {
         Readiness::Ready
     }

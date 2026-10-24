@@ -778,6 +778,8 @@ mod unix {
         /// [`PROBE_DEADLINE`], because the input stream may still receive a late reply and live
         /// forwarding must not begin on one that might. Returns [`CliError::Terminal`] when the
         /// terminal's modes cannot be read or set.
+        ///
+        /// [`PROBE_DEADLINE`]: super::PROBE_DEADLINE
         pub fn probe(
             &self,
             context: kr_term::probe::InputContext,

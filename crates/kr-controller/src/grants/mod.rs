@@ -356,7 +356,7 @@ pub struct Permitted {
     pub unresolved: Vec<RequiredAuthority>,
     /// Whether the request was decided while this boot's clock continuity is lost, for a grant the
     /// host decides by the clock: only the owner's confirmation of the clock is served then, and
-    /// the subject refuses any other ([`may_end_the_loss`]).
+    /// the subject refuses any other (`may_end_the_loss`).
     pub confirms_the_clock_only: bool,
     /// Whether the request is an owner's device that no lease serves on an exclusively
     /// organisation-managed host, reaching only the methods that recover it

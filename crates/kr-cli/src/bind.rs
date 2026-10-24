@@ -65,7 +65,7 @@ pub async fn open(bound: &Bound, build_id: BuildId) -> Result<LocalClient> {
 /// Connects to a worker for a tool call, and refuses a worker of another release.
 ///
 /// Discovery sends every worker the probe whose shape never changes, so it opens a worker of any
-/// level with [`open`]. A call writes in the shape of this release: a worker of another level
+/// level with [`open()`]. A call writes in the shape of this release: a worker of another level
 /// answers in a shape the tools do not read, and no tool of its release was started in their
 /// place, so the call says so and sends nothing.
 ///

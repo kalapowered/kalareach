@@ -581,6 +581,10 @@ impl DeliveryRuntime {
     /// Returns [`Confirmation::Refused`] for the gateway's own refusal,
     /// [`Confirmation::Limited`] when this device or this host has asked too often, and
     /// [`Confirmation::NotAsked`] when it was not asked or was not answered as the gateway answers.
+    ///
+    /// [`Confirmation::Refused`]: super::Confirmation::Refused
+    /// [`Confirmation::Limited`]: super::Confirmation::Limited
+    /// [`Confirmation::NotAsked`]: super::Confirmation::NotAsked
     pub fn confirm(
         &self,
         device_id: kr_protocol::ids::DeviceId,

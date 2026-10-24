@@ -11,7 +11,7 @@
 //!   the read model and stays there.
 //! * Nothing content-bearing is in it. Shell programs, working directories and anything else a
 //!   person or a platform wrote arrive only through [`Content`], and [`write`] takes one only from
-//!   an [`Approved`](super::content::Approved), which the content export makes when the person has
+//!   an [`Approved`], which the content export makes when the person has
 //!   been shown exactly that content and has confirmed it. `--include-content` is the explicit
 //!   selection section 26 asks for, and the preview is what lets the person stop.
 //!
@@ -20,6 +20,8 @@
 //! One uncompressed POSIX `ustar` archive, which `tar -tf` lists and every archiver opens. It is
 //! built in memory and written owner-only in one atomic replacement, because a bundle half-written
 //! into a path a person is about to attach to a message is worse than no bundle.
+//!
+//! [`write`]: fn@write
 
 use kr_client::shown;
 use kr_client::shown::Shown;

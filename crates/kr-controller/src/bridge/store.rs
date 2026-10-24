@@ -37,7 +37,7 @@ const MAX_RECORD_LEN: u64 = 1024 * 1024;
 /// records none was written before the format was recorded and is read as this one; a file that
 /// records a later one is refused rather than read and written back without what it adds.
 ///
-/// Remove the absent-version default on [`Record::version`] once no supported upgrade starts from
+/// Remove the absent-version default on `Record::version` once no supported upgrade starts from
 /// a file written before the format was recorded.
 pub const RECORD_VERSION: u32 = 1;
 

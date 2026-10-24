@@ -122,12 +122,12 @@ pub struct TransferModule {
 /// The admission one transfer mutation arrived under, as the transfer service asks about it.
 ///
 /// Every answer is the check each service asks from inside the work a mutation has begun,
-/// [`Controller::check_registration`]: a fence this host owes and could not raise, then the
+/// `Controller::check_registration`: a fence this host owes and could not raise, then the
 /// connection's registration under the revision the mutation was admitted at, then the accepted
 /// deadline. The service asks it where the mutation begins an effect, with its own lock held, and
-/// runs each commit through [`Controller::under_registration`], so the connection table, which a
+/// runs each commit through `Controller::under_registration`, so the connection table, which a
 /// withdrawal takes, is held from the check to the end of the commit. The refusal the check gave is
-/// kept, so that [`TransferModule::write`] can answer with it and not retain it.
+/// kept, so that `TransferModule::write` can answer with it and not retain it.
 pub struct TransferAdmission {
     controller: Arc<Controller>,
     carried: crate::authority::AdmittedMutation,

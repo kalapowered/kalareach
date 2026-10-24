@@ -567,7 +567,7 @@ impl DeliveryModule {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] when the revision does not move forward, what
-    /// `admitted` refuses with, and [`ControllerError::Unavailable`] when the journal cannot be
+    /// `admitted` refuses with, and [`ControllerError::Storage`] when the journal cannot be
     /// written.
     pub fn update_preview_key(
         &self,
