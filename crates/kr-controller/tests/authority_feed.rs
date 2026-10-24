@@ -239,8 +239,9 @@ impl Rig {
         if feed_down {
             // The start's read and the reads a connection asks for before it is served.
             for nth in 1..=4 {
-                served.web().fail(
+                served.web().fail_with_member(
                     AUTHORITY,
+                    "read",
                     nth,
                     Moment::Refuse {
                         status: 503,
@@ -286,8 +287,9 @@ impl Rig {
     async fn restarted_while_the_feed_is_down(self) -> (Host, Served) {
         let Self { host, served, .. } = self;
         for nth in 1..=4 {
-            served.web().fail(
+            served.web().fail_with_member(
                 AUTHORITY,
+                "read",
                 nth,
                 Moment::Refuse {
                     status: 503,
@@ -300,6 +302,16 @@ impl Rig {
         let timer = HeldTimer::held();
         let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
         (host, served)
+    }
+
+    /// Waits until at least `count` requests of one kind have reached the feed in all.
+    async fn until_arrivals(&self, operation: &str, count: usize) {
+        within("the request reaches the feed", async {
+            while self.arrivals(operation) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
     }
 
     /// How many requests of one kind (`read`, `revise`, `acknowledge`, ...) reached the feed.
@@ -554,10 +566,16 @@ async fn a_revocation_published_while_a_device_is_connected_is_carried_out_at_th
 async fn a_host_that_stops_between_carrying_a_request_out_and_acknowledging_it_finishes_it_once() {
     let rig = Rig::start().await;
     let (_phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    // Pairing wakes the carrier, and a pass still running when the fault is armed would meet it,
+    // and the pass the poll asks for would then acknowledge the request.
+    rig.until_the_carrier_is_idle().await;
     let request = rig.owner_publishes(0xa3, devices(record.device_id)).await;
 
-    // The pass reads (1), issues its revision (2) and acknowledges (3): the last never arrives.
-    rig.served.web().fail(AUTHORITY, 3, Moment::Before);
+    // The pass reads the request, issues its revision and acknowledges: the acknowledgement never
+    // arrives.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "acknowledge", 1, Moment::Before);
     rig.poll().await;
     let held = rig.feed_as_the_owner_sees_it().await;
     assert!(
@@ -1507,8 +1525,9 @@ async fn a_feed_that_cannot_be_reached_refuses_nothing_and_shows_stale_status() 
     let rig = Rig::start().await;
     rig.the_owner_bounds_offline_validity();
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
-    rig.served.web().fail(
+    rig.served.web().fail_with_member(
         AUTHORITY,
+        "read",
         1,
         Moment::Refuse {
             status: 503,
@@ -1548,9 +1567,10 @@ async fn the_keys_that_may_remove_the_feed_are_the_owners_the_host_is_paired_wit
     );
 
     // The owner is revoked at the machine while the feed turns the delegation back.
-    rig.served.web().fail(
+    rig.served.web().fail_with_member(
         AUTHORITY,
-        2,
+        "delegate",
+        1,
         Moment::Refuse {
             status: 503,
             code: "SERVICE_UNAVAILABLE",
@@ -1740,8 +1760,10 @@ async fn a_second_request_for_what_was_withdrawn_is_refused_again_when_the_refus
         .owner_publishes(0xd2, devices(first_device.device_id))
         .await;
 
-    // The pass reads (1) and refuses the second request (2): the refusal never arrives.
-    rig.served.web().fail(AUTHORITY, 2, Moment::Before);
+    // The pass reads and refuses the second request: the refusal never arrives.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "reject", 1, Moment::Before);
     rig.poll().await;
     assert_eq!(
         rig.held(&again).await.rejected.0,
@@ -1780,11 +1802,12 @@ async fn a_pass_that_fails_waits_out_a_backoff_and_then_finishes_the_request() {
     rig.poll().await;
     let request = rig.owner_publishes(0xf1, devices(device.device_id)).await;
 
-    // The pass reads (1), issues its revision (2) and acknowledges (3): the feed turns the
-    // acknowledgement back, naming no delay.
-    rig.served.web().fail(
+    // The pass reads, issues its revision and acknowledges: the feed turns the acknowledgement
+    // back, naming no delay.
+    rig.served.web().fail_with_member(
         AUTHORITY,
-        3,
+        "acknowledge",
+        1,
         Moment::Refuse {
             status: 503,
             code: "SERVICE_UNAVAILABLE",
@@ -1899,17 +1922,19 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
             .await
             .expect("the feed stores the request");
     }
-    // The first pass reads (1) and refuses 64 records (2 to 65); the scan then goes on at once with
-    // a second read (66), which the feed holds open. A connection that asked for a synchronisation
-    // is not given one by the first page, and what the host shows is not current while the scan is
-    // under way.
-    let before = rig.served.web().requests_to(AUTHORITY);
-    rig.served.web().fail(AUTHORITY, 66, Moment::Hold);
+    // The first pass reads a page and refuses its 64 records; the scan then goes on at once with a
+    // second read, which the feed holds open. A connection that asked for a synchronisation is not
+    // given one by the first page, and what the host shows is not current while the scan is under
+    // way.
+    let reads = rig.arrivals("read");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 2, Moment::Hold);
     let waiting = rig.runtime().synchronised_before_serving();
     tokio::pin!(waiting);
     tokio::select! {
         () = &mut waiting => panic!("the first page of a feed is no synchronisation"),
-        () = rig.served.web().requests_reach(AUTHORITY, before + 66) => {}
+        () = rig.until_arrivals("read", reads + 2) => {}
     }
     assert!(
         rig.shown().await.list.feed_stale,
@@ -1963,7 +1988,9 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
     rig.poll().await;
 
-    rig.served.web().fail(AUTHORITY, 1, Moment::Hold);
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
     let session = within(
         "the connection is served",
         connect(&rig.host, &phone, &record),
@@ -2688,16 +2715,18 @@ async fn a_refusal_whose_first_write_failed_is_on_disk_before_it_is_sent() {
     registry
         .execute_batch("DROP TRIGGER refuse_refusal")
         .expect("the fault is lifted");
-    // The next pass reads (1) and refuses the request (2): the feed holds that answer while the
-    // test looks at what the host has on disk.
-    let before = rig.served.web().requests_to(AUTHORITY);
-    rig.served.web().fail(AUTHORITY, 2, Moment::Hold);
+    // The next pass reads and refuses the request: the feed holds that answer while the test looks
+    // at what the host has on disk.
+    let refusals = rig.arrivals("reject");
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "reject", 1, Moment::Hold);
     rig.timer.release_held();
     let polled = rig.runtime().synchronised_before_serving();
     tokio::pin!(polled);
     tokio::select! {
         () = &mut polled => panic!("the pass ended before the refusal was held"),
-        () = rig.served.web().requests_reach(AUTHORITY, before + 2) => {}
+        () = rig.until_arrivals("reject", refusals + 1) => {}
     }
     let stored = rig
         .host
