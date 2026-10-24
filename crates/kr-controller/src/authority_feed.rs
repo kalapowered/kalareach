@@ -476,6 +476,17 @@ impl FeedRuntime {
                     None,
                 )
             };
+        // A refusal the feed puts on every remote grant is a warning whatever else the check found,
+        // and its remedy is the one that ends it.
+        let (state, remedy) = if status.removed_at_ms.0.is_some() {
+            (state, remedy)
+        } else if observed.unverified {
+            (DoctorStatus::Warning, Some(UNVERIFIED_REMEDY))
+        } else if observed.catching_up {
+            (DoctorStatus::Warning, Some(CATCHING_UP_REMEDY))
+        } else {
+            (state, remedy)
+        };
         let detail = if observed.catching_up {
             detail.stated(
                 "; the feed holds a revision above this host's own records, so this host is \
@@ -492,6 +503,7 @@ impl FeedRuntime {
                  owner's at this machine until that owner is paired again or the owner at this \
                  machine revokes them",
             )
+            .sentence(&names_of(&controller.unverified_withdrawals()))
         } else {
             detail
         };
@@ -568,6 +580,68 @@ impl Drop for FeedRuntime {
             task.abort();
         }
     }
+}
+
+/// What a person who finds the host refusing remote access for a withdrawal it cannot verify does:
+/// the devices and the grants the withdrawal names are what to revoke, and the owner who made it is
+/// the one to pair again.
+const UNVERIFIED_REMEDY: &str = "Revoke what the request names, with `kr device revoke <device>` for a \
+     device and `kr share revoke <grant>` for a grant, or pair the owner who made it again. \
+     Remote access returns once the request can be verified.";
+
+/// What a person who finds the host refusing remote access while it catches up with its feed does.
+const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
+     this, the registry cannot take the write: check the disk and the permissions of the state \
+     directory.";
+
+/// How many of each of the issuers, devices and grants a withdrawal names a check says by name.
+const MOST_NAMED: usize = 8;
+
+/// The sentence that says whose withdrawal the host cannot verify and what it names: the identifier
+/// and key each request gives for its issuer, in sixteen hexadecimal digits of the key's
+/// identifier, and the devices and grants it would withdraw.
+fn names_of(found: &Unverified) -> Sentence {
+    let mut sentence = Sentence::new();
+    for (position, (issuer, key)) in found.issuers.iter().take(MOST_NAMED).enumerate() {
+        let digits = key.as_bytes()[..8].try_into().map_or(0, u64::from_be_bytes);
+        sentence = sentence
+            .stated(if position == 0 {
+                "; it says it was made by device "
+            } else {
+                ", and by device "
+            })
+            .identifier(issuer)
+            .stated(" with key ")
+            .hexadecimal(digits);
+    }
+    for (position, device) in found.devices.iter().take(MOST_NAMED).enumerate() {
+        sentence = sentence
+            .stated(if position == 0 {
+                "; it names device "
+            } else {
+                ", device "
+            })
+            .identifier(device);
+    }
+    for (position, grant) in found.grants.iter().take(MOST_NAMED).enumerate() {
+        sentence = sentence
+            .stated(if position == 0 {
+                "; it names grant "
+            } else {
+                ", grant "
+            })
+            .identifier(grant);
+    }
+    let beyond = found.issuers.len().saturating_sub(MOST_NAMED)
+        + found.devices.len().saturating_sub(MOST_NAMED)
+        + found.grants.len().saturating_sub(MOST_NAMED);
+    if beyond > 0 {
+        sentence = sentence
+            .stated("; ")
+            .number(beyond as u64)
+            .stated(" more are not listed");
+    }
+    sentence
 }
 
 /// What the carrier does for as long as the daemon lives.
@@ -1147,6 +1221,43 @@ mod tests {
             Some(&acknowledged(pending(1))),
             RevocationCompletion::Complete
         ));
+    }
+
+    /// KR-REQ-24.15: `kr doctor` names what a withdrawal the host cannot verify would withdraw, the
+    /// grants in the grant store among it, and the key the request gives for its issuer, so the
+    /// owner at the machine has something to revoke, and says how many more it does not list.
+    #[test]
+    fn a_withdrawal_the_host_cannot_verify_is_named_by_its_devices_grants_and_issuer_key() {
+        let id = |byte: u8| kr_protocol::scalars::Uuid::from_bytes([byte; 16]);
+        let issuer = DeviceId::new(id(1));
+        let key = KeyId::from_bytes([0xab; 32]);
+        let mut found = Unverified {
+            issuers: [(issuer, key)].into_iter().collect(),
+            devices: [DeviceId::new(id(2))].into_iter().collect(),
+            grants: [kr_protocol::ids::GrantId::new(id(3))]
+                .into_iter()
+                .collect(),
+        };
+        let said = names_of(&found);
+        let said = said.as_str();
+        for named in [
+            issuer.to_string(),
+            DeviceId::new(id(2)).to_string(),
+            kr_protocol::ids::GrantId::new(id(3)).to_string(),
+            "abababababababab".to_owned(),
+        ] {
+            assert!(said.contains(&named), "{named} is not said in: {said}");
+        }
+
+        found
+            .devices
+            .extend((10..10 + MOST_NAMED as u8 + 2).map(|byte| DeviceId::new(id(byte))));
+        let said = names_of(&found);
+        assert!(
+            said.as_str().contains("3 more are not listed"),
+            "{}",
+            said.as_str()
+        );
     }
 
     #[derive(Debug)]

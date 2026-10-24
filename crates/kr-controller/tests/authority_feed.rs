@@ -750,12 +750,18 @@ async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pas
         .await;
     rig.until_the_carrier_is_idle().await;
 
-    let shown = rig.shown().await;
+    let check = rig.shown().await.check.expect("the feed check");
     assert!(
-        shown
-            .check
-            .is_some_and(|check| check.detail().contains("catching up")),
+        check.detail().contains("catching up"),
         "the host says it is catching up"
+    );
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("registry")),
+        "and says the registry cannot take the write: {:?}",
+        check.remedy()
     );
     let outcome = match paired_dial(&rig.host, &kept.0, &kept.1).try_dial().await {
         Ok(transport) => {
@@ -914,6 +920,8 @@ struct Unverifiable {
     victim: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// A device it does not name.
     kept: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The owner the registry no longer holds, who made the withdrawal.
+    owner: (Device, kr_controller::service::net::devices::DeviceRecord),
 }
 
 /// Pairs the device the withdrawal will name with `victim_rights` and one it will not, takes a copy
@@ -978,7 +986,12 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
         .await;
     rig.until_the_carrier_is_idle().await;
     rig.until_the_carrier_is_idle().await;
-    Unverifiable { rig, victim, kept }
+    Unverifiable {
+        rig,
+        victim,
+        kept,
+        owner,
+    }
 }
 
 fn says_an_owner_is_unknown(outcome: &Result<(), kr_client::ClientError>) -> bool {
@@ -1000,8 +1013,12 @@ fn says_an_owner_is_unknown(outcome: &Result<(), kr_client::ClientError>) -> boo
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_refused_until_the_owner_at_the_machine_acts()
  {
-    let Unverifiable { rig, victim, kept } =
-        a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView]).await;
+    let Unverifiable {
+        rig,
+        victim,
+        kept,
+        owner,
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView]).await;
 
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
@@ -1013,13 +1030,34 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         says_an_owner_is_unknown(&refused),
         "the device the withdrawal names is not served: {refused:?}"
     );
-    let shown = rig.shown().await;
+    let check = rig.shown().await.check.expect("the feed check");
     assert!(
-        shown
-            .check
-            .is_some_and(|check| check.detail().contains("an owner this host does not know")),
+        check.detail().contains("an owner this host does not know"),
         "the host says what it is waiting for"
     );
+    assert_eq!(
+        check.status,
+        DoctorStatus::Warning,
+        "a refusal that stands is a warning"
+    );
+    assert!(check.remedy().is_some(), "and it says what to do about it");
+    // It names what the owner at the machine acts on: the device the withdrawal names, the owner
+    // who made it as the request says, and that owner's key.
+    let issuer_key = owner.0.keys().authorisation.key_id();
+    for named in [
+        victim.1.device_id.to_string(),
+        owner.1.device_id.to_string(),
+        issuer_key.as_bytes()[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    ] {
+        assert!(
+            check.detail().contains(&named),
+            "{named} is not named in: {}",
+            check.detail()
+        );
+    }
 
     // The owner at this machine revokes the device the withdrawal names.
     let mut local = rig.host.client().await;
@@ -1056,7 +1094,9 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
 /// device the withdrawal would take its standing from could lift the refusal itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_removing_the_feed() {
-    let Unverifiable { rig, victim, kept } = a_withdrawal_by_an_owner_the_host_does_not_know(&[
+    let Unverifiable {
+        rig, victim, kept, ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[
         ActionRight::HostManage,
         ActionRight::SessionView,
     ])

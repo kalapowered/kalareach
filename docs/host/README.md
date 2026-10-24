@@ -6460,7 +6460,7 @@ the registry's. A feed that is ahead means the registry, and the policy row and 
 an earlier state than one this host issued: a state directory put back from a copy, or one that is
 another host's. While the feed is ahead the host refuses every grant for an ingress other than the
 owner at the machine, an organisation's and a personal one alike, with `PERMISSION_DENIED` saying
-that it is catching up with its feed, and `kr doctor` says so. It carries out again each request the
+that it is catching up with its feed, and `kr doctor` says so as a warning with a remedy. It carries out again each request the
 feed shows complete and the registry does not show withdrawn, each time a pass reads the record and
 whatever the two counters say: a restore that stopped after it moved the counter has lost the
 withdrawal all the same. It does so only for a request it could have carried out, because the feed
@@ -6478,7 +6478,9 @@ not revoked and holds the key and could have made it, as after a restore to a po
 owner was paired, can be neither carried out nor dismissed: the feed could have named any request as
 complete, and the host cannot tell whose word it was. The host then refuses
 every grant but the owner's at the machine, with `PERMISSION_DENIED` saying that it shows a
-revocation by an owner it does not know, and `kr doctor` says so. Every scan reads such a record
+revocation by an owner it does not know. `kr doctor` shows the feed check as a warning with a
+remedy, and names the device the request says made it, the key it gives for that device, and the
+devices and grants it names, up to eight of each. Every scan reads such a record
 again, so a restart does not lose the refusal, and nothing is stored for it. It ends when the owner
 at the machine revokes what the request names, or pairs the owner again, whose key the request names
 and whose request is then carried out. A feed that shows a revocation complete that no owner made
