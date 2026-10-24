@@ -307,9 +307,10 @@ reads each admitted package itself, from its checked copy and with the check a p
 runs, so the match rules, the actions, the connector table and the command integration all come from
 the manifest the package hash names.
 
-The catalogue's search indexes match rules by executable file stem and by distribution, so
-recognising a running application there is a lookup; the worker's binder reads the rules of every
-admitted package instead. An explicit selection, where a caller supplies one, wins a conflict
+The catalogue's `MatchIndex` indexes match rules by executable file stem and by distribution,
+but no host call uses it (the catalogue's search is a text search); the one place where a running
+application meets the rules is the worker's binder, which reads the rules of every admitted
+package. An explicit selection, where a caller supplies one, wins a conflict
 outright (no host call supplies one, so a person settles a conflict by disabling or removing one
 of the packages); an exact rule beats an inferred one; of the rules left, one that matched
 an installation location the package names beats one that matched only the executable's name, when
