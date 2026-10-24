@@ -368,6 +368,10 @@ struct State {
     /// while its host is still held under its own number, so the run of a host that was forgotten
     /// writes nothing, and a host paired again is claimed afresh.
     running: BTreeMap<DeviceId, u64>,
+    /// What ends the run that holds each host, by the run's number: the person forgetting the host
+    /// calls it, and the run's task is dropped where it waits, with the connection to the host and
+    /// the hold on its endpoint it owns.
+    cancels: BTreeMap<DeviceId, (u64, Arc<tokio::sync::Notify>)>,
     /// The hosts whose person has just chosen to turn notifications on: the one thing that may put
     /// the system's permission question in front of them. A run takes its host out when it reaches
     /// the question, and out again whenever it ends or goes round again, so a look the application
@@ -511,6 +515,7 @@ impl PushDesk {
             state: Mutex::new(State {
                 record,
                 running: BTreeMap::new(),
+                cancels: BTreeMap::new(),
                 asking: BTreeSet::new(),
                 observed: BTreeMap::new(),
                 next_run: 0,
@@ -695,11 +700,17 @@ impl PushDesk {
     }
 
     /// Forgets what is kept of `host`, as the person forgetting the host does. A run that is
-    /// taking the host up loses its claim with it, writes nothing more and ends.
+    /// taking the host up loses its claim with it, writes nothing more, and is ended where it
+    /// waits.
     pub fn forgotten(&self, host: DeviceId) {
         {
             let mut state = lock(&self.state);
             state.running.remove(&host);
+            // The run may be waiting on the host for an answer that never comes, holding the
+            // connection and the endpoint with it: it is ended where it waits.
+            if let Some((_, cancel)) = state.cancels.remove(&host) {
+                cancel.notify_one();
+            }
             state.asking.remove(&host);
             state.observed.remove(&host);
             if state.record.hosts.remove(&host.to_string()).is_some() {
@@ -713,6 +724,17 @@ impl PushDesk {
     /// the provider holds is not the one the registration just made proposed. The host is reached
     /// as `reach` says.
     fn spawn_run(self: &Arc<Self>, host: PairedHost, run: u64, reach: Reach) {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = lock(&self.state);
+            // A host forgotten between the claim and here has no run to start.
+            if !state.holds(host.host_device_id, run) {
+                return;
+            }
+            state
+                .cancels
+                .insert(host.host_device_id, (run, Arc::clone(&cancel)));
+        }
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             let mut guard = RunGuard {
@@ -721,23 +743,43 @@ impl PushDesk {
                 run,
                 armed: true,
             };
-            loop {
-                match desk.sequence(&host, run, reach).await {
-                    Ok(registered) => {
-                        desk.about_to_compare(host.host_device_id, run);
-                        let current = desk.current_digest().await;
-                        if !desk.registered(host.host_device_id, run, registered, current) {
+            let work = async {
+                loop {
+                    match desk.sequence(&host, run, reach).await {
+                        Ok(registered) => {
+                            desk.about_to_compare(host.host_device_id, run);
+                            let current = desk.current_digest().await;
+                            if !desk.registered(host.host_device_id, run, registered, current) {
+                                break;
+                            }
+                        }
+                        Err(stop) => {
+                            desk.stopped(host.host_device_id, run, &stop);
                             break;
                         }
                     }
-                    Err(stop) => {
-                        desk.stopped(host.host_device_id, run, &stop);
-                        break;
-                    }
                 }
+            };
+            tokio::select! {
+                () = work => {}
+                () = cancel.notified() => {}
             }
+            desk.run_ended(host.host_device_id, run);
             guard.armed = false;
         });
+    }
+
+    /// A run's task has ended: what would end it is no longer wanted. A later run of the same host
+    /// keeps its own.
+    fn run_ended(&self, host: DeviceId, run: u64) {
+        let mut state = lock(&self.state);
+        if state
+            .cancels
+            .get(&host)
+            .is_some_and(|(held, _)| *held == run)
+        {
+            state.cancels.remove(&host);
+        }
     }
 
     /// A run is about to read the token for its comparison: what a look saw until now is older than
