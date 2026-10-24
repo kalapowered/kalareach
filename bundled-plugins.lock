@@ -12,22 +12,22 @@
       "size_bytes": "2145"
     },
     {
-      "digest": "294604dc6892c4868586e667ce0f917abde1f897e6b08a726eb9bd3cce7446fa",
+      "digest": "a50d5849c57f908e1c558bb7a70d035954a5a1a83208279bcc8f4d2fa8ac6b95",
       "path": "metadata/snapshot.json",
       "size_bytes": "611"
     },
     {
-      "digest": "1387755e4d6f5556b20f5da6f0d7269247ce7d46b09efe6657fd5cdb273c8c71",
+      "digest": "cf1fc0c8c398edeebbaff75ccdc9230a18e3618b0267506007e53a012b0ceceb",
       "path": "metadata/targets.json",
       "size_bytes": "13148"
     },
     {
-      "digest": "be42b9509912ea2d2e96e2f933c5ce81e4530c608ff8ae6536baba7694868100",
+      "digest": "19dc5e6500e91926788e6ea229d67d6279df47470a007efd517ade3884732d86",
       "path": "metadata/timestamp.json",
       "size_bytes": "611"
     },
     {
-      "digest": "5cccc0d33f54bd09821d4a23e2cc452d33be41441d9c05ae37a05718e359a037",
+      "digest": "b4e919b4bd34035c0413ae384cd53dfaeea82134929126ee0de0f945670a3e02",
       "path": "targets/index.json",
       "size_bytes": "23912"
     }
@@ -482,12 +482,12 @@
     }
   ],
   "source": {
-    "commit": "579333e89b65df837115e6e321876603640495c9",
-    "generation": "2",
+    "commit": "2e93bc8d82bea7b5ad8021394b08e3768f7ff1e6",
+    "generation": "3",
     "generation_path": "snapshots/development",
     "produced_at": "1760000000000",
     "repository": "https://github.com/kalapowered/kalareach-plugins",
-    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/579333e89b65df837115e6e321876603640495c9/snapshots/development"
+    "tree_url": "https://github.com/kalapowered/kalareach-plugins/tree/2e93bc8d82bea7b5ad8021394b08e3768f7ff1e6/snapshots/development"
   },
   "trust_root": {
     "digest": "d008a8b2f121f112108632aa5e5a99af0bdc0a770431d84865ed34fa3dd9acb7",
