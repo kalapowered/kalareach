@@ -224,9 +224,8 @@ struct Shared {
     scan_put_off: AtomicBool,
     /// What the scan met so far of withdrawals the feed shows complete and this host cannot verify.
     scan_found: Mutex<Unverified>,
-    /// Why the first request the scan met so far whose issuer's standing this host could not decide
-    /// could not be judged.
-    scan_undecided: Mutex<Option<Refusal>>,
+    /// The first request the scan met so far whose issuer's standing this host could not decide.
+    scan_undecided: Mutex<Option<Undecided>>,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
     /// How many passes have finished, for whatever waits on one.
@@ -834,9 +833,22 @@ async fn pass(
             // holds the requests: one behind a request whose issuer's standing could not be decided
             // waits for the scan that can decide it. What the feed shows complete is only carried
             // out again, which asks no clock, and finds the withdrawals this host cannot verify.
-            if undecided.is_some() && !shown_complete(record) {
-                contiguous = false;
-                continue;
+            if let Some(pending) = &undecided {
+                if !shown_complete(record) {
+                    contiguous = false;
+                    continue;
+                }
+                // A record that would revoke the issuer of that request is not carried out ahead
+                // of it: the request would then be refused for a revocation that came after it.
+                // The pass ends here, as it ends at the request.
+                if controller
+                    .request_names_one_of(&record.request, &pending.issuers)
+                    .map_err(Stopped::local)?
+                {
+                    return Err(Stopped::local(Controller::undecided_standing(
+                        &pending.refusal,
+                    )));
+                }
             }
             match settle(shared, controller, record, &mut now).await? {
                 Settled::Done => {
@@ -878,7 +890,10 @@ async fn pass(
                 }
                 Settled::Undecided(refusal) => {
                     contiguous = false;
-                    undecided.get_or_insert(refusal);
+                    undecided.get_or_insert_with(|| Undecided {
+                        refusal,
+                        issuers: [record.request.issuer_device_id].into_iter().collect(),
+                    });
                 }
             }
         }
@@ -946,7 +961,7 @@ async fn pass(
                 return Ok(Pass::More);
             }
         }
-        if let Some(refusal) = undecided {
+        if let Some(Undecided { refusal, .. }) = undecided {
             // The refusal and the catch-up are done, and what the feed shows complete is carried
             // out again. A pass that could not judge a request is no synchronisation: nothing is
             // shown as read, the owners' list is left as it was and the next pass waits out its
@@ -1068,6 +1083,14 @@ enum Settled {
     /// This host cannot yet decide whether the device that made it may manage the host, for the
     /// reason given. It stays unsettled, and a later scan judges it again.
     Undecided(Refusal),
+}
+
+/// A request whose issuer's standing this host could not decide, and why.
+#[derive(Clone, Debug)]
+struct Undecided {
+    refusal: Refusal,
+    /// The devices that made the requests that wait for it.
+    issuers: std::collections::BTreeSet<DeviceId>,
 }
 
 /// Whether the feed shows the record's request completed by this host, and not refused.
