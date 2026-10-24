@@ -8,16 +8,18 @@
  * the request the page makes of native code. What the shell does with a real drop, a real clipboard
  * and the system's save dialog, and the file that results, is native code's own: the Rust suites
  * for uploads and exports prove it, and a run of the packaged application on a desktop is the
- * photograph that is not taken here. Every screenshot goes under `/tmp`.
+ * photograph that is not taken here. Every screenshot goes in the run's evidence directory.
  */
 
 import { expect, test, type Page } from '@playwright/test'
+
+import { screenshotPath } from './evidence'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
-  return `/tmp/kr-companion-${name}-${test.info().project.name}.png`
+  return screenshotPath(`kr-companion-${name}-${test.info().project.name}`)
 }
 
 async function open(page: Page): Promise<void> {
