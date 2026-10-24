@@ -892,10 +892,7 @@ async fn a_device_pairs_by_code_through_the_product_client() {
     let session = device
         .pairing
         .link
-        .connect_paired(
-            &paired,
-            &device.pairing.candidate.paired_identity(paired.device_id),
-        )
+        .connect_paired(&paired, &device.pairing.paired_identity_for(&paired))
         .await
         .expect("the paired device connects");
     let status: PairStatusResult = session
@@ -2272,6 +2269,7 @@ async fn owner_device(
         proposed_grant: kr_pairing::grants::personal_owner_grant(),
         name: Some("the test host".to_owned()),
         paired_at_ms: record.paired_at_ms.get(),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
     };
     let device =
         ProductDevice::with_keys(owner_keys.clone(), Arc::new(host.room.clone()), |link| {
@@ -2280,10 +2278,7 @@ async fn owner_device(
     let session = device
         .pairing
         .link
-        .connect_paired(
-            &paired,
-            &device.pairing.candidate.paired_identity(record.device_id),
-        )
+        .connect_paired(&paired, &device.pairing.paired_identity_for(&paired))
         .await
         .expect("the owner device connects");
     let channel = Arc::new(WatchedChannel {
@@ -2747,6 +2742,7 @@ fn stale_record(host: &Host, network_config: NetworkConfig) -> PairedHost {
         proposed_grant: kr_pairing::grants::personal_owner_grant(),
         name: None,
         paired_at_ms: owner.paired_at_ms.get(),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
     }
 }
 
@@ -2778,7 +2774,7 @@ async fn each_host_is_reached_through_its_own_network_configuration() {
         let pairing = Arc::clone(&device.pairing);
         let host = host.clone();
         async move {
-            let identity = pairing.candidate.paired_identity(host.device_id);
+            let identity = pairing.paired_identity_for(&host);
             let session = pairing.link.connect_paired(&host, &identity).await?;
             let info: kr_protocol::hostinfo::HostInfoResult = session
                 .read(Method::HostInfo, &EmptyParams {})

@@ -742,7 +742,7 @@ impl Rig {
             .into_iter()
             .next()
             .expect("a paired host");
-        let identity = pairing.candidate.paired_identity(host.device_id);
+        let identity = pairing.paired_identity_for(&host);
         tokio::time::timeout(WATCHDOG, pairing.link.connect_paired(&host, &identity))
             .await
             .expect("the connection ends one way or the other")
@@ -760,7 +760,7 @@ impl Rig {
             .into_iter()
             .next()
             .expect("a paired host");
-        let identity = pairing.candidate.paired_identity(host.device_id);
+        let identity = pairing.paired_identity_for(&host);
         tokio::time::timeout(
             WATCHDOG,
             pairing.link.visit_paired(&host, &identity, &|| None),
@@ -1913,7 +1913,7 @@ async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_
     rig.switches_to("bea").await;
     let key = *device.identity().keys.notification_preview.public();
     let refused = line
-        .update_preview_key(key)
+        .update_preview_key(key, kr_protocol::ids::DeviceKeyRevision::new(1))
         .await
         .expect_err("the key is not sent for an account that has left");
     assert!(refused.contains("changed"), "{refused}");

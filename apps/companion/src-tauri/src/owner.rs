@@ -350,7 +350,7 @@ impl Owner {
         visiting: bool,
     ) -> std::result::Result<Arc<OwnerConfirmations>, Missed> {
         let pairing = self.device.pairing();
-        let identity = pairing.candidate.paired_identity(host.device_id);
+        let identity = pairing.paired_identity_for(&host);
         let session = if visiting {
             let device = &self.device;
             let in_use = || device.host_in_use().map(|using| using.network_config);

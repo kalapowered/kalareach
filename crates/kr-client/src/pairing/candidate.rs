@@ -202,15 +202,20 @@ impl Candidate {
     /// random one the host does not use: the host assigns the record's own when it commits.
     #[must_use]
     pub fn unpaired(&self) -> LocalIdentity {
-        self.paired_identity(DeviceId::new(kr_ipc::new_uuid()))
+        self.paired_identity(DeviceId::new(kr_ipc::new_uuid()), DeviceKeyRevision::new(1))
     }
 
-    /// The identity this device connects to a host with, as the device `device_id` it became.
+    /// The identity this device connects to a host with, as the device `device_id` it became, at the
+    /// revision of its keys the host holds. A host refuses a device that offers another.
     #[must_use]
-    pub fn paired_identity(&self, device_id: DeviceId) -> LocalIdentity {
+    pub fn paired_identity(
+        &self,
+        device_id: DeviceId,
+        revision: DeviceKeyRevision,
+    ) -> LocalIdentity {
         LocalIdentity::new(
             device_id,
-            DeviceKeyRevision::new(1),
+            revision,
             self.endpoint_id(),
             self.keys.authorisation.clone(),
             self.build_id.clone(),
@@ -400,6 +405,22 @@ impl std::fmt::Debug for Pairing {
 }
 
 impl Pairing {
+    /// The identity this device connects to `host` with: the revision of its keys is the one the
+    /// records hold now, read at each connection and not taken from the copy of the host record a
+    /// caller kept, since a copy made before the host took a higher revision would offer the old
+    /// one and be refused. When the records no longer hold the pairing, the copy's is used.
+    #[must_use]
+    pub fn paired_identity_for(&self, host: &PairedHost) -> LocalIdentity {
+        let revision = self
+            .hosts
+            .by_device(host.host_device_id)
+            .ok()
+            .flatten()
+            .filter(|held| held.device_id == host.device_id)
+            .map_or(host.device_key_revision, |held| held.device_key_revision);
+        self.candidate.paired_identity(host.device_id, revision)
+    }
+
     /// What a first dial that was lost means when the managed service had no free capacity to admit
     /// this device through the relay the dial addresses, and none otherwise.
     ///
@@ -1151,6 +1172,7 @@ impl Pairing {
             proposed_grant: pending.proposed_grant.clone(),
             name: None,
             paired_at_ms: self.clock.wall_clock_ms(),
+            device_key_revision: DeviceKeyRevision::new(1),
         };
         // The record first: a device that stops between the two keeps both, and resuming then
         // reaches the host through the record rather than as a candidate it no longer is.
@@ -1174,7 +1196,9 @@ impl Pairing {
             stage: Stage::ReachingHost,
         });
         let device_id = host.device_id;
-        let identity = self.candidate.paired_identity(device_id);
+        let identity = self
+            .candidate
+            .paired_identity(device_id, host.device_key_revision);
         let params = PairStatusParams {
             invitation_id: pending.invitation_id,
         };
