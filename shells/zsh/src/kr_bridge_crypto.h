@@ -31,6 +31,10 @@ void kr_sha256_final(kr_sha256 *state, unsigned char out[KR_SHA256_LEN]);
 void kr_hmac_sha256(const unsigned char *key, size_t key_len, const unsigned char *message,
                     size_t message_len, unsigned char out[KR_SHA256_LEN]);
 
+/* Overwrites `length` bytes at `buffer` with zeroes. Unlike a memset, the compiler may not drop it
+ * for a buffer that is not read again, so it is what clears a secret or a key-derived value. */
+void kr_wipe(void *buffer, size_t length);
+
 /* Decodes unpadded base64url. Returns non-zero on success. */
 int kr_base64url_decode(const char *text, unsigned char *out, size_t capacity, size_t *written);
 
