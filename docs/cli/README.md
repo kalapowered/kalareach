@@ -1592,7 +1592,9 @@ of any shares of the session that the device already holds. If `--live` is speci
 are currently displayed on the screen are also shown, with any terminal control characters written
 out as an escape, and the command refuses a screen too big for a preview. The screen shown is the
 screen at the time it is read. When the device opens the session, a resize or a program that
-switches screens can bring earlier lines into view, and the command says so.
+switches screens can bring earlier lines into view, and the command says so. The role line says
+what the role sees and does: a viewer invited to answer the agent's questions is still described as
+a viewer, and the sentences for the consequences say what the answer lets the device do.
 
 An invitation that carries a consequence or the live screen is issued only after `share` is typed at
 the controlling terminal, which has to be outside every KalaReach session. No flag skips that
@@ -1622,7 +1624,9 @@ If the screen has changed, the document also holds the lines the host kept. It a
 command that withdraws the invitation.
 
 `kr share list` shows each share with its state (waiting to be accepted, active, ended or revoked),
-the device it goes to, its role, whether it includes the live screen, its session and when it ends.
+the device it goes to, its role (the widest role whose default actions the share carries, so a
+viewer share that lets the device answer questions is listed as `viewer`), whether it includes the
+live screen, its session and when it ends.
 `kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
 is complete when every affected session's worker has fenced it; until then it is pending, and the
 command names what it waits for and exits with 1. Asking again is a new revocation. What the device
