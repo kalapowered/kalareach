@@ -1311,6 +1311,10 @@ mod a_crash_whose_endpoint_cannot_be_removed;
 #[cfg(test)]
 mod a_migration_and_a_recovery_of_one_session;
 
+/// A closed session whose worker has not yet exited.
+#[cfg(test)]
+mod a_worker_that_is_on_its_way_out;
+
 /// The sessions a daemon finds recorded in an earlier boot, when another recovery holds one.
 #[cfg(test)]
 mod a_previous_boot_left_to_a_held_recovery;

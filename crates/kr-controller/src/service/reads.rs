@@ -345,32 +345,43 @@ impl Controller {
     /// pessimistic: a query the platform declines establishes nothing, and nothing is the answer
     /// that keeps a store shut.
     async fn a_worker_may_still_own(self: &Arc<Self>, session_id: SessionId) -> Result<bool> {
-        let (row, closure) = {
+        let (row, closure, reservation) = {
             let registry = self.registry.lock().await;
             // A registry this host cannot read answers nothing, and nothing is not "no worker".
-            // Both reads are propagated rather than flattened away, because the caller refusing
+            // Every read is propagated rather than flattened away, because the caller refusing
             // with the registry's own error is the safe end of that.
             let row = registry
                 .workers()?
                 .into_iter()
                 .find(|row| row.session_id == session_id);
-            (row, registry.closure(session_id)?)
+            (
+                row,
+                registry.closure(session_id)?,
+                registry.reservation_for_session(session_id)?,
+            )
         };
-        Ok(self.worker_may_remain(session_id, row.as_ref(), closure.as_ref()))
+        Ok(self.worker_may_remain(
+            session_id,
+            row.as_ref(),
+            closure.as_ref(),
+            reservation.as_ref(),
+        ))
     }
 
     /// Whether anything this host holds says the worker of a session may still be there, given the
-    /// registry's worker row and closure for it.
+    /// registry's worker row, closure and reservation for it.
     ///
     /// The registry's row names a process the kernel has not said ended; the closure lists a worker
-    /// it never saw end; or the published descriptor names one. Each of the three is evidence, and
-    /// a closure erases the first two, so the answer is only as good as all three being asked. A
-    /// collection asks it with the session's recovery lock held.
+    /// it never saw end; the reservation names the process the launch ran, which is the worker
+    /// until the kernel says it ended; or the published descriptor names one. Each is evidence, and
+    /// a closure erases the row and the descriptor, so the answer is only as good as all four being
+    /// asked. A collection asks it with the session's recovery lock held.
     pub(crate) fn worker_may_remain(
         &self,
         session_id: SessionId,
         row: Option<&crate::registry::WorkerRecord>,
         closure: Option<&ClosureRecord>,
+        reservation: Option<&crate::registry::Reservation>,
     ) -> bool {
         if let Some(row) = row
             && !matches!(
@@ -388,7 +399,63 @@ impl Controller {
         {
             return true;
         }
+        // A worker hands its closure over before it exits, and the closure erases its registry
+        // row and its descriptor. The reservation still names the process the launch ran, and that
+        // process is the worker until the kernel says it ended: until then the worker may still
+        // write the stores a collection or a migration would open.
+        if reservation
+            .and_then(|reservation| reservation.launcher_identity.as_ref())
+            .is_some_and(|launched| {
+                !matches!(
+                    kr_ipc::identity::process_state(launched),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            })
+        {
+            return true;
+        }
         self.archive().a_worker_may_still_own(session_id)
+    }
+
+    /// The question [`Self::worker_may_remain`] asks, as the archive of this daemon asks it before a
+    /// migration, and without waiting for the registry: a registry that is busy or cannot be read
+    /// answers that a worker may remain, and the migration is made on a later look.
+    pub(crate) fn asker_of_a_worker_that_may_remain(
+        &self,
+    ) -> impl Fn(SessionId) -> bool + Send + Sync + 'static {
+        let daemon = self.me.clone();
+        move |session_id| {
+            daemon
+                .upgrade()
+                .is_none_or(|daemon| daemon.a_worker_may_remain_without_waiting(session_id))
+        }
+    }
+
+    fn a_worker_may_remain_without_waiting(&self, session_id: SessionId) -> bool {
+        let Ok(registry) = self.registry.try_lock() else {
+            return true;
+        };
+        let asked = (|| -> Result<_> {
+            let row = registry
+                .workers()?
+                .into_iter()
+                .find(|row| row.session_id == session_id);
+            Ok((
+                row,
+                registry.closure(session_id)?,
+                registry.reservation_for_session(session_id)?,
+            ))
+        })();
+        drop(registry);
+        match asked {
+            Ok((row, closure, reservation)) => self.worker_may_remain(
+                session_id,
+                row.as_ref(),
+                closure.as_ref(),
+                reservation.as_ref(),
+            ),
+            Err(_) => true,
+        }
     }
 
     /// Reads what one session left behind, with the registry's own record beside it.
