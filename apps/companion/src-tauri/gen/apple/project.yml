@@ -99,6 +99,9 @@ targets:
         PRODUCT_NAME: KalaReachNotificationService
         PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.notifications
         SKIP_INSTALL: true
+        # The preview library is built for arm64 only, and so is the application.
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64
         "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]": $(KR_EXTENSION_PROFILE)
         LIBRARY_SEARCH_PATHS: $(inherited) $(PROJECT_DIR)/Externals/preview/$(PLATFORM_NAME)/$(CONFIGURATION)
         OTHER_LDFLAGS: $(inherited) -lcompanion_preview
@@ -133,6 +136,8 @@ targets:
         PRODUCT_NAME: KalaReachNativeTests
         PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.native-tests
         GENERATE_INFOPLIST_FILE: true
+        ARCHS: [arm64]
+        VALID_ARCHS: arm64
         LIBRARY_SEARCH_PATHS: $(inherited) $(PROJECT_DIR)/Externals/preview/$(PLATFORM_NAME)/$(CONFIGURATION)
         OTHER_LDFLAGS: $(inherited) -lcompanion_preview
     preBuildScripts:
