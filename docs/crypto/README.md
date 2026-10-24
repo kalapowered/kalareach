@@ -571,7 +571,9 @@ The two 32-byte HMAC secrets of the attention store (its item-key secret) and th
 requires every one of the 256 bits to take both values, which a secret made from two version-four
 identifiers cannot do because the identifiers fix twelve of its bits. A secret already stored is
 read as it was and is not replaced. The documentation of `random_bytes` names the randomness in the
-tree that comes from elsewhere.
+tree that comes from elsewhere, the worker's detach token included: a version-four UUID with 122
+random bits from the operating system, which a shell bridge exports to one command and which the
+worker accepts only while that command's line is running.
 
 ## Vectors
 
