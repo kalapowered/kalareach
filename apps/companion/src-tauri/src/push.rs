@@ -1521,7 +1521,7 @@ impl PushDesk {
             tracing::warn!(%error, "the paired hosts could not be read to file the preview keys");
             "This phone could not read its paired hosts.".to_owned()
         })?;
-        let senders: Vec<SenderKey> = {
+        let senders: BTreeMap<[u8; 32], SenderKey> = {
             let state = lock(&self.state);
             hosts
                 .iter()
@@ -1534,14 +1534,20 @@ impl PushDesk {
                 })
                 .map(|host| {
                     let key = host.host_keys.notification_preview;
-                    SenderKey {
-                        id: *kr_protocol::pairing::key_id(
-                            kr_protocol::pairing::KeyPurpose::NotificationPreview,
-                            key.as_bytes(),
-                        )
-                        .as_bytes(),
-                        key: *key.as_bytes(),
-                    }
+                    let id = *kr_protocol::pairing::key_id(
+                        kr_protocol::pairing::KeyPurpose::NotificationPreview,
+                        key.as_bytes(),
+                    )
+                    .as_bytes();
+                    // Two records that name one key name it once: the receivers refuse a set that
+                    // names an identifier twice, and one refusal would stop every filing.
+                    (
+                        id,
+                        SenderKey {
+                            id,
+                            key: *key.as_bytes(),
+                        },
+                    )
                 })
                 .collect()
         };
@@ -1564,7 +1570,7 @@ impl PushDesk {
                 id: *identity.keys.notification_preview.key_id().as_bytes(),
                 seed: zeroize::Zeroizing::new(seed.expose().to_vec()),
             }],
-            senders,
+            senders: senders.into_values().collect(),
         })
     }
 
@@ -1622,16 +1628,17 @@ impl PushDesk {
     /// person agrees and the system has given the application its own token, which is after the
     /// permission step has said yes.
     async fn token_within(&self, within: Duration) -> std::result::Result<Option<String>, String> {
-        let mut waited = Duration::ZERO;
+        // Measured by the clock and not by the waits counted: one read can itself wait for the
+        // provider, and the registration slot this run holds is not held longer than `within`.
+        let started = tokio::time::Instant::now();
         loop {
             if let Some(token) = self.token().await? {
                 return Ok(Some(token));
             }
-            if waited >= within {
+            if started.elapsed() >= within {
                 return Ok(None);
             }
             tokio::time::sleep(LOOK_EVERY).await;
-            waited += LOOK_EVERY;
         }
     }
 
