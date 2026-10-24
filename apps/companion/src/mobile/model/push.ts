@@ -18,6 +18,8 @@ export interface Notifications {
   readonly view: PushView | null
   /** Turns notifications on for the host `reference` names. */
   readonly enable: (reference: string) => Promise<void>
+  /** Chooses whether the notifications of the host `reference` names show what needs the person. */
+  readonly setPreviews: (reference: string, on: boolean) => Promise<void>
   /** Opens this application's page in the system's settings. */
   readonly openSettings: () => Promise<void>
 }
@@ -55,6 +57,12 @@ export function useNotifications(): Notifications {
     },
     [port]
   )
+  const setPreviews = useCallback(
+    async (reference: string, on: boolean) => {
+      setView(await port.pushPreviews(reference, on))
+    },
+    [port]
+  )
   const openSettings = useCallback(() => port.openAppSettings(), [port])
-  return { view, enable, openSettings }
+  return { view, enable, setPreviews, openSettings }
 }
