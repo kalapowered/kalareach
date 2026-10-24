@@ -990,7 +990,9 @@ no prompt was shown. Every capability past the repository's default ceiling stay
 permission-required, and no native bridge is applied for a package whose grant lacks
 `native_bridge.install`.
 
-What the seed leaves alone is as much of its work. It never replaces an installation that is already
+What the seed leaves alone is as much of its work. A store that holds the bundle's generation number
+with another index keeps the index it holds, pinned or not, and the seed's outcome says so with the
+number and both digests. It never replaces an installation that is already
 there, whatever repository it came from and in whatever state, and it records that it left it. An
 owner's uninstall or disable is never undone: once the seed has made its enrolment, an uninstall
 settles that plugin in its own commit, so a seed that stopped part way cannot bring back what the
@@ -1047,8 +1049,10 @@ its own, verifies the chain there, resolves each payload by the digest the verif
 and stages the whole bundle beside the published one. The packages it bundles are listed at the top
 of the script. It refuses a checkout that is not at the pin, a link anywhere in the exported
 generation, an unsafe path, two names that are one file, a payload that is not the exact length the
-metadata pinned, roots that do not run from version 1 without a gap, and a bundle already published
-that the lock on disk does not describe. It executes nothing out of a package, and it holds a
+metadata pinned, roots that do not run from version 1 without a gap, an index that differs from
+the one the lock on disk records while the generation number is the same (a number names one index,
+so the plugin repository publishes a change as the next number), and a bundle already published that
+the lock on disk does not describe. It executes nothing out of a package, and it holds a
 directory lock so two runs cannot publish at once. The trust a build commits (the production root
 key identifiers, which stay empty until the production root exists, and the development lineage's)
 is written at the top of the script too.

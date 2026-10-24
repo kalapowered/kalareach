@@ -633,6 +633,171 @@ fn the_script_verifies_the_committed_bundle_and_refuses_a_changed_one() {
     );
 }
 
+/// KR-REQ-11.08: one generation number names one index. A synchronisation that would write a lock
+/// for the number the lock on disk holds, over an index whose digest is not the one that lock
+/// records, stops before it writes anything: the lock and the published bundle are as they were.
+/// The same index under that number, and another index under the next number, are the controls:
+/// each gets past the check and stops later, at the plugin repository's missing pipeline, which
+/// the repository made for this case does not carry.
+#[cfg(unix)]
+#[test]
+fn the_script_refuses_another_index_under_the_generation_the_lock_holds() {
+    use std::process::Command;
+
+    for tool in ["python3", "git", "tar"] {
+        if Command::new(tool).arg("--version").output().is_err() {
+            eprintln!("skipping: {tool} is not on this machine, and the script needs it");
+            return;
+        }
+    }
+
+    let repository = repository();
+    let committed_lock = std::fs::read(repository.join(LOCK_FILE)).expect("the committed lock");
+    let committed_index = std::fs::read(repository.join("bundled-plugins/targets/index.json"))
+        .expect("the committed index");
+    let held = kr_plugin_sdk::digest::PayloadDigest::of(&committed_index).to_string();
+    let lock_value: serde_json::Value =
+        serde_json::from_slice(&committed_lock).expect("a readable lock");
+    let recorded = lock_value["metadata"]
+        .as_array()
+        .expect("metadata")
+        .iter()
+        .find(|entry| entry["path"] == "targets/index.json")
+        .expect("the lock names the index")["digest"]
+        .as_str()
+        .expect("a digest")
+        .to_owned();
+    assert_eq!(
+        recorded, held,
+        "the committed lock records the committed index"
+    );
+    let number = lock_value["source"]["generation"]
+        .as_str()
+        .expect("a generation")
+        .to_owned();
+
+    // A copy of the script beside no other file of the repository, a lock to hold, and a plugin
+    // repository of one commit whose development generation holds `index`.
+    let run = |index: &[u8], lock_bytes: &[u8]| {
+        let directory = tempfile::tempdir().expect("a directory");
+        let alone = directory.path().join("checkout");
+        std::fs::create_dir_all(alone.join("scripts")).expect("a directory");
+        let script = alone.join("scripts/sync-bundled-plugins.sh");
+        std::fs::copy(repository.join("scripts/sync-bundled-plugins.sh"), &script)
+            .expect("the script copies");
+        let lock = directory.path().join("bundled-plugins.lock");
+        std::fs::write(&lock, lock_bytes).expect("the lock copies");
+        let bundle = directory.path().join("bundled-plugins");
+
+        let plugins = directory.path().join("plugins");
+        std::fs::create_dir_all(plugins.join("snapshots/development/targets"))
+            .expect("a directory");
+        std::fs::write(
+            plugins.join("snapshots/development/targets/index.json"),
+            index,
+        )
+        .expect("the index writes");
+        let git = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&plugins)
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.test"])
+                .args(arguments)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "--message", "a generation"]);
+        let commit = git(&["rev-parse", "HEAD"]);
+
+        let output = Command::new("bash")
+            .arg(&script)
+            .arg("--plugins")
+            .arg(&plugins)
+            .args(["--commit", &commit])
+            .arg("--bundle-root")
+            .arg(&bundle)
+            .arg("--lock")
+            .arg(&lock)
+            .current_dir(&alone)
+            .output()
+            .expect("the script runs");
+        assert_eq!(
+            std::fs::read(&lock).expect("the lock is there"),
+            lock_bytes,
+            "the lock is as it was"
+        );
+        assert!(!bundle.exists(), "no bundle was published");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            commit,
+        )
+    };
+    // The line the script writes once the check has passed, and what it says when it refuses.
+    let passed = |stdout: &str, commit: &str| {
+        stdout.contains(&format!("verifying snapshots/development at {commit}"))
+    };
+
+    // Other bytes under the number the lock holds.
+    let mut other = committed_index.clone();
+    other.extend_from_slice(b"\n");
+    let changed = kr_plugin_sdk::digest::PayloadDigest::of(&other).to_string();
+    let (success, stdout, stderr, commit) = run(&other, &committed_lock);
+    assert!(!success, "{stderr}");
+    assert!(!passed(&stdout, &commit), "{stdout}");
+    assert!(
+        stderr.contains("already locked")
+            && stderr.contains(&format!("generation {number} "))
+            && stderr.contains(&held)
+            && stderr.contains(&changed),
+        "{stderr}"
+    );
+
+    // The same index: the check passes, and the script stops where the repository has no pipeline.
+    let (success, stdout, stderr, commit) = run(&committed_index, &committed_lock);
+    assert!(!success && passed(&stdout, &commit), "{stdout}{stderr}");
+    assert!(
+        !stderr.contains(&changed) && !stderr.contains("already locked"),
+        "{stderr}"
+    );
+
+    // Other bytes under the next number.
+    let mut next: serde_json::Value = serde_json::from_slice(&committed_index).expect("an index");
+    next["generation"] =
+        serde_json::json!((number.parse::<u64>().expect("a number") + 1).to_string());
+    let (success, stdout, stderr, commit) = run(
+        &serde_json::to_vec(&next).expect("an index"),
+        &committed_lock,
+    );
+    assert!(!success && passed(&stdout, &commit), "{stdout}{stderr}");
+    assert!(!stderr.contains("already locked"), "{stderr}");
+
+    // A lock that names no generation cannot be compared with, and is refused rather than read as
+    // a number of its own.
+    let mut nameless = lock_value.clone();
+    nameless["source"]
+        .as_object_mut()
+        .expect("a source")
+        .remove("generation");
+    let (success, stdout, stderr, commit) = run(
+        &committed_index,
+        serde_json::to_string_pretty(&nameless)
+            .expect("a lock")
+            .as_bytes(),
+    );
+    assert!(!success && !passed(&stdout, &commit), "{stdout}{stderr}");
+    assert!(stderr.contains("names no generation"), "{stderr}");
+}
+
 /// The cleanup the script runs when it is interrupted, taken from the script's own text: from the
 /// function that names the lock's owner, through the traps, to the line that takes the lock.
 fn cleanup_block() -> String {

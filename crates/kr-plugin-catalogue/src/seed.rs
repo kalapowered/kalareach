@@ -247,6 +247,9 @@ pub struct SeedBundle {
     by_digest: Arc<BTreeMap<PayloadDigest, String>>,
     trust: SeedTrust,
     roots: BTreeMap<u64, String>,
+    /// The digest of the index's canonical rendering, which is what a store names a generation's
+    /// index by.
+    index_digest: PayloadDigest,
 }
 
 impl SeedBundle {
@@ -550,6 +553,15 @@ impl SeedBundle {
             }
         }
 
+        let index_digest = PayloadDigest::of(
+            index
+                .canonical_json()
+                .map_err(|source| {
+                    integrity(format!("the bundled index cannot be rendered: {source}"))
+                })?
+                .as_bytes(),
+        );
+
         let mut by_digest = BTreeMap::new();
         for (path, bytes) in &files {
             by_digest
@@ -562,6 +574,7 @@ impl SeedBundle {
             by_digest: Arc::new(by_digest),
             trust,
             roots,
+            index_digest,
         })
     }
 
@@ -569,6 +582,13 @@ impl SeedBundle {
     #[must_use]
     pub fn generation(&self) -> RepositoryGeneration {
         self.lock.source.generation
+    }
+
+    /// The digest of the bundled index's canonical rendering, the one a store that activated this
+    /// generation records for it.
+    #[must_use]
+    pub const fn index_digest(&self) -> PayloadDigest {
+        self.index_digest
     }
 
     /// The highest root the bundle ships, which a new enrolment adopts.
@@ -674,7 +694,8 @@ pub struct SeedOutcome {
     /// next start tries them again.
     pub skipped: Vec<(PluginId, String)>,
     /// Why the seed did less than a full run for a reason the host should report: a bundle this
-    /// build does not trust, or a seeded repository it will not move.
+    /// build does not trust, a seeded repository it will not move, or a bundle that carries another
+    /// index under a generation number the store already holds.
     pub notes: Vec<String>,
     /// What the owner's own choices left alone: a pin that holds back a newer bundle, a removed
     /// seeded repository, a repository of the owner's that holds the bundled root. These are
@@ -879,6 +900,24 @@ impl Catalogue {
         };
 
         let id = enrolled.enrolment.id.clone();
+
+        // A generation number names one index. A store that holds the bundle's number with another
+        // index keeps the one it holds, whether or not a pin is there, and says so: the end state is
+        // right, but the host's owner should be able to read why the bundle was not taken.
+        if let Some(held) = enrolled.active
+            && held.generation == bundle.generation().get()
+            && held.index_digest != bundle.index_digest()
+        {
+            outcome.notes.push(format!(
+                "the bundled generation {} was not taken: this host holds generation {} with the \
+                 index {} and the bundle carries the index {}, and a generation number names one \
+                 index",
+                held.generation,
+                held.generation,
+                held.index_digest,
+                bundle.index_digest()
+            ));
+        }
 
         // Only the sync is skipped by a pin, and by a generation that is already as high: the
         // packages the bundle carries are still installed against whatever is active.
