@@ -301,7 +301,10 @@ fn answer(
         .and_then(|()| {
             actor.admit(request.method.as_str(), request.method_version)?;
             PairingMethod::from_name(request.method.as_str()).ok_or_else(|| {
-                ProtocolError::new(ErrorCode::PermissionDenied, "the method is not available")
+                ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    crate::actor::METHOD_NOT_AVAILABLE,
+                )
             })
         })
         .and_then(|method| surface.call(method, peer, &request.params));
