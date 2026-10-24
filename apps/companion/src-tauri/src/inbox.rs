@@ -11,7 +11,9 @@
 //! in time, is out of contact: that says nothing of what its sessions are doing, and the answer
 //! carries only since when contact has been lost, which this device noted itself. A host that
 //! answers and refuses is in contact, and is not that: it is shown as having refused, with the
-//! refusal it sent, and no loss of contact is noted for it.
+//! refusal it sent, and no loss of contact is noted for it. So is a host of a member's device that
+//! cannot be given the lease its organisation signs for it, because the device is signed out or is
+//! not a member: the refusal is the reason in words, and the host is asked nothing.
 //!
 //! Nothing is written to disk. Which connections are open and since when contact was lost are the
 //! memory of this run; a run that has just started has no loss to report, and says only that
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kr_client::ClientError;
+use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult};
 use kr_protocol::error::ErrorCode;
@@ -278,13 +281,23 @@ impl InboxDesk {
 /// Reads `host`'s inbox over the connection held, or over a fresh one when there is none or it no
 /// longer answers. A refusal on the connection held is the host's answer, and a fresh connection
 /// is not made to ask again.
+///
+/// A host that answers a member's device only while it holds the lease its organisation signed
+/// stops answering the connection held when that lease ends, and nothing keeps the lease of a host
+/// that is not in use fresh. So the lease is presented again over the connection before each read:
+/// the lease the device holds is presented as it is while it lasts, with no request to the
+/// organisation's service, and a new one is asked for when it has ended.
 async fn read_host(
     device: &Arc<Device>,
     host: &PairedHost,
     held: Option<Arc<Connection>>,
 ) -> Visited {
     if let Some(connection) = held {
-        match read_over(&connection).await {
+        let read = match present_again(device, host, &connection).await {
+            Ok(()) => read_over(&connection).await,
+            Err(missed) => Err(missed),
+        };
+        match read {
             Ok((result, sessions)) => return Visited::Read((connection, result, sessions)),
             Err(missed) => {
                 connection.session().close();
@@ -305,6 +318,27 @@ async fn read_host(
             missed.into()
         }
     }
+}
+
+/// Presents again, over `connection`, what the host needs of this device before it answers: the
+/// lease of a member's device, and nothing for a host whose grant answers to no organisation.
+async fn present_again(
+    device: &Arc<Device>,
+    host: &PairedHost,
+    connection: &Connection,
+) -> Result<(), Missed> {
+    let pairing = device.pairing();
+    let identity = pairing.candidate.paired_identity(host.device_id);
+    pairing
+        .link
+        .present_membership(&connection.session(), host, &identity)
+        .await
+        .map_err(|error| match error {
+            LinkError::Refused(refusal) | LinkError::Membership(refusal) => {
+                Missed::Refused(CommandError::from(refusal))
+            }
+            LinkError::Lost(_) | LinkError::Configuration(_) => Missed::Unreached,
+        })
 }
 
 /// Reads the whole inbox and the session numbers over `connection`.
