@@ -2858,6 +2858,34 @@ async fn a_retry_the_worker_answers_with_a_receipt_reaches_the_caller_as_one() {
     );
 }
 
+/// How many names one page of the worker's evidence carries in the cases that need a fence of more
+/// than one acknowledgement carries ([`seed_a_fence_across_pages`]), so that a fence which spans pages
+/// is a few actions and not hundreds.
+///
+/// Each action the fence takes back is a durable commit of its own, and the daemon waits for the
+/// worker's acknowledgement for a bound of its own (five seconds). A disk that takes tens of
+/// milliseconds for a durable write, as a hosted Windows runner's does, makes a fence of five
+/// hundred actions last half a minute, and the daemon answers the revocation as pending before the
+/// worker has fenced: section 9's answer for a worker that has not yet acknowledged, and not the
+/// answer these cases read.
+const NAMES_A_PAGE_CARRIES: usize = 8;
+
+/// Makes a page of the worker's evidence carry [`NAMES_A_PAGE_CARRIES`] names and accepts two pages of
+/// intents and five more from `device` that the worker never dispatches: a fence that takes them
+/// back spans pages, as a fence of the hundreds a full page holds does, in a few durable commits.
+/// Returns how many it accepted.
+fn seed_a_fence_across_pages(hosted: &Hosted, device: &ActorId) -> usize {
+    hosted
+        .runtime
+        .session()
+        .journal_mut()
+        .expect("a journal")
+        .limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
+    let affected = NAMES_A_PAGE_CARRIES * 2 + 5;
+    seed_undispatched_intents(hosted, device, affected);
+    affected
+}
+
 /// Accepts `count` intents from `device` that the worker never dispatches, more than one
 /// acknowledgement carries when `count` is, so that a fence that takes them back reports them in
 /// pages.
@@ -2934,8 +2962,7 @@ async fn a_revocation_collects_every_name_a_fence_produced_even_across_pages() {
     let hosted = hosted_worker().await;
     let device = actor("device:phone");
     // More intents than one acknowledgement carries, so the answer has to come in pages.
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    seed_undispatched_intents(&hosted, &device, affected);
+    let affected = seed_a_fence_across_pages(&hosted, &device);
 
     let first = hosted
         .controller
@@ -3038,8 +3065,7 @@ fn worker_report(
 async fn a_page_refused_while_the_worker_is_inside_its_dispatch_boundary_is_asked_for_again() {
     let hosted = hosted_worker_apart().await;
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    seed_undispatched_intents(&hosted, &device, affected);
+    let affected = seed_a_fence_across_pages(&hosted, &device);
 
     let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
@@ -3084,8 +3110,7 @@ async fn a_worker_that_refuses_every_page_is_asked_a_bounded_number_of_times_and
  {
     let hosted = hosted_worker_apart().await;
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    seed_undispatched_intents(&hosted, &device, affected);
+    let affected = seed_a_fence_across_pages(&hosted, &device);
 
     let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
@@ -3142,8 +3167,7 @@ async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
     let hosted = hosted_worker_apart().await;
     hosted.controller.limit_evidence_pages_for_tests(2);
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    seed_undispatched_intents(&hosted, &device, affected);
+    let affected = seed_a_fence_across_pages(&hosted, &device);
 
     let stopped = stopped_after_the_acknowledgement(&hosted.controller).await;
     let refused = hosted.service.refusals_for_the_boundary();
@@ -3193,9 +3217,9 @@ async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_ask
         add_worker(&daemon, false).await,
     ];
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    let mut affected = 0;
     for hosted in &hosts {
-        seed_undispatched_intents(hosted, &device, affected);
+        affected = seed_a_fence_across_pages(hosted, &device);
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
@@ -3278,8 +3302,7 @@ async fn the_actions_a_fence_could_not_take_back_are_named_in_the_acknowledgemen
     let hosted = hosted_worker().await;
     hosted.controller.limit_evidence_pages_for_tests(0);
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    seed_undispatched_intents(&hosted, &device, affected);
+    seed_a_fence_across_pages(&hosted, &device);
     let dispatched = [
         a_dispatched_action(&hosted).await,
         a_dispatched_action(&hosted).await,
@@ -3374,9 +3397,8 @@ async fn the_asking_again_of_an_announcement_is_bounded_for_all_the_workers_it_c
         add_worker(&daemon, true).await,
     ];
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
     for hosted in &hosts {
-        seed_undispatched_intents(hosted, &device, affected);
+        seed_a_fence_across_pages(hosted, &device);
     }
     let refusals = |hosts: &[Hosted; 2]| {
         hosts
@@ -3487,17 +3509,6 @@ fn an_issued_grant(hosted: &Hosted) -> kr_protocol::ids::GrantId {
     held.grant_id
 }
 
-/// How many names one page of the worker's evidence carries in the cases that read the answer to
-/// a revocation, so that a fence which spans pages is a few actions and not hundreds.
-///
-/// Each action the fence takes back is a durable commit of its own, and the daemon waits for the
-/// worker's acknowledgement for a bound of its own (five seconds). A disk that takes tens of
-/// milliseconds for a durable write, as a hosted Windows runner's does, makes a fence of five
-/// hundred actions last half a minute, and the daemon answers the revocation as pending before the
-/// worker has fenced: section 9's answer for a worker that has not yet acknowledged, and not the
-/// answer these cases read.
-const NAMES_A_PAGE_CARRIES: usize = 8;
-
 /// A real revocation of a grant, sent by the local owner, whose answer leaves names to come.
 ///
 /// A worker that is busy for a moment refuses the announcement, and the answer is then pending
@@ -3539,15 +3550,8 @@ async fn a_revocation_answered_once() -> Unasked {
     let hosted = hosted_worker().await;
     let granted = an_issued_grant(&hosted);
     hosted.controller.limit_evidence_pages_for_tests(0);
-    hosted
-        .runtime
-        .session()
-        .journal_mut()
-        .expect("a journal")
-        .limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
     let device = actor("device:phone");
-    let affected = NAMES_A_PAGE_CARRIES * 2 + 5;
-    seed_undispatched_intents(&hosted, &device, affected);
+    let affected = seed_a_fence_across_pages(&hosted, &device);
 
     let mut client = LocalClient::connect(&hosted.client_endpoint, LocalClientKind::Cli, build())
         .await

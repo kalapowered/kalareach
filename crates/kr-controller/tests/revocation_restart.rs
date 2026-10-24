@@ -395,6 +395,117 @@ async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that
     adopted.stop().await;
 }
 
+/// How many names one page of the worker's evidence carries in the case that needs a fence of more
+/// than one acknowledgement carries.
+///
+/// Each action the fence takes back is a durable commit of its own, and the daemon waits for the
+/// worker's acknowledgement for a bound of its own (five seconds). A fence of the five hundred
+/// actions a full page holds twice over lasts as long as five hundred durable writes take, which
+/// a loaded disk or a hosted Windows runner makes longer than the bound: the daemon then answers
+/// the revocation as pending before the worker has fenced, and not with the answer this case reads.
+const NAMES_A_PAGE_CARRIES: usize = 8;
+
+/// A daemon whose worker has a fence of more names than one acknowledgement carries, and the
+/// revocation of a share the worker is named in, answered once with names still owing.
+struct Owing {
+    host: Host,
+    workers: Vec<Worker>,
+    /// The revocation, as the local owner sent it: repeating it repeats the action.
+    mutation: kr_protocol::envelope::MutationRequest,
+    session_id: kr_protocol::ids::SessionId,
+    owed: usize,
+}
+
+/// Arranges [`Owing`]. A worker that is busy for a moment refuses the announcement, and the answer
+/// is then pending (section 9): nothing has been fenced, so nothing is owing, and a later
+/// announcement does not change the answer the daemon kept of the mutation. When it is pending the
+/// arrangement is made again on a new daemon, until an answer holds. One deadline bounds the
+/// attempts, and a failure says what each attempt answered.
+async fn a_revocation_that_left_names_owing() -> Owing {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut attempts = Vec::new();
+    loop {
+        let started = tokio::time::Instant::now();
+        let Adopted {
+            host,
+            owner,
+            workers,
+        } = Adopted::start(1).await;
+        let session_id = workers[0].session_id;
+        let (device, record) = recipient(&host, &owner).await;
+        let granted = share(
+            &host,
+            session_id,
+            &device,
+            &record,
+            RoleSelection::plain(SessionRole::Controller),
+        )
+        .await;
+        // Two full pages of the worker's evidence and five names more, so that the names an
+        // acknowledgement carries are a part of them.
+        workers[0].limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
+        let owed = NAMES_A_PAGE_CARRIES * 2 + 5;
+        workers[0]
+            .seed_undispatched_intents(&ActorId::new("device:phone").expect("a principal"), owed);
+        host.controller().limit_evidence_pages_for_tests(0);
+
+        let mut client = host.client().await;
+        let mutation = client
+            .compose(
+                Method::GrantRevoke,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                on_the_host(&host),
+                &kr_protocol::sharing::GrantRevokeParams {
+                    grant_id: granted.grant_id,
+                },
+            )
+            .await
+            .expect("the revocation is composed");
+        let first: kr_protocol::sharing::RevocationResult =
+            tokio::time::timeout(Duration::from_secs(60), client.repeat(&mutation))
+                .await
+                .expect("the revocation is answered")
+                .expect("the daemon answers")
+                .expect("the revocation is done")
+                .to_typed()
+                .expect("a revocation result");
+        let given = first
+            .barrier
+            .workers
+            .iter()
+            .find(|reported| reported.session_id == session_id)
+            .expect("the worker is in the barrier");
+        if first.barrier.holds() {
+            assert!(
+                given.names_pending.get() > 0,
+                "the names did not all arrive with the first answer: {given:?}"
+            );
+            drop(client);
+            return Owing {
+                host,
+                workers,
+                mutation,
+                session_id,
+                owed,
+            };
+        }
+        attempts.push(format!(
+            "{:?} after {:?}: {}",
+            given.state,
+            started.elapsed(),
+            given.detail
+        ));
+        drop(client);
+        host.stop().await;
+        drop(workers);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no answer to a revocation held within a minute of {} attempts: {attempts:#?}",
+            attempts.len()
+        );
+    }
+}
+
 /// KR-REQ-10.45, 09.13: a restarted daemon collects the names a revocation left owing, which the
 /// repeat of that revocation then carries.
 ///
@@ -403,56 +514,14 @@ async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that
 /// took none, and the new daemon asks for them again once it has started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
-    let Adopted {
+    let Owing {
         host,
-        owner,
         workers,
-    } = Adopted::start(1).await;
-    let session_id = workers[0].session_id;
-    let (device, record) = recipient(&host, &owner).await;
-    let granted = share(
-        &host,
+        mutation,
         session_id,
-        &device,
-        &record,
-        RoleSelection::plain(SessionRole::Controller),
-    )
-    .await;
-    let owed = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
-    workers[0].seed_undispatched_intents(&ActorId::new("device:phone").expect("a principal"), owed);
-    host.controller().limit_evidence_pages_for_tests(0);
+        owed,
+    } = a_revocation_that_left_names_owing().await;
 
-    let mut client = host.client().await;
-    let mutation = client
-        .compose(
-            Method::GrantRevoke,
-            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-            on_the_host(&host),
-            &kr_protocol::sharing::GrantRevokeParams {
-                grant_id: granted.grant_id,
-            },
-        )
-        .await
-        .expect("the revocation is composed");
-    let first: kr_protocol::sharing::RevocationResult = client
-        .repeat(&mutation)
-        .await
-        .expect("the daemon answers")
-        .expect("the revocation is done")
-        .to_typed()
-        .expect("a revocation result");
-    let given = first
-        .barrier
-        .workers
-        .iter()
-        .find(|reported| reported.session_id == session_id)
-        .expect("the worker is in the barrier");
-    assert!(
-        given.names_pending.get() > 0,
-        "the names did not all arrive with the first answer: {given:?}"
-    );
-
-    drop(client);
     let stopped = host.shut_down().await;
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
