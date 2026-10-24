@@ -9,7 +9,7 @@ this script. It reads them and fails on a change the register has no row for:
     links PCRE2, so a PCRE2 advisory is a fish advisory);
   * the issues of PowerShell/Announcements that are security advisories, which is where Microsoft
     publishes the advisories that reach PowerShell, the .NET ones included (the Security label,
-    or a title that says so or names a CVE on an issue a member of the organisation opened);
+    or a title that says so or names a CVE, whoever opened the issue);
   * the stable releases of fish and PowerShell, the tags of zsh and the releases and patches of
     bash that are newer than what the packages pin. Neither zsh nor bash publishes a machine
     readable advisory feed, so a new release or patch is the only signal either gives;
@@ -18,7 +18,8 @@ this script. It reads them and fails on a change the register has no row for:
 
 A change needs a row when it was first published on or after the day the register started, or
 when its affected range includes what the package pins (a RustSec advisory against the lock needs
-one whatever its date). The newest row that names the package and the change by its identifier
+one whatever its date), or when it was revised on or after that day and its ranges now reach a
+version the module accepts, for the advisories of the two packages that pin no version. The newest row that names the package and the change by its identifier
 covers it, when its status is one the register defines, it is not `scheduled` past its target, it
 quotes every affected range the source gives as the source gives it, and it is dated on or after
 the day the source last revised the change, so that a revision is a new fact and not an old row.
@@ -27,7 +28,7 @@ the time the register allows for triage, and fails after it. A RustSec advisory 
 allowance, because the report carries no date on which it reached the database.
 
 Every source is public. The run's own read-only token is used for api.github.com only, to lift
-the rate limit. A source that cannot be read, or answers with nothing where it must have
+the rate limit, and goes with the first request alone: a redirect is followed without it. A source that cannot be read, or answers with nothing where it must have
 something, fails the run and names itself; nothing passes silently.
 
   check-shell-advisories.py check [--root DIR] [--facts DIR] [--audit FILE] [--now YYYY-MM-DD]
@@ -56,6 +57,7 @@ REGISTER = "docs/shell-integration/upstream.md"
 STARTED = datetime.date(2026, 9, 20)
 STATUSES = ("released", "scheduled", "flagged", "not-affected")
 GITHUB = "https://api.github.com"
+TOKEN_HOST = "api.github.com"
 GNU_BASH = "https://ftp.gnu.org/gnu/bash"
 RETRIES = 3
 RETRY_DELAY = 2.0
@@ -71,15 +73,17 @@ class SourceError(Exception):
 
 def fetch(url, token=None, missing_ok=False):
     """The body at url and the Link header of the answer, after up to three tries. The token goes
-    to api.github.com only. A page that is not there is None where the caller says it may be
-    missing."""
+    to api.github.com only, with the first request: urllib copies a request's ordinary headers to
+    the request a redirect makes, wherever it leads, so the token is added as a header that is not
+    copied. A redirect inside api.github.com is then followed without it, which only lowers the
+    rate limit. A page that is not there is None where the caller says it may be missing."""
     headers = {"User-Agent": "kalareach-shell-advisories", "Accept": "application/vnd.github+json"}
-    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
-        headers["Authorization"] = "Bearer " + token
     last = None
     for attempt in range(RETRIES):
         try:
             request = urllib.request.Request(url, headers=headers)
+            if token and urllib.parse.urlparse(url).hostname == TOKEN_HOST:
+                request.add_unredirected_header("Authorization", "Bearer " + token)
             with urllib.request.urlopen(request, timeout=60) as response:
                 return response.read(), response.headers.get("Link") or ""
         except urllib.error.HTTPError as error:
@@ -156,6 +160,49 @@ def in_range(range_text, version):
     return True
 
 
+def range_intervals(range_text):
+    """The versions a range covers, as half-open intervals of number tuples: `low` is inside, `high`
+    is not, and None is no bound. Comparators separated by a comma all hold, alternatives separated
+    by `||` are each their own interval, and `a-b` is the span from a to b. A suffix such as `-RC.2`
+    adds its numbers to the version, which is as near as a number tuple gets. None when the range
+    cannot be read in full."""
+    intervals = []
+    for alternative in range_text.split("||"):
+        low, high = None, None
+        span = re.match(r"\s*([0-9][0-9A-Za-z.+]*)\s*-\s*([0-9][0-9A-Za-z.+]*)\s*$", alternative)
+        if span:
+            intervals.append((numbers(span.group(1)), numbers(span.group(2)) + (0,)))
+            continue
+        for comparator in alternative.split(","):
+            match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
+            if not match:
+                return None
+            operator, version = match.group(1) or "=", numbers(match.group(2))
+            if operator in (">=", "="):
+                low = version if low is None else max(low, version)
+            if operator == ">":
+                low = version + (0,) if low is None else max(low, version + (0,))
+            if operator == "<":
+                high = version if high is None else min(high, version)
+            if operator in ("<=", "="):
+                high = version + (0,) if high is None else min(high, version + (0,))
+        intervals.append((low, high))
+    return intervals
+
+
+def overlap(first, second):
+    lows = [bound for bound in (first[0], second[0]) if bound is not None]
+    highs = [bound for bound in (first[1], second[1]) if bound is not None]
+    return not lows or not highs or max(lows) < min(highs)
+
+
+def reaches(range_text, accepted):
+    """Whether a range covers any version inside the accepted intervals. A range that cannot be read
+    in full counts as reaching, because the safe mistake is a row too many."""
+    intervals = range_intervals(range_text)
+    return intervals is None or any(overlap(each, other) for each in intervals for other in accepted)
+
+
 def finding(source, package, identifier, aliases, published, updated=None, ranges=(), needs_row=True,
             allowance=True):
     """One change an upstream published. `published` and `updated` are the days it first appeared
@@ -174,10 +221,13 @@ def finding(source, package, identifier, aliases, published, updated=None, range
     }
 
 
-def repository_advisories(api, token, repository, package, pinned, may_be_empty=False):
+def repository_advisories(api, token, repository, package, pinned, may_be_empty=False, accepted=None):
     """The security advisories of one repository. `pinned` is the version of what the package
-    pins from it, or None where only the date decides. A repository that has published none
-    is the one case of a source that may answer with nothing."""
+    pins from it, or None where only the date decides. `accepted` is, for a package that pins no
+    version, the intervals of the versions its module accepts: an advisory revised since the
+    register started whose ranges now reach one of them needs a row, whenever it was first
+    published. A repository that has published none is the one case of a source that may answer
+    with nothing."""
     source = "%s security advisories" % repository
     items = fetch_pages(
         "%s/repos/%s/security-advisories" % (api, repository),
@@ -195,6 +245,10 @@ def repository_advisories(api, token, repository, package, pinned, may_be_empty=
         ]
         affects = bool(pinned) and any(in_range(text, pinned) for text in texts)
         recent = published is not None and published >= STARTED
+        revised = updated is not None and updated >= STARTED
+        affects = affects or (
+            bool(accepted) and revised and (not texts or any(reaches(text, accepted) for text in texts))
+        )
         found.append(
             finding(
                 source,
@@ -231,9 +285,11 @@ def revised_day(body, created):
 
 def announcements(api, token):
     """The advisories Microsoft publishes for PowerShell, the .NET ones that reach it included.
-    An issue is an advisory when it carries the Security label, or when its title says it is one or
-    names a CVE and a member of the organisation opened it: not every advisory is labelled, and
-    anyone can open an issue. Pull requests are not issues."""
+    An issue is an advisory when it carries the Security label or when its title says it is one or
+    names a CVE: not every advisory is labelled. Who opened it is not asked, because GitHub shows a
+    member of another organisation, or one whose membership is private, as a contributor; an issue
+    that only looks like an advisory then fails the run for a row, which is the safe direction.
+    Pull requests are not issues."""
     url = "%s/repos/PowerShell/Announcements/issues?state=all" % api
     found = []
     for item in fetch_pages(url, token):
@@ -242,9 +298,7 @@ def announcements(api, token):
         labelled = "Security" in [
             label if isinstance(label, str) else (label or {}).get("name") for label in item.get("labels") or []
         ]
-        titled = bool(cves or re.search(r"Security Advisory", title, re.I)) and item.get(
-            "author_association"
-        ) in ("MEMBER", "OWNER", "COLLABORATOR")
+        titled = bool(cves or re.search(r"Security Advisory", title, re.I))
         if "pull_request" in item or not (labelled or titled):
             continue
         identifier = cves[0] if cves else "PowerShell/Announcements#%d" % item["number"]
@@ -326,10 +380,11 @@ def zsh_tags(api, token, pinned):
 
 def bash_listing(ftp, path, pattern, missing_ok=False):
     """The entries of a directory listing on ftp.gnu.org that match `pattern`, with the day each
-    was put there. The pattern has one group, the entry's name."""
+    was put there, or None where the page is not there and the caller says it may be missing. The
+    pattern has one group, the entry's name."""
     body, _ = fetch("%s/%s" % (ftp, path), None, missing_ok=missing_ok)
     if body is None:
-        return []
+        return None
     listing = body.decode("utf-8", "replace")
     entries = []
     for line in listing.splitlines():
@@ -339,29 +394,27 @@ def bash_listing(ftp, path, pattern, missing_ok=False):
     return entries
 
 
-PATCH_GRACE_DAYS = 60
-
-
-def bash_releases(ftp, pinned, now):
+def bash_releases(ftp, pinned, register_text):
     """Releases of a series newer than the pinned one, the newest patch of each such series (bash
     fixes land in the newest series, and a patch to it that fixes a defect the pinned series also
     has gets no other announcement), and the patches of the pinned series above the pinned patch.
-    The pinned series' patch directory must be there. A newer series gets its first patches within
-    weeks of its release, so its directory may be missing or empty for sixty days after the release
-    and not after: a directory that stays missing is a source that failed."""
+    The pinned series' patch directory must be there. A newer series has patches when the root
+    listing names its patch directory or the register names one of its patches, and then the
+    directory must answer; one that answers with nothing is a failed source only when the register
+    has named a patch of the series. A series with neither has none yet, at whatever age."""
     found = []
     pin = numbers(pinned)
     releases = bash_listing(ftp, "", r"bash-(?:\d+\.\d+(?:\.\d+)?)\.tar\.gz")
     if not releases:
         raise SourceError("%s/: the listing holds no release" % ftp)
-    series = {}
+    listed = {name for name, _ in bash_listing(ftp, "", r"bash-\d+\.\d+-patches/")}
+    series = set()
     for name, published in releases:
         version = numbers(name.replace(".tar.gz", ""))
         if version > pin:
             found.append(finding("bash releases", "bash", name.replace(".tar.gz", ""), [], published))
         if version[:2] > pin[:2]:
-            first = series.get(version[:2])
-            series[version[:2]] = min(first, published) if first and published else (first or published)
+            series.add(version[:2])
     pinned_patches = "bash-%d.%d-patches/" % pin[:2]
     patches = bash_listing(ftp, pinned_patches, r"bash%d%d-\d+" % pin[:2])
     if not patches:
@@ -369,16 +422,19 @@ def bash_releases(ftp, pinned, now):
     for name, published in patches:
         if int(name.rsplit("-", 1)[1]) > pin[2]:
             found.append(finding("bash patches", "bash", name, [], published))
-    for (major, minor), released in sorted(series.items()):
+    for major, minor in sorted(series):
         directory = "bash-%d.%d-patches/" % (major, minor)
+        named = re.search(r"\bbash%d%d-\d+" % (major, minor), register_text) is not None
+        if directory not in listed and not named:
+            continue
         newer = bash_listing(ftp, directory, r"bash%d%d-\d+" % (major, minor), True)
+        if newer is None:
+            raise SourceError("%s/%s: the series has patches and its directory does not answer" % (ftp, directory))
         if newer:
             name, published = max(newer, key=lambda entry: int(entry[0].rsplit("-", 1)[1]))
             found.append(finding("bash patches", "bash", name, [], published))
-        elif released is None or (now - released).days > PATCH_GRACE_DAYS:
-            raise SourceError(
-                "%s/%s: the listing of a series released %s holds no patch" % (ftp, directory, released)
-            )
+        elif named:
+            raise SourceError("%s/%s: the register names patches of the series and the listing holds none" % (ftp, directory))
     return found
 
 
@@ -555,7 +611,16 @@ def pinned_versions(root):
         for series, fixed in advisory["first_fixed"].items():
             key = numbers(series)
             floors[key] = max(floors.get(key, ()), numbers(fixed))
+    # What the module accepts of PowerShell: from the first fixed release of each series it lists to
+    # the next series, and every series above the newest. What it accepts of PSReadLine is the
+    # range it was qualified against.
+    newest = max(floors) if floors else (0, 0)
+    powershell = [(floor, (series[0], series[1] + 1)) for series, floor in sorted(floors.items())]
+    powershell.append(((newest[0], newest[1] + 1), None))
+    qualified = manifest("psreadline")["qualified"]
+    psreadline = [(numbers(qualified["psreadline_from"]), numbers(qualified["psreadline_before"]))]
     return {
+        "accepted": {"powershell": powershell, "psreadline": psreadline},
         "fish": manifest("fish")["upstream"]["version"],
         "zsh": manifest("zsh")["upstream"]["version"],
         "bash": manifest("bash")["upstream"]["version"],
@@ -563,7 +628,7 @@ def pinned_versions(root):
     }
 
 
-def collect(root, api, ftp, token, facts, audit, now):
+def collect(root, api, ftp, token, facts, audit, register_text):
     pins = pinned_versions(root)
     pcre2 = None
     if facts:
@@ -574,13 +639,18 @@ def collect(root, api, ftp, token, facts, audit, now):
     found = []
     found += repository_advisories(api, token, "fish-shell/fish-shell", "fish", pins["fish"])
     found += repository_advisories(api, token, "PCRE2Project/pcre2", "fish", pcre2)
-    found += repository_advisories(api, token, "PowerShell/PowerShell", "psreadline", None)
-    found += repository_advisories(api, token, "PowerShell/PSReadLine", "psreadline", None, may_be_empty=True)
+    found += repository_advisories(
+        api, token, "PowerShell/PowerShell", "psreadline", None, accepted=pins["accepted"]["powershell"]
+    )
+    found += repository_advisories(
+        api, token, "PowerShell/PSReadLine", "psreadline", None, may_be_empty=True,
+        accepted=pins["accepted"]["psreadline"],
+    )
     found += announcements(api, token)
     found += powershell_releases(api, token, pins["floors"])
     found += fish_releases(api, token, pins["fish"])
     found += zsh_tags(api, token, pins["zsh"])
-    found += bash_releases(ftp, pins["bash"], now)
+    found += bash_releases(ftp, pins["bash"], register_text)
     found += audited_lock(audit)
     return found
 
@@ -594,7 +664,7 @@ def check(args, register_text=None):
     triage_days = figure_within(block(register_text, "target"), "working day")
     if triage_days is None:
         raise SourceError("%s states no time within which a change is triaged" % REGISTER)
-    findings = collect(args.root, args.github_api, args.gnu_bash, token, args.facts, args.audit, now)
+    findings = collect(args.root, args.github_api, args.gnu_bash, token, args.facts, args.audit, register_text)
     problems, waiting = judge(findings, triage_rows(register_text), now, triage_days)
     return findings, problems, waiting
 
@@ -708,9 +778,11 @@ def routes():
 
 class Server:
     """A local stand-in for the public sources. A route holds the answer, or a list of answers
-    that GitHub-style Link headers chain together, the first asked for with no cursor."""
+    that GitHub-style Link headers chain together, the first asked for with no cursor. A redirect
+    names, by a `%d` for this server's port, the address another path leads to; `seen` holds each
+    request's path and the Authorization header it came with."""
 
-    def __init__(self, table):
+    def __init__(self, table, redirects=None):
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -718,6 +790,13 @@ class Server:
                 parsed = urllib.parse.urlparse(self.path)
                 cursor = urllib.parse.parse_qs(parsed.query).get("after", ["0"])[0]
                 outer.requests.append(self.path)
+                outer.seen.append((parsed.path, self.headers.get("Authorization")))
+                location = outer.redirects.get(parsed.path)
+                if location is not None:
+                    self.send_response(302)
+                    self.send_header("Location", location % outer.httpd.server_address[1])
+                    self.end_headers()
+                    return
                 answer = outer.table.get(parsed.path)
                 if answer is None:
                     self.send_response(404)
@@ -740,7 +819,8 @@ class Server:
             def log_message(self, *_):
                 pass
 
-        self.table, self.requests = table, []
+        self.table, self.requests, self.seen = table, [], []
+        self.redirects = redirects or {}
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
@@ -754,8 +834,9 @@ class Server:
 
 
 def run_self_test():
-    global RETRY_DELAY
+    global RETRY_DELAY, TOKEN_HOST
     RETRY_DELAY = 0.0
+    TOKEN_HOST = "127.0.0.1"
     with open(os.path.join(ROOT, REGISTER)) as handle:
         register = handle.read()
     audit = os.path.join(FIXTURES, "cargo-audit-fish-4.9.3.json")
@@ -892,14 +973,19 @@ def run_self_test():
         expect("a revised advisory", says(outcome, "CVE-2026-69806", "revised 2026-10-30"), str(outcome))
         outcome = attempt(edited(routes(), issues, commented), now="2026-11-10")
         expect("a comment on an advisory", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-69806"), str(outcome))
-        def spam(items):
-            return items + [{
-                "number": 9003, "title": "Advisory: CVE-2026-77777 PowerShell Remote Code Execution", "labels": [],
-                "created_at": "2026-10-20T10:00:00Z", "updated_at": "2026-10-20T10:00:00Z", "state": "closed",
-                "author_association": "NONE", "body": "",
-            }]
-        outcome = attempt(edited(routes(), issues, spam), now="2026-11-10")
-        expect("an advisory-shaped issue from outside the organisation", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-77777"), str(outcome))
+        def titled_by(author, number):
+            def add(items):
+                return items + [{
+                    "number": number, "title": "Advisory: CVE-2026-%d PowerShell Remote Code Execution" % number,
+                    "labels": [], "created_at": "2026-10-20T10:00:00Z", "updated_at": "2026-10-20T10:00:00Z",
+                    "state": "closed", "author_association": author, "body": "",
+                }]
+            return add
+        # GitHub shows a member of another organisation, or one whose membership is private, as a
+        # contributor, so who opened an issue says nothing about whether it is an advisory.
+        for author, number in (("CONTRIBUTOR", 77777), ("NONE", 77778)):
+            outcome = attempt(edited(routes(), issues, titled_by(author, number)), now="2026-11-10")
+            expect("a titled advisory opened by " + author, says(outcome, "CVE-2026-%d" % number, "no triage row"), str(outcome))
         def labelled_only(items):
             return items + [{
                 "number": 9004, "title": "OpenSSL 4.0 Security Release", "labels": ["Security", "PowerShell"],
@@ -941,6 +1027,42 @@ def run_self_test():
         outcome = attempt(edited(routes(), "/repos/PowerShell/PowerShell/security-advisories", powershell_advisory))
         expect("a PowerShell advisory", says(outcome, "GHSA-aaaa-bbbb-cccc", "no triage row"), str(outcome))
 
+        # An advisory published before the register started and revised after needs a row when its
+        # ranges now reach a version the module accepts. A range that starts inside a series is
+        # found by what it covers, and one that covers only what the module refuses is not.
+        def old_advisory(identifier, text, updated):
+            def add(items):
+                return items + [{
+                    "ghsa_id": identifier, "cve_id": None, "published_at": "2026-08-01T10:00:00Z",
+                    "updated_at": updated, "severity": "high", "summary": "x",
+                    "vulnerabilities": [{"package": {"name": "PowerShell"}, "vulnerable_version_range": text, "patched_versions": ""}],
+                }]
+            return add
+        powershell_route = "/repos/PowerShell/PowerShell/security-advisories"
+        for text, revised, needs, name in (
+            (">= 7.6.7, < 7.6.9", "2026-10-20T10:00:00Z", True, "a revised range that starts inside a series"),
+            ("< 7.6.8 || >= 7.0.0, < 7.2.1", "2026-10-20T10:00:00Z", True, "a revised range with an alternative"),
+            (">= 7.4.0, < 7.4.15", "2026-10-20T10:00:00Z", False, "a revised range of releases the module refuses"),
+            ("<= 7.3.11", "2026-10-20T10:00:00Z", False, "a revised range below what the module loads on"),
+            (">= 7.6.7, < 7.6.9", "2026-08-02T10:00:00Z", False, "the same range, not revised since the register started"),
+        ):
+            outcome = attempt(
+                edited(routes(), powershell_route, old_advisory("GHSA-old1-aaaa-bbbb", text, revised)), now="2026-11-10"
+            )
+            expect(
+                name,
+                not isinstance(outcome, SourceError) and says(outcome, "GHSA-old1-aaaa-bbbb", "no triage row") == needs,
+                str(outcome),
+            )
+        reader_route = "/repos/PowerShell/PSReadLine/security-advisories"
+        table = routes()
+        table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", ">= 2.3.5, < 2.3.7", "2026-10-20T10:00:00Z")([])).encode()
+        outcome = attempt(table, now="2026-11-10")
+        expect("a revised PSReadLine range inside the qualified one", says(outcome, "GHSA-old2-aaaa-bbbb", "no triage row"), str(outcome))
+        table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", "< 2.3.4", "2026-10-20T10:00:00Z")([])).encode()
+        outcome = attempt(table, now="2026-11-10")
+        expect("a revised PSReadLine range below it", not isinstance(outcome, SourceError) and not says(outcome, "GHSA-old2"), str(outcome))
+
         # The allowance: a change that arrived a working day ago waits, two working days ago it
         # fails. GHSA-r9hj was published on 2026-09-28 and last revised on Thursday 2026-10-01.
         text = without("GHSA-r9hj-j2rw-4q3m")
@@ -957,14 +1079,29 @@ def run_self_test():
         )
         outcome = attempt(table, now="2026-10-28")
         expect("a patch of the newer bash series", says(outcome, "bash53-021", "no triage row"), str(outcome))
+        five_three = "/gnu/bash/bash-5.3-patches/"
+        # A series has patches when the root listing names its directory or the register names one of
+        # them, and then the directory has to answer, whatever the series' age.
         table = routes()
-        del table["/gnu/bash/bash-5.3-patches/"]
+        del table[five_three]
         outcome = attempt(table)
         expect("a patch directory that went missing", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        unnamed = register.replace("bash53-", "bash 5.3 patch ")
+        outcome = attempt(table, text=unnamed)
+        expect("a listed directory that went missing, no patch named", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        unlisted = routes()
+        unlisted["/gnu/bash/"] = b"".join(
+            line for line in unlisted["/gnu/bash/"].splitlines(keepends=True) if b"bash-5.3-patches/" not in line
+        )
+        del unlisted[five_three]
+        outcome = attempt(unlisted)
+        expect("a directory the register has patches of, gone from the listing", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
         table = routes()
-        table["/gnu/bash/bash-5.3-patches/"] = b"<html>no listing</html>"
+        table[five_three] = b"<html>no listing</html>"
         outcome = attempt(table)
-        expect("a patch listing with nothing in it", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        expect("a patch listing with nothing in it, patches named", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        outcome = attempt(table, text=unnamed)
+        expect("a patch listing with nothing in it, none named", not isinstance(outcome, SourceError), str(outcome))
         table = routes()
         del table["/gnu/bash/bash-5.2-patches/"]
         outcome = attempt(table)
@@ -974,8 +1111,27 @@ def run_self_test():
         outcome = attempt(table, now="2026-10-24", text=with_row(
             "| 2026-10-24 | bash-5.4, the series after 5.3; released 2026-10-20 | bash | Read. | 2026-11-03 | not-affected |"))
         expect("a new series with no patch yet", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
+        # A series that has gone a long time with no patch is not a source that failed: nothing names
+        # a patch of it.
+        table = routes()
+        table["/gnu/bash/"] += b'<a href="bash-5.4.tar.gz">bash-5.4.tar.gz</a> 2026-07-01 10:00  11M\n'
+        outcome = attempt(table, now="2026-10-24", text=with_row(
+            "| 2026-10-24 | bash-5.4, the series after 5.3; released 2026-07-01 | bash | Read. | 2026-07-15 | not-affected |"))
+        expect("an old series with no patch", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
+        # A patch is judged against the allowance from the day it was put there: a Friday patch waits
+        # through Monday, the one working day the register allows, and has no row by Tuesday.
+        table = routes()
+        table[five_three] += (
+            b'<tr><td><a href="bash53-021">bash53-021</a></td><td align="right">2026-10-23 10:00  </td></tr>\n'
+        )
         outcome = attempt(table, now="2026-10-26")
-        expect("a new patch inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "bash53-021"), str(outcome))
+        expect(
+            "a new patch inside its allowance",
+            not isinstance(outcome, SourceError) and not says(outcome, "bash53-021") and any("bash53-021" in line for line in outcome[2]),
+            str(outcome),
+        )
+        outcome = attempt(table, now="2026-10-27")
+        expect("a new patch past its allowance", says(outcome, "bash53-021", "no triage row"), str(outcome))
         with open(audit) as handle:
             report = json.load(handle)
         report["warnings"]["unsound"].append({
@@ -1031,6 +1187,14 @@ def run_self_test():
         asked = [path for path in server.requests if path.startswith("/paged")]
         expect("the next page is the one the header names", len(asked) == 2 and "after=1" in asked[1], str(asked))
         expect("a single page is asked for once", len([p for p in server.requests if p.startswith("/single")]) == 1)
+
+        # The token goes to the first request, and a redirect to another host is followed without it:
+        # the server answers /start with a redirect to the same server under another name.
+        server = Server({"/final": b"[]"}, {"/start": "http://localhost:%d/final"})
+        with server as base:
+            fetch(base + "/start", "a-token")
+        expect("the token goes with the request it was made for", ("/start", "Bearer a-token") in server.seen, str(server.seen))
+        expect("a redirect carries no token", ("/final", None) in server.seen, str(server.seen))
     print("check-shell-advisories self-test: %d checks passed" % len(results))
     return 0
 

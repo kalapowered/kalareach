@@ -52,19 +52,24 @@ If the lock file changes with a new release of fish, running `bash scripts/build
 demand, and fails when something an upstream published has no row below. It reads, from public
 sources only, the security advisories of the fish, PowerShell, PSReadLine and PCRE2 repositories;
 the issues of PowerShell/Announcements that carry the Security label, or whose title says they
-are a security advisory or names a CVE and that a member of the organisation opened, where
-Microsoft publishes the advisories that reach PowerShell, the ones against .NET included (not
-every one carries the label, and anyone can open an issue); the stable releases of fish and PowerShell
+are a security advisory or names a CVE, whoever opened them, where Microsoft publishes the
+advisories that reach PowerShell, the ones against .NET included (not every one carries the label,
+and GitHub shows a member of another organisation as a contributor, so an issue that only looks like
+an advisory also needs a row); the stable releases of fish and PowerShell
 that are newer than what the packages pin, the tags of zsh, and the releases of bash together with
 the patches of the pinned series and the newest patch of each newer series, which are the only
 signal zsh and bash give; and a cargo-audit report of fish's lock. That report matches the crates
 the lock takes from crates.io. The crates it takes from git (`pcre2` and `pcre2-sys`, the `fluent`
 crates, `intl-memoizer` and `gettext-po-file-parser`) have no RustSec source to match, so no
 advisory against one of them is reported by it; PCRE2 itself is watched through its own
-repository's advisories.
+repository's advisories. A newer series of bash has patches when the listing of bash's releases
+names its patch directory or a row of this register names one of its patches, and then the
+directory has to answer.
 
-A change needs a row when it was first published on or after 2026-09-20, or when its affected
-range includes what a package pins. The newest row that names the package and the change by its
+A change needs a row when it was first published on or after 2026-09-20, when its affected
+range includes what a package pins, or, for the advisories of PowerShell and PSReadLine, which pin
+no release, when it was revised on or after that day and its ranges now reach a version the module
+accepts. The newest row that names the package and the change by its
 identifier (a CVE, a GHSA, a RustSec identifier, a release tag, a patch name) is the assessment
 that stands, and the rows before it are the record of what was thought earlier. It covers the
 change when it has a status defined below, is not `scheduled` past its target, quotes every
