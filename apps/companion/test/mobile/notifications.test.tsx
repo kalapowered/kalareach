@@ -80,13 +80,70 @@ describe('the notifications of a paired host', () => {
     act(() => {
       controls.setPush({
         available: true,
-        hosts: [{ reference: 'studio-reference', state: 'on', words: '', settings: false }]
+        hosts: [
+          { reference: 'studio-reference', state: 'on', words: '', settings: false, previews: true }
+        ]
       })
     })
     await waitFor(() => {
-      expect(within(row).getByTestId('notifications-words').textContent).toBe('Notifications are on.')
+      expect(within(row).getByTestId('notifications-words').textContent).toBe(
+        'This host took this phone for notifications.'
+      )
     })
     expect(within(row).queryByRole('button')).toBeNull()
+  })
+
+  it('offers the choice of previews once they are on, and passes it to native code for this host', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    const row = await openHosts()
+    expect(within(row).queryByRole('switch', { name: 'Previews' })).toBeNull()
+    act(() => {
+      controls.setPush({
+        available: true,
+        hosts: [
+          { reference: 'studio-reference', state: 'on', words: '', settings: false, previews: true }
+        ]
+      })
+    })
+    const choice = await within(row).findByRole('switch', { name: 'Previews' })
+    expect(choice).toHaveAttribute('aria-checked', 'true')
+    expect(choice).toHaveAccessibleDescription(
+      'The notification shows what needs you. Off, it shows only that something does.'
+    )
+    await person.click(choice)
+    expect(controls.pushPreviewChoices).toEqual([{ reference: 'studio-reference', on: false }])
+    // The choice reads as made at once; the host is told next, and the switch waits meanwhile.
+    expect(within(row).getByRole('switch', { name: 'Previews' })).toHaveAttribute(
+      'aria-checked',
+      'false'
+    )
+    expect(within(row).getByRole('switch', { name: 'Previews' })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    )
+  })
+
+  it('keeps the recorded choice where a step stopped, and offers it for change', async () => {
+    const { controls } = start()
+    const row = await openHosts()
+    act(() => {
+      controls.setPush({
+        available: true,
+        hosts: [
+          {
+            reference: 'studio-reference',
+            state: 'needs_attention',
+            words: 'The host did not take this phone as a destination: it did not answer.',
+            settings: false,
+            previews: false
+          }
+        ]
+      })
+    })
+    const choice = await within(row).findByRole('switch', { name: 'Previews' })
+    expect(choice).toHaveAttribute('aria-checked', 'false')
+    expect(choice).not.toHaveAttribute('aria-disabled')
   })
 
   // The system's setting is the person's alone: the page says so in words and links to it.
@@ -102,7 +159,8 @@ describe('the notifications of a paired host', () => {
             reference: 'studio-reference',
             state: 'needs_attention',
             words: 'Notifications are turned off for KalaReach in Settings.',
-            settings: true
+            settings: true,
+            previews: true
           }
         ]
       })
@@ -129,7 +187,8 @@ describe('the notifications of a paired host', () => {
             reference: 'studio-reference',
             state: 'needs_attention',
             words: 'The host did not answer. Try again when it is reachable.',
-            settings: false
+            settings: false,
+            previews: true
           }
         ]
       })
