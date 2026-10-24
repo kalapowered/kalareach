@@ -1671,6 +1671,16 @@ that replaces itself with another program is therefore named for the program, an
 through an interpreter that was given no script to name is named by the interpreter. A session that
 has closed reports no state.
 
+Following all of this costs a session with no question open and no approval waiting on a
+deadline nothing it would not cost without it. The worker reads the broker and the question ledger
+when one of them says something changed, and when the journal commits a host event, a privacy
+transition or a transition of an approval. A question can run out of time and an approval pass its
+deadline with nothing to say so, so while a question is open the worker reads them every fifteen
+seconds, and it reads them at the next deadline of an approval that has one, or in fifteen seconds
+if that comes first, because a machine that sleeps stops the timer. It never reads either at a look
+at the terminal. The foreground is read at the pace the adoption watch already looks at the
+terminal, and the producer adds none.
+
 An assertion asks the operating system not to sleep on its own. It does not stop a closed lid, a
 forced sleep or a platform policy that overrides the request, and none of those need to be stopped:
 every deadline this host decides is measured on a clock that counts suspended time, so waking up
