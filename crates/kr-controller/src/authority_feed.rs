@@ -791,6 +791,9 @@ async fn pass(
                 .await
                 .map_err(Stopped::local)?;
             shared.removed.store(true, Ordering::SeqCst);
+            // The refusal a withdrawal this host cannot verify puts on remote grants may outlive
+            // the removal.
+            shared.observed().unverified = !controller.unverified_withdrawals().is_empty();
             return Ok(Pass::Removed);
         }
         let mut now = Latest::of(&state);
@@ -821,6 +824,12 @@ async fn pass(
                         .await
                         .map_err(Stopped::local)?;
                     shared.observed().unverified = true;
+                    // The feed takes a removal from the keys it lists, so the keys of the devices
+                    // this names are taken out of the list now, not when the scan has read the
+                    // feed through: a scan that stops half way leaves the list as it is. A change
+                    // the feed turns back does not hold up the catching up that follows; the end
+                    // of the scan makes it again and reports it.
+                    let _ = withhold_from_the_feed(shared, controller, &mut now).await;
                 }
                 Settled::Waiting => {
                     contiguous = false;
@@ -916,14 +925,43 @@ async fn name_owners(
     let mut listed = latest.removal_keys.clone();
     wanted.sort();
     listed.sort();
-    if wanted == listed {
-        return Ok(());
+    if wanted != listed {
+        shared
+            .client
+            .delegate(&named)
+            .await
+            .map_err(|error| Stopped::of(&error, &shared.quiet))?;
     }
-    shared
-        .client
-        .delegate(&named)
-        .await
-        .map_err(|error| Stopped::of(&error, &shared.quiet))?;
+    // The list the feed holds is the owners this host names, and none of them is a key a
+    // withdrawal this host cannot verify takes the right from.
+    controller.feed_lists_no_withheld_key();
+    Ok(())
+}
+
+/// Takes the keys of the devices a withdrawal this host cannot verify names out of the keys the
+/// feed lists as permitted to remove it, leaving every other as it is: the host adds no key to the
+/// list on what a registry it has found wrong holds.
+async fn withhold_from_the_feed(
+    shared: &Arc<Shared>,
+    controller: &Arc<Controller>,
+    latest: &mut Latest,
+) -> std::result::Result<(), Stopped> {
+    let withheld = controller.withheld_key_ids();
+    let kept: Vec<KeyId> = latest
+        .removal_keys
+        .iter()
+        .filter(|key| !withheld.contains(key))
+        .copied()
+        .collect();
+    if kept.len() != latest.removal_keys.len() {
+        shared
+            .client
+            .delegate(&kept)
+            .await
+            .map_err(|error| Stopped::of(&error, &shared.quiet))?;
+        latest.removal_keys = kept;
+    }
+    controller.feed_lists_no_withheld_key();
     Ok(())
 }
 

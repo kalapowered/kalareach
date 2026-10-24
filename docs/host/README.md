@@ -6590,26 +6590,32 @@ effect before the revocation, and a registry that holds the revocation holds wha
 withdrew. The device the request names as its issuer is judged alone. When the registry holds no
 such device, the issuer is a device that is not revoked, holds the key the request names and could
 have made the request, which is how an owner paired again is found. The first device that holds the
-key is not taken for the issuer. A request can name something live here while the registry cannot
-show its issuer: it holds no device of that identity, and no device that is not revoked, holds the
-key and could have made the request. That happens after a restore to a point before that owner was
-paired. The host can neither carry out nor dismiss such a request, because the feed could have named
-any request as complete and the host cannot tell whose word it was. The host then refuses every
-grant but the owner's at the machine, with `PERMISSION_DENIED` saying that it shows a revocation by
-an owner it does not know. `kr doctor` shows the feed check as a warning with a remedy. It names the
-device the request says made it, the key the request gives for that device, and the devices and
-grants the request names, up to eight of each. Every scan reads such a record again, so a restart
-does not lose the refusal, and nothing is stored for it. It ends when the owner at the machine
-revokes what the request names, or pairs the owner again, whose key the request names and whose
-request is then carried out. A feed that shows a revocation complete that no owner made can only
-keep remote access refused this way. It cannot revive a device, and the owner at the machine can
-always end it. While the refusal stands, the devices the request names keep no standing over the
-feed, and neither does a device that holds a key one of them holds. A feed removes the host by a
-key, so none of those keys is named to the feed as permitted to remove it, and a request one of them
-publishes is refused as lacking owner authority. Another owner can still remove the feed, which ends
-the refusal. If the named device is the only owner, no key can remove a lost host while the refusal
-stands. A host that starts again does not read a feed that has been removed, so nothing finds the
-condition again. A request the feed holds that is not shown complete waits until the host
+key is not taken for the issuer. When devices hold the key and none of them signed the request, it
+is no request the host could have carried out, and the host dismisses it. A request can name
+something live here while the registry cannot show its issuer: it holds no device of that identity
+and none that is not revoked holds the key, or the devices that hold the key and signed the request
+may not manage the host. That happens after a restore to a point before that owner was paired. The
+host can neither carry out nor dismiss such a request, because the feed could have named any request
+as complete and the host cannot tell whose word it was. The host then refuses every grant but the
+owner's at the machine, with `PERMISSION_DENIED` saying that it shows a revocation by an owner it
+does not know. `kr doctor` shows the feed check as a warning with a remedy. It names the device the
+request says made it, the key the request gives for that device, and the devices and grants the
+request names, up to eight of each. Every scan reads such a record again, so a restart does not lose
+the refusal, and nothing is stored for it. It ends when the owner at the machine revokes what the
+request names, or pairs the owner again, whose key the request names and whose request is then
+carried out. A feed that shows a revocation complete that no owner made can only keep remote access
+refused this way. It cannot revive a device, and the owner at the machine can always end it. While
+the refusal stands, the devices the request names keep no standing over the feed, and neither does a
+device that holds a key one of them holds. A feed removes the host by a key, so the host takes those
+keys out of the list of keys the feed takes a removal from as soon as it finds the withdrawal,
+before it has read the feed through, and a request one of them publishes is refused as lacking owner
+authority. Another owner can still remove the feed, which ends the refusal. If the named device is
+the only owner, no key can remove a lost host while the refusal stands. If the feed has not taken
+the change when it is removed, as when it turned the change back and still lists a key the
+withdrawal takes the right from, the removal says nothing of an owner having acted, and the refusal
+stands until the host starts again, which the owner at the machine can do. A host that starts again
+does not read a feed that has been removed, so nothing finds the condition again. A request the feed
+holds that is not shown complete waits until the host
 has caught up, and is then judged on the registry as it stands, in a scan of its own that is the
 synchronisation a connection waits for, so the owner is not refused for the host's being behind.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier
