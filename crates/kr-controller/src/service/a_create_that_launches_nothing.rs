@@ -2993,13 +2993,16 @@ impl WorkerSupervisor for SlowSupervisor {
     }
 }
 
-/// A launch that waits on the platform's service manager does not hold up the daemon's other
-/// work: with one thread to run on, a request made meanwhile is still served.
+/// KR-REQ-07.58: a create that waits on the service manager to start its worker does not hold a
+/// thread the daemon's other tasks run on. With one thread to run on, a task spawned on the
+/// daemon's runtime while the start is waiting is still served, because the runtime hands the
+/// thread's other tasks to another thread for the wait (`blocking_start`).
 ///
 /// The service manager is asked from the create, and a manager busy starting processes answers in
 /// seconds. The daemon's tasks, the rendezvous of the worker it is starting among them, run on the
-/// runtime's threads, and a create that kept its thread through the wait would hold them all back
-/// on a host with few processors.
+/// runtime's threads, and a create that held a thread they run on through the wait would hold them
+/// all back on a host with few processors. The case fails when the wait holds its thread's other
+/// tasks back: the spawned task never runs and the bounded wait for it ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_launch_waiting_on_the_service_manager_does_not_hold_up_the_daemon() {
     let temp = kr_ipc::testing::TempHost::create();
