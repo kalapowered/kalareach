@@ -105,8 +105,8 @@ pub const PREVIEW_CHANGES_PER_DEVICE: StatusAllowance = StatusAllowance {
 /// What a registration is, for the allowance of the device that makes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Registering {
-    /// A credential for a destination, an authorisation or an installation the host did not hold
-    /// in service: a first registration, a token refresh, a renewed authorisation.
+    /// Every registration that is not a change of the choice of previews: a first registration, a
+    /// token refresh, a new authorisation, a destination that was out of service.
     NewCredential,
     /// A credential for the authorisation and installation the destination in service already
     /// names, with the other choice of previews.
