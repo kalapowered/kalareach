@@ -3034,10 +3034,6 @@ impl World {
 /// daemon has, the host holds a record of the channel, and a session made through it is in the
 /// container and nowhere else. The Linux `kr`, `kr-controller` and `kr-worker` run inside a real
 /// container; nothing stands in for the runtime.
-///
-/// KR-REQ-18.11, the part about a named container environment: it is enrolled by the identifier its
-/// runtime issued, a refresh finds it running and its own daemon answering as the controller with
-/// its channel scoped, and a session made in it is the container's and no other environment's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_lives_there() {
     if !runtime_available() {
