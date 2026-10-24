@@ -779,15 +779,18 @@ impl PushDesk {
     ///
     /// The choice is recorded and applied on this phone at once: the receivers hold the host's
     /// preview key only while previews are on for it, so turning them off takes the key out before
-    /// the host is told, and turning them on files it first. A host that is on is then told, over a
-    /// run that makes no proposal to the gateway and asks the person nothing. A host that a run
-    /// holds is told by that run, which reads the choice when it gets to the host and goes round
-    /// again if the choice changed after. A host that is not on keeps the choice for the run that
-    /// turns it on, so trying again sends it.
+    /// the host is told, and turning them on files it first. A choice that cannot be kept in the
+    /// record, or whose key cannot be filed, is not made: it is let go, the person is told so, and
+    /// nothing is left half done. A host that is on is then told, over a run that makes no proposal
+    /// to the gateway and asks the person nothing. A host that a run holds is told by that run,
+    /// which reads the choice when it gets to the host and goes round again if the choice changed
+    /// after. A host that is not on keeps the choice for the run that turns it on, so trying again
+    /// sends it.
     ///
     /// # Errors
     ///
-    /// Returns a refusal when this phone is not paired with that host.
+    /// Returns a refusal when this phone is not paired with that host, and a local failure when the
+    /// choice could not be kept or its key not filed.
     pub async fn set_previews(self: &Arc<Self>, reference: &str, on: bool) -> Result<PushView> {
         let host = self
             .device
@@ -797,17 +800,36 @@ impl PushDesk {
             // A choice made now would be one this phone could not remember.
             return Ok(self.view());
         }
-        {
+        let key = host.host_device_id.to_string();
+        let before = {
             let mut state = lock(&self.state);
-            let Some(kept) = state.record.hosts.get_mut(&host.host_device_id.to_string()) else {
+            let Some(kept) = state.record.hosts.get_mut(&key) else {
                 // A host nobody asked for notifications has no row to choose on.
+                drop(state);
                 return Ok(self.view());
             };
-            kept.previews = on;
-            self.keep(&state.record);
+            let before = std::mem::replace(&mut kept.previews, on);
+            if before != on && !self.keep_checked(&state.record) {
+                if let Some(kept) = state.record.hosts.get_mut(&key) {
+                    kept.previews = before;
+                }
+                return Err(CommandError::local_failure(
+                    "This phone could not keep your choice of previews. Try again.",
+                ));
+            }
+            before
+        };
+        if let Err(words) = self.file_keys().await {
+            // The receivers hold what they held, so the choice is let go with the record: Off that
+            // left the host's key with them would be Off in name only.
+            if let Some(kept) = lock(&self.state).record.hosts.get_mut(&key) {
+                kept.previews = before;
+            }
+            self.keep(&lock(&self.state).record);
+            return Err(CommandError::local_failure(format!(
+                "{words} Your choice of previews was not made. Try again."
+            )));
         }
-        (self.changed)();
-        self.file_keys_logged().await;
         let now = (self.wiring.clock)();
         let claimed = {
             let mut state = lock(&self.state);
@@ -815,7 +837,7 @@ impl PushDesk {
             let due = state
                 .record
                 .hosts
-                .get(&id.to_string())
+                .get(&key)
                 .filter(|kept| kept.phase == Phase::On && !kept.lost)
                 .and_then(|kept| kept.told_differs().then_some(kept.registered).flatten());
             match due {
@@ -829,8 +851,8 @@ impl PushDesk {
         };
         if let Some((run, job)) = claimed {
             self.spawn_run(host, run, Reach::Asked, job);
-            (self.changed)();
         }
+        (self.changed)();
         Ok(self.view())
     }
 
@@ -1408,7 +1430,18 @@ impl PushDesk {
         let Some(sender_record_id) = self.sender_record_for(host, Some(run)) else {
             return Err(forgotten_host());
         };
-        self.file_keys().await.map_err(Stop::from)?;
+        // The choice the host is told is read once, before the keys are filed, so what the receivers
+        // hold is never older than it: a choice made after this is told by a run that goes round
+        // again, and one that turns previews off is only ever told after the key is out of the
+        // receivers' hands.
+        let Some(previews) = self.previews_wanted(host.host_device_id, run) else {
+            return Err(forgotten_host());
+        };
+        let filed = self.file_keys().await;
+        if let (Err(words), true) = (&filed, previews) {
+            // The host is not asked to seal to a key the receivers do not hold.
+            return Err(Stop::from(words.clone()));
+        }
         // The person can forget the host during any of the waits that follow, so the host is
         // sent nothing until the run is asked about again: before the connection, after it, and
         // before each of the changes.
@@ -1448,11 +1481,6 @@ impl PushDesk {
         if !wanted() {
             return Err(forgotten_host());
         }
-        // The choice is read as the host is told, so one made while the connection was opened and
-        // the credential issued is the one sent.
-        let Some(previews) = self.previews_wanted(host.host_device_id, run) else {
-            return Err(forgotten_host());
-        };
         line.register(DevicePushRegisterParams {
             credential: issued.credential,
             // The host seals a preview to the key it holds for this phone when this is true, and
@@ -1484,7 +1512,9 @@ impl PushDesk {
         }
         // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);
-        Ok(())
+        // Previews turned off reach the host even when the key could not be taken out of the
+        // receivers' hands, which is then said, and the next look files again.
+        filed.map_err(Stop::from)
     }
 
     /// The choice of previews the host is to be told, while `run` holds it.
@@ -1734,23 +1764,34 @@ impl PushDesk {
     /// still in place. A failure is logged and not raised: what the person sees is the memory, and
     /// the next change writes it again.
     fn keep(&self, record: &Record) {
+        self.keep_checked(record);
+    }
+
+    /// [`Self::keep`], saying whether the record is on disk as `record` has it: a choice the person
+    /// must be told did not take effect is made only after this answers yes.
+    fn keep_checked(&self, record: &Record) -> bool {
         if self.write_blocked {
-            return;
+            return false;
         }
         let Some(directory) = self.file.parent() else {
-            return;
+            return false;
         };
         if let Err(error) = kr_ipc::paths::create_private_directory(directory) {
             tracing::warn!(%error, "the notifications record's directory could not be made");
-            return;
+            return false;
         }
         match serde_json::to_vec(&Versioned { record }) {
-            Ok(bytes) => {
-                if let Err(error) = write_owner_only_file(&self.file, &bytes) {
+            Ok(bytes) => match write_owner_only_file(&self.file, &bytes) {
+                Ok(()) => true,
+                Err(error) => {
                     tracing::warn!(%error, "the notifications record could not be written");
+                    false
                 }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "the notifications record could not be encoded");
+                false
             }
-            Err(error) => tracing::warn!(%error, "the notifications record could not be encoded"),
         }
     }
 }
