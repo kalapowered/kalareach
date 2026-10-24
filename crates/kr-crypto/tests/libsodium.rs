@@ -365,30 +365,236 @@ fn a_buffer_the_caller_assembled_is_cleared_through_libsodium() {
     assert!(buffer[48..].iter().all(|byte| *byte == 0xa5));
 }
 
-/// No product source file carries the constants a hand-written cipher, hash, MAC or curve would:
-/// the ChaCha and Salsa20 constants, the SHA-2 initial values and round constants, the Poly1305
-/// clamp, the Curve25519 prime or the start of the AES S-box. A primitive written without those
-/// spellings would pass this, so it is a tripwire rather than a proof of absence.
-#[test]
-fn no_source_file_carries_the_constants_of_a_primitive() {
-    const PRIMITIVE_CONSTANTS: &[&str] = &[
-        "expand 32-byte k",
-        "expand 16-byte k",
-        "0x61707865",
-        "0x6a09e667",
-        "0x428a2f98",
-        "0x0ffffffc0fffffff",
-        "0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed",
-        "0x63, 0x7c, 0x77, 0x7b",
-    ];
-    for path in product_sources() {
-        let text = read(&path).to_ascii_lowercase();
-        for constant in PRIMITIVE_CONSTANTS {
-            assert!(
-                !text.contains(constant),
-                "{} carries {constant}",
-                relative(&path)
-            );
+/// The first words of a SHA-2 hash: the initial value and the first round constant. They are
+/// written in two pieces so that this file does not carry them.
+const SHA2_CONSTANTS: &[&str] = &[concat!("0x6a09", "e667"), concat!("0x428a", "2f98")];
+
+/// The constants of every other primitive this tree must not write: the ChaCha and Salsa20 key
+/// expansion words, the Poly1305 clamp, the Curve25519 prime and the start of the AES S-box.
+const OTHER_CONSTANTS: &[&str] = &[
+    concat!("expand 32-byte", " k"),
+    concat!("expand 16-byte", " k"),
+    concat!("0x6170", "7865"),
+    concat!("0x0ffffffc", "0fffffff"),
+    concat!(
+        "0x7fffffffffffffffffffffffffffffff",
+        "ffffffffffffffffffffffffffffffed"
+    ),
+    concat!("0x63, 0x7c,", " 0x77, 0x7b"),
+];
+
+/// The one named exception: the shell packages' bridges. Each compiles `kr_bridge_crypto.c`, a
+/// SHA-256 and an HMAC-SHA-256 of its own, because a shell package cannot link the host's
+/// cryptography library into every interactive shell it starts. They are a hash and a MAC, not a
+/// cipher or a password-authenticated key exchange, so they stay inside what the application may
+/// write itself. What holds them to standard SHA-256 and HMAC-SHA-256 is that every package build
+/// runs them against the published answers before it compiles the shell, and that each shell
+/// session's proof is compared with the worker's RustCrypto HMAC-SHA-256 of the same transcript.
+/// A file listed here may carry the SHA-2 constants and no others.
+const SHELL_BRIDGE_HASHES: &[&str] = &[
+    "shells/bash/src/kr_bridge_crypto.c",
+    "shells/fish/src/kr_bridge_crypto.c",
+    "shells/zsh/src/kr_bridge_crypto.c",
+];
+
+/// Every file that ships or is about to: the files git tracks and the new files it does not
+/// ignore, as git's own `/`-separated paths. Build output is whatever the repository's ignore
+/// rules say it is, so no tree is left out by a list of names kept here.
+fn repository_files(root: &Path) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git lists the repository's files");
+    assert!(
+        output.status.success(),
+        "git could not list {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files: std::collections::BTreeSet<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            // A name that is not UTF-8 cannot be turned into a path here and then read, and a
+            // file skipped for that would be a file the tripwire never looks inside.
+            String::from_utf8(path.to_vec())
+                .unwrap_or_else(|_| panic!("a file name that is not UTF-8: {path:?}"))
+        })
+        .collect();
+    files.into_iter().collect()
+}
+
+/// The primitive constants each file under `root` carries, by git's path.
+///
+/// A file is read as bytes and searched as text whatever it holds, so a binary cannot stop the
+/// walk and a constant in one is still found. Only regular files are read: a link, a submodule or
+/// a tracked file that is gone from the working tree has no bytes of its own to hold one.
+fn carriers(root: &Path) -> std::collections::BTreeMap<String, Vec<&'static str>> {
+    let mut found = std::collections::BTreeMap::new();
+    for path in repository_files(root) {
+        let file = root.join(&path);
+        let Ok(metadata) = std::fs::symlink_metadata(&file) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            // A file another process removed since the listing has nothing left to carry.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("{}: {error}", file.display()),
+        };
+        let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+        let carried: Vec<&'static str> = SHA2_CONSTANTS
+            .iter()
+            .chain(OTHER_CONSTANTS)
+            .copied()
+            .filter(|constant| text.contains(constant))
+            .collect();
+        if !carried.is_empty() {
+            found.insert(path, carried);
         }
     }
+    found
+}
+
+/// KR-REQ-20.03: no file the repository holds carries the constants of a hand-written cipher, hash,
+/// MAC or curve, in any tree and in any language, except the shell bridges' SHA-256 (see
+/// `SHELL_BRIDGE_HASHES`), which may carry the SHA-2 constants and no other primitive's. A
+/// primitive written without those spellings would pass this, so it is a tripwire rather than a
+/// proof of absence.
+#[test]
+fn no_source_file_carries_the_constants_of_a_primitive() {
+    let root = repository_root();
+    assert!(
+        repository_files(&root).len() > 1_000,
+        "the listing found the repository's files"
+    );
+    let found = carriers(&root);
+    let mut wrong = Vec::new();
+    for (path, constants) in &found {
+        if !SHELL_BRIDGE_HASHES.contains(&path.as_str()) {
+            wrong.push(format!("{path} carries {constants:?}"));
+        } else if constants.as_slice() != SHA2_CONSTANTS {
+            wrong.push(format!(
+                "{path} must carry exactly the SHA-2 constants, and carries {constants:?}"
+            ));
+        }
+    }
+    for path in SHELL_BRIDGE_HASHES {
+        if !found.contains_key(*path) {
+            wrong.push(format!(
+                "{path} no longer carries the SHA-2 constants: remove it from the named exception"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// KR-REQ-20.03: the tripwire reaches every tree and every kind of file. A repository with one
+/// planted constant in each tree that ships, in the languages those trees are written in, is
+/// reported whole; a file git ignores, a link and a file that is not text are handled as the walk
+/// says.
+#[test]
+fn the_tripwire_reads_every_tree_and_every_kind_of_file() {
+    let directory = tempfile::tempdir().expect("a scratch repository");
+    let root = directory.path();
+    let git = |arguments: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(arguments)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {arguments:?}");
+    };
+    git(&["init", "-q"]);
+    // The person's own global ignore rules are not part of what this repository ignores: a
+    // `*.bin` there would hide a plant, so the scratch repository points at a file that is not
+    // there.
+    let no_global_rules = root.join("no-global-ignore-rules");
+    git(&[
+        "config",
+        "core.excludesFile",
+        no_global_rules.to_str().expect("a UTF-8 path"),
+    ]);
+
+    let planted = [
+        "shells/zsh/src/other.c",
+        "shells/psreadline/module/Other.psm1",
+        "shells/zsh/patches/0009-other.patch",
+        "apps/companion/native/android/src/Other.kt",
+        "apps/companion/native/ios/Other.swift",
+        "apps/companion/native/platform/src/other.rs",
+        "apps/companion/src/other.ts",
+        "packages/protocol/src/other.ts",
+        "bundled-plugins/targets/other.json",
+        "scripts/other.py",
+        "scripts/other.sh",
+        "skills/other/SKILL.md",
+        "docs/other.md",
+        "fixtures/other.json",
+        "tests/other.rs",
+        "crates/other/tests/other.rs",
+    ];
+    for (index, path) in planted.iter().enumerate() {
+        let constant = SHA2_CONSTANTS
+            .iter()
+            .chain(OTHER_CONSTANTS)
+            .nth(index % 8)
+            .expect("a constant");
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().expect("a directory")).expect("a directory");
+        std::fs::write(
+            &file,
+            format!("value = {}\n", constant.to_ascii_uppercase()),
+        )
+        .expect("a plant");
+    }
+    // A file that is not text, with the constant in the middle of bytes that are not UTF-8.
+    let binary = root.join("apps/companion/src/logo.bin");
+    let mut bytes = vec![0xff, 0xfe, 0x00];
+    bytes.extend_from_slice(SHA2_CONSTANTS[0].as_bytes());
+    bytes.extend_from_slice(&[0x00, 0xff]);
+    std::fs::write(&binary, bytes).expect("a binary plant");
+    // A file the repository ignores is output, not source.
+    std::fs::write(root.join(".gitignore"), "ignored/\n").expect("an ignore file");
+    std::fs::create_dir_all(root.join("ignored")).expect("a directory");
+    std::fs::write(root.join("ignored/other.c"), SHA2_CONSTANTS[0]).expect("an ignored plant");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        root.join("shells/zsh/src/other.c"),
+        root.join("scripts/link.c"),
+    )
+    .expect("a link");
+
+    let found = carriers(root);
+    for path in planted.iter().chain(&["apps/companion/src/logo.bin"]) {
+        assert!(found.contains_key(*path), "{path} was not read");
+    }
+    assert!(
+        !found.contains_key("ignored/other.c"),
+        "a file git ignores was read"
+    );
+    #[cfg(unix)]
+    assert!(
+        !found.contains_key("scripts/link.c"),
+        "a link was read as a file of its own"
+    );
 }
