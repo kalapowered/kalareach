@@ -784,7 +784,15 @@ impl Controller {
             registry.record_launch(reservation.reservation_id, &identity)?;
         }
 
-        let ready = match tokio::time::timeout(RENDEZVOUS_TIMEOUT, receiver).await {
+        // A worker that launches a managed shell reports itself only once the shell has qualified,
+        // which it gives its own bound; the create waits for that as well, so that when the worker
+        // gives up it is its reason the caller gets and not that the worker was late.
+        let wait = if matches!(create.shell_mode, kr_protocol::session::ShellMode::Managed) {
+            RENDEZVOUS_TIMEOUT + kr_worker::runtime::QUALIFICATION_DEADLINE
+        } else {
+            RENDEZVOUS_TIMEOUT
+        };
+        let ready = match tokio::time::timeout(wait, receiver).await {
             Ok(Ok(Ok(ready))) => ready,
             // A worker that failed its rendezvous, or never reported, has no session to close, so
             // no closure removes its job. It goes once the worker has ended.

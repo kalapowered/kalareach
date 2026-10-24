@@ -732,6 +732,7 @@ mod tests {
                 startup_entry: PackageStartupEntry {
                     file: "startup/entry".to_owned(),
                 },
+                launch: kr_shell_integration::host::package::PackageLaunch::default(),
             },
             directory,
         }
@@ -763,8 +764,11 @@ mod tests {
             let all_hosts = home.path().join(format!("{}.ps1", name.replace(' ', "-")));
             let current_host = home.path().join("current-host.ps1");
             std::fs::write(&all_hosts, text).expect("writes");
-            let targets =
-                startup::powershell_targets(&package.executable(), all_hosts.clone(), current_host);
+            let targets = startup::powershell_targets(
+                &startup::PowerShell::of_package(&package),
+                all_hosts.clone(),
+                current_host,
+            );
             for dry_run in [true, false] {
                 let refused =
                     install_targets(&package, &targets, &record, &host_paths(), false, dry_run)
@@ -1067,6 +1071,7 @@ mod tests {
                 startup_entry: PackageStartupEntry {
                     file: "startup/entry".to_owned(),
                 },
+                launch: kr_shell_integration::host::package::PackageLaunch::default(),
             },
             directory,
         };
@@ -1136,6 +1141,7 @@ mod tests {
                 startup_entry: PackageStartupEntry {
                     file: "startup/entry".to_owned(),
                 },
+                launch: kr_shell_integration::host::package::PackageLaunch::default(),
             },
             directory,
         };

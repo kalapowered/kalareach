@@ -153,6 +153,56 @@ fn cache_root() -> PathBuf {
 }
 
 impl Package {
+    /// The package's own directory: its record, its module tree and its startup entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the module tree is not inside a directory, which no package's is.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        self.module_directory
+            .parent()
+            .expect("a package's module tree is inside the package")
+    }
+
+    /// What starting this package's shell sets over this process's own environment: the runtime
+    /// location the record holds and the package's module directory first on the list of module
+    /// directories. The package's own reader of its record decides it, as a session's worker does.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host cannot read the package it was just handed.
+    #[must_use]
+    pub fn launch(&self) -> Vec<(String, String)> {
+        let package = kr_shell_integration::host::package::ShellPackage::read(self.directory())
+            .unwrap_or_else(|fault| {
+                panic!(
+                    "the host cannot read {}: {fault}",
+                    self.directory().display()
+                )
+            });
+        let base: Vec<(String, String)> = std::env::vars().collect();
+        package.launch_environment(&base, cfg!(windows))
+    }
+
+    /// The package's host as the PowerShell this host asks about profiles, started the way a session
+    /// starts it.
+    #[must_use]
+    pub fn powershell(&self) -> startup::PowerShell {
+        startup::PowerShell {
+            executable: self.executable.clone(),
+            environment: self.launch(),
+        }
+    }
+
+    /// The package's shell as a command to run, started the way a session starts it.
+    #[must_use]
+    pub fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.executable);
+        command.envs(self.launch());
+        command
+    }
+
     /// Finds this tree's own built package, or says why it is not there.
     ///
     /// The installation's `current` names a build, and a build is named by a digest of what it was
@@ -388,7 +438,7 @@ fn install_startup(package: &Package, home: &Path, prompt: &str, profile: Profil
                 ));
                 let record = startup::EntryRecord::in_state_directory(&state);
                 for target in
-                    startup::powershell_targets(&package.executable, all_hosts, current_host)
+                    startup::powershell_targets(&package.powershell(), all_hosts, current_host)
                 {
                     let body = startup::entry(&target, &package.startup_entry, false)
                         .expect("the package's entry is text");
@@ -569,18 +619,6 @@ pub fn told(path: &Path) -> String {
             )
         })
         .to_owned()
-}
-
-/// The module search path a PowerShell package's host starts with: the package's own modules
-/// first, then whatever this process was given, each exactly as the system spells it.
-#[must_use]
-pub fn module_search_path(package: &Package) -> std::ffi::OsString {
-    let mut path = package.module_directory.clone().into_os_string();
-    if let Some(existing) = std::env::var_os("PSModulePath") {
-        path.push(":");
-        path.push(existing);
-    }
-    path
 }
 
 /// One live session: the worker's endpoint, the shell under a pseudo-terminal, and the frames
@@ -821,16 +859,11 @@ impl Session {
                 // the launch is this package's.
                 command.arg("-NoLogo");
                 // The qualified editor and this module are selected before the profile runs, which
-                // is what the marked block then imports by name.
-                command.env("PSModulePath", module_search_path(package));
-                // The host's own image needs its runtime's location, which the qualification
-                // recorded from the launcher that started the host it qualified.
-                if let Some(environment) = package.record["launch"]["environment"].as_object() {
-                    for (name, value) in environment {
-                        if let Some(value) = value.as_str() {
-                            command.env(name, value);
-                        }
-                    }
+                // is what the marked block then imports by name. The package's launch puts its
+                // module directory first on the module path and gives the host the runtime
+                // location the qualification recorded, as a session's worker does.
+                for (name, value) in package.launch() {
+                    command.env(name, value);
                 }
             }
             _ => {
