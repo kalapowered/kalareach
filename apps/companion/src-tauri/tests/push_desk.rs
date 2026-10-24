@@ -3005,8 +3005,10 @@ async fn turning_previews_on_files_the_hosts_key_before_the_host_is_told() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_it() {
     let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    let refusal =
+        "RATE_LIMITED: this device has changed its choice of previews too often; try again later";
     phone.registered.lock().expect("the script").register_stops =
-        Some(LineStop::Host("it did not answer".to_owned()));
+        Some(LineStop::Host(refusal.to_owned()));
 
     phone
         .desk
@@ -3017,6 +3019,11 @@ async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_
         .until(|states| states == [PushState::NeedsAttention])
         .await;
     assert!(!phone.view().hosts[0].previews, "the choice stays recorded");
+    assert!(
+        phone.view().hosts[0].words.ends_with(refusal),
+        "the row says what the host said: {:?}",
+        phone.view().hosts[0].words
+    );
     assert!(held_keys(&phone).expect("keys").senders.is_empty());
 
     // A host that needs the person is not told again by a second choice: the choice is recorded,
