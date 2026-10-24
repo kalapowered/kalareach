@@ -138,6 +138,8 @@ pub struct Acting {
     pub hosted: Hosted,
     /// The connection this test registered the component over, where it registered it by hand.
     pub runtime: Option<Arc<PluginClient>>,
+    /// The gate that connection runs through, which keeps the host's replies back while it is held.
+    pub gate: Option<super::Gate>,
     pub written: Written,
     /// How the scripted upstream answers.
     pub upstream: Arc<Mutex<Upstream>>,
@@ -211,6 +213,24 @@ impl Acting {
         .await
     }
 
+    /// Starts the world with a native terminal served on the transport the production gateway
+    /// uses, beside the component registered by hand, and the worker's deadlines measured on
+    /// `clock`, so that the terminal's requests can be carried while a call into the component is
+    /// outstanding.
+    pub async fn start_with_a_terminal_on(
+        clock: Arc<dyn kr_transport::clock::ContinuousClock>,
+    ) -> Option<Self> {
+        Self::assemble(
+            Registration::ByHand { told: true },
+            Some(clock),
+            Options {
+                native_terminal: true,
+                ..Options::DEFAULT
+            },
+        )
+        .await
+    }
+
     /// Starts the world with the worker's deadlines measured on `clock`, which the test moves by
     /// hand.
     pub async fn start_on(clock: Arc<dyn kr_transport::clock::ContinuousClock>) -> Option<Self> {
@@ -265,9 +285,12 @@ impl Acting {
         let wasm = component("preparing")?;
         let hosted = hosted_on(options.epoch, clock).await;
         let source = install(&hosted.environment(), &wasm);
-        let runtime = match registration {
-            Registration::ByHand { .. } => Some(Arc::new(hosted.runtime().await)),
-            Registration::ByLink => None,
+        let (gate, runtime) = match registration {
+            Registration::ByHand { .. } => {
+                let (gate, client) = hosted.runtime_through_a_gate().await;
+                (Some(gate), Some(Arc::new(client)))
+            }
+            Registration::ByLink => (None, None),
         };
         let service = &hosted._service;
         let broker = service.broker();
@@ -532,6 +555,7 @@ impl Acting {
         Some(Self {
             hosted,
             runtime,
+            gate,
             written,
             upstream,
             _owner: owner,
@@ -649,21 +673,59 @@ impl Acting {
         self.written.lock().expect("not poisoned").clone()
     }
 
-    /// Stops the plugin host, the way a machine that is slow to schedule it looks to a caller.
-    pub fn stop_host(&self) -> ProcessStartIdentity {
-        let host = self.hosted.published().expect("the host is published");
-        signal(&host, rustix::process::Signal::STOP);
-        host
+    /// The gate to the plugin host, where the world registered its component by hand.
+    pub fn gate(&self) -> &super::Gate {
+        self.gate
+            .as_ref()
+            .expect("this world registered its component over a gate")
+    }
+
+    /// Holds the worker's next preparation before it asks the component, until the case lets it
+    /// go.
+    ///
+    /// The action's receipt says `accepted` by then and its component has not been asked, so the
+    /// action waits for its component for as long as the case holds it, however long the machine
+    /// takes to do what the case does meanwhile. The preparation's own bound starts at the
+    /// release, so a case that moves the worker's clock by hand (`Acting::start_on`) cannot run it
+    /// out. A case that needs a call outstanding in the component keeps the host's replies back
+    /// instead ([`Acting::gate`]).
+    pub fn hold_the_next_preparation(&self) -> HeldPreparation {
+        let (arrived, release) = self.hosted._service.stall_next_preparation();
+        HeldPreparation {
+            arrived: Some(arrived),
+            release,
+        }
+    }
+}
+
+/// A preparation the worker holds before it asks the component
+/// ([`Acting::hold_the_next_preparation`]). Dropping it lets the preparation go.
+pub struct HeldPreparation {
+    arrived: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl HeldPreparation {
+    /// Waits until the preparation stands at its stop.
+    pub async fn arrives(&mut self) {
+        let arrived = self.arrived.take().expect("the arrival is waited for once");
+        tokio::time::timeout(PATIENCE, arrived)
+            .await
+            .expect("the preparation reaches its stop")
+            .expect("the stop is not dropped before the preparation reaches it");
+    }
+
+    /// Lets the preparation go.
+    pub fn release(self) {
+        self.release
+            .send(())
+            .expect("the preparation is waiting at its stop");
     }
 }
 
 impl Drop for Acting {
     fn drop(&mut self) {
         self.hosted._service.broker().component_calls().set(None);
-        // A host this test stopped is let go, so the harness can end it.
-        if let Some(host) = self.hosted.published() {
-            signal(&host, rustix::process::Signal::CONT);
-        }
         let _ = &self.runtime;
     }
 }
