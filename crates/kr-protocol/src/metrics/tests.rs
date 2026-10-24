@@ -13,9 +13,8 @@ use crate::envelope::ParamsValue;
 use crate::hostinfo::{EffectiveConfiguration, HostDoctorResult};
 use crate::scalars::U64;
 
-/// KR-REQ-26.43, the part about the metric set and its label lists: the committed vector is the
-/// one the declaration writes, so the service's suite and this one hold their declarations to the
-/// same document. Not shown here: what any list holds, which the next case reads.
+/// The committed vector is the one the declaration writes, so the service's suite and this one
+/// hold their declarations to the same document.
 #[test]
 fn the_committed_vector_is_the_one_the_declaration_writes() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
