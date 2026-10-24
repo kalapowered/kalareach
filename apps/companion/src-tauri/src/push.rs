@@ -813,22 +813,41 @@ impl PushDesk {
                 if let Some(kept) = state.record.hosts.get_mut(&key) {
                     kept.previews = before;
                 }
-                return Err(CommandError::local_failure(
-                    "This phone could not keep your choice of previews. Try again.",
-                ));
+                // A write that failed may have reached the disk (a rename that went through and a
+                // directory that did not sync): the earlier choice is written again, so that what
+                // a restart reads is what the person is told.
+                let undone = self.keep_checked(&state.record);
+                return Err(CommandError::local_failure(if undone {
+                    "This phone could not keep your choice of previews. Try again."
+                } else {
+                    "This phone could not keep your choice of previews, or put back the one it \
+                     had. The one it had may return when the application next starts."
+                }));
             }
             before
         };
         if let Err(words) = self.file_keys().await {
-            // The receivers hold what they held, so the choice is let go with the record: Off that
-            // left the host's key with them would be Off in name only.
-            if let Some(kept) = lock(&self.state).record.hosts.get_mut(&key) {
-                kept.previews = before;
-            }
-            self.keep(&lock(&self.state).record);
-            return Err(CommandError::local_failure(format!(
-                "{words} Your choice of previews was not made. Try again."
-            )));
+            // The choice is let go with the record: Off that left the host's key with the receivers
+            // would be Off in name only.
+            let undone = {
+                let mut state = lock(&self.state);
+                if let Some(kept) = state.record.hosts.get_mut(&key) {
+                    kept.previews = before;
+                }
+                self.keep_checked(&state.record)
+            };
+            // A filing that failed part way may have left the receivers holding some of the new
+            // set: the set the record says now is filed again at once, and the next look files it
+            // again if this fails too.
+            let restored = self.file_keys().await.is_ok();
+            return Err(CommandError::local_failure(if undone && restored {
+                format!("{words} Your choice of previews was not made. Try again.")
+            } else {
+                format!(
+                    "{words} Your choice of previews was not made, and this phone could not put \
+                     back everything it held before. It tries again shortly."
+                )
+            }));
         }
         let now = (self.wiring.clock)();
         let claimed = {
@@ -1432,8 +1451,8 @@ impl PushDesk {
         };
         // The choice the host is told is read once, before the keys are filed, so what the receivers
         // hold is never older than it: a choice made after this is told by a run that goes round
-        // again, and one that turns previews off is only ever told after the key is out of the
-        // receivers' hands.
+        // again, and one that turns previews off is told after the receivers were asked to let the
+        // key go, whether or not they did (a filing that failed is said at the end of the run).
         let Some(previews) = self.previews_wanted(host.host_device_id, run) else {
             return Err(forgotten_host());
         };
