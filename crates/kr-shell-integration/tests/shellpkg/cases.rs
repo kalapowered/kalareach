@@ -424,6 +424,103 @@ pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
     );
 }
 
+/// Stops or continues the shell a session started, by the process identifier the session holds.
+///
+/// # Panics
+///
+/// Panics when the session has no process or `kill` cannot signal it.
+#[cfg(unix)]
+fn signal_the_shell(session: &Session, signal: &str) {
+    let pid = session
+        .child_pid()
+        .expect("the shell's process has an identifier");
+    let status = std::process::Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill -{signal} {pid} failed");
+}
+
+/// KR-REQ-08.49: bytes the host put into the terminal that no one typed are input the reader has
+/// not taken, so a reader that is asked for its queues says they are not drained.
+///
+/// The bridge cannot tell what a byte is: a host's answer to a query the application made reaches
+/// the shell as input like any other, and the fence rests on the reader saying it has none left.
+/// The case stops an idle reader, puts three answers a terminal gives to a device-attributes query
+/// into its terminal, asks for the fence and lets the reader go, so the answers are waiting when
+/// the reader meets the request. A reader takes its input a byte at a time and meets its mailbox
+/// at the first point it is free to, which is before the first byte or after the first whole key
+/// sequence, so more than one answer is waiting whichever it is, and what it reports then has to
+/// count the bytes it has not read. Once it has taken them a later exchange says the queues are
+/// drained, so a reader that counts bytes it no longer holds is not the one that passes.
+///
+/// # Panics
+///
+/// Panics when the reader says its terminal's typeahead is drained with the answer unread, or says
+/// it is not after it has taken the answer.
+#[cfg(unix)]
+pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(kind: ShellKind) {
+    // Three answers a terminal gives to a primary device-attributes query.
+    const HOST_REPLY: &[u8] = b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c";
+
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    let first = session.first_prompt();
+    session.expect_event(
+        "an idle report from this reader with its queues clear",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == first.prompt_generation
+                        && idle.reader_revision == first.reader_revision
+                        && idle.editor.buffer_empty
+                        && idle.snapshot.queued_keys == U64::new(0)
+                        && idle.snapshot.pending_bytes == U64::new(0)
+            )
+        },
+    );
+
+    signal_the_shell(&session, "STOP");
+    session.type_bytes(HOST_REPLY);
+    let id = session.ask(WorkerRequest::Fence(RootEditorFenceParams {
+        session_id: session.session_id,
+        fence_id: fence_id(31),
+        prompt_generation: first.prompt_generation,
+        reader_revision: first.reader_revision,
+        deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+        cause: FenceCause::EditorEntry,
+    }));
+    signal_the_shell(&session, "CONT");
+    let BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(asked)) = session.answer(id) else {
+        panic!("the reader did not acknowledge the fence it was asked for")
+    };
+    assert!(
+        !asked.queues.tty_typeahead_drained,
+        "the reader said its terminal's typeahead was drained with {HOST_REPLY:?} unread: {:?}",
+        asked.queues
+    );
+
+    // Taken, the answer is no longer typeahead: the reader that reported it unread reports the
+    // queues drained once it has read it.
+    let deadline = Instant::now() + REPLY;
+    let mut entry = first;
+    let mut latest = asked;
+    while !latest.queues.tty_typeahead_drained && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        entry.prompt_generation = latest.prompt_generation;
+        entry.reader_revision = latest.reader_revision;
+        latest = session.fence_exchange_before(&entry, fence_id(32), deadline);
+    }
+    assert!(
+        latest.queues.tty_typeahead_drained,
+        "the reader still reports typeahead after it has had the answer: {:?}\n{}",
+        latest.queues,
+        session.terminal_output()
+    );
+}
+
 /// KR-REQ-07.34, KR-REQ-07.35: the reader's own boundaries, and the fence its state proves.
 pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKind) {
     let package = Package::built(kind);

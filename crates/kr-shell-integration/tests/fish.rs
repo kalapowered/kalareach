@@ -29,6 +29,13 @@ fn the_fish_package_links_no_library_of_the_machine_that_built_it() {
     shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(FISH);
 }
 
+/// KR-REQ-08.49: bytes the host put into the terminal are input the reader has not taken.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_taken() {
+    shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(FISH);
+}
+
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
