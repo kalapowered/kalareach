@@ -29,9 +29,11 @@
 //! host's authorisation identifier, so it is moved aside whole and never written over. The desk
 //! then starts a record of its own that marks every host paired at that moment as lost: the page
 //! shows it as needing the person, a look leaves it alone, and the mark stays across restarts
-//! until the person turns that host on again, since what was on is no longer known. A record that
-//! cannot be read for want of the system (a read that failed) is left where it is, and nothing is
-//! written until a start can read it.
+//! until the person turns that host on again, since what was on is no longer known. A start that
+//! finds no record and a record set aside before it, because the one before it ended in between,
+//! marks the hosts then. A record the system failed to read, one that cannot be moved, and a list
+//! of paired hosts that cannot be read, leave the record in place: nothing is written and no host
+//! is started until a start can deal with it, and the page says to start the application again.
 //!
 //! # What repeats
 //!
@@ -107,10 +109,19 @@ const CHALLENGE_WAIT: Duration = Duration::from_millis(CHALLENGE_WITHIN_MS + 30_
 /// or the gateway again at every foreground would be a loop with a person in it.
 const RETRY_AFTER_MS: u64 = 60 * 1000;
 
-/// What a host with nothing kept is shown as when the record could not be read.
+/// The start of the name a record that cannot be read is set aside under.
+const ASIDE_PREFIX: &str = "push.unreadable-";
+
+/// What a lost host is shown as: the record that said where its notifications stood was set aside.
 const RECORD_LOST: &str = "This phone could not read what it had kept about notifications, so it \
                            cannot say whether this host has them on. Choose Try again to start \
                            over.";
+
+/// What a lost host is shown as when the record could not be set aside or read, and is still in
+/// place: nothing is changed until a start can deal with it.
+const RECORD_KEPT: &str = "This phone could not read what it had kept about notifications, so it \
+                           cannot say whether this host has them on. Close the application and \
+                           open it again.";
 
 /// How far a host's notifications stand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,19 +446,38 @@ impl PushDesk {
         let now = (wiring.clock)();
         let (record, write_blocked, lost) = match read_record(&file) {
             Loaded::Record(record) => (after_a_restart(record, now), false, false),
-            Loaded::Unreadable { why, read_failed } => {
-                // What the record said of each host is gone. One the system failed to read may be
-                // fine at the next start, so it stays where it is; one that was read and is not a
-                // record this build knows is moved aside. Either way nothing is written over it.
-                let kept = !read_failed && set_aside(&file, &why, now);
-                if !kept {
-                    tracing::error!(
-                        why = %why,
-                        "the notifications record could not be read, and was left in place"
-                    );
+            loss => {
+                // What the record said of each host is gone, and the hosts paired now are marked.
+                // The paired hosts are read first: a list that cannot be read is not an empty one,
+                // and a start that marked no host would hide the loss from every later start.
+                let hosts = device.pairing().hosts.list();
+                if let Err(error) = &hosts {
+                    tracing::error!(%error, "the paired hosts could not be read to mark the lost ones");
                 }
-                let hosts = device.pairing().hosts.list().unwrap_or_default();
-                (record_after_a_loss(&hosts, now), !kept, true)
+                // A record the system failed to read may be fine at the next start, so it stays
+                // where it is; one that was read and is not a record this build knows is moved
+                // aside. Where it stays, nothing is written, so nothing is written over it.
+                let kept = match &loss {
+                    Loaded::Unreadable { why, read_failed } => {
+                        let aside = hosts.is_ok() && !read_failed && set_aside(&file, why, now);
+                        if !aside {
+                            tracing::error!(
+                                why = %why,
+                                "the notifications record could not be read, and was left in place"
+                            );
+                        }
+                        aside
+                    }
+                    _ => true,
+                };
+                let write_blocked = !kept || hosts.is_err();
+                let words = if write_blocked {
+                    RECORD_KEPT
+                } else {
+                    RECORD_LOST
+                };
+                let hosts = hosts.unwrap_or_default();
+                (record_after_a_loss(&hosts, now, words), write_blocked, true)
             }
         };
         let desk = Arc::new(Self {
@@ -523,6 +553,10 @@ impl PushDesk {
             .device
             .host_by_reference(reference)
             .ok_or_else(crate::hosts::unknown_host)?;
+        if self.write_blocked {
+            // A host started now would be one this phone could not remember.
+            return Ok(self.view());
+        }
         let now = (self.wiring.clock)();
         let run = {
             let mut state = lock(&self.state);
@@ -553,7 +587,7 @@ impl PushDesk {
     /// Looks again at where notifications stand, and mends what a change since the last look
     /// needs: a host whose registration proposed another token than the provider holds now is
     /// registered again, and a try that stopped for the person is tried again once the person has
-    /// had time to act.
+    /// had time to act. A host the record lost is left to the person.
     ///
     /// A change of the token is found by comparing the digest each host's registration proposed,
     /// which the record keeps, with the digest of the token the provider holds, so what a look finds
@@ -1216,13 +1250,22 @@ enum Loaded {
         /// Whether the system failed to read it, which a later start may not.
         read_failed: bool,
     },
+    /// No record, where an earlier start set one aside: it ended before it had written the record
+    /// that marks the lost hosts.
+    Interrupted,
 }
 
 /// The record on disk.
 fn read_record(file: &Path) -> Loaded {
     let bytes = match read_owner_only_file(file, RECORD_LIMIT) {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return Loaded::Record(Record::empty()),
+        Ok(None) => {
+            return if has_a_record_set_aside(file) {
+                Loaded::Interrupted
+            } else {
+                Loaded::Record(Record::empty())
+            };
+        }
         Err(error) => {
             return Loaded::Unreadable {
                 why: Shown::ipc(&error),
@@ -1243,6 +1286,30 @@ fn read_record(file: &Path) -> Loaded {
     }
 }
 
+/// Whether nothing is at `path`, a link that points nowhere included. A path that cannot be
+/// inspected is not absent.
+fn is_absent(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Whether a start set a record aside before: the file's name, `push.unreadable-<time>` and what
+/// follows, is in the record's directory.
+fn has_a_record_set_aside(file: &Path) -> bool {
+    file.parent()
+        .and_then(|directory| std::fs::read_dir(directory).ok())
+        .is_some_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(ASIDE_PREFIX)
+            })
+        })
+}
+
 /// Moves a record that cannot be read out of the way, under a name no earlier one has, and says so
 /// in the log. It holds each host's authorisation identifier, so it is kept as it was found.
 /// Returns whether it was moved.
@@ -1250,12 +1317,12 @@ fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
     let aside = (0_u32..)
         .map(|attempt| {
             let name = match attempt {
-                0 => format!("push.unreadable-{now_ms}.json"),
-                _ => format!("push.unreadable-{now_ms}-{attempt}.json"),
+                0 => format!("{ASIDE_PREFIX}{now_ms}.json"),
+                _ => format!("{ASIDE_PREFIX}{now_ms}-{attempt}.json"),
             };
             file.with_file_name(name)
         })
-        .find(|each| !each.exists())
+        .find(|each| is_absent(each))
         .expect("a name is free");
     match std::fs::rename(file, &aside) {
         Ok(()) => {
@@ -1279,7 +1346,7 @@ fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
 
 /// The record a desk starts from when the one it found cannot be read: each host paired now is
 /// marked as lost, which the page shows as needing the person.
-fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64) -> Record {
+fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64, words: &str) -> Record {
     let mut record = Record::empty();
     for host in hosts {
         record.hosts.insert(
@@ -1287,7 +1354,7 @@ fn record_after_a_loss(hosts: &[PairedHost], now_ms: u64) -> Record {
             HostPush {
                 sender_record_id: None,
                 phase: Phase::Attention,
-                words: RECORD_LOST.to_owned(),
+                words: words.to_owned(),
                 settings: false,
                 updated_ms: now_ms,
                 registered: None,
@@ -1577,5 +1644,33 @@ mod tests {
         );
         assert_eq!(started.hosts["on"], on);
         assert_eq!(started.hosts["stopped"], stopped);
+    }
+
+    /// A record is set aside under a name no earlier one has: one left from an earlier loss, a link
+    /// that points nowhere among them, is never replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_set_aside_under_a_name_no_earlier_one_has() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join(RECORD);
+        std::fs::write(&file, b"the record").expect("a record");
+        let earlier = directory.path().join(format!("{ASIDE_PREFIX}7.json"));
+        std::os::unix::fs::symlink(directory.path().join("nowhere"), &earlier)
+            .expect("a link that points nowhere");
+
+        assert!(set_aside(&file, &Shown::said("a test"), 7));
+
+        assert!(
+            std::fs::symlink_metadata(&earlier)
+                .expect("the earlier name")
+                .is_symlink(),
+            "the earlier name is as it was"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(format!("{ASIDE_PREFIX}7-1.json")))
+                .expect("the record under a name of its own"),
+            b"the record"
+        );
+        assert!(!file.exists(), "the record is out of the way");
     }
 }

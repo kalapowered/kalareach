@@ -501,8 +501,11 @@ written by a build this one does not know, is moved aside as `push/push.unreadab
 and never written over, and the failure is logged. The new record marks each host paired at that
 moment as lost: the page shows it as needing the person, in place of off, across restarts, until the
 person turns that host on again, which issues a new authorisation identifier (the old one stays in
-the file set aside), and a look leaves it alone. A file the system fails to read is left where it
-is, and nothing is written until a start can read it. `docs/delivery/README.md` ("What the phone does first") says what
+the file set aside), and a look leaves it alone. A start that finds a record set aside and no
+record, because the start before it ended in between, marks the hosts then. A file the system fails
+to read, one that cannot be moved aside, and a list of paired hosts that cannot be read leave the
+record where it is: nothing is written and no host is started until a start can deal with it, and
+the page says to close the application and open it again. `docs/delivery/README.md` ("What the phone does first") says what
 the steps are. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
 comes back to the screen they left. A tap on a notification opens the application, and
