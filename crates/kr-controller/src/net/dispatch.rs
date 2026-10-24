@@ -292,6 +292,12 @@ impl RemoteConnection {
         self.device.device_id
     }
 
+    /// The pairing grant this connection was admitted under.
+    #[must_use]
+    pub const fn grant(&self) -> &kr_protocol::grant::Grant {
+        &self.device.grant
+    }
+
     /// Returns true when this connection's grant still has time on it.
     ///
     /// The deadline was anchored on the continuous clock when the connection was admitted, and

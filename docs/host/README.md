@@ -6621,16 +6621,19 @@ answer being written when the refusal rises ends with the connection. A device's
 or raw input that waited for the link to the session's worker, for its write half or for room in its
 socket, are refused before the first byte of the frame goes. A frame the worker has part of when
 the refusal rises is not finished: the rest is not written and the link to the worker ends, so that
-the worker reads a frame that stops short and acts on nothing of it, and the call is refused. Three
-things remain. A mutation already forwarded runs for what is left of its dispatch lease, five
+the worker reads a frame that stops short and acts on nothing of it, and the call is refused. A refusal
+moves no revision, so a worker would learn of it from nothing else: when a refusal rises, and when the
+feed removes the host, the host ends the link to its worker of each connection the refusal reaches. The
+worker then detaches the connection's attachments, which ends their input lease and discards the input
+it holds for them. Input the terminal has already taken is not taken back. The connection stays up and
+refused, and the device attaches again once the refusal has ended. Three things remain. A mutation already forwarded runs for what is left of its dispatch lease, five
 seconds at most. A voice call a device started is not ended, as a revocation ends it, and runs to
 its deadline. An owner confirmation that a remote owner device
 signed, spent at the machine after the refusal rose, is spent under the standing the signer had. The
 refusal a removed feed puts on the grants that rest on it applies by kind of grant: work that a
 connection under such a grant had admitted before the removal is held to it where it commits and
 where its answer is written, as it is for the two refusals above, and the default owner grant is
-not refused. It is not held in a worker that already has it, and it stays with the policy's epoch
-for a relayed batch. The owner at the machine
+not refused. A relayed batch stays with the policy's epoch. The owner at the machine
 is never refused, and can stop any session locally.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
