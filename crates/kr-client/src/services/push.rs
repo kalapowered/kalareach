@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{SignedService, malformed, unreadable_answer};
+use super::{PushService, ServiceFuture};
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
@@ -326,42 +327,6 @@ impl PushGateway {
         }
     }
 
-    /// Proposes a provider token: the gateway records the attempt and sends a challenge through
-    /// the provider to that token.
-    ///
-    /// # Errors
-    ///
-    /// Returns the gateway's refusal, or why nothing was answered.
-    pub async fn propose(&self, proposal: PushRegistrationProposal) -> Result<Registration> {
-        self.call(&PushRequest::InstallationRegister {
-            request: PushRegistrationRequest::Propose { proposal },
-        })
-        .await
-    }
-
-    /// Presents the signed answer to a challenge and activates the binding.
-    ///
-    /// # Errors
-    ///
-    /// Returns the gateway's refusal, or why nothing was answered.
-    pub async fn answer(&self, answer: PushRegistrationAnswer) -> Result<Registration> {
-        self.call(&PushRequest::InstallationRegister {
-            request: PushRegistrationRequest::Answer { answer },
-        })
-        .await
-    }
-
-    /// Authorises one paired host and takes the credential to hand it. Asking again under the same
-    /// authorisation identifier for the same host gives a fresh credential and keeps the one
-    /// authorisation.
-    ///
-    /// # Errors
-    ///
-    /// Returns the gateway's refusal, or why nothing was answered.
-    pub async fn issue(&self, request: PushSenderIssueRequest) -> Result<Issued> {
-        self.call(&PushRequest::SenderIssue { request }).await
-    }
-
     async fn call<T: for<'de> Deserialize<'de>>(&self, body: &PushRequest) -> Result<T> {
         let data = self
             .service
@@ -369,6 +334,34 @@ impl PushGateway {
             .await?;
         serde_json::from_value(data)
             .map_err(|error| unreadable_answer("what a push gateway answered", &error))
+    }
+}
+
+/// Every call returns the gateway's refusal, or why nothing was answered.
+impl PushService for PushGateway {
+    fn propose<'a>(
+        &'a self,
+        proposal: PushRegistrationProposal,
+    ) -> ServiceFuture<'a, Registration> {
+        Box::pin(async move {
+            self.call(&PushRequest::InstallationRegister {
+                request: PushRegistrationRequest::Propose { proposal },
+            })
+            .await
+        })
+    }
+
+    fn answer<'a>(&'a self, answer: PushRegistrationAnswer) -> ServiceFuture<'a, Registration> {
+        Box::pin(async move {
+            self.call(&PushRequest::InstallationRegister {
+                request: PushRegistrationRequest::Answer { answer },
+            })
+            .await
+        })
+    }
+
+    fn issue<'a>(&'a self, request: PushSenderIssueRequest) -> ServiceFuture<'a, Issued> {
+        Box::pin(async move { self.call(&PushRequest::SenderIssue { request }).await })
     }
 }
 
@@ -380,7 +373,6 @@ mod tests {
     use kr_protocol::scalars::Digest256;
 
     use super::*;
-    use crate::services::ServiceFuture;
     use crate::services::relay::ServiceHttpAnswer;
 
     const VECTORS: &str = include_str!("../../../../fixtures/push/push.json");
@@ -569,17 +561,26 @@ mod tests {
         }
     }
 
-    fn gateway(answers: Vec<(u16, serde_json::Value)>) -> (PushGateway, Arc<Gateway>) {
+    /// The gateway client in the push slot of a set of service clients, which is where a process
+    /// holds it, and what it was asked.
+    fn gateway(answers: Vec<(u16, serde_json::Value)>) -> (Arc<dyn PushService>, Arc<Gateway>) {
         let stand_in = Arc::new(Gateway {
             answers: Mutex::new(answers),
             asked: Mutex::new(Vec::new()),
         });
-        let client = PushGateway::new(
-            origin(),
-            Arc::clone(&stand_in) as Arc<dyn ServiceHttp>,
-            Arc::new(installation()),
+        let clients = crate::services::ServiceClients {
+            push: Some(Arc::new(PushGateway::new(
+                origin(),
+                Arc::clone(&stand_in) as Arc<dyn ServiceHttp>,
+                Arc::new(installation()),
+            ))),
+            ..crate::services::ServiceClients::none()
+        };
+        assert!(
+            clients.holds(crate::services::ManagedService::Push),
+            "the slot is filled"
         );
-        (client, stand_in)
+        (clients.push.expect("the push slot"), stand_in)
     }
 
     fn proposal() -> PushRegistrationProposal {
@@ -592,7 +593,8 @@ mod tests {
     }
 
     /// What the gateway answers to each of the installation's three calls is read as the records the
-    /// vectors carry, and each call goes to its own route with a request the gateway can check.
+    /// vectors carry, and each call, made through the push slot, goes to its own route with a
+    /// request the gateway can check.
     #[tokio::test]
     async fn the_gateway_client_reads_what_the_gateway_answers_each_call_with() {
         let records = vectors()["records"].clone();
