@@ -67,6 +67,8 @@ targets:
     sources:
       - path: ../../../native/ios/NotificationService
       - path: ../../../native/ios/Shared
+      # Opening a sealed preview with the Rust library, which the application never does.
+      - path: ../../../native/ios/Receiver
     # The description is written here rather than kept as a file beside the Swift, because the
     # project generator rewrites whatever path this names and would silently replace a hand-written
     # one with its own defaults -- which is how an extension ends up with no extension point and a
@@ -98,7 +100,16 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.notifications
         SKIP_INSTALL: true
         "PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]": $(KR_EXTENSION_PROFILE)
+        LIBRARY_SEARCH_PATHS: $(inherited) $(PROJECT_DIR)/Externals/preview/$(PLATFORM_NAME)/$(CONFIGURATION)
+        OTHER_LDFLAGS: $(inherited) -lcompanion_preview
       groups: [signing]
+    # The library that opens a sealed preview: the extension's one new weight.
+    preBuildScripts:
+      - script: bash "${SRCROOT}/../../../scripts/build-preview-library.sh"
+        name: Build the preview library
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Externals/preview/${PLATFORM_NAME}/${CONFIGURATION}/libcompanion_preview.a
 
   # The native decisions, built and run without the application, so the four cases the
   # specification names are exercised by a test rather than by a device nobody has.
@@ -109,6 +120,9 @@ targets:
       - path: ../../../native/ios/Tests
       - path: ../../../native/ios/Shared
       - path: ../../../native/ios/KalaReachNative
+      # The extension's own code, run here against the real library and a golden preview.
+      - path: ../../../native/ios/Receiver
+      - path: ../../../native/ios/NotificationService
     # The test target compiles `KalaReachNative`, which imports WebRTC for the call and the audio
     # session, so it links the same product the application does.
     dependencies:
@@ -119,6 +133,14 @@ targets:
         PRODUCT_NAME: KalaReachNativeTests
         PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.native-tests
         GENERATE_INFOPLIST_FILE: true
+        LIBRARY_SEARCH_PATHS: $(inherited) $(PROJECT_DIR)/Externals/preview/$(PLATFORM_NAME)/$(CONFIGURATION)
+        OTHER_LDFLAGS: $(inherited) -lcompanion_preview
+    preBuildScripts:
+      - script: bash "${SRCROOT}/../../../scripts/build-preview-library.sh"
+        name: Build the preview library
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Externals/preview/${PLATFORM_NAME}/${CONFIGURATION}/libcompanion_preview.a
     # Its own scheme, with no host application: these are decisions about a payload and a clock,
     # and running them must not need the whole application to link first.
     scheme:
