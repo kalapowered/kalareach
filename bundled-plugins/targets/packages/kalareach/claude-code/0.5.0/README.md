@@ -98,7 +98,9 @@ answered in the terminal.
 
 Claude Code reads its channels and its hooks from files in its own directory, so the bridge is three
 declarative files and one settings key. Nothing here is a program, and nothing here carries protocol
-logic: each file names the core forwarder and the surface it should carry.
+logic: each file names the core forwarder and the surface it should carry. The forwarder is written as
+`{kr_hook}`, which KalaReach replaces with the full path of the forwarder it installed when it writes
+each file.
 
 | Installed | What it is |
 | --- | --- |

@@ -48,15 +48,15 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # the one that is copied, whatever order the index is in.
 generation_path="snapshots/development"
 bundled_packages=(
-    "kalareach/claude-code@0.4.0"
+    "kalareach/claude-code@0.5.0"
     "kalareach/codex@0.2.1"
     "kalareach/example-declarative@0.1.0"
-    "kalareach/gemini-cli@0.4.0"
+    "kalareach/gemini-cli@0.5.0"
     "kalareach/kimi-cli@0.1.1"
     "kalareach/kimi-code-cli@0.2.1"
     "kalareach/opencode@0.2.1"
     "kalareach/opencode-attach@0.1.1"
-    "kalareach/qoder-cli@0.4.0"
+    "kalareach/qoder-cli@0.5.0"
 )
 
 # The repository the generation is published from. The lock records it beside the commit, which is

@@ -95,14 +95,16 @@ changed extension can remain active, under an allow list wherever a pattern allo
 source. Whatever removes the bridge also removes the directories the installation created once they
 are empty, because an empty `extensions/kalareach/` is a directory with no record too.
 
-The hooks start `kr-hook gemini-cli hook`, the KalaReach forwarder, for three events:
+The hooks start `{kr_hook} gemini-cli hook`, where `{kr_hook}` stands for the full path of the
+KalaReach forwarder, which KalaReach writes in single quotes, for three events:
 `SessionStart` and `Notification` with a five-second timeout, and `SessionEnd` with one second.
 Gemini CLI runs a hook's command through `bash -c`, and bash runs a command of plain words like
 this one in its own process, so the forwarder is Gemini CLI's own child. It runs under Gemini CLI's
 permissions, outside the KalaReach plugin sandbox and outside Wasmtime. It reports the event to the
 KalaReach worker that launched the session, stops waiting for the worker half a second after it
 started, then answers `{}` with exit 0, and it never waits for a person. Outside a KalaReach launch
-it answers the same way and reports nothing.
+it answers the same way and reports nothing. The package is not offered on Windows, where Gemini CLI
+starts a hook through PowerShell and these lines are written for bash.
 
 Those three are events whose refusals Gemini CLI ignores, and that is why there are no others.
 Gemini CLI reads a hook's standard error as its answer when standard output is empty, and turns
