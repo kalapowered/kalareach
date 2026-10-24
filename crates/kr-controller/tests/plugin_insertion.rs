@@ -28,7 +28,7 @@ mod plugin_world;
 
 use plugin_world::acting::{
     Acting, Change, Upstream, answer, ask_for_receipt, contribution, read_receipt,
-    receipt_answered, send, signal, supersede, until_receipt, until_settled,
+    receipt_answered, send, supersede, until_receipt, until_settled,
 };
 use plugin_world::{PATIENCE, kill, until};
 
@@ -379,7 +379,8 @@ async fn kr_req_23_30_an_action_cancelled_while_prepared_claims_nothing() {
     let mut asking = acting.client().await;
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    acting.gate().hold();
+    let before = acting.gate().frames_sent();
     asking
         .writer()
         .write_message(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
@@ -388,10 +389,15 @@ async fn kr_req_23_30_an_action_cancelled_while_prepared_claims_nothing() {
         .await
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+    // The worker has made the call, and its reply is kept back.
+    until("the call to reach the plugin host", || async {
+        (acting.gate().frames_sent() > before).then_some(())
+    })
+    .await;
 
     let cancel = cancellation(&acting, &watcher, action_id);
     assert!(matches!(send(&mut watcher, cancel).await, Outcome::Ok(_)));
-    signal(&host, rustix::process::Signal::CONT);
+    acting.gate().release();
     answer(&mut asking, Some(1)).await;
 
     assert!(acting.frames().is_empty());
@@ -863,7 +869,7 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
         .pause_after_a_read();
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    acting.gate().hold();
     asking
         .writer()
         .write_message(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
@@ -875,11 +881,11 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
 
     // The daemon is serving the worker's read of the draft. It is let go only once the exchange it
     // is serving has ended, so the worker has the draft when the daemon goes away, and the
-    // component, which is stopped, has not answered.
+    // component's reply is kept back, so it has not answered.
     until_the_daemon_holds(read).await;
     go_on.send(()).expect("lets the answer go");
     acting.hosted.stop_daemon().await;
-    signal(&host, rustix::process::Signal::CONT);
+    acting.gate().release();
     let finished = answer(&mut asking, Some(1)).await;
     let Outcome::Error(refusal) = finished else {
         panic!("an offer whose claim nobody answered was carried: {finished:?}");
@@ -1122,7 +1128,7 @@ async fn an_offer_while_its_client(how: Client) {
     let idle = Arc::strong_count(&service);
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let mut held = acting.hold_the_next_preparation();
 
     // The offer is held inside the dispatch boundary, and its repeat is written behind it and left
     // unread. When the offer is let go it is accepted and its preparation is started, and the
@@ -1150,7 +1156,8 @@ async fn an_offer_while_its_client(how: Client) {
 
     // The component answers and the offer is claimed. The task that prepared it has handed it to
     // the connection once it no longer holds the service.
-    signal(&host, rustix::process::Signal::CONT);
+    held.arrives().await;
+    held.release();
     until_binding(&acting, draft.draft_id, &handle, InsertionState::Inserting).await;
     until("the preparation to be handed to the connection", || async {
         (Arc::strong_count(&service) == idle).then_some(())
@@ -1293,12 +1300,13 @@ async fn kr_req_23_30_an_offer_that_loses_its_ground_while_prepared_settles_what
         let mut asking = acting.client().await;
         let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
         let action_id = mutation.action_id;
-        let host = acting.stop_host();
+        let mut held = acting.hold_the_next_preparation();
         write(&mut asking, mutation).await;
         until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
+        held.arrives().await;
         let mut asking = Some(asking);
         acting.change(change, "attach.photo", &mut asking).await;
-        signal(&host, rustix::process::Signal::CONT);
+        held.release();
         if let Some(asking) = asking.as_mut() {
             answer(asking, Some(1)).await;
         }
@@ -1336,9 +1344,10 @@ async fn kr_req_23_30_a_repeat_of_an_offer_claims_nothing_again_and_a_changed_on
     let mut other = acting.client().await;
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, first.transfer_id);
     let action_id = mutation.action_id;
-    let host = acting.stop_host();
+    let mut held = acting.hold_the_next_preparation();
     write(&mut asking, mutation.clone()).await;
     until_receipt(&mut other, action_id, ReceiptState::Accepted).await;
+    held.arrives().await;
 
     // The same offer from another connection is answered with the receipt as it stands.
     let mut repeat = mutation.clone();
@@ -1360,7 +1369,7 @@ async fn kr_req_23_30_a_repeat_of_an_offer_claims_nothing_again_and_a_changed_on
     };
     assert_eq!(conflict.code, ErrorCode::IdConflict, "{conflict:?}");
 
-    signal(&host, rustix::process::Signal::CONT);
+    held.release();
     let finished = answer(&mut asking, Some(1)).await;
     assert!(matches!(finished, Outcome::Ok(_)), "{finished:?}");
     let accepted = until_binding(
