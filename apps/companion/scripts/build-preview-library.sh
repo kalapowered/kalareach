@@ -37,7 +37,7 @@ if [ "${CONFIGURATION:?}" = "release" ] || [ "${CONFIGURATION}" = "Release" ]; t
 fi
 
 target_directory="${CARGO_TARGET_DIR:-${root}/target}"
-(cd "${root}" && cargo build --locked --package companion-preview --target "${triple}" ${profile_flag[@]+"${profile_flag[@]}"})
+(cd "${root}" && cargo rustc --locked --package companion-preview --lib --crate-type staticlib --target "${triple}" ${profile_flag[@]+"${profile_flag[@]}"})
 
 destination="${SRCROOT}/Externals/preview/${PLATFORM_NAME}/${CONFIGURATION}"
 mkdir -p "${destination}"
