@@ -134,6 +134,25 @@ def numbers(text):
     return tuple(int(part) for part in re.findall(r"\d+", text))
 
 
+def release_key(version):
+    """Where the release `version` (numbers) sorts: after every pre-release of itself."""
+    return tuple(version) + (1,)
+
+
+def version_key(text):
+    """Where a version written as `7.7.0` or `7.7.0-preview.1` sorts among releases. A suffix after
+    a hyphen makes a pre-release, which sorts before its release and after every earlier release,
+    and build metadata after a plus sign is not part of the order."""
+    match = re.match(r"\s*v?(\d+(?:\.\d+)*)(.*)$", text)
+    if not match:
+        return numbers(text)
+    release = numbers(match.group(1))
+    suffix = match.group(2)
+    if re.match(r"-[0-9A-Za-z]", suffix):
+        return release + (0,) + numbers(suffix)
+    return release_key(release)
+
+
 def in_range(range_text, version):
     """Whether a version is inside a range such as '>= 10.32, <= 10.47' or '3.1.0-3.3.1'. A range
     that cannot be read in full counts as inside it, because the safe mistake is a row too many."""
@@ -161,23 +180,23 @@ def in_range(range_text, version):
 
 
 def range_intervals(range_text):
-    """The versions a range covers, as half-open intervals of number tuples: `low` is inside, `high`
+    """The versions a range covers, as half-open intervals of version keys: `low` is inside, `high`
     is not, and None is no bound. Comparators separated by a comma all hold, alternatives separated
-    by `||` are each their own interval, and `a-b` is the span from a to b. A suffix such as `-RC.2`
-    adds its numbers to the version, which is as near as a number tuple gets. None when the range
-    cannot be read in full."""
+    by `||` are each their own interval, and `a-b` is the span from a to b. A pre-release such as
+    `7.7.0-preview.1` sorts below its release (see `version_key`). None when the range cannot be
+    read in full."""
     intervals = []
     for alternative in range_text.split("||"):
         low, high = None, None
         span = re.match(r"\s*([0-9][0-9A-Za-z.+]*)\s*-\s*([0-9][0-9A-Za-z.+]*)\s*$", alternative)
         if span:
-            intervals.append((numbers(span.group(1)), numbers(span.group(2)) + (0,)))
+            intervals.append((version_key(span.group(1)), version_key(span.group(2)) + (0,)))
             continue
         for comparator in alternative.split(","):
             match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
             if not match:
                 return None
-            operator, version = match.group(1) or "=", numbers(match.group(2))
+            operator, version = match.group(1) or "=", version_key(match.group(2))
             if operator in (">=", "="):
                 low = version if low is None else max(low, version)
             if operator == ">":
@@ -606,19 +625,27 @@ def pinned_versions(root):
         with open(os.path.join(root, "shells", name, "manifest.json")) as handle:
             return json.load(handle)
 
-    floors = {}
+    floors, host_floors = {}, {}
     for advisory in manifest("psreadline")["qualified"]["powershell_advisories"]:
         for series, fixed in advisory["first_fixed"].items():
             key = numbers(series)
             floors[key] = max(floors.get(key, ()), numbers(fixed))
-    # What the module accepts of PowerShell: from the first fixed release of each series it lists to
-    # the next series, and every series above the newest. What it accepts of PSReadLine is the
-    # range it was qualified against.
-    newest = max(floors) if floors else (0, 0)
-    powershell = [(floor, (series[0], series[1] + 1)) for series, floor in sorted(floors.items())]
+            # An advisory against the .NET runtime is judged by the runtime the host reports, on its
+            # platforms, and the module does not hold the PowerShell version to it, so only the
+            # advisories against PowerShell itself bound the versions the module accepts.
+            if "runtime_first_fixed" not in advisory:
+                host_floors[key] = max(host_floors.get(key, ()), numbers(fixed))
+    # What the module accepts of PowerShell: from the first release of each series that no advisory
+    # against PowerShell itself lists as affected to the next series, and every series above the
+    # newest. A pre-release of the first fixed release is refused. What it accepts of PSReadLine is
+    # the range it was qualified against, whose upper bound is left open to its pre-releases.
+    newest = max(host_floors) if host_floors else (0, 0)
+    powershell = [
+        (release_key(floor), (series[0], series[1] + 1)) for series, floor in sorted(host_floors.items())
+    ]
     powershell.append(((newest[0], newest[1] + 1), None))
     qualified = manifest("psreadline")["qualified"]
-    psreadline = [(numbers(qualified["psreadline_from"]), numbers(qualified["psreadline_before"]))]
+    psreadline = [(release_key(numbers(qualified["psreadline_from"])), release_key(numbers(qualified["psreadline_before"])))]
     return {
         "accepted": {"powershell": powershell, "psreadline": psreadline},
         "fish": manifest("fish")["upstream"]["version"],
@@ -1044,6 +1071,10 @@ def run_self_test():
             (">= 7.4.0, < 7.4.15", "2026-10-20T10:00:00Z", False, "a revised range of releases the module refuses"),
             ("<= 7.3.11", "2026-10-20T10:00:00Z", False, "a revised range below what the module loads on"),
             (">= 7.6.7, < 7.6.9", "2026-08-02T10:00:00Z", False, "the same range, not revised since the register started"),
+            (">= 7.6.6, < 7.6.7", "2026-10-20T10:00:00Z", True, "a revised range of a release the module accepts on a platform the runtime advisory does not list"),
+            (">= 7.6.0, < 7.6.6", "2026-10-20T10:00:00Z", False, "a revised range below the first fixed release of the series"),
+            (">= 7.7.0-preview.1, < 7.7.0", "2026-10-20T10:00:00Z", True, "a revised range of previews the module accepts"),
+            (">= 7.6.8-rc.1, < 7.6.8", "2026-10-20T10:00:00Z", True, "a revised range of release candidates of an accepted release"),
         ):
             outcome = attempt(
                 edited(routes(), powershell_route, old_advisory("GHSA-old1-aaaa-bbbb", text, revised)), now="2026-11-10"
