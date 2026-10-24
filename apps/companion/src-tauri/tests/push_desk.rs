@@ -1996,8 +1996,8 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
     .await;
     assert_eq!(
         restarted.desk.view().hosts[0].state,
-        PushState::NeedsAttention,
-        "no run was started"
+        PushState::Off,
+        "the forgotten host shows nothing, and no run was started for it"
     );
 
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
