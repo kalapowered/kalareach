@@ -23,7 +23,7 @@
 //! | `seed` | `go-seed` | the host's attention store given an approval, a failed command and a completed turn, and a question asked by a program whose label imitates its verified identity; `seed-result.txt` says which session they are in |
 //! | `down` | `go-down` | the host ends, and says so with `done-down`; the phone reaches nothing until `up`. It can be asked again: the suite takes `go-down` away when it is done, and the script takes `done-down` away before it asks |
 //! | `up` | `go-up` | the host starts again on the same address, with every record it kept, and says so with `done-up`; asked again as `down` is |
-//! | `sent` | `go-sent` | `sent-result.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`) |
+//! | `sent` | `go-sent`, then `go-counted` | `sent-first.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`); `sent-result.txt`, how many times it was, once the script has seen the phone itself say the send is applied and asks for the count |
 //! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
@@ -669,10 +669,19 @@ impl Run {
     async fn sent(&self) {
         let end = Instant::now() + STEP;
         while Instant::now() < end {
-            let prompts = self.upstream.prompts();
-            if prompts.iter().any(|prompt| prompt == DRAFT) {
-                // A second send would arrive a moment after the first.
-                tokio::time::sleep(Duration::from_secs(3)).await;
+            if self.upstream.prompts().iter().any(|prompt| prompt == DRAFT) {
+                self.say("sent-first.txt", "sent\n");
+                // The phone says the send is applied when the host has answered it, and sends
+                // nothing more for it. The script asks for the count once it has seen the phone say
+                // so, and not after a time chosen here.
+                let counted = self.directory.join("go-counted");
+                while !counted.exists() {
+                    assert!(
+                        Instant::now() < end,
+                        "the script never asked how many times the draft was sent"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
                 let prompts = self.upstream.prompts();
                 self.say(
                     "sent-result.txt",
