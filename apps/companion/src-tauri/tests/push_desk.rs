@@ -320,6 +320,18 @@ struct Line {
     device: String,
 }
 
+/// The host's answer to a registration, as the vectors record it, for the phone named `device`.
+fn registration_answer(device: &str) -> DevicePushRegisterResult {
+    let records = vectors()["records"].clone();
+    serde_json::from_value(json!({
+        "device_id": device,
+        "installation_id": records["installation_binding"]["installation_id"],
+        "sender_record_id": records["sender_record"]["binding"]["sender_record_id"],
+        "credential_expires_at_ms": "1769817600000",
+    }))
+    .expect("a result")
+}
+
 impl HostLine for Line {
     fn register(
         &mut self,
@@ -335,14 +347,7 @@ impl HostLine for Line {
                     json!({ "sender_record_id": params.credential.sender_record_id.to_string() }),
                 ));
             while_held(&self.script, |script| script.hold_answer).await;
-            let records = vectors()["records"].clone();
-            Ok(serde_json::from_value(json!({
-                "device_id": self.device,
-                "installation_id": records["installation_binding"]["installation_id"],
-                "sender_record_id": records["sender_record"]["binding"]["sender_record_id"],
-                "credential_expires_at_ms": "1769817600000",
-            }))
-            .expect("a result"))
+            Ok(registration_answer(&self.device))
         })
     }
 
@@ -1331,8 +1336,8 @@ async fn a_late_answer_to_a_runs_last_read_does_not_hide_a_change_a_look_saw() {
     );
 }
 
-/// The run of a host that was forgotten does not use the consent the person gave when they turned
-/// the host on again: it ends without asking the system anything, and the new run asks once.
+/// The run of a host that was forgotten is ended where it waits, and does not use the consent the
+/// person gave when they turned the host on again: the new run asks once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_replaced_it() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -1379,16 +1384,11 @@ async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_re
     })
     .await;
 
-    // The first run's answer arrives first. A run holds the desk for as long as its task lives, so
-    // the count of those who hold it falls when the first run has ended; only then is the second
-    // run's answer let go, so that the second run cannot take the consent before the first run
-    // has had its say.
-    let holders = Arc::strong_count(&phone.desk);
-    phone.receiver.with(|state| {
-        state.permission_released.insert(1);
-    });
-    eventually("the first run ended", || {
-        Arc::strong_count(&phone.desk) < holders
+    // The first run is ended where it waits, though its answer has not come: a run holds the desk
+    // for as long as its task lives, so only the test's handle and the second run's are left. Only
+    // then is the second run's answer let go.
+    eventually("the first run ended where it waited", || {
+        Arc::strong_count(&phone.desk) <= 3
     })
     .await;
     phone.receiver.with(|state| {
@@ -1469,7 +1469,13 @@ enum Step {
 
 /// Starts the sequence for the one host, holds it at `step`, lets `forgets` do what the person did,
 /// lets the step go, and waits for the run to end. The desk is returned for what the host was sent.
-async fn the_host_is_forgotten_while(step: Step, forgets: impl FnOnce(&Desk, &PairedHost)) -> Desk {
+///
+/// `forgets` says whether what the person did ended the run where it waits, as the desk forgetting
+/// the host does: then the run has ended before the step is let go, and not only after.
+async fn the_host_is_forgotten_while(
+    step: Step,
+    forgets: impl FnOnce(&Desk, &PairedHost) -> bool,
+) -> Desk {
     let owner = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
@@ -1517,10 +1523,16 @@ async fn the_host_is_forgotten_while(step: Step, forgets: impl FnOnce(&Desk, &Pa
         .list()
         .expect("the paired hosts")
         .remove(0);
-    forgets(&phone, &paired);
-    hold(false);
+    let ended_where_it_waited = forgets(&phone, &paired);
     // A run holds the desk for as long as its task lives, so only the test's handle is left when
     // the run has ended.
+    if ended_where_it_waited {
+        eventually("the run ended where it waited", || {
+            Arc::strong_count(&phone.desk) == 1
+        })
+        .await;
+    }
+    hold(false);
     eventually("the run ended", || Arc::strong_count(&phone.desk) == 1).await;
     phone
 }
@@ -1541,6 +1553,7 @@ fn sent(phone: &Desk) -> (usize, usize, usize) {
 async fn a_host_forgotten_while_the_gateway_issues_for_it_is_not_connected_to() {
     let phone = the_host_is_forgotten_while(Step::GatewayIssue, |phone, paired| {
         phone.desk.forgotten(paired.host_device_id);
+        true
     })
     .await;
     assert_eq!(sent(&phone), (0, 0, 0));
@@ -1555,6 +1568,7 @@ async fn a_host_unpaired_while_the_gateway_issues_for_it_is_not_connected_to() {
             .device
             .forget_host(paired.host_device_id)
             .expect("the pairing is forgotten");
+        false
     })
     .await;
     assert_eq!(sent(&phone), (0, 0, 0));
@@ -1566,6 +1580,7 @@ async fn a_host_unpaired_while_the_gateway_issues_for_it_is_not_connected_to() {
 async fn a_host_forgotten_while_it_is_connected_to_is_told_nothing() {
     let phone = the_host_is_forgotten_while(Step::Connection, |phone, paired| {
         phone.desk.forgotten(paired.host_device_id);
+        true
     })
     .await;
     assert_eq!(sent(&phone), (1, 0, 0));
@@ -1576,6 +1591,7 @@ async fn a_host_forgotten_while_it_is_connected_to_is_told_nothing() {
 async fn a_host_forgotten_while_it_answers_the_registration_is_sent_no_preview_key() {
     let phone = the_host_is_forgotten_while(Step::HostAnswer, |phone, paired| {
         phone.desk.forgotten(paired.host_device_id);
+        true
     })
     .await;
     assert_eq!(sent(&phone), (1, 1, 0));
@@ -2011,8 +2027,48 @@ impl Registrar for Watched {
                 .connected
                 .push(host.host_device_id);
             while_held(&self.script, |script| script.hold_connection).await;
-            Ok(line)
+            Ok(Box::new(WatchedLine {
+                real: line,
+                script: Arc::clone(&self.script),
+                host: host.host_device_id,
+                device: host.device_id.to_string(),
+            }) as Box<dyn HostLine + 'a>)
         })
+    }
+}
+
+/// The product's line to a host, with a host that does not answer the registration for as long as
+/// the test says (the request has gone out, and the line waits), and then answers it as the vectors
+/// record. The preview key goes over the real connection.
+struct WatchedLine<'a> {
+    real: Box<dyn HostLine + 'a>,
+    script: Arc<Mutex<Registered>>,
+    host: kr_protocol::ids::DeviceId,
+    device: String,
+}
+
+impl HostLine for WatchedLine<'_> {
+    fn register(
+        &mut self,
+        params: DevicePushRegisterParams,
+    ) -> PushFuture<'_, DevicePushRegisterResult> {
+        Box::pin(async move {
+            self.script
+                .lock()
+                .expect("what was sent")
+                .credentials
+                .push((self.host, json!({})));
+            while_held(&self.script, |script| script.hold_answer).await;
+            let _ = params;
+            Ok(registration_answer(&self.device))
+        })
+    }
+
+    fn update_preview_key(
+        &mut self,
+        preview_key: kr_protocol::scalars::NotificationPreviewKey,
+    ) -> PushFuture<'_, ()> {
+        self.real.update_preview_key(preview_key)
     }
 }
 
@@ -2187,4 +2243,68 @@ async fn a_look_never_cuts_off_the_host_in_use_for_a_host_beside_it() {
         PushState::NeedsAttention,
         "the host beside it is left for the person"
     );
+}
+
+/// A host the person forgets while it has not answered the registration, and never does, does not
+/// keep the endpoint it was reached through: the run ends where it waits, with its connection and
+/// the hold on the endpoint, and another host on the same relay connects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forgotten_host_that_never_answers_does_not_keep_the_relay_it_was_reached_through() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let in_use = Host::start(&owner).await;
+    let silent = on_the_shared_relay(&owner, 9).await;
+    let other = on_the_shared_relay(&owner, 10).await;
+    let phone = desk_over_the_product_registrar(&[&in_use, &silent, &other], &owner).await;
+    let references = phone.references();
+    let host = |number: usize| {
+        phone
+            .device
+            .host_by_reference(&references[number])
+            .expect("a paired host")
+    };
+    phone
+        .device
+        .use_host(host(0).host_device_id)
+        .expect("the host in use");
+    let (silent_host, other_host) = (host(1), host(2));
+    phone.registered.lock().expect("what was sent").hold_answer = true;
+
+    // The host has the registration and does not answer.
+    phone.desk.enable(&references[1]).expect("the person asks");
+    eventually("the registration was sent", || {
+        phone
+            .registered
+            .lock()
+            .expect("what was sent")
+            .credentials
+            .len()
+            == 1
+    })
+    .await;
+    assert!(
+        companion_tauri::connection::Connection::paired(&phone.device, &other_host)
+            .await
+            .is_err(),
+        "the endpoint is held while the host is waited for"
+    );
+
+    // The person forgets it, as the application does: the pairing, then the desk.
+    phone
+        .device
+        .forget_host(silent_host.host_device_id)
+        .expect("the pairing is forgotten");
+    phone.desk.forgotten(silent_host.host_device_id);
+
+    tokio::time::timeout(WATCHDOG, async {
+        while companion_tauri::connection::Connection::paired(&phone.device, &other_host)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("another host on the relay connects once the forgotten host's run has ended");
+    eventually("the run ended", || Arc::strong_count(&phone.desk) == 1).await;
+    phone.registered.lock().expect("what was sent").hold_answer = false;
 }
