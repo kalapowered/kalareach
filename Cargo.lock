@@ -1278,6 +1278,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "companion-preview"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "kr-cbor",
+ "kr-crypto",
+ "kr-delivery",
+ "kr-protocol",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "companion-tauri"
 version = "0.1.0"
 dependencies = [
