@@ -1485,7 +1485,7 @@ impl Session {
         // record, the closure and a status read never name a different desktop from the one being
         // watched. The journal's copy is written again with it, so that a reader of the journal
         // sees the desktop that was watched and not the one the shell started with. The control
-        // daemon's registry takes the desktop when it next describes the worker.
+        // daemon's registry takes the desktop when a daemon adopts the worker again.
         if !self.config.desktop.desktop_session_id.is_present()
             && let Some(bound) = self.desktop.bound_binding()
         {

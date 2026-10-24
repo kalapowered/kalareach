@@ -4021,14 +4021,15 @@ among what the host could not account for, and so keeps the session's registrati
 until the daemon next starts. The reason such a session closes with, a desktop lost with its login
 session, comes from the desktop the worker reported when it came up, which the registry keeps with
 the worker's row, so the worker's journal is not opened to find it. A desktop the worker bound to
-after it came up reaches the registry when the daemon next describes the worker, so a worker that
-goes before that closes as a crash. A migration of a session's
+after it came up reaches the registry only when a daemon adopts the worker again, at its next start
+or when a list or a read finds the worker missing from the directory, so a worker that goes before
+that closes as a crash. A migration of a session's
 journal is a write and takes the same lock, and when another holds it the store is left as it is and
 read as unmigrated. The offline importer holds the environment's singleton lock instead, which no daemon
 can be running under.
 
-**A session closed on request is closed the same way.** The daemon watches the worker it asked to
-close, looking every 200 milliseconds for a minute, and when the kernel says the worker has ended it
+**A session closed on request is closed the same way.** Where the worker accepts a close and its
+closure comes later, the daemon watches the worker it asked to close, looking every 200 milliseconds for a minute, and when the kernel says the worker has ended it
 takes the ownership and records the closure under it, whether or not the worker wrote a closure of
 its own in its journal. When another recovery holds the session, or the lock cannot be taken,
 nothing is recorded in that look. After the minute, the next list or read of the session that
