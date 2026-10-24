@@ -10,7 +10,9 @@ use kr_protocol::root::ReaderContext;
 use kr_shell_integration::contract::events::BridgeEvent;
 use kr_shell_integration::contract::qualification::ShellKind;
 
-use super::commands::{a_session_with_probes, after_the_first_line, last_run};
+use super::commands::{
+    a_session_with_probes, a_session_with_probes_and, after_the_first_line, last_run,
+};
 use super::*;
 
 /// The status a line ended by a signal leaves: 128 plus the signal.
@@ -552,6 +554,85 @@ pub fn a_launcher_leaves_its_exit_status_as_the_lines(kind: ShellKind) {
     session.commands.policy = ResolvePolicy::default();
     let _ = session.submit("kr-probe as-typed", "never-printed-by-the-line");
     assert_eq!(session.status_of("kr-probe as-typed"), Some(0));
+}
+
+/// KR-REQ-01.06, KR-REQ-12.07: a program the worker does not take is not touched. The status it
+/// leaves, the code it exits with and the errors the session holds are the ones it left, as in a
+/// shell with no integration; that is the reason the shell asks before it changes anything.
+pub fn a_program_the_worker_does_not_take_leaves_the_status_it_left(kind: ShellKind) {
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    let counted = format!(
+        "$kr_errors = $Error.Count; {}",
+        print_assembled(kind, "kr-counted")
+    );
+    assert!(session.run(&counted, "kr-counted"));
+    let asked = session.run_asking("kr-probe-fails", "fails-ran");
+    assert_eq!(asked.len(), 1, "the program is asked about once: {asked:?}");
+    assert!(
+        session.run(
+            "\"kr-st=$?;c=$LASTEXITCODE;e=$($Error.Count - $kr_errors)\"",
+            "kr-st=False;c=7;e=0"
+        ),
+        "the status of the program was not the one it left:\n{}",
+        session.terminal_output()
+    );
+    let asked = session.run_asking("kr-probe succeeds", "probe-ran");
+    assert_eq!(asked.len(), 1, "the program is asked about once: {asked:?}");
+    assert!(
+        session.run(
+            "\"kr-st=$?;c=$LASTEXITCODE;e=$($Error.Count - $kr_errors)\"",
+            "kr-st=True;c=0;e=0"
+        ),
+        "the status of the program was not the one it left:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-12.07: a launcher that cannot be started leaves the program to run once, as typed, and
+/// a launcher that runs and fails is not followed by the program, whatever the person's profile
+/// does with a failed program.
+pub fn a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed(
+    kind: ShellKind,
+) {
+    const STRICT_PROFILE: &str = "$ErrorActionPreference = 'Stop'\n\
+                                  $PSNativeCommandUseErrorActionPreference = $true\n";
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    session.commands.policy = ResolvePolicy::Backend {
+        launcher: told(&probes.broken_launcher()),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let runs = probes.runs().len();
+    let asked = session.run_asking("kr-probe unstartable", "probe-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    assert_eq!(probes.runs().len(), runs + 1, "the program ran once");
+    assert_eq!(last_run(&probes).arguments, ["unstartable"]);
+
+    let mut session = a_session_with_probes_and(&package, &probes, STRICT_PROFILE);
+    session.commands.policy = ResolvePolicy::Backend {
+        launcher: told(&probes.failing_launcher()),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let runs = probes.runs().len();
+    let _ = session.submit(
+        "kr-probe under-a-strict-profile",
+        "never-printed-by-the-line",
+    );
+    assert_eq!(
+        session.status_of("kr-probe under-a-strict-profile"),
+        Some(7)
+    );
+    assert_eq!(probes.failing_launches().len(), 1, "the launcher ran once");
+    assert_eq!(
+        probes.runs().len(),
+        runs,
+        "the program ran after the launcher that stood in for it"
+    );
 }
 
 /// KR-REQ-07.84, KR-REQ-25.05: a prompt a running line opens ($Host.EnterNestedPrompt()) is not a
