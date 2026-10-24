@@ -87,6 +87,11 @@ struct ReceiverState {
     keys_asked: usize,
     /// Whether a filing of the preview keys fails.
     keys_fail: bool,
+    /// How many of the next filings of the preview keys fail, and whether a filing that fails has
+    /// first put the set it was handed where the receivers read it, as a store that fails part way
+    /// does.
+    keys_fail_next: usize,
+    keys_partly_applied: bool,
     /// The reads of the token, by their number, that wait to be released in the same way.
     token_held: BTreeSet<usize>,
     token_released: BTreeSet<usize>,
@@ -126,6 +131,8 @@ impl Receiver {
                 keys_released: false,
                 keys_asked: 0,
                 keys_fail: false,
+                keys_fail_next: 0,
+                keys_partly_applied: false,
                 token_held: BTreeSet::new(),
                 token_released: BTreeSet::new(),
                 token_reads: 0,
@@ -270,7 +277,11 @@ impl Native for Receiver {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             let mut state = self.state.lock().expect("the receiver");
-            if state.keys_fail {
+            if state.keys_fail || state.keys_fail_next > 0 {
+                state.keys_fail_next = state.keys_fail_next.saturating_sub(1);
+                if state.keys_partly_applied {
+                    state.keys_now = Some(keys.clone());
+                }
                 return Err("the receivers' store refused the keys".to_owned());
             }
             state.keys_now = Some(keys.clone());
@@ -3554,6 +3565,46 @@ async fn a_choice_whose_key_cannot_be_filed_is_not_made() {
     assert_eq!(held_keys(&phone).expect("keys").senders.len(), 1);
 }
 
+/// KR-REQ-16.11: a filing that failed part way may have left the receivers holding some of the new
+/// set, so the choice is let go with the set the record says filed again at once: previews that were
+/// off do not stay open to a host because an attempt to turn them on stopped half way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filing_that_failed_part_way_is_followed_by_the_earlier_set_at_once() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    phone.until(|states| states == [PushState::On]).await;
+    eventually("the host was told off", || {
+        previews_asked(&phone) == [true, false]
+    })
+    .await;
+    assert!(held_keys(&phone).expect("keys").senders.is_empty());
+
+    phone.receiver.with(|state| {
+        state.keys_fail_next = 1;
+        state.keys_partly_applied = true;
+    });
+    let refused = phone
+        .desk
+        .set_previews(&reference, true)
+        .await
+        .expect_err("the choice is refused");
+
+    assert!(
+        refused.message.contains("Try again"),
+        "{:?}",
+        refused.message
+    );
+    assert!(!phone.view().hosts[0].previews, "the choice was let go");
+    assert!(
+        held_keys(&phone).expect("keys").senders.is_empty(),
+        "the host's key the failed filing left is taken out again before the call ends"
+    );
+}
+
 /// KR-REQ-16.11: previews turned off reach the host even when the key cannot be taken out of the
 /// receivers' hands in the run that tells it: the host stops sealing, and the row says what is left
 /// to do.
@@ -3617,4 +3668,68 @@ async fn a_choice_the_record_cannot_keep_is_not_made() {
         [Reach::Asked],
         "no run was started"
     );
+}
+
+/// A choice let go after its filing failed is written back to the record, and when that cannot be
+/// done the person is told the earlier choice may return: what a restart reads is what the person is
+/// told.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_let_go_says_so_when_the_record_cannot_be_written_back() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    let next = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .keys_asked
+        + 1;
+    phone.receiver.with(|state| {
+        state.keys_hold = Some(next);
+        state.keys_released = false;
+    });
+    let choosing = tokio::spawn({
+        let (desk, reference) = (Arc::clone(&phone.desk), reference.clone());
+        async move { desk.set_previews(&reference, false).await }
+    });
+    eventually("the filing is asked of the receivers", || {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_asked
+            == next
+    })
+    .await;
+    // The record took the choice. It cannot take another write now.
+    let directory = phone._phone.data.path().join("push");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made unwritable");
+    if std::fs::write(directory.join("probe"), b"").is_ok() {
+        eprintln!("a_choice_let_go_says_so: skipped, this account writes where it was refused");
+        phone.receiver.with(|state| state.keys_released = true);
+        let _ = choosing.await;
+        return;
+    }
+
+    phone.receiver.with(|state| {
+        state.keys_fail = true;
+        state.keys_released = true;
+    });
+    let refused = choosing
+        .await
+        .expect("the call ran")
+        .expect_err("the choice is refused");
+
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is made writable again");
+    assert!(
+        refused.message.contains("put back"),
+        "the person is told the earlier choice may not be what is kept: {:?}",
+        refused.message
+    );
+    assert!(phone.view().hosts[0].previews, "and the choice was let go");
 }
