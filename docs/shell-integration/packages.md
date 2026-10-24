@@ -315,7 +315,7 @@ adapter for that reader:
 | --- | --- |
 | `kr_bridge.c`, `kr_bridge.h` | The endpoint, the frames, the handshake, the fence view, the pre-EOF decision and the reader's launch check |
 | `kr_bridge_cbor.c`, `kr_bridge_cbor.h` | KR-CBOR-1: canonical encoding with map keys checked into order as they are written, and a bounded decoder |
-| `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256 and base64url, for the one proof taken at startup |
+| `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256, base64url and a wipe the compiler keeps, for the one proof taken at startup |
 | `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant, and the shell's own string representation |
 | `kr_bridge_fish.rs` (fish only) | The reader's own state and the shell's own variables and executor, in Rust beside the reader: the same reads, the line's block and capability, and the question in front of each command |
 | `kr_bridge_bash.c` (Bash only) | What only the shell itself can do: put a variable in its exported environment or take one out, say which prompt it is at and what the last line exited with, and decide whether a command is one of the line's own |
@@ -411,8 +411,8 @@ alone. Bash does it in the block itself, which is why the block belongs at the e
 `scripts/place-shell-sources.sh` puts each pinned source where the build looks for it. An archive comes from the manifest's URL or, if that server doesn't respond, a mirror. For fish, each crate that its build would otherwise download comes from static.crates.io, by the name and version in the lock inside the archive, and each git repository comes from its forge as a bundle, with a second copy on github.com for `fluent-ftl-tools`. The build fetches any sources that are missing and checks every digest. A fish build then compiles with cargo offline, using a dedicated cargo home, against those checked files.
 
 `scripts/build-shells.sh` fetches the pinned tarball, verifies its digest, applies the patches with
-no fuzz at all, copies the bridge sources in, configures, compiles, runs the shell's own test suite
-and installs the result:
+no fuzz at all, copies the bridge sources in, runs the bridge's SHA-256 and HMAC-SHA-256 against
+published answers, configures, compiles, runs the shell's own test suite and installs the result:
 
 ```bash
 scripts/place-shell-sources.sh --all     # the pinned sources, first

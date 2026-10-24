@@ -498,6 +498,67 @@ name that exact nonce, and consumes it before it checks anything. One set of pro
 accepted once, on the connection it belongs to. The outstanding set is bounded, and a full ledger is
 answered by ending idle connections rather than by forgetting a challenge.
 
+## The hash the shell bridges write themselves
+
+The application writes no cipher and no password-authenticated key exchange. It does write one hash
+and one MAC. The Bash, Fish and Zsh packages each compile `kr_bridge_crypto.c`, a SHA-256 from FIPS
+180-4 and an HMAC-SHA-256 from RFC 2104, and the bridge uses them once, at startup, to compute its
+bootstrap proof. A shell package cannot link the host's cryptography library into every interactive
+shell it starts, so the code is the package's own. The three copies differ only in the licence note,
+and a test in `crates/kr-shell-integration/tests/` holds the rest equal. The worker verifies the
+proof with the RustCrypto HMAC in `crates/kr-shell-integration/src/host/handshake.rs`. Two checks
+hold the C code to the standard algorithms, and a third limits what the exception may carry.
+
+Every package build runs the code against published answers before it configures the shell.
+`scripts/build-shells.sh` compiles the tree's own copy of the file with the compiler, the manifest's
+flags and the `CPPFLAGS` and `LDFLAGS` of the build, twice (once with the platform's wipe call and
+once with the portable one), and runs it. A wrong answer stops the build and installs nothing. The
+check runs for Bash, Fish and Zsh whatever the shell's own test options say, so the build box and
+the `shell-packages` job run it too. Zsh and Bash compile the file under their own makefiles, which
+add defines and include paths the file does not read, so the check builds what they build. Fish
+compiles it through the `cc` crate, which adds flags of its own, so for Fish the check builds it
+closely.
+
+The SHA-256 cases are the examples in FIPS 180-2 (`abc`, the 448-bit message and one million `a`)
+and the NIST CAVP byte-oriented vectors for the empty message and for 55, 56, 57, 63 and 64 bytes,
+the lengths on each side of the point where the padding needs a second block. NIST publishes nothing
+for 65, 119 to 121 and 127 to 129 bytes, so those answers come from OpenSSL and from Perl's
+`Digest::SHA`, which agree. Each message is hashed whole, one byte at a time and in uneven pieces,
+which reaches every state of the 64-byte buffer. The HMAC-SHA-256 cases are RFC 4231 test cases 1 to
+7 (case 5 is the published 128-bit truncation, and cases 6 and 7 use a 131-byte key, which is hashed
+first), keys of 63, 64 and 65 bytes around the block size, and an empty key with an empty message.
+
+The second check compares the two implementations on the same input. Each managed session that
+`Session::start` opens in the shell package tests compares the proof its bridge sent with the
+worker's own `handshake::proof_bytes` over the same session, endpoint, shell process and integration
+version, and then decides the handshake with `handshake::admit_observed`. The three
+`the_handshake_declares_the_published_*` cases are the proof cases. They run against the built
+packages in the contract step of the `shell-packages` job. The cases that drive a person's startup
+customisations check the proof with a RustCrypto HMAC of their own.
+
+The third check is the primitive tripwire. `crates/kr-crypto/tests/libsodium.rs` looks for the
+constants of a hand-written primitive: the ChaCha and Salsa20 key-expansion words, the SHA-2 initial
+and first round constants, the Poly1305 clamp, the Curve25519 prime and the start of the AES S-box.
+It reads every file that git lists for the repository, which is the tracked files and the new files
+that are not ignored, in every tree (the crates, the companion's application and native code, the
+packages, the shells, the scripts, the documents, the fixtures, the tests, the bundled plugins and
+the skills) and in every language. Files are read as bytes, so a binary does not stop it. A file
+that git ignores is build output and is not read.
+
+The one named exception is the three `shells/<shell>/src/kr_bridge_crypto.c` files. Each may carry
+the two SHA-2 constants and no other primitive's constant. A cipher, MAC or curve constant in one of
+them fails the test, and so does an exception that no longer carries the SHA-2 constants. A second
+test builds a scratch repository with a constant planted in each tree and in each kind of file, a
+binary, an ignored directory and a link, and checks what the walk reads. A primitive written without
+these spellings passes, so the test is a tripwire and not a proof of absence.
+
+The two 32-byte HMAC secrets of the attention store (its item-key secret) and the delivery journal
+(its collapse secret) come from `kr_crypto::random_bytes`. Each has a test that draws 64 secrets and
+requires every one of the 256 bits to take both values, which a secret made from two version-four
+identifiers cannot do because the identifiers fix twelve of its bits. A secret already stored is
+read as it was and is not replaced. The documentation of `random_bytes` names the randomness in the
+tree that comes from elsewhere.
+
 ## Vectors
 
 `fixtures/crypto/` holds the documents below. The first three are regenerated with
@@ -568,6 +629,19 @@ Two secret buffers in this path are not cleared, and neither is reachable from t
 Both are recorded here with the versions pinned below, because no external cryptographic review has
 examined them. The release's statement of that exception is in
 [the release evidence gates](../releases/evidence-gates.md).
+
+### The shell bridges' hash and MAC
+
+The bridge's SHA-256 and HMAC-SHA-256 are this project's own code, and no external cryptographic
+review has examined them. The checks above bound that, but they do not replace a review.
+
+The code clears its temporaries, and the bootstrap secret when an activation fails, with `kr_wipe`.
+An optimiser may drop a `memset` of a buffer that is not read again, so `kr_wipe` calls `memset_s`
+on Apple platforms, `explicit_bzero` on glibc 2.25 or later in its default feature set, and a loop
+through a volatile pointer on any other platform. No case can show the wipes of the temporaries
+inside the hash and the MAC, because reading them back means reading dead stack memory. The cases
+read only memory the caller owns: the hash state after the digest is taken, and the range a wipe is
+given, once with the platform's call and once with the loop.
 
 ## Release manifest
 
