@@ -1658,18 +1658,7 @@ impl PushDesk {
     /// person agrees and the system has given the application its own token, which is after the
     /// permission step has said yes.
     async fn token_within(&self, within: Duration) -> std::result::Result<Option<String>, String> {
-        // Measured by the clock and not by the waits counted: one read can itself wait for the
-        // provider, and the registration slot this run holds is not held longer than `within`.
-        let started = tokio::time::Instant::now();
-        loop {
-            if let Some(token) = self.token().await? {
-                return Ok(Some(token));
-            }
-            if started.elapsed() >= within {
-                return Ok(None);
-            }
-            tokio::time::sleep(LOOK_EVERY).await;
-        }
+        read_until(|| self.token(), within, LOOK_EVERY).await
     }
 
     /// Waits for the receiver to answer the challenge, reading the record it writes.
@@ -1949,6 +1938,31 @@ fn after_a_restart(mut record: Record, now_ms: u64) -> Record {
         }
     }
     record
+}
+
+/// Reads with `read` every `every` until it gives a value, for no longer than `within` in all.
+///
+/// One deadline covers the reads and the waits between them: a read can itself wait for the
+/// provider, or never answer, and the registration slot a run holds is not held longer than
+/// `within`. `Ok(None)` when the time ran out.
+async fn read_until<F, Fut, T>(
+    mut read: F,
+    within: Duration,
+    every: Duration,
+) -> std::result::Result<Option<T>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<T>, String>>,
+{
+    let wait = async {
+        loop {
+            if let Some(value) = read().await? {
+                return Ok(Some(value));
+            }
+            tokio::time::sleep(every).await;
+        }
+    };
+    tokio::time::timeout(within, wait).await.unwrap_or(Ok(None))
 }
 
 fn forgotten_host() -> Stop {
@@ -2384,6 +2398,31 @@ mod tests {
             b"the record",
             "the record is where it was"
         );
+    }
+
+    /// A read that never answers does not keep the registration slot past the time given: the wait
+    /// ends with no value, and a value that comes in time is the value.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_never_answers_does_not_outlast_its_time() {
+        let never = read_until(
+            std::future::pending::<std::result::Result<Option<u8>, String>>,
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        );
+        let ended = tokio::time::timeout(Duration::from_secs(21), never).await;
+        assert_eq!(ended, Ok(Ok(None)), "the wait ended at its time");
+
+        let mut reads = 0;
+        let late = read_until(
+            || {
+                reads += 1;
+                let answer = (reads == 3).then_some(7_u8);
+                async move { Ok(answer) }
+            },
+            Duration::from_secs(20),
+            Duration::from_millis(500),
+        );
+        assert_eq!(late.await, Ok(Some(7)), "a value in time is the value");
     }
 
     /// A host that keeps its connection and never answers a change does not keep the line for ever:
