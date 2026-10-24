@@ -332,6 +332,7 @@ impl Host {
             startup_entry: PackageStartupEntry {
                 file: "startup/entry".to_owned(),
             },
+            launch: kr_shell_integration::host::package::PackageLaunch::default(),
         };
         std::fs::write(
             directory.join(MANIFEST_BASENAME),

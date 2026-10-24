@@ -387,9 +387,11 @@ fn install_startup(package: &Package, home: &Path, prompt: &str, profile: Profil
                     )
                 ));
                 let record = startup::EntryRecord::in_state_directory(&state);
-                for target in
-                    startup::powershell_targets(&package.executable, all_hosts, current_host)
-                {
+                for target in startup::powershell_targets(
+                    &startup::PowerShell::plain(package.executable.clone()),
+                    all_hosts,
+                    current_host,
+                ) {
                     let body = startup::entry(&target, &package.startup_entry, false)
                         .expect("the package's entry is text");
                     startup::install(&target.path, &body, &target.placement, &record)

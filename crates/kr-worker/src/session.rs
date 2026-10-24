@@ -1213,6 +1213,12 @@ impl Session {
         self.config.session_id
     }
 
+    /// Returns the program the session started as its root shell.
+    #[must_use]
+    pub fn shell_program(&self) -> &str {
+        &self.config.shell.program
+    }
+
     /// Returns what this session was created as.
     #[must_use]
     pub const fn config(&self) -> &SessionConfig {
