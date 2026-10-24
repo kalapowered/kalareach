@@ -233,8 +233,7 @@ fn a_plaintext_padded_to_a_larger_bucket_than_it_rounds_to_is_refused() {
     padded.push(0x80);
     padded.resize(larger as usize, 0);
     let envelope = seal_padded(&parties, &plaintext, &padded, larger);
-    // Refused either because the padding does not end in the last block of that bucket or because
-    // the length is not its content's bucket; whichever check sees it first, it is not opened.
-    let refused = reason(open(&parties, &envelope));
-    assert!(matches!(refused, "authentication" | "size"), "{refused}");
+    // The padding marker is not in the last block of the declared bucket, so the padding is refused
+    // before the content is read.
+    assert_eq!(reason(open(&parties, &envelope)), "authentication");
 }
