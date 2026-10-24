@@ -1409,16 +1409,18 @@ handed on. The reason (`SignIn` or `AccountChanged`) is kept before the connecti
 `ControlTransport::ended_by_this_device` gives it to whoever finds the connection closed: the
 application's connection state, a link's `reconnecting`, a terminal view's ending, the inbox's
 refusal and the push run's stop. A pass of the inbox asks once, at its end, whether its connection
-ended, and publishes nothing it read if it did; a failed session list fails the pass instead of
-leaving the rows without numbers, and only the host's own refusal of the list does that. A
-connection that presents no lease of its own (a link, a view) serves the person only while the
-keeper of its sign-in holds a lease the host took (`LeaseKeeper::took_a_lease`): the host binds a
-device to the first account that presents a lease, so a link opened after a switch to an account
-whose lease the host refuses is ended with the keeper's held stop and not served on the lease of
-the account before. The binding hears what the account object publishes. A change another process
-of the application makes in the shared store of a desktop, and one whose status could not be read
-when it was published, are not heard: the old account's sessions then end at the keeper's next
-request, and at the latest when the lease ends, up to fifteen minutes.
+ended, and publishes nothing it read if it did; the answer waits for the slowest host, so it asks
+again of each host it read as it returns and leaves out a host whose connection ended meanwhile. A
+failed session list fails the pass instead of leaving the rows without numbers, and only the host's
+own refusal of the list does that. A connection that presents no lease of its own (a link, a view)
+serves the person only while the keeper of its sign-in holds a lease the host took
+(`LeaseKeeper::took_a_lease`): the host binds a device to the first account that presents a lease,
+so a link opened after a switch to an account whose lease the host refuses is ended with the
+keeper's held stop and not served on the lease of the account before. The binding hears what the
+account object publishes. A change another process of the application makes in the shared store of a
+desktop, and one whose status could not be read when it was published, are not heard: the old
+account's sessions then end at the keeper's next request, and at the latest when the lease ends, up
+to fifteen minutes.
 
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
 service answers. A lease that has ended, that the host installed before its restart, or that a newer

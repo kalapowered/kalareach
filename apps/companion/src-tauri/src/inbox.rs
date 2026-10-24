@@ -114,6 +114,12 @@ struct Kept {
 /// The result of one successful visit: the connection that answered, the inbox and the numbers.
 type Read = (Arc<Connection>, AttentionReadResult, Vec<NumberedSession>);
 
+/// A host's row, with the connection its inbox was read over when the row carries a read.
+struct Found {
+    inbox: HostInbox,
+    read_over: Option<Arc<Connection>>,
+}
+
 /// What one visit to a host came to.
 enum Visited {
     /// The host answered with its inbox.
@@ -153,7 +159,8 @@ impl From<Missed> for Visited {
 impl InboxDesk {
     /// Visits every paired host that is not the one in use, all at once, and answers with what each
     /// said, in the order the pairing screen lists them. A host this device forgot, or began to use,
-    /// while it was visited is not among them.
+    /// while it was visited is not among them, and neither is a host whose inbox was read for an
+    /// account that has left by the time the answer is ready.
     pub async fn visit(self: &Arc<Self>, device: &Arc<Device>) -> Vec<HostInbox> {
         let in_use = device.host_in_use().map(|host| host.host_device_id);
         let hosts: Vec<PairedHost> = device
@@ -193,7 +200,17 @@ impl InboxDesk {
                 found.push(each);
             }
         }
+        // The answer waits for the slowest host, so an account may have left since the pass that
+        // read a host ended. What was read for it is not handed on.
         found
+            .into_iter()
+            .filter(|each| {
+                each.read_over
+                    .as_ref()
+                    .is_none_or(|connection| connection.ended_by_this_device().is_none())
+            })
+            .map(|each| each.inbox)
+            .collect()
     }
 
     /// Lets go of the connection kept to `host`, because this device no longer pairs with it.
@@ -206,7 +223,7 @@ impl InboxDesk {
 
     /// One visit to `host`. `None` when this device forgot the host, or began to use it, while it
     /// was visited: it is no longer a host to report.
-    async fn visit_one(&self, device: &Arc<Device>, host: &PairedHost) -> Option<HostInbox> {
+    async fn visit_one(&self, device: &Arc<Device>, host: &PairedHost) -> Option<Found> {
         let gate = Arc::clone(&self.kept().entry(host.host_device_id).or_default().gate);
         let _turn = gate.lock().await;
         let now = device.pairing().clock.wall_clock_ms();
@@ -229,6 +246,7 @@ impl InboxDesk {
             result: None,
             sessions: Vec::new(),
         };
+        let mut read_over = None;
         // A host this device forgot, or began to use, while it was visited is let go of, and keeps
         // nothing here.
         let in_use = device.host_in_use().map(|using| using.host_device_id);
@@ -250,7 +268,8 @@ impl InboxDesk {
         let entry = kept.entry(host.host_device_id).or_default();
         match outcome {
             Visited::Read((connection, result, sessions)) => {
-                entry.connection = Some(connection);
+                entry.connection = Some(Arc::clone(&connection));
+                read_over = Some(connection);
                 entry.lost_since_ms = None;
                 found.state = HostInboxState::Read;
                 found.read_at_ms = Some(now);
@@ -271,7 +290,10 @@ impl InboxDesk {
                 found.lost_since_ms = Some(*entry.lost_since_ms.get_or_insert(now));
             }
         }
-        Some(found)
+        Some(Found {
+            inbox: found,
+            read_over,
+        })
     }
 
     fn kept(&self) -> MutexGuard<'_, BTreeMap<DeviceId, Kept>> {
@@ -295,7 +317,8 @@ impl InboxDesk {
 /// signs out or another signs in ([`crate::bound`]). A pass decides once, at its end, whether its
 /// connection is still that account's: if not, nothing it read is published, the connection is
 /// closed, a kept one is replaced by a fresh one (which is refused with the words when no account
-/// is signed in, and is the new account's otherwise), and a fresh one shows the words.
+/// is signed in, and is the new account's otherwise), and a fresh one shows the words. The answer
+/// of [`InboxDesk::visit`] asks again as it returns, since it waits for the slowest host.
 async fn read_host(
     device: &Arc<Device>,
     host: &PairedHost,
