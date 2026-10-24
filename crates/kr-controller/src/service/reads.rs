@@ -414,8 +414,10 @@ impl Controller {
     }
 
     /// Reads the closure a worker wrote for itself, when one survived it.
+    ///
+    /// The caller holds the session's ownership, which brought the store forward and kept every
+    /// other writer off it: nothing here opens a journal that is not owned.
     pub(super) fn recovered_closure(&self, session_id: SessionId) -> Option<ClosureRecord> {
-        self.archive().bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         let journal = kr_worker::journal::Journal::open_read_only(&path).ok()?;
         journal.read_closure(session_id).ok().flatten()

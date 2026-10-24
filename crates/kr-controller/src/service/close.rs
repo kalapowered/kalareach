@@ -99,6 +99,16 @@ pub(super) enum Death {
     Unconfirmed,
 }
 
+/// What one look of the closure watcher found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Watch {
+    /// The worker's session is closed, or has left this daemon's directory: nothing is left to watch.
+    Over,
+    /// The worker has not ended, or the session is another recovery's, or the lock could not be
+    /// taken: look again.
+    Waiting,
+}
+
 impl Controller {
     /// Tells every worker holding a close for this action that the caller has its acceptance.
     ///
@@ -394,59 +404,62 @@ impl Controller {
     pub async fn watch_closure(self: Arc<Self>, session_id: SessionId, reason: ClosureReason) {
         let deadline = std::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
         loop {
-            let worker = {
-                let registry = self.registry.lock().await;
-                registry.workers().ok().and_then(|workers| {
-                    workers
-                        .into_iter()
-                        .find(|record| record.session_id == session_id)
-                })
-            };
-            let Some(worker) = worker else {
-                // The session has left this daemon's directory, which is what recording a closure
-                // does, so something else finished what this watcher was waiting for.
-                self.review_power_soon();
+            if self.watch_closure_once(session_id, reason).await == Watch::Over {
                 return;
-            };
-            match kr_ipc::identity::process_state(&worker.process_identity) {
-                kr_ipc::identity::ProcessState::Ended => {
-                    // A worker that handed over its own closure before it went has stopped what it
-                    // owned, and its account is the record. One that did not is a crash, and what
-                    // its session still owned is stopped before its identity is released.
-                    let finished = if self.recovered_closure(session_id).is_some() {
-                        self.record_final(
-                            session_id,
-                            reason,
-                            &worker.process_identity,
-                            &crate::archive::Fenced::nothing(session_id),
-                            Death::Confirmed,
-                        )
-                        .await
-                        .map(Some)
-                    } else {
-                        self.crash_flight(
-                            session_id,
-                            worker.display_number,
-                            &worker.process_identity,
-                            reason,
-                        )
-                        .await
-                    };
-                    if matches!(finished, Ok(Some(_))) {
-                        // The closure this watcher was waiting on has finished, so what it was
-                        // counted as is over. Whoever asked for it is not waiting for this.
-                        self.review_power_soon();
-                        return;
-                    }
-                }
-                kr_ipc::identity::ProcessState::Running
-                | kr_ipc::identity::ProcessState::Unknown { .. } => {}
             }
             if std::time::Instant::now() >= deadline {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    }
+
+    /// One look of [`Self::watch_closure`] at the session's worker.
+    ///
+    /// A worker the kernel says has ended is closed through [`Self::crash_flight`], whether or not
+    /// it handed its own closure over: the session's recovery lock is taken and its endpoint
+    /// fenced before its journal is opened, so a closure is never recorded from under another
+    /// recovery of the session. Where another holds it, or the lock cannot be taken, nothing is
+    /// recorded and the look is `Waiting`.
+    pub(super) async fn watch_closure_once(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        reason: ClosureReason,
+    ) -> Watch {
+        let worker = {
+            let registry = self.registry.lock().await;
+            registry.workers().ok().and_then(|workers| {
+                workers
+                    .into_iter()
+                    .find(|record| record.session_id == session_id)
+            })
+        };
+        let Some(worker) = worker else {
+            // The session has left this daemon's directory, which is what recording a closure
+            // does, so something else finished what this watcher was waiting for.
+            self.review_power_soon();
+            return Watch::Over;
+        };
+        if matches!(
+            kr_ipc::identity::process_state(&worker.process_identity),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            let finished = self
+                .crash_flight(
+                    session_id,
+                    worker.display_number,
+                    &worker.process_identity,
+                    reason,
+                )
+                .await;
+            if matches!(finished, Ok(Some(_))) {
+                // The closure this watcher was waiting on has finished, so what it was counted as
+                // is over. Whoever asked for it is not waiting for this.
+                self.review_power_soon();
+                return Watch::Over;
+            }
+        }
+        Watch::Waiting
     }
 
     /// Reconciles a session whose worker cannot be reached.
@@ -541,17 +554,20 @@ impl Controller {
 
     /// The body of [`Self::reconcile`].
     async fn reconcile_session(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
-        let record = {
+        let (record, desktop) = {
             let registry = self.registry.lock().await;
-            registry
+            let record = registry
                 .workers()?
                 .into_iter()
-                .find(|record| record.session_id == session_id)
+                .find(|record| record.session_id == session_id);
+            // A binding that cannot be read is not a reason to leave a gone worker's session open:
+            // the reason is then the one given for any worker whose desktop is not known.
+            (record, registry.desktop_of(session_id).ok().flatten())
         };
         let Some(record) = record else {
             return Ok(None);
         };
-        let reason = self.why_a_worker_is_gone(session_id, record.profile);
+        let reason = self.why_a_worker_is_gone(session_id, record.profile, desktop.as_ref());
         self.crash_flight(
             session_id,
             record.display_number,
@@ -718,15 +734,21 @@ impl Controller {
     ///
     /// A desktop-bound worker whose desktop has gone went with it: the platform ended the job with
     /// the login session it was in, which is what a logout does, and the worker had no chance to
-    /// write its own record. The desktop the session was created on is in the worker's own
-    /// journal, which outlives the worker, so the platform can be asked about that login session
-    /// by name. That is an answer rather than a guess even after the person has logged in again,
-    /// and it is an answer about the right session on a host where one user holds several at once:
-    /// the desktop this daemon itself is in says nothing about another login's.
+    /// write its own record. The desktop the session was created on is what the worker reported
+    /// when it came up, and the registry keeps it with the worker's row, so the platform can be
+    /// asked about that login session by name without opening the worker's journal. That is an
+    /// answer rather than a guess even after the person has logged in again, and it is an answer
+    /// about the right session on a host where one user holds several at once: the desktop this
+    /// daemon itself is in says nothing about another login's.
     ///
     /// Everything else is a worker that ended for reasons this host does not know, including a
     /// desktop it could not read: an unreadable platform is not a logout.
-    fn why_a_worker_is_gone(&self, session_id: SessionId, profile: WorkerProfile) -> ClosureReason {
+    fn why_a_worker_is_gone(
+        &self,
+        session_id: SessionId,
+        profile: WorkerProfile,
+        desktop: Option<&kr_protocol::identity::DesktopBinding>,
+    ) -> ClosureReason {
         if self
             .left_by_an_earlier_boot
             .lock()
@@ -738,34 +760,16 @@ impl Controller {
         if profile != WorkerProfile::DesktopBound {
             return ClosureReason::WorkerCrash;
         }
-        let Some(recorded) = self.recorded_desktop(session_id) else {
+        let Some(recorded) = desktop else {
             return ClosureReason::WorkerCrash;
         };
-        match kr_worker::desktop::recorded_presence(&recorded) {
+        match kr_worker::desktop::recorded_presence(recorded) {
             // The login session this session was created on is not there any more.
             kr_worker::desktop::Presence::Ended => ClosureReason::DesktopLost,
             kr_worker::desktop::Presence::Present | kr_worker::desktop::Presence::Unknown => {
                 ClosureReason::WorkerCrash
             }
         }
-    }
-
-    /// Returns the desktop a session was created on, from its own journal.
-    ///
-    /// The journal is in the environment's state directory and outlives the worker that wrote it,
-    /// which is what makes this readable after the worker has gone.
-    fn recorded_desktop(
-        &self,
-        session_id: SessionId,
-    ) -> Option<kr_protocol::identity::DesktopBinding> {
-        self.archive().bring_forward(session_id);
-        let path = self.paths.journal_database(session_id);
-        let journal = kr_worker::journal::Journal::open_read_only(path).ok()?;
-        journal
-            .read_session(session_id)
-            .ok()
-            .flatten()
-            .map(|summary| summary.desktop)
     }
 
     /// Records how a session ended, once.

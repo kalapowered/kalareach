@@ -32,6 +32,24 @@ async fn recorded_worker(
     temp: &kr_ipc::testing::TempHost,
     process: kr_protocol::identity::ProcessStartIdentity,
 ) -> SessionId {
+    recorded_worker_of(
+        controller,
+        temp,
+        process,
+        kr_protocol::identity::WorkerProfile::HeadlessUser,
+        &kr_protocol::identity::DesktopBinding::none(),
+    )
+    .await
+}
+
+/// Records a worker of the given profile, bound to `desktop`, whose process is `process`.
+pub(super) async fn recorded_worker_of(
+    controller: &Controller,
+    temp: &kr_ipc::testing::TempHost,
+    process: kr_protocol::identity::ProcessStartIdentity,
+    profile: kr_protocol::identity::WorkerProfile,
+    desktop: &kr_protocol::identity::DesktopBinding,
+) -> SessionId {
     let mut registry = controller.registry.lock().await;
     let reservation = registry
         .reserve(
@@ -74,11 +92,11 @@ async fn recorded_worker(
                     .worker_endpoint(reservation.display_number)
                     .expect("an endpoint")
                     .as_text(),
-                profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                profile,
                 state: kr_protocol::session::SessionState::Live,
                 acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
             },
-            &kr_protocol::identity::DesktopBinding::none(),
+            desktop,
         )
         .expect("records the worker");
     reservation.session_id
