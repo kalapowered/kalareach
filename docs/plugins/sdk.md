@@ -6,9 +6,11 @@ registers an action that answers through that place, and every call to the actio
 resource it answers. A document drawn for one request can also say that its controls are for that
 request alone.
 
-All of this is in version 0.1.1 of the package contract. A package that uses any of it declares
-`"sdk_range": ">=0.1.1, <0.2.0"`. A host on 0.1.0 cannot read the new members and refuses such a
-package.
+The destination, the action and the visibility declarations are in version 0.1.1 of the package
+contract. A package that uses only those declares `"sdk_range": ">=0.1.1, <0.2.0"`. A host on 0.1.0
+cannot read the new members and refuses such a package. The `decision_response`, `observation` and
+`operations` members of a table are in version 0.1.6: a package whose table declares any of them
+declares `"sdk_range": ">=0.1.6, <0.2.0"`, and a host on an earlier contract refuses it.
 
 The examples use the Claude Code Channels surface. Claude Code relays a tool approval as
 `notifications/claude/channel/permission_request` with `params.request_id`, and it reads the answer
