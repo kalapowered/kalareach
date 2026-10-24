@@ -89,6 +89,48 @@ pub const CONFIRMATIONS_PER_DEVICE: StatusAllowance = StatusAllowance {
     per_hour: 6,
 };
 
+/// How many times an hour one paired device may have a credential confirmed that only changes its
+/// choice of previews: a burst of three, then six an hour.
+///
+/// Every change of the choice reaches the host as a registration with a new bearer, since the
+/// device asks the gateway to issue first, and every bearer is confirmed. The changes are counted
+/// apart from [`CONFIRMATIONS_PER_DEVICE`], so that a person who changes the choice does not spend
+/// what the device's next token refresh needs. The host-wide allowance for the nonce
+/// ([`CONFIRMATIONS_PER_HOST`]) is shared by both.
+pub const PREVIEW_CHANGES_PER_DEVICE: StatusAllowance = StatusAllowance {
+    burst: 3,
+    per_hour: 6,
+};
+
+/// What a registration is, for the allowance of the device that makes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Registering {
+    /// A credential for a destination, an authorisation or an installation the host did not hold
+    /// in service: a first registration, a token refresh, a renewed authorisation.
+    NewCredential,
+    /// A credential for the authorisation and installation the destination in service already
+    /// names, with the other choice of previews.
+    PreviewsChoice,
+}
+
+impl Registering {
+    fn allowance(self) -> StatusAllowance {
+        match self {
+            Self::NewCredential => CONFIRMATIONS_PER_DEVICE,
+            Self::PreviewsChoice => PREVIEW_CHANGES_PER_DEVICE,
+        }
+    }
+
+    fn refusal(self) -> &'static str {
+        match self {
+            Self::NewCredential => "this device has registered too often; try again later",
+            Self::PreviewsChoice => {
+                "this device has changed its choice of previews too often; try again later"
+            }
+        }
+    }
+}
+
 /// How many nonces for a renewal this host asks the gateway for, to confirm credentials, whichever
 /// devices hand them over: a burst of six, then six an hour.
 ///
@@ -174,8 +216,10 @@ pub struct DeliveryRuntime {
     /// document selects one.
     mailbox: OnceLock<kr_protocol::service::GatewayOrigin>,
     recovered: AtomicBool,
-    /// What each paired device may still ask the gateway about a credential it hands over.
-    confirmations: Mutex<std::collections::BTreeMap<kr_protocol::ids::DeviceId, StatusBudget>>,
+    /// What each paired device may still ask the gateway about a credential it hands over, for
+    /// each kind of registration.
+    confirmations:
+        Mutex<std::collections::BTreeMap<(kr_protocol::ids::DeviceId, Registering), StatusBudget>>,
     /// What all devices together may still spend of the gateway's allowance for renewing and
     /// revoking, on nonces that confirm a credential.
     nonces: StatusBudget,
@@ -572,9 +616,12 @@ impl DeliveryRuntime {
     ///
     /// A device may ask a few times an hour, whatever it hands over, and all devices together a few
     /// more: the questions come out of the gateway's allowances for this host, and a device that
-    /// registers over and over would spend the renewals and revocations of every other. The
-    /// nonce is the dearer question, so it is asked only for a bearer the first question took, and
-    /// the host-wide allowance for it ([`CONFIRMATIONS_PER_HOST`]) is spent only then.
+    /// registers over and over would spend the renewals and revocations of every other. A device's
+    /// changes of its choice of previews have an allowance of their own
+    /// ([`PREVIEW_CHANGES_PER_DEVICE`]), so that they do not spend the one new credentials need;
+    /// both are counted before the gateway is asked, and every bearer is asked about all the same.
+    /// The nonce is the dearer question, so it is asked only for a bearer the first question took,
+    /// and the host-wide allowance for it ([`CONFIRMATIONS_PER_HOST`]) is spent only then.
     ///
     /// # Errors
     ///
@@ -589,6 +636,7 @@ impl DeliveryRuntime {
         &self,
         device_id: kr_protocol::ids::DeviceId,
         credential: &kr_protocol::push::PushDeliveryCredential,
+        registering: Registering,
     ) -> Result<(), super::Confirmation> {
         use super::Confirmation::{Limited, NotAsked};
 
@@ -601,13 +649,11 @@ impl DeliveryRuntime {
             .confirmations
             .lock()
             .map_err(|_| NotAsked("an earlier registration failed part way".to_owned()))?
-            .entry(device_id)
-            .or_insert_with(|| StatusBudget::new(CONFIRMATIONS_PER_DEVICE))
+            .entry((device_id, registering))
+            .or_insert_with(|| StatusBudget::new(registering.allowance()))
             .take(SystemClock.steady_ms());
         if !allowed {
-            return Err(Limited(
-                "this device has registered too often; try again later".to_owned(),
-            ));
+            return Err(Limited(registering.refusal().to_owned()));
         }
         // From the sweep's share, so a device that registers over and over cannot spend the
         // pass's, which notifications a person is waiting on depend on.
