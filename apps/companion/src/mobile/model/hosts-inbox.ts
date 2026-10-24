@@ -8,7 +8,7 @@
  * inbox is shown, and nowhere else, so nothing is asked of a host the person is not looking at.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { readOnCadence } from '../../app/cadence'
 import { useApp } from '../../app/state'
@@ -17,7 +17,11 @@ import { ATTENTION_READ_CADENCE_MS } from '../../model/attention'
 
 /** The other hosts as the last visit found them, and who is in use. */
 export interface OtherHosts {
-  /** What the last visit found of each host that is not in use; null before the first answer. */
+  /**
+   * What the last visit found of each host that is not in use; null before the first answer. A host
+   * this phone has forgotten since, or is using now, is not among them, whatever the visit found
+   * before the page knew.
+   */
   readonly hosts: readonly HostInbox[] | null
   /**
    * The last time each of those hosts answered, by its reference, kept while it does not: what a
@@ -32,6 +36,8 @@ export interface OtherHosts {
     readonly inUseReference: string | null
     readonly inUseName: string | null
     readonly count: number
+    /** Every host this phone is paired with, by reference. */
+    readonly references: ReadonlySet<string>
   } | null
   /** Looks again now, as after a change of the host in use. */
   readonly again: () => void
@@ -58,7 +64,8 @@ export function useOtherHosts(): OtherHosts {
           setPaired({
             inUseReference: using?.reference ?? null,
             inUseName: using?.name ?? null,
-            count: listed.length
+            count: listed.length,
+            references: new Set(listed.map((each) => each.reference))
           })
         },
         () => undefined
@@ -110,5 +117,17 @@ export function useOtherHosts(): OtherHosts {
   const again = useCallback(() => {
     nudge.current()
   }, [])
-  return { hosts, lastRead, paired, again }
+  // A visit's answer is as old as the visit: the person may have forgotten the host, or begun to use
+  // it, since. What the page reads of the pairing is newer, so the answers are weighed against it
+  // before anything is shown, and a host it does not list as one of the others shows nothing.
+  const current = useMemo(() => {
+    if (paired === null) return { hosts, lastRead }
+    const others = (reference: string) =>
+      paired.references.has(reference) && reference !== paired.inUseReference
+    return {
+      hosts: hosts === null ? null : hosts.filter((each) => others(each.reference)),
+      lastRead: new Map([...lastRead].filter(([reference]) => others(reference)))
+    }
+  }, [hosts, lastRead, paired])
+  return { hosts: current.hosts, lastRead: current.lastRead, paired, again }
 }
