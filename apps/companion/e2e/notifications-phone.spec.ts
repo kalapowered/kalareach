@@ -22,7 +22,7 @@ const TARGET = { ios: 44, android: 48 } as const
 const STATES = [
   { name: 'off', query: '', words: 'Notifications are off.', actions: ['Turn on notifications'] },
   { name: 'working', query: '&push=working', words: 'Waiting for the notification service.', actions: [] },
-  { name: 'on', query: '&push=on', words: 'Notifications are on.', actions: [] },
+  { name: 'on', query: '&push=on', words: 'This host took this phone for notifications.', actions: [] },
   {
     name: 'stopped',
     query: '&push=stopped',
