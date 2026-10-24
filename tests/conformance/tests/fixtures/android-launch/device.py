@@ -15,6 +15,9 @@ The device's state is a directory, named by the environment variable KR_FAKE_DEV
              a crash) or `never`
   port       the port the debugging endpoint listens on
   format     when present, the screen is in pixel format RGB_565
+  unreadable-screens
+             a number: that many of the first reads of the screen fail, and `screencap` writes
+             the text of its error where the frame would be
 
 The screen is a small raw frame in the shape `screencap` writes it: a header of width, height,
 format and colour space, then four bytes a pixel. A frame the picture of which was asked for
@@ -55,6 +58,19 @@ def end_the_process():
         pass
     with open(state_file("log"), "a") as log:
         log.write(read("ending.log"))
+
+
+def nth_call(name):
+    """The number of this call among the calls the device counts under `name`, from one."""
+    number = int(read("calls-" + name, "0").strip() or 0) + 1
+    with open(state_file("calls-" + name), "w") as handle:
+        handle.write(str(number))
+    return number
+
+
+def count(name):
+    """The number a state file of that name holds, or nought."""
+    return int(read(name, "0").strip() or 0)
 
 
 def ends_at(stage):
@@ -108,6 +124,10 @@ def adb(arguments):
             time.sleep(0.1)
         out.write((read("port").strip() + "\n").encode())
     elif command == "exec-out" and rest == ["screencap"]:
+        if nth_call("screen") <= count("unreadable-screens"):
+            out.write(b"screencap: unable to capture the display (error -22)\n")
+            out.flush()
+            return
         out.write(frame())
         out.flush()
         ends_at("screen")

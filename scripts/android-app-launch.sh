@@ -201,6 +201,7 @@ wait_for() {
         if [ $(($(date +%s) - wait_started)) -ge "$deadline" ]; then
             printf 'android-app-launch: FAIL: gave up waiting for %s\n' "$what" >&2
             [ -z "${mount_answers:-}" ] || printf 'android-app-launch: the page check answered:%s\n' "$mount_answers" >&2
+            [ -z "${screen_note:-}" ] || printf 'android-app-launch: the last look at the screen: %s\n' "$screen_note" >&2
             exit 1
         fi
         sleep 1
@@ -437,12 +438,14 @@ wait_for "the interface to have drawn into the document's root" interface_mounte
 # found to hold on, and no later look at the screen can find the application gone. The frame is the
 # application's only if its process was there when the frame was read, which is looked at at once.
 # The program says 0 when the page is drawn and the picture is written, 1 when the page is not
-# drawn, and 2 when the screen's frames cannot be read (a pixel format that is not RGBA_8888) or the
-# picture cannot be kept, which no later frame would change.
+# drawn or the stream is not a whole frame (read again), and 2 when the screen's frames cannot be
+# read (a whole frame in a pixel format that is not RGBA_8888) or the picture cannot be kept, which
+# no later frame would change.
 mkdir -p "$(dirname "$screenshot")"
+screen_note=""
 screen_shows_the_page() {
-    local status
-    dev exec-out screencap 2> /dev/null | python3 -I -c '
+    local result status
+    result="$(dev exec-out screencap 2> /dev/null | python3 -I -c '
 import binascii
 import collections
 import struct
@@ -451,14 +454,22 @@ import zlib
 
 data = sys.stdin.buffer.read()
 if len(data) < 16:
+    print(f"the capture was {len(data)} bytes, too few for a frame: {data[:60]!r}")
     sys.exit(1)
 width, height, pixel_format = struct.unpack_from("<III", data, 0)
+# A whole frame is a header (three words, and a fourth on newer systems) and then every pixel of
+# the screen in the size the format gives it. A capture that failed writes its error text, and one
+# that was cut off writes less than a frame: neither says what the screen is, so they are read again
+# and the format is judged only on a stream that is a whole frame for it.
+bytes_a_pixel = {1: 4, 2: 4, 3: 3, 4: 2, 5: 4, 0x16: 8, 0x2B: 4}
+sizes = [bytes_a_pixel[pixel_format]] if pixel_format in bytes_a_pixel else range(1, 9)
+header = next((h for h in (12, 16) for size in sizes if len(data) - h == width * height * size), None)
+if header is None or width == 0 or height == 0:
+    print(f"the capture was {len(data)} bytes, not a whole frame of {width} x {height} pixels; it began {data[:40]!r}")
+    sys.exit(1)
 if pixel_format != 1:
     print(f"the screen is in pixel format {pixel_format}, and only RGBA_8888 is read", file=sys.stderr)
     sys.exit(2)
-header = len(data) - width * height * 4
-if header not in (12, 16) or width == 0 or height == 0:
-    sys.exit(1)
 sampled = []
 for row in range(height * 12 // 100, height, 4):
     start = header + row * width * 4
@@ -467,6 +478,7 @@ for row in range(height * 12 // 100, height, 4):
 common = collections.Counter(sampled).most_common(1)[0][0]
 different = sum(1 for pixel in sampled if max(abs(a - b) for a, b in zip(pixel, common)) > 30)
 if different * 200 <= len(sampled):
+    print(f"the capture was a whole frame of {width} x {height} pixels, and the page is not drawn in it")
     sys.exit(1)
 
 
@@ -486,8 +498,10 @@ try:
 except OSError as error:
     print(f"the screenshot could not be written: {error}", file=sys.stderr)
     sys.exit(2)
-' "$screenshot"
-    status=${PIPESTATUS[1]}
+' "$screenshot"; printf 'status:%s' "${PIPESTATUS[1]}")"
+    status=${result##*status:}
+    screen_note=${result%status:*}
+    screen_note=${screen_note%$'\n'}
     if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
         echo "android-app-launch: FAIL: the screen cannot be read as a picture, or the screenshot cannot be written" >&2
         exit 1
