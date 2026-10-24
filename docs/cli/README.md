@@ -706,7 +706,7 @@ first page of output and again after the last. If it changed in between, nothing
 command tells you to export again. Turning privacy mode on after the file exists cannot recall the
 file.
 
-The retained output is the raw bytes the program wrote, and those bytes include what the program
+The retained output is the raw bytes the session's terminal received (on Windows, ConPTY's rendering of what the program did), and those bytes include what the program
 asked the terminal to do: write the clipboard, raise a notification, ring the bell, ask what the
 terminal is. A file that kept them would do those things again to whoever replayed it. So the
 command reads the output through the terminal engine that read it the first time, and the file
