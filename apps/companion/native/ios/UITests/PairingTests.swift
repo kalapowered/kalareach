@@ -582,6 +582,11 @@ final class PairingTests: DeviceTestCase {
         screenshot("draft-host-back")
         press("Send")
         touch("go-sent")
+        waitFor("sent-first.txt", timeout: 90)
+        // The phone itself says the send is applied once the host has answered it, and sends nothing
+        // more for it: the host is asked how many times it was sent after that, and not after a time.
+        waitToShow("Applied", timeout: 60)
+        touch("go-counted")
         waitFor("sent-result.txt", timeout: 90)
         XCTAssertEqual(read("sent-result.txt"), "prompts=1 text=\(draft)", "the agent was not sent the draft once")
         say("PAIRING the draft was kept across the views and the host being out of contact, and sent once")
