@@ -10,8 +10,8 @@ use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::session::DisplayNumber;
 
 use super::a_migration_and_a_recovery_of_one_session::{
-    RECOVERED, after_the_first_pass, closure_of, put_back_to_an_earlier_schema, version_of,
-    written_journal,
+    RECOVERED, after_the_first_pass, closure_of, put_back_to_an_earlier_schema, until_made,
+    version_of, written_journal,
 };
 use crate::attention::ClosedJournal;
 use crate::registry::Reservation;
@@ -86,10 +86,12 @@ async fn a_read_is_refused_while_the_process_the_launch_ran_still_runs() {
     assert_eq!(version_of(&controller, session_id), 3);
 
     the_launchs_process_ends(&controller, &reservation).await;
-    let read = controller
-        .session_archive(session_id)
-        .await
-        .expect("the archive answers once the process has ended");
+    let read = until_made(
+        || controller.session_archive(session_id),
+        |_| version_of(&controller, session_id) == kr_worker::persistence::migration::CURRENT,
+    )
+    .await
+    .expect("the archive answers once the process has ended");
     assert_eq!(
         read.summary.map(|summary| summary.cwd),
         Some(RECOVERED.to_owned())
@@ -146,9 +148,11 @@ async fn no_reader_migrates_a_store_while_the_process_the_launch_ran_still_runs(
     );
 
     the_launchs_process_ends(&controller, &reservation).await;
-    let listed = controller
-        .closed_session(&closure, DisplayNumber::new(1))
-        .await;
+    let listed = until_made(
+        || controller.closed_session(&closure, DisplayNumber::new(1)),
+        |listed| listed.cwd == RECOVERED,
+    )
+    .await;
     assert_eq!(
         listed.cwd, RECOVERED,
         "control: once it has ended it is read"
