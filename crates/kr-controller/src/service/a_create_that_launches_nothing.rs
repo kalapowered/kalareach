@@ -3357,6 +3357,60 @@ async fn the_registration_of_a_claimed_failed_create_follows_what_the_workers_jo
     }
 }
 
+/// KR-REQ-14.32 and KR-REQ-24.18: the look at a worker whose process the kernel has just said ended
+/// does not ask the daemon's evidence that a worker may remain. A session closed over a worker this
+/// daemon could not confirm ended has a closure in the registry that lists it, which is that evidence
+/// for every other reader for as long as it stands; the registration still ends with the launch's
+/// process when the journal the worker kept shows a closure that lists nothing, and the look has
+/// brought that journal forward to read it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_registration_of_a_session_closed_over_an_unaccounted_worker_ends_with_its_launchs_process()
+ {
+    let (temp, controller, _started) = daemon().await;
+    // The daemon's first collection pass takes a closed session the registry holds no record of
+    // and would bring the journal forward under this case.
+    super::a_migration_and_a_recovery_of_one_session::after_the_first_pass(&controller).await;
+    let (session_id, worker, identity) = a_session_with_a_worker_running(&controller);
+    a_workers_journal(&temp, session_id, Some(Vec::new()), true);
+    let closure = a_workers_own_closure(
+        session_id,
+        vec![kr_protocol::session::SurvivingResource {
+            kind: crate::archive::UNACCOUNTED_WORKER.to_owned(),
+            detail: "the worker's end could not be confirmed".to_owned(),
+        }],
+    );
+    controller
+        .registry
+        .lock()
+        .await
+        .record_closure(&closure)
+        .expect("the closure is recorded");
+    assert!(
+        controller.worker_may_remain(session_id, None, Some(&closure), None),
+        "every gated reader is told a worker may remain"
+    );
+    assert_eq!(
+        controller.archive().bring_forward(session_id),
+        crate::archive::Forward::HeldBack,
+        "and the daemon's archive leaves the journal as it is"
+    );
+
+    assert!(
+        !still_counted_after_the_worker_ends(&controller, session_id, worker, identity, false)
+            .await,
+        "the registration ends with the launch's process"
+    );
+    assert_eq!(
+        kr_worker::journal::Journal::recorded_schema_version(
+            temp.environment().journal_database(session_id)
+        )
+        .expect("reads the version"),
+        kr_worker::persistence::migration::CURRENT,
+        "and the look brought the journal forward to read it"
+    );
+}
+
 /// A supervisor that says it started a worker, which is a process the test keeps and ends itself.
 #[cfg(unix)]
 #[derive(Debug)]
