@@ -44,10 +44,12 @@ import to.kala.reach.companion.mobile.CallNews
 import to.kala.reach.companion.mobile.CallOpenings
 import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
+import to.kala.reach.companion.mobile.CurrentTokenHolder
 import to.kala.reach.companion.mobile.NotificationRoute
 import to.kala.reach.companion.mobile.OwnerAuthenticators
 import to.kala.reach.companion.mobile.PreviewKeySet
 import to.kala.reach.companion.mobile.PushStores
+import to.kala.reach.companion.mobile.PushToken
 import to.kala.reach.companion.mobile.SecretFiles
 import to.kala.reach.companion.mobile.SignInSession
 
@@ -323,13 +325,27 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("state", notificationState()))
     }
 
-    /** The registration token the provider gave this installation, when it has given one. */
+    /**
+     * The registration token the provider gave this installation, when it has given one: the
+     * provider's current token when it answers within a short time, and the one the messaging
+     * service stored otherwise. The wait is off the thread the command arrived on.
+     */
     @Command
     fun pushToken(invoke: Invoke) {
-        val token = activity
-            .getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
-            .getString(PushStores.TOKEN_KEY, null)
-        invoke.resolve(JSObject().put("token", token ?: JSONObject.NULL))
+        val preferences = activity.getSharedPreferences(PushStores.TOKEN_STORE, Context.MODE_PRIVATE)
+        Thread {
+            val token = PushToken.read(
+                stored = { preferences.getString(PushStores.TOKEN_KEY, null) },
+                source = CurrentTokenHolder.source,
+                keep = { current ->
+                    preferences.edit()
+                        .putString(PushStores.TOKEN_KEY, current)
+                        .putLong(PushStores.TOKEN_AT_KEY, System.currentTimeMillis())
+                        .commit()
+                }
+            )
+            invoke.resolve(JSObject().put("token", token ?: JSONObject.NULL))
+        }.start()
     }
 
     @Command
