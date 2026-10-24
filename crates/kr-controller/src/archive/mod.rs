@@ -653,6 +653,8 @@ impl ArchiveService {
                 Err(_) => return,
             }
         };
+        #[cfg(test)]
+        while_migrating::run(session_id);
         // `Journal::open` migrates and then holds the current schema. Dropping it immediately is
         // what keeps this a migration rather than a second reader.
         drop(Journal::open(&path));
@@ -1329,6 +1331,45 @@ fn durability_lost(gap: &RecoveryGap) -> Incompleteness {
     Incompleteness::DurabilityLost {
         from_ms: gap.faulted_at_ms.get(),
         to_ms: gap.recovered_at_ms.get(),
+    }
+}
+
+/// A step of a test that runs inside a migration, with the session's recovery lock held.
+#[cfg(test)]
+pub(crate) mod while_migrating {
+    use std::sync::Mutex;
+
+    use kr_protocol::ids::SessionId;
+
+    type Step = Box<dyn FnOnce() + Send>;
+
+    static NEXT: Mutex<Option<(SessionId, Step)>> = Mutex::new(None);
+
+    /// Makes the next migration of `session_id` run `step` once it holds the session's lock and
+    /// before it opens the store.
+    pub(crate) fn run_once(session_id: SessionId, step: impl FnOnce() + Send + 'static) {
+        *NEXT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((session_id, Box::new(step)));
+    }
+
+    pub(super) fn run(session_id: SessionId) {
+        let step = {
+            let mut next = NEXT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match next.take() {
+                Some((session, step)) if session == session_id => Some(step),
+                other => {
+                    *next = other;
+                    None
+                }
+            }
+        };
+        if let Some(step) = step {
+            step();
+        }
     }
 }
 

@@ -1328,6 +1328,10 @@ mod a_copy_a_viewer_may_hold;
 #[cfg(all(test, unix))]
 mod a_crash_whose_endpoint_cannot_be_removed;
 
+/// A migration and a recovery of one session's journal, which its recovery lock keeps apart.
+#[cfg(test)]
+mod a_migration_and_a_recovery_of_one_session;
+
 /// The sessions a daemon finds recorded in an earlier boot, when another recovery holds one.
 #[cfg(test)]
 mod a_previous_boot_left_to_a_held_recovery;

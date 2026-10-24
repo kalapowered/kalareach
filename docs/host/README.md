@@ -4017,9 +4017,18 @@ the state the fence is for; one that is already gone is fenced. A crashed sessio
 refusal is closed all the same, with nothing recovered, nothing it owned stopped, and the worker's
 journal not read for a closure of its own: its closure records the worker's end, lists the refusal
 among what the host could not account for, and so keeps the session's registration as a writer
-until the daemon next starts. A migration of a session's journal is a write and takes the same lock,
-and when another holds it the store is left as it is and read as unmigrated. The offline importer holds the environment's singleton lock instead, which no daemon
+until the daemon next starts. The reason such a session closes with, a desktop lost with its login
+session, comes from the desktop the worker reported when it came up, which the registry keeps with
+the worker's row, so the worker's journal is not opened to find it. A migration of a session's
+journal is a write and takes the same lock, and when another holds it the store is left as it is and
+read as unmigrated. The offline importer holds the environment's singleton lock instead, which no daemon
 can be running under.
+
+**A session closed on request is closed the same way.** The daemon watches the worker it asked to
+close, and when the kernel says the worker has ended it takes the ownership and records the closure
+under it, whether or not the worker handed over a closure of its own. When another recovery holds the
+session, or the lock cannot be taken, nothing is recorded yet: the next list or read of the session
+that cannot reach its worker closes it, and so does the next start.
 
 The order is that way round because the answer can be *no*: a daemon that fenced before it asked
 would delete a working session's socket on the way to finding out that it was working. A query the
@@ -4059,7 +4068,8 @@ an accepted intent with no marker is rejected), stops what the session still own
 records the closure. The closure record carries the terminated process identities and which of them
 had to be forced, the processes that outlasted the attempt, and an ownership-coverage flag that
 never claims every application was discovered. Nothing is rebuilt from terminal history. A worker
-that wrote its own closure before it went has stopped what it owned, and its record stands.
+that wrote its own closure before it went has stopped what it owned, and its record stands, except
+where its endpoint could not be removed: that closure is the host's, as above.
 
 **What the cleanup stops, and by what.** The worker writes down the processes its session owns in
 its journal (the `owned_processes` table), each by identifier and start value, and rewrites that
