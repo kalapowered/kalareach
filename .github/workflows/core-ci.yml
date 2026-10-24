@@ -197,7 +197,8 @@ jobs:
       # whose documentation builds without one. The client library is built a second time without
       # its default features, as a phone builds it. The macos and windows jobs document the same
       # crates for their own platforms, whose code this build does not read, so a crate added here
-      # is added to both.
+      # is added to both. The windows job also documents kr-cli and kr-controller, which this list
+      # does not name.
       - name: Documentation without warnings
         if: ${{ !cancelled() }}
         env:
@@ -1334,8 +1335,9 @@ jobs:
           if-no-files-found: ignore
 
       # The rust job's documentation step for this platform's own code: a doc comment on an item
-      # only Windows compiles is read by this build and no other. The crates are that step's. It
-      # comes last because a step that fails here stops every later step that has no condition.
+      # only Windows compiles is read by this build and no other. The crates are that step's, and
+      # kr-cli and kr-controller besides. It comes last because a step that fails here stops every
+      # later step that has no condition.
       - name: Documentation without warnings
         if: ${{ !cancelled() && matrix.part == 'second' }}
         env:
@@ -1343,8 +1345,9 @@ jobs:
         run: >-
           cargo doc --locked --no-deps
           -p companion-platform -p companion-tauri -p kr-attention -p kr-automation
-          -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance
-          -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents
+          -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-cli -p kr-client
+          -p kr-conformance -p kr-controller -p kr-crypto -p kr-delivery -p kr-describe
+          -p kr-describe-model -p kr-e2e-agents
           -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf
           -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk
           -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol

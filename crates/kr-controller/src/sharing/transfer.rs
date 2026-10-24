@@ -18,7 +18,7 @@
 //! Two rules a transfer cannot be talked out of:
 //!
 //! * **It needs the owner's confirmation, always.** It changes who holds host-control authority
-//!   over the session, which is [`SensitiveAction::ChangeHostAuthority`].
+//!   over the session, which is `SensitiveAction::ChangeHostAuthority`.
 //! * **It cannot hand over what the transferring device does not hold.** Section 19's delegation
 //!   rule does not stop applying because the issuer is giving something up: an actor with a
 //!   viewer's grant cannot make somebody else an owner.

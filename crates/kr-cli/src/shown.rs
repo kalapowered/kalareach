@@ -23,6 +23,8 @@
 //!
 //! Each type here is made only by the function beside it, so a value of it is always what that
 //! function decided may be said.
+//!
+//! [`kr_client::shown`]: mod@kr_client::shown
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -277,7 +279,7 @@ const BUILD_NAME_LIMIT: usize = 64;
 ///
 /// The name is lower-case letters, digits and dashes, starting with a letter; the release is
 /// numbers separated by dots, and after a `+` the twelve lower-case hexadecimal digits of a
-/// commit where there is one; the whole is at most [`BUILD_NAME_LIMIT`] bytes.
+/// commit where there is one; the whole is at most `BUILD_NAME_LIMIT` bytes.
 #[must_use]
 pub fn build_name(build_id: &kr_protocol::ids::BuildId) -> BuildName {
     let text = build_id.as_str();

@@ -94,7 +94,7 @@ const FIRST_RETRY_MS: u64 = 1_000;
 /// admission, a deadline and the authority it was given, and holds that authority standing until
 /// the write has committed, so a withdrawal is ordered wholly before the check or wholly after
 /// the commit. A refusal is returned without running the write. The daemon passes
-/// [`crate::service::Controller::under_registration`] over the admission a mutation carried.
+/// `crate::service::Controller::under_registration` over the admission a mutation carried.
 pub type Admitted<'a> = &'a dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()>;
 
 /// The longest wait between two tries of a refused step.

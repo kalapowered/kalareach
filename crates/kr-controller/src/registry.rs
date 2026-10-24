@@ -61,7 +61,7 @@ use crate::error::{ControllerError, Result};
 /// The file has four writers, and each creates and migrates its own tables when it is opened:
 /// [`Registry`], [`crate::grants::GrantDirectory`], [`crate::service::net::devices::DeviceDirectory`] and
 /// [`crate::service::net::invitations::prepare`]. A change to the tables or to a value kept in them, by any of the four,
-/// raises this version, with a step in [`Registry::migrate`] that may be empty when the writer's own
+/// raises this version, with a step in `Registry::migrate` that may be empty when the writer's own
 /// idempotent open does the work. The stored-format lock fails until it has been raised. A migration
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands

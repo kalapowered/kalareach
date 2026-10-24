@@ -27,7 +27,7 @@
 //! * what is **owed** to the durable record: a decision or a step that could not be written stays
 //!   here and is written again before the next answer.
 //!
-//! [`ClockTrust::establish_with`] clears the decision and both holds, moves the mark and the
+//! `ClockTrust::establish_with` clears the decision and both holds, moves the mark and the
 //! anchor, confirms the clock and ends a lost clock continuity, in one transition. Nothing else
 //! does, and the owner's confirmation is spent in the same transaction.
 //!

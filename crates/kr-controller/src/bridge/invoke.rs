@@ -375,7 +375,7 @@ pub struct Invocation {
 ///
 /// Standard error is diagnostic output that belongs to whoever ran the command, and a helper that
 /// writes a line there while a terminal shows a projection of a session would damage the screen it
-/// is describing. So it is read here, kept to its last [`DIAGNOSTIC_TAIL`] bytes, and left for the
+/// is describing. So it is read here, kept to its last `DIAGNOSTIC_TAIL` bytes, and left for the
 /// caller to say once it is able to.
 #[derive(Clone, Debug, Default)]
 pub struct Diagnostics(Arc<Mutex<DiagnosticTail>>);

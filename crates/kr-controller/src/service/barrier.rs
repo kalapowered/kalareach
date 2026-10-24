@@ -443,7 +443,7 @@ impl Controller {
     ///
     /// Every worker is asked for its acknowledgement first. The pages of evidence an
     /// acknowledgement leaves are asked for once all of them have been, one worker after another
-    /// ([`Self::collect_owed_evidence`]), so a worker that keeps refusing its pages holds up the
+    /// (`Self::collect_owed_evidence`), so a worker that keeps refusing its pages holds up the
     /// pages of the workers after it and the report, and never another worker's acknowledgement,
     /// which is what the barrier holds on and what renews that worker's lease.
     ///

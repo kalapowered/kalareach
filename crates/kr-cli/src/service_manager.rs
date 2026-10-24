@@ -71,6 +71,8 @@
 //! setup's own report is not a failure: it names each drop-in the user manager applies besides the
 //! definition by its path, as content the person asked for, on standard output alone
 //! ([`crate::output`]).
+//!
+//! [`kr_client::shown`]: mod@kr_client::shown
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

@@ -136,7 +136,7 @@ impl AdmittedMutation {
 /// a newer revocation's lists as the older one's answer would name the wrong actions. So the
 /// reports are kept by revision. A worker that produced more revocations than this without their
 /// evidence ever being completed loses the oldest, which is the same bound its own journal keeps.
-/// A result that read the names of a report that goes says so ([`Carries::lost`]).
+/// A result that read the names of a report that goes says so (`Carries::lost`).
 ///
 /// It is also the most revisions one announcement tells a worker by name
 /// (`Controller::revision_notices`), so the reports of an announcement are never more than the
@@ -1035,7 +1035,7 @@ impl AuthorityBarrier {
     /// Marks the workers a registry of an earlier run showed behind a fence that run still owed,
     /// which this daemon has been told nothing of: the first announcement to each reads the
     /// revisions between what it acknowledged and that announcement
-    /// ([`WorkerFences::announce`]). A worker made in this run is not marked, because everything
+    /// (`WorkerFences::announce`). A worker made in this run is not marked, because everything
     /// announced to it is in memory, and neither is one that run saw acknowledge everything it
     /// owed.
     pub fn recovered(&self, workers: impl IntoIterator<Item = SessionId>) {

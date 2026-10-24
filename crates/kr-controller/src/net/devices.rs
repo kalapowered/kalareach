@@ -392,7 +392,7 @@ impl DeviceDirectory {
     /// Opens the directory in the daemon's registry database, creating its tables.
     ///
     /// The handle raises a signal of its own. A second handle on a directory the daemon keeps
-    /// comes from [`Self::open_beside`], or what waits on the signal misses what it writes.
+    /// comes from `Self::open_beside`, or what waits on the signal misses what it writes.
     ///
     /// # Errors
     ///
@@ -1338,7 +1338,7 @@ impl DeviceDirectory {
     /// that was serving it: a clock that went backwards once, and then reads plausibly again,
     /// would otherwise let the next connection decide a grant's life against it. The owner's
     /// confirmation of the clock goes with it: the owner said what the time was, not that the
-    /// clock would keep it. What clears it is [`Self::establish_clock`].
+    /// clock would keep it. What clears it is `establish_clock_in`.
     ///
     /// # Errors
     ///
@@ -1358,7 +1358,7 @@ impl DeviceDirectory {
 
     /// Records that the platform's time service was found unqualified while the owner had not
     /// confirmed the clock: the hold on attention's forgetting and quiet hours, which only
-    /// [`Self::establish_clock`] lifts.
+    /// `establish_clock_in` lifts.
     ///
     /// # Errors
     ///
@@ -1515,7 +1515,7 @@ impl DeviceDirectory {
 }
 
 /// What runs a commit it is handed while it holds whatever must stay true from the last check to
-/// the commit ([`DeviceDirectory::guarded_transaction`]).
+/// the commit (`DeviceDirectory::guarded_transaction`).
 pub type CommitFn = dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync;
 
 /// Clears the decision, both holds, and marks the moment the owner established the clock at.

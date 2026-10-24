@@ -17,7 +17,7 @@
 //! # Who pays
 //!
 //! A host key draws on no allowance of its own, so every lease is billed to the account the host is
-//! signed in as. The keeper asks the service for the authorisation that sign-in opened ([`payer`]),
+//! signed in as. The keeper asks the service for the authorisation that sign-in opened (`payer`),
 //! names it in every lease request, and keeps it in the row of the lease. A lease keeps the
 //! authorisation it was asked for under for as long as it lives, also when a new sign-in has opened
 //! another: the keeper names the new one for the pairs it leases from then on, and stops asking for
