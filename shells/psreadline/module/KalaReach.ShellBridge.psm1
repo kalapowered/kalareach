@@ -434,17 +434,17 @@ function Initialize-KalaReachBridge {
     $script:Kr.Session = $sessionBytes
     $script:Kr.Secret = $secretBytes
     $script:Kr.Endpoint = $endpoint
-    # An error on the way to the proof must not leave the secret in the module for the life of the
-    # process, so everything between holding it and the accepted handshake clears it on a throw.
+    # Whatever stops the exchange before the handshake is accepted, an error or the person's
+    # interrupt included, must not leave the secret in the module for the life of the process, so
+    # it is cleared on the way out of anything that is not an acceptance. A `finally` changes
+    # nothing else: an error that the caller's preference lets continue goes on as it did.
+    $accepted = $false
     try {
         $script:Kr.Identity = Get-KrProcessIdentity
         $script:Kr.Package = Get-KrPackageIdentity
 
         $script:Kr.Socket = Connect-KrEndpoint $endpoint
-        if ($null -eq $script:Kr.Socket) {
-            Clear-KrSecret
-            return
-        }
+        if ($null -eq $script:Kr.Socket) { return }
 
         $transcript = Get-KrTranscript $script:Kr.Identity $script:Kr.Package.integration_version
         $mac = [System.Security.Cryptography.HMACSHA256]::new($script:Kr.Secret)
@@ -452,17 +452,15 @@ function Initialize-KalaReachBridge {
 
         if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $script:Kr.Package) })) {
             Disconnect-KrEndpoint
-            Clear-KrSecret
             return
         }
         if (-not (Wait-KrHandshake)) {
             Disconnect-KrEndpoint
-            Clear-KrSecret
             return
         }
-    } catch {
-        Clear-KrSecret
-        throw
+        $accepted = $true
+    } finally {
+        if (-not $accepted) { Clear-KrSecret }
     }
     $script:Kr.Registered = $true
     $script:Kr.Managed = $true

@@ -3386,9 +3386,39 @@ struct Scan {
     guards: u64,
 }
 
-/// The size of a page of the machines this case runs on, for stepping over a guard page.
+/// The size of a page on this machine, from the kernel's own report on a mapping of this process.
+///
+/// # Panics
+///
+/// Panics when the report cannot be read, because a scan that does not know its pages cannot step
+/// over one.
 #[cfg(target_os = "linux")]
-const PAGE: u64 = 4096;
+fn page_size() -> u64 {
+    std::fs::read_to_string("/proc/self/smaps")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("KernelPageSize:"))
+                .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+        })
+        .map(|kilobytes| kilobytes * 1024)
+        .expect("the kernel reports its page size in /proc/self/smaps")
+}
+
+/// Whether the kernel says the page at `address` is a guard page of the process `pagemap` belongs
+/// to: bit 58 of its entry in `/proc/<pid>/pagemap`, which Linux sets for a page that a guard
+/// installed with `MADV_GUARD_INSTALL` makes fault on every access (Linux 6.15 and later).
+#[cfg(target_os = "linux")]
+fn is_guard_page(pagemap: &mut std::fs::File, address: u64, page: u64) -> bool {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut entry = [0u8; 8];
+    pagemap
+        .seek(SeekFrom::Start(address / page * 8))
+        .and_then(|_| pagemap.read_exact(&mut entry))
+        .is_ok()
+        && ((u64::from_le_bytes(entry) >> 58) & 1) == 1
+}
 
 /// Looks for `needle` in every mapping of a running process that is both readable and writable,
 /// which is where a static buffer, the heap and the stack are.
@@ -3408,6 +3438,9 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
         .unwrap_or_else(|error| panic!("the memory map of process {pid} cannot be read: {error}"));
     let mut memory = std::fs::File::open(format!("/proc/{pid}/mem"))
         .unwrap_or_else(|error| panic!("the memory of process {pid} cannot be opened: {error}"));
+    let mut pagemap = std::fs::File::open(format!("/proc/{pid}/pagemap"))
+        .unwrap_or_else(|error| panic!("the page map of process {pid} cannot be opened: {error}"));
+    let page = page_size();
     let mut scan = Scan {
         copies: Vec::new(),
         unread: Vec::new(),
@@ -3443,12 +3476,17 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
             let read = match outcome {
                 Ok(read) => read,
                 // A guard page of a thread's stack stays inside a mapping that reads as writable,
-                // and the kernel refuses to read it with an input/output error. Nothing a process
-                // wrote can be in a page that faults on every access, so the scan goes on past it
-                // and counts it; any other refusal ends the mapping unread.
-                Err(error) if error.raw_os_error() == Some(5) => {
+                // and the kernel refuses to read it with an input/output error. The same error
+                // is what an unmapped address or a page that failed gives, so the page is
+                // stepped over only when the kernel's page map marks it as a guard, which faults
+                // on every access and holds nothing a process wrote. Any other refusal ends the
+                // mapping unread.
+                Err(error)
+                    if error.raw_os_error() == Some(5)
+                        && is_guard_page(&mut pagemap, offset, page) =>
+                {
                     scan.guards += 1;
-                    offset += PAGE;
+                    offset += page;
                     carried.clear();
                     continue;
                 }
