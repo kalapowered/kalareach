@@ -11,6 +11,8 @@
 //! behind TLS a test issues, against a room that says `HostGone` as the deployed one does. No
 //! deployment is involved.
 
+#![cfg(unix)]
+
 #[path = "../../../../crates/kr-client/tests/support/room_tls.rs"]
 mod room_tls;
 
