@@ -247,6 +247,7 @@ fn the_power_setting_is_written_into_the_one_configuration_document() {
 }
 
 /// KR-REQ-26.13: a document from a later build is refused, not rewritten.
+/// KR-REQ-26.16: an edit that the document under it cannot take is refused, and nothing is written.
 #[test]
 fn a_document_this_build_does_not_know_is_left_exactly_as_it_was() {
     let installation = Installation::create();
@@ -275,6 +276,7 @@ fn a_document_this_build_does_not_know_is_left_exactly_as_it_was() {
 
 /// KR-REQ-26.13: a document of a level this build does not read is not rewritten either, though the
 /// build reads it: an edit would drop the members it cannot see.
+/// KR-REQ-26.16: an edit that the document under it cannot take is refused, and nothing is written.
 #[test]
 fn a_document_at_a_higher_level_is_refused_an_edit_and_left_exactly_as_it_was() {
     let installation = Installation::create();
