@@ -738,6 +738,57 @@ async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
     third.stop().await;
 }
 
+/// KR-REQ-13.01: a pass reports a host only if it is still one of the others when the pass ends.
+/// Each visit asks about its own host when it ends, and a slower visit runs on after that: a host
+/// the phone begins to use, or forgets, in the meantime is settled out of the pass's answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_ends() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let third = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
+    connection(companion, true).await;
+    let device = companion.device();
+    let id_of = |name_of: &Host| {
+        device
+            .pairing()
+            .hosts
+            .list()
+            .expect("the records")
+            .into_iter()
+            .find(|each| each.host_endpoint_id == name_of.network().endpoint_id())
+            .expect("the host is recorded")
+            .host_device_id
+    };
+    let (second_id, third_id) = (id_of(&second), id_of(&third));
+
+    let desk = Arc::new(companion_tauri::inbox::InboxDesk::default());
+    let found = desk.visit(&device).await;
+    assert_eq!(found.len(), 2, "both other hosts were visited: {found:?}");
+    assert_eq!(
+        companion_tauri::inbox::InboxDesk::settled(&device, found.clone()).len(),
+        2,
+        "nothing changed, so nothing is left out"
+    );
+
+    device.use_host(second_id).expect("the second is chosen");
+    device
+        .forget_host(third_id)
+        .expect("the third is forgotten");
+    let settled = companion_tauri::inbox::InboxDesk::settled(&device, found);
+    assert!(settled.is_empty(), "{settled:?}");
+    first.stop().await;
+    second.stop().await;
+    third.stop().await;
+}
+
 /// KR-REQ-13.01: a host this computer owns is watched for what it wants confirmed, and the watcher
 /// visits it beside the host in use: it asks the link to leave the host in use's connection alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
