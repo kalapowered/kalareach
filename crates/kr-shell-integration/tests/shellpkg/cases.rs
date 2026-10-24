@@ -3382,7 +3382,8 @@ struct Scan {
     unread: Vec<String>,
     /// How many bytes were read.
     bytes: u64,
-    /// How many pages the kernel refused to read as guard pages, which hold nothing.
+    /// How many pages the kernel refused to read that hold nothing: guard pages, and pages of a
+    /// region that was unmapped after the scan listed it.
     guards: u64,
 }
 
@@ -3405,19 +3406,30 @@ fn page_size() -> u64 {
         .expect("the kernel reports its page size in /proc/self/smaps")
 }
 
-/// Whether the kernel says the page at `address` is a guard page of the process `pagemap` belongs
-/// to: bit 58 of its entry in `/proc/<pid>/pagemap`, which Linux sets for a page that a guard
-/// installed with `MADV_GUARD_INSTALL` makes fault on every access (Linux 6.15 and later).
+/// The kernel's entry for the page at `address` in `/proc/<pid>/pagemap`, the file `pagemap` is
+/// open on, or nothing when the entry cannot be read.
 #[cfg(target_os = "linux")]
-fn is_guard_page(pagemap: &mut std::fs::File, address: u64, page: u64) -> bool {
+fn page_entry(pagemap: &mut std::fs::File, address: u64, page: u64) -> Option<u64> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let mut entry = [0u8; 8];
     pagemap
         .seek(SeekFrom::Start(address / page * 8))
         .and_then(|_| pagemap.read_exact(&mut entry))
-        .is_ok()
-        && ((u64::from_le_bytes(entry) >> 58) & 1) == 1
+        .ok()
+        .map(|()| u64::from_le_bytes(entry))
+}
+
+/// Whether a page's entry in `/proc/<pid>/pagemap` says the page can hold nothing a process wrote.
+///
+/// That is a page the kernel marks as a guard (bit 58, Linux 6.15 and later, for a guard installed
+/// with `MADV_GUARD_INSTALL`), and a page that is neither in memory (bit 63) nor swapped out
+/// (bit 62): a process that wrote to a page leaves it in one of the two, so such a page holds no
+/// copy of anything. The second is also what a guard looks like on the Linux versions that have
+/// guards and no bit for them, and what an address that is no longer mapped looks like.
+#[cfg(target_os = "linux")]
+fn entry_holds_nothing(entry: u64) -> bool {
+    (entry >> 58) & 1 == 1 || (entry >> 62) & 0b11 == 0
 }
 
 /// Looks for `needle` in every mapping of a running process that is both readable and writable,
@@ -3432,10 +3444,19 @@ fn is_guard_page(pagemap: &mut std::fs::File, address: u64, page: u64) -> bool {
 /// Panics when the process's memory map or memory cannot be opened.
 #[cfg(target_os = "linux")]
 fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
+    scan_memory_listing(pid, needle, "")
+}
+
+/// [`scan_memory`] over the process's memory map with `extra` lines added to it. A process that is
+/// running changes its map between the reading of the map and the reading of its memory, and a
+/// line for a region that is not mapped is how a case makes the scan meet that on purpose.
+#[cfg(target_os = "linux")]
+fn scan_memory_listing(pid: u32, needle: &[u8], extra: &str) -> Scan {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
-        .unwrap_or_else(|error| panic!("the memory map of process {pid} cannot be read: {error}"));
+        .unwrap_or_else(|error| panic!("the memory map of process {pid} cannot be read: {error}"))
+        + extra;
     let mut memory = std::fs::File::open(format!("/proc/{pid}/mem"))
         .unwrap_or_else(|error| panic!("the memory of process {pid} cannot be opened: {error}"));
     let mut pagemap = std::fs::File::open(format!("/proc/{pid}/pagemap"))
@@ -3476,14 +3497,14 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
             let read = match outcome {
                 Ok(read) => read,
                 // A guard page of a thread's stack stays inside a mapping that reads as writable,
-                // and the kernel refuses to read it with an input/output error. The same error
-                // is what an unmapped address or a page that failed gives, so the page is
-                // stepped over only when the kernel's page map marks it as a guard, which faults
-                // on every access and holds nothing a process wrote. Any other refusal ends the
-                // mapping unread.
+                // a mapping can be unmapped between the listing and the read, and the kernel
+                // answers both with an input/output error, as it does a page it cannot read.
+                // A page is stepped over only when the kernel's page map says it holds nothing a
+                // process wrote, and any other refusal ends the mapping unread.
                 Err(error)
                     if error.raw_os_error() == Some(5)
-                        && is_guard_page(&mut pagemap, offset, page) =>
+                        && page_entry(&mut pagemap, offset, page)
+                            .is_some_and(entry_holds_nothing) =>
                 {
                     scan.guards += 1;
                     offset += page;
@@ -3558,7 +3579,7 @@ pub fn the_bootstrap_secret_does_not_outlive_the_accepted_handshake(kind: ShellK
         );
         assert!(
             scan.unread.is_empty() && scan.bytes > 0,
-            "{} bytes of the {} shell's memory were read ({} guard pages stepped over), and these writable mappings were not read to their end:\n{}",
+            "{} bytes of the {} shell's memory were read ({} pages that hold nothing stepped over), and these writable mappings were not read to their end:\n{}",
             scan.bytes,
             kind.as_str(),
             scan.guards,
@@ -3600,6 +3621,35 @@ pub fn the_powershell_bootstrap_secret_is_cleared_once_the_handshake_is_accepted
         session.run(probe, "kr-secret-length=0"),
         "the module still holds secret bytes after the handshake was accepted:\n{}",
         session.terminal_output()
+    );
+}
+
+/// KR-REQ-07.40: a mapping that goes while the scan is reading is not memory the scan left unread.
+///
+/// A shell that runs threads maps and unmaps small regions, such as the alternate signal stack of
+/// a thread that ends, and the scan reads the process's map before it reads the memory it lists.
+/// A region listed and gone by then answers the read with an input/output error, as a page the
+/// kernel guards does, and the scan has to tell the two apart from memory it truly cannot read: a
+/// region that is no longer mapped holds nothing a process could have written. The case adds a
+/// line to the map for a region that is not mapped, as one unmapped after the listing is, and asks
+/// that the scan does not report it.
+///
+/// # Panics
+///
+/// Panics when the scan reports the unmapped region as unread.
+#[cfg(target_os = "linux")]
+pub fn a_mapping_that_goes_while_the_scan_reads_is_not_memory_left_unread() {
+    // A region the map lists and the process no longer has: nothing is mapped at this address,
+    // which is what a region unmapped after the listing looks like to the read.
+    let gone = "200000000000-200000002000 rw-p 00000000 00:00 0\n";
+    let scan = scan_memory_listing(std::process::id(), b"a needle of no consequence", gone);
+    assert!(
+        !scan
+            .unread
+            .iter()
+            .any(|line| line.starts_with("200000000000-")),
+        "the scan reports a region that was unmapped before it was read as unread memory: {:?}",
+        scan.unread
     );
 }
 
@@ -3753,5 +3803,34 @@ pub fn the_shell_links_no_library_of_the_machine_that_built_it(kind: ShellKind) 
                 kind.as_str()
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pages {
+    use super::entry_holds_nothing;
+
+    /// KR-REQ-07.40: the scan steps over a page only when the kernel says nothing was ever written
+    /// to it, and never over a page that is in memory or swapped out.
+    #[test]
+    fn a_page_holds_nothing_only_when_it_is_a_guard_or_neither_in_memory_nor_swapped() {
+        assert!(
+            entry_holds_nothing(1 << 58),
+            "a page the kernel marks as a guard"
+        );
+        assert!(
+            entry_holds_nothing(0),
+            "a page that is neither in memory nor swapped out"
+        );
+        assert!(
+            entry_holds_nothing(1 << 55),
+            "a page with only its soft-dirty bit set is still neither in memory nor swapped out"
+        );
+        assert!(!entry_holds_nothing(1 << 63), "a page that is in memory");
+        assert!(!entry_holds_nothing(1 << 62), "a page that is swapped out");
+        assert!(
+            !entry_holds_nothing((1 << 63) | (1 << 61)),
+            "a page that is in memory and file-backed or shared"
+        );
     }
 }
