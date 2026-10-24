@@ -7,8 +7,9 @@ this script. It reads them and fails on a change the register has no row for:
 
   * the security advisories of the fish, PowerShell, PSReadLine and PCRE2 repositories (fish
     links PCRE2, so a PCRE2 advisory is a fish advisory);
-  * the issues of PowerShell/Announcements labelled Security, which is where Microsoft publishes
-    the advisories that reach PowerShell, the .NET ones included;
+  * the issues of PowerShell/Announcements that are security advisories, which is where Microsoft
+    publishes the advisories that reach PowerShell, the .NET ones included (not every one carries
+    the Security label, so the title decides);
   * the stable releases of fish and PowerShell, the tags of zsh and the releases and patches of
     bash that are newer than what the packages pin. Neither zsh nor bash publishes a machine
     readable advisory feed, so a new release or patch is the only signal either gives;
@@ -17,12 +18,13 @@ this script. It reads them and fails on a change the register has no row for:
 
 A change needs a row when it was first published on or after the day the register started, or
 when its affected range includes what the package pins (a RustSec advisory against the lock needs
-one whatever its date). A row covers it when the row names the package and names the change by
-its identifier, its status is one the register defines, a `scheduled` row is not past its target,
-and, for an advisory with an affected range, the row quotes the range as the source gives it, so
-that a range which changes later is a new fact and not an old row. A change with no row passes
-for one working day after it was published, which is the time the register allows for triage, and
-fails after it.
+one whatever its date). The newest row that names the package and the change by its identifier
+covers it, when its status is one the register defines, it is not `scheduled` past its target, it
+quotes every affected range the source gives as the source gives it, and it is dated on or after
+the day the source last revised the change, so that a revision is a new fact and not an old row.
+A change with no row passes for one working day after it was published or last revised, which is
+the time the register allows for triage, and fails after it. A RustSec advisory has no such
+allowance, because the report carries no date on which it reached the database.
 
 Every source is public. The run's own read-only token is used for api.github.com only, to lift
 the rate limit. A source that cannot be read, or answers with nothing where it must have
@@ -67,8 +69,10 @@ class SourceError(Exception):
 # ---- reading the sources -------------------------------------------------------------------------
 
 
-def fetch(url, token=None):
-    """The body at url, after up to three tries. The token goes to api.github.com only."""
+def fetch(url, token=None, missing_ok=False):
+    """The body at url and the Link header of the answer, after up to three tries. The token goes
+    to api.github.com only. A page that is not there is None where the caller says it may be
+    missing."""
     headers = {"User-Agent": "kalareach-shell-advisories", "Accept": "application/vnd.github+json"}
     if token and urllib.parse.urlparse(url).hostname == "api.github.com":
         headers["Authorization"] = "Bearer " + token
@@ -77,28 +81,42 @@ def fetch(url, token=None):
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=60) as response:
-                return response.read()
+                return response.read(), response.headers.get("Link") or ""
+        except urllib.error.HTTPError as error:
+            if error.code == 404 and missing_ok:
+                return None, ""
+            last = error
         except (urllib.error.URLError, OSError) as error:
             last = error
-            time.sleep(RETRY_DELAY * (attempt + 1))
+        time.sleep(RETRY_DELAY * (attempt + 1))
     raise SourceError("%s: %s" % (url, last))
 
 
 def fetch_pages(url, token, must_hold_something=True):
-    """Every item of a paginated GitHub list, as one list."""
+    """Every item of a paginated GitHub list, as one list. GitHub says where the next page is in
+    the Link header, and some lists (the security advisories) take a cursor and ignore a page
+    number, so the header is followed and a page number is never guessed."""
     items = []
-    for page in range(1, 30):
-        separator = "&" if "?" in url else "?"
-        body = fetch("%s%sper_page=100&page=%d" % (url, separator, page), token)
+    separator = "&" if "?" in url else "?"
+    next_url = "%s%sper_page=100" % (url, separator)
+    for _ in range(30):
+        body, link = fetch(next_url, token)
         try:
             chunk = json.loads(body)
         except ValueError as error:
-            raise SourceError("%s: the answer is not JSON (%s)" % (url, error))
+            raise SourceError("%s: the answer is not JSON (%s)" % (next_url, error))
         if not isinstance(chunk, list):
-            raise SourceError("%s: the answer is not a list" % url)
+            raise SourceError("%s: the answer is not a list" % next_url)
+        for item in chunk:
+            if not isinstance(item, dict):
+                raise SourceError("%s: an item of the list is not an object" % next_url)
         items.extend(chunk)
-        if len(chunk) < 100:
+        following = re.findall(r'<([^>]+)>\s*;\s*rel="next"', link)
+        if not following:
             break
+        next_url = following[0]
+    else:
+        raise SourceError("%s: the list has more than 30 pages" % url)
     if must_hold_something and not items:
         raise SourceError("%s: the answer holds nothing" % url)
     return items
@@ -113,17 +131,19 @@ def numbers(text):
 
 
 def in_range(range_text, version):
-    """Whether a version is inside a range such as '>= 10.32, <= 10.47'. An unreadable range
-    counts as inside it, because the safe mistake is a row too many."""
+    """Whether a version is inside a range such as '>= 10.32, <= 10.47' or '3.1.0-3.3.1'. A range
+    that cannot be read in full counts as inside it, because the safe mistake is a row too many."""
     wanted = numbers(version)
     span = re.match(r"\s*([0-9][0-9.]*)\s*-\s*([0-9][0-9.]*)\s*$", range_text)
     if span:
         return numbers(span.group(1)) <= wanted <= numbers(span.group(2))
+    tests = []
     for comparator in range_text.split(","):
         match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9.]*)\s*$", comparator)
         if not match:
             return True
-        operator, bound = match.group(1) or "=", numbers(match.group(2))
+        tests.append((match.group(1) or "=", numbers(match.group(2))))
+    for operator, bound in tests:
         held = {
             "<=": wanted <= bound,
             ">=": wanted >= bound,
@@ -136,15 +156,21 @@ def in_range(range_text, version):
     return True
 
 
-def finding(source, package, identifier, aliases, published, range_text=None, needs_row=True):
+def finding(source, package, identifier, aliases, published, updated=None, ranges=(), needs_row=True,
+            allowance=True):
+    """One change an upstream published. `published` and `updated` are the days it first appeared
+    and was last revised, where the source says; `ranges` are the affected ranges the source gives,
+    as it gives them."""
     return {
         "source": source,
         "package": package,
         "id": identifier,
         "aliases": [identifier] + [alias for alias in aliases if alias],
         "published": published,
-        "range": range_text,
+        "updated": updated,
+        "ranges": list(ranges),
         "needs_row": needs_row,
+        "allowance": allowance,
     }
 
 
@@ -160,13 +186,14 @@ def repository_advisories(api, token, repository, package, pinned, may_be_empty=
     )
     found = []
     for item in items:
-        published = day(item.get("published_at"))
-        range_text = None
-        affects = False
-        for vulnerability in item.get("vulnerabilities") or []:
-            text = vulnerability.get("vulnerable_version_range")
-            if text and pinned and in_range(text, pinned):
-                range_text, affects = text, True
+        published, updated = day(item.get("published_at")), day(item.get("updated_at"))
+        texts = [
+            text
+            for vulnerability in item.get("vulnerabilities") or []
+            for text in [vulnerability.get("vulnerable_version_range")]
+            if text
+        ]
+        affects = bool(pinned) and any(in_range(text, pinned) for text in texts)
         recent = published is not None and published >= STARTED
         found.append(
             finding(
@@ -175,7 +202,8 @@ def repository_advisories(api, token, repository, package, pinned, may_be_empty=
                 item["ghsa_id"],
                 [item.get("cve_id")],
                 published,
-                range_text if affects else None,
+                updated,
+                texts,
                 needs_row=recent or affects,
             )
         )
@@ -183,11 +211,16 @@ def repository_advisories(api, token, repository, package, pinned, may_be_empty=
 
 
 def announcements(api, token):
-    """The advisories Microsoft publishes for PowerShell, the .NET ones that reach it included."""
-    url = "%s/repos/PowerShell/Announcements/issues?labels=Security&state=all" % api
+    """The advisories Microsoft publishes for PowerShell, the .NET ones that reach it included.
+    Not every one carries the Security label, so an issue is an advisory when its title says so or
+    names a CVE, and the issues that are pull requests are not issues."""
+    url = "%s/repos/PowerShell/Announcements/issues?state=all" % api
     found = []
     for item in fetch_pages(url, token):
-        cves = re.findall(r"CVE-\d{4}-\d{4,}", item.get("title") or "")
+        title = item.get("title") or ""
+        cves = re.findall(r"CVE-\d{4}-\d{4,}", title)
+        if "pull_request" in item or not (cves or re.search(r"Security Advisory", title, re.I)):
+            continue
         identifier = cves[0] if cves else "PowerShell/Announcements#%d" % item["number"]
         created, updated = day(item.get("created_at")), day(item.get("updated_at"))
         recent = (created is not None and created >= STARTED) or (
@@ -200,6 +233,7 @@ def announcements(api, token):
                 identifier,
                 ["https://github.com/PowerShell/Announcements/issues/%d" % item["number"]],
                 created,
+                updated,
                 needs_row=recent,
             )
         )
@@ -256,30 +290,58 @@ def zsh_tags(api, token, pinned):
     for item in fetch_pages("%s/repos/zsh-users/zsh/tags" % api, token):
         match = re.fullmatch(r"zsh-(\d+(?:\.\d+){1,2})", item["name"])
         if match and numbers(match.group(1)) > numbers(pinned):
-            found.append(finding("zsh tags", "zsh", item["name"], [], None))
+            commit, _ = fetch("%s/repos/zsh-users/zsh/commits/%s" % (api, item["name"]), token)
+            try:
+                published = day(json.loads(commit)["commit"]["committer"]["date"])
+            except (ValueError, KeyError, TypeError) as error:
+                raise SourceError("the commit of %s cannot be read (%s)" % (item["name"], error))
+            found.append(finding("zsh tags", "zsh", item["name"], [], published))
     return found
 
 
+def bash_listing(ftp, path, pattern, missing_ok=False):
+    """The entries of a directory listing on ftp.gnu.org that match `pattern`, with the day each
+    was put there. The pattern has one group, the entry's name."""
+    body, _ = fetch("%s/%s" % (ftp, path), None, missing_ok=missing_ok)
+    if body is None:
+        return []
+    listing = body.decode("utf-8", "replace")
+    entries = []
+    for line in listing.splitlines():
+        match = re.search(r'href="(%s)"[^\n]*?(\d{4}-\d{2}-\d{2})' % pattern, line)
+        if match:
+            entries.append((match.group(1), day(match.group(2))))
+    return entries
+
+
 def bash_releases(ftp, pinned):
-    """Releases of a series newer than the pinned one, and patches of the pinned series above
-    the pinned patch. The 5.2 series gets no patch after the pinned one once its successor is out,
-    so a release of the next series is the signal that matters."""
+    """Releases of a series newer than the pinned one, the newest patch of each such series (bash
+    fixes land in the newest series, and a patch to it that fixes a defect the pinned series also
+    has gets no other announcement), and the patches of the pinned series above the pinned patch."""
     found = []
-    listing = fetch(ftp + "/").decode("utf-8", "replace")
-    names = re.findall(r'href="(bash-(\d+\.\d+(?:\.\d+)?)\.tar\.gz)"', listing)
-    if not names:
+    pin = numbers(pinned)
+    releases = bash_listing(ftp, "", r"bash-(?:\d+\.\d+(?:\.\d+)?)\.tar\.gz")
+    if not releases:
         raise SourceError("%s/: the listing holds no release" % ftp)
-    for _, version in names:
-        if numbers(version) > numbers(pinned):
-            found.append(finding("bash releases", "bash", "bash-" + version, [], None))
-    series = "%d%d" % numbers(pinned)[:2]
-    patches = fetch("%s/bash-%d.%d-patches/" % (ftp, *numbers(pinned)[:2])).decode("utf-8", "replace")
-    names = re.findall(r'href="(bash%s-(\d+))"' % series, patches)
-    if not names:
-        raise SourceError("%s/bash-%d.%d-patches/: the listing holds no patch" % (ftp, *numbers(pinned)[:2]))
-    for name, number in names:
-        if int(number) > numbers(pinned)[2]:
-            found.append(finding("bash patches", "bash", name, [], None))
+    series = set()
+    for name, published in releases:
+        version = numbers(name.replace(".tar.gz", ""))
+        if version > pin:
+            found.append(finding("bash releases", "bash", name.replace(".tar.gz", ""), [], published))
+        if version[:2] > pin[:2]:
+            series.add(version[:2])
+    pinned_patches = "bash-%d.%d-patches/" % pin[:2]
+    patches = bash_listing(ftp, pinned_patches, r"bash%d%d-\d+" % pin[:2])
+    if not patches:
+        raise SourceError("%s/%s: the listing holds no patch" % (ftp, pinned_patches))
+    for name, published in patches:
+        if int(name.rsplit("-", 1)[1]) > pin[2]:
+            found.append(finding("bash patches", "bash", name, [], published))
+    for major, minor in sorted(series):
+        newer = bash_listing(ftp, "bash-%d.%d-patches/" % (major, minor), r"bash%d%d-\d+" % (major, minor), True)
+        if newer:
+            name, published = max(newer, key=lambda entry: int(entry[0].rsplit("-", 1)[1]))
+            found.append(finding("bash patches", "bash", name, [], published))
     return found
 
 
@@ -298,7 +360,9 @@ def audited_lock(path):
             continue
         advisories.extend(entry["advisory"] for entry in entries if entry.get("advisory"))
     return [
-        finding("RustSec, fish's Cargo.lock", "fish", advisory["id"], [], day(advisory.get("date")))
+        finding(
+            "RustSec, fish's Cargo.lock", "fish", advisory["id"], [], day(advisory.get("date")), allowance=False
+        )
         for advisory in advisories
     ]
 
@@ -325,11 +389,17 @@ def triage_rows(text):
         rows.append(cells)
     rows = rows[2:]
     parsed = []
-    for cells in rows:
+    for index, cells in enumerate(rows):
         if len(cells) != 6:
             raise SourceError("a triage row has %d cells: %s" % (len(cells), cells))
+        try:
+            written = datetime.date.fromisoformat(cells[0])
+        except ValueError:
+            raise SourceError("a triage row has no date: %s" % cells)
         parsed.append(
             {
+                "index": index,
+                "written": written,
                 "date": cells[0],
                 "change": cells[1],
                 "packages": cells[2].split(", "),
@@ -363,6 +433,12 @@ def figure_within(text, unit):
         position = at + len("within ")
 
 
+def date_after(text, label):
+    """The day written `YYYY-MM-DD` right after `label` in `text`, or None."""
+    match = re.search(re.escape(label) + r"(\d{4}-\d{2}-\d{2})", text)
+    return datetime.date.fromisoformat(match.group(1)) if match else None
+
+
 def mentions(text, aliases):
     for alias in aliases:
         if re.search(r"(?<![\w.-])%s(?![\w-]|\.\d)" % re.escape(alias), text):
@@ -382,7 +458,8 @@ def working_days_between(start, end):
 
 def judge(findings, rows, now, triage_days):
     """What is wrong with the register for these findings, and what is only waiting out its
-    allowance."""
+    allowance. The newest row that names a change is the assessment that stands; the rows before
+    it are the record of what was thought earlier."""
     problems, waiting = [], []
     for item in findings:
         if not item["needs_row"]:
@@ -394,13 +471,14 @@ def judge(findings, rows, now, triage_days):
             if item["package"] in row["packages"] and mentions(row["change"], item["aliases"])
         ]
         if not covering:
-            published = item["published"]
-            if published is not None and working_days_between(published, now) <= triage_days:
-                waiting.append("%s was published %s and is inside its triage allowance" % (label, published))
+            dates = [value for value in (item["published"], item["updated"]) if value is not None]
+            arrived = max(dates) if dates else None
+            if item["allowance"] and arrived is not None and working_days_between(arrived, now) <= triage_days:
+                waiting.append("%s arrived %s and is inside its triage allowance" % (label, arrived))
             else:
                 problems.append("%s has no triage row for %s" % (label, item["package"]))
             continue
-        row = covering[0]
+        row = max(covering, key=lambda candidate: (candidate["written"], candidate["index"]))
         if row["status"] not in STATUSES:
             problems.append("%s: its row says %r, which is not a status the register defines" % (label, row["status"]))
         try:
@@ -410,11 +488,20 @@ def judge(findings, rows, now, triage_days):
             continue
         if row["status"] == "scheduled" and target < now:
             problems.append("%s: its row is still scheduled and its target %s has passed" % (label, target))
-        if item["range"] and item["range"] not in row["change"]:
-            problems.append(
-                "%s: the source now gives the affected range %r, which its row does not quote"
-                % (label, item["range"])
-            )
+        for text in item["ranges"]:
+            if text not in row["change"]:
+                problems.append(
+                    "%s: the source gives the affected range %r, which its newest row does not quote"
+                    % (label, text)
+                )
+        if item["updated"] is not None and item["updated"] > row["written"]:
+            arrived = item["updated"]
+            if item["allowance"] and working_days_between(arrived, now) <= triage_days:
+                waiting.append("%s was revised %s and is inside its triage allowance" % (label, arrived))
+            else:
+                problems.append(
+                    "%s: the source was revised %s, after its newest row of %s" % (label, arrived, row["date"])
+                )
     return problems, waiting
 
 
@@ -570,32 +657,46 @@ def routes():
         ("PCRE2Project/pcre2", "pcre2"),
     ):
         table["/repos/%s/security-advisories" % repository] = fixture("github-%s-security-advisories.json" % name)
-    table["/repos/PowerShell/Announcements/issues"] = fixture("github-announcements-security-issues.json")
+    table["/repos/PowerShell/Announcements/issues"] = fixture("github-announcements-issues.json")
     table["/repos/fish-shell/fish-shell/releases"] = fixture("github-fish-releases.json")
     table["/repos/PowerShell/PowerShell/releases"] = fixture("github-powershell-releases.json")
     table["/repos/zsh-users/zsh/tags"] = fixture("github-zsh-tags.json")
+    for tag in ("zsh-5.9.1", "zsh-5.9.2"):
+        table["/repos/zsh-users/zsh/commits/" + tag] = fixture("github-zsh-commit-%s.json" % tag)
     table["/gnu/bash/"] = fixture("gnu-bash-listing.html")
     table["/gnu/bash/bash-5.2-patches/"] = fixture("gnu-bash-5.2-patches.html")
+    table["/gnu/bash/bash-5.3-patches/"] = fixture("gnu-bash-5.3-patches.html")
     return table
 
 
 class Server:
+    """A local stand-in for the public sources. A route holds the answer, or a list of answers
+    that GitHub-style Link headers chain together, the first asked for with no cursor."""
+
     def __init__(self, table):
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
-                page = urllib.parse.parse_qs(parsed.query).get("page", ["1"])[0]
+                cursor = urllib.parse.parse_qs(parsed.query).get("after", ["0"])[0]
                 outer.requests.append(self.path)
                 answer = outer.table.get(parsed.path)
                 if answer is None:
                     self.send_response(404)
                     self.end_headers()
                     return
-                if page != "1":
-                    answer = b"[]"
+                link = None
+                if isinstance(answer, list):
+                    position = int(cursor)
+                    if position + 1 < len(answer):
+                        link = '<http://127.0.0.1:%d%s?per_page=100&after=%d>; rel="next"' % (
+                            outer.httpd.server_address[1], parsed.path, position + 1,
+                        )
+                    answer = answer[position]
                 self.send_response(200)
+                if link:
+                    self.send_header("Link", link)
                 self.end_headers()
                 self.wfile.write(answer)
 
@@ -626,7 +727,7 @@ def run_self_test():
     def expect(name, condition, detail=""):
         results.append(name)
         if not condition:
-            print("check-shell-advisories self-test: FAILED %s %s" % (name, detail), file=sys.stderr)
+            print("check-shell-advisories self-test: FAILED %s %s" % (name, str(detail)[:600]), file=sys.stderr)
             sys.exit(1)
 
     with tempfile.TemporaryDirectory() as scratch:
@@ -652,22 +753,36 @@ def run_self_test():
                 kept.append(line)
             return "".join(kept)
 
+        def with_row(row):
+            marker = "<!-- /kr:triage -->"
+            return register.replace(marker, row + "\n" + marker)
+
         def says(outcome, *words):
             if isinstance(outcome, SourceError):
                 return all(word in str(outcome) for word in words)
             _, problems, _ = outcome
             return any(all(word in problem for word in words) for problem in problems)
 
-        # The figures the check reads.
+        def edited(table, path, change):
+            table = dict(table)
+            table[path] = json.dumps(change(json.loads(table[path]))).encode()
+            return table
+
+        issues = "/repos/PowerShell/Announcements/issues"
+        pcre2 = "/repos/PCRE2Project/pcre2/security-advisories"
+
+        # The figures and the ranges the check reads.
         expect("one working day", figure_within("triaged within one working day of it", "working day") == 1)
         expect("fourteen days", figure_within("published within fourteen days of that", "days") == 14)
         expect(
-            "a range",
+            "ranges",
             in_range(">= 10.32, <= 10.47", "10.43")
             and not in_range("<= 10.47", "10.48")
             and not in_range("3.1.0-3.3.1", "4.9.3")
-            and in_range("3.1.0-3.3.1", "3.2"),
+            and in_range("3.1.0-3.3.1", "3.2")
+            and in_range(">= 10.44, < 10.48 || <= 10.43", "10.43"),
         )
+        expect("the start day is the register's", date_after(register, "published from ") == STARTED)
 
         # The control: the committed register covers every change the recorded sources hold.
         outcome = attempt(routes())
@@ -677,6 +792,7 @@ def run_self_test():
         needing = [item["id"] for item in findings if item["needs_row"]]
         for identifier in (
             "GHSA-r9hj-j2rw-4q3m", "RUSTSEC-2026-0204", "RUSTSEC-2026-0253", "v7.6.7", "zsh-5.9.2", "bash-5.3",
+            "bash53-020", "CVE-2026-69806",
         ):
             expect("the control reads " + identifier, identifier in needing, str(needing))
 
@@ -703,22 +819,91 @@ def run_self_test():
         outcome = attempt(routes(), text="".join(lines))
         expect("a scheduled row past its target", says(outcome, "RUSTSEC-2026-0204", "target"), str(outcome))
 
-        # A range that changed after the row was written is not covered by the old row.
-        table = routes()
-        advisories = json.loads(table["/repos/PCRE2Project/pcre2/security-advisories"])
-        for advisory in advisories:
-            if advisory["ghsa_id"] == "GHSA-r9hj-j2rw-4q3m":
-                advisory["vulnerabilities"][0]["vulnerable_version_range"] = "<= 10.49"
-        table["/repos/PCRE2Project/pcre2/security-advisories"] = json.dumps(advisories).encode()
-        outcome = attempt(table)
-        expect("a changed range", says(outcome, "GHSA-r9hj-j2rw-4q3m", "<= 10.49"), str(outcome))
+        # An advisory Microsoft published without the Security label still needs its row.
+        def unlabelled(items):
+            return items + [{
+                "number": 9001, "title": "Microsoft Security Advisory CVE-2026-99999: PowerShell Remote Code Execution",
+                "created_at": "2026-10-20T10:00:00Z", "updated_at": "2026-10-20T10:00:00Z", "state": "open", "labels": [],
+            }]
+        outcome = attempt(edited(routes(), issues, unlabelled))
+        expect("an advisory with no label", says(outcome, "CVE-2026-99999", "no triage row"), str(outcome))
+        def chatter(items):
+            return items + [{
+                "number": 9002, "title": "PowerShell 7.4 end of support", "created_at": "2026-10-20T10:00:00Z",
+                "updated_at": "2026-10-20T10:00:00Z", "state": "open", "labels": [],
+            }]
+        outcome = attempt(edited(routes(), issues, chatter))
+        expect("an announcement that is no advisory", not isinstance(outcome, SourceError) and not says(outcome, "9002"), str(outcome))
 
-        # The allowance: a change published a working day ago waits, two days ago it fails.
+        # A revision after the newest row is a new fact, and a newer row answers it.
+        def revised(items):
+            for item in items:
+                if item["number"] == 101:
+                    item["updated_at"] = "2026-10-30T09:00:00Z"
+            return items
+        outcome = attempt(edited(routes(), issues, revised), now="2026-11-10")
+        expect("a revised advisory", says(outcome, "CVE-2026-69806", "revised 2026-10-30"), str(outcome))
+        answer = with_row(
+            "| 2026-11-02 | CVE-2026-69806, revised again at github.com/PowerShell/Announcements/issues/101; released 2026-09-11 "
+            "| psreadline | The revision was read and the bound still covers it. | 2026-09-25 | not-affected |"
+        )
+        outcome = attempt(edited(routes(), issues, revised), now="2026-11-10", text=answer)
+        expect("a revision answered by a newer row", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-69806"), str(outcome))
+        outcome = attempt(edited(routes(), issues, revised), now="2026-10-30")
+        expect("a revision inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-69806"), str(outcome))
+
+        # A range that changed after the row was written is not covered by the old row, and a newer
+        # row that quotes the new range covers it. A range is read for an advisory with no pin too.
+        def widened(items):
+            for item in items:
+                if item["ghsa_id"] == "GHSA-r9hj-j2rw-4q3m":
+                    item["vulnerabilities"][0]["vulnerable_version_range"] = "<= 10.49"
+            return items
+        outcome = attempt(edited(routes(), pcre2, widened))
+        expect("a changed range", says(outcome, "GHSA-r9hj-j2rw-4q3m", "<= 10.49"), str(outcome))
+        row = (
+            "| 2026-10-25 | PCRE2 CVE-2026-103111 (GHSA-r9hj-j2rw-4q3m), affected `<= 10.49`, fixed in 10.50; released 2026-09-28 "
+            "| fish | The wider range was read and the bundled PCRE2 is built without JIT. | 2026-10-12 | not-affected |"
+        )
+        outcome = attempt(edited(routes(), pcre2, widened), text=with_row(row), now="2026-10-26")
+        expect("a newer row for the new range", not isinstance(outcome, SourceError) and not says(outcome, "GHSA-r9hj"), str(outcome))
+        def powershell_advisory(items):
+            return items + [{
+                "ghsa_id": "GHSA-aaaa-bbbb-cccc", "cve_id": "CVE-2026-88888", "published_at": "2026-10-20T10:00:00Z",
+                "updated_at": "2026-10-20T10:00:00Z", "severity": "high", "summary": "x",
+                "vulnerabilities": [{"package": {"name": "PowerShell"}, "vulnerable_version_range": "< 7.6.8", "patched_versions": "7.6.8"}],
+            }]
+        outcome = attempt(edited(routes(), "/repos/PowerShell/PowerShell/security-advisories", powershell_advisory))
+        expect("a PowerShell advisory", says(outcome, "GHSA-aaaa-bbbb-cccc", "no triage row"), str(outcome))
+
+        # The allowance: a change that arrived a working day ago waits, two working days ago it
+        # fails. GHSA-r9hj was published on 2026-09-28 and last revised on Thursday 2026-10-01.
         text = without("GHSA-r9hj-j2rw-4q3m")
-        outcome = attempt(routes(), now="2026-09-29", text=text)
+        outcome = attempt(routes(), now="2026-10-02", text=text)
         expect("inside the allowance", not isinstance(outcome, SourceError) and not says(outcome, "GHSA-r9hj"), str(outcome))
-        outcome = attempt(routes(), now="2026-09-30", text=text)
+        outcome = attempt(routes(), now="2026-10-05", text=text)
         expect("past the allowance", says(outcome, "GHSA-r9hj-j2rw-4q3m"), str(outcome))
+        # A zsh tag and a bash patch are dated by their sources, and a RustSec advisory has no allowance.
+        outcome = attempt(routes(), now="2026-07-13", text=without("zsh-5.9.2"))
+        expect("a zsh tag inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "zsh-5.9.2"), str(outcome))
+        table = routes()
+        table["/gnu/bash/bash-5.3-patches/"] = table["/gnu/bash/bash-5.3-patches/"] + (
+            b'<tr><td><a href="bash53-021">bash53-021</a></td><td align="right">2026-10-23 10:00  </td></tr>\n'
+        )
+        outcome = attempt(table, now="2026-10-28")
+        expect("a patch of the newer bash series", says(outcome, "bash53-021", "no triage row"), str(outcome))
+        outcome = attempt(table, now="2026-10-26")
+        expect("a new patch inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "bash53-021"), str(outcome))
+        with open(audit) as handle:
+            report = json.load(handle)
+        report["warnings"]["unsound"].append({
+            "kind": "unsound", "package": {"name": "x", "version": "1.0.0"},
+            "advisory": {"id": "RUSTSEC-2026-9999", "package": "x", "title": "t", "date": "2026-10-24"},
+        })
+        with open(os.path.join(scratch, "report.json"), "w") as handle:
+            json.dump(report, handle)
+        outcome = attempt(routes(), report=os.path.join(scratch, "report.json"))
+        expect("a new RustSec advisory has no allowance", says(outcome, "RUSTSEC-2026-9999", "no triage row"), str(outcome))
 
         # A source that cannot be read fails, and names itself.
         table = routes()
@@ -730,7 +915,7 @@ def run_self_test():
         outcome = attempt(table)
         expect("a malformed source", isinstance(outcome, SourceError) and "zsh-users/zsh/tags" in str(outcome), str(outcome))
         table = routes()
-        table["/repos/PCRE2Project/pcre2/security-advisories"] = b"[]"
+        table[pcre2] = b"[]"
         outcome = attempt(table)
         expect("an empty list of advisories", isinstance(outcome, SourceError) and "PCRE2Project/pcre2" in str(outcome), str(outcome))
         table = routes()
@@ -741,18 +926,29 @@ def run_self_test():
         table["/repos/fish-shell/fish-shell/releases"] = b"[]"
         outcome = attempt(table)
         expect("an empty list of releases", isinstance(outcome, SourceError) and "fish-shell/fish-shell/releases" in str(outcome), str(outcome))
+        table = routes()
+        table["/repos/zsh-users/zsh/tags"] = b'["zsh-5.9.1"]'
+        outcome = attempt(table)
+        expect("an item that is no object", isinstance(outcome, SourceError) and "zsh-users/zsh/tags" in str(outcome), str(outcome))
+        table = routes()
+        table["/repos/zsh-users/zsh/tags"] = b'{"message": "rate limit"}'
+        outcome = attempt(table)
+        expect("an object where a list is expected", isinstance(outcome, SourceError) and "not a list" in str(outcome), str(outcome))
         outcome = attempt(routes(), report=os.path.join(scratch, "no-such-report.json"))
         expect("a missing audit report", isinstance(outcome, SourceError) and "cargo-audit report" in str(outcome), str(outcome))
 
-        # Pagination: the next page is asked for when a page was full, and not otherwise.
-        full = json.dumps([{"name": "zsh-0.%d" % number} for number in range(100)]).encode()
-        server = Server({"/full": full, "/short": b'[{"name": "zsh-0.1"}]'})
+        # Pagination follows the Link header and never guesses a page number.
+        pages = [
+            json.dumps([{"name": "zsh-0.%d" % number} for number in range(100)]).encode(),
+            b'[{"name": "zsh-0.100"}]',
+        ]
+        server = Server({"/paged": pages, "/single": b'[{"name": "zsh-0.1"}]'})
         with server as base:
-            expect("a full page", len(fetch_pages(base + "/full", None)) == 100)
-            expect("a short page", len(fetch_pages(base + "/short", None)) == 1)
-        asked = [path for path in server.requests if path.startswith("/full")]
-        expect("the next page is asked for", len(asked) == 2 and "page=2" in asked[1], str(asked))
-        expect("a short page ends the list", len([p for p in server.requests if p.startswith("/short")]) == 1)
+            expect("a list of two pages", len(fetch_pages(base + "/paged", None)) == 101)
+            expect("a list of one page", len(fetch_pages(base + "/single", None)) == 1)
+        asked = [path for path in server.requests if path.startswith("/paged")]
+        expect("the next page is the one the header names", len(asked) == 2 and "after=1" in asked[1], str(asked))
+        expect("a single page is asked for once", len([p for p in server.requests if p.startswith("/single")]) == 1)
     print("check-shell-advisories self-test: %d checks passed" % len(results))
     return 0
 

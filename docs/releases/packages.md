@@ -433,7 +433,7 @@ published within fourteen days of that release. No binary is
 distributed before its requalification passes, and no package is swapped into a session that is
 already running: a session keeps the package identity it started with until it ends. Each target
 of a release tree runs the contract suites of the Zsh, Bash and Fish packages it built before the
-tree is assembled; the whole corpus runs on Linux in the core workflow.
+tree is assembled; the core workflow runs the whole corpus on x86-64 Linux.
 
 A package whose fourteen days pass without a requalified build is flagged in the register, a row of
 `docs/shell-integration/upstream.md` that no code reads, and the flag names the choices rather than

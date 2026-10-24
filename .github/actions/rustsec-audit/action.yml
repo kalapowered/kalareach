@@ -5,8 +5,8 @@ description: >-
   The repository has to be checked out first. .cargo/audit.toml says what fails the check and
   names each advisory the workspace has accepted, with its reason and the condition for removing
   it. The checker is one release, and its archive has to match the digest below before it runs; it
-  and the database are public downloads, so the action needs no credential. Core-ci and the daily
-  advisories workflow both run this action, so the two cannot differ.
+  and the database are public downloads, so the action needs no credential. Core-ci, the daily
+  advisories workflow and the shell advisories workflow all run this action, so they cannot differ.
 
   With `lock` set, the action audits that lock file instead of the workspace's, from a directory of
   its own so that the workspace's policy and its accepted advisories do not apply, and writes
