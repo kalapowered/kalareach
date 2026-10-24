@@ -26,6 +26,23 @@ $script:QualifiedFrom = [version]'2.3.4'
 $script:QualifiedBefore = [version]'3.0.0'
 $script:IntegrationVersion = '1'
 
+# The advisories against PowerShell itself that this package refuses to run under. Each names the
+# first fixed release of every series it lists; a release of a listed series below that, a
+# pre-release of the fixed release included, is affected. A series the advisory does not list is
+# judged by the advisory's own ranges and is not refused here. shells/psreadline/manifest.json
+# holds the same list for the identity record, and a test holds the two equal.
+$script:HostAdvisories = @(
+    @{
+        Id         = 'CVE-2026-62801'
+        Url        = 'https://github.com/PowerShell/Announcements/issues/98'
+        FirstFixed = [ordered]@{
+            '7.4' = [System.Management.Automation.SemanticVersion]'7.4.20'
+            '7.5' = [System.Management.Automation.SemanticVersion]'7.5.11'
+            '7.6' = [System.Management.Automation.SemanticVersion]'7.6.6'
+        }
+    }
+)
+
 $script:Hooks = @{
     Activated          = $false
     GestureChord       = $null
@@ -271,7 +288,38 @@ function Get-KrPathIdentity {
     "path $(Get-KrResolvedPath "$($item.FullName)")"
 }
 
+function Test-KrPowerShellRelease {
+    <#
+    .SYNOPSIS
+    The advisory a PowerShell release is affected by, or nothing.
+
+    .DESCRIPTION
+    A release is affected by an advisory when the advisory lists its series and the release sorts
+    below the first fixed release of that series. Versions compare as semantic versions, so
+    7.5.9 is below 7.5.11 and 7.6.6-rc.1 is below 7.6.6.
+    #>
+    param([Parameter(Mandatory)][System.Management.Automation.SemanticVersion]$Version)
+
+    $series = "$($Version.Major).$($Version.Minor)"
+    foreach ($advisory in $script:HostAdvisories) {
+        if (-not $advisory.FirstFixed.Contains($series)) { continue }
+        $fixed = $advisory.FirstFixed[$series]
+        if ($Version -lt $fixed) {
+            return @{ Id = $advisory.Id; Url = $advisory.Url; FirstFixed = "$fixed" }
+        }
+    }
+    $null
+}
+
 function Test-KrQualifiedEditor {
+    $affected = Test-KrPowerShellRelease $PSVersionTable.PSVersion
+    if ($null -ne $affected) {
+        return @{
+            Ok     = $false
+            Reason = 'powershell_release_affected'
+            Detail = "PowerShell $($PSVersionTable.PSVersion) is affected by $($affected.Id) ($($affected.Url)); $($affected.FirstFixed) is the first fixed release of the $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor) series; update PowerShell"
+        }
+    }
     $version = Get-KrPSReadLineVersion
     if ($null -eq $version) {
         return @{ Ok = $false; Reason = 'psreadline_absent'; Detail = 'PSReadLine is not loaded' }
@@ -1502,6 +1550,11 @@ function Publish-KalaReachQualification {
         qualified     = [ordered]@{
             psreadline_from        = $script:QualifiedFrom.ToString()
             psreadline_before      = $script:QualifiedBefore.ToString()
+            powershell_advisories  = @($script:HostAdvisories | ForEach-Object {
+                    $first = [ordered]@{}
+                    foreach ($series in $_.FirstFixed.Keys) { $first[$series] = "$($_.FirstFixed[$series])" }
+                    [ordered]@{ id = $_.Id; url = $_.Url; first_fixed = $first }
+                })
             psreadline_found       = "$psrl"
             powershell_executable  = $qualifiedHost.executable
             psreadline_module_base = $qualifiedHost.psreadline_module_base
