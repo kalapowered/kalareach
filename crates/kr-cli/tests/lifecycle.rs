@@ -46,6 +46,7 @@ use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
 };
+use kr_protocol::desktop::InhibitionReason;
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
@@ -2313,6 +2314,173 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
         Some(1),
         "and no session was created in its place"
     );
+}
+
+/// What `kr status` reports about the host's sleep for one session, as its JSON carries it.
+fn power_in_status(host: &Host, display: &str) -> Value {
+    host.kr_json(&["status", display])["power"].clone()
+}
+
+/// The sleep report `kr status` has for one session once the host is counting `pending` requests.
+fn power_counting(host: &Host, display: &str, pending: u64) -> Value {
+    until(
+        &format!("the host to count {pending} pending requests in kr status"),
+        || {
+            let power = power_in_status(host, display);
+            (power["pending_requests"] == pending).then_some(power)
+        },
+    )
+}
+
+/// The sleep report `kr status` has for one session once what it prints agrees with what its JSON
+/// reports.
+///
+/// Each `kr status` is an evaluation of its own, which asks the platform for the power source and
+/// for the assertion, each with a limit of its own, and a platform that is slow answers differently
+/// from one evaluation to the next. The two forms agree on any evaluation that is not disturbed, so
+/// the case asks again until they do.
+fn power_as_printed(host: &Host, display: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let power = power_in_status(host, display);
+        let printed = host.kr(&["status", display]);
+        assert!(printed.status.success(), "kr status failed");
+        let printed = String::from_utf8_lossy(&printed.stdout).into_owned();
+        if let Some(line) = power["description"].as_str()
+            && printed.lines().any(|printed| printed == line)
+        {
+            return power;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "kr status never printed the sleep line its JSON reports; the JSON said {power}, and it \
+             printed {printed}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// KR-REQ-03.27 and KR-REQ-26.16: a host whose owner has not chosen to stay awake does not, however
+/// much is waiting; the owner chooses it as a validated edit that applies at once and is shown with
+/// its source; an agent's open question then keeps the host awake, which `kr status` says and gives
+/// the reason for; and the answer lets it go, which `kr status` says too.
+///
+/// A real daemon and worker, a scripted agent in a session asking one question, and `kr` for
+/// everything a person does. Whether the platform confirms the assertion decides which of two
+/// lines `kr status` has while the question is open, and the case asserts the one the platform's
+/// own answer implies; the branch it took is printed.
+#[test]
+fn a_host_kept_awake_for_a_question_says_so_in_kr_status_and_lets_go_when_it_is_answered() {
+    let host = Host::start();
+    let (window, created) = host.create_in_window("IFS= read -r _");
+    let display = created.display.clone();
+    let document = kr_cli::doctor::configuration::document_path(&host.environment());
+
+    // Offered, and never silently enabled: the host says how to choose, and an agent's question in
+    // a session changes nothing about the host's sleep.
+    let offered = host.kr(&["host", "power"]);
+    assert!(offered.status.success(), "kr host power failed");
+    let offered = String::from_utf8_lossy(&offered.stdout).into_owned();
+    assert!(
+        offered.contains("kr host power --set mains_only"),
+        "the host says how to choose: {offered}"
+    );
+    window.type_text(b"\"$PWD\"/agent\r");
+    let question = until("the agent's question to be waiting", || {
+        host.questions().into_iter().next()
+    });
+    let question_id = question["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let unchosen = power_as_printed(&host, &display);
+    assert_eq!(unchosen["setting"], "off", "{unchosen}");
+    assert_eq!(unchosen["active"], false, "{unchosen}");
+    assert_eq!(
+        unchosen["pending_requests"], 0,
+        "a host whose owner chose nothing is not even asked what is outstanding: {unchosen}"
+    );
+    assert!(
+        !document.exists(),
+        "nothing was chosen, so nothing was written"
+    );
+
+    // The owner's choice: one validated edit of the host's configuration, which the host applies
+    // at once and shows with where it came from.
+    let chosen = host.kr(&["host", "power", "--set", "battery_too"]);
+    assert!(
+        chosen.status.success(),
+        "kr host power --set failed: {}",
+        String::from_utf8_lossy(&chosen.stderr)
+    );
+    assert_eq!(
+        kr_cli::doctor::configuration::load(&host.environment()).revision(),
+        1,
+        "one validated edit, one revision"
+    );
+    power_counting(&host, &display, 1);
+    let held = power_as_printed(&host, &display);
+    assert_eq!(held["pending_requests"], 1, "{held}");
+    let line = held["description"].as_str().expect("a line").to_owned();
+    println!(
+        "kr status while the question was open (the platform held the assertion: {}): {line}",
+        held["active"]
+    );
+    if held["active"] == true {
+        assert_eq!(held["reason"], "pending_requests", "{held}");
+        assert!(
+            line.starts_with("sleep inhibited (battery_too): "),
+            "{line}"
+        );
+        assert!(
+            line.contains(InhibitionReason::PendingRequests.describe()),
+            "the line gives the reason the host holds the assertion: {line}"
+        );
+    } else {
+        assert!(
+            line.starts_with(&format!(
+                "sleep policy unchanged (battery_too): {}",
+                kr_cli::report::PLATFORM_HELD_NOTHING
+            )),
+            "the line says the work justifies an assertion and the platform held none: {line}"
+        );
+    }
+    let doctor = host.kr(&["doctor", "--json"]);
+    let report: Value =
+        serde_json::from_slice(&doctor.stdout).expect("kr doctor printed a document");
+    let row = report["configuration"]["values"]
+        .as_array()
+        .and_then(|values| {
+            values
+                .iter()
+                .find(|value| value["key"] == "sleep_inhibition")
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("kr doctor reports the sleep setting: {report}"));
+    assert_eq!(row["value"], "battery_too", "{row}");
+    assert_eq!(row["source"], "host_configuration", "{row}");
+    assert_eq!(row["effect"], "immediately", "{row}");
+    assert_eq!(row["origin"], document.display().to_string(), "{row}");
+
+    // The person answers, which ends the question, and the host lets go.
+    let answered = host.kr_json(&["question", "answer", &question_id, "--text", ANSWER]);
+    assert_eq!(answered["state"], "answered", "{answered}");
+    power_counting(&host, &display, 0);
+    let released = power_as_printed(&host, &display);
+    assert_eq!(released["active"], false, "{released}");
+    let line = released["description"].as_str().expect("a line");
+    assert!(
+        line.starts_with("sleep policy unchanged (battery_too): ")
+            && line.ends_with(kr_cli::report::NOTHING_JUSTIFIES_AN_ASSERTION),
+        "the host says that nothing justifies an assertion now: {line}"
+    );
+
+    // And choosing nothing again puts the first form back.
+    let off = host.kr(&["host", "power", "--set", "off"]);
+    assert!(off.status.success(), "kr host power --set off failed");
+    let off = power_in_status(&host, &display);
+    assert_eq!(off["setting"], "off", "{off}");
+    assert_eq!(off["active"], false, "{off}");
 }
 
 /// KR-REQ-07.52: end of input and a crash close a session just as its shell's own exit does, and
