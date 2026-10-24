@@ -78,8 +78,8 @@ enum Standing {
     /// It may not.
     Not,
     /// This host cannot say: the clock reading the decision stands on is not written down, or this
-    /// boot's clock is not proven. Nothing about the device decides it, so the pass stops and asks
-    /// again, and a device is not named as one that may remove the feed meanwhile.
+    /// boot's clock is not proven. Nothing about the device decides it, so the request waits for a
+    /// scan that can say, and a device is not named as one that may remove the feed meanwhile.
     Undecided(Refusal),
 }
 
@@ -213,21 +213,51 @@ impl Controller {
         Ok(Judged::Apply(plan))
     }
 
-    /// Whether `request` names one of `devices`, or a grant one of them holds.
+    /// Whether carrying out again the request the feed shows complete would revoke one of
+    /// `devices` that the registry holds live: its issuer is one that could have made it, the host
+    /// did not refuse it, and it names one of them, or a grant one of them holds.
     ///
     /// # Errors
     ///
     /// Returns an error when the device directory or the grant store cannot be read.
-    pub(crate) fn request_names_one_of(
+    pub(crate) fn would_revoke_one_of(
         &self,
         request: &RevocationRequest,
         devices: &std::collections::BTreeSet<DeviceId>,
     ) -> Result<bool> {
+        if request.host_device_id != self.host_device_id() {
+            return Ok(false);
+        }
+        let held = self.devices.devices()?;
+        if !matches!(
+            self.issuer_of_a_completed_request(request, &held),
+            Issuer::Could
+        ) {
+            return Ok(false);
+        }
+        Ok(self.plan_of(request)?.devices.iter().any(|named| {
+            devices.contains(named)
+                && held
+                    .iter()
+                    .any(|record| record.device_id == *named && record.revoked_at_ms.is_none())
+        }))
+    }
+
+    /// The identifiers of the keys of the devices the registry holds live.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device directory cannot be read.
+    pub(crate) fn live_key_ids(&self) -> Result<std::collections::BTreeSet<KeyId>> {
         Ok(self
-            .plan_of(request)?
             .devices
-            .iter()
-            .any(|device| devices.contains(device)))
+            .devices()?
+            .into_iter()
+            .filter(DeviceRecord::is_paired)
+            .map(|record| {
+                kr_crypto::keys::key_id(KeyPurpose::Authorisation, record.authorisation.as_bytes())
+            })
+            .collect())
     }
 
     /// The error a standing this host could not decide comes to, for the pass that could not

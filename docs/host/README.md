@@ -6554,10 +6554,15 @@ request is refused for it. The request waits, and so does each request behind it
 not show complete, because requests are judged in the order the feed holds them. The scan goes on
 for what the feed shows complete, which asks no clock: those are carried out again, and a withdrawal
 this host cannot verify among them raises its refusal as ever. A record that would revoke the
-device that made the waiting request is not carried out ahead of it, so the scan ends there, as it
-ends at the request. The pass then ends as one this host could not finish, so nothing is shown as
-read, and it asks again after its backoff. A device whose grant holds no right to manage the host is
-turned away whatever the clock says.
+device that made a waiting request is not carried out ahead of that request: the request would then
+be refused for a revocation that came after it. The record waits as well, with the device that made
+it, so that a record which would revoke that device waits too, and the scan reads on to the end of
+the feed to settle its refusals and catch up. The records that wait are judged and carried out in
+the order the feed holds them by the scan that follows once the clock is proven. The pass ends as
+one this host could not finish, so nothing is shown as read, no key is added to the list of keys
+that may remove the feed, those of owners the pass revoked are taken off it, and it asks again
+after its backoff. A device whose grant holds no right to manage the host is turned away whatever
+the clock says.
 
 A request that passes is written down before it takes effect. It is then carried out through the
 same revocation the owner at the machine makes, issued the revision the daemon's registry
@@ -6610,7 +6615,13 @@ request says made it, the key the request gives for that device, and the devices
 request names, up to eight of each. Every scan reads such a record again, so a restart does not lose
 the refusal while the feed holds the record, and nothing is stored for it. It ends when the owner at the machine revokes what the
 request names, which needs no confirmation. Pairing the owner again is no way to end it, because
-pairing waits for an owner device's confirmation, which is refused while the refusal stands. A feed that shows a revocation complete that no owner made can only keep remote access
+pairing waits for an owner device's confirmation, which is refused while the refusal stands. A
+withdrawal that names every owner device has a cost: once the owner at the machine has revoked them,
+as the remedy says, the host has no owner device left to confirm for it, and the terminal confirms
+nothing on an owned host. The way out is the one for any host whose owner devices are all revoked
+or gone ("Two kinds of host have no route to establish the clock"): on a host that is exclusively
+organisation-managed the person at the terminal ends exclusive management, and pairs an owner device
+again. A feed that shows a revocation complete that no owner made can only keep remote access
 refused this way. It cannot revive a device, and the owner at the machine can always end it. While
 the refusal stands, the devices the request names keep no standing over the feed, and neither does a
 device that holds a key one of them holds. A feed removes the host by a key, so the host takes those

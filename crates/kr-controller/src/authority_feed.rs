@@ -605,7 +605,8 @@ impl Drop for FeedRuntime {
 const UNVERIFIED_REMEDY: &str = "Revoke what the request names, at this machine, with `kr device \
      revoke <device>` for a device and `kr share revoke <grant>` for a grant. Neither needs a \
      confirmation. Remote access returns once the request names nothing live here. Until then no \
-     confirmation from an owner device is accepted, so a device cannot be paired.";
+     confirmation from an owner device is accepted, so a device cannot be paired. If the request \
+     names every owner device, the host guide says how the host is recovered once they are revoked.";
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
@@ -833,21 +834,19 @@ async fn pass(
             // holds the requests: one behind a request whose issuer's standing could not be decided
             // waits for the scan that can decide it. What the feed shows complete is only carried
             // out again, which asks no clock, and finds the withdrawals this host cannot verify.
-            if let Some(pending) = &undecided {
-                if !shown_complete(record) {
+            // A complete record that would revoke the issuer of a request that waits is not carried
+            // out ahead of it either: the request would then be refused for a revocation that came
+            // after it. That record waits as well, and so does anything that would revoke its issuer,
+            // while the scan goes on reading, to settle the refusals and catch up.
+            if let Some(waiting) = undecided.as_mut() {
+                let held = !shown_complete(record)
+                    || controller
+                        .would_revoke_one_of(&record.request, &waiting.issuers)
+                        .map_err(Stopped::local)?;
+                if held {
+                    waiting.issuers.insert(record.request.issuer_device_id);
                     contiguous = false;
                     continue;
-                }
-                // A record that would revoke the issuer of that request is not carried out ahead
-                // of it: the request would then be refused for a revocation that came after it.
-                // The pass ends here, as it ends at the request.
-                if controller
-                    .request_names_one_of(&record.request, &pending.issuers)
-                    .map_err(Stopped::local)?
-                {
-                    return Err(Stopped::local(Controller::undecided_standing(
-                        &pending.refusal,
-                    )));
                 }
             }
             match settle(shared, controller, record, &mut now).await? {
@@ -963,9 +962,16 @@ async fn pass(
         }
         if let Some(Undecided { refusal, .. }) = undecided {
             // The refusal and the catch-up are done, and what the feed shows complete is carried
-            // out again. A pass that could not judge a request is no synchronisation: nothing is
-            // shown as read, the owners' list is left as it was and the next pass waits out its
-            // backoff, then judges the request again.
+            // out again, but for what waits. A pass that could not judge a request is no
+            // synchronisation: nothing is shown as read, no key is added to the owners' list, and
+            // the next pass waits out its backoff, then judges the request again. Keys of devices
+            // the carrying out revoked are taken off the list all the same, as the feed removes the
+            // host by a key.
+            if drop_revoked_owners_from_the_feed(shared, controller, &latest).await?
+                == Delegation::Removed
+            {
+                return removed(shared, controller).await;
+            }
             return Err(Stopped::local(Controller::undecided_standing(&refusal)));
         }
         if name_owners(shared, controller, &latest).await? == Delegation::Removed {
@@ -1040,6 +1046,35 @@ async fn name_owners(
     Ok(Delegation::Taken)
 }
 
+/// Takes the keys no live device holds out of the keys the feed lists as permitted to remove it,
+/// and adds none: what a pass that ended undecided leaves of the list.
+async fn drop_revoked_owners_from_the_feed(
+    shared: &Arc<Shared>,
+    controller: &Arc<Controller>,
+    latest: &Latest,
+) -> std::result::Result<Delegation, Stopped> {
+    let live = controller.live_key_ids().map_err(Stopped::local)?;
+    let kept: Vec<KeyId> = latest
+        .removal_keys
+        .iter()
+        .filter(|key| live.contains(key))
+        .copied()
+        .collect();
+    if kept.len() == latest.removal_keys.len() {
+        return Ok(Delegation::Taken);
+    }
+    let answer = shared
+        .client
+        .delegate(&kept)
+        .await
+        .map_err(|error| Stopped::of(&error, &shared.quiet))?;
+    Ok(if answer.summary.removed {
+        Delegation::Removed
+    } else {
+        Delegation::Taken
+    })
+}
+
 /// Takes the keys of the devices a withdrawal this host cannot verify names out of the keys the
 /// feed lists as permitted to remove it, leaving every other as it is: the host adds no key to the
 /// list on what a registry it has found wrong holds.
@@ -1089,7 +1124,8 @@ enum Settled {
 #[derive(Clone, Debug)]
 struct Undecided {
     refusal: Refusal,
-    /// The devices that made the requests that wait for it.
+    /// The devices that made the requests that wait for it, those behind it that are not complete
+    /// and the complete records held because they would revoke one of these.
     issuers: std::collections::BTreeSet<DeviceId>,
 }
 
