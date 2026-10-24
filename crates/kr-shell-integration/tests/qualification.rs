@@ -3077,6 +3077,115 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
     );
 }
 
+/// KR-REQ-07.88, KR-REQ-07.85: a PowerShell release that a published advisory affects is named and
+/// refused, with the first fixed release of its series, and a release at or above it is not.
+///
+/// The package qualifies the editor against the PowerShell the person runs, and it is not the
+/// package's to update that host. What it can do is refuse to bind into one that an advisory
+/// names. The module's own list of advisories is asked about the releases around each series'
+/// first fixed release, including a pre-release of it and a series the advisory does not list, and
+/// the list the package publishes in its record is the one the manifest holds.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
+    let package = Package::built(ShellKind::PowerShell);
+    let directory = package
+        .executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the package directory")
+        .to_owned();
+
+    // Release, then the advisory and the first fixed release it names, or nothing.
+    let table: [(&str, Option<(&str, &str)>); 11] = [
+        ("7.4.19", Some(("CVE-2026-62801", "7.4.20"))),
+        ("7.4.20", None),
+        ("7.4.20-preview.1", Some(("CVE-2026-62801", "7.4.20"))),
+        ("7.5.10", Some(("CVE-2026-62801", "7.5.11"))),
+        ("7.5.11", None),
+        ("7.6.5", Some(("CVE-2026-62801", "7.6.6"))),
+        ("7.6.6", None),
+        ("7.6.6-rc.1", Some(("CVE-2026-62801", "7.6.6"))),
+        ("7.6.10", None),
+        ("7.7.0-preview.5", None),
+        ("8.0.0", None),
+    ];
+    let versions = table
+        .iter()
+        .map(|(version, _)| format!("'{version}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let module = directory
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         & (Get-Module KalaReach.ShellBridge) {{ foreach ($v in @({versions})) {{ \
+           $r = Test-KrPowerShellRelease ([System.Management.Automation.SemanticVersion]$v); \
+           if ($r) {{ Write-Output \"kr-release=[$v|$($r.Id)|$($r.FirstFixed)]\" }} \
+           else {{ Write-Output \"kr-release=[$v||]\" }} }} }}"
+    );
+    let asked = std::process::Command::new(&package.executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    for (version, expected) in table {
+        let prefix = format!("kr-release=[{version}|");
+        let line = said
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the module said nothing of {version}:\n{said}\n{}",
+                    String::from_utf8_lossy(&asked.stderr)
+                )
+            });
+        let found = line
+            .trim_start_matches(&prefix)
+            .trim_end_matches(']')
+            .to_owned();
+        let wanted = expected.map_or_else(
+            || "|".to_owned(),
+            |(advisory, fixed)| format!("{advisory}|{fixed}"),
+        );
+        assert_eq!(
+            found, wanted,
+            "PowerShell {version}: the advisory and the first fixed release the module names"
+        );
+    }
+
+    // The list the package publishes is the one the manifest pins.
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(directory.join("kr-shell-identity.json")).expect("the record"),
+    )
+    .expect("the record reads");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repository_root().join("shells/psreadline/manifest.json"))
+            .expect("the manifest"),
+    )
+    .expect("the manifest reads");
+    assert!(
+        manifest["qualified"]["powershell_advisories"]
+            .as_array()
+            .is_some_and(|list| !list.is_empty()),
+        "the manifest names no advisory the package refuses"
+    );
+    assert_eq!(
+        record["qualified"]["powershell_advisories"],
+        manifest["qualified"]["powershell_advisories"],
+        "the module and the manifest name different advisories"
+    );
+
+    // The host this run has is at or above every bound, so the package binds into it.
+    assert_eq!(
+        refusal(&package, &directory),
+        "",
+        "the package refused the PowerShell this run qualified it against"
+    );
+}
+
 /// The same path with the case of its letters turned over, which is another directory wherever the
 /// filesystem keeps one and another spelling wherever it does not.
 fn flip_case(path: &str) -> String {

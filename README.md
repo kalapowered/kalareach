@@ -83,7 +83,8 @@ Requirements for building the project:
 - On macOS, fish, which the Fish test in `crates/kr-worker/tests/shells.rs` starts as a session's
   root shell (macOS ships the Bash and Zsh that the file's other two tests start)
 - curl, make, patch, and tar, as well as the headers for ncurses, and gettext (for the managed shell
-  packages), and PowerShell >= 7.4 with PSReadLine >= 2.3.4 < 3.0.0 (for the PSReadLine package)
+  packages), and PowerShell >= 7.4 with PSReadLine >= 2.3.4 < 3.0.0, at or above the fixed release of each advisory in
+  `docs/shell-integration/upstream.md` (for the PSReadLine package)
 
 The lists below hold every step, in order.
 [`scripts/check-clean-checkout.sh`](scripts/check-clean-checkout.sh) runs them in a fresh clone of

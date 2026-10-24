@@ -20,13 +20,19 @@ a test failing.
 | zsh | Zsh | zsh-5.9 | https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz | 9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5 | the zsh-announce and zsh-workers lists, and the project's own release notes |
 | bash | GNU Bash | bash-5.2.37 | https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz | 9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff | the bug-bash list and the official patch series under ftp.gnu.org/gnu/bash/bash-5.2-patches |
 | fish | fish-shell | fish-4.9.3 | https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz | 20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c | the fish-shell repository's security advisories and its release notes, RustSec advisories published from 2026-09-20 against the crates and repositories in fish's `Cargo.lock`, and, where the build compiles or links PCRE2, PCRE2's own advisories published from that day |
-| psreadline | PSReadLine | psreadline-2.3.4 to 3.0.0 on PowerShell 7.4 or later | https://github.com/PowerShell/PowerShell | qualified rather than fetched | PowerShell/Announcements, and the PSReadLine and PowerShell repositories' security advisories |
+| psreadline | PSReadLine | psreadline-2.3.4 to 3.0.0 on PowerShell 7.4 or later, except a release below the fixed release of an advisory in the triage record (CVE-2026-62801: 7.4.20, 7.5.11 and 7.6.6) | https://github.com/PowerShell/PowerShell | qualified rather than fetched | PowerShell/Announcements, and the PSReadLine and PowerShell repositories' security advisories |
 <!-- /kr:pins -->
 
 The PSReadLine package rebuilds no shell. What it pins is the range of the editor it was qualified
 against, and the identity it publishes records the editor it found on the machine it qualified. A
 security update to PowerShell or to PSReadLine is therefore a requalification rather than a rebuild,
 and the same triage applies to it.
+
+The module holds the advisories against PowerShell itself that it refuses to run under, each with the first
+fixed release of every series it lists, and the package manifest holds the same list. A release of a listed
+series below that, a pre-release of the fixed release included, is refused with a diagnostic that names the
+advisory and the first fixed release. A series an advisory does not list is judged by that advisory's own
+ranges, and the module does not refuse it, so a preview of a newer series is not refused here.
 
 That range is a statement about the editor this integration works with, not about which releases
 inside it carry which fixes. A person runs the host their machine has, so an advisory against
@@ -78,7 +84,9 @@ date, with the choices above) or `not-affected`.
 | 2026-09-20 | The official GNU Bash 5.2 patch series, 001 to 037 | bash | The pinned release is 5.2.37, which carries every patch published for 5.2 at the time of this pin. | 2026-10-04 | not-affected |
 | 2026-09-20 | The fish-shell advisories published against 4.x | fish | The pinned release is 4.9.3, which is the newest 4.x release at the time of this pin and carries every advisory fix published for the series. | 2026-10-04 | not-affected |
 | 2026-09-20 | The editor identity this package was qualified against | psreadline | This package was qualified against PSReadLine 2.4.5 on PowerShell 7.6.6, which is the identity its record names. The range it declares says which editor the integration works with and not which releases inside it carry which fixes, so an advisory against either project is triaged against the versions that advisory names and gets its own row. | 2026-10-04 | not-affected |
-| 2026-09-20 | CVE-2026-62801, PowerShell, published at github.com/PowerShell/Announcements/issues/98; fixed in 7.4.20, 7.5.11 and 7.6.6 | psreadline | The host this package was qualified against is 7.6.6, which is the fixed release of its own series, so the qualified identity carries the fix. A person on an earlier 7.4 or 7.5 release is on an affected host and updates it; this package qualifies the editor against the host the person runs and does not ship one. | 2026-10-04 | not-affected |
+| 2026-09-20 | CVE-2026-62801, PowerShell, published at github.com/PowerShell/Announcements/issues/98; fixed in 7.4.20, 7.5.11 and 7.6.6 | psreadline | The host this package was qualified against is 7.6.6, which is the fixed release of its own series, so the qualified identity carries the fix. A person on an earlier 7.4, 7.5 or 7.6 release is on an affected host and updates it; this package qualifies the editor against the host the person runs and does not ship one, and the module refuses to bind into a release below 7.4.20, 7.5.11 or 7.6.6, naming this advisory and the first fixed release. | 2026-10-04 | not-affected |
+| 2026-10-24 | CVE-2026-40400, PowerShell, published at github.com/PowerShell/Announcements/issues/99; fixed in 7.4.18, 7.5.11 and 7.6.6; Windows only; released 2026-09-11 | psreadline | The module's bound for CVE-2026-62801 (7.4.20, 7.5.11 and 7.6.6) is at or above every first fixed release of this advisory, so a host this advisory affects is refused. This assessment was made after the one working day the target allows. | 2026-09-25 | not-affected |
+| 2026-10-24 | CVE-2026-69806, a .NET vulnerability in PowerShell, published at github.com/PowerShell/Announcements/issues/101 and updated on 2026-09-23; fixed in 7.5.11 and 7.6.6; Linux only, and 7.4 is not affected; released 2026-09-11 | psreadline | The module's bound for CVE-2026-62801 is at or above the first fixed release of both affected series, so a host this advisory affects is refused. This assessment was made after the one working day the target allows. | 2026-09-25 | not-affected |
 <!-- /kr:triage -->
 
 ## Native modules and the editor ABI
