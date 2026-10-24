@@ -22,6 +22,27 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const FISH: ShellKind = ShellKind::Fish;
 
+/// KR-REQ-07.88: the executable depends on no library of the machine that built it.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_fish_executable_links_no_library_of_the_machine_that_built_it() {
+    shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(FISH);
+}
+
+/// KR-REQ-07.88: the executable depends on no library of the machine that built it.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_fish_executable_links_no_library_of_the_machine_that_built_it() {
+    shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(FISH);
+}
+
+/// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_bootstrap_secret_is_wiped_once_the_handshake_is_accepted() {
+    shellpkg::the_bootstrap_secret_does_not_outlive_the_accepted_handshake(FISH);
+}
+
 /// KR-REQ-07.36, KR-REQ-07.85, KR-REQ-20.03: the proof the package's own SHA-256 and HMAC-SHA-256
 /// compute is the worker's HMAC-SHA-256 of the same transcript.
 #[test]

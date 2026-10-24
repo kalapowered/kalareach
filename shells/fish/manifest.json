@@ -15,7 +15,8 @@
   },
   "configure": [
     "-DCMAKE_BUILD_TYPE=Release",
-    "-DWITH_MESSAGE_LOCALIZATION=ON"
+    "-DWITH_MESSAGE_LOCALIZATION=ON",
+    "-DFISH_USE_SYSTEM_PCRE2=OFF"
   ],
   "cflags": [
     "-O2",
