@@ -964,7 +964,11 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                 .expect("the delivery");
             report.insert(
                 format!("{key}_carries_a_preview"),
-                json!(data_of(&sent.body).get("preview").is_some_and(|preview| !preview.is_null())),
+                json!(
+                    data_of(&sent.body)
+                        .get("preview")
+                        .is_some_and(|preview| !preview.is_null())
+                ),
             );
             n += 1;
             report.insert(format!("{key}_message"), json!(n));
@@ -1067,7 +1071,10 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         .collect();
     report.insert(
         "burst_span_ms".to_owned(),
-        json!(admitted.iter().max().copied().unwrap_or(0) - admitted.iter().min().copied().unwrap_or(0)),
+        json!(
+            admitted.iter().max().copied().unwrap_or(0)
+                - admitted.iter().min().copied().unwrap_or(0)
+        ),
     );
     report.insert(
         "burst_refill_ms".to_owned(),
