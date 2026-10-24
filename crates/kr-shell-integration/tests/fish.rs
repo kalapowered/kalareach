@@ -22,10 +22,10 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const FISH: ShellKind = ShellKind::Fish;
 
-/// KR-REQ-07.88: the executable depends on no library of the machine that built it.
+/// KR-REQ-07.88: no native file of the package depends on a library of the machine that built it.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
-fn the_fish_executable_links_no_library_of_the_machine_that_built_it() {
+fn the_fish_package_links_no_library_of_the_machine_that_built_it() {
     shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(FISH);
 }
 
