@@ -27,7 +27,7 @@ use crate::error::{CommandError, Result};
 use crate::state::AppState;
 
 /// How long a connection to a paired host, and the question that follows it, may take.
-const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The event the backend publishes each host notification on.
 pub const HOST_EVENT: &str = "kr://event";
