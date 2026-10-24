@@ -29,6 +29,13 @@ fn the_handshake_declares_the_published_zle_patches_and_the_reader_they_build() 
     shellpkg::the_handshake_declares_the_packaged_reader(ZSH);
 }
 
+/// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_bootstrap_secret_is_wiped_once_the_handshake_is_accepted() {
+    shellpkg::the_bootstrap_secret_does_not_outlive_the_accepted_handshake(ZSH);
+}
+
 /// KR-REQ-07.34
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

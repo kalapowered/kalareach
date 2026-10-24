@@ -3373,6 +3373,138 @@ fn linux_start_value(pid: u64) -> Option<u64> {
     tail.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// Where a running process holds `needle` in memory it can write, as the lines of its memory map.
+///
+/// A Linux process can be read through `/proc/<pid>/mem` by the process that started it. The
+/// scan reads every mapping that is both readable and writable, which is where a static buffer,
+/// the heap and the stack are, and reports each mapping that holds the bytes.
+///
+/// # Panics
+///
+/// Panics when the process's memory cannot be opened, because a scan that cannot read finds
+/// nothing and proves nothing.
+#[cfg(target_os = "linux")]
+fn copies_in_memory(pid: u32, needle: &[u8]) -> Vec<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .unwrap_or_else(|error| panic!("the memory map of process {pid} cannot be read: {error}"));
+    let mut memory = std::fs::File::open(format!("/proc/{pid}/mem"))
+        .unwrap_or_else(|error| panic!("the memory of process {pid} cannot be opened: {error}"));
+    let mut found = Vec::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(permissions)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if !permissions.starts_with("rw") {
+            continue;
+        }
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+        else {
+            continue;
+        };
+        let mut offset = start;
+        let mut carried: Vec<u8> = Vec::new();
+        while offset < end {
+            let want =
+                usize::try_from(end - offset).map_or(chunk.len(), |left| left.min(chunk.len()));
+            if memory.seek(SeekFrom::Start(offset)).is_err() {
+                break;
+            }
+            let Ok(read) = memory.read(&mut chunk[..want]) else {
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            carried.extend_from_slice(&chunk[..read]);
+            if carried.windows(needle.len()).any(|window| window == needle) {
+                found.push(line.to_owned());
+                break;
+            }
+            let keep = needle.len().saturating_sub(1).min(carried.len());
+            carried.drain(..carried.len() - keep);
+            offset += read as u64;
+        }
+    }
+    found
+}
+
+/// KR-REQ-07.40: a compiled bridge holds no copy of the bootstrap secret once the handshake is
+/// accepted.
+///
+/// The secret is decoded into the bridge's own buffer, used once for the proof and read by nothing
+/// afterwards. The case starts a shell with a secret it knows, waits for the first prompt (which
+/// follows the acceptance and the wipe, by a condition and not by a delay) and looks for the
+/// secret's 32 bytes in every writable mapping of the shell's process. The scan is wider than the
+/// bridge's buffer, so a copy anywhere else in the process fails the case too. Reading another
+/// process's memory is a Linux facility, so the case is a stated skip elsewhere. The first thing it
+/// does is look for the same bytes in its own process, so a scan that cannot find a secret fails
+/// the case instead of passing it.
+///
+/// # Panics
+///
+/// Panics when the scan cannot find the bytes where they are known to be, or finds them in the
+/// shell.
+pub fn the_bootstrap_secret_does_not_outlive_the_accepted_handshake(kind: ShellKind) {
+    #[cfg(target_os = "linux")]
+    {
+        let secret = bootstrap_secret();
+        assert!(
+            !copies_in_memory(std::process::id(), &secret).is_empty(),
+            "the memory scan cannot find a secret it is given, so it proves nothing about a shell"
+        );
+        let package = Package::built(kind);
+        let mut session = Session::start(&package);
+        session.first_prompt();
+        let pid = session
+            .child_pid()
+            .expect("the shell's process has an identifier");
+        let copies = copies_in_memory(pid, &secret);
+        assert!(
+            copies.is_empty(),
+            "the {} bridge still holds the bootstrap secret after the handshake was accepted, in:\n{}",
+            kind.as_str(),
+            copies.join("\n")
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = kind;
+        record(
+            "bootstrap-secret-scan-skipped.txt",
+            "another process's memory is read through /proc on Linux; this host is not Linux\n",
+        );
+    }
+}
+
+/// KR-REQ-07.40: the PowerShell bridge holds no secret bytes once the handshake is accepted.
+///
+/// The module's array is cleared in place and replaced with an empty one, and the case reads the
+/// length the module is left with after the first prompt. The runtime's own copies of the
+/// environment variable's text and of the key an HMAC object held are outside what the module can
+/// reach, and outside what this case reads.
+///
+/// # Panics
+///
+/// Panics when the module still holds bytes.
+pub fn the_powershell_bootstrap_secret_is_cleared_once_the_handshake_is_accepted() {
+    let package = Package::built(ShellKind::PowerShell);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let probe = "Write-Output ('kr-secret-length=' + (& (Get-Module KalaReach.ShellBridge) { $script:Kr.Secret.Length }))";
+    assert!(
+        session.run(probe, "kr-secret-length=0"),
+        "the module still holds secret bytes after the handshake was accepted:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// The libraries a built executable asks the loader for, by the name or path the file records.
 ///
 /// # Panics

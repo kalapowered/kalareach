@@ -41,6 +41,16 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# The scratch directory of the package being built. A package that returns removes its own, and a
+# build that stops with `exit` skips that, so the script's exit removes whatever is left.
+scratch_directory=""
+remove_scratch_directory() {
+    if [ -n "${scratch_directory:-}" ]; then
+        rm -rf "${scratch_directory:?}"
+    fi
+}
+trap remove_scratch_directory EXIT
+
 build_zsh=0
 build_bash=0
 build_fish=0
@@ -1014,6 +1024,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
 
     local work
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-shell-$shell_name.XXXXXX")"
+    scratch_directory="$work"
     trap 'rm -rf "${work:?}"' RETURN
 
     # The archive is copied before it is judged and the copy is unpacked, so the bytes that were

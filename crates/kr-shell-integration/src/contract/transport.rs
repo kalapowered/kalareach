@@ -256,9 +256,9 @@ impl Bootstrap {
     /// Moves the bootstrap values into private integration state.
     ///
     /// Called once, immediately after the handshake is accepted. The returned state names the
-    /// variables the integration removes from the exported environment; the secret survives only
-    /// where a child process and a user's startup file cannot reach it, because the integration
-    /// needs it again if the reader is re-established within the same shell.
+    /// variables the integration removes from the exported environment, where a child process and
+    /// a user's startup file could read them. The bridges wipe their own copy of the secret at the
+    /// same moment, because nothing reads it after the proof.
     #[must_use]
     pub fn retain_after_handshake(self) -> RetainedBootstrap {
         RetainedBootstrap {

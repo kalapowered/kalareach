@@ -108,10 +108,18 @@ impl Tree {
 
     /// Runs the check with every proxy variable pointing at a port nothing listens on.
     fn check(&self) -> Output {
+        self.script("--check-sources")
+            .output()
+            .expect("bash to run")
+    }
+
+    /// The build script in this tree, for the Fish package and one mode, with every proxy
+    /// variable pointing at a port nothing listens on.
+    fn script(&self, mode: &str) -> Command {
         let mut command = Command::new("bash");
         command
             .arg("scripts/build-shells.sh")
-            .args(["--fish", "--check-sources", "--prefix"])
+            .args(["--fish", mode, "--prefix"])
             .arg(self.sources.parent().expect("the prefix"))
             .current_dir(&self.root)
             .env_remove("NO_PROXY")
@@ -135,7 +143,7 @@ impl Tree {
         ] {
             command.env(name, "http://127.0.0.1:9");
         }
-        command.output().expect("bash to run")
+        command
     }
 
     /// Replaces a placed file by a copy that `edit` has changed.
@@ -446,4 +454,73 @@ fn a_lock_the_check_cannot_read_is_refused() {
         format!("{} # a note{}", &lock[..close], &lock[close..])
     });
     assert_refused(&tree.check(), "Cargo.lock");
+}
+
+/// A build that stops leaves nothing behind in the scratch directory.
+///
+/// The build unpacks the release into a directory of its own, and several of the ways it stops
+/// are an `exit`, which a cleanup that runs when a function returns never reaches. A patch that
+/// does not apply is one of them. The control is the same build with every patch applying, which
+/// returns and also leaves nothing.
+#[test]
+#[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
+fn a_build_that_stops_leaves_no_scratch_directory() {
+    let tree = Tree::new();
+    let scratch = tempfile::tempdir().expect("a scratch directory of the case's own");
+    let leftovers = || {
+        fs::read_dir(scratch.path())
+            .expect("the scratch directory")
+            .count()
+    };
+
+    let mut whole = tree.script("--check-patches");
+    whole.env("TMPDIR", scratch.path());
+    let output = whole.output().expect("bash to run");
+    assert!(
+        output.status.success(),
+        "the patches apply to the pinned release:\n{}",
+        said(&output)
+    );
+    assert_eq!(
+        leftovers(),
+        0,
+        "a build that returned left its scratch directory"
+    );
+
+    // One context line of the first patch no longer matches the release.
+    let patch = fs::read_dir(tree.root.join("shells/fish/patches"))
+        .expect("the patches")
+        .map(|entry| entry.expect("a patch").path())
+        .min()
+        .expect("the package has a patch");
+    let text = fs::read_to_string(&patch).expect("the patch");
+    let mut changed = false;
+    let broken: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if !changed && line.starts_with("  ") && line.trim().len() > 8 {
+                changed = true;
+                format!("{line} (no longer in the release)")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    assert!(changed, "the patch has a context line to break");
+    fs::write(&patch, broken.join("\n") + "\n").expect("the broken patch");
+
+    let mut stopped = tree.script("--check-patches");
+    stopped.env("TMPDIR", scratch.path());
+    let output = stopped.output().expect("bash to run");
+    assert!(
+        !output.status.success(),
+        "a patch that does not apply stopped nothing:\n{}",
+        said(&output)
+    );
+    assert_eq!(
+        leftovers(),
+        0,
+        "a build that stopped left its scratch directory behind:\n{}",
+        said(&output)
+    );
 }

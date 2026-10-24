@@ -653,13 +653,20 @@ examined them. The release's statement of that exception is in
 The bridge's SHA-256 and HMAC-SHA-256 are this project's own code, and no external cryptographic
 review has examined them. The checks above bound that, but they do not replace a review.
 
-The code clears its temporaries, and the bootstrap secret when an activation fails, with `kr_wipe`.
-An optimiser may drop a `memset` of a buffer that is not read again, so `kr_wipe` calls `memset_s`
-on Apple platforms, `explicit_bzero` on glibc 2.25 or later in its default feature set, and a loop
-through a volatile pointer on any other platform. No case can show the wipes of the temporaries
-inside the hash and the MAC, because reading them back means reading dead stack memory. The cases
-read only memory the caller owns: the hash state after the digest is taken, and the range a wipe is
-given, once with the platform's call and once with the loop.
+The code clears its temporaries, and the bootstrap secret when an activation fails and once the
+handshake is accepted, with `kr_wipe`. An optimiser may drop a `memset` of a buffer that is not read
+again, so `kr_wipe` calls `memset_s` on Apple platforms, `explicit_bzero` on glibc 2.25 or later in
+its default feature set, and a loop through a volatile pointer on any other platform. No case can
+show the wipes of the temporaries inside the hash and the MAC, because reading them back means
+reading dead stack memory. The cases read only memory the caller owns: the hash state after the
+digest is taken, and the range a wipe is given, once with the platform's call and once with the
+loop. A Linux case reads the memory of a running Bash, Fish and Zsh after its first prompt and finds
+no copy of the secret in a writable mapping.
+
+The wipe covers the buffer the secret was decoded into. The base64url text that carried it stays in
+the memory the process was started with after the variable is unset, and the PowerShell bridge's
+runtime keeps managed copies of the text and of the key its HMAC object held; no code of the bridge
+can clear those.
 
 ## Release manifest
 

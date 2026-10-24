@@ -60,8 +60,7 @@ kr_shell_unexport (name)
   /*
    * The bootstrap values leave the shell with the environment, so a child process started
    * afterwards inherits neither the endpoint nor the secret and the guarded startup entry is inert
-   * in all of them. The bridge keeps the secret in its own memory, where a startup file cannot
-   * reach it, because a reader re-established inside this shell needs it again.
+   * in all of them. The bridge wipes its own copy of the secret once the handshake is accepted.
    */
   unbind_variable ((char *) name);
 }

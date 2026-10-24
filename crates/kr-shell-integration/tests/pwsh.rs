@@ -25,6 +25,13 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const PWSH: ShellKind = ShellKind::PowerShell;
 
+/// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_bootstrap_secret_is_cleared_once_the_handshake_is_accepted() {
+    shellpkg::the_powershell_bootstrap_secret_is_cleared_once_the_handshake_is_accepted();
+}
+
 /// KR-REQ-07.37, KR-REQ-07.85
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
