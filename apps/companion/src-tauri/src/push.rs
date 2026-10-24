@@ -208,6 +208,11 @@ impl HostPush {
 /// What a host that is on is shown while it is told again.
 const TELLING_THE_HOST: &str = "Telling the host.";
 
+/// What a host that a look cannot reach without cutting off the host in use is shown as.
+const BESIDE_THE_HOST_IN_USE: &str = "This host is reached through the same relay as the host you \
+                                      are using. Choose Try again to turn notifications on for it; \
+                                      the host in use reconnects afterwards.";
+
 /// The choice a record that holds none reads as.
 const fn previews_on() -> bool {
     true
@@ -293,6 +298,9 @@ impl From<String> for Stop {
 pub type PushFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, String>> + Send + 'a>>;
 
+/// A boxed future for a question the answer to which is yes or no.
+pub type AskFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
 /// Why a change made over the line to a host did not happen, in words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LineStop {
@@ -366,6 +374,14 @@ pub trait Registrar: Send + Sync {
         host: &'a PairedHost,
         reach: Reach,
     ) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
+
+    /// Whether reaching `host` as a visit would be refused now because that would cut off the host
+    /// in use, asked before anything is done for the host and with nothing held. The answer is as
+    /// of now: the connection is the authority when it is made. A registrar that cannot tell says
+    /// no.
+    fn beside_the_host_in_use<'a>(&'a self, _host: &'a PairedHost) -> AskFuture<'a> {
+        Box::pin(async { false })
+    }
 }
 
 /// A boxed future for a change made over the line.
@@ -1109,6 +1125,11 @@ impl PushDesk {
         reach: Reach,
         job: Job,
     ) -> std::result::Result<Digest256, Stop> {
+        // A look never cuts off the host in use, so a host it cannot reach without that is not
+        // asked or told anything, and the words say why.
+        if reach == Reach::Visit && self.registrar.beside_the_host_in_use(host).await {
+            return Err(BESIDE_THE_HOST_IN_USE.to_owned().into());
+        }
         match job {
             Job::Full => {
                 let (gateway, proposed) = self.propose(host, run).await?;
@@ -1898,6 +1919,17 @@ async fn within_the_answer<T>(
 pub struct ConnectionRegistrar(pub Arc<Device>);
 
 impl Registrar for ConnectionRegistrar {
+    fn beside_the_host_in_use<'a>(&'a self, host: &'a PairedHost) -> AskFuture<'a> {
+        Box::pin(async move {
+            let in_use = || self.0.host_in_use().map(|using| using.network_config);
+            self.0
+                .pairing()
+                .link
+                .would_refuse_visit(&host.network_config, &in_use)
+                .await
+        })
+    }
+
     fn connect<'a>(
         &'a self,
         host: &'a PairedHost,
