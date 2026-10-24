@@ -138,9 +138,10 @@ pub fn initialise() -> Result<()> {
 /// * The libraries the cryptography guide lists draw their own: the pairing exchange, TLS and the
 ///   transport between devices.
 /// * The companion's phone code uses the platform's own: the Android Keystore and `SecureRandom`
-///   for the keys and random files it holds, Foundation's `UUID` for identifiers on iOS, and, in
-///   the page it shows, `crypto.randomUUID` (or `Math.random` where that is missing) for local
-///   tokens.
+///   for the keys and random files it holds, and Foundation's `UUID` for identifiers on iOS.
+/// * The companion's page, on the desktop and on the phone, makes its opening tokens with
+///   `crypto.randomUUID` (or `Math.random` where that is missing) and its local identifiers with
+///   `Math.random`.
 ///
 /// # Errors
 ///
