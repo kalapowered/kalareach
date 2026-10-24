@@ -163,6 +163,12 @@ impl ConnectionActor {
     }
 }
 
+/// What a host says to a method it does not list, to a method it lists for another way in, and to
+/// a method a caller before pairing may not call: one text for all of them, because the difference
+/// tells a caller which methods exist. A client reads it to tell a host of an earlier build, which
+/// does not list a newer method, from a host that refuses for a reason of its own.
+pub const METHOD_NOT_AVAILABLE: &str = "the method is not available";
+
 fn denial(method: &str, reason: &kr_protocol::authority::DenialReason) -> ProtocolError {
     use kr_protocol::authority::DenialReason;
     match reason {
@@ -172,7 +178,7 @@ fn denial(method: &str, reason: &kr_protocol::authority::DenialReason) -> Protoc
         ),
         DenialReason::UnlistedMethod | DenialReason::ForbiddenIngress { .. } => {
             // One message for both, because the difference tells a caller which methods exist.
-            ProtocolError::new(ErrorCode::PermissionDenied, "the method is not available")
+            ProtocolError::new(ErrorCode::PermissionDenied, METHOD_NOT_AVAILABLE)
         }
     }
 }
@@ -302,6 +308,7 @@ mod tests {
             .admit("host.shutdown", MethodVersion::V1)
             .expect_err("a refusal");
         assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_eq!(error.message, METHOD_NOT_AVAILABLE);
     }
 
     #[test]

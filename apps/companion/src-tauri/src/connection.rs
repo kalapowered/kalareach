@@ -238,7 +238,7 @@ impl Connection {
         visiting: bool,
     ) -> std::result::Result<Self, Unopened> {
         let pairing = device.pairing();
-        let identity = pairing.paired_identity_for(&host);
+        let identity = pairing.paired_identity_for(host);
         let connecting = async {
             if visiting {
                 let in_use = || device.host_in_use().map(|using| using.network_config);
@@ -323,11 +323,33 @@ impl Connection {
     }
 }
 
+/// What a host's refusal to open a paired connection becomes. A host of an earlier build does not
+/// list the method and refuses it as any unlisted method is refused (`PERMISSION_DENIED` with
+/// [`kr_transport::actor::METHOD_NOT_AVAILABLE`]), and only that refusal is told to be updated: a
+/// host that refuses for a reason of its own, such as a feed it has not caught up with, says that
+/// reason alone.
+fn opening_refused(refusal: kr_protocol::error::ProtocolError) -> Unopened {
+    use kr_protocol::error::ErrorCode;
+
+    if refusal.code == ErrorCode::PermissionDenied
+        && refusal.message == kr_transport::actor::METHOD_NOT_AVAILABLE
+    {
+        return Unopened::Refused(CommandError::stated(
+            refusal.code,
+            format!(
+                "{} If the host is of an earlier build than this application, update it.",
+                refusal.message
+            ),
+        ));
+    }
+    Unopened::of_read(kr_client::ClientError::Host(refusal))
+}
+
 /// Opens a paired connection for the host alone, and returns the rights the host decided the open
 /// with.
 ///
 /// A host of an earlier build does not list the method and refuses it as any unlisted method is
-/// refused, so a refusal that is not a transient one says that.
+/// refused, so that refusal says to update the host.
 async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionRight>, Unopened> {
     use kr_protocol::scalars::Nullable;
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
@@ -345,21 +367,7 @@ async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionR
     .await
     .map_err(|_| Unopened::unreached("the host did not open the connection in time"))?
     .map_err(|error| match error {
-        kr_client::ClientError::Host(refusal)
-            if matches!(
-                refusal.code,
-                kr_protocol::error::ErrorCode::PermissionDenied
-                    | kr_protocol::error::ErrorCode::InvalidArgument
-            ) =>
-        {
-            Unopened::Refused(CommandError::stated(
-                refusal.code,
-                format!(
-                    "{} If the host is of an earlier build than this application, update it.",
-                    refusal.message
-                ),
-            ))
-        }
+        kr_client::ClientError::Host(refusal) => opening_refused(refusal),
         other => Unopened::of_read(other),
     })?;
     match opened {
@@ -887,6 +895,41 @@ mod tests {
             Unopened::of_read(kr_client::ClientError::ConnectionEnded),
             Unopened::Unreached(_)
         ));
+    }
+
+    /// A host that opens a paired connection with a refusal of its own says that reason alone. Only
+    /// the refusal a host of an earlier build gives (it does not list the method, and refuses it as
+    /// it refuses any unlisted method) is told to be updated; the refusals the host's authority feed
+    /// produces, which are `PERMISSION_DENIED` too, are not.
+    #[test]
+    fn only_the_refusal_of_an_unlisted_method_tells_the_person_to_update_the_host() {
+        use kr_controller::grants::Refusal;
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        let hint = "If the host is of an earlier build than this application, update it.";
+        let said = |refusal: ProtocolError| match opening_refused(refusal) {
+            Unopened::Refused(error) => error.message,
+            Unopened::Unreached(_) => panic!("a refusal the host sent"),
+        };
+
+        let earlier_host = ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            kr_transport::actor::METHOD_NOT_AVAILABLE,
+        );
+        let told = said(earlier_host);
+        assert!(told.contains(hint), "{told}");
+        assert!(told.starts_with(kr_transport::actor::METHOD_NOT_AVAILABLE));
+
+        for refusal in [Refusal::BehindItsFeed, Refusal::WithdrawalUnverified] {
+            let error = refusal.to_protocol_error();
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            let words = error.message.clone();
+            let told = said(error);
+            assert_eq!(told, words, "the host's own words alone");
+            assert!(!told.contains(hint));
+        }
+        let other = ProtocolError::new(ErrorCode::InvalidArgument, "the grant is malformed");
+        assert_eq!(said(other), "the grant is malformed");
     }
 
     /// A connection says whether its host is one this device is paired with, because an
