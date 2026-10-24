@@ -58,11 +58,49 @@ class PreviewDecisionTest {
     }
 
     @Test
-    fun theGenericAlertStandsWhenNoKeyHasBeenProvisioned() {
+    fun theGenericAlertStandsWhenThisDeviceHoldsNoSeed() {
+        val withoutTheSeed =
+            object : PreviewKeyReading {
+                override fun recipientSeed(recipientKeyId: ByteArray): Result<ByteArray> =
+                    Result.failure(PreviewKeyUnavailableException(PreviewKeyUnavailable.NotProvisioned))
+
+                override fun senderKey(senderKeyId: ByteArray) = Result.success(ByteArray(32) { 0x55 })
+            }
+        val decision = PreviewDecider(withoutTheSeed, refusingOpener()).decide(payload(), now)
+        assertEquals(PreviewDecision.Generic(GenericReason.KEY_UNAVAILABLE), decision)
+    }
+
+    @Test
+    fun aDeviceWhoseEveryHostHasPreviewsOffHoldsNeitherKeyAndSaysTheHostIsUnknown() {
+        // The seed is filed only while some host may seal to it, so a device with every host off
+        // holds neither key: the reason is the host's key, which is the one that is asked first.
         val decision =
             PreviewDecider(failingKeys(PreviewKeyUnavailable.NotProvisioned), refusingOpener())
                 .decide(payload(), now)
-        assertEquals(PreviewDecision.Generic(GenericReason.KEY_UNAVAILABLE), decision)
+        assertEquals(PreviewDecision.Generic(GenericReason.SENDER_UNKNOWN), decision)
+    }
+
+    @Test
+    fun anOpenerThatFailsLeavesTheGenericAlertAndTheSeedCleared() {
+        val seed = ByteArray(32) { 0x44 }
+        val keys =
+            object : PreviewKeyReading {
+                override fun recipientSeed(recipientKeyId: ByteArray) = Result.success(seed)
+
+                override fun senderKey(senderKeyId: ByteArray) = Result.success(ByteArray(32) { 0x55 })
+            }
+        for (failure in listOf<Throwable>(
+            UnsatisfiedLinkError("no library"),
+            RuntimeException("the opener failed")
+        )) {
+            seed.fill(0x44)
+            val failing = PreviewOpening { _, _, _, _, _ -> throw failure }
+
+            val decision = PreviewDecider(keys, failing).decide(payload(), now)
+
+            assertEquals(PreviewDecision.Generic(GenericReason.DECRYPTION_FAILED), decision)
+            assertEquals("the seed is cleared", List(32) { 0.toByte() }, seed.toList())
+        }
     }
 
     @Test

@@ -61,7 +61,10 @@ class PreviewKeyUnavailableException(val unavailable: PreviewKeyUnavailable) :
  * unlock.
  */
 interface PreviewKeyReading {
-    /** The seed for one recipient key identifier, or the reason there is none. */
+    /**
+     * The seed for one recipient key identifier, or the reason there is none. The array is the
+     * caller's own copy, which it clears when it has used it.
+     */
     fun recipientSeed(recipientKeyId: ByteArray): Result<ByteArray>
 
     /** The public key for one sender key identifier, or the reason there is none. */
@@ -118,25 +121,37 @@ class PreviewDecider(
             return PreviewDecision.Generic(GenericReason.NOT_FOR_THIS_DEVICE)
         }
 
-        val seed =
-            keys.recipientSeed(envelope.routing.recipientKeyId).getOrElse { failure ->
-                return PreviewDecision.Generic(unavailable(failure, GenericReason.KEY_UNAVAILABLE))
-            }
         // A host this device holds no key for is one whose previews are off here, or one it never
-        // asked for them: nothing it sealed is opened.
+        // asked for them: nothing it sealed is opened. It is asked first, since a phone whose every
+        // host has previews off holds no seed either, and the reason is then this one.
         val senderKey =
             keys.senderKey(envelope.routing.senderKeyId).getOrElse { failure ->
                 return PreviewDecision.Generic(unavailable(failure, GenericReason.SENDER_UNKNOWN))
             }
+        val seed =
+            keys.recipientSeed(envelope.routing.recipientKeyId).getOrElse { failure ->
+                return PreviewDecision.Generic(unavailable(failure, GenericReason.KEY_UNAVAILABLE))
+            }
 
+        // The opener is the Rust library, reached through JNI. A library that does not load, or one
+        // that fails or panics, leaves the generic alert and not a message that is lost. The seed is
+        // cleared when the call ends, as the challenge's is.
         val opened =
-            opener.open(
-                preview = data.getValue("preview"),
-                alert = data["alert"].orEmpty(),
-                seed = seed,
-                senderKey = senderKey,
-                nowMillis = nowMillis
-            )
+            try {
+                opener.open(
+                    preview = data.getValue("preview"),
+                    alert = data["alert"].orEmpty(),
+                    seed = seed,
+                    senderKey = senderKey,
+                    nowMillis = nowMillis
+                )
+            } catch (failure: LinkageError) {
+                PreviewOpened.Refused("library")
+            } catch (failure: RuntimeException) {
+                PreviewOpened.Refused("library")
+            } finally {
+                seed.fill(0)
+            }
         return when (opened) {
             is PreviewOpened.Refused -> PreviewDecision.Generic(refusal(opened.reason))
             is PreviewOpened.Text -> {
