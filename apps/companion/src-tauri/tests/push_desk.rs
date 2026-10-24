@@ -19,7 +19,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +44,12 @@ use serde_json::{Value, json};
 use support::{WATCHDOG, pair, phone_paired_with};
 
 const VECTORS: &str = include_str!("../../../../fixtures/push/push.json");
+
+tokio::task_local! {
+    /// Set around a call of the desk by a test that wants the page's callback to fail inside that
+    /// call, and nowhere else.
+    static CALLBACK_FAILS_HERE: bool;
+}
 
 const FIRST_TOKEN: &str = "fZ9k-test-registration-token:APA91bExample";
 const SECOND_TOKEN: &str = "gH2m-another-registration-token:APA91bExample";
@@ -499,9 +505,8 @@ struct Desk {
     device: Arc<Device>,
     /// What the desk's clock is ahead of the real one, so that a test can let time pass.
     clock_ahead_ms: Arc<AtomicU64>,
-    /// Whether the application ends at its next page callback: the callback is the product's own
-    /// seam, at a point with no wait in it where a process can end.
-    ends: Arc<AtomicBool>,
+    /// How many times the desk told the page that what it shows changed.
+    changes: Arc<AtomicUsize>,
     /// Kept so the phone's records outlive the test.
     _phone: support::Phone,
 }
@@ -609,13 +614,11 @@ async fn desk_reaching(
     }
     let device = phone.companion.device();
     let registered = Arc::new(Mutex::new(Registered::default()));
-    let ends = Arc::new(AtomicBool::new(false));
     let opened = open_with(
         phone.data.path(),
         &device,
         &receiver,
         registrar(&device, &registered),
-        Arc::clone(&ends),
     );
     Desk {
         desk: opened.desk,
@@ -624,7 +627,7 @@ async fn desk_reaching(
         registered,
         device,
         clock_ahead_ms: opened.clock_ahead_ms,
-        ends,
+        changes: opened.changes,
         _phone: phone,
     }
 }
@@ -635,6 +638,8 @@ struct Opened {
     desk: Arc<PushDesk>,
     gateway: Arc<Gateway>,
     clock_ahead_ms: Arc<AtomicU64>,
+    /// How many times the desk told the page that what it shows changed.
+    changes: Arc<AtomicUsize>,
 }
 
 impl Opened {
@@ -650,14 +655,12 @@ fn open_over(
     device: &Arc<Device>,
     receiver: &Arc<Receiver>,
     registered: &Arc<Mutex<Registered>>,
-    ends: Arc<AtomicBool>,
 ) -> Opened {
     open_with(
         data,
         device,
         receiver,
         Arc::new(HostLink(Arc::clone(registered))),
-        ends,
     )
 }
 
@@ -666,12 +669,13 @@ fn open_with(
     device: &Arc<Device>,
     receiver: &Arc<Receiver>,
     registrar: Arc<dyn Registrar>,
-    ends: Arc<AtomicBool>,
 ) -> Opened {
     let gateway = Gateway::new();
     let http = Arc::clone(&gateway);
     let clock_ahead_ms = Arc::new(AtomicU64::new(0));
     let ahead = Arc::clone(&clock_ahead_ms);
+    let changes = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&changes);
     let desk = PushDesk::open(
         data,
         Arc::clone(device),
@@ -681,13 +685,24 @@ fn open_with(
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
         },
-        move || assert!(!ends.load(Ordering::SeqCst), "the application ends"),
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            // Where a test asks the page's callback to fail in its own task, as a panic in the page
+            // does. The desk's runs are tasks of their own, which the scope does not reach.
+            assert!(
+                !CALLBACK_FAILS_HERE
+                    .try_with(|fails| *fails)
+                    .unwrap_or(false),
+                "the page's callback failed"
+            );
+        },
     )
     .expect("the desk opens");
     Opened {
         desk,
         gateway,
         clock_ahead_ms,
+        changes,
     }
 }
 
@@ -1022,7 +1037,6 @@ async fn a_token_the_provider_gave_while_the_application_was_not_running_is_regi
         &phone.device,
         &Receiver::new(SECOND_TOKEN),
         &phone.registered,
-        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(restarted.desk.view().hosts[0].state, PushState::On);
     look(&restarted.desk).await;
@@ -1083,7 +1097,6 @@ async fn a_change_found_while_a_run_is_under_way_is_not_lost_when_the_applicatio
         &phone.device,
         &Receiver::new(SECOND_TOKEN),
         &phone.registered,
-        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(
         restarted.desk.view().hosts[0].state,
@@ -1097,9 +1110,8 @@ async fn a_change_found_while_a_run_is_under_way_is_not_lost_when_the_applicatio
 }
 
 /// KR-REQ-16.16: two hosts are on, the provider gives another token, and the application ends in
-/// the look that found it, right after that look has written what it found and before anything
-/// else. Both hosts are then marked, as one write, and the next start registers both with the token
-/// the provider holds.
+/// the look that found it, with both runs under way. Both hosts are then marked, as one write, and
+/// the next start registers both with the token the provider holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_application_ending_in_the_look_that_found_a_new_token_loses_it_for_neither_host() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -1113,13 +1125,20 @@ async fn the_application_ending_in_the_look_that_found_a_new_token_loses_it_for_
         .until(|states| states == [PushState::On, PushState::On])
         .await;
 
+    // The runs the look starts hang at their first question to the platform, as they do when the
+    // application ends in them.
     phone.receiver.token_is(SECOND_TOKEN);
-    phone.ends.store(true, Ordering::SeqCst);
-    let desk = Arc::clone(&phone.desk);
-    let outcome = tokio::spawn(async move { desk.refresh().await }).await;
-    assert!(
-        outcome.is_err_and(|error| error.is_panic()),
-        "the look ended where the application does"
+    phone.receiver.with(|state| state.permission_hangs = true);
+    look(&phone.desk).await;
+    assert_eq!(
+        phone
+            .view()
+            .hosts
+            .iter()
+            .map(|each| each.state)
+            .collect::<Vec<_>>(),
+        [PushState::Working, PushState::Working],
+        "both hosts were marked, and a run holds each"
     );
 
     let restarted = open_over(
@@ -1127,7 +1146,6 @@ async fn the_application_ending_in_the_look_that_found_a_new_token_loses_it_for_
         &phone.device,
         &Receiver::new(SECOND_TOKEN),
         &phone.registered,
-        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(
         restarted
@@ -1220,7 +1238,6 @@ async fn a_record_with_no_digest_is_registered_again_at_the_next_look() {
         &phone.device,
         &Receiver::new(FIRST_TOKEN),
         &phone.registered,
-        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(restarted.desk.view().hosts[0].state, PushState::On);
     look(&restarted.desk).await;
@@ -1236,7 +1253,6 @@ async fn a_record_with_no_digest_is_registered_again_at_the_next_look() {
         &phone.device,
         &Receiver::new(FIRST_TOKEN),
         &phone.registered,
-        Arc::new(AtomicBool::new(false)),
     );
     look(&again.desk).await;
     assert_eq!(again.desk.view().hosts[0].state, PushState::On);
@@ -1801,15 +1817,7 @@ async fn a_record_that_cannot_be_read_is_set_aside_and_its_hosts_are_marked_lost
         let record = data.join("push").join("push.json");
         kr_ipc::paths::write_owner_only_file(&record, bytes).expect("the record is spoiled");
 
-        let open = || {
-            open_over(
-                data,
-                &phone.device,
-                &receiver,
-                &phone.registered,
-                Arc::new(AtomicBool::new(false)),
-            )
-        };
+        let open = || open_over(data, &phone.device, &receiver, &phone.registered);
         let states = |opened: &Opened| {
             opened
                 .desk
@@ -1910,7 +1918,6 @@ fn reopened(phone: &Desk) -> Opened {
         &phone.device,
         &phone.receiver,
         &phone.registered,
-        Arc::new(AtomicBool::new(false)),
     )
 }
 
@@ -2041,10 +2048,18 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
         Arc::strong_count(&restarted.desk) == 1
     })
     .await;
+    let shown = restarted.desk.view().hosts.remove(0);
     assert_eq!(
-        restarted.desk.view().hosts[0].state,
-        PushState::Off,
-        "the forgotten host shows nothing, and no run was started for it"
+        shown.state,
+        PushState::NeedsAttention,
+        "no run was started for the host, and it still says to start the application again"
+    );
+    assert!(
+        shown
+            .words
+            .contains("Close the application and open it again"),
+        "{:?}",
+        shown.words
     );
 
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
@@ -3152,6 +3167,98 @@ async fn a_look_tells_a_host_the_choice_it_was_not_told() {
     let _ = reference;
 }
 
+/// What the page has been told so far: how many times the desk said that what it shows changed.
+fn told(phone: &Desk) -> usize {
+    phone.changes.load(Ordering::SeqCst)
+}
+
+/// A look that cannot read the notification token cannot say that a host which is on still has the
+/// token it was registered with: it shows the host as needing the person, starts no run, tells the
+/// page once, and the next look that reads a token shows it on again without registering it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_look_that_cannot_read_the_token_does_not_leave_a_host_shown_as_on() {
+    let (_host, phone, _reference) = a_phone_with_notifications_on().await;
+    let before = told(&phone);
+    phone
+        .receiver
+        .with(|state| state.token_readable_for = Some(state.token_reads));
+
+    look(&phone.desk).await;
+
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("could not check its notification token"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+    assert_eq!(told(&phone), before + 1, "the page was told");
+    look(&phone.desk).await;
+    assert_eq!(told(&phone), before + 1, "nothing new to tell the page");
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked],
+        "no run was started"
+    );
+
+    phone.receiver.with(|state| state.token_readable_for = None);
+    look(&phone.desk).await;
+    assert_eq!(phone.view().hosts[0].state, PushState::On);
+    assert_eq!(told(&phone), before + 2, "the page was told it is on again");
+    assert_eq!(
+        proposed(&phone.gateway),
+        [FIRST_TOKEN],
+        "the same token is not registered again"
+    );
+}
+
+/// A host left unconfirmed by a look that could not read the token is registered by the next look
+/// that reads a different one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_left_unconfirmed_is_registered_when_the_next_look_finds_another_token() {
+    let (_host, phone, _reference) = a_phone_with_notifications_on().await;
+    phone
+        .receiver
+        .with(|state| state.token_readable_for = Some(state.token_reads));
+    look(&phone.desk).await;
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+
+    phone.receiver.with(|state| state.token_readable_for = None);
+    phone.receiver.token_is(SECOND_TOKEN);
+    look(&phone.desk).await;
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN, SECOND_TOKEN]);
+}
+
+/// A desk opened while the paired hosts could not be read cannot write a record, so a host it never
+/// heard of is not one it can turn on: once the list can be read the host shows as needing the
+/// person, with the words that say to start the application again, and turning it on starts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_a_blocked_desk_never_heard_of_shows_the_restart_words_once_the_list_is_readable() {
+    let (_host, phone) = a_phone_whose_record_was_spoiled(b"{ not a record").await;
+    let file = find(phone._phone.data.path(), "hosts.json").expect("the paired hosts' file");
+    let kept = std::fs::read(&file).expect("the paired hosts");
+    std::fs::write(&file, b"{ not a list").expect("spoiled");
+    let blocked = reopened(&phone);
+    std::fs::write(&file, kept).expect("mended");
+
+    let shown = blocked.desk.view().hosts.remove(0);
+    assert_eq!(shown.state, PushState::NeedsAttention);
+    assert!(
+        shown
+            .words
+            .contains("Close the application and open it again"),
+        "{:?}",
+        shown.words
+    );
+    blocked
+        .desk
+        .enable(&shown.reference)
+        .expect("the person asks");
+    assert_eq!(Arc::strong_count(&blocked.desk), 1, "no run was started");
+}
+
 /// A host whose run the system ended in the middle, `ago_ms` before the application starts again.
 async fn a_phone_whose_run_ended_with_the_application(ago_ms: u64) -> (Host, Desk, Opened) {
     let (host, phone, _reference) = a_phone_with_notifications_on().await;
@@ -3204,5 +3311,43 @@ async fn a_run_cut_short_moments_before_the_start_waits_out_its_minute() {
     assert_eq!(
         restarted.desk.view().hosts[0].state,
         PushState::NeedsAttention
+    );
+}
+
+/// A failure in the page's callback, in the look that claimed the hosts, does not leave a host
+/// working with no run behind it: the runs are started before the page is told, so each host reaches
+/// the end the look sent it to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_callback_that_fails_in_the_look_does_not_leave_a_host_working_without_a_run() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
+    for reference in phone.references() {
+        phone.desk.enable(&reference).expect("the person asks");
+    }
+    phone
+        .until(|states| states == [PushState::On, PushState::On])
+        .await;
+
+    phone.receiver.token_is(SECOND_TOKEN);
+    let desk = Arc::clone(&phone.desk);
+    let outcome =
+        tokio::spawn(CALLBACK_FAILS_HERE.scope(true, async move { desk.refresh().await })).await;
+    assert!(
+        outcome.is_err_and(|error| error.is_panic()),
+        "the callback failed in the look"
+    );
+
+    phone
+        .until(|states| states == [PushState::On, PushState::On])
+        .await;
+    assert_eq!(
+        proposed(&phone.gateway)
+            .iter()
+            .filter(|token| *token == SECOND_TOKEN)
+            .count(),
+        2,
+        "each host registered the token the provider holds"
     );
 }

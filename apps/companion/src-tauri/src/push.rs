@@ -208,6 +208,19 @@ impl HostPush {
 /// What a host that is on is shown while it is told again.
 const TELLING_THE_HOST: &str = "Telling the host.";
 
+/// What a host that is on is shown when a look could not read the notification token, so that this
+/// phone cannot say whether the host still has the one it holds: nothing is changed, and the next
+/// look that reads a token settles it.
+const TOKEN_UNREADABLE: &str = "This phone could not check its notification token. It will check \
+                                again the next time you open the app.";
+
+/// What a token the gateway does not take is shown as.
+const TOKEN_REFUSED: &str =
+    "The notification token this phone was given is not one the gateway takes.";
+
+/// The most names a record that cannot be read is tried under before it is left where it is.
+const ASIDE_NAMES: u32 = 1_000;
+
 /// What a host that a look cannot reach without cutting off the host in use is shown as.
 const BESIDE_THE_HOST_IN_USE: &str = "This host is reached through the same relay as the host you \
                                       are using. Choose Try again to turn notifications on for it; \
@@ -495,6 +508,10 @@ struct State {
     /// its comparison, so what is here when it compares is something a look saw while the run's own
     /// answer was on its way.
     observed: BTreeMap<DeviceId, BTreeSet<Digest256>>,
+    /// The hosts that are on and that a look could not confirm, because it could not read the
+    /// token, each with the words that say so. Kept in memory only: the record still says on, and
+    /// the next look that reads a token takes the mark away, as does a run that ends.
+    unconfirmed: BTreeMap<DeviceId, &'static str>,
     /// The number the next claim is given.
     next_run: u64,
 }
@@ -629,6 +646,7 @@ impl PushDesk {
                 cancels: BTreeMap::new(),
                 asking: BTreeSet::new(),
                 observed: BTreeMap::new(),
+                unconfirmed: BTreeMap::new(),
                 next_run: 0,
             }),
             registering: tokio::sync::Mutex::new(()),
@@ -658,15 +676,30 @@ impl PushDesk {
             .rev()
             .map(|host| {
                 let kept = state.record.hosts.get(&host.host_device_id.to_string());
+                let unconfirmed = state.unconfirmed.get(&host.host_device_id);
+                let (shown, words) = match (kept, unconfirmed) {
+                    // A record that could not be written knows no host the list now has, and a host
+                    // turned on would be one this phone could not remember.
+                    (None, _) if self.write_blocked => {
+                        (PushState::NeedsAttention, RECORD_KEPT.to_owned())
+                    }
+                    (None, _) => (PushState::Off, String::new()),
+                    (Some(kept), Some(why)) if kept.phase == Phase::On => {
+                        (PushState::NeedsAttention, (*why).to_owned())
+                    }
+                    (Some(kept), _) => (
+                        match kept.phase {
+                            Phase::Working => PushState::Working,
+                            Phase::On => PushState::On,
+                            Phase::Attention => PushState::NeedsAttention,
+                        },
+                        kept.words.clone(),
+                    ),
+                };
                 HostPushView {
                     reference: reference_of(host),
-                    state: match kept.map(|kept| kept.phase) {
-                        None => PushState::Off,
-                        Some(Phase::Working) => PushState::Working,
-                        Some(Phase::On) => PushState::On,
-                        Some(Phase::Attention) => PushState::NeedsAttention,
-                    },
-                    words: kept.map_or_else(String::new, |kept| kept.words.clone()),
+                    state: shown,
+                    words,
                     settings: kept.is_some_and(|kept| kept.settings),
                     previews: kept.is_none_or(|kept| kept.previews),
                 }
@@ -716,8 +749,10 @@ impl PushDesk {
             run
         };
         if let Some(run) = run {
-            (self.changed)();
+            // The run starts before the page is told: a host marked working has a run behind it
+            // even when the page's callback fails.
             self.spawn_run(host, run, Reach::Asked, Job::Full);
+            (self.changed)();
         }
         Ok(self.view())
     }
@@ -775,8 +810,8 @@ impl PushDesk {
             }
         };
         if let Some((run, job)) = claimed {
-            (self.changed)();
             self.spawn_run(host, run, Reach::Asked, job);
+            (self.changed)();
         }
         Ok(self.view())
     }
@@ -803,12 +838,33 @@ impl PushDesk {
             tracing::warn!(%error, "the paired hosts could not be read for a look at notifications");
             CommandError::local_failure("the paired hosts could not be read")
         })?;
-        let current = self.current_digest().await;
+        let checked = self.checked_token().await;
+        let current = checked.ok();
         let now = (self.wiring.clock)();
+        let mut shown = false;
         let claimed: Vec<(PairedHost, u64, Job)> = {
             let mut state = lock(&self.state);
             let mut claimed = Vec::new();
             let mut marked = false;
+            // A look that read a token settles every host it could not confirm before; one that
+            // could not read one leaves the hosts that are on unconfirmed, since nothing says they
+            // still have the token they were registered with.
+            match checked {
+                Ok(_) => shown = !std::mem::take(&mut state.unconfirmed).is_empty(),
+                Err(why) => {
+                    for host in &hosts {
+                        let id = host.host_device_id;
+                        let on = state
+                            .record
+                            .hosts
+                            .get(&id.to_string())
+                            .is_some_and(|kept| kept.phase == Phase::On);
+                        if on && state.unconfirmed.insert(id, why) != Some(why) {
+                            shown = true;
+                        }
+                    }
+                }
+            }
             for host in hosts {
                 let id = host.host_device_id;
                 if let Some(digest) = current
@@ -855,11 +911,14 @@ impl PushDesk {
             }
             claimed
         };
-        if !claimed.is_empty() {
-            (self.changed)();
-        }
+        let changed = !claimed.is_empty() || shown;
+        // The runs start before the page is told: a host marked working has a run behind it even
+        // when the page's callback fails.
         for (host, run, job) in claimed {
             self.spawn_run(host, run, Reach::Visit, job);
+        }
+        if changed {
+            (self.changed)();
         }
         // What the receivers hold follows the record and the paired hosts, so a look mends a filing
         // that failed or a host that was unpaired meanwhile.
@@ -886,6 +945,7 @@ impl PushDesk {
             }
             state.asking.remove(&host);
             state.observed.remove(&host);
+            state.unconfirmed.remove(&host);
             if state.record.hosts.remove(&host.to_string()).is_some() {
                 self.keep(&state.record);
             }
@@ -1019,6 +1079,7 @@ impl PushDesk {
                 return Next::Again(Job::Delivery(registered));
             }
             state.running.remove(&host);
+            state.unconfirmed.remove(&host);
             let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
                 return Next::Done;
             };
@@ -1045,6 +1106,7 @@ impl PushDesk {
             state.running.remove(&host);
             state.asking.remove(&host);
             state.observed.remove(&host);
+            state.unconfirmed.remove(&host);
             let Some(kept) = state.record.hosts.get_mut(&host.to_string()) else {
                 return;
             };
@@ -1066,6 +1128,8 @@ impl PushDesk {
         settings: bool,
         now: u64,
     ) {
+        // What a run says of the host replaces the mark of a look that could not confirm it.
+        state.unconfirmed.remove(&host);
         let entry = state
             .record
             .hosts
@@ -1102,12 +1166,20 @@ impl PushDesk {
         true
     }
 
+    /// The digest of the token the provider holds now, or the words for why a look cannot say: it
+    /// holds none, it could not be read, or the gateway would not take it.
+    async fn checked_token(&self) -> std::result::Result<Digest256, &'static str> {
+        match self.token().await {
+            Ok(Some(token)) => RegistrationToken::new(token)
+                .map(|token| token_digest(&token))
+                .map_err(|_| TOKEN_REFUSED),
+            Ok(None) | Err(_) => Err(TOKEN_UNREADABLE),
+        }
+    }
+
     /// The digest of the token the provider holds now, when it holds one.
     async fn current_digest(&self) -> Option<Digest256> {
-        let token = self.token().await.ok().flatten()?;
-        RegistrationToken::new(token)
-            .ok()
-            .map(|token| token_digest(&token))
+        self.checked_token().await.ok()
     }
 
     /// What `job` does for one host, for the run that holds it. The full sequence is permission,
@@ -1236,9 +1308,8 @@ impl PushDesk {
         }
         // The record is written before the token is proposed, so a challenge that arrives before the
         // gateway's answer to the proposal is the challenge of a registration the receiver knows.
-        let registration_token = RegistrationToken::new(token).map_err(|_| {
-            "The notification token this phone was given is not one the gateway takes.".to_owned()
-        })?;
+        let registration_token =
+            RegistrationToken::new(token).map_err(|_| TOKEN_REFUSED.to_owned())?;
         let registration_id = PushRegistrationId::new(kr_ipc::new_uuid());
         let now = (self.wiring.clock)();
         let pending = PendingRegistration {
@@ -1740,7 +1811,7 @@ fn has_a_record_set_aside(file: &Path) -> bool {
 /// in the log. It holds each host's authorisation identifier, so it is kept as it was found.
 /// Returns whether it was moved.
 fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
-    let aside = (0_u32..)
+    let free = (0_u32..ASIDE_NAMES)
         .map(|attempt| {
             let name = match attempt {
                 0 => format!("{ASIDE_PREFIX}{now_ms}.json"),
@@ -1748,8 +1819,16 @@ fn set_aside(file: &Path, why: &Shown, now_ms: u64) -> bool {
             };
             file.with_file_name(name)
         })
-        .find(|each| is_absent(each))
-        .expect("a name is free");
+        .find(|each| is_absent(each));
+    let Some(aside) = free else {
+        // Names that are all taken, or that cannot be inspected, are not tried for ever: the record
+        // stays where it is and nothing is written over it.
+        tracing::error!(
+            why = %why,
+            "the notifications record could not be set aside under any name it was tried under"
+        );
+        return false;
+    };
     match std::fs::rename(file, &aside) {
         Ok(()) => {
             tracing::error!(
@@ -2215,6 +2294,30 @@ mod tests {
             b"the record"
         );
         assert!(!file.exists(), "the record is out of the way");
+    }
+
+    /// A record is not set aside for ever under names that are all taken or cannot be inspected: it
+    /// is tried under a bounded number of names and left where it is, whole.
+    #[test]
+    fn a_record_is_left_in_place_when_no_name_is_free_to_set_it_aside_under() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let file = directory.path().join(RECORD);
+        std::fs::write(&file, b"the record").expect("a record");
+        for attempt in 0..ASIDE_NAMES {
+            let name = match attempt {
+                0 => format!("{ASIDE_PREFIX}7.json"),
+                _ => format!("{ASIDE_PREFIX}7-{attempt}.json"),
+            };
+            std::fs::write(directory.path().join(name), b"earlier").expect("an earlier record");
+        }
+
+        assert!(!set_aside(&file, &Shown::said("a test"), 7));
+
+        assert_eq!(
+            std::fs::read(&file).expect("the record"),
+            b"the record",
+            "the record is where it was"
+        );
     }
 
     /// A host that keeps its connection and never answers a change does not keep the line for ever:
