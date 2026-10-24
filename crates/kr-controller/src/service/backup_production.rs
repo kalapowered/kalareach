@@ -257,8 +257,9 @@ struct Candidate {
     summary: SessionSummary,
     closed_at_ms: u64,
     retained_bytes: u64,
-    /// A digest of the session's identity, when it closed and how much output it retains: what a
-    /// generation keeps of it, and all it keeps.
+    /// A digest of the session's identity, when it closed, how much output it retains and whether
+    /// its journal was held back when its summary was built: what a generation keeps of it, and all
+    /// it keeps.
     digest: Digest256,
 }
 
@@ -746,11 +747,14 @@ impl Controller {
                 continue;
             }
             let closed_at_ms = closure.closed_at_ms.get();
+            let described = self
+                .described_closed_session(&closure, display_number)
+                .await;
             candidates.push(Candidate {
-                summary: self.closed_session(&closure, display_number).await,
+                summary: described.summary,
                 closed_at_ms,
                 retained_bytes: retained,
-                digest: session_digest(session_id, closed_at_ms, retained),
+                digest: session_digest(session_id, closed_at_ms, retained, described.held_back),
             });
         }
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.closed_at_ms));
@@ -1293,14 +1297,27 @@ fn spool_bytes(directory: &std::path::Path) -> u64 {
 }
 
 /// A digest of one session as a generation keeps it: its identifier, when it closed and how much
-/// output it retains. The identifier goes into the digest and nowhere else; a member's name is
-/// inside the encrypted manifest and the store never writes it down.
-fn session_digest(session_id: SessionId, closed_at_ms: u64, retained_bytes: u64) -> Digest256 {
+/// output it retains, and whether its summary was built from the closure alone because its journal
+/// was held back. The identifier goes into the digest and nowhere else; a member's name is inside
+/// the encrypted manifest and the store never writes it down.
+///
+/// A session whose journal was held back digests differently from the same session once the journal
+/// can be read, so a generation made with the poorer summary is made again with the better one. A
+/// session whose journal was not held back digests as it always has.
+fn session_digest(
+    session_id: SessionId,
+    closed_at_ms: u64,
+    retained_bytes: u64,
+    journal_held_back: bool,
+) -> Digest256 {
     let mut hashed = Vec::with_capacity(64);
     hashed.extend_from_slice(b"kalareach-backup-session/1");
     hashed.extend_from_slice(session_id.get().as_bytes());
     hashed.extend_from_slice(&closed_at_ms.to_be_bytes());
     hashed.extend_from_slice(&retained_bytes.to_be_bytes());
+    if journal_held_back {
+        hashed.extend_from_slice(b"journal-held-back");
+    }
     Digest256::from_bytes(kr_cbor::sha256(&hashed))
 }
 

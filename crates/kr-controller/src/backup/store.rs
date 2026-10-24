@@ -643,8 +643,9 @@ pub struct NewGeneration {
 ///
 /// The unreadable sessions count in the first digest like every other, so a host whose sessions
 /// have not changed makes no new generation however many it could not read. The second list is how
-/// they are found again to be tried: a digest of each session's identity, when it closed and how
-/// much output it retains, which names nothing a person chose.
+/// they are found again to be tried: a digest of each session's identity, when it closed, how much
+/// output it retains and whether its journal was held back from being brought forward when its
+/// summary was built, which names nothing a person chose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MadeFrom {
     /// The digest of everything that could have been packed.
