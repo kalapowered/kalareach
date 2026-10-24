@@ -496,7 +496,10 @@ The page asks four commands of the backend: `push_view`, `push_enable`, `push_re
 steps for the host the person chose and holds the result in `push/push.json` under the data
 directory: per host, whether the person asked, the authorisation identifier this phone issued for it
 (so that asking again issues under the same one), the digest of the token the registration that last
-turned the host on proposed, and the last outcome in words. The file holds no token, no key and no credential. `docs/delivery/README.md` ("What the phone does first") says what
+turned the host on proposed, and the last outcome in words. The file holds no token, no key and no credential. A file that cannot be read, damaged or
+written by a build this one does not know, is moved aside as `push/push.unreadable-<time>.json` and
+never written over, and the failure is logged. Until the person turns a host on again, every host
+with nothing kept shows as needing the person, not as off. `docs/delivery/README.md` ("What the phone does first") says what
 the steps are. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
 comes back to the screen they left. A tap on a notification opens the application, and

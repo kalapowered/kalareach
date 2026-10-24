@@ -1469,3 +1469,91 @@ async fn a_host_forgotten_while_it_waits_for_its_turn_proposes_nothing() {
         "the run that was not wanted proposed nothing"
     );
 }
+
+/// The files the phone set aside because it could not read them.
+fn set_aside(data: &Path) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<_> = std::fs::read_dir(data.join("push"))
+        .expect("the directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("push.unreadable-"))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// A record that cannot be read, damaged or written by a build this one does not know, holds each
+/// host's authorisation identifier. It is kept aside whole and not written over; the page does not
+/// show its hosts as off but as needing the person, who starts over with Try again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_cannot_be_read_is_set_aside_reported_and_not_written_over() {
+    let unreadable: [(&str, &[u8]); 2] = [
+        ("damaged", b"{\"version\": 1, \"hosts\": {"),
+        ("another version", br#"{"version":2,"hosts":{}}"#),
+    ];
+    for (kind, bytes) in unreadable {
+        let owner = DeviceKeys::generate().expect("keys");
+        let host = Host::start(&owner).await;
+        let receiver = Receiver::new(FIRST_TOKEN);
+        let phone = desk(&[&host], &owner, Arc::clone(&receiver)).await;
+        let reference = phone.references().remove(0);
+        phone.desk.enable(&reference).expect("the person asks");
+        phone.until(|states| states == [PushState::On]).await;
+        let data = phone._phone.data.path();
+        let record = data.join("push").join("push.json");
+        kr_ipc::paths::write_owner_only_file(&record, bytes).expect("the record is spoiled");
+
+        let restarted = open_over(
+            data,
+            &phone.device,
+            &receiver,
+            &phone.registered,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let states = |opened: &Opened| {
+            opened
+                .desk
+                .view()
+                .hosts
+                .iter()
+                .map(|each| each.state)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            states(&restarted),
+            [PushState::NeedsAttention],
+            "{kind}: a host whose notifications are not known is not shown as off"
+        );
+        let aside = set_aside(data);
+        assert_eq!(aside.len(), 1, "{kind}: the record was set aside");
+        assert_eq!(
+            std::fs::read(&aside[0]).expect("the file set aside"),
+            bytes,
+            "{kind}: whole"
+        );
+
+        // A look writes nothing and registers nothing, however long the person has left it.
+        restarted.let_time_pass();
+        look(&restarted.desk).await;
+        assert_eq!(states(&restarted), [PushState::NeedsAttention]);
+        assert!(!record.exists(), "{kind}: no record was written");
+        assert!(proposed(&restarted.gateway).is_empty());
+
+        // The person starts over, and what is set aside stays as it was.
+        restarted
+            .desk
+            .enable(&reference)
+            .expect("the person asks again");
+        states_until(&restarted.desk, |states| states == [PushState::On]).await;
+        assert!(record.exists(), "{kind}: the new record is written");
+        assert_eq!(
+            std::fs::read(&aside[0]).expect("the file set aside"),
+            bytes,
+            "{kind}: still whole"
+        );
+    }
+}
