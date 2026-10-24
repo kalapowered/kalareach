@@ -42,7 +42,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, to_base64url};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
-use support::{Capture, Companion, StubIntake, WATCHDOG, device, owner_device, reached};
+use support::{Capture, Companion, StubIntake, WATCHDOG, device, on_relay, owner_device, reached};
 
 fn awaiting(state: &AttemptState) -> bool {
     matches!(state, AttemptState::AwaitingApproval { .. })
@@ -584,21 +584,6 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
     .expect("the planted event is heard");
     assert_eq!(found.len(), 1, "the scan finds the one planted secret");
     assert!(found[0].contains(&planted));
-}
-
-/// A host's endpoint on the loopback network whose configuration names `relay` and resolves
-/// through `resolver`. Nothing answers at either, so a device reaches the host at its direct
-/// address; what the two services decide is which of this device's endpoints may be open at once.
-fn on_relay(relay: &str, resolver: &str) -> kr_transport::config::EndpointConfig {
-    kr_transport::config::EndpointConfig {
-        bind_addr: Some(support::loopback()),
-        relay_urls: vec![relay.parse().expect("a relay URL")],
-        discovery: kr_transport::config::DiscoveryConfig {
-            pkarr_resolver_url: Some(resolver.parse().expect("a resolver URL")),
-            ..kr_transport::config::DiscoveryConfig::default()
-        },
-        ..kr_transport::config::EndpointConfig::default()
-    }
 }
 
 /// KR-REQ-10.27, KR-REQ-10.06: this computer watches a host it owns while it pairs with another
