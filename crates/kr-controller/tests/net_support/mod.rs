@@ -443,7 +443,35 @@ impl Host {
         timer: Arc<dyn kr_controller::quiet::Timer>,
         clocks: Clocks,
     ) -> Self {
+        Self::start_with_feed_keys(
+            owner,
+            &DeviceKeys::generate().expect("host keys"),
+            origin,
+            timer,
+            clocks,
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_feed_on`], with `host_keys` as the host's own keys, put where the daemon
+    /// finds them when it starts, so that a suite can sign for the host at the feed.
+    pub async fn start_with_feed_keys(
+        owner: &DeviceKeys,
+        host_keys: &DeviceKeys,
+        origin: &str,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
+        let secrets = open_store_in(&temp.environment().secrets_dir())
+            .expect("a secret store for the test environment");
+        kr_crypto::store::store_device_keys(
+            secrets.store.as_ref(),
+            &net::device_key_scope(temp.environment_id()),
+            host_keys,
+        )
+        .expect("the host's keys are stored");
+        drop(secrets);
         write_feed_document(&temp, Some(origin));
         let mut host = Self::start_on(
             temp,
