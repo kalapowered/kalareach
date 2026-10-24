@@ -55,7 +55,7 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
-use net_support::{Device, Host, RawDevice, pair_with, proposal};
+use net_support::{Device, Host, Moved, RawDevice, pair_with, proposal};
 
 /// How long a test waits for something the daemon's own tick or the worker has to do.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -2517,83 +2517,6 @@ async fn a_devices_destination_ends_when_its_grant_runs_out_while_the_daemon_run
             .any(|debt| debt.sender_record_id == sender),
         "the authorisation is owed a revocation"
     );
-}
-
-/// The clocks of a daemon the test takes forward by hand, and a way to take both past a day.
-///
-/// Both run with the machine's own, as a running host's do: a daemon that restarts finds the wall
-/// clock where the boot clock says it must be, and a wall clock that stood still while the machine
-/// ran would be one that went backwards. The test adds what it moves them by.
-struct Moved {
-    wall_ahead_ms: Arc<std::sync::atomic::AtomicU64>,
-    continuous_ahead_ns: Arc<std::sync::atomic::AtomicU64>,
-}
-
-/// The machine's continuous clock, taken forward by what a test adds to it.
-#[derive(Debug)]
-struct ContinuousAhead {
-    machine: kr_transport::clock::SystemContinuousClock,
-    ahead_ns: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl kr_transport::clock::ContinuousClock for ContinuousAhead {
-    fn now(&self) -> kr_transport::clock::ContinuousInstant {
-        let now = self.machine.now();
-        let ahead = Duration::from_nanos(self.ahead_ns.load(std::sync::atomic::Ordering::Acquire));
-        now.checked_add(ahead).unwrap_or(now)
-    }
-}
-
-impl Moved {
-    fn new() -> (Self, kr_controller::service::Clocks) {
-        let wall_ahead_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let continuous_ahead_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let clocks = kr_controller::service::Clocks {
-            continuous: Arc::new(ContinuousAhead {
-                machine: kr_transport::clock::SystemContinuousClock::new(),
-                ahead_ns: Arc::clone(&continuous_ahead_ns),
-            }),
-            wall: kr_controller::service::WallClock::from_fn({
-                let wall_ahead_ms = Arc::clone(&wall_ahead_ms);
-                move || now() + wall_ahead_ms.load(std::sync::atomic::Ordering::SeqCst)
-            }),
-        };
-        (
-            Self {
-                wall_ahead_ms,
-                continuous_ahead_ns,
-            },
-            clocks,
-        )
-    }
-
-    /// Takes the wall clock two days on and leaves the continuous clock where it is: the grant
-    /// `proposal` gives a session invitation has run out by UTC, and the deadlines a request was
-    /// admitted under, which are counted on the continuous clock, have not.
-    fn past_the_grant_by_utc(&self) {
-        let days = Duration::from_secs(2 * 24 * 60 * 60);
-        self.wall_ahead_ms.fetch_add(
-            u64::try_from(days.as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::SeqCst,
-        );
-    }
-
-    /// Takes both clocks two days on, past the day the grant `proposal` gives a session invitation
-    /// lasts.
-    ///
-    /// The wall clock goes first. A daemon that reads between the two steps anchors the new wall
-    /// reading at the old continuous instant, and its first reading after the continuous step
-    /// finds the wall clock two days behind that anchor and distrusts it. A grant with no anchor
-    /// in this boot would then be refused; the three cases that use this anchored theirs at the
-    /// connection, and the grant ends on its continuous deadline whatever the host trusts.
-    fn past_the_grant(&self) {
-        let days = Duration::from_secs(2 * 24 * 60 * 60);
-        self.past_the_grant_by_utc();
-        self.continuous_ahead_ns.fetch_add(
-            u64::try_from(days.as_nanos()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Release,
-        );
-    }
 }
 
 /// The daemon's watch over paired devices looks every fifty milliseconds, and the test waits until
