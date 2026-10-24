@@ -1849,6 +1849,63 @@ async fn a_revision_answered_by_the_feeds_removal_refuses_the_grants_that_rest_o
     );
 }
 
+/// KR-REQ-24.15: a refusal that rises waits for every write to the pairing records that was under
+/// way, and while it waits `kr doctor` says so: the refusal stands, this host reads no more of the
+/// feed until the registry has taken a write, and the check is a warning with a remedy. Another
+/// handle on the registry holds its write lock until the case lets it go, and the wait says it goes
+/// on once it has waited out the database's busy timeout. When the write ends the wait ends, and the
+/// check no longer says it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records() {
+    const WAITS: &str = "waits for the registry to take a write";
+
+    let rig = Rig::start().await;
+    let writer = rusqlite::Connection::open(rig.host.registry_database()).expect("the registry");
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the write lock is taken");
+    let raising = tokio::spawn({
+        let controller = Arc::clone(rig.host.controller());
+        async move {
+            controller.raise_the_unverified_withdrawal_refusal().await;
+        }
+    });
+    let check = within("the check says that the refusal waits", async {
+        loop {
+            let check = rig.shown().await.check.expect("the feed check");
+            if check.detail().contains(WAITS) {
+                break check;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert_eq!(check.status, DoctorStatus::Warning, "{}", check.detail());
+    assert!(
+        check.detail().contains("a write to the pairing records"),
+        "it says what the wait is for: {}",
+        check.detail()
+    );
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("takes a write")),
+        "and what to do"
+    );
+    assert!(!raising.is_finished(), "the refusal's rise waits meanwhile");
+
+    writer.execute_batch("ROLLBACK").expect("the write ends");
+    within("the rise returns", raising)
+        .await
+        .expect("the rise ends");
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        !check.detail().contains(WAITS),
+        "a wait that has ended is not said to go on: {}",
+        check.detail()
+    );
+}
+
 /// A change to the list of keys that may remove the feed, turned back with a delay, ends the pass:
 /// the host asks the feed for nothing more until the delay is over, as it does for any request the
 /// feed turns back with one.

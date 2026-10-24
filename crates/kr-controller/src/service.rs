@@ -717,6 +717,9 @@ pub struct Controller {
     /// ([`Controller::feed_refusal`]), and the pairing records read it where an owner confirmation
     /// is spent.
     feed_refusal: Arc<crate::grants::RemoteRefusal>,
+    /// The wait for the pairing records' write lock that a refusal which rose is in, while it has
+    /// gone on past the database's busy timeout ([`Controller::stuck_drain`]).
+    feed_drain: std::sync::Mutex<Option<remote_revocation::StuckDrain>>,
     /// What a withdrawal the feed shows complete and this host cannot verify names, while one
     /// stands: the devices, and the keys they hold, that keep no standing over the feed.
     feed_withheld: std::sync::Mutex<remote_revocation::Withheld>,
