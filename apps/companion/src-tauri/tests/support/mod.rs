@@ -23,6 +23,7 @@ use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::paired::PairedHost;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretStore, store_device_keys};
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::DeviceKeyRevision;
 
 use crate::net_support::pairing::{self as calls, Signer};
@@ -192,6 +193,38 @@ pub fn record_owned(device: &Device, host: &Host, name: &str) {
             device_id: record.device_id,
             grant_id: record.grant.grant_id,
             proposed_grant: kr_pairing::grants::personal_owner_grant(),
+            name: Some(name.to_owned()),
+            paired_at_ms: record.paired_at_ms.get(),
+        })
+        .expect("the host is recorded");
+}
+
+/// Records `host`, which was started with this computer's keys as its owner, as a host this
+/// computer owns whose grant answers to the organisation `requirement` names, as far as this
+/// computer's own record goes.
+pub fn record_owned_under(
+    device: &Device,
+    host: &Host,
+    name: &str,
+    requirement: kr_protocol::grant::OrganisationRequirement,
+) {
+    let record = host.owner.clone().expect("the owner device");
+    let identity = host.network().pairing().identity();
+    device
+        .pairing()
+        .hosts
+        .record(PairedHost {
+            host_device_id: identity.device_id,
+            host_key_revision: DeviceKeyRevision::new(1),
+            host_keys: identity.keys,
+            host_endpoint_id: host.network().endpoint_id(),
+            network_config: host.network().network_config().expect("the configuration"),
+            device_id: record.device_id,
+            grant_id: record.grant.grant_id,
+            proposed_grant: kr_protocol::pairing::ProposedGrant {
+                organisation: kr_protocol::scalars::Nullable::some(requirement),
+                ..kr_pairing::grants::personal_owner_grant()
+            },
             name: Some(name.to_owned()),
             paired_at_ms: record.paired_at_ms.get(),
         })
@@ -1005,6 +1038,9 @@ pub struct LinkControl {
     presentations: tokio::sync::Notify,
     /// Told when the connections held after their presentation are let go.
     released: tokio::sync::Notify,
+    /// Told when a request is held before it is sent, and when it is let go.
+    request_arrived: tokio::sync::Notify,
+    request_released: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -1025,6 +1061,13 @@ struct LinkState {
     presented: usize,
     /// What every presentation fails with, when it does.
     failing_presentation: Option<kr_protocol::error::ProtocolError>,
+    /// Whether a connection goes on whatever the host says of the lease it was given, as to a host
+    /// that needs none.
+    ignoring_presentation: bool,
+    /// The method of the next request or mutation, on any connection, that is held before it is
+    /// sent, and whether one is held now.
+    holding_request: Option<String>,
+    request_held: bool,
     waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The host in use each visit was made beside, in the order the visits were asked for.
     visits: Vec<Option<kr_protocol::pairing::NetworkConfig>>,
@@ -1161,6 +1204,68 @@ impl LinkControl {
         self.state.lock().expect("the record").failing_presentation = error;
     }
 
+    /// Holds the next request or mutation of `method`, on any connection, before it is sent, until
+    /// the test releases it.
+    pub fn hold_next_request(&self, method: kr_protocol::method::Method) {
+        self.state.lock().expect("the record").holding_request = Some(method.as_str().to_owned());
+    }
+
+    /// Waits until a request is held before it is sent.
+    pub async fn until_request_held(&self) {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let arrived = self.request_arrived.notified();
+                tokio::pin!(arrived);
+                arrived.as_mut().enable();
+                if self.state.lock().expect("the record").request_held {
+                    return;
+                }
+                arrived.await;
+            }
+        })
+        .await
+        .expect("a request was held");
+    }
+
+    /// Lets the held request go on to be sent.
+    pub fn release_request(&self) {
+        self.state.lock().expect("the record").request_held = false;
+        self.request_released.notify_waiters();
+    }
+
+    /// Holds `frame` before it is sent when it is the request the test asked to hold.
+    async fn before_sending(&self, frame: &ControlFrame) {
+        let method = match frame {
+            ControlFrame::Request(request) => request.method.as_str(),
+            ControlFrame::Mutation(request) => request.method.as_str(),
+            _ => return,
+        };
+        {
+            let mut state = self.state.lock().expect("the record");
+            if state.holding_request.as_deref() != Some(method) {
+                return;
+            }
+            state.holding_request = None;
+            state.request_held = true;
+        }
+        self.request_arrived.notify_waiters();
+        loop {
+            let released = self.request_released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.state.lock().expect("the record").request_held {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    /// Makes a connection go on whatever the host says of the lease it is given: a host that needs
+    /// none refuses one, and the connection is the device's to use all the same.
+    pub fn ignore_presentation(&self) {
+        self.state.lock().expect("the record").ignoring_presentation = true;
+    }
+
     /// Counts a presentation, and waits while the test holds the connections that made one.
     async fn after_presenting(&self) {
         self.state.lock().expect("the record").presented += 1;
@@ -1239,7 +1344,72 @@ impl ControlledLink {
         if ending {
             transport.close();
         }
-        Ok(transport)
+        Ok(Arc::new(Tapped {
+            inner: transport,
+            control: Arc::clone(&self.control),
+        }))
+    }
+}
+
+/// A transport that holds the request a test asked to hold, and otherwise carries every frame, and
+/// every question, as the transport under it does.
+#[derive(Debug)]
+struct Tapped {
+    inner: Arc<dyn kr_client::transport::ControlTransport>,
+    control: Arc<LinkControl>,
+}
+
+impl std::fmt::Debug for LinkControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LinkControl")
+    }
+}
+
+impl kr_client::transport::ControlTransport for Tapped {
+    fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+        self.inner.connection_id()
+    }
+
+    fn limits(&self) -> kr_protocol::hello::ReceiveLimits {
+        self.inner.limits()
+    }
+
+    fn initial_action_window(&self) -> kr_protocol::hello::ActionWindow {
+        self.inner.initial_action_window()
+    }
+
+    fn reach(&self) -> Option<kr_client::transport::Reach> {
+        self.inner.reach()
+    }
+
+    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+        self.inner.ended_by_this_device()
+    }
+
+    fn send<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+    ) -> kr_client::transport::TransportFuture<'a, ()> {
+        Box::pin(async move {
+            self.control.before_sending(frame).await;
+            self.inner.send(frame).await
+        })
+    }
+
+    fn claim_receiver(&self) -> kr_client::Result<()> {
+        self.inner.claim_receiver()
+    }
+
+    fn recv(&self) -> kr_client::transport::TransportFuture<'_, Option<ControlFrame>> {
+        self.inner.recv()
+    }
+
+    fn revoke_streams(&self) {
+        self.inner.revoke_streams();
+    }
+
+    fn close(&self) {
+        self.inner.close();
     }
 }
 
@@ -1321,9 +1491,19 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
             if let Some(error) = failing {
                 return Err(kr_client::pairing::link::LinkError::Membership(error));
             }
-            self.own
+            let presented = self
+                .own
                 .present_membership(session, host, identity, presentation)
-                .await?;
+                .await;
+            if !self
+                .control
+                .state
+                .lock()
+                .expect("the record")
+                .ignoring_presentation
+            {
+                presented?;
+            }
             if presentation == kr_client::pairing::link::Presentation::First
                 && host.proposed_grant.organisation.as_ref().is_some()
             {

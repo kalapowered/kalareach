@@ -42,6 +42,14 @@
 //! | KR-REQ-17.53 | `a_request_given_up_on_holds_back_the_chain_request_of_a_presentation_already_under_way` |
 //! | KR-REQ-17.53 | `an_owner_that_cannot_get_its_lease_is_shown_why_and_is_not_out_of_contact` |
 //! | KR-REQ-17.53 | `a_push_run_sends_its_changes_only_under_the_account_its_connection_was_opened_under` |
+//! | KR-REQ-17.53 | `a_session_link_to_a_member_host_closes_at_a_sign_out` |
+//! | KR-REQ-17.53 | `an_ambient_link_to_a_member_host_is_not_used_after_a_sign_out` |
+//! | KR-REQ-17.53 | `a_terminal_view_of_a_member_host_ends_at_a_sign_out_and_takes_no_more_input` |
+//! | KR-REQ-17.53 | `a_link_does_not_open_again_for_a_switch_to_an_account_the_host_refuses` |
+//! | KR-REQ-17.53 | `an_owner_watcher_lets_its_session_go_when_the_account_signs_out` |
+//! | KR-REQ-17.53 | `a_confirmation_in_the_ceremony_when_the_account_signs_out_is_not_completed` |
+//! | KR-REQ-17.53 | `an_inbox_pass_whose_account_leaves_while_the_host_is_asked_publishes_nothing` |
+//! | KR-REQ-17.53 | `a_kept_visit_whose_account_leaves_before_its_session_list_publishes_nothing` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -66,7 +74,9 @@ use companion_tauri::lease::LeaseDesk;
 use companion_tauri::owner::Owner;
 use kr_client::Session;
 use kr_client::organisation::LeaseTimer;
+use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::LinkError;
+use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome, ReviewOutcome};
 use kr_client::services::account::{
     AccountService, AccountToken, Client, IssuedGrant, PendingAuthorisation, RefreshToken,
     SignedInAccount,
@@ -77,11 +87,17 @@ use kr_client::services::{
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
 use kr_protocol::account::{MembershipLease, PolicyAuthority};
+use kr_protocol::confirmation::ConfirmationSubject;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::OrganisationRequirement;
+use kr_protocol::ids::SessionId;
+use kr_protocol::invitation::{InviteGrantKind, InviteModeKind};
+use kr_protocol::method::Method;
 use kr_protocol::pairing::ProposedGrant;
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, Nullable};
 use kr_service_stand_in::{Moment, OrganisationAuthority, Served, serve};
+use net_support::worker::{Adopted, Worker};
 use net_support::{Host, proposal};
 use organisation_fixture::{Fixture, SERVED};
 use organisation_support::{MINUTE_MS, Organisation, member};
@@ -153,6 +169,8 @@ struct Signing {
     foreign_chain: AtomicBool,
     /// How far behind the host's wall clock the service's runs, in milliseconds.
     behind_ms: AtomicU64,
+    /// The rights every lease the organisation signs carries.
+    rights: Vec<ActionRight>,
 }
 
 impl std::fmt::Debug for Signing {
@@ -232,7 +250,7 @@ impl OrganisationAuthority for Signing {
             &member(account),
             *device_key,
             self.now(),
-            SERVED,
+            &self.rights,
         );
         self.issued
             .lock()
@@ -401,8 +419,12 @@ struct Rig {
     tokens: Arc<SignedInAccount>,
     /// Counts each time the application tells the page where its connection stands.
     changes: watch::Receiver<u64>,
+    /// Counts each change of an opened session's standing the page was told.
+    standings: watch::Receiver<u64>,
     /// What the test does to the application's connections to the host.
     control: Arc<LinkControl>,
+    /// The sessions the host serves, which stop with the rig.
+    workers: Vec<Worker>,
 }
 
 /// The path the device asks the organisation's service for a lease on.
@@ -417,6 +439,12 @@ impl Rig {
     /// A host enrolled in an organisation, the organisation's service, and a device signed in as a
     /// member that has paired with the host under a grant that answers to the organisation.
     async fn start() -> Self {
+        Self::start_with(SERVED, 0).await
+    }
+
+    /// As [`Self::start`], for a member whose grant and leases carry `rights`, and with a host that
+    /// serves `sessions` sessions.
+    async fn start_with(rights: &[ActionRight], sessions: u64) -> Self {
         let port = {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a port");
             socket.local_addr().expect("an address").port()
@@ -424,7 +452,32 @@ impl Rig {
         let mut settings = kr_controller::service::net::config::NetworkSettings::default();
         settings.endpoint.bind_addr =
             Some(format!("127.0.0.1:{port}").parse().expect("an address"));
-        let fixture = Fixture::start_on(settings).await;
+        let mut fixture = Fixture::start_on(settings).await;
+        let mut workers = Vec::new();
+        if sessions > 0 {
+            // The daemon is stopped, the sessions' workers are started on its tree, and it is
+            // started again on the same address and adopts them, as `Adopted` does.
+            let stopped = fixture.host.shut_down().await;
+            for display in 1..=sessions {
+                workers.push(Worker::start_reserved(stopped.tree(), display).await);
+            }
+            let settings = stopped.settings().clone();
+            let adopted = Adopted {
+                host: stopped.start(settings).await,
+                owner: fixture.owner.clone(),
+                workers,
+            };
+            for worker in &adopted.workers {
+                adopted.until_adopted(worker).await;
+            }
+            let Adopted {
+                host,
+                workers: kept,
+                ..
+            } = adopted;
+            fixture.host = host;
+            workers = kept;
+        }
         let served = serve().await;
         account_system_knows(&served, ACCOUNT);
         let signing = Arc::new(Signing {
@@ -435,6 +488,7 @@ impl Rig {
             other: Organisation::new(0x66, kr_ipc::now_ms().get()),
             foreign_chain: AtomicBool::new(false),
             behind_ms: AtomicU64::new(0),
+            rights: rights.to_vec(),
         });
         served.web().serve_organisation(
             &fixture.organisation.organisation_id.to_string(),
@@ -442,7 +496,7 @@ impl Rig {
         );
         let waits = HeldWaits::new();
         let control = LinkControl::new();
-        let (phone, tokens) = signed_in_phone(&fixture, &served, &waits, &control).await;
+        let (phone, tokens) = signed_in_phone(&fixture, &served, &waits, &control, None).await;
         let changes = {
             let (heard, changes) = watch::channel(0_u64);
             phone.companion.app.listen_any(CONNECTION_EVENT, move |_| {
@@ -450,12 +504,22 @@ impl Rig {
             });
             changes
         };
+        let standings = {
+            let (heard, standings) = watch::channel(0_u64);
+            phone
+                .companion
+                .app
+                .listen_any(companion_tauri::standing::STANDING_EVENT, move |_| {
+                    heard.send_modify(|count| *count += 1);
+                });
+            standings
+        };
         let grant = ProposedGrant {
             organisation: Nullable::some(OrganisationRequirement {
                 organisation_id: fixture.organisation.organisation_id,
                 policy_revision: fixture.revision,
             }),
-            ..proposal(SERVED)
+            ..proposal(rights)
         };
         pair_under(&phone, &fixture.host, &fixture.owner, grant).await;
         Self {
@@ -466,8 +530,18 @@ impl Rig {
             phone,
             tokens,
             changes,
+            standings,
             control,
+            workers,
         }
+    }
+
+    /// The session the host serves.
+    fn session(&self) -> SessionId {
+        self.workers
+            .first()
+            .expect("the rig serves a session")
+            .session_id
     }
 
     fn companion(&self) -> &Companion {
@@ -695,6 +769,48 @@ impl Rig {
             .expect("the person signs in");
     }
 
+    /// The person signs in as `account`, a member the account system knows, over the sign-in that
+    /// is held: one change from the first account to the second, with no sign-out between.
+    async fn switches_to(&self, account: &str) {
+        account_system_knows(&self.served, account);
+        self.signing.admits(account);
+        self.tokens
+            .keep(grant_of(account), "a-nonce")
+            .await
+            .expect("the person switches accounts");
+    }
+
+    /// Waits until a standing event for `opening` that `wanted` accepts has reached the page, and
+    /// returns what it says.
+    async fn standing_where(
+        &self,
+        opening: &str,
+        wanted: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let mut changes = self.standings.clone();
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                for text in self.companion().standing.texts() {
+                    let event: serde_json::Value = serde_json::from_str(&text).expect("an event");
+                    if event["opening"] == opening && wanted(&event["standing"]) {
+                        return event["standing"].clone();
+                    }
+                }
+                changes
+                    .changed()
+                    .await
+                    .expect("the application goes on telling the page");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the page was not told what was waited for of {opening}: {:?}",
+                self.companion().standing.texts()
+            )
+        })
+    }
+
     /// The host stops and starts again on its tree, where it was.
     async fn restarted(self) -> Self {
         Self {
@@ -710,6 +826,7 @@ async fn signed_in_phone(
     served: &Served,
     waits: &Arc<HeldWaits>,
     control: &Arc<LinkControl>,
+    keys: Option<&DeviceKeys>,
 ) -> (Phone, Arc<SignedInAccount>) {
     let origin = kr_protocol::service::GatewayOrigin::new(served.origin()).expect("an origin");
     let http = HttpService::with(
@@ -751,6 +868,10 @@ async fn signed_in_phone(
     };
     let data = tempfile::tempdir().expect("a directory");
     let secrets: Arc<dyn kr_crypto::store::SecretStore> = Arc::new(MemoryStore::new());
+    if let Some(keys) = keys {
+        kr_crypto::store::store_device_keys(&*secrets, "device", keys)
+            .expect("the owner's keys are kept");
+    }
     let room: Arc<dyn kr_client::pairing::candidate::CandidateRoom> =
         Arc::new(fixture.host.room.clone());
     let paste = StubIntake::holding("", false);
@@ -1553,7 +1674,7 @@ async fn a_connection_ends_when_another_account_signs_in_after_it_presented_and_
     rig.control.hold_after_presenting();
     let rig = rig.restarted().await;
     rig.control.until_presented(presented + 1).await;
-    rig.signs_in_as("bea").await;
+    rig.switches_to("bea").await;
     rig.control.hold_own();
     rig.control.release_presented();
 
@@ -1575,7 +1696,7 @@ async fn a_visit_that_presented_for_one_account_reads_nothing_when_another_has_s
     rig.control.hold_after_presenting();
     let (row, ()) = tokio::join!(rig.inbox_of(&desk), async {
         rig.control.until_presented(presented + 1).await;
-        rig.signs_in_as("bea").await;
+        rig.switches_to("bea").await;
         rig.control.release_presented();
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
@@ -1768,13 +1889,415 @@ async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_
         .await
         .expect("a line to the host");
 
-    rig.signs_in_as("bea").await;
+    rig.switches_to("bea").await;
     let key = *device.identity().keys.notification_preview.public();
     let refused = line
         .update_preview_key(key)
         .await
         .expect_err("the key is not sent for an account that has left");
     assert!(refused.contains("changed"), "{refused}");
+}
+
+/// The rights of a member who may type into a session's terminal.
+const TYPING_RIGHTS: &[ActionRight] = &[
+    ActionRight::SessionView,
+    ActionRight::SessionClose,
+    ActionRight::TerminalInput,
+];
+
+/// Opens `session` on the screen holding `opening`, as the page does, under the pairing.
+fn open(
+    companion: &Companion,
+    session: SessionId,
+    opening: &str,
+) -> Result<serde_json::Value, serde_json::Value> {
+    companion.call(
+        "session_open",
+        json!({
+            "sessionId": session.to_string(),
+            "grantId": null,
+            "opening": opening,
+        }),
+    )
+}
+
+/// Whether a standing, or a refusal, says in its words that the account must sign in.
+fn asks_to_sign_in(said: &serde_json::Value) -> bool {
+    said["reason"]
+        .as_str()
+        .or_else(|| said["message"].as_str())
+        .is_some_and(|words| words.contains("sign in"))
+}
+
+/// KR-REQ-17.53: a session link to a member's host belongs to the account it was opened under. The
+/// link presents no lease of its own and rides on the lease the application's connection keeps, so
+/// when the account signs out it ends with the account: the page is told, in the sign-in words, and
+/// a screen opened afterwards is not served on the lease of the account that left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_link_to_a_member_host_closes_at_a_sign_out() {
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let session = rig.session();
+    let standing = open(rig.companion(), session, "screen").expect("the session opens");
+    assert_eq!(standing["state"], "open", "{standing}");
+
+    let _ = rig.tokens.sign_out().await;
+    let lost = rig
+        .standing_where("screen", |standing| standing["state"] == "reconnecting")
+        .await;
+    assert!(asks_to_sign_in(&lost), "{lost}");
+
+    let again = open(rig.companion(), session, "second-screen").expect("the opening stands");
+    assert_eq!(again["state"], "reconnecting", "{again}");
+    assert!(asks_to_sign_in(&again), "{again}");
+}
+
+/// KR-REQ-17.53: a link that serves commands made outside a session screen is kept idle for a
+/// while. A sign-out ends it as it ends every other, and the next command is told to sign in; the
+/// idle link does not answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ambient_link_to_a_member_host_is_not_used_after_a_sign_out() {
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let session = rig.session();
+    let read = || {
+        rig.companion().call(
+            "question_read",
+            json!({ "params": {
+                "session_id": session.to_string(),
+                "question_id": null,
+                "include_resolved": false,
+            } }),
+        )
+    };
+    read().expect("a link is opened beside the application's and answers");
+
+    let _ = rig.tokens.sign_out().await;
+    let refused = read().expect_err("the link of the account that left answers nothing");
+    assert!(asks_to_sign_in(&refused), "{refused}");
+}
+
+/// KR-REQ-17.53: a raw terminal view of a member's host is a connection of its own, bound to the
+/// account like the rest. A sign-out ends the view, in the sign-in words, and the input the page
+/// sends it afterwards is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_view_of_a_member_host_ends_at_a_sign_out_and_takes_no_more_input() {
+    let rig = Rig::start_with(TYPING_RIGHTS, 1).await;
+    rig.connection(true).await;
+    let session = rig.session();
+    let companion = rig.companion();
+    open(companion, session, "terminal-screen").expect("the session opens");
+    let view = companion
+        .call(
+            "terminal_view_open",
+            json!({
+                "sessionId": session.to_string(),
+                "columns": 40,
+                "rows": 8,
+                "opening": "terminal-screen",
+                "onState": "__CHANNEL__:11",
+            }),
+        )
+        .expect("the view opens")
+        .as_str()
+        .expect("the view's handle")
+        .to_owned();
+    companion
+        .state_where(11, |state| state["state"] == "showing")
+        .await;
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "take", "number": 1 } }),
+        )
+        .expect("the take is taken");
+    companion
+        .state_where(11, |state| state["control"]["state"] == "controlling")
+        .await;
+
+    let _ = rig.tokens.sign_out().await;
+    let ended = companion
+        .state_where(11, |state| state["state"] == "ended")
+        .await;
+    assert!(asks_to_sign_in(&ended), "{ended}");
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "text", "take": 1, "text": "typed-after" } }),
+        )
+        .expect_err("the view that ended takes no input");
+}
+
+/// KR-REQ-17.53: after a switch to a member whose lease the host refuses (the host binds the device
+/// to the first account), the link of the first account is lost and a screen opened for the second
+/// is not served on the lease the host still holds for the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_does_not_open_again_for_a_switch_to_an_account_the_host_refuses() {
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let session = rig.session();
+    let standing = open(rig.companion(), session, "screen").expect("the session opens");
+    assert_eq!(standing["state"], "open", "{standing}");
+
+    rig.switches_to("bea").await;
+    rig.standing_where("screen", |standing| standing["state"] == "reconnecting")
+        .await;
+    // The device is Ada's to the host, which refuses Bea's lease by name.
+    rig.down_because("account_mismatch").await;
+    let again = open(rig.companion(), session, "second-screen").expect("the opening stands");
+    assert_eq!(again["state"], "reconnecting", "{again}");
+}
+
+/// What a host asks its owner to confirm: an invitation for a viewer, offered on its network.
+fn an_invitation() -> ConfirmationSubject {
+    ConfirmationSubject::IssueInvitation {
+        mode: InviteModeKind::Direct,
+        rendezvous_origin: Nullable::null(),
+        grant_kind: InviteGrantKind::SessionInvitation,
+        proposed_grant: proposal(&[ActionRight::SessionView]),
+    }
+}
+
+/// A ceremony whose person has not answered yet: it says so when it is asked, and then waits until
+/// the test lets one answer through, which confirms.
+struct GatedCeremony {
+    started: tokio::sync::Notify,
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedCeremony {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: tokio::sync::Notify::new(),
+            gate: tokio::sync::Semaphore::new(0),
+        })
+    }
+}
+
+impl Ceremony for GatedCeremony {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::FaceId
+    }
+
+    fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        self.started.notify_one();
+        Box::pin(async move {
+            if let Ok(permit) = self.gate.acquire().await {
+                permit.forget();
+            }
+            CeremonyOutcome::Confirmed
+        })
+    }
+}
+
+/// The host's owner as a second device of the test's: it holds the owner's keys, and its record of
+/// the host says the host's grant for it answers to the organisation, as a member's does. The host
+/// asks nothing of it (its grant on the host names no organisation) and refuses the lease it is
+/// given, which the device goes on without, so what the cases below show is the device's: that
+/// what it opened for the host belongs to the account signed in when it was opened.
+struct OwnerDevice {
+    phone: Phone,
+    tokens: Arc<SignedInAccount>,
+    pairings: watch::Receiver<u64>,
+}
+
+impl OwnerDevice {
+    async fn of(rig: &Rig) -> Self {
+        let control = LinkControl::new();
+        control.ignore_presentation();
+        let (phone, tokens) = signed_in_phone(
+            &rig.fixture,
+            &rig.served,
+            &rig.waits,
+            &control,
+            Some(&rig.fixture.owner),
+        )
+        .await;
+        let pairings = {
+            let (heard, pairings) = watch::channel(0_u64);
+            phone
+                .companion
+                .app
+                .listen_any(companion_tauri::pairing::PAIRING_EVENT, move |_| {
+                    heard.send_modify(|count| *count += 1);
+                });
+            pairings
+        };
+        support::record_owned_under(
+            &phone.companion.device(),
+            &rig.fixture.host,
+            "the test host",
+            OrganisationRequirement {
+                organisation_id: rig.fixture.organisation.organisation_id,
+                policy_revision: rig.fixture.revision,
+            },
+        );
+        Self {
+            phone,
+            tokens,
+            pairings,
+        }
+    }
+
+    /// Waits until the pairing screen's row for the host is one `wanted` accepts.
+    async fn row_where(&self, wanted: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+        let mut changes = self.pairings.clone();
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let screen = serde_json::to_value(self.phone.companion.device().view())
+                    .expect("the screen as the page gets it");
+                if let Some(row) = screen["hosts"].as_array().and_then(|rows| rows.first())
+                    && wanted(row)
+                {
+                    return row.clone();
+                }
+                changes
+                    .changed()
+                    .await
+                    .expect("the application goes on telling the page");
+            }
+        })
+        .await
+        .expect("the pairing screen shows the host so")
+    }
+}
+
+/// KR-REQ-17.53: the watcher of a host the device manages keeps a session to it between looks. The
+/// session belongs to the account it was opened under: when the account signs out the watcher lets
+/// it go, and the host is shown with the sign-in words instead of as in contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_watcher_lets_its_session_go_when_the_account_signs_out() {
+    let rig = Rig::start().await;
+    let owner = OwnerDevice::of(&rig).await;
+    let mut client = rig.fixture.host.client().await;
+    net_support::pairing::request(
+        rig.fixture.host.environment_id,
+        &mut client,
+        an_invitation(),
+    )
+    .await
+    .expect("the host asks its owner");
+    let watcher = Owner::new(owner.phone.companion.device(), Arc::new(NoOwner), || {});
+    watcher.start();
+    support::listed(&watcher, |request| request.checkable).await;
+
+    let _ = owner.tokens.sign_out().await;
+    let row = owner.row_where(asks_to_sign_in_row).await;
+    assert!(row["refusal"].is_string(), "{row}");
+}
+
+/// Whether the pairing screen's row says in its words that the account must sign in.
+fn asks_to_sign_in_row(row: &serde_json::Value) -> bool {
+    row["refusal"]
+        .as_str()
+        .is_some_and(|words| words.contains("sign in"))
+}
+
+/// KR-REQ-17.53: a confirmation the person is being asked about is completed over the session the
+/// watcher holds, so when the account signs out while the person is asked, the answer is not sent:
+/// the host records no acceptance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_in_the_ceremony_when_the_account_signs_out_is_not_completed() {
+    let rig = Rig::start().await;
+    let owner = OwnerDevice::of(&rig).await;
+    let ceremony = GatedCeremony::new();
+    let watcher = Owner::new(owner.phone.companion.device(), ceremony.clone(), || {});
+    watcher.start();
+    let mut client = rig.fixture.host.client().await;
+    let asked = net_support::pairing::request(
+        rig.fixture.host.environment_id,
+        &mut client,
+        an_invitation(),
+    )
+    .await
+    .expect("the host asks its owner");
+    let request = support::listed(&watcher, |request| request.checkable).await;
+
+    let review = tokio::spawn({
+        let watcher = Arc::clone(&watcher);
+        async move { watcher.review(&request.reference).await }
+    });
+    tokio::time::timeout(WATCHDOG, ceremony.started.notified())
+        .await
+        .expect("the person is asked");
+    let _ = owner.tokens.sign_out().await;
+    ceremony.gate.add_permits(1);
+    let outcome = tokio::time::timeout(WATCHDOG, review)
+        .await
+        .expect("the review ends")
+        .expect("the review ran");
+    assert!(
+        !matches!(outcome, Ok(ReviewOutcome::Confirmed)),
+        "{outcome:?}"
+    );
+    assert!(
+        rig.fixture
+            .host
+            .network()
+            .pairing()
+            .rows()
+            .acceptance(asked.request.confirmation_id)
+            .expect("readable")
+            .is_none(),
+        "the host recorded no answer from the account that left"
+    );
+}
+
+/// A pass over the member host that is the inbox's, whose reply to the next `method` is held; the
+/// account signs out while it is held; the pass publishes nothing of what it read.
+async fn a_pass_whose_account_leaves_while_the_host_is_asked(method: Method) {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+
+    rig.control.hold_next_request(method);
+    let (row, ()) = tokio::join!(rig.inbox_of(&desk), async {
+        rig.control.until_request_held().await;
+        let _ = rig.tokens.sign_out().await;
+        rig.control.release_request();
+    });
+    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
+    assert!(row.result.is_none(), "nothing was published: {row:?}");
+    let said = row.refusal.expect("the reason").message;
+    assert!(said.contains("sign in"), "{said}");
+}
+
+/// KR-REQ-17.53: an inbox pass whose account signs out while the host is asked who it is publishes
+/// nothing of what it read, and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbox_pass_whose_account_leaves_while_the_host_is_asked_publishes_nothing() {
+    a_pass_whose_account_leaves_while_the_host_is_asked(Method::HostInfo).await;
+}
+
+/// KR-REQ-17.53: the same, while the host is asked to open the connection for itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbox_pass_whose_account_leaves_while_the_connection_is_opened_publishes_nothing() {
+    a_pass_whose_account_leaves_while_the_host_is_asked(Method::SessionOpen).await;
+}
+
+/// KR-REQ-17.53: a visit the inbox keeps reads the inbox's pages and then the session list. When
+/// the account signs out between the two, the pass publishes neither: not the pages it read, and
+/// not the inbox without the session numbers a failed list would leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_whose_account_leaves_before_its_session_list_publishes_nothing() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{first:?}");
+
+    rig.control.hold_next_request(Method::SessionList);
+    let (row, ()) = tokio::join!(rig.inbox_of(&desk), async {
+        rig.control.until_request_held().await;
+        let _ = rig.tokens.sign_out().await;
+        rig.control.release_request();
+    });
+    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
+    assert!(row.result.is_none(), "nothing was published: {row:?}");
+    let said = row.refusal.expect("the reason").message;
+    assert!(said.contains("sign in"), "{said}");
 }
 
 /// The host answers what it is, to a connection that holds a lease.
