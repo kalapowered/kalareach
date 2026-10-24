@@ -17,7 +17,7 @@ use kr_protocol::metrics::{
     Environment, HostMetrics, MetricOutcome, MetricsReport, ReconnectAttempt,
 };
 use kr_protocol::rights::ActionRight;
-use net_support::{Device, Host, MovedClocks, connect, pair_with, paired_dial, proposal};
+use net_support::{Device, Host, Moved, connect, pair_with, paired_dial, proposal};
 
 /// A grant that sees a session and nothing more: all a device needs to hold a connection.
 const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
@@ -230,8 +230,8 @@ async fn kr_req_26_43_a_connection_whose_grant_the_clock_cannot_vouch_for_is_a_r
 async fn kr_req_09_17_a_device_that_comes_back_after_its_anchored_grant_ran_out_is_counted_refused()
 {
     let owner = DeviceKeys::generate().expect("owner keys");
-    let moved = MovedClocks::new();
-    let host = Host::start_on_clocks(&owner, moved.clocks()).await;
+    let (moved, clocks) = Moved::new();
+    let host = Host::start_on_clocks(&owner, clocks).await;
     // The first connection anchors the grant, and ends.
     let (device, record) = a_device_that_has_come_and_gone(&host, &owner).await;
 

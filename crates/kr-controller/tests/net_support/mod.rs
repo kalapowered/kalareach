@@ -221,12 +221,16 @@ impl MovedWall {
     }
 }
 
-/// A wall clock and a continuous clock a suite moves by hand together, each the machine's own and
-/// the time added to it, as a machine that slept past the end of a grant reads them.
-#[derive(Clone, Debug, Default)]
-pub struct MovedClocks {
-    wall_ms: Arc<std::sync::atomic::AtomicU64>,
-    continuous_ns: Arc<std::sync::atomic::AtomicU64>,
+/// The clocks of a daemon a suite takes forward by hand, and a way to take both past a day.
+///
+/// Both run with the machine's own, as a running host's do: a daemon that restarts finds the wall
+/// clock where the boot clock says it must be, and a wall clock that stood still while the machine
+/// ran would be one that went backwards. The suite adds what it moves them by, as a machine that
+/// slept past the end of a grant reads them.
+#[derive(Clone, Debug)]
+pub struct Moved {
+    wall_ahead_ms: Arc<std::sync::atomic::AtomicU64>,
+    continuous_ahead_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The machine's continuous clock, taken forward by what a suite adds to it.
@@ -244,38 +248,69 @@ impl kr_transport::clock::ContinuousClock for ContinuousAhead {
     }
 }
 
-impl MovedClocks {
-    /// Clocks that read the machine's own until they are moved.
+impl Moved {
+    /// Clocks that read the machine's own until they are moved, and the handle that moves them.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new() -> (Self, Clocks) {
+        let wall_ahead_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let continuous_ahead_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks = Clocks {
+            continuous: Arc::new(ContinuousAhead {
+                machine: kr_transport::clock::SystemContinuousClock::new(),
+                ahead_ns: Arc::clone(&continuous_ahead_ns),
+            }),
+            wall: WallClock::from_fn({
+                let wall_ahead_ms = Arc::clone(&wall_ahead_ms);
+                move || {
+                    kr_ipc::now_ms().get() + wall_ahead_ms.load(std::sync::atomic::Ordering::SeqCst)
+                }
+            }),
+        };
+        (
+            Self {
+                wall_ahead_ms,
+                continuous_ahead_ns,
+            },
+            clocks,
+        )
     }
 
-    /// Moves both clocks `by` forward.
-    pub fn advance(&self, by: Duration) {
-        self.wall_ms.fetch_add(
+    /// Takes the wall clock `by` forward and leaves the continuous clock where it is.
+    pub fn advance_wall(&self, by: Duration) {
+        self.wall_ahead_ms.fetch_add(
             u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::SeqCst,
         );
-        self.continuous_ns.fetch_add(
+    }
+
+    /// Takes both clocks `by` forward.
+    ///
+    /// The wall clock goes first. A daemon that reads between the two steps anchors the new wall
+    /// reading at the old continuous instant, and its first reading after the continuous step
+    /// finds the wall clock `by` behind that anchor and distrusts it.
+    pub fn advance(&self, by: Duration) {
+        self.advance_wall(by);
+        self.continuous_ahead_ns.fetch_add(
             u64::try_from(by.as_nanos()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::Release,
         );
     }
 
-    /// The daemon's clocks.
-    #[must_use]
-    pub fn clocks(&self) -> Clocks {
-        let wall_ms = Arc::clone(&self.wall_ms);
-        Clocks {
-            continuous: Arc::new(ContinuousAhead {
-                machine: kr_transport::clock::SystemContinuousClock::new(),
-                ahead_ns: Arc::clone(&self.continuous_ns),
-            }),
-            wall: WallClock::from_fn(move || {
-                kr_ipc::now_ms().get() + wall_ms.load(std::sync::atomic::Ordering::SeqCst)
-            }),
-        }
+    /// Takes the wall clock two days on and leaves the continuous clock where it is: the grant
+    /// `proposal` gives a session invitation has run out by UTC, and the deadlines a request was
+    /// admitted under, which are counted on the continuous clock, have not.
+    pub fn past_the_grant_by_utc(&self) {
+        self.advance_wall(Duration::from_secs(2 * 24 * 60 * 60));
+    }
+
+    /// Takes both clocks two days on, past the day the grant `proposal` gives a session invitation
+    /// lasts.
+    ///
+    /// A grant with no anchor in this boot would be refused if the wall clock were left behind;
+    /// the cases that use this anchored theirs at the connection, and the grant ends on its
+    /// continuous deadline whatever the host trusts.
+    pub fn past_the_grant(&self) {
+        self.advance(Duration::from_secs(2 * 24 * 60 * 60));
     }
 }
 
