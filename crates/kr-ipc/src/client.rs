@@ -1542,6 +1542,29 @@ impl LinkWriter {
         self.writer.write_frame(&framed).await
     }
 
+    /// Writes one frame as [`Self::write`] does, asking `may_write` before every transport write,
+    /// and returns whether the frame went.
+    ///
+    /// `false` means the check refused while the worker had none of the frame, so nothing was sent
+    /// and the link is whole. Once the worker has part of the frame it is finished
+    /// ([`FrameWriter::write_frame_while`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::NotInLevel`] for a frame the level cannot read, which is then not
+    /// written, and a transport failure.
+    pub async fn write_while(
+        &mut self,
+        frame: &ControlFrame,
+        may_write: impl FnMut() -> bool,
+    ) -> Result<bool> {
+        let payload = self
+            .level
+            .encode(frame, &StreamKind::Control.cbor_limits())?;
+        let framed = FrameCodec::new(StreamKind::Control).encode(&payload)?;
+        self.writer.write_frame_while(&framed, may_write).await
+    }
+
     /// Whether a frame stopped part way through, which leaves the stream in pieces.
     #[must_use]
     pub fn is_mid_frame(&self) -> bool {
