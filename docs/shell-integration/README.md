@@ -361,14 +361,18 @@ command only in the child it forks, so a command with either is not asked about 
 `ARGV0` there would change the file or the vector that runs. The PSReadLine package asks from a
 command-lookup handler of its own, which it puts in front of the person's when its hooks go live and
 takes off when it goes, putting the person's back only if its own is still the one installed. The
-person's handler is called first, and what it answers stands. The handler acts on a line that is one
+person's handler is called first, and what it answers stands. A handler the person sets later is
+theirs and stays where they put it: one that calls the handler it replaced still reaches this
+one, and one that does not leaves the commands to run as typed. The handler acts on a line that is one
 native command whose words are all plain constants, and only when the command PowerShell would run
 for that name is the program: an alias, a function, a cmdlet or a script that has the name is what
 runs, and nothing is asked. It changes a lookup only when the worker answers with a backend, so
 every other command runs untouched and leaves `$?`, `$LASTEXITCODE` and `$Error` as the program
 left them. After a command that ran through the launcher, the launcher's exit code is in
 `$LASTEXITCODE` and in the line's block, and `$?` is true: a script block that replaces the command
-cannot report the program's failure as its own.
+cannot report the program's failure as its own. A person whose profile turns a failed program into
+an error (`$PSNativeCommandUseErrorActionPreference` with `$ErrorActionPreference = 'Stop'`) gets
+that error as it stands, from the launcher and not from the program, and `$?` is false.
 
 The shell waits at most one second for the answer. A bypass, a refusal, the deadline and a lost
 endpoint all run the command exactly as the shell would have run it without asking: the same file,

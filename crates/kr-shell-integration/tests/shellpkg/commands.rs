@@ -1316,6 +1316,43 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
         );
     }
 
+    if kind == ShellKind::PowerShell {
+        // Words that read as options are passed on as they were typed, each as the one word the
+        // shell would have given the program, and a number the shell would write out its own way
+        // is left to the shell.
+        session.commands.policy = backend(told(&probes.launcher()));
+        let asked = session.run_asking("kr-probe -x --key=value -p:v -n 5 'a b'", "launcher-ran");
+        assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+        let launched = probes
+            .launches()
+            .last()
+            .cloned()
+            .expect("the launcher recorded its start");
+        assert_eq!(
+            launched.arguments,
+            [
+                "launch",
+                "--",
+                probe.as_str(),
+                "kr-probe",
+                "-x",
+                "--key=value",
+                "-p:v",
+                "-n",
+                "5",
+                "a b",
+                "--kr-integrated"
+            ],
+            "a line of options was not handed on as typed"
+        );
+        let asked = session.run_asking("kr-probe 1.5", "probe-ran");
+        assert!(
+            asked.is_empty(),
+            "a number the shell rewrites asked: {asked:?}"
+        );
+        assert_eq!(last_run(&probes).arguments, ["1.5"]);
+    }
+
     // The backend's variables were that one child's: the shell exports none of them.
     session.commands.policy = ResolvePolicy::default();
     let asked = session.run_asking("kr-probe afterwards", "probe-ran");
@@ -1326,11 +1363,14 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
     assert!(!ran.environment.contains_key("KR_REGISTRATION"));
 }
 
-/// A lookup handler of the person's own, which answers `kr-probe` while it is switched on.
+/// A lookup handler of the person's own, which answers `kr-probe` while it is switched on and
+/// notes whether it was ever asked about `Write-Error`.
 const OWN_LOOKUP_HANDLER: &str = r#"
 $global:KrOwn = $false
+$global:KrAskedWriteError = $false
 $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
     param($CommandName, $EventArgs)
+    if ($CommandName -eq 'Write-Error') { $global:KrAskedWriteError = $true }
     if ($global:KrOwn -and $CommandName -eq 'kr-probe') {
         $EventArgs.CommandScriptBlock = { 'own-' + 'handler-ran' }
         $EventArgs.StopSearch = $true
@@ -1433,8 +1473,38 @@ pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
         "the person's handler removed the module's: {asked:?}"
     );
 
-    // A handler the person sets after the module's replaces it for the rest of that line; from the
-    // next prompt the module's is in front again, and the person's still answers first.
+    // A lookup made after a failed command in the same line puts the status that failure left
+    // back once the module's own lookups are done, and that is not a lookup the person's handler is
+    // asked about.
+    let asked = session.run_asking("sh -c 'exit 5'; kr-probe after-a-failure", "probe-ran");
+    assert!(asked.is_empty(), "part of a line asked: {asked:?}");
+    assert!(
+        session.run(
+            "if ($global:KrAskedWriteError) { Write-Output ('kr-' + 'asked-about-it') } \
+             else { Write-Output ('kr-' + 'not-asked') }",
+            "kr-not-asked"
+        ),
+        "the person's handler was asked about the lookup that puts the status back:\n{}",
+        session.terminal_output()
+    );
+
+    // A handler the person sets after the module's is theirs and stays where they put it. One that
+    // calls the handler it replaced leaves the module's answering, once, however often the prompt
+    // comes round; one that does not answers by itself, and the commands run as it says.
+    defined(
+        &mut session,
+        "$kr_saved = $ExecutionContext.InvokeCommand.PreCommandLookupAction; \
+         $ExecutionContext.InvokeCommand.PreCommandLookupAction = { param($n, $e) \
+         $kr_saved.Invoke($n, $e) }.GetNewClosure()",
+    );
+    for round in 0..3 {
+        let asked = session.run_asking(&format!("kr-probe chained-{round}"), "launcher-ran");
+        assert_eq!(
+            asked.len(),
+            1,
+            "a handler that calls the one it replaced was asked about {round}: {asked:?}"
+        );
+    }
     defined(
         &mut session,
         "$ExecutionContext.InvokeCommand.PreCommandLookupAction = { param($n, $e) \

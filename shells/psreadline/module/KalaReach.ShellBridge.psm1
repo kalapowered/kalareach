@@ -59,6 +59,9 @@ $script:Hooks = @{
     LookupInstalled    = $null
     # Held while this module asks the engine what a name is, which looks the name up again.
     LookupBusy         = $false
+    # The name of the one lookup this module makes after its work, to put the status back; the
+    # handler passes it over so that the person's handler is not asked about the module's own.
+    LookupRestoring    = $null
     # What the one substituted command runs: the program, the vector it was asked about, the answer.
     Substitution       = $null
 }
@@ -920,7 +923,7 @@ function Invoke-KalaReachReadLine {
         # The profile has run by the time the host asks for a line, and the reader has not started.
         Enable-KalaReachHooks
     } elseif ($script:Kr.Registered) {
-        # A lookup handler the person set since the last prompt is called first from here on.
+        # Says in the trace when the person has replaced the lookup handler since the last prompt.
         Install-KrLookupHandler
     }
     # A reader a running line starts is not a new prompt: the generation the worker holds the line
@@ -1396,6 +1399,11 @@ $script:LookupHandler = {
     # A lookup this module makes itself, to see what a name is, is not one the person's handler is
     # asked about again.
     if ($script:Hooks.LookupBusy) { return }
+    if ($null -ne $script:Hooks.LookupRestoring) {
+        $own = $script:Hooks.LookupRestoring
+        $script:Hooks.LookupRestoring = $null
+        if ($CommandName -ieq $own) { return }
+    }
     $prior = $script:Hooks.LookupPrior
     if ($null -ne $prior) { $prior.Invoke($CommandName, $EventArgs) }
     if ($EventArgs.StopSearch -or $null -ne $EventArgs.Command -or $null -ne $EventArgs.CommandScriptBlock) { return }
@@ -1410,18 +1418,31 @@ $script:LookupHandler = {
     } catch {
         Write-KrTrace "lookup failed: $($_.Exception.GetType().FullName)"
     } finally {
+        # What the lookups above ran must not have changed the status the person's line reads. The
+        # last statement puts it back, and the lookup that statement makes is this module's own and
+        # nobody's to answer.
         $script:Hooks.LookupBusy = $false
-        # What the lookups above ran must not have changed the status the person's line reads.
-        if (-not $kept) { Write-Error 'kalareach' -ErrorAction Ignore }
+        if (-not $kept) {
+            $script:Hooks.LookupRestoring = 'Write-Error'
+            Write-Error 'kalareach' -ErrorAction Ignore
+        }
     }
 }
 
 # Puts the handler in front of whatever handler the engine holds, remembering that one to call first.
-# A handler the person sets after this is called first as well from the next prompt on, because
-# this module puts itself in front of it again; nothing the person wrote is replaced.
+# Done once, when the hooks go live. A handler the person sets after that is theirs and stays where
+# they put it: it is not taken out or put behind this one again, because a handler that calls the one
+# it replaced would then be called by the one it is behind, for ever. If theirs calls this module's,
+# this module's still answers; if it does not, the commands it would have asked about run as typed,
+# and the trace says so.
 function Install-KrLookupHandler {
     $current = $ExecutionContext.InvokeCommand.PreCommandLookupAction
-    if ($null -ne $script:Hooks.LookupInstalled -and [object]::ReferenceEquals($current, $script:Hooks.LookupInstalled)) { return }
+    if ($null -ne $script:Hooks.LookupInstalled) {
+        if (-not [object]::ReferenceEquals($current, $script:Hooks.LookupInstalled)) {
+            Write-KrTrace 'the lookup handler was replaced by the person''s own; commands run as typed unless it calls this one'
+        }
+        return
+    }
     $script:Hooks.LookupPrior = $current
     $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:LookupHandler
     $script:Hooks.LookupInstalled = $ExecutionContext.InvokeCommand.PreCommandLookupAction
@@ -1794,7 +1815,6 @@ function Publish-KalaReachQualification {
                     [ordered]@{ id = $_.Id; url = $_.Url; first_fixed = $first }
                 })
             psreadline_found       = "$psrl"
-            powershell_executable  = $qualifiedHost.executable
             psreadline_module_base = $qualifiedHost.psreadline_module_base
         }
         # What a start of the host adds to its environment, which the worker that starts it sets:

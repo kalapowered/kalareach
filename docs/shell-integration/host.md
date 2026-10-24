@@ -268,7 +268,10 @@ forms for one architecture) to the value the qualification found it at, because 
 start without it. `launch.search_paths.PSModulePath` lists the package's module directories, which
 the worker puts first on the list of module directories, once each, with every other entry kept in
 the order it had: the module a startup entry imports by name is then the package's own, and a
-module of the same name that the person listed first is behind it. A record that names any other
+module of the same name that the person listed first is behind it. PowerShell puts its own user,
+shared and `$PSHOME` module folders before a list it inherits, so a module of the same name in one
+of those is found first; the handshake then names the module it was given, which is not the
+package's, and refuses the session. A record that names any other
 variable, a variable the host owns, a value with a NUL in it or a directory outside the package is
 refused when it is read. The worker applies the block before it adds the two bootstrap values, and
 the shells that ask a question of the host (where a profile is, whether an entry sits among whole

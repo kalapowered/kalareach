@@ -165,6 +165,7 @@ impl ShellPackage {
         if !package.executable().is_file() {
             return Err(PackageFault::MissingExecutable {
                 path: package.directory.display().to_string(),
+                republish: package.kind() == ShellKind::PowerShell,
             });
         }
         Ok(package)
@@ -575,10 +576,13 @@ pub enum PackageFault {
         detail: String,
     },
     /// The manifest names a binary that is not there.
-    #[error("the package at {path} names an executable that is not installed")]
+    #[error("the package at {path} names an executable that is not installed{}", republish_hint(*.republish))]
     MissingExecutable {
         /// Where the package is.
         path: String,
+        /// Whether the package is one a person publishes for the host they have, so that the host
+        /// having moved or gone is mended by publishing it again.
+        republish: bool,
     },
     /// A request for a non-interactive script, which never becomes an interactive session shell.
     #[error("a script invocation is not an interactive root shell: {detail}")]
@@ -586,6 +590,16 @@ pub enum PackageFault {
         /// What the request asked for.
         detail: String,
     },
+}
+
+/// What follows "not installed" when publishing the package again mends it.
+#[must_use]
+pub fn republish_hint(republish: bool) -> String {
+    if republish {
+        format!("; run {PUBLISH_COMMAND} in PowerShell to qualify the one this account runs")
+    } else {
+        String::new()
+    }
 }
 
 /// The words for a host with no package: the Windows host has one shell to qualify, so it is told
@@ -865,6 +879,7 @@ impl PackageSet {
         if !package.executable().is_file() {
             return Err(PackageFault::MissingExecutable {
                 path: package.directory.display().to_string(),
+                republish: package.kind() == ShellKind::PowerShell,
             });
         }
         Ok(package)
@@ -1637,6 +1652,31 @@ mod tests {
             .expect("names the identity");
     }
 
+    /// A PowerShell that was updated, moved or removed since the package was published leaves a
+    /// package naming a host that is not there; the refusal says to publish it again.
+    #[test]
+    fn a_package_whose_host_has_gone_says_to_publish_it_again() {
+        let root = tempfile::tempdir().expect("a directory");
+        let elsewhere = tempfile::tempdir().expect("a directory");
+        let host = a_host(elsewhere.path());
+        publish(root.path(), &host_record(root.path(), &host));
+        std::fs::remove_file(&host).expect("the host goes");
+
+        let refused = ShellPackage::read(&root.path().join("powershell/identity-1"))
+            .expect_err("a package with no host is refused");
+        assert!(
+            matches!(
+                refused,
+                PackageFault::MissingExecutable {
+                    republish: true,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains(PUBLISH_COMMAND), "{refused}");
+    }
+
     /// KR-REQ-07.16: a package that builds no shell names the host it qualified, and a session
     /// starts that host with the package's own launch in its environment. Its files are inside it.
     #[test]
@@ -1796,7 +1836,8 @@ mod tests {
         });
         refused("a directory with the list's separator in it", &|record| {
             let root = record["shell"]["modules"][0]["search_path"].clone();
-            let tricky = format!("{}:x", root.as_str().expect("text"));
+            let separator = if cfg!(windows) { ';' } else { ':' };
+            let tricky = format!("{}{separator}x", root.as_str().expect("text"));
             record["launch"]["search_paths"]["PSModulePath"] = serde_json::json!([tricky]);
         });
         // The architecture forms the module records are the other names it may set.
@@ -1863,6 +1904,7 @@ mod tests {
 
     /// The package's directory goes first on the list of module directories, once,
     /// and everything else on the list keeps its order, wherever the package's directory was.
+    #[cfg(unix)]
     #[test]
     fn the_packages_module_directory_goes_first_and_the_rest_keep_their_order() {
         let host_directory = tempfile::tempdir().expect("a directory");
