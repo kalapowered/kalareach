@@ -63,6 +63,9 @@ pub(crate) struct StuckDrain {
 pub(crate) enum DrainWhy {
     /// A write has held the lock for longer than the database's busy timeout.
     Held,
+    /// The ask has not been answered within the bound, which a user of the daemon's handle on the
+    /// pairing records can bring about without any write.
+    Unanswered,
     /// The database could not take the lock, for the reason given in words this build writes.
     Failed(&'static str),
 }
@@ -1056,8 +1059,9 @@ impl Controller {
     /// one, ends the links of the connections it reaches and waits for the writes to the pairing
     /// records that were under way ([`Self::put_a_feed_refusal`]).
     ///
-    /// The callers are the carrier's one pass at a time and, at the start, the restoring of a
-    /// removal, which waits for nothing ([`Self::refuse_the_grants_that_rest_on_the_feed_at_start`]).
+    /// The callers are the carrier's one pass at a time. A start that restores a removal raises it
+    /// through [`Self::put_a_feed_refusal`] and waits for nothing
+    /// ([`Self::refuse_the_grants_that_rest_on_the_feed_at_start`]).
     async fn move_a_feed_refusal(
         &self,
         bit: u8,
@@ -1071,7 +1075,7 @@ impl Controller {
         }
     }
 
-    /// Raises or lifts one of the two refusals the feed puts on every remote grant: the policy's
+    /// Raises or lifts one of the refusals the feed puts on remote grants: the policy's
     /// flag and the word that mirrors it change together, under the policy's lock, and the epoch
     /// moves after. Says whether it changed anything.
     ///
@@ -1133,19 +1137,19 @@ impl Controller {
     /// the wait goes on, and why ([`Self::stuck_drain`]). Each ask holds the connection of the
     /// daemon's own handle on the pairing records, so other users of that handle wait as long.
     ///
-    /// The callers are the start and then the carrier's one pass at a time, so two waits do not
-    /// overlap.
+    /// The only caller is the carrier's one pass at a time, so two waits do not overlap. A start
+    /// that restores a removal waits for nothing ([`Self::put_a_feed_refusal`]).
     async fn wait_for_the_confirmations_being_spent(&self) {
         loop {
             let devices = Arc::clone(&self.devices);
             let mut ask = tokio::task::spawn_blocking(move || devices.write_lock_is_free());
-            // An ask that is still going after the busy timeout is held up by a user of the
-            // handle and not by a write, and the wait is said to be stuck all the same. The ask
-            // is not given up: the lock is what ends the wait.
+            // An ask still going after the busy timeout has not been answered by the database,
+            // which a user of the handle holds up without any write, and the wait is said to be
+            // stuck all the same. The ask is not given up: the lock is what ends the wait.
             let answered = match tokio::time::timeout(DRAIN_ASK_DUE, &mut ask).await {
                 Ok(answered) => answered,
                 Err(_) => {
-                    self.note_a_stuck_drain(DrainWhy::Held, None);
+                    self.note_a_stuck_drain(DrainWhy::Unanswered, None);
                     ask.await
                 }
             };
@@ -1180,13 +1184,18 @@ impl Controller {
             before.is_none_or(|before| before.why != why)
         };
         if said {
-            eprintln!(
-                "kr-controller: a refusal on remote grants waits for the registry to take a write \
-                 and the wait goes on until it does: {}",
-                detail.unwrap_or(
+            let because = detail.unwrap_or(match why {
+                DrainWhy::Unanswered => {
+                    "the ask for the database's write lock has not been answered in time"
+                }
+                _ => {
                     "a write to the pairing records has held the database's write lock longer \
                      than its busy timeout"
-                )
+                }
+            });
+            eprintln!(
+                "kr-controller: a refusal on remote grants waits for the registry to take a write \
+                 and the wait goes on until it does: {because}"
             );
         }
     }
@@ -1934,8 +1943,8 @@ mod tests {
         );
     }
 
-    /// A raise of the refusal that waits for the pairing records, started while `beside` or the
-    /// daemon's own handle keeps the registry from taking a write, as the cases below arrange.
+    /// A raise of the refusal that waits for the pairing records, started while the daemon's own
+    /// handle keeps the registry from taking a write, as the cases below arrange.
     fn rising(controller: &std::sync::Arc<super::Controller>) -> tokio::task::JoinHandle<()> {
         use super::RemoteRefusal;
 
@@ -1971,8 +1980,8 @@ mod tests {
 
     /// KR-REQ-24.15: a refusal that rises waits for the daemon's own handle on the pairing records
     /// as it waits for a write, and says that the wait goes on once an ask has gone past the
-    /// database's busy timeout without an answer. A user of the handle holds it here, as a write
-    /// that waits for the lock does for as long as it waits; nothing is asked of the database
+    /// database's busy timeout without an answer, without saying that a write holds the lock. A
+    /// user of the handle holds it here and starts no transaction; nothing is asked of the database
     /// meanwhile. The wait ends when the handle is let go.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wait_held_up_by_a_user_of_the_pairing_records_handle_is_said_to_go_on() {
@@ -2002,11 +2011,11 @@ mod tests {
             matches!(
                 controller.stuck_drain(),
                 Some(StuckDrain {
-                    why: DrainWhy::Held,
+                    why: DrainWhy::Unanswered,
                     ..
                 })
             ),
-            "and it says that the wait goes on"
+            "and it says that the wait goes on, and that the ask is not answered"
         );
 
         go.send(()).expect("the handle goes");
@@ -2106,9 +2115,13 @@ mod tests {
                     .await
             }
         });
-        while !starting.is_finished() && controller.stuck_drain().is_none() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while !starting.is_finished() && controller.stuck_drain().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the start ends or the wait says it goes on");
         assert!(
             controller.stuck_drain().is_none(),
             "the start made no wait for the registry"
