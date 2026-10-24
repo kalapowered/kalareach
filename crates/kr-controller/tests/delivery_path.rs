@@ -3424,6 +3424,142 @@ async fn a_device_that_registers_over_and_over_is_not_confirmed_with_the_gateway
         .expect("another device is confirmed");
 }
 
+/// What a device registers a destination with: a credential from the gateway for the authorisation
+/// it already has (a new bearer, which retires the last), and whether it wants previews.
+async fn reissue_and_register(
+    environment: &Environment,
+    phone: &Phone,
+    sender: PushSenderRecordId,
+    previews_enabled: bool,
+) -> Result<DevicePushRegisterResult, kr_protocol::error::ProtocolError> {
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register_choosing(environment, &credential, previews_enabled)
+        .await
+}
+
+/// KR-REQ-16.11: a person who changes the choice of previews does not spend what the next token
+/// refresh needs. A device that has registered new credentials as often as it may in a row is still
+/// taken when its registration keeps the authorisation and installation its destination names and
+/// only changes the choice, and the gateway is asked about that credential like any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_change_of_previews_is_taken_after_the_device_has_spent_its_allowance_for_new_credentials()
+ {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe1));
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    for attempt in 1..=3 {
+        reissue_and_register(&environment, &phone, sender, true)
+            .await
+            .unwrap_or_else(|error| panic!("new credential {attempt}: {error:?}"));
+    }
+    assert_eq!(probes(), 3);
+
+    reissue_and_register(&environment, &phone, sender, false)
+        .await
+        .expect("the change of previews is taken");
+    assert_eq!(probes(), 4, "and its bearer was confirmed with the gateway");
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is still a destination");
+    assert!(
+        !destination
+            .as_push()
+            .expect("a push destination")
+            .previews_enabled,
+        "the destination records the choice"
+    );
+}
+
+/// KR-REQ-16.11: a device that changes the choice of previews over and over is stopped like one
+/// that registers new credentials over and over: the fourth change in a row is refused without the
+/// gateway being asked, and the destination keeps the choice it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_changes_its_previews_over_and_over_is_not_confirmed_with_the_gateway_each_time()
+ {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe2));
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect("the first registration");
+    for (change, previews) in [(1, false), (2, true), (3, false)] {
+        reissue_and_register(&environment, &phone, sender, previews)
+            .await
+            .unwrap_or_else(|error| panic!("change {change}: {error:?}"));
+    }
+    assert_eq!(probes(), 4);
+
+    let refused = reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect_err("the fourth change in a row is not put to the gateway");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::RateLimited,
+        "a refusal that says to wait"
+    );
+    assert_eq!(probes(), 4, "and the gateway was not asked");
+    assert!(
+        !environment
+            .destination(phone.device_id())
+            .expect("the device is still a destination")
+            .as_push()
+            .expect("a push destination")
+            .previews_enabled,
+        "the destination keeps the choice it had"
+    );
+}
+
+/// KR-REQ-16.08, KR-REQ-16.11: changes of previews do not widen what new credentials may spend. After
+/// two changes, a device that registers new credentials is still stopped at the third in a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn changes_of_previews_do_not_let_a_device_register_more_new_credentials() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0xe3));
+    let probes = || {
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len()
+    };
+    reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect("the first registration");
+    for previews in [false, true] {
+        reissue_and_register(&environment, &phone, sender, previews)
+            .await
+            .expect("a change of previews");
+    }
+    for attempt in 2..=3 {
+        reissue_and_register(&environment, &phone, sender, true)
+            .await
+            .unwrap_or_else(|error| panic!("new credential {attempt}: {error:?}"));
+    }
+    assert_eq!(probes(), 5);
+
+    let refused = reissue_and_register(&environment, &phone, sender, true)
+        .await
+        .expect_err("the fourth new credential in a row is not put to the gateway");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::RateLimited);
+    assert_eq!(probes(), 5, "and the gateway was not asked");
+}
+
 // ---------------------------------------------------------------------------------------------
 // What the gateway's answers have to be to count
 // ---------------------------------------------------------------------------------------------
