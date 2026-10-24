@@ -820,6 +820,15 @@ impl Latest {
             removal_keys: state.summary.removal_keys.clone(),
         }
     }
+
+    /// Takes the state an answer to a change carries, and says whether the answer is that the feed
+    /// removed this host. Every change reads its answer here, so none can drop the removal: a feed
+    /// that stores a revision for a host it removed answers `removed`, and the pass that read it
+    /// ends as a removal then and not when the next read finds it.
+    fn took(&mut self, state: &AuthorityFeedState) -> bool {
+        *self = Self::of(state);
+        state.summary.removed
+    }
 }
 
 /// One pass: read what the feed holds, carry out what it asks, say what became of it, and name the
@@ -950,6 +959,7 @@ async fn pass(
                         issuers: [record.request.issuer_device_id].into_iter().collect(),
                     });
                 }
+                Settled::Removed => return removed(shared, controller).await,
             }
         }
         cursor = state.next_after_sequence.get();
@@ -1202,6 +1212,8 @@ enum Settled {
     /// This host cannot yet decide whether the device that made it may manage the host, for the
     /// reason given. It stays unsettled, and a later scan judges it again.
     Undecided(Refusal),
+    /// The feed answered a change to this host's records by saying it removed the host.
+    Removed,
 }
 
 /// A request whose issuer's standing this host could not decide, and why.
@@ -1344,7 +1356,11 @@ async fn settle_request(
         .revise(&revision, None)
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
-    *latest = Latest::of(&state);
+    // A feed that removed the host answers its revision with the removal, and holds no record to
+    // acknowledge: the request was carried out and written down above, and nothing more is asked.
+    if latest.took(&state) {
+        return Ok(Settled::Removed);
+    }
     let acknowledgement = RevocationAcknowledgement {
         request_id: id,
         host_device_id: shared.host_device_id,
@@ -1358,7 +1374,9 @@ async fn settle_request(
         .acknowledge(&acknowledgement, announcement.as_ref())
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
-    *latest = Latest::of(&state);
+    if latest.took(&state) {
+        return Ok(Settled::Removed);
+    }
     if applied.completion == RevocationCompletion::Complete {
         controller.authority_feed_settled(id, shared.host_device_id);
         Ok(Settled::Done)
@@ -1420,7 +1438,9 @@ async fn refuse(
         .reject(id, reason)
         .await
         .map_err(|error| Stopped::of(&error, &shared.quiet))?;
-    *latest = Latest::of(&state);
+    if latest.took(&state) {
+        return Ok(Settled::Removed);
+    }
     Ok(Settled::Done)
 }
 
