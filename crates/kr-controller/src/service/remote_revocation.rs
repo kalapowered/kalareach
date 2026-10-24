@@ -1567,6 +1567,178 @@ mod tests {
         );
     }
 
+    /// Hides the device directory from the daemon, as a registry that cannot be read would, or
+    /// shows it again.
+    fn the_directory_is_unreadable(temp: &kr_ipc::testing::TempHost, unreadable: bool) {
+        let (from, to) = if unreadable {
+            ("network_devices", "network_devices_hidden")
+        } else {
+            ("network_devices_hidden", "network_devices")
+        };
+        let registry = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("the registry opens");
+        registry
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("a busy timeout");
+        registry
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .expect("the table is renamed");
+    }
+
+    /// A device that holds host management, which a withdrawal can name, and the identifier of the
+    /// key it holds.
+    fn a_named_device(
+        controller: &crate::service::Controller,
+    ) -> (Unverified, kr_protocol::scalars::KeyId) {
+        use kr_crypto::keys::AuthorisationKeyPair;
+
+        use crate::service::a_voice_grant_on_the_floor::paired_signing_as;
+
+        let key = AuthorisationKeyPair::generate().expect("a key");
+        let device = paired_signing_as(
+            controller,
+            1,
+            *key.public(),
+            &[ActionRight::HostManage],
+            None,
+        );
+        (
+            Unverified {
+                devices: [(device.device_id, 1)].into_iter().collect(),
+                ..Unverified::default()
+            },
+            kr_crypto::keys::key_id(KeyPurpose::Authorisation, key.public().as_bytes()),
+        )
+    }
+
+    /// KR-REQ-24.15: a withdrawal found while the device directory cannot be read raises the refusal
+    /// all the same, and owes the keys of the devices it names: a feed that is removed meanwhile
+    /// may have been removed by one of them, so the keys that could not be read are not taken for
+    /// none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_withdrawal_found_while_the_directory_cannot_be_read_owes_the_keys_it_names() {
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        let (temp, controller) = daemon().await;
+        let (found, key) = a_named_device(&controller);
+
+        the_directory_is_unreadable(&temp, true);
+        controller
+            .note_unverified_withdrawal(&found)
+            .await
+            .expect_err("the directory cannot be read");
+        assert!(
+            controller.policy().withdrawal_unverified(),
+            "the refusal is raised all the same"
+        );
+        assert!(
+            controller.a_withheld_key_may_still_remove_the_feed(),
+            "and the keys of the devices the withdrawal names are owed"
+        );
+
+        the_directory_is_unreadable(&temp, false);
+        controller
+            .settle_unverified_withdrawals(Some(&found))
+            .await
+            .expect("the directory reads");
+        assert_eq!(controller.withheld_key_ids(), vec![key]);
+        controller.feed_lists_no_withheld_key();
+        assert!(
+            !controller.a_withheld_key_may_still_remove_the_feed(),
+            "the control: a scan that reads the keys, with none of them listed, owes nothing"
+        );
+    }
+
+    /// KR-REQ-24.15: a scan that cannot read the device directory keeps the keys it knew and owes
+    /// the ones it could not read, and the next scan that reads them owes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_that_cannot_read_the_keys_keeps_the_ones_it_knew_and_owes_the_rest() {
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        let (temp, controller) = daemon().await;
+        let (found, key) = a_named_device(&controller);
+        controller
+            .note_unverified_withdrawal(&found)
+            .await
+            .expect("the directory reads");
+        controller.feed_lists_no_withheld_key();
+        assert!(
+            !controller.a_withheld_key_may_still_remove_the_feed(),
+            "the control: the feed lists no key a named device holds"
+        );
+
+        the_directory_is_unreadable(&temp, true);
+        controller
+            .settle_unverified_withdrawals(Some(&found))
+            .await
+            .expect_err("the directory cannot be read");
+        assert!(
+            controller.policy().withdrawal_unverified(),
+            "the refusal follows what was found"
+        );
+        assert_eq!(
+            controller.withheld_key_ids(),
+            vec![key],
+            "the keys it knew are kept"
+        );
+        assert!(
+            controller.a_withheld_key_may_still_remove_the_feed(),
+            "and the ones it could not read are owed"
+        );
+
+        the_directory_is_unreadable(&temp, false);
+        controller
+            .settle_unverified_withdrawals(Some(&found))
+            .await
+            .expect("the directory reads");
+        assert!(
+            !controller.a_withheld_key_may_still_remove_the_feed(),
+            "a scan that reads the keys owes nothing"
+        );
+    }
+
+    /// KR-REQ-24.15: the feed's removal of this host ends the refusal of a withdrawal the host
+    /// cannot verify only when no key the withdrawal takes the right from may still have removed
+    /// it. Here the keys could not be read, so the refusal stands; the control reads them, finds
+    /// the feed lists none, and the removal ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_removal_keeps_the_refusal_while_a_key_the_withdrawal_names_may_have_removed_the_feed()
+     {
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        let (temp, controller) = daemon().await;
+        let (found, _) = a_named_device(&controller);
+        the_directory_is_unreadable(&temp, true);
+        controller
+            .note_unverified_withdrawal(&found)
+            .await
+            .expect_err("the directory cannot be read");
+        the_directory_is_unreadable(&temp, false);
+
+        controller
+            .authority_feed_removed("https://feed.example")
+            .await
+            .expect("the removal is written down");
+        assert!(
+            controller.policy().withdrawal_unverified(),
+            "a key the withdrawal names may have removed the feed, so the refusal stands"
+        );
+
+        controller
+            .settle_unverified_withdrawals(Some(&found))
+            .await
+            .expect("the directory reads");
+        controller.feed_lists_no_withheld_key();
+        controller
+            .authority_feed_removed("https://feed.example")
+            .await
+            .expect("the removal is written down");
+        assert!(
+            !controller.policy().withdrawal_unverified(),
+            "the control: with every key off the feed's list, the removal ends the refusal"
+        );
+    }
+
     /// KR-REQ-24.15: a refusal that rises returns only when every write to the pairing records
     /// that was under way has ended. An owner confirmation reads the refusal inside its write, so
     /// one that read it before it rose has been committed by the time the rise returns, and one
