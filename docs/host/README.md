@@ -6463,12 +6463,20 @@ owner at the machine, an organisation's and a personal one alike, with `PERMISSI
 that it is catching up with its feed, and `kr doctor` says so. It carries out again each request the
 feed shows complete and the registry does not show withdrawn, each time a pass reads the record and
 whatever the two counters say: a restore that stopped after it moved the counter has lost the
-withdrawal all the same. It does so only for a request it could have carried out, which a device
-that may manage the host signed with the key the registry holds for it and the host did not refuse,
-because the feed judges nothing and could name any request as complete. A request that names
-something live here and was issued by an owner the registry does not know, as after a restore to a
-point before that owner was paired, can be neither carried out nor dismissed: the feed could have
-named any request as complete, and the host cannot tell whose word it was. The host then refuses
+withdrawal all the same. It does so only for a request it could have carried out, because the feed
+judges nothing and could name any request as complete: one that a device the registry holds and has
+not revoked signed with the key the registry holds for it, whose pairing grant holds the right to
+manage the host and the configured ceiling leaves it, and that the host did not refuse. The clock and
+the policy are not asked. The request took effect when it did, so an owner whose grant has run out
+since still counts; a revoked device proves nothing, because its request took effect before the
+revocation and a registry that holds the revocation holds what it withdrew. The device the request
+names as its issuer is judged alone. When the registry holds no such device, a device that holds the
+key the request names and could have made it is the issuer, which is how an owner paired again is
+found, and the first device that holds the key is not. A request that names something live here and
+whose issuer the registry cannot show, because it holds no device of that identity and none that is
+not revoked and holds the key and could have made it, as after a restore to a point before that
+owner was paired, can be neither carried out nor dismissed: the feed could have named any request as
+complete, and the host cannot tell whose word it was. The host then refuses
 every grant but the owner's at the machine, with `PERMISSION_DENIED` saying that it shows a
 revocation by an owner it does not know, and `kr doctor` says so. Every scan reads such a record
 again, so a restart does not lose the refusal, and nothing is stored for it. It ends when the owner
