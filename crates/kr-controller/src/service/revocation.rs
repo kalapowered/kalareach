@@ -707,6 +707,7 @@ impl Controller {
             self.settled_utc_now(),
         );
         *held = candidate;
+        self.mirror_the_feed_standing_of(&held);
         self.lifetimes.hold_offline_anchor(next, &held);
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
         // policy it names or a later one.

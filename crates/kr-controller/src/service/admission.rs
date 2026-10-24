@@ -114,9 +114,21 @@ impl Controller {
         &self,
         connection: Option<&AdmittedConnection>,
     ) -> Option<ControllerError> {
+        self.feed_refusal_of(connection)
+            .map(|refusal| ControllerError::PermissionDenied {
+                detail: refusal.detail(),
+            })
+    }
+
+    /// The refusal the authority feed puts on `connection`, when it came through the network under
+    /// a grant and one stands for that grant.
+    pub(super) fn feed_refusal_of(
+        &self,
+        connection: Option<&AdmittedConnection>,
+    ) -> Option<crate::grants::Refusal> {
         connection
             .filter(|connection| connection.door == Door::Network)
-            .and_then(|_| self.refuse_while_the_feed_refuses().err())
+            .and_then(|connection| self.feed_refusal(connection.grant.as_ref()))
     }
 
     /// The admission check a mutation's own effect repeats, when it is carrying an admission.
@@ -1099,6 +1111,9 @@ pub(super) struct AdmittedConnection {
     pub(super) acting: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
     /// The door the connection came through.
     door: Door,
+    /// The pairing grant a connection through the network was admitted under, which says whether
+    /// the authority feed's removal refuses it ([`Controller::feed_refusal`]).
+    grant: Option<kr_protocol::grant::Grant>,
 }
 
 /// The door a connection came through, which is where a session it creates takes its
@@ -1129,7 +1144,14 @@ impl AdmittedConnection {
             latch: None,
             acting: std::collections::BTreeSet::new(),
             door: Door::Network,
+            grant: None,
         }
+    }
+
+    /// The same registration, admitted under `grant`.
+    pub(super) fn under(mut self, grant: kr_protocol::grant::Grant) -> Self {
+        self.grant = Some(grant);
+        self
     }
 
     /// A registration of `actor_id`, admitted under `admitted_revision`, of a local client that
@@ -1145,6 +1167,7 @@ impl AdmittedConnection {
             latch: None,
             acting: std::collections::BTreeSet::new(),
             door: Door::Local(kind),
+            grant: None,
         }
     }
 }

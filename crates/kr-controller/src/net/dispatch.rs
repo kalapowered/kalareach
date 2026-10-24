@@ -219,7 +219,8 @@ impl RemoteConnection {
             crate::service::AdmittedConnection::new(
                 device.principal(),
                 controller.policy().authority_revision(),
-            ),
+            )
+            .under(device.grant.clone()),
         );
         let authority = Arc::new(Authorisation {
             grant_deadline: controller.lifetimes().deadline(&device).ok().flatten(),

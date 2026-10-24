@@ -190,7 +190,10 @@ impl RemoteConnection {
                 &envelope,
                 authority,
                 Some(&asked.acting.grant.history),
-                &|| self.controller.refuse_while_the_feed_refuses(),
+                &|| {
+                    self.controller
+                        .refuse_while_the_feed_refuses(self.connection_id)
+                },
             )
             .await
         {
@@ -304,6 +307,7 @@ impl RemoteConnection {
         // rights is made where the attachment is admitted, out of what the host checked this
         // request against.
         let controller = Arc::clone(&self.controller);
+        let connection_id = self.connection_id;
         let effect = tokio::spawn(async move {
             proxy
                 .forward_mutation(
@@ -316,7 +320,7 @@ impl RemoteConnection {
                         lease: bound.lease,
                     },
                     bound.deadline_boot_ms,
-                    &|| controller.refuse_while_the_feed_refuses(),
+                    &|| controller.refuse_while_the_feed_refuses(connection_id),
                 )
                 .await
         });
@@ -640,7 +644,10 @@ impl RemoteConnection {
                 &envelope,
                 authority,
                 Some(&asked.acting.grant.history),
-                &|| self.controller.refuse_while_the_feed_refuses(),
+                &|| {
+                    self.controller
+                        .refuse_while_the_feed_refuses(self.connection_id)
+                },
             )
             .await
         else {

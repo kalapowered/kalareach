@@ -449,7 +449,12 @@ impl RemoteOutput {
             return Written::Withdrawn;
         }
         let decided = || {
-            !(answer && self.authority.controller.feed_refusal().is_some())
+            !(answer
+                && self
+                    .authority
+                    .controller
+                    .feed_refusal_on(self.authority.connection_id)
+                    .is_some())
                 && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()

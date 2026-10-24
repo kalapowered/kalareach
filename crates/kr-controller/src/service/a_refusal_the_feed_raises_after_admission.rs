@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use kr_protocol::grant::Grant;
 use kr_protocol::ids::ConnectionId;
 
 use super::a_transfer_left_unanswered::daemon;
@@ -99,4 +100,96 @@ async fn a_connection_admitted_before_a_feed_refusal_rose_is_refused_where_it_co
         [false, false],
         "one refusal lifted, the other stands"
     );
+}
+
+/// A registration of a connection through the network under `grant`, at the revision in force, and
+/// the admission it carries.
+fn registered_under(controller: &Arc<Controller>, grant: Grant) -> AdmittedMutation {
+    let revision = controller.policy().authority_revision();
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    controller.admitted_table().insert(
+        connection_id,
+        AdmittedConnection::new(actor, revision).under(grant),
+    );
+    AdmittedMutation {
+        connection_id,
+        admitted_revision: revision,
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(60)),
+    }
+}
+
+/// KR-REQ-24.15: the removal of this host from its feed is a refusal of one kind of grant, and it
+/// holds work admitted before it as the other two refusals do. A connection under a grant that
+/// rests on the feed, an organisation's, or a personal one once the owner has bounded offline
+/// validity, is refused where it commits; one under the default owner grant is not, which stays
+/// usable without the feed, and the owner at this machine never is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_admitted_before_the_feed_removed_the_host_is_refused_by_the_kind_of_its_grant()
+ {
+    use super::a_voice_grant_on_the_floor::{paired, paired_needing_a_lease};
+
+    let (_temp, controller) = daemon().await;
+    let (_, local) = registered(&controller);
+    let personal = registered_under(&controller, paired(&controller, 1, None).grant);
+    let organisational = registered_under(
+        &controller,
+        paired_needing_a_lease(
+            &controller,
+            2,
+            &[kr_protocol::rights::ActionRight::SessionView],
+        )
+        .grant,
+    );
+    for admission in [&personal, &organisational] {
+        assert_eq!(
+            asked(&controller, admission).await,
+            [true, true],
+            "the control"
+        );
+    }
+
+    controller
+        .authority_feed_removed("https://feed.example")
+        .await
+        .expect("the removal is written down");
+    assert_eq!(
+        asked(&controller, &organisational).await,
+        [false, false],
+        "a grant that rests on the feed is refused where it commits"
+    );
+    let refused = controller
+        .check_registration(&organisational)
+        .expect_err("the removal stands");
+    assert!(
+        matches!(&refused, ControllerError::PermissionDenied { detail }
+            if detail.contains("authority feed")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        asked(&controller, &personal).await,
+        [true, true],
+        "the default owner grant stays usable"
+    );
+    assert_eq!(asked(&controller, &local).await, [true, true]);
+
+    controller
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                last_synchronised_at_ms: kr_protocol::scalars::Nullable::some(
+                    kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                ),
+            }));
+        })
+        .expect("the owner bounds offline validity");
+    assert_eq!(
+        asked(&controller, &personal).await,
+        [false, false],
+        "a personal grant rests on the feed once offline validity is bounded"
+    );
+    assert_eq!(asked(&controller, &local).await, [true, true]);
 }

@@ -1239,6 +1239,76 @@ async fn an_answer_held_at_the_writer_is_not_written_once_a_feed_refusal_rises()
     }
 }
 
+/// KR-REQ-24.15: an answer decided before the feed removed this host is not written when the
+/// connection's grant rests on the feed, as it is not for the other two refusals: the removal moves
+/// no revision, so a decision taken before it names nothing that has changed. The device is written
+/// the refusal. The control: a change of the epoch that refuses nothing leaves the answer to go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_decided_before_the_feed_removed_the_host_is_not_written_when_its_grant_rests_on_it()
+ {
+    for removed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        // Personal grants rest on the feed while offline validity is bounded, and a bound that was
+        // synchronised a moment ago holds throughout.
+        controller
+            .update_policy(|policy| {
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: DurationMs::new(60 * 60 * 1000),
+                    last_synchronised_at_ms: Nullable::some(
+                        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                    ),
+                }));
+            })
+            .expect("the owner's choice is recorded");
+        let stream = HeldStream::new(false);
+        let connection = paired_connection_writing_to(
+            &controller,
+            65,
+            &[ActionRight::SessionView],
+            Box::new(Arc::clone(&stream)),
+        );
+        let answered = connection
+            .answer_now(ControlFrame::Request(listing(1)))
+            .await
+            .expect("an answer");
+        let (stands, ()) = tokio::join!(connection.write_answer(answered), async {
+            stream.waited(1).await;
+            if removed {
+                controller
+                    .authority_feed_removed("https://feed.example")
+                    .await
+                    .expect("the removal is written down");
+            } else {
+                controller.advance_authority_epoch();
+            }
+            // The answer, and the refusal that replaces it when the answer is not written.
+            stream.writer.add_permits(2);
+        });
+        assert!(stands, "the connection stands");
+        let frames = stream.frames();
+        assert_eq!(frames.len(), 1, "one frame reached the peer: {frames:?}");
+        match &frames[0] {
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(refusal),
+                ..
+            }) => {
+                assert!(removed, "refused with nothing removed: {refusal:?}");
+                assert_eq!(
+                    refusal.code,
+                    kr_protocol::error::ErrorCode::PermissionDenied
+                );
+            }
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            }) => assert!(!removed, "the answer went past the removal"),
+            other => panic!("not an answer: {other:?}"),
+        }
+        drop(controller);
+    }
+}
+
 /// A response decided under a lease that has ended is never written under a lease installed
 /// after that end, which is a new run of the device's lease and can grant less: installed after
 /// the end, a replacement that drops the right the response needed is not a narrowing the host
