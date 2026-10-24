@@ -1293,6 +1293,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         session: &'a kr_client::session::Session,
         host: &'a kr_client::pairing::paired::PairedHost,
         identity: &'a kr_transport::handshake::LocalIdentity,
+        presentation: kr_client::pairing::link::Presentation,
     ) -> kr_client::pairing::BoxFuture<'a, Result<(), kr_client::pairing::link::LinkError>> {
         Box::pin(async move {
             let failing = self
@@ -1305,8 +1306,12 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
             if let Some(error) = failing {
                 return Err(kr_client::pairing::link::LinkError::Membership(error));
             }
-            self.own.present_membership(session, host, identity).await?;
-            if host.proposed_grant.organisation.as_ref().is_some() {
+            self.own
+                .present_membership(session, host, identity, presentation)
+                .await?;
+            if presentation == kr_client::pairing::link::Presentation::First
+                && host.proposed_grant.organisation.as_ref().is_some()
+            {
                 self.control.after_presenting().await;
             }
             Ok(())
