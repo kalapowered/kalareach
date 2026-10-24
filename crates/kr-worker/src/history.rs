@@ -3434,6 +3434,10 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// KR-REQ-20.20, the part about the host cap's measure on Windows: a segment held open and
+    /// written through its handle is sized by the bytes written to it, so the retained output the
+    /// 1 GiB host cap is held against is not undercounted while a spool is being written. Not shown
+    /// here: the cap being applied to that figure.
     #[test]
     fn the_host_measure_sizes_a_segment_that_is_open_for_append_by_the_bytes_written_to_it() {
         use std::io::Write as _;
@@ -3461,6 +3465,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-REQ-20.20, the part about what the host cap's measure counts: the output segments and
+    /// nothing beside them, not the record of where a spool got to, a stray file in a session's
+    /// directory or a file outside one. Not shown here: the cap being applied to that figure.
     #[test]
     fn the_host_measure_counts_the_segments_and_nothing_beside_them() {
         let root = spool_directory("measure-beside");
