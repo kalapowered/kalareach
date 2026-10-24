@@ -219,3 +219,22 @@ fn a_plaintext_that_is_not_a_preview_or_not_an_envelope_is_refused() {
     let envelope = seal_padded(&parties, &plaintext(&parties), &padded, bucket);
     assert_eq!(reason(open(&parties, &envelope)), "malformed");
 }
+
+#[test]
+fn a_plaintext_padded_to_a_larger_bucket_than_it_rounds_to_is_refused() {
+    let parties = parties();
+    let plaintext = plaintext(&parties);
+    let encoded = kr_cbor::to_canonical_vec(&plaintext).expect("encoded");
+    let (_, bucket) = pad_notification_preview(&encoded).expect("padded");
+    // The same content, ISO/IEC 7816-4 padded to the next bucket up and declared as it: every length
+    // is a bucket the rule produces, and the content still belongs to the smaller one.
+    let larger = bucket + 1024;
+    let mut padded = encoded;
+    padded.push(0x80);
+    padded.resize(larger as usize, 0);
+    let envelope = seal_padded(&parties, &plaintext, &padded, larger);
+    // Refused either because the padding does not end in the last block of that bucket or because
+    // the length is not its content's bucket; whichever check sees it first, it is not opened.
+    let refused = reason(open(&parties, &envelope));
+    assert!(matches!(refused, "authentication" | "size"), "{refused}");
+}
