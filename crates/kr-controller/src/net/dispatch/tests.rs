@@ -1635,6 +1635,24 @@ async fn a_devices_close_waiting_for_the_workers_link_is_refused_once_a_feed_ref
                 ),
                 "{error:?}"
             );
+            // Nothing reached the worker: with the refusal gone, the same close is performed now,
+            // and not answered from an action the worker had already performed.
+            controller
+                .settle_unverified_withdrawals(None)
+                .await
+                .expect("the refusal is lifted");
+            let closed = try_close_for_a_device_of(
+                controller,
+                accepted,
+                &connection,
+                &close,
+                &[ActionRight::SessionView, ActionRight::SessionClose],
+            )
+            .await
+            .expect("the close goes through once the refusal is gone");
+            assert_eq!(closed.retained, crate::service::net::Retained::Not);
+            let answered: SessionCloseResult = closed.value.to_typed().expect("a close result");
+            assert_eq!(answered.state, SessionState::Closing);
         } else {
             let closed = closed.expect("the close goes through");
             let answered: SessionCloseResult = closed.value.to_typed().expect("a close result");
@@ -1714,6 +1732,109 @@ async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refu
                 other => panic!("the read was not answered: {other:?}"),
             }
             assert_eq!(forwarded_reads(&recorded).len(), 1);
+        }
+        world.serving.abort();
+    }
+}
+
+/// KR-REQ-24.15: a device's raw input that waits for the write half of its link to the session's
+/// worker, behind a frame the worker is slow to take, is refused once it has the half if the
+/// authority feed has raised a refusal on remote grants meanwhile, and nothing is sent. The
+/// control: the same wait with no refusal raised ends with the input at the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_input_waiting_for_the_workers_writer_is_refused_once_a_feed_refusal_rises() {
+    use std::sync::Arc;
+
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, InputSequence};
+    use kr_protocol::scalars::Bytes;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for refused in [false, true] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(move |request: &kr_protocol::envelope::Request| {
+                (request.method.method()? == Method::InputWrite).then(ParamsValue::empty)
+            }),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let device = paired_with_every_right(controller, 26);
+        let connection = super::RemoteConnection::for_test(controller, device);
+        let input = |id: u64| {
+            device_request(
+                id,
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: world.session_id,
+                    attachment_id: AttachmentId::new(Uuid::from_bytes([9; 16])),
+                    epoch: InputLeaseEpoch::new(1),
+                    sequence: InputSequence::new(id),
+                    bytes: Bytes::new(b"x".to_vec()),
+                },
+            )
+        };
+        // The first input opens the link, and is the call the second one waits behind.
+        let first = connection.read(&input(1)).await;
+        assert!(
+            matches!(
+                first,
+                kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                    outcome: kr_protocol::envelope::Outcome::Ok(_),
+                    ..
+                })
+            ),
+            "{first:?}"
+        );
+        let proxy = connection
+            .proxy
+            .lock()
+            .await
+            .clone()
+            .expect("the first input opened the link");
+        let held = proxy.hold_the_writer().await;
+        let waiting = proxy.calls_at_the_writer() + 1;
+
+        let second = input(2);
+        let (answer, ()) = tokio::join!(connection.read(&second), async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while proxy.calls_at_the_writer() < waiting {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the input waits for the writer");
+            if refused {
+                controller.raise_the_unverified_withdrawal_refusal().await;
+            }
+            drop(held);
+        });
+        if refused {
+            let error = refusal(answer);
+            assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+            assert_eq!(
+                forwarded_reads(&recorded).len(),
+                1,
+                "input refused at the writer reaches no worker"
+            );
+        } else {
+            assert!(
+                matches!(
+                    answer,
+                    kr_protocol::envelope::ControlFrame::Response(
+                        kr_protocol::envelope::Response {
+                            outcome: kr_protocol::envelope::Outcome::Ok(_),
+                            ..
+                        }
+                    )
+                ),
+                "{answer:?}"
+            );
+            assert_eq!(forwarded_reads(&recorded).len(), 2);
         }
         world.serving.abort();
     }

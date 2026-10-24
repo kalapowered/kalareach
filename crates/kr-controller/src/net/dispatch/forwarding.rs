@@ -190,6 +190,7 @@ impl RemoteConnection {
                 &envelope,
                 authority,
                 Some(&asked.acting.grant.history),
+                &|| self.controller.refuse_while_the_feed_refuses(),
             )
             .await
         {
@@ -302,6 +303,7 @@ impl RemoteConnection {
         // holds no grants: section 8's intersection of requested capabilities with the actor's
         // rights is made where the attachment is admitted, out of what the host checked this
         // request against.
+        let controller = Arc::clone(&self.controller);
         let effect = tokio::spawn(async move {
             proxy
                 .forward_mutation(
@@ -314,6 +316,7 @@ impl RemoteConnection {
                         lease: bound.lease,
                     },
                     bound.deadline_boot_ms,
+                    &|| controller.refuse_while_the_feed_refuses(),
                 )
                 .await
         });
@@ -637,6 +640,7 @@ impl RemoteConnection {
                 &envelope,
                 authority,
                 Some(&asked.acting.grant.history),
+                &|| self.controller.refuse_while_the_feed_refuses(),
             )
             .await
         else {
