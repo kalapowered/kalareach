@@ -798,6 +798,36 @@ async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pas
         "a device is refused, and told why, while the host is behind its feed: {outcome:?}"
     );
 
+    // The feed turns the next read back. What stops the pass now is the feed, and the host has not
+    // stopped being behind it, but the registry is not what to look at.
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    rig.served.web().fail(
+        AUTHORITY,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    );
+    rig.timer.release_held();
+    within("a pass ends at the feed", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    let check = rig.shown().await.check.expect("the feed check");
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| !remedy.contains("registry")),
+        "a pass the feed stopped is not put down to the registry: {:?}",
+        check.remedy()
+    );
+
     // The fault clears, and the pass that follows finishes what the first could not.
     rusqlite::Connection::open(rig.host.tree().environment().registry_database())
         .expect("the registry opens")

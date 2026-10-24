@@ -157,8 +157,9 @@ pub(crate) struct Withheld {
 enum Issuer {
     /// A device that could have made it, and the host could have carried it out.
     Could,
-    /// The registry holds the device that made it, or every device that holds its key, and none
-    /// could have: the host would have refused it, or it was not signed by the key it names.
+    /// The registry holds the device that made it and it could not have, or holds devices that
+    /// hold the key it names and none of them signed it: no request this host could have carried
+    /// out.
     CouldNot,
     /// The registry cannot show who made it.
     Unknown,
@@ -651,15 +652,20 @@ impl Controller {
     /// registry, if it holds the revocation, holds what it withdrew. The owner is the device the
     /// request names, decided alone; when the registry holds no such device, a device that is not
     /// revoked, holds the key the request names and could have made it, which is how an owner
-    /// paired again is found, and not the first that holds the key. What is already withdrawn is left alone, so a request the
-    /// registry shows done raises no barrier, and carrying one out twice is carrying it out once.
+    /// paired again is found, and not the first that holds the key. What is already withdrawn is
+    /// left alone, so a request the registry shows done raises no barrier, and carrying one out
+    /// twice is carrying it out once.
     ///
     /// A request that names a device or grant the registry holds live, and whose owner the registry
-    /// cannot show it to be, because it holds no device of that identity and none that is not
-    /// revoked that holds the key and could have made it, can be neither carried out nor dismissed:
-    /// it comes back as [`Replay::Unverified`], and the host refuses every grant but the owner's at
-    /// this machine until the owner at this machine has revoked what it names or paired the owner
-    /// again. A key held only by a device that is revoked says nothing of who signed.
+    /// cannot show it to be, can be neither carried out nor dismissed: it comes back as
+    /// [`Replay::Unverified`], and the host refuses every grant but the owner's at this machine
+    /// until the owner at this machine has revoked what it names or paired the owner again. The
+    /// registry cannot show the owner when it holds no device of the identity the request gives
+    /// and no device that is not revoked that holds the key it names, and when the devices that
+    /// hold the key include one that signed it but may not manage this host. A key held only by a
+    /// device that is revoked says nothing of who signed. When devices hold the key and none of
+    /// them signed the request, it is no request this host could have carried out, and is
+    /// dismissed.
     ///
     /// # Errors
     ///

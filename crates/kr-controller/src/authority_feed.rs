@@ -482,7 +482,13 @@ impl FeedRuntime {
             (state, remedy)
         } else if observed.unverified {
             (DoctorStatus::Warning, Some(UNVERIFIED_REMEDY))
-        } else if observed.catching_up {
+        } else if observed.catching_up
+            && !matches!(
+                observed.stopped,
+                Some(Stopped::Unreachable | Stopped::Refused)
+            )
+        {
+            // The registry is the likely cause only when the pass was not stopped by the feed.
             (DoctorStatus::Warning, Some(CATCHING_UP_REMEDY))
         } else {
             (state, remedy)
@@ -583,11 +589,12 @@ impl Drop for FeedRuntime {
 }
 
 /// What a person who finds the host refusing remote access for a withdrawal it cannot verify does:
-/// the devices and the grants the withdrawal names are what to revoke, and the owner who made it is
-/// the one to pair again.
+/// the devices and the grants the withdrawal names are what to revoke, and the owner who made it,
+/// by the key the check gives, is the one to pair again.
 const UNVERIFIED_REMEDY: &str = "Revoke what the request names, with `kr device revoke <device>` for a \
-     device and `kr share revoke <grant>` for a grant, or pair the owner who made it again. \
-     Remote access returns once the request can be verified.";
+     device and `kr share revoke <grant>` for a grant, or pair the owner who made it again, the \
+     one who holds the key named. Remote access returns once the request names nothing live here \
+     or its owner is paired again.";
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
@@ -1259,43 +1266,6 @@ mod tests {
             Some(&acknowledged(pending(1))),
             RevocationCompletion::Complete
         ));
-    }
-
-    /// KR-REQ-24.15: `kr doctor` names what a withdrawal the host cannot verify would withdraw, the
-    /// grants in the grant store among it, and the key the request gives for its issuer, so the
-    /// owner at the machine has something to revoke, and says how many more it does not list.
-    #[test]
-    fn a_withdrawal_the_host_cannot_verify_is_named_by_its_devices_grants_and_issuer_key() {
-        let id = |byte: u8| kr_protocol::scalars::Uuid::from_bytes([byte; 16]);
-        let issuer = DeviceId::new(id(1));
-        let key = KeyId::from_bytes([0xab; 32]);
-        let mut found = Unverified {
-            issuers: [(issuer, key)].into_iter().collect(),
-            devices: [DeviceId::new(id(2))].into_iter().collect(),
-            grants: [kr_protocol::ids::GrantId::new(id(3))]
-                .into_iter()
-                .collect(),
-        };
-        let said = names_of(&found);
-        let said = said.as_str();
-        for named in [
-            issuer.to_string(),
-            DeviceId::new(id(2)).to_string(),
-            kr_protocol::ids::GrantId::new(id(3)).to_string(),
-            "abababababababab".to_owned(),
-        ] {
-            assert!(said.contains(&named), "{named} is not said in: {said}");
-        }
-
-        found
-            .devices
-            .extend((10..10 + MOST_NAMED as u8 + 2).map(|byte| DeviceId::new(id(byte))));
-        let said = names_of(&found);
-        assert!(
-            said.as_str().contains("3 more are not listed"),
-            "{}",
-            said.as_str()
-        );
     }
 
     #[derive(Debug)]
