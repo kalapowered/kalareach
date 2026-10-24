@@ -448,11 +448,13 @@ impl From<OwnershipRefusal> for ControllerError {
 /// What [`ArchiveService::bring_forward`] left of a session's store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Forward {
-    /// There was nothing to make, or it was made: the store is not there, is at the current
-    /// version, is older than the ladder, or was brought forward.
+    /// Nothing was held back: the store is not there, is at the current version, is older than the
+    /// ladder or newer than this build, or its version could not be read, or a migration was
+    /// attempted. Whether the store can be read is for the reader to find.
     Settled,
-    /// A migration is due and was not made, because a worker may still own the store or another
-    /// recovery holds it. A later look may make it.
+    /// A migration is due and was not made, because a worker may still own the store, the
+    /// daemon's evidence could not rule one out (its registry was busy or unreadable), or the
+    /// recovery lock could not be taken. A later look may make it.
     HeldBack,
 }
 
