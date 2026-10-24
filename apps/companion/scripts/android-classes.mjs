@@ -53,6 +53,21 @@ const REQUIRED = [
   'to.kala.reach.platform.PlatformPlugin'
 ]
 
+/**
+ * Where the source of each required class lives, for the failure to name. The service and the
+ * workers are the application module's; the plugin is the platform library's, which reaches the
+ * application through its own Gradle module and not through that source-set line.
+ */
+const SOURCES = {
+  'to.kala.reach.platform.PlatformPlugin': 'apps/companion/native/platform/android/src/main/java'
+}
+const APPLICATION_SOURCES = 'apps/companion/native/android/android/src/main/java'
+
+/** The source directories the missing classes belong to, for a failure to say what is not compiling. */
+export function sourcesOf(missing) {
+  return [...new Set(missing.map((name) => SOURCES[name] ?? APPLICATION_SOURCES))]
+}
+
 /** The packages whose classes are listed by `--list`. */
 const HAND_WRITTEN = ['to.kala.reach.companion.push.', 'to.kala.reach.companion.mobile.']
 
@@ -552,8 +567,7 @@ export function verify(paths) {
       `${relative(process.cwd(), path)} is missing ${missing.length} of ${REQUIRED.length} ` +
         'hand-written native classes:\n' +
         missing.map((name) => `  ${name}`).join('\n') +
-        '\nThe application module is not compiling ' +
-        'apps/companion/native/android/android/src/main/java into this build.'
+        `\nThe build is not compiling ${sourcesOf(missing).join(' and ')} into this application.`
     )
   }
   return whole
