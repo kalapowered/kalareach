@@ -805,15 +805,7 @@ async fn pass(
             .await
             .map_err(|error| Stopped::of(&error, &shared.quiet))?;
         if state.summary.removed {
-            controller
-                .authority_feed_removed(&shared.origin)
-                .await
-                .map_err(Stopped::local)?;
-            shared.removed.store(true, Ordering::SeqCst);
-            // The refusal a withdrawal this host cannot verify puts on remote grants may outlive
-            // the removal.
-            shared.observed().unverified = !controller.unverified_withdrawals().is_empty();
-            return Ok(Pass::Removed);
+            return removed(shared, controller).await;
         }
         let mut now = Latest::of(&state);
         // The feed's revision for this host, against the registry's, before a record is settled: a
@@ -848,7 +840,11 @@ async fn pass(
                     // feed through: a scan that stops half way leaves the list as it is. A change
                     // the feed turns back stops the pass like any other request it turns back,
                     // with the delay it asked for.
-                    withhold_from_the_feed(shared, controller, &mut now).await?;
+                    if withhold_from_the_feed(shared, controller, &mut now).await?
+                        == Delegation::Removed
+                    {
+                        return removed(shared, controller).await;
+                    }
                 }
                 Settled::Waiting => {
                     contiguous = false;
@@ -934,7 +930,9 @@ async fn pass(
             // The requests that waited for the places are judged by the scan that begins now.
             return Ok(Pass::More);
         }
-        name_owners(shared, controller, &latest).await?;
+        if name_owners(shared, controller, &latest).await? == Delegation::Removed {
+            return removed(shared, controller).await;
+        }
     }
     controller.authority_feed_synchronised();
     shared.observed().stopped = None;
@@ -945,6 +943,34 @@ async fn pass(
     })
 }
 
+/// Records that the feed answered that it removed this host, whichever request it answered, and
+/// ends the pass there: the grants that rest on the feed are refused from this moment and nothing
+/// more is asked of a feed that removed the host.
+async fn removed(
+    shared: &Arc<Shared>,
+    controller: &Arc<Controller>,
+) -> std::result::Result<Pass, Stopped> {
+    controller
+        .authority_feed_removed(&shared.origin)
+        .await
+        .map_err(Stopped::local)?;
+    shared.removed.store(true, Ordering::SeqCst);
+    // The refusal a withdrawal this host cannot verify puts on remote grants may outlive the
+    // removal.
+    shared.observed().unverified = !controller.unverified_withdrawals().is_empty();
+    Ok(Pass::Removed)
+}
+
+/// What the feed answered a change to the list of keys that may remove it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delegation {
+    /// The feed took the change, or none was asked.
+    Taken,
+    /// The feed answered that it removed this host. A list changed after the removal proves nothing
+    /// about who removed it, so nothing is concluded from it.
+    Removed,
+}
+
 /// Names the keys of the owners this host is paired with as the ones that may remove the feed,
 /// when the feed lists others. The feed replaces the whole list, so one delegation is in flight at
 /// a time, and what the feed lists on its answers is what is compared.
@@ -952,7 +978,7 @@ async fn name_owners(
     shared: &Arc<Shared>,
     controller: &Arc<Controller>,
     latest: &Latest,
-) -> std::result::Result<(), Stopped> {
+) -> std::result::Result<Delegation, Stopped> {
     let (named, beyond) = controller.owner_key_ids().map_err(Stopped::local)?;
     shared.observed().unnamed_owners = beyond;
     let mut wanted = named.clone();
@@ -966,15 +992,14 @@ async fn name_owners(
             .await
             .map_err(|error| Stopped::of(&error, &shared.quiet))?;
         if answer.summary.removed {
-            // A feed that was removed in between takes the change and says so, and a list changed
-            // after the removal proves nothing about who removed it.
-            return Ok(());
+            // A feed that was removed in between takes the change and says so.
+            return Ok(Delegation::Removed);
         }
     }
     // The list the feed holds is the owners this host names, and none of them is a key a
     // withdrawal this host cannot verify takes the right from.
     controller.feed_lists_no_withheld_key();
-    Ok(())
+    Ok(Delegation::Taken)
 }
 
 /// Takes the keys of the devices a withdrawal this host cannot verify names out of the keys the
@@ -984,7 +1009,7 @@ async fn withhold_from_the_feed(
     shared: &Arc<Shared>,
     controller: &Arc<Controller>,
     latest: &mut Latest,
-) -> std::result::Result<(), Stopped> {
+) -> std::result::Result<Delegation, Stopped> {
     let withheld = controller.withheld_key_ids();
     let kept: Vec<KeyId> = latest
         .removal_keys
@@ -999,13 +1024,12 @@ async fn withhold_from_the_feed(
             .await
             .map_err(|error| Stopped::of(&error, &shared.quiet))?;
         if answer.summary.removed {
-            // See `name_owners`: the list proves nothing once the feed has been removed.
-            return Ok(());
+            return Ok(Delegation::Removed);
         }
         latest.removal_keys = kept;
     }
     controller.feed_lists_no_withheld_key();
-    Ok(())
+    Ok(Delegation::Taken)
 }
 
 /// How a record the feed holds stands after this host has dealt with it.
