@@ -29,11 +29,16 @@ use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionRule};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
-use kr_protocol::ids::{DeviceId, RevocationRequestId};
+use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
 use kr_protocol::method::Method;
-use kr_protocol::pairing::{RevocationCompletion, RevocationRequest, RevocationTarget};
+use kr_protocol::pairing::{
+    AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, RevocationAcknowledgement,
+    RevocationCompletion, RevocationRequest, RevocationTarget,
+};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, Signature64, U64};
+use kr_protocol::scalars::{
+    AuthorisationKey, CanonicalSet, KeyId, Nullable, Signature64, TimestampMs, U64,
+};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, OfflineValidityPolicy};
 use kr_service_stand_in::{Moment, Served, serve};
@@ -78,6 +83,9 @@ struct Rig {
     served: Served,
     timer: Arc<HeldTimer>,
     owner: DeviceKeys,
+    /// The host's own keys, which a case signs with when it makes the feed hold what an earlier run
+    /// of the host would have left in it.
+    host_keys: DeviceKeys,
     /// The owner, as a remote owner's client reaches the feed.
     remote: AuthorityFeedClient,
 }
@@ -105,15 +113,22 @@ impl Rig {
         let served = serve().await;
         let timer = HeldTimer::held();
         let owner = DeviceKeys::generate().expect("owner keys");
-        let host =
-            Host::start_with_feed_on(&owner, served.origin(), Arc::clone(&timer) as _, clocks)
-                .await;
+        let host_keys = DeviceKeys::generate().expect("host keys");
+        let host = Host::start_with_feed_keys(
+            &owner,
+            &host_keys,
+            served.origin(),
+            Arc::clone(&timer) as _,
+            clocks,
+        )
+        .await;
         let remote = client_for(served.origin(), owner.authorisation.clone());
         let rig = Self {
             host,
             served,
             timer,
             owner,
+            host_keys,
             remote,
         };
         // Every pass the start and the pairing of the owner asked for has run: the owner's key is
@@ -240,6 +255,7 @@ impl Rig {
             host,
             served,
             owner,
+            host_keys,
             remote,
             ..
         } = self;
@@ -267,6 +283,7 @@ impl Rig {
             served,
             timer,
             owner,
+            host_keys,
             remote,
         }
     }
@@ -274,7 +291,12 @@ impl Rig {
     /// Stops the daemon and starts it again with its configuration document selecting `feed`, a
     /// service that holds nothing of this host. A suite closes its clients before it restarts.
     async fn pointed_at(self, feed: Served) -> Self {
-        let Self { host, owner, .. } = self;
+        let Self {
+            host,
+            owner,
+            host_keys,
+            ..
+        } = self;
         let stopped = host.shut_down().await;
         net_support::write_feed_document(stopped.tree(), Some(feed.origin()));
         let timer = HeldTimer::held();
@@ -285,6 +307,7 @@ impl Rig {
             served: feed,
             timer,
             owner,
+            host_keys,
             remote,
         }
     }
@@ -1701,6 +1724,359 @@ async fn a_request_for_what_the_owner_at_the_machine_already_withdrew_issues_no_
         "no revision was issued for it"
     );
     assert_eq!(held.summary.authority_revision.0, None);
+}
+
+/// The host, as the feed knows it: requests signed with the host's own key.
+#[derive(Debug)]
+struct HostAtTheFeed(AuthorisationKeyPair);
+
+impl kr_client::services::ServiceSigner for HostAtTheFeed {
+    fn signer(&self) -> ServiceRequestSigner {
+        ServiceRequestSigner::Host
+    }
+
+    fn public_key(&self) -> AuthorisationKey {
+        *self.0.public()
+    }
+
+    fn sign(&self, message: &[u8]) -> kr_client::Result<Signature64> {
+        let transcript = SigningTranscript::from_canonical_bytes(
+            ServiceRequestSigner::Host.domain(),
+            message.to_vec(),
+        )
+        .expect("a transcript");
+        Ok(sign(&self.0, &transcript).expect("a signature"))
+    }
+}
+
+impl Rig {
+    /// Makes the feed hold what an earlier run of the host that carried `request` out would have
+    /// left in it: revision `number`, issued after `previous`, for that request, and the request
+    /// acknowledged complete. The host that runs now has taken none of it.
+    async fn an_earlier_run_carried_out(
+        &self,
+        request: &RevocationRequest,
+        previous: u64,
+        number: u64,
+    ) {
+        let gateway = GatewayOrigin::new(self.served.origin()).expect("an origin");
+        let http: Arc<dyn ServiceHttp> = Arc::new(
+            HttpService::with(
+                gateway.clone(),
+                HttpDeadlines::default(),
+                managed_response_limits(),
+            )
+            .expect("a transport"),
+        );
+        let as_the_host = AuthorityFeedClient::new(
+            gateway,
+            http,
+            Arc::new(HostAtTheFeed(self.host_keys.authorisation.clone())),
+        );
+        let mut revision = AuthorityRevisionRecord {
+            host_device_id: self.host_device(),
+            authority_revision: AuthorityRevision::new(number),
+            previous_revision: AuthorityRevision::new(previous),
+            applied_requests: [request.request_id]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+            issued_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+            host_key_id: self.feed(),
+            signature: Signature64::from_bytes([0; 64]),
+        };
+        let input = revision.signing_input().expect("a signing input");
+        let transcript = SigningTranscript::from_canonical_bytes(AUTHORITY_REVISION_DOMAIN, input)
+            .expect("a transcript");
+        revision.signature = sign(&self.host_keys.authorisation, &transcript).expect("a signature");
+        as_the_host
+            .revise(&revision, None)
+            .await
+            .expect("the feed takes the revision");
+        as_the_host
+            .acknowledge(
+                &RevocationAcknowledgement {
+                    request_id: request.request_id,
+                    host_device_id: self.host_device(),
+                    authority_revision: AuthorityRevision::new(number),
+                    completion: RevocationCompletion::Complete,
+                    acknowledged_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+                },
+                None,
+            )
+            .await
+            .expect("the feed takes the acknowledgement");
+    }
+
+    /// A request `issuer` signs with `key`, naming `target`, under a fixed identity.
+    fn request_of(
+        &self,
+        key: &AuthorisationKeyPair,
+        issuer: DeviceId,
+        id: u8,
+        target: RevocationTarget,
+    ) -> RevocationRequest {
+        kr_pairing::grants::sign_revocation_request(
+            key,
+            RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([id; 16])),
+            issuer,
+            self.host_device(),
+            target,
+            TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("a signed request")
+    }
+
+    /// Publishes `request` as the holder of `key`, whose key the feed knows it by.
+    async fn published_as(&self, key: &AuthorisationKeyPair, request: &RevocationRequest) {
+        client_for(self.served.origin(), key.clone())
+            .publish(self.feed(), request, None)
+            .await
+            .expect("the feed stores the request");
+    }
+
+    /// What the feed holds of `request`, as the holder of `key` who published it reads it.
+    async fn held_as(
+        &self,
+        key: &AuthorisationKeyPair,
+        request: &RevocationRequest,
+    ) -> kr_client::services::authority::AuthorityFeedRecord {
+        client_for(self.served.origin(), key.clone())
+            .read(self.feed(), None, false)
+            .await
+            .expect("the feed answers its publisher")
+            .record(request.request_id)
+            .expect("the record")
+            .clone()
+    }
+}
+
+/// A device's request that the host has not taken, ahead in the feed of a withdrawal of that device
+/// that an earlier run of the host carried out, and a host that stands behind the feed.
+struct PutOff {
+    rig: Rig,
+    /// The device that made the first request, an owner.
+    issuer: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The device the first request names.
+    target: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// A device neither request names.
+    kept: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// The first request.
+    first: RevocationRequest,
+}
+
+/// Pairs an owner `v`, a device `t` its request will name and a device `k` nothing names, has `v`
+/// publish a request naming `t` and then an owner `o` publish a withdrawal of `v`, and makes the feed
+/// hold the withdrawal as an earlier run of the host would have left it: carried out, under
+/// revision 1. The host that runs now has not taken the first request, and stands at revision 0
+/// behind the feed. `o` is an owner it knows when `o_is_paired`, and one a registry put back to
+/// before it was paired does not hold otherwise.
+async fn a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(
+    o_is_paired: bool,
+) -> PutOff {
+    let rig = Rig::start().await;
+    let rights = [ActionRight::HostManage, ActionRight::SessionView];
+    let issuer = rig.pairs(&rights).await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let (o_key, o_device) = if o_is_paired {
+        let o = rig.pairs(&rights).await;
+        (o.0.keys().authorisation.clone(), o.1.device_id)
+    } else {
+        (
+            AuthorisationKeyPair::generate().expect("a key"),
+            DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0e; 16])),
+        )
+    };
+    // Every pass the pairings woke has ended, so none reads the feed before the case has made it.
+    rig.until_the_carrier_is_idle().await;
+    let issuer_key = issuer.0.keys().authorisation.clone();
+    let first = rig.request_of(
+        &issuer_key,
+        issuer.1.device_id,
+        0xe1,
+        devices(target.1.device_id),
+    );
+    let withdrawal = rig.request_of(&o_key, o_device, 0xe2, devices(issuer.1.device_id));
+    rig.published_as(&issuer_key, &first).await;
+    rig.published_as(&o_key, &withdrawal).await;
+    rig.an_earlier_run_carried_out(&withdrawal, 0, 1).await;
+    PutOff {
+        rig,
+        issuer,
+        target,
+        kept,
+        first,
+    }
+}
+
+/// KR-REQ-24.15: a request the host put off while it was behind its feed is judged by the standing
+/// its issuer had at its place in the feed. A withdrawal of the issuer that the host cannot verify
+/// comes after the request, so it took nothing from the issuer yet: the request is carried out, and
+/// its targets stay withdrawn when the owner at the machine has dealt with the withdrawal, which is
+/// what the host refuses remote access for meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_put_off_ahead_of_a_withdrawal_the_host_cannot_verify_is_carried_out() {
+    let PutOff {
+        rig,
+        issuer,
+        target,
+        kept,
+        first,
+    } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(false).await;
+    rig.until_the_carrier_is_idle().await;
+
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(
+        says_an_owner_is_unknown(&refused),
+        "the withdrawal the host cannot verify refuses remote access: {refused:?}"
+    );
+    let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
+    assert_eq!(
+        held.rejected.0, None,
+        "the device was an owner where its request stands in the feed: {held:?}"
+    );
+    assert_eq!(
+        held.acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "and the host carried it out: {held:?}"
+    );
+
+    // The owner at this machine revokes the device the withdrawal names, as the doctor says.
+    let mut local = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: issuer.1.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+    rig.until_the_carrier_is_idle().await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the other device is served once the owner at the machine has acted");
+    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
+        .await;
+}
+
+/// KR-REQ-24.15: a request put off while the host was behind its feed is judged at its place when
+/// the owner who withdrew its issuer after it is one the host knows, and the host revoked the
+/// issuer by carrying that withdrawal out again first: the issuer was an owner where the request
+/// stands in the feed, and the request is carried out, not refused for the issuer's having been
+/// revoked since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_carried_out() {
+    let PutOff {
+        rig,
+        issuer,
+        target,
+        kept,
+        first,
+    } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(true).await;
+    rig.until_the_carrier_is_idle().await;
+
+    let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
+    assert_eq!(
+        held.rejected.0, None,
+        "the device was an owner where its request stands in the feed: {held:?}"
+    );
+    assert_eq!(
+        held.acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "and the host carried it out: {held:?}"
+    );
+    rig.connects_while_a_revocation_is_held(&issuer.0, &issuer.1)
+        .await;
+    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
+        .await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the device nothing names is served");
+}
+
+/// KR-REQ-24.15: where a withdrawal stands in the feed is read from the feed by every run, and no
+/// state of the run before is needed. The host stops after the scan that carried the later
+/// withdrawal out again and before the scan that judges the request, and the run that follows
+/// carries the request out all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_ahead_of_a_withdrawal_is_carried_out_by_the_run_that_follows_a_stop_between_them()
+ {
+    let PutOff {
+        rig,
+        issuer,
+        target,
+        kept,
+        first,
+    } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(true).await;
+    // The first scan reads the feed (1), puts the request off and carries the withdrawal out
+    // again; the feed turns the second scan's read (2) back, and the host stops there.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 2, TURNED_BACK);
+    rig.poll().await;
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+
+    let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
+    assert_eq!(
+        held.rejected.0, None,
+        "the run that follows judges the request at its place: {held:?}"
+    );
+    rig.connects_while_a_revocation_is_held(&target.0, &target.1)
+        .await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the device nothing names is served");
+}
+
+/// KR-REQ-24.15: a device the owner at the machine revoked has no place in the feed, so its
+/// request is refused, however the feed's later records stand: the host holds it for one scan, to
+/// learn that no record explains the revocation, and then refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_of_a_device_the_owner_revoked_at_the_machine_is_refused() {
+    let rig = Rig::start().await;
+    let issuer = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let target = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let mut local = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: issuer.1.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+    rig.until_the_carrier_is_idle().await;
+    let key = issuer.0.keys().authorisation.clone();
+    let request = rig.request_of(&key, issuer.1.device_id, 0xe3, devices(target.1.device_id));
+    rig.published_as(&key, &request).await;
+    rig.poll().await;
+
+    assert_eq!(
+        rig.held_as(&key, &request).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "a revoked owner's request is refused"
+    );
+    let session = connect(&rig.host, &target.0, &target.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("what the request named was not withdrawn");
 }
 
 /// What the owner at this machine is shown of the feed, on the local socket.

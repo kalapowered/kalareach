@@ -6577,8 +6577,8 @@ refused this way. It cannot revive a device, and the owner at the machine can al
 the refusal stands, the devices the request names keep no standing over the feed, and neither does a
 device that holds a key one of them holds. A feed removes the host by a key, so the host takes those
 keys out of the list of keys the feed takes a removal from as soon as it finds the withdrawal,
-before it has read the feed through, and a request one of them publishes is refused as lacking owner
-authority. Another owner can still remove the feed, which ends the refusal. If the named device is
+before it has read the feed through, and a request one of them publishes after the withdrawal is
+refused as lacking owner authority. Another owner can still remove the feed, which ends the refusal. If the named device is
 the only owner, no key can remove a lost host while the refusal stands. If the feed has not taken
 the change when it is removed, as when it turned the change back and still lists a key the
 withdrawal takes the right from, the removal says nothing of an owner having acted, and the refusal
@@ -6587,6 +6587,16 @@ does not read a feed that has been removed, so nothing finds the condition again
 holds that is not shown complete waits until the host
 has caught up, and is then judged on the registry as it stands, in a scan of its own that is the
 synchronisation a connection waits for, so the owner is not refused for the host's being behind.
+A request is judged by the standing its issuer had at the request's place in the feed. A withdrawal
+that comes later in the feed than the request took nothing from the issuer yet, so a request that
+the host put off while it was behind is carried out when the issuer was revoked by a later record:
+by a withdrawal the host cannot verify, which only withholds the issuer, or by a withdrawal the
+host carried out again itself. The host reads where in the feed it revoked each device at every
+start, from the first record, so nothing is stored for it, and a request that comes before the
+first scan of a run has read the feed through waits for that scan. A device the owner at the
+machine revoked has no place in the feed, and its request is refused. A device that the owner at
+the machine revoked and that a later record also names is taken to have been revoked by that
+record, and a request it made earlier in the feed is carried out, which only withdraws.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier
 that fences the workers and withdraws every connection admitted under the earlier state. The next
 revision it issues is then above everything it issued, and it decides again. A pass that stops

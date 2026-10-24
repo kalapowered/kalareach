@@ -79,13 +79,16 @@ async fn a_completed_request_is_carried_out_again_only_when_its_issuer_could_man
 
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &manager_key,
-                manager.device_id,
-                withdrawn.device_id,
-                7,
-            ))
+            .replay_feed_request(
+                &signed(
+                    &controller,
+                    &manager_key,
+                    manager.device_id,
+                    withdrawn.device_id,
+                    7,
+                ),
+                1
+            )
             .await
             .expect("the manager's request is carried out again"),
         Replay::Done
@@ -97,13 +100,16 @@ async fn a_completed_request_is_carried_out_again_only_when_its_issuer_could_man
 
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &viewer_key,
-                viewer.device_id,
-                kept.device_id,
-                8,
-            ))
+            .replay_feed_request(
+                &signed(
+                    &controller,
+                    &viewer_key,
+                    viewer.device_id,
+                    kept.device_id,
+                    8,
+                ),
+                1
+            )
             .await
             .expect("the viewer's request is passed over"),
         Replay::Done,
@@ -117,7 +123,7 @@ async fn a_completed_request_is_carried_out_again_only_when_its_issuer_could_man
     let stranger = DeviceId::new(Uuid::from_bytes([9; 16]));
     let request = signed(&controller, &stranger_key, stranger, kept.device_id, 9);
     let Replay::Unverified(found) = controller
-        .replay_feed_request(&request)
+        .replay_feed_request(&request, 1)
         .await
         .expect("the stranger's request is passed over")
     else {
@@ -130,7 +136,7 @@ async fn a_completed_request_is_carried_out_again_only_when_its_issuer_could_man
     );
     assert_eq!(
         found.devices,
-        [kept.device_id].into_iter().collect(),
+        [(kept.device_id, 1)].into_iter().collect(),
         "and the device it would withdraw"
     );
     assert!(
@@ -142,13 +148,16 @@ async fn a_completed_request_is_carried_out_again_only_when_its_issuer_could_man
     // owner's, and is carried out.
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &manager_key,
-                DeviceId::new(Uuid::from_bytes([10; 16])),
-                withdrawn_by_the_paired_again.device_id,
-                10,
-            ))
+            .replay_feed_request(
+                &signed(
+                    &controller,
+                    &manager_key,
+                    DeviceId::new(Uuid::from_bytes([10; 16])),
+                    withdrawn_by_the_paired_again.device_id,
+                    10,
+                ),
+                1
+            )
             .await
             .expect("the request of an owner paired again is carried out"),
         Replay::Done
@@ -182,13 +191,10 @@ async fn a_completed_request_of_an_owner_the_host_revoked_is_dismissed() {
 
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &key,
-                owner.device_id,
-                named.device_id,
-                7
-            ))
+            .replay_feed_request(
+                &signed(&controller, &key, owner.device_id, named.device_id, 7),
+                1
+            )
             .await
             .expect("the request is passed over"),
         Replay::Done
@@ -218,13 +224,16 @@ async fn a_completed_request_is_attributed_to_the_pairing_of_its_key_that_could_
 
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &key,
-                DeviceId::new(Uuid::from_bytes([9; 16])),
-                named.device_id,
-                8,
-            ))
+            .replay_feed_request(
+                &signed(
+                    &controller,
+                    &key,
+                    DeviceId::new(Uuid::from_bytes([9; 16])),
+                    named.device_id,
+                    8,
+                ),
+                1
+            )
             .await
             .expect("the request is carried out"),
         Replay::Done
@@ -254,13 +263,10 @@ async fn a_completed_request_is_dismissed_when_the_ceiling_leaves_its_issuer_no_
 
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &key,
-                owner.device_id,
-                before.device_id,
-                7
-            ))
+            .replay_feed_request(
+                &signed(&controller, &key, owner.device_id, before.device_id, 7),
+                1
+            )
             .await
             .expect("the request is carried out"),
         Replay::Done
@@ -274,13 +280,10 @@ async fn a_completed_request_is_dismissed_when_the_ceiling_leaves_its_issuer_no_
         Some([ActionRight::SessionView].into_iter().collect());
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &key,
-                owner.device_id,
-                after.device_id,
-                8
-            ))
+            .replay_feed_request(
+                &signed(&controller, &key, owner.device_id, after.device_id, 8),
+                1
+            )
             .await
             .expect("the request is passed over"),
         Replay::Done
@@ -316,13 +319,16 @@ async fn a_completed_request_whose_key_only_a_revoked_device_holds_is_left_unver
     assert!(
         matches!(
             controller
-                .replay_feed_request(&signed(
-                    &controller,
-                    &key,
-                    DeviceId::new(Uuid::from_bytes([10; 16])),
-                    named.device_id,
-                    9,
-                ))
+                .replay_feed_request(
+                    &signed(
+                        &controller,
+                        &key,
+                        DeviceId::new(Uuid::from_bytes([10; 16])),
+                        named.device_id,
+                        9,
+                    ),
+                    1
+                )
                 .await
                 .expect("the request is left"),
             Replay::Unverified(_)
@@ -357,13 +363,10 @@ async fn a_completed_request_of_an_owner_whose_grant_ran_out_since_is_carried_ou
 
     assert_eq!(
         controller
-            .replay_feed_request(&signed(
-                &controller,
-                &key,
-                owner.device_id,
-                named.device_id,
-                7
-            ))
+            .replay_feed_request(
+                &signed(&controller, &key, owner.device_id, named.device_id, 7),
+                1
+            )
             .await
             .expect("the request is carried out"),
         Replay::Done
