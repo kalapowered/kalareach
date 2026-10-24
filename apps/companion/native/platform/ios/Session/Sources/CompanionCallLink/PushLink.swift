@@ -31,7 +31,7 @@ public enum PushLink {
   /// The commands the adapter takes.
   public static let commands = [
     "pushPermission", "pushAskPermission", "pushToken", "pushPendingSet", "pushPendingGet",
-    "pushPendingClear", "pushLimitedKey", "pushRoute",
+    "pushPendingClear", "pushPreviewKeys", "pushRoute",
   ]
 
   /// What a command's answer is: the result as JSON text, or a code and a message.

@@ -68,6 +68,7 @@ log="$artefacts/run.log"
 # The messages' outcomes are this run's alone: the judge keeps the last line of each message, and a
 # message this run never sent must not be judged on an earlier run's.
 : >"${artefacts:?}/challenge-outcomes.txt"
+: >"${artefacts:?}/delivery-outcomes.txt"
 # What the harness and the gateway hold lives on the internal disk, for this run.
 harness="$(mktemp -d "${TMPDIR:-/tmp}/kr-push-device.XXXXXX")"
 gateway_state="$harness/gateway"
@@ -307,12 +308,12 @@ for line in phone.splitlines():
 say("the key the host seals to is the key this phone holds (16.11)", own != "" and own == report.get("preview_key_id"),
     f"phone {own} host {report.get('preview_key_id')}")
 if platform == "android":
-    # The store names a file by the digest of the item's name, and the item's name is the key's
-    # identifier in hex.
+    # The store names a file by the digest of the item's name, and holds one sealed item: the set of
+    # preview keys the application handed over, whole. What is in it is sealed under the keystore.
     import hashlib
-    expected = hashlib.sha256((report.get("preview_key_id") or "").encode()).hexdigest()
+    expected = hashlib.sha256(b"preview-keys").hexdigest()
     limited = read("phone-limited.txt").split()
-    say("the limited store holds the key the host seals to, and that key only (16.11, 10.48)",
+    say("the limited store holds the one item that is the set of preview keys, and nothing else (16.11, 10.48)",
         limited == [expected], f"store {limited} expected {expected}")
 else:
     print("note=the iOS keychain cannot be listed from outside: the key's filing is shown by the write that preceded 'on' and by the Swift cases (10.48)")
@@ -334,6 +335,14 @@ else:
         shape.get("apns_alert") is True and shape.get("apns_mutable_content") == 1
         and shape.get("apns_expiration") is True and shape.get("apns_collapse_id") is True, f"{shape}")
 if platform == "android":
+    # The receiver logs why the alert it showed stands, never what the preview held. The question the
+    # worker asks carries no sentence of the host's own, so the host seals nothing to show: the real
+    # receiver opened the real host's seal, found it authentic and addressed to this phone, and had
+    # nothing to put in the alert's place.
+    deliveries = [line.partition("|")[2] for line in read("delivery-outcomes.txt").splitlines() if "|" in line]
+    say("the receiver opened each sealed preview the host sent and found nothing to show (16.11, 16.13)",
+        len(deliveries) > 0 and all(outcome.strip() == "delivery: shown (empty_preview)" for outcome in deliveries),
+        f"{deliveries}")
     cold = read("cold-start.txt")
     before_pid = cold.split("pid before the message: '")[1].split("'")[0] if "pid before the message: '" in cold else "?"
     after_pid = cold.split("pid after the message: '")[1].split("'")[0] if "pid after the message: '" in cold else ""
@@ -458,6 +467,7 @@ pump_android() { # <adb> <serial>
         outcome="$("$adb" -s "$serial" logcat -d -s KalaReachPush:I 2>/dev/null | tail -n 1 | sed 's/^.*KalaReachPush: //')"
         say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $outcome"
         if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
+            printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/delivery-outcomes.txt"
             check_android_notification "$adb" "$serial" "$n"
         else
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/challenge-outcomes.txt"
