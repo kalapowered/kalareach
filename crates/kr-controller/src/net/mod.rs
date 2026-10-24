@@ -739,16 +739,6 @@ impl NetworkHost {
         }
     }
 
-    /// How many authorised connections this host is serving now, for a suite that waits until it
-    /// has seen one end.
-    #[cfg(feature = "testing")]
-    pub(crate) fn connections_served(&self) -> usize {
-        self.live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-    }
-
     /// Returns the live connections this predicate selects, holding each one for the caller.
     ///
     /// The map holds weak handles, so an entry whose connection has already gone is skipped: its
@@ -1680,16 +1670,6 @@ impl Controller {
         // every worker would make one paused session everybody's wait.
         let _ = self.acknowledge_worker_revision(session_id).await;
         Ok(proxy)
-    }
-
-    /// How many network connections this daemon is serving now, for a suite that waits until the
-    /// host has seen one end.
-    #[cfg(feature = "testing")]
-    #[must_use]
-    pub fn network_connections_served(&self) -> usize {
-        self.network
-            .get()
-            .map_or(0, |guard| guard.host.connections_served())
     }
 
     /// Releases what the connections the authority feed refuses hold at their workers.

@@ -232,23 +232,8 @@ async fn kr_req_09_17_a_device_that_comes_back_after_its_anchored_grant_ran_out_
     let owner = DeviceKeys::generate().expect("owner keys");
     let moved = MovedClocks::new();
     let host = Host::start_on_clocks(&owner, moved.clocks()).await;
-    let device = Device::create().await;
-    let record = pair_with(&host, &device, &owner, proposal(VIEWER)).await;
-
     // The first connection anchors the grant, and ends.
-    let first = connect(&host, &device, &record).await;
-    first
-        .read::<_, kr_protocol::hostinfo::HostInfoResult>(Method::HostInfo, &())
-        .await
-        .expect("the host answers the device");
-    first.close();
-    tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while host.controller().network_connections_served() > 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the host sees the connection end");
+    let (device, record) = a_device_that_has_come_and_gone(&host, &owner).await;
 
     // The grant is a day's: two days on, on both clocks, it has run out, and nothing has observed
     // that.

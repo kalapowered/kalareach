@@ -1104,12 +1104,7 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
     if !delegations.is_empty() {
         // The change that follows the withdrawal has reached the feed, which turned it back: the
         // feed still lists the key of the device the withdrawal names.
-        within("the host's change to the list reaches the feed", async {
-            while rig.arrivals("delegate") <= delegated_before {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        rig.until_arrivals("delegate", delegated_before + 1).await;
         let listed = rig.feed_as_the_owner_sees_it().await.summary.removal_keys;
         assert!(
             listed.contains(&victim.0.keys().authorisation.key_id()),
@@ -1433,12 +1428,7 @@ async fn a_change_to_the_feeds_list_taken_after_the_feed_was_removed_does_not_en
         false,
     )
     .await;
-    within("the host's change reaches the feed", async {
-        while rig.arrivals("delegate") <= delegated {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    rig.until_arrivals("delegate", delegated + 1).await;
     client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
         .remove(rig.feed())
         .await
