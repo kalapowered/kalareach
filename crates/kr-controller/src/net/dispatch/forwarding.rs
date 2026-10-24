@@ -16,6 +16,7 @@ use kr_transport::window::AcceptedDeadline;
 use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::HeldBound;
+use crate::service::FeedStanding;
 
 use super::acting::Acting;
 use super::decision::{Asked, session_of};
@@ -57,6 +58,13 @@ fn unreadable_retained_answer() -> ProtocolError {
 }
 
 impl RemoteConnection {
+    /// The standing work decided under `acting` takes with it: this connection's pairing grant,
+    /// `acting`, and the shares it has decided a request under.
+    pub(super) fn feed_standing(&self, acting: &kr_protocol::grant::Grant) -> FeedStanding {
+        self.controller
+            .feed_standing(self.connection_id, &self.device.grant, acting)
+    }
+
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
     ///
     /// A catalogue action names no session: its receipt is kept by the catalogue, beside the
@@ -184,16 +192,14 @@ impl RemoteConnection {
             Ok(authority) => authority,
             Err(error) => return failure(request.request_id, error),
         };
+        let standing = self.feed_standing(&asked.acting.grant);
         match proxy
             .forward_read(
                 request,
                 &envelope,
                 authority,
                 Some(&asked.acting.grant.history),
-                &|| {
-                    self.controller
-                        .refuse_while_the_feed_refuses(self.connection_id)
-                },
+                &|| self.controller.refuse_while_the_feed_refuses(&standing),
             )
             .await
         {
@@ -307,7 +313,10 @@ impl RemoteConnection {
         // rights is made where the attachment is admitted, out of what the host checked this
         // request against.
         let controller = Arc::clone(&self.controller);
-        let connection_id = self.connection_id;
+        // This task outlives the connection, so it takes the standing the feed's refusal is asked
+        // of with it, and a connection that ends while the mutation waits for the writer does not
+        // lift the refusal.
+        let standing = self.feed_standing(&acting.grant);
         let effect = tokio::spawn(async move {
             proxy
                 .forward_mutation(
@@ -320,7 +329,7 @@ impl RemoteConnection {
                         lease: bound.lease,
                     },
                     bound.deadline_boot_ms,
-                    &|| controller.refuse_while_the_feed_refuses(connection_id),
+                    &|| controller.refuse_while_the_feed_refuses(&standing),
                 )
                 .await
         });
@@ -638,16 +647,14 @@ impl RemoteConnection {
         let authority = self
             .authority_deadline(asked)
             .map_err(RouteRefusal::Conflict)?;
+        let standing = self.feed_standing(&asked.acting.grant);
         let Ok(response) = proxy
             .forward_read(
                 &request,
                 &envelope,
                 authority,
                 Some(&asked.acting.grant.history),
-                &|| {
-                    self.controller
-                        .refuse_while_the_feed_refuses(self.connection_id)
-                },
+                &|| self.controller.refuse_while_the_feed_refuses(&standing),
             )
             .await
         else {

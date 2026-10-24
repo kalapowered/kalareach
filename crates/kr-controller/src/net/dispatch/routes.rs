@@ -823,6 +823,9 @@ impl RemoteConnection {
                 let (tell, delivered) = tokio::sync::oneshot::channel();
                 self.output().on_delivery(request_id, tell);
                 let observer = self.expiry_observer();
+                // The close runs on a task that outlives this connection, so it takes the standing
+                // the feed's refusal is asked of with it.
+                let standing = self.feed_standing(&decided.acting.grant);
                 tokio::spawn(async move {
                     controller
                         .close_remote_session(
@@ -835,6 +838,7 @@ impl RemoteConnection {
                                 // Stopping owned execution does not depend on the remote lease.
                                 lease: None,
                             },
+                            &standing,
                             accepted,
                             Some(&observer),
                             answer,

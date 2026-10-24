@@ -1509,6 +1509,7 @@ async fn try_close_for_a_device_of(
     let (answer, answered) = tokio::sync::oneshot::channel();
     // Nothing holds the link for a delivery: the acceptance is taken as delivered at once.
     let (_, delivered) = tokio::sync::oneshot::channel();
+    let standing = connection.feed_standing(&connection.pairing_acting().grant);
     controller
         .close_remote_session(
             close,
@@ -1519,6 +1520,7 @@ async fn try_close_for_a_device_of(
                 screen_basis: None,
                 lease: None,
             },
+            &standing,
             accepted,
             Some(&connection.expiry_observer()),
             answer,
@@ -1662,6 +1664,73 @@ async fn a_devices_close_waiting_for_the_workers_link_is_refused_once_a_feed_ref
                 "the worker took the close"
             );
         }
+    }
+}
+
+/// KR-REQ-24.15: a device's close that had been admitted, and waits for the link to the session's
+/// worker, is refused when the link opens if the authority feed has raised a refusal on remote
+/// grants meanwhile, also when the device's connection has ended in between: the close runs on a
+/// task of its own and takes the standing it was admitted under with it, so the end of the
+/// connection does not lift the refusal, and nothing is asked of the worker. The control: the same
+/// wait with the connection ended and no refusal raised reaches the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_close_whose_connection_ends_while_it_waits_for_the_workers_link_is_refused_once_a_feed_refusal_rises()
+ {
+    use std::sync::Arc;
+
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::session::SessionCloseParams;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for refused in [false, true] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(|_: &kr_protocol::envelope::Request| None),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        let connection =
+            super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 29));
+        let close = device_mutation(
+            &world,
+            &connection,
+            Method::SessionClose,
+            1,
+            ParamsValue::from_typed(&SessionCloseParams {
+                session_id: world.session_id,
+            })
+            .expect("encodes"),
+        );
+        let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+
+        let (answer, ()) = tokio::join!(connection.mutate(&close), async {
+            arrived.await.expect("the close reaches the worker's door");
+            // As the transport's loss of the control stream does: the registration goes.
+            controller.deregister(connection.connection_id);
+            if refused {
+                controller.raise_the_unverified_withdrawal_refusal().await;
+            }
+            go.send(()).expect("the close is waiting");
+        });
+        if refused {
+            let error = refusal(answer);
+            assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+            assert_eq!(
+                forwarded_mutations(&recorded),
+                0,
+                "a close refused at the link reaches no worker"
+            );
+        } else {
+            assert_eq!(
+                forwarded_mutations(&recorded),
+                1,
+                "the control: the close reaches the worker"
+            );
+        }
+        world.serving.abort();
     }
 }
 
@@ -1855,7 +1924,10 @@ fn forwarded_mutations(
 /// KR-REQ-24.15: a device's mutation that waits for the write half of its link to the session's
 /// worker, behind a frame the worker is slow to take, is refused once it has the half if the
 /// authority feed has raised a refusal on remote grants meanwhile, and nothing is sent. The
-/// control: the same wait with no refusal raised ends with the mutation at the worker.
+/// mutation runs on a task of its own and takes the standing it was admitted under with it, so the
+/// end of the device's connection while it waits does not lift the refusal. The control: the same
+/// wait with no refusal raised ends with the mutation at the worker, whether the connection ended
+/// or not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_devices_mutation_waiting_for_the_workers_writer_is_refused_once_a_feed_refusal_rises() {
     use std::sync::Arc;
@@ -1864,7 +1936,7 @@ async fn a_devices_mutation_waiting_for_the_workers_writer_is_refused_once_a_fee
 
     use crate::service::a_close_a_worker_never_answers as fake;
 
-    for refused in [false, true] {
+    for (refused, ended) in [(false, false), (true, false), (false, true), (true, true)] {
         let recorded: fake::Recorded = Arc::default();
         let world = answering_worker(
             Arc::new(|_: &kr_protocol::envelope::Request| None),
@@ -1910,6 +1982,10 @@ async fn a_devices_mutation_waiting_for_the_workers_writer_is_refused_once_a_fee
             })
             .await
             .expect("the mutation waits for the writer");
+            if ended {
+                // As the transport's loss of the control stream does: the registration goes.
+                controller.deregister(connection.connection_id);
+            }
             if refused {
                 controller.raise_the_unverified_withdrawal_refusal().await;
             }
