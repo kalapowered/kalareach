@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "apps/companion/src-tauri",
     "apps/companion/native/platform",
+    "apps/companion/native/preview",
     "crates/kr-attention",
     "crates/kr-automation",
     "crates/kr-cbor",
@@ -59,6 +60,9 @@ publish = false
 # The companion's native platform services: its one secure store, the Android TLS verifier's start
 # and the browser-backed sign-in session.
 companion-platform = { path = "apps/companion/native/platform", version = "=0.1.0" }
+# Opens a sealed notification preview: linked into the Android library, and built as the static
+# library the iOS notification extension links.
+companion-preview = { path = "apps/companion/native/preview", version = "=0.1.0" }
 # The signing and verification primitives `tough` is built on. Declared here because the catalogue
 # tests build their own trust roots and generations, which needs the same random source and key
 # pair types that crate signs with.
