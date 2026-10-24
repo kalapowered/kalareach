@@ -1,0 +1,36 @@
+[package]
+name = "companion-preview"
+description = "The KalaReach companion's opener for a sealed notification preview, small enough for a phone's notification extension to link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The Android receiver reaches it through the platform library; the iOS notification extension
+# links the static library, which carries no more than this crate and what it depends on.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+base64.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+
+# The workspace forbids unsafe code, which a C function Swift finds by its name cannot honour. This
+# crate denies unsafe code and allows it on exactly those functions, in `ios`.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+# The host's own sealing, so a test opens what the host seals.
+kr-delivery.workspace = true
