@@ -218,8 +218,12 @@ impl Controller {
     }
 
     /// Whether carrying out again the request the feed shows complete would revoke one of
-    /// `devices` that the registry holds live: its issuer is one that could have made it, the host
-    /// did not refuse it, and it names one of them, or a grant one of them holds.
+    /// `devices` that the registry holds live. Its issuer is judged as a replay judges it first:
+    /// a live device the registry holds, or one that holds the key the request names, could have
+    /// made it. Whether this host refused the request is not asked, which a replay asks last, so a
+    /// request the host refused counts all the same and waits for that replay. A request names a
+    /// device by its identifier or by the pairing grant the device holds; a share is no device, and
+    /// is not counted.
     ///
     /// # Errors
     ///
