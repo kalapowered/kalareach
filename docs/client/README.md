@@ -1358,7 +1358,8 @@ for it and counts under account login; the companion's lease desk builds its cli
 signed in on the device.
 
 `organisation::LeaseKeeper` uses it. It presents the lease to the host with `membership.present` as
-the first thing on a connection made through `HostLink::connect_paired`, because the host refuses a
+the first thing on a connection made through `HostLink::connect_paired` or `HostLink::visit_paired`
+(a visit to a host that is not the one in use), because the host refuses a
 device whose grant answers to an organisation every other method until it holds a lease, and no
 lease survives a host's restart. The application's own connection to the host keeps the lease: it
 asks again on the interval the service advises, held between one and five minutes, so a renewal
@@ -1367,7 +1368,7 @@ not carried before travels with the chain of keys.
 
 The keeper holds the lease the host last took, and counts its life from when it arrived. A connection
 made beside the application's own (the pairing's confirmation, an owner's confirmation, the settings
-listing) presents that lease again while it lasts, and the service is asked for another only when
+listing, a visit) presents that lease again while it lasts, and the service is asked for another only when
 none is held, the application's own refresh is due, or the host refuses the one that is, as a host
 does that restarted or whose clock has passed the lease's end. The standing links the companion opens
 to a host's sessions use `connect_paired_transport`, present nothing, and rely on the lease the

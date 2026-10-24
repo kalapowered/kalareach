@@ -213,7 +213,9 @@ pub trait HostLink: Send + Sync {
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
 
-    /// Connects to a paired host as a visit, and starts a session on the connection.
+    /// Connects to a paired host as a visit, and starts a session on the connection, which holds
+    /// whatever the host needs of this device before it answers anything else on it
+    /// ([`Self::present_membership`]).
     fn visit_paired<'a>(
         &'a self,
         host: &'a PairedHost,
@@ -222,7 +224,7 @@ pub trait HostLink: Send + Sync {
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
         Box::pin(async move {
             let transport = self.visit_paired_transport(host, identity, in_use).await?;
-            Session::start(transport).map_err(|error| LinkError::lost(error.said()))
+            presenting(self, transport, host, identity).await
         })
     }
 
@@ -236,13 +238,7 @@ pub trait HostLink: Send + Sync {
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
         Box::pin(async move {
             let transport = self.connect_paired_transport(host, identity).await?;
-            let session =
-                Session::start(transport).map_err(|error| LinkError::lost(error.said()))?;
-            if let Err(error) = self.present_membership(&session, host, identity).await {
-                session.close();
-                return Err(error);
-            }
-            Ok(session)
+            presenting(self, transport, host, identity).await
         })
     }
 
@@ -284,6 +280,22 @@ pub trait HostLink: Send + Sync {
     fn relay_capacity_refused(&self, _network: &NetworkConfig, _endpoint: &EndpointKey) -> bool {
         false
     }
+}
+
+/// A session on `transport`, to a paired host, with what the host needs of this device presented
+/// on it first; the connection is closed when that cannot be done.
+async fn presenting<L: HostLink + ?Sized>(
+    link: &L,
+    transport: Arc<dyn ControlTransport>,
+    host: &PairedHost,
+    identity: &LocalIdentity,
+) -> Result<Session, LinkError> {
+    let session = Session::start(transport).map_err(|error| LinkError::lost(error.said()))?;
+    if let Err(error) = link.present_membership(&session, host, identity).await {
+        session.close();
+        return Err(error);
+    }
+    Ok(session)
 }
 
 /// The live peer of a connection, as kr-pairing checks it.
