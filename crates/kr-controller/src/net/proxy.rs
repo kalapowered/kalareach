@@ -491,17 +491,15 @@ impl WorkerProxy {
         // is what the caller is told.
         //
         // The write half is shared by every call on the link, so a call can wait for it behind a
-        // frame the worker is slow to read. What this call was admitted for is asked again once it
-        // has the half and before a byte of its frame goes: a refusal that rose while it waited,
-        // and that moves nothing the worker would find, stops it there. A frame already being
-        // written is not taken back.
+        // frame the worker is slow to read, and the socket can be full when it has the half. What
+        // this call was admitted for is asked again before every transport write: a refusal that
+        // rose while it waited, and that moves nothing the worker would find, stops it while the
+        // worker has none of its frame, and the link stays whole. A frame the worker has part of is
+        // finished, because only finishing it keeps the stream whole.
         let exchange = async {
             #[cfg(test)]
             self.calls_at_the_writer.fetch_add(1, Ordering::SeqCst);
             let mut held = self.writer.lock().await;
-            if let Err(refusal) = still_admitted() {
-                return Err(refusal);
-            }
             let Some(writer) = held.as_mut() else {
                 return Ok((
                     Err(kr_ipc::IpcError::UnexpectedMessage("this link has ended")),
@@ -509,7 +507,25 @@ impl WorkerProxy {
                     false,
                 ));
             };
-            let written = writer.write(frame).await;
+            let mut refusal = None;
+            let written = writer
+                .write_while(frame, || match still_admitted() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        refusal = Some(error);
+                        false
+                    }
+                })
+                .await;
+            let written = match written {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    return Err(refusal.unwrap_or_else(|| {
+                        ControllerError::supervision("this call was not admitted to write")
+                    }));
+                }
+                Err(error) => Err(error),
+            };
             let interrupted = writer.is_mid_frame();
             // A frame that stopped part way through leaves the stream in pieces, and the writer
             // refuses to continue one. A frame that could not be encoded at all left the stream
