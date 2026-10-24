@@ -239,6 +239,21 @@ jobs:
       - name: Test the release tool against the packages built here
         run: cargo test --locked -p kr-release --test release_tree -- --include-ignored
 
+      # No tree is assembled from a shell package that has not passed its requalification here, on
+      # the bytes this job built. These are the suites that need only the packages this tree
+      # carries: the contract suites of Zsh, Bash and Fish, the Fish source checks, Zsh's
+      # native-module proof, and the case that compares each package with the pin the register
+      # names. The whole corpus, with the startup customisations that are pinned for two of the four
+      # targets, the second Zsh build and the PowerShell package that no release tree carries, runs
+      # in core-ci's shell-packages job. KR_SHELL_PREFIX names the packages built above.
+      - name: Requalify the shell packages built here
+        run: |
+          cargo test --locked -p kr-shell-integration \
+            --test zsh --test bash --test fish --test fish_sources --test module_abi \
+            -- --test-threads=1 --include-ignored
+          cargo test --locked -p kr-shell-integration --test qualification \
+            -- the_packages_built_here_were_built_from_the_registers_pins --include-ignored
+
       # Every Mach-O or ELF file the release carries is held to the baseline its target runs on:
       # the host's programs, the shells' programs and the modules a shell loads, found by what a
       # file is and not by its name, since a loadable builtin has no extension.
