@@ -127,6 +127,22 @@ pub enum Wrote {
 /// platform alike.
 pub const CHECKED_WRITE_BYTES: usize = 64 * 1024;
 
+/// How a frame written with a check before every transport write came out
+/// ([`FrameWriter::write_frame_while`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameWhile {
+    /// Every byte of the frame is with the peer.
+    Sent,
+    /// The check refused before the peer had a byte of the frame. The frame was taken back, and the
+    /// stream is whole for the next one.
+    Withdrawn,
+    /// The check refused after the peer had part of the frame. The rest of it stays in hand and is
+    /// never written: the stream is in pieces, [`FrameWriter::is_mid_frame`] says so, and the caller
+    /// ends the connection, so that the peer reads a frame that stops short and acts on nothing of
+    /// it.
+    Cut,
+}
+
 /// What a checked write attempt achieved.
 ///
 /// A checked attempt asks its caller before every transport write it makes, and a caller whose
@@ -620,13 +636,13 @@ impl FrameWriter {
     }
 
     /// Writes an already framed buffer as [`Self::write_frame`] does, asking `may_write` before every
-    /// transport write, and gives the frame back when the check refuses while the peer has none of
-    /// it.
+    /// transport write, and stops when the check refuses.
     ///
-    /// Returns whether the frame went. `false` means the check refused before a byte of it was
-    /// taken, including on the attempt after a wait for room, and the stream is whole for the next
-    /// frame. A check that refuses once the peer has part of the frame does not stop it: only
-    /// finishing it keeps the stream whole.
+    /// A check that refuses before the peer has a byte of the frame, including on the attempt after
+    /// a wait for room, takes the frame back ([`FrameWhile::Withdrawn`]) and the stream is whole for
+    /// the next one. A check that refuses once the peer has part of it leaves the rest in hand and
+    /// writes none of it ([`FrameWhile::Cut`]): the frame is not finished, because finishing it
+    /// would deliver what the check no longer stands behind, and the caller ends the connection.
     ///
     /// # Errors
     ///
@@ -635,27 +651,22 @@ impl FrameWriter {
         &mut self,
         frame: &[u8],
         mut may_write: impl FnMut() -> bool,
-    ) -> Result<bool> {
+    ) -> Result<FrameWhile> {
         let mut outcome = self.begin_frame_checked(frame, &mut may_write)?;
         loop {
             match outcome {
-                CheckedWrite::Complete => return Ok(true),
+                CheckedWrite::Complete => return Ok(FrameWhile::Sent),
                 CheckedWrite::Blocked => {
                     let writable = self.writable.clone();
                     writable.ready().await?;
                     outcome = self.resume_frame_checked(&mut may_write)?;
                 }
                 CheckedWrite::Refused => {
-                    if self.withdraw_unstarted() {
-                        return Ok(false);
-                    }
-                    let mut finishing = self.resume_frame()?;
-                    while finishing == Wrote::Blocked {
-                        let writable = self.writable.clone();
-                        writable.ready().await?;
-                        finishing = self.resume_frame()?;
-                    }
-                    return Ok(true);
+                    return Ok(if self.withdraw_unstarted() {
+                        FrameWhile::Withdrawn
+                    } else {
+                        FrameWhile::Cut
+                    });
                 }
             }
         }
@@ -969,21 +980,23 @@ mod tests {
         let (_reader, mut writer) = split(client, StreamKind::Control);
 
         let refused = FrameWriter::encode(StreamKind::Control, &request(1)).expect("encodes");
-        assert!(
-            !writer
+        assert_eq!(
+            writer
                 .write_frame_while(&refused, || false)
                 .await
                 .expect("the peer is there"),
+            FrameWhile::Withdrawn,
             "a check that refuses before a byte goes takes the frame back"
         );
         assert!(!writer.is_mid_frame(), "nothing of it is left in hand");
         for id in [2, 3] {
             let frame = FrameWriter::encode(StreamKind::Control, &request(id)).expect("encodes");
-            assert!(
+            assert_eq!(
                 writer
                     .write_frame_while(&frame, || true)
                     .await
                     .expect("the peer is there"),
+                FrameWhile::Sent,
                 "a check that allows the frame sends it"
             );
         }
@@ -994,10 +1007,11 @@ mod tests {
         );
     }
 
-    /// A frame the peer already has part of is finished when the check refuses, because only
-    /// finishing it keeps the stream whole.
+    /// A frame the peer already has part of is cut when the check refuses: the rest is not written,
+    /// the writer is left part way through it for the caller to end the connection, and the peer
+    /// reads a frame that stops short and never a whole one.
     #[tokio::test]
-    async fn a_frame_the_peer_has_part_of_is_finished_when_the_check_refuses() {
+    async fn a_frame_the_peer_has_part_of_is_cut_when_the_check_refuses() {
         let (endpoint, listener, _host) = pair();
         let big = ControlFrame::Request(Request {
             request_id: RequestId::new(7),
@@ -1011,39 +1025,122 @@ mod tests {
             ]))
             .expect("encodes"),
         });
-        let expected = big.clone();
         let server = tokio::spawn(async move {
             let (connection, _) = listener.accept().await.expect("accepts");
             let (mut reader, _writer) = split(connection, StreamKind::Control);
-            let first: ControlFrame = reader.read_message().await.expect("reads");
-            let second: ControlFrame = reader.read_message().await.expect("reads");
-            (first, second)
+            reader.read_message::<ControlFrame>().await
         });
         let client = Connection::connect(&endpoint).await.expect("connects");
         let (_reader, mut writer) = split(client, StreamKind::Control);
 
         let frame = FrameWriter::encode(StreamKind::Control, &big).expect("encodes");
         let mut asked = 0_u32;
-        let went = writer
+        let outcome = writer
             .write_frame_while(&frame, || {
                 asked += 1;
                 asked == 1
             })
             .await
             .expect("the peer is there");
-        assert!(
-            went,
-            "the check refused the second piece, after the first had gone, and the frame was finished"
+        assert_eq!(
+            outcome,
+            FrameWhile::Cut,
+            "the check refused the second piece, after the first had gone"
         );
         assert!(asked >= 2, "the check was asked again: {asked}");
-        let next = FrameWriter::encode(StreamKind::Control, &request(8)).expect("encodes");
-        writer
-            .write_frame(&next)
-            .await
-            .expect("the stream is whole");
-        let (first, second) = server.await.expect("server task");
-        assert_eq!(first, expected, "the peer has the whole frame");
-        assert_eq!(second, request(8), "and the frame after it");
+        assert!(writer.has_sent_any() && writer.is_mid_frame());
+        drop(writer);
+        drop(_reader);
+        assert!(
+            server.await.expect("server task").is_err(),
+            "the peer reads a frame that stops short, not the whole one"
+        );
+    }
+
+    /// A check that refuses after a wait for room, with the peer holding part of the frame, cuts it:
+    /// the writer fills a socket the peer does not read, the permission lapses while it waits, the
+    /// peer then reads, and the attempt that follows the wait asks the check again, is refused, and
+    /// writes nothing more. The control is the attempt before the wait, which the check allowed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_that_refuses_after_a_wait_for_room_cuts_the_frame() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let (endpoint, listener, _host) = pair();
+        let (read_now, may_read) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("accepts");
+            let (mut reader, _writer) = split(connection, StreamKind::Control);
+            // The peer reads nothing until the test lets it.
+            may_read.await.expect("the test lets the peer read");
+            reader.read_message::<ControlFrame>().await
+        });
+        let client = Connection::connect(&endpoint).await.expect("connects");
+        let (_reader, mut writer) = split(client, StreamKind::Control);
+        // A small send buffer, so that a frame of this size outruns the socket whatever the platform
+        // gives by default.
+        rustix::net::sockopt::set_socket_send_buffer_size(
+            writer.descriptor.as_ref().expect("a descriptor"),
+            4096,
+        )
+        .expect("the buffer is set");
+        let big = ControlFrame::Request(Request {
+            request_id: RequestId::new(7),
+            method: Method::SessionList.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::scalars::Bytes::new(vec![
+                7_u8;
+                900 * 1024
+            ]))
+            .expect("encodes"),
+        });
+        let frame = FrameWriter::encode(StreamKind::Control, &big).expect("encodes");
+
+        let allowed = AtomicBool::new(true);
+        let asked = AtomicU32::new(0);
+        let mut check = || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            allowed.load(Ordering::SeqCst)
+        };
+        let first = writer
+            .begin_frame_checked(&frame, &mut check)
+            .expect("the peer is there");
+        assert_eq!(
+            first,
+            CheckedWrite::Blocked,
+            "the control: a peer that reads nothing leaves the frame waiting for room, with part of \
+             it sent"
+        );
+        assert!(writer.has_sent_any());
+
+        allowed.store(false, Ordering::SeqCst);
+        let before = asked.load(Ordering::SeqCst);
+        read_now.send(()).expect("the peer waits");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            writer.writable().ready(),
+        )
+        .await
+        .expect("the peer's reading opens room")
+        .expect("the peer is there");
+        let second = writer
+            .resume_frame_checked(&mut check)
+            .expect("the peer is there");
+        assert_eq!(second, CheckedWrite::Refused);
+        assert!(
+            asked.load(Ordering::SeqCst) > before,
+            "the check was asked after the wait"
+        );
+        assert!(
+            !writer.withdraw_unstarted() && writer.is_mid_frame(),
+            "the peer has part of the frame, which stays in hand"
+        );
+        drop(writer);
+        drop(_reader);
+        assert!(
+            server.await.expect("server task").is_err(),
+            "the peer reads a frame that stops short, not the whole one"
+        );
     }
 
     #[tokio::test]

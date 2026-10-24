@@ -36,7 +36,7 @@ use kr_protocol::worker::{
 
 use crate::endpoint::Connection;
 use crate::error::{IpcError, Result};
-use crate::framed::{FrameReader, FrameWriter, split};
+use crate::framed::{FrameReader, FrameWhile, FrameWriter, split};
 use crate::paths::Endpoint;
 use crate::verify::{check_proof, fresh_challenge};
 
@@ -1543,10 +1543,11 @@ impl LinkWriter {
     }
 
     /// Writes one frame as [`Self::write`] does, asking `may_write` before every transport write,
-    /// and returns whether the frame went.
+    /// and says how it came out.
     ///
-    /// `false` means the check refused while the worker had none of the frame, so nothing was sent
-    /// and the link is whole. Once the worker has part of the frame it is finished
+    /// [`FrameWhile::Withdrawn`] means the check refused while the worker had none of the frame, so
+    /// nothing was sent and the link is whole. [`FrameWhile::Cut`] means it refused once the worker
+    /// had part of the frame: the rest is never written, and the caller ends the link
     /// ([`FrameWriter::write_frame_while`]).
     ///
     /// # Errors
@@ -1557,7 +1558,7 @@ impl LinkWriter {
         &mut self,
         frame: &ControlFrame,
         may_write: impl FnMut() -> bool,
-    ) -> Result<bool> {
+    ) -> Result<FrameWhile> {
         let payload = self
             .level
             .encode(frame, &StreamKind::Control.cbor_limits())?;
