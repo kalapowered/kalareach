@@ -315,7 +315,15 @@ function Write-KrHint {
 # it is asked once per prompt rather than once per key.
 function Get-KrTerminalEof {
     if ($IsWindows) { return -1 }
+    # `stty` leaves its own exit code in `$LASTEXITCODE`, which is the code of the last program the
+    # person ran and stays theirs: it is put back as it was, or taken out if there was none.
+    $before = $ExecutionContext.SessionState.PSVariable.GetValue('LASTEXITCODE')
     $settings = try { & stty -a 2>$null } catch { $null }
+    if ($null -ne $before) {
+        $global:LASTEXITCODE = $before
+    } else {
+        Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+    }
     if (-not $settings) { return -1 }
     $text = ($settings -join ' ')
     if ($text -notmatch 'eof\s*=\s*([^;]+);') { return -1 }
