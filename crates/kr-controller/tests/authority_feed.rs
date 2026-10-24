@@ -2780,11 +2780,57 @@ async fn an_unknown_owners_withdrawal_of_the_issuer_of_a_waiting_request_raises_
         "the withdrawal behind the request is found while the clock is unproven: {}",
         check.detail()
     );
+    // The withdrawal names the device that made the request, which waits for the clock: the doctor
+    // names it, says that revoking it refuses the request, and says what ends a lost continuity.
+    assert!(
+        check.detail().contains(&format!(
+            "device {} made a request that waits for this host's clock",
+            issuer.1.device_id
+        )),
+        "the doctor names the device whose request waits for the clock: {}",
+        check.detail()
+    );
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("reboot")),
+        "and says that a reboot ends a lost continuity: {:?}",
+        check.remedy()
+    );
     let waiting = rig.held_as(&issuer.0.keys().authorisation, &first).await;
     assert_eq!(
         (waiting.rejected.0, waiting.acknowledgement.0),
         (None, None),
         "the request is neither refused nor carried out while the clock is unproven"
+    );
+    assert!(!rig.has_revoked(target.1.device_id).await);
+}
+
+/// KR-REQ-24.15: a limit. A request waits for the clock, and a withdrawal the host cannot verify
+/// names its issuer. The owner at the machine revokes the issuer, as the doctor says to for what a
+/// withdrawal names, and the request is refused: the registry holds its issuer revoked, so what the
+/// request named is not withdrawn, and the doctor said so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_the_issuer_of_a_waiting_request_that_a_withdrawal_names_refuses_the_request() {
+    let Undecidable {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(
+        &[Then::AnUnknownOwnersWithdrawalOfTheIssuer],
+        0,
+    )
+    .await;
+
+    rig.revokes_at_the_machine(issuer.1.device_id).await;
+    rig.poll().await;
+    let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
+    assert_eq!(
+        held.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the issuer is revoked, so its request is refused: {held:?}"
     );
     assert!(!rig.has_revoked(target.1.device_id).await);
 }

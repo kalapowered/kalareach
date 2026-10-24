@@ -187,6 +187,10 @@ struct Observed {
     unverified: bool,
     /// How many owners are paired beyond the keys the feed takes.
     unnamed_owners: usize,
+    /// The devices that made a request waiting for this host's clock, which lost its continuity,
+    /// and that a withdrawal this host cannot verify names: revoking one of them refuses its
+    /// request.
+    waiting_named: Vec<DeviceId>,
 }
 
 /// What the carrier shares with the daemon.
@@ -485,7 +489,14 @@ impl FeedRuntime {
         let (state, remedy) = if status.removed_at_ms.0.is_some() {
             (state, remedy)
         } else if observed.unverified {
-            (DoctorStatus::Warning, Some(UNVERIFIED_REMEDY))
+            (
+                DoctorStatus::Warning,
+                Some(if observed.waiting_named.is_empty() {
+                    UNVERIFIED_REMEDY
+                } else {
+                    UNVERIFIED_WAITING_REMEDY
+                }),
+            )
         } else if observed.catching_up
             && !matches!(
                 observed.stopped,
@@ -524,6 +535,18 @@ impl FeedRuntime {
         } else {
             detail
         };
+        let detail =
+            observed
+                .waiting_named
+                .iter()
+                .take(MOST_NAMED)
+                .fold(detail, |detail, device| {
+                    detail.stated("; device ").identifier(device).stated(
+                        " made a request that waits for this host's clock, which lost its \
+                         continuity, and the withdrawal names it, so revoking it refuses that \
+                         request",
+                    )
+                });
         let detail = if observed.unissued {
             detail.stated(
                 "; the feed holds a revision this host has not reached, so it cannot issue its own",
@@ -599,21 +622,39 @@ impl Drop for FeedRuntime {
     }
 }
 
+/// The text of [`UNVERIFIED_REMEDY`], which [`UNVERIFIED_WAITING_REMEDY`] goes on from.
+macro_rules! unverified_remedy {
+    () => {
+        "Never revoke the last owner device of this host while this stands: no confirmation from an \
+         owner device is accepted until it ends, and a host with no owner device left cannot pair \
+         one again. Otherwise revoke what the request names, at this machine, with `kr device \
+         revoke <device>` for a device and `kr share revoke <grant>` for a grant. Neither needs a \
+         confirmation. Remote access returns once the request names nothing live here. If the \
+         request names every owner device, remove `authority.origin` from the configuration \
+         document and start the daemon again, which ends the refusal because the host keeps none \
+         of it. Then pair a new owner device, revoke what the request names, set \
+         `authority.origin` back and start the daemon again. Until you revoke them, this host \
+         serves the devices the request names, and while it reads no feed it learns no remote \
+         revocation."
+    };
+}
+
 /// What a person who finds the host refusing remote access for a withdrawal it cannot verify does:
 /// the devices and the grants the withdrawal names are what to revoke, unless it names every owner
 /// device. A revocation at the machine needs no owner device's confirmation, and none is spent while
 /// the refusal stands, so a host whose last owner device is revoked can pair none again. The refusal
 /// is not stored, which is what the way out for that case rests on.
-const UNVERIFIED_REMEDY: &str = "Never revoke the last owner device of this host while this \
-     stands: no confirmation from an owner device is accepted until it ends, and a host with no \
-     owner device left cannot pair one again. Otherwise revoke what the request names, at this \
-     machine, with `kr device revoke <device>` for a device and `kr share revoke <grant>` for a \
-     grant. Neither needs a confirmation. Remote access returns once the request names nothing \
-     live here. If the request names every owner device, remove `authority.origin` from the \
-     configuration document and start the daemon again, which ends the refusal because the host \
-     keeps none of it. Then pair a new owner device, revoke what the request names, set \
-     `authority.origin` back and start the daemon again. Until you revoke them, this host serves \
-     the devices the request names, and while it reads no feed it learns no remote revocation.";
+const UNVERIFIED_REMEDY: &str = unverified_remedy!();
+
+/// As [`UNVERIFIED_REMEDY`], for a host whose clock lost its continuity while a request waits that
+/// was made by a device the withdrawal names: revoking that device refuses the request, and the
+/// clock is what keeps the request from being judged.
+const UNVERIFIED_WAITING_REMEDY: &str = concat!(
+    unverified_remedy!(),
+    " A request that waits for this host's clock is refused if you revoke the device that made \
+     it. A reboot of this machine ends a lost clock continuity, after which the host can decide \
+     the request."
+);
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
@@ -949,7 +990,11 @@ async fn pass(
         .settle_unverified_withdrawals((!found.is_empty()).then_some(&found))
         .await
         .map_err(Stopped::local)?;
-    shared.observed().unverified = !found.is_empty();
+    {
+        let mut observed = shared.observed();
+        observed.unverified = !found.is_empty();
+        observed.waiting_named = waiting_issuers_the_withdrawal_names(undecided.as_ref(), &found);
+    }
     if let Some(latest) = latest {
         // A registry found behind the feed is raised to the feed's revision, in one barrier, before
         // the feed is called read: until then what the host decides stands on an earlier state.
@@ -1007,9 +1052,33 @@ async fn removed(
         .map_err(Stopped::local)?;
     shared.removed.store(true, Ordering::SeqCst);
     // The refusal a withdrawal this host cannot verify puts on remote grants may outlive the
-    // removal.
-    shared.observed().unverified = !controller.unverified_withdrawals().is_empty();
+    // removal. A feed that is read no more leaves no request waiting for the clock.
+    let unverified = !controller.unverified_withdrawals().is_empty();
+    let mut observed = shared.observed();
+    observed.unverified = unverified;
+    observed.waiting_named.clear();
     Ok(Pass::Removed)
+}
+
+/// The devices that made a request waiting for this host's clock, which lost its continuity, and
+/// that a withdrawal this host cannot verify names. The request cannot be judged until the clock is
+/// decided again, and revoking its issuer refuses it. Another reason a standing is undecided names
+/// no such device.
+fn waiting_issuers_the_withdrawal_names(
+    undecided: Option<&Undecided>,
+    found: &Unverified,
+) -> Vec<DeviceId> {
+    undecided
+        .filter(|waiting| matches!(waiting.refusal, Refusal::ClockUnproven))
+        .map(|waiting| {
+            waiting
+                .issuers
+                .iter()
+                .filter(|issuer| found.devices.contains_key(issuer))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// What the feed answered a change to the list of keys that may remove it.
