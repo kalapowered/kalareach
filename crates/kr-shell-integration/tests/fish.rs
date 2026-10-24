@@ -29,13 +29,6 @@ fn the_fish_executable_links_no_library_of_the_machine_that_built_it() {
     shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(FISH);
 }
 
-/// KR-REQ-07.88: the executable depends on no library of the machine that built it.
-#[test]
-#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
-fn the_fish_executable_links_no_library_of_the_machine_that_built_it() {
-    shellpkg::the_shell_links_no_library_of_the_machine_that_built_it(FISH);
-}
-
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

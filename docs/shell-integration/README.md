@@ -223,9 +223,12 @@ hint rather than turned into a native empty-prompt end of file.
 ### The bootstrap secret, and what a child shell inherits
 
 The secret is in the exported environment only until the handshake succeeds. The integration then
-removes both bootstrap variables from the exported environment and keeps the secret in private
-integration state: a shell-local variable it never exports, or the module's own memory for a
-compiled bridge. It keeps it because a reader re-established inside the same shell needs it again.
+removes both bootstrap variables from the exported environment and wipes its own copy: the compiled
+bridges clear the buffer the secret was decoded into, and the PowerShell module clears its array.
+Nothing reads the secret again, because activation is its only reader and a bridge that is lost
+finds the variables gone. A copy the shell itself made cannot be cleared: the base64url text of the
+secret stays in the memory the process was started with after the variable is unset, and the
+PowerShell runtime keeps managed copies.
 
 A child shell therefore inherits neither an active root token nor automatic activation, and two
 independent rules keep it that way:

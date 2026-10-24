@@ -801,9 +801,7 @@ impl Session {
 
         let prompt = "KR> ".to_owned();
         let session_id = SessionId::new(Uuid::from_bytes([0x5e; 16]));
-        let secret: Vec<u8> = (0..BOOTSTRAP_SECRET_LEN)
-            .map(|i| (i as u8).wrapping_mul(7))
-            .collect();
+        let secret = bootstrap_secret();
 
         install_startup(package, &home, &prompt, profile);
 
@@ -2593,6 +2591,14 @@ fn a_path_that_is_not_text_is_refused_rather_than_told_as_another() {
         b"/tmp/kr-shell-\xff/rt/shell-bridge".to_vec(),
     ));
     let _ = told(&path);
+}
+
+/// The bootstrap secret every session of this harness is started with.
+#[must_use]
+pub fn bootstrap_secret() -> Vec<u8> {
+    (0..BOOTSTRAP_SECRET_LEN)
+        .map(|i| (i as u8).wrapping_mul(7))
+        .collect()
 }
 
 mod cases;

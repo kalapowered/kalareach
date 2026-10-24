@@ -1169,10 +1169,14 @@ kr_bridge_activate(void)
     kr.registered = 1;
 
     /*
-     * The secret leaves the exported environment and stays in this module's own memory, where a
-     * child process and a user's startup file cannot reach it. The integration keeps it because a
-     * reader re-established inside the same shell needs it again.
+     * The proof is accepted and nothing reads the secret again: this function is its only reader,
+     * it returns at once while the bridge is registered, and a bridge that is lost later finds the
+     * variables below gone and stops before it decodes anything. So the copy in this module's
+     * memory is wiped now, and the variables that carried the secret leave the exported
+     * environment, where a child process and a user's startup file could read them.
      */
+    kr_wipe(kr.secret, sizeof(kr.secret));
+    kr.secret_len = 0;
     kr.managed = 1;
 
     kr_shell_unexport(KR_ENDPOINT_VARIABLE);
