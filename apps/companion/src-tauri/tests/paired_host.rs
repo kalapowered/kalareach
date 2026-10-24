@@ -738,9 +738,27 @@ async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
     third.stop().await;
 }
 
+/// Waits until `count` connections are held by `control`.
+async fn until_held(control: &LinkControl, count: usize) {
+    tokio::time::timeout(WATCHDOG, async {
+        while control.held() != count {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the connections are held");
+}
+
 /// KR-REQ-13.01: a pass reports a host only if it is still one of the others when the pass ends.
 /// Each visit asks about its own host when it ends, and a slower visit runs on after that: a host
-/// the phone begins to use, or forgets, in the meantime is settled out of the pass's answers.
+/// the phone begins to use, or forgets, once its visit is over and before the pass is, is left out of
+/// the pass's answers.
+///
+/// One visit is held at its connection and the other is let go and fails. A second pass is the
+/// witness that the let-go visit is over: visits to one host take turns, so the second pass asks for
+/// that host's connection only after the first pass's visit to it has ended. Which of the two hosts
+/// is the let-go one does not matter; the phone then uses one and forgets the other, and neither is
+/// to be reported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_ends() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -768,22 +786,42 @@ async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_en
             .host_device_id
     };
     let (second_id, third_id) = (id_of(&second), id_of(&third));
-
     let desk = Arc::new(companion_tauri::inbox::InboxDesk::default());
-    let found = desk.visit(&device).await;
-    assert_eq!(found.len(), 2, "both other hosts were visited: {found:?}");
-    assert_eq!(
-        companion_tauri::inbox::InboxDesk::settled(&device, found.clone()).len(),
-        2,
-        "nothing changed, so nothing is left out"
-    );
 
+    // Both visits are at their connections. One is let go and fails to reach its host.
+    control.hold();
+    let pass = tokio::spawn({
+        let (desk, device) = (Arc::clone(&desk), Arc::clone(&device));
+        async move { desk.visit(&device).await }
+    });
+    until_held(&control, 2).await;
+    control.unreachable(true);
+    control.release(0);
+
+    // The witness: it holds a connection once the let-go visit has ended, and not before.
+    let witness = tokio::spawn({
+        let (desk, device) = (Arc::clone(&desk), Arc::clone(&device));
+        async move { desk.visit(&device).await }
+    });
+    until_held(&control, 2).await;
+
+    // The phone begins to use one of the other hosts and forgets the other, and the slow visit goes on.
     device.use_host(second_id).expect("the second is chosen");
     device
         .forget_host(third_id)
         .expect("the third is forgotten");
-    let settled = companion_tauri::inbox::InboxDesk::settled(&device, found);
-    assert!(settled.is_empty(), "{settled:?}");
+    control.stop_holding();
+    control.release_all();
+
+    let found = tokio::time::timeout(WATCHDOG, pass)
+        .await
+        .expect("the pass ended")
+        .expect("the pass ran");
+    assert!(found.is_empty(), "{found:?}");
+    tokio::time::timeout(WATCHDOG, witness)
+        .await
+        .expect("the witness pass ended")
+        .expect("the witness pass ran");
     first.stop().await;
     second.stop().await;
     third.stop().await;
