@@ -1025,7 +1025,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     local work
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-shell-$shell_name.XXXXXX")"
     scratch_directory="$work"
-    trap 'rm -rf "${work:?}"' RETURN
+    trap 'rm -rf "${work:?}"; scratch_directory=""' RETURN
 
     # The archive is copied before it is judged and the copy is unpacked, so the bytes that were
     # checked are the bytes that are built, whatever else uses the cache meanwhile.

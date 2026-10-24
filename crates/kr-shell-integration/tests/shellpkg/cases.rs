@@ -3373,25 +3373,40 @@ fn linux_start_value(pid: u64) -> Option<u64> {
     tail.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Where a running process holds `needle` in memory it can write, as the lines of its memory map.
+/// What one scan of a process's writable memory found.
+#[cfg(target_os = "linux")]
+struct Scan {
+    /// The lines of the memory map whose mapping holds the bytes looked for.
+    copies: Vec<String>,
+    /// The lines of the mappings the scan could not read to their end.
+    unread: Vec<String>,
+    /// How many bytes were read.
+    bytes: u64,
+}
+
+/// Looks for `needle` in every mapping of a running process that is both readable and writable,
+/// which is where a static buffer, the heap and the stack are.
 ///
-/// A Linux process can be read through `/proc/<pid>/mem` by the process that started it. The
-/// scan reads every mapping that is both readable and writable, which is where a static buffer,
-/// the heap and the stack are, and reports each mapping that holds the bytes.
+/// A Linux process can be read through `/proc/<pid>/mem` by the process that started it. A mapping
+/// that cannot be read to its end is reported and not skipped, because a scan that stopped early
+/// finds nothing and proves nothing.
 ///
 /// # Panics
 ///
-/// Panics when the process's memory cannot be opened, because a scan that cannot read finds
-/// nothing and proves nothing.
+/// Panics when the process's memory map or memory cannot be opened.
 #[cfg(target_os = "linux")]
-fn copies_in_memory(pid: u32, needle: &[u8]) -> Vec<String> {
+fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
         .unwrap_or_else(|error| panic!("the memory map of process {pid} cannot be read: {error}"));
     let mut memory = std::fs::File::open(format!("/proc/{pid}/mem"))
         .unwrap_or_else(|error| panic!("the memory of process {pid} cannot be opened: {error}"));
-    let mut found = Vec::new();
+    let mut scan = Scan {
+        copies: Vec::new(),
+        unread: Vec::new(),
+        bytes: 0,
+    };
     let mut chunk = vec![0u8; 1 << 20];
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
@@ -3410,29 +3425,33 @@ fn copies_in_memory(pid: u32, needle: &[u8]) -> Vec<String> {
         };
         let mut offset = start;
         let mut carried: Vec<u8> = Vec::new();
+        let mut found = false;
         while offset < end {
             let want =
                 usize::try_from(end - offset).map_or(chunk.len(), |left| left.min(chunk.len()));
-            if memory.seek(SeekFrom::Start(offset)).is_err() {
-                break;
-            }
-            let Ok(read) = memory.read(&mut chunk[..want]) else {
-                break;
+            let read = match memory.seek(SeekFrom::Start(offset)) {
+                Ok(_) => memory.read(&mut chunk[..want]).unwrap_or(0),
+                Err(_) => 0,
             };
             if read == 0 {
                 break;
             }
+            scan.bytes += read as u64;
             carried.extend_from_slice(&chunk[..read]);
             if carried.windows(needle.len()).any(|window| window == needle) {
-                found.push(line.to_owned());
+                scan.copies.push(line.to_owned());
+                found = true;
                 break;
             }
             let keep = needle.len().saturating_sub(1).min(carried.len());
             carried.drain(..carried.len() - keep);
             offset += read as u64;
         }
+        if !found && offset < end {
+            scan.unread.push(line.to_owned());
+        }
     }
-    found
+    scan
 }
 
 /// KR-REQ-07.40: a compiled bridge holds no copy of the bootstrap secret once the handshake is
@@ -3442,21 +3461,22 @@ fn copies_in_memory(pid: u32, needle: &[u8]) -> Vec<String> {
 /// afterwards. The case starts a shell with a secret it knows, waits for the first prompt (which
 /// follows the acceptance and the wipe, by a condition and not by a delay) and looks for the
 /// secret's 32 bytes in every writable mapping of the shell's process. The scan is wider than the
-/// bridge's buffer, so a copy anywhere else in the process fails the case too. Reading another
-/// process's memory is a Linux facility, so the case is a stated skip elsewhere. The first thing it
-/// does is look for the same bytes in its own process, so a scan that cannot find a secret fails
-/// the case instead of passing it.
+/// bridge's buffer, so a copy anywhere else in the process fails the case too. It must read every
+/// mapping to its end with the shell still running, so a shell that has gone, or memory that could
+/// not be read, fails the case instead of passing it. Reading another process's memory is a Linux
+/// facility, so the case is a stated skip elsewhere. The first thing it does is look for the same
+/// bytes in its own process, so a scan that cannot find a secret fails the case too.
 ///
 /// # Panics
 ///
-/// Panics when the scan cannot find the bytes where they are known to be, or finds them in the
-/// shell.
+/// Panics when the scan cannot find the bytes where they are known to be, cannot read the shell,
+/// or finds them in the shell.
 pub fn the_bootstrap_secret_does_not_outlive_the_accepted_handshake(kind: ShellKind) {
     #[cfg(target_os = "linux")]
     {
         let secret = bootstrap_secret();
         assert!(
-            !copies_in_memory(std::process::id(), &secret).is_empty(),
+            !scan_memory(std::process::id(), &secret).copies.is_empty(),
             "the memory scan cannot find a secret it is given, so it proves nothing about a shell"
         );
         let package = Package::built(kind);
@@ -3465,12 +3485,27 @@ pub fn the_bootstrap_secret_does_not_outlive_the_accepted_handshake(kind: ShellK
         let pid = session
             .child_pid()
             .expect("the shell's process has an identifier");
-        let copies = copies_in_memory(pid, &secret);
         assert!(
-            copies.is_empty(),
+            session.alive(),
+            "the shell had gone before its memory was read"
+        );
+        let scan = scan_memory(pid, &secret);
+        assert!(
+            session.alive(),
+            "the shell went while its memory was read, so the scan may have read nothing"
+        );
+        assert!(
+            scan.unread.is_empty() && scan.bytes > 0,
+            "{} bytes of the {} shell's memory were read, and these writable mappings were not read to their end:\n{}",
+            scan.bytes,
+            kind.as_str(),
+            scan.unread.join("\n")
+        );
+        assert!(
+            scan.copies.is_empty(),
             "the {} bridge still holds the bootstrap secret after the handshake was accepted, in:\n{}",
             kind.as_str(),
-            copies.join("\n")
+            scan.copies.join("\n")
         );
     }
     #[cfg(not(target_os = "linux"))]

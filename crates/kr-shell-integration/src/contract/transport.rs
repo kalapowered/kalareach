@@ -57,7 +57,8 @@ pub const ENDPOINT_VARIABLE: &str = "KR_SHELL_BRIDGE";
 /// The reserved variable that carries the one-time bootstrap secret.
 ///
 /// Unpadded base64url of [`BOOTSTRAP_SECRET_LEN`] random bytes. It is removed from the exported
-/// environment with the endpoint and retained only in private integration state.
+/// environment with the endpoint once the handshake is accepted, and the bridge wipes its own
+/// decoded copy at the same moment.
 pub const SECRET_VARIABLE: &str = "KR_SHELL_BRIDGE_SECRET";
 
 /// Both bootstrap variables, in the order a package reads them.
@@ -213,9 +214,9 @@ pub enum SecretLocation {
     /// In the exported environment, where the shell's own startup files can read it and where a
     /// child process would inherit it. This is true only until the handshake succeeds.
     ExportedEnvironment,
-    /// In private integration state: a shell-local variable the integration never exports, or the
-    /// module's own memory for a compiled bridge. Nothing a child process inherits and nothing a
-    /// user's startup file receives.
+    /// Not in the exported environment: only in the integration's own memory, which nothing a
+    /// child process inherits and no user's startup file reaches, and which the bridge wipes as
+    /// the handshake is accepted.
     PrivateIntegrationState,
 }
 
