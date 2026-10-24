@@ -77,9 +77,10 @@ impl Controller {
         self.check_fence()?;
         let authority_revision = registry.authority_revision()?;
         let admitted = self.admitted_table();
-        let registered = admitted
-            .get(&admission.connection_id)
-            .is_some_and(|connection| connection.admitted_revision >= authority_revision);
+        let connection = admitted.get(&admission.connection_id);
+        let registered =
+            connection.is_some_and(|connection| connection.admitted_revision >= authority_revision);
+        let refusal = self.refusal_of_the_feed_for(connection);
         drop(admitted);
         admission
             .check(crate::authority::AdmissionContext {
@@ -97,7 +98,25 @@ impl Controller {
                         detail: lapse.to_string(),
                     }
                 }
-            })
+            })?;
+        refusal.map_or(Ok(()), Err)
+    }
+
+    /// The refusal the authority feed puts on remote grants, as an error, when one stands and
+    /// `connection` came through the network.
+    ///
+    /// The owner at this machine is never refused by the feed. A mutation that a remote device had
+    /// admitted before the refusal rose is held to it where it commits, because the refusal moves
+    /// no revision and withdraws no registration: without this it would finish under the standing
+    /// the device had when it was admitted. A connection that is not registered has no door, and
+    /// the admission's own answer says so.
+    fn refusal_of_the_feed_for(
+        &self,
+        connection: Option<&AdmittedConnection>,
+    ) -> Option<ControllerError> {
+        connection
+            .filter(|connection| connection.door == Door::Network)
+            .and_then(|_| self.refuse_while_the_feed_refuses().err())
     }
 
     /// The admission check a mutation's own effect repeats, when it is carrying an admission.
@@ -345,6 +364,10 @@ impl Controller {
             return Err(ControllerError::PermissionDenied {
                 detail: crate::authority::AdmissionLapse::Revoked.to_string(),
             });
+        }
+        if let Some(refused) = self.refusal_of_the_feed_for(admitted.get(&admission.connection_id))
+        {
+            return Err(refused);
         }
         if admission
             .deadline
