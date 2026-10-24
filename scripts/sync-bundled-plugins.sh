@@ -838,6 +838,69 @@ mkdir "$staged_bundle" "$export_root"
 git -C "$plugins" archive --format=tar "$pinned_commit" | tar -x -f - -C "$export_root"
 [ -d "$generation" ] || fail "the export of $pinned_commit carries no $generation_path"
 
+# A generation number names one index: a host that holds a number refuses other bytes under it. So
+# a lock is not replaced by one for the same number over an index whose digest is not the one the
+# lock records; the plugin repository publishes the change as the next number. This needs only the
+# lock and the exported index, so it runs before the chain is verified and before anything is
+# written. The index is opened as every other file of the export is, with links refused.
+if [ -f "$lock_file" ]; then
+    PYTHONPATH="$work" python3 - "$export_root" "$generation_path" "$lock_file" \
+        "$max_index_bytes" <<'PY'
+import json
+import os
+import stat
+import sys
+
+from bundle import *  # noqa: F401,F403 - the program above
+
+export_root, generation_path, lock_path, max_index_bytes = sys.argv[1:5]
+max_index_bytes = int(max_index_bytes)
+
+lock = read_lock(lock_path)
+source = lock.get("source")
+held_number = source.get("generation") if isinstance(source, dict) else None
+held_digest = next(
+    (
+        entry.get("digest")
+        for entry in lock.get("metadata", [])
+        if isinstance(entry, dict) and entry.get("path") == INDEX
+    ),
+    None,
+)
+if held_number is None or held_digest is None:
+    fail(f"the lock {lock_path} names no generation or no index, so a new index cannot be compared")
+held_number = str(held_number)
+
+descent = []
+try:
+    descent.append(open_directory(export_root))
+    for segment in [*generation_path.split("/"), *INDEX.split("/")[:-1]]:
+        descent.append(open_directory(segment, descent[-1]))
+    file_fd = open_file(INDEX.split("/")[-1], descent[-1])
+    with os.fdopen(file_fd, "rb", closefd=True) as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            fail(f"{INDEX} of the exported generation is not a regular file")
+        content = handle.read(max_index_bytes + 1)
+except OSError as error:
+    fail(f"{INDEX} of the exported generation is not a readable file: {error}")
+finally:
+    for descriptor in descent:
+        os.close(descriptor)
+if len(content) > max_index_bytes:
+    fail(f"{INDEX} of the exported generation is over {max_index_bytes} bytes")
+try:
+    number = str(json.loads(content)["generation"])
+except (ValueError, KeyError, TypeError) as error:
+    fail(f"{INDEX} of the exported generation names no generation: {error}")
+if number == held_number and sha256(content) != held_digest:
+    fail(
+        f"generation {number} is already locked with the index {held_digest} and the plugin "
+        f"repository now publishes the index {sha256(content)} under it; a generation number names "
+        "one index, so a change is published as the next number"
+    )
+PY
+fi
+
 # The chain first: root, timestamp, snapshot, targets and every target's digest and length, through
 # the client the plugin repository publishes with, built from the same commit. Expiry is enforced,
 # because metadata that has expired blocks a new generation however well it is signed. Nothing has

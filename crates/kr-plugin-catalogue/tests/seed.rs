@@ -17,6 +17,7 @@ use kr_plugin_catalogue::{
     Permitted, Refusal, RepositoryKind, SeedBundle, SeedPoint, SeedTrust, permitted_root,
 };
 use kr_plugin_sdk::capability::PluginCapability;
+use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_plugin_sdk::limits::RepositoryBudgets;
 use kr_plugin_sdk::version::PackageVersion;
@@ -1190,6 +1191,86 @@ async fn a_store_holding_generation_two_refuses_another_index_under_two_and_take
             .any(|entry| entry.version.to_string() == "0.2.0"),
         "the index taken is the rebuilt one"
     );
+}
+
+/// KR-REQ-11.08: a store that holds a generation number leaves a bundle that publishes another index
+/// under that number alone, and the outcome says so: the number, the index the store holds and the
+/// one the bundle carries, with the repository pinned to that number or not. The same bundle seeded
+/// again has nothing to report.
+#[tokio::test]
+async fn a_bundle_with_another_index_under_a_held_number_is_reported_and_left_alone() {
+    for pinned in [false, true] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), adapter_spec(2)).await;
+        let held_bundle = seed_bundle(&generation);
+        let mut catalogue = offline(home.path());
+        let first = catalogue.seed(&held_bundle, environment(), budgets()).await;
+        assert_eq!(
+            first.activated,
+            Some(held_bundle.generation()),
+            "{}",
+            first.report()
+        );
+        let id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
+        if pinned {
+            catalogue
+                .pin(&id, Some(held_bundle.generation()))
+                .expect("the owner pins the generation");
+        }
+        let held = catalogue
+            .active(&id)
+            .expect("records")
+            .expect("the bundle is active");
+
+        let again = catalogue.seed(&held_bundle, environment(), budgets()).await;
+        assert!(
+            again.notes.is_empty(),
+            "the bundle the store holds has nothing to report: {}",
+            again.report()
+        );
+
+        // The repository publishes a different index under the number the store holds.
+        generation
+            .rewrite_with(GenerationSpec {
+                package_version: "0.2.0".to_owned(),
+                ..adapter_spec(2)
+            })
+            .await;
+        let other = seed_bundle(&generation);
+        assert_eq!(other.generation(), held_bundle.generation());
+        // The digest a store names the index by is the one of its canonical rendering.
+        let index: kr_plugin_sdk::catalogue::CatalogueIndex = serde_json::from_slice(
+            other
+                .file("targets/index.json")
+                .expect("the bundle carries its index"),
+        )
+        .expect("an index");
+        let other_digest =
+            PayloadDigest::of(index.canonical_json().expect("it renders").as_bytes());
+        assert_eq!(other_digest, other.index_digest());
+        assert_ne!(other_digest, held.index_digest);
+
+        let outcome = catalogue.seed(&other, environment(), budgets()).await;
+        assert!(outcome.activated.is_none(), "{}", outcome.report());
+        assert_eq!(
+            outcome.notes.len(),
+            1,
+            "pinned: {pinned}: {}",
+            outcome.report()
+        );
+        let note = &outcome.notes[0];
+        assert!(
+            note.contains("generation 2")
+                && note.contains(&held.index_digest.to_string())
+                && note.contains(&other_digest.to_string()),
+            "pinned: {pinned}: {note}"
+        );
+        assert_eq!(
+            catalogue.active(&id).expect("records"),
+            Some(held),
+            "the index the store holds stays in use"
+        );
+    }
 }
 
 /// Marks the release revoked, as a later generation publishes it.
