@@ -296,10 +296,17 @@ pub trait HostLine: Send {
         &mut self,
         params: DevicePushRegisterParams,
     ) -> PushFuture<'_, DevicePushRegisterResult>;
-    /// Sends `device.preview_key.update`, which says which preview key this phone holds.
+    /// Sends `device.preview_key.update`, which says which preview key this phone holds and at
+    /// which revision. When the host answers, the line records the revision, since a connection
+    /// offers the revision the host holds and is refused at another.
+    ///
+    /// The host commits a revision before it answers, so a phone that does not record the answer
+    /// offers the old revision and is refused at every connection. Nothing in the desk sends a
+    /// revision above the one it holds; a caller that does has to add a retry on that refusal.
     fn update_preview_key(
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        revision: DeviceKeyRevision,
     ) -> PushFuture<'_, ()>;
 }
 
@@ -1125,7 +1132,16 @@ impl PushDesk {
         if !wanted() {
             return Err(forgotten_host());
         }
-        line.update_preview_key(*keys.notification_preview.public())
+        // The revision the host holds, read now: the record may have moved since this run began.
+        let revision = self
+            .device
+            .pairing()
+            .hosts
+            .by_device(host.host_device_id)
+            .ok()
+            .flatten()
+            .map_or(host.device_key_revision, |held| held.device_key_revision);
+        line.update_preview_key(*keys.notification_preview.public(), revision)
             .await
             .map_err(not_taken)?;
         // The line is not needed any more, and the hold on the host's endpoint goes with it: the
@@ -1617,6 +1633,7 @@ impl Registrar for ConnectionRegistrar {
             Ok(Box::new(ConnectionLine {
                 connection,
                 device: Arc::clone(&self.0),
+                host_device_id: host.host_device_id,
                 device_id: host.device_id,
                 _held: held,
             }) as Box<dyn HostLine + 'a>)
@@ -1628,8 +1645,9 @@ impl Registrar for ConnectionRegistrar {
 struct ConnectionLine {
     connection: crate::connection::Connection,
     /// This phone, which says whether the account the connection was opened under is still the one
-    /// signed in.
+    /// signed in, and keeps the revision of its keys the host takes.
     device: Arc<Device>,
+    host_device_id: DeviceId,
     /// The host's identifier for this phone.
     device_id: DeviceId,
     /// The hold on the host's endpoint, kept until the line is dropped.
@@ -1687,6 +1705,7 @@ impl HostLine for ConnectionLine {
     fn update_preview_key(
         &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        revision: DeviceKeyRevision,
     ) -> PushFuture<'_, ()> {
         Box::pin(async move {
             use kr_protocol::envelope::ActionTarget;
@@ -1696,9 +1715,9 @@ impl HostLine for ConnectionLine {
             // The registration that came before may have been made under an account that has since
             // left: the key goes to the host only for the account that is signed in now.
             self.still_the_account().await?;
-            // The key the host seals previews to is the one it recorded when this phone paired. The
-            // call says the phone holds it and at which revision: the same key at the same revision
-            // is answered as already recorded, and any other is refused rather than taken.
+            // The call says which key the phone holds and at which revision: the same key at the
+            // same revision is answered as already recorded, a higher revision is recorded, and a
+            // revision behind the host's is refused.
             within_the_answer(async {
                 self.connection
                     .session()
@@ -1710,7 +1729,7 @@ impl HostLine for ConnectionLine {
                         &DevicePreviewKeyUpdateParams {
                             device_id: self.device_id,
                             notification_preview: preview_key,
-                            revision: DeviceKeyRevision::new(1),
+                            revision,
                         },
                         crate::commands::MUTATION_TTL,
                     )
@@ -1718,7 +1737,13 @@ impl HostLine for ConnectionLine {
                     .map(|_| ())
                     .map_err(|error| CommandError::from(error).message)
             })
-            .await
+            .await?;
+            // The host holds the revision now, and the next connection has to offer it.
+            self.device
+                .pairing()
+                .hosts
+                .raise_revision(self.host_device_id, self.device_id, revision)
+                .map_err(|_| "this phone could not keep the revision the host took".to_owned())
         })
     }
 }

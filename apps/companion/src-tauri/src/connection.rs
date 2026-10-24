@@ -262,7 +262,7 @@ impl Connection {
         visiting: bool,
     ) -> std::result::Result<Self, Unopened> {
         let pairing = device.pairing();
-        let identity = pairing.candidate.paired_identity(host.device_id);
+        let identity = pairing.paired_identity_for(&host);
         let connecting = async {
             // The connection is the account's that is signed in before it is dialled: an account
             // that signs in while it is dialled and presented is not the one its lease was got for.
@@ -645,8 +645,7 @@ pub async fn keep<R, A, F>(
                     let desk = device.leases()?.clone();
                     let key = *device
                         .pairing()
-                        .candidate
-                        .paired_identity(host.device_id)
+                        .paired_identity_for(&host)
                         .authorisation
                         .public();
                     Some((desk, host, key, under))

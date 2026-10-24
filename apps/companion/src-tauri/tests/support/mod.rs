@@ -194,6 +194,7 @@ pub fn record_owned(device: &Device, host: &Host, name: &str) {
             proposed_grant: kr_pairing::grants::personal_owner_grant(),
             name: Some(name.to_owned()),
             paired_at_ms: record.paired_at_ms.get(),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
         })
         .expect("the host is recorded");
 }
@@ -317,6 +318,7 @@ impl SilentHost {
             proposed_grant: kr_pairing::grants::personal_owner_grant(),
             name: Some(name.to_owned()),
             paired_at_ms: kr_ipc::now_ms().get(),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
         };
         Self {
             record,
