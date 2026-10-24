@@ -259,3 +259,41 @@ fn a_capture_that_failed_is_read_again_and_not_taken_for_a_pixel_format() {
     assert!(!run.output.contains("pixel format"), "{}", run.output);
     assert_eq!(run.picture(), Some((64, 128)), "{}", run.output);
 }
+
+/// Queries for the application's process that the device does not answer (an `adb` that lost its
+/// device for a moment) are not a process that ended: they are asked again until it answers, and a
+/// healthy launch passes.
+#[test]
+fn queries_the_device_did_not_answer_are_asked_again_and_do_not_end_a_healthy_launch() {
+    let run = launch_with(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[("unanswered-queries", "2")],
+    );
+    assert_eq!(run.status, Some(0), "{}", run.output);
+    assert!(!run.output.contains("ended"), "{}", run.output);
+}
+
+/// A process that does end is still named when a query was not answered on the way to the answer.
+#[test]
+fn a_process_that_ends_after_an_unanswered_query_is_still_named() {
+    let run = launch_with(
+        "7072",
+        "application-killed.log",
+        "screen",
+        &[("unanswered-queries", "1")],
+    );
+    assert_eq!(run.status, Some(1), "{}", run.output);
+    assert!(
+        run.output.contains("ended when the screen was read"),
+        "{}",
+        run.output
+    );
+    assert!(
+        run.output
+            .contains("low-memory killer of the system ended the application"),
+        "{}",
+        run.output
+    );
+}

@@ -18,6 +18,9 @@ The device's state is a directory, named by the environment variable KR_FAKE_DEV
   unreadable-screens
              a number: that many of the first reads of the screen fail, and `screencap` writes
              the text of its error where the frame would be
+  unanswered-queries
+             a number: after the first query for the application's process, that many queries
+             for it fail at the transport and print the error of an `adb` that lost its device
 
 The screen is a small raw frame in the shape `screencap` writes it: a header of width, height,
 format and colour space, then four bytes a pixel. A frame the picture of which was asked for
@@ -142,9 +145,14 @@ def adb(arguments):
         elif words.startswith("am start"):
             out.write(b"Status: ok\nActivity: to.kala.reach/.MainActivity\n")
         elif words.startswith("pidof"):
-            if not pid:
+            call = nth_call("pidof")
+            if 1 < call <= 1 + count("unanswered-queries"):
+                sys.stderr.write("error: device offline\n")
                 sys.exit(1)
-            out.write((pid + "\n").encode())
+            # The shell on the device runs the whole line: `pidof`, and then the status it ended with.
+            if pid:
+                out.write((pid + "\n").encode())
+            out.write(b"status:0\n" if pid else b"status:1\n")
         elif words.startswith("run-as"):
             out.write(
                 f"7000000000-7000200000 r-xp 00000000 fe:00 1 /data/app/{PACKAGE}-1/base.apk\n".encode()
