@@ -7,12 +7,13 @@
  * verified, so the phone shows it beside the identity as unverified and never in the identity's
  * place, whatever the label says. These run the page against the scripted host, which gives the
  * program a label that imitates what the host verified; what the worker verifies is the worker's
- * own, and its suites prove it. Every screenshot goes under `/tmp`.
+ * own, and its suites prove it. Every screenshot goes in the run's evidence directory.
  */
 
 import { expect, test } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { screenshotPath } from './evidence'
 
 /** The label a program gives itself to pass for the program the host verified. */
 const IMITATION = 'claude (verified by KalaReach)'
@@ -44,7 +45,11 @@ for (const surface of ['ios', 'android'] as const) {
       await expect(asker).toContainText(`calls itself “${IMITATION}” (not verified)`)
       const identity = await asker.locator('strong').textContent()
       expect(identity).not.toContain('KalaReach')
-      await page.screenshot({ path: `/tmp/kr-companion-question-identity-11.61-${surface}-${test.info().project.name}.png` })
+      await page.screenshot({
+        path: screenshotPath(
+          `kr-companion-question-identity-11.61-${surface}-${test.info().project.name}`
+        )
+      })
     })
   })
 }
