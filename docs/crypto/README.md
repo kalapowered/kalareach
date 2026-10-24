@@ -4,12 +4,12 @@
 maintained implementation, plus the rules that make those implementations hard to misuse. The same
 holds for the whole tree: no crate, package or application writes a cipher, a cryptographic hash, a signature
 scheme, a key exchange or a password-authenticated key exchange of its own. A crate that needs one
-calls a maintained library, and the libraries are the ones below. Two exceptions exist and neither is
+calls a maintained library, and the libraries are the ones below. One exception exists, and it is not
 a cipher, a signature scheme, a key exchange or a PAKE. The Bash, Fish and Zsh packages each compile
 `kr_bridge_crypto.c`, a SHA-256 and an HMAC-SHA-256 of its own, written from FIPS 180-4 and RFC 2104,
 with which the bridge computes its bootstrap proof; the worker verifies that proof with the RustCrypto
-HMAC. And two HMAC keys of the attention and delivery stores are made from random UUIDs through
-`getrandom`, not from `kr-crypto`.
+HMAC. Every package build holds that code to published known answers, and
+[a section below](#the-hash-the-shell-bridges-write-themselves) describes the checks.
 
 | What | Implementation |
 | --- | --- |
@@ -24,7 +24,7 @@ HMAC. And two HMAC keys of the attention and delivery stores are made from rando
 | The media path of a voice call | DTLS-SRTP in the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
 | Secrets at rest | the operating system's credential store through the `keyring` crate on a desktop, and on a phone the Keychain on iOS and the Keystore on Android through the companion's platform services |
 | The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
-| The shell bridges' bootstrap proof | The shell packages' own `kr_bridge_crypto.c` (SHA-256 and HMAC-SHA-256, as above) for Bash, Fish and Zsh, and .NET's `HMACSHA256` and `SHA256` in the PowerShell bridge |
+| The shell bridges' bootstrap proof | The shell packages' own `kr_bridge_crypto.c` (SHA-256 and HMAC-SHA-256, as above, [checked against published answers](#the-hash-the-shell-bridges-write-themselves)) for Bash, Fish and Zsh, and .NET's `HMACSHA256` and `SHA256` in the PowerShell bridge |
 | The release tool's keys and signatures | `aws-lc-rs` and `tough`'s signing, with `SystemRandom` for a development key |
 | Secret files on Android and previews on a phone | Android's `SecureRandom`, AES-256-GCM under an Android Keystore key, AndroidX encrypted preferences (AES-SIV and AES-GCM), Java `MessageDigest`; CryptoKit on iOS for hashes |
 | Primitives inside the libraries above | `keyring`'s Linux store uses the `secret-service` crate with its own Diffie-Hellman exchange and AES-128-CBC; iroh brings `blake3`, `ed25519-dalek`, `curve25519-dalek` and RustCrypto `aes-gcm`, and, in its relay server (which the transport and controller tests enable), RustCrypto `sha1`; `libsodium-sys-stable`'s build script uses `minisign-verify`, with its own Ed25519 and BLAKE2b, to check the minisign signature of the libsodium archive at build time (the source archive on Linux and macOS, the prebuilt archive on Windows); `n0-mainline` and `tokio-websockets` bring `sha1_smol`; `noq-proto`, `rustls`, `x509-parser` and the other TLS crates bring `ring`; `rand` brings the `chacha20` and `rand_chacha` generators; `spake2` brings `curve25519-dalek` 4.1.3. No Rust source of the workspace calls any of them |
@@ -598,7 +598,9 @@ The RFC 8032 and RFC 5869 vectors are there so a reader can confirm that this is
 and standard HKDF, not a variant. `packages/protocol/test/crypto.test.ts` checks the same documents
 with the Node runtime's own SHA-256, HMAC-SHA256, HKDF-SHA256 and Ed25519 verification, and with
 this repository's own TypeScript codec for the encodings, so a value that drifts in one language
-fails in both. The shell bridges' own SHA-256 and HMAC-SHA-256 have no known-answer vectors in this tree.
+fails in both. The shell bridges' own SHA-256 and HMAC-SHA-256 keep their answers in
+`scripts/build-shells.sh`, where every package build runs them, and not in `fixtures/crypto/`; see
+[the hash the shell bridges write themselves](#the-hash-the-shell-bridges-write-themselves).
 
 ## Known limitations
 
