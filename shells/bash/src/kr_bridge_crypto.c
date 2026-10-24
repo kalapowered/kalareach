@@ -12,9 +12,52 @@
  * interactive shell, so the two primitives it needs are here, from FIPS 180-4 and RFC 2104.
  */
 
+/* Before any system header: strict C asks for memset_s by this name. */
+#ifndef __STDC_WANT_LIB_EXT1__
+#define __STDC_WANT_LIB_EXT1__ 1
+#endif
+
 #include "kr_bridge_crypto.h"
 
 #include <string.h>
+
+/*
+ * A memset of a buffer that is never read again is a dead store, and an optimiser may remove it,
+ * which would leave the hash state and the key pads in memory after the call. A wipe is therefore
+ * one the compiler has to keep: memset_s where Apple's C library has it, explicit_bzero where
+ * glibc 2.25 or later has it, and a loop through a volatile pointer on any other platform. A build
+ * that defines KR_PORTABLE_WIPE takes the loop everywhere.
+ */
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ) && defined(__USE_MISC)
+#define KR_GLIBC_EXPLICIT_BZERO __GLIBC_PREREQ(2, 25)
+#else
+#define KR_GLIBC_EXPLICIT_BZERO 0
+#endif
+
+#if defined(KR_PORTABLE_WIPE)
+/* The loop below. */
+#elif defined(__APPLE__)
+#define KR_WIPE_WITH_MEMSET_S 1
+#elif KR_GLIBC_EXPLICIT_BZERO
+#define KR_WIPE_WITH_EXPLICIT_BZERO 1
+#endif
+
+void
+kr_wipe(void *buffer, size_t length)
+{
+#if defined(KR_WIPE_WITH_MEMSET_S)
+    (void)memset_s(buffer, length, 0, length);
+#elif defined(KR_WIPE_WITH_EXPLICIT_BZERO)
+    explicit_bzero(buffer, length);
+#else
+    volatile unsigned char *cursor = (volatile unsigned char *)buffer;
+
+    while (length > 0) {
+        *cursor++ = 0;
+        length--;
+    }
+#endif
+}
 
 #define ROTR(value, bits) (((value) >> (bits)) | ((value) << (32 - (bits))))
 #define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
@@ -84,7 +127,7 @@ kr_sha256_block(kr_sha256 *state, const unsigned char *block)
     state->h[6] = (state->h[6] + g) & 0xffffffffUL;
     state->h[7] = (state->h[7] + h) & 0xffffffffUL;
 
-    memset(w, 0, sizeof(w));
+    kr_wipe(w, sizeof(w));
 }
 
 void
@@ -148,7 +191,7 @@ kr_sha256_final(kr_sha256 *state, unsigned char out[KR_SHA256_LEN])
         out[i * 4 + 2] = (unsigned char)((state->h[i] >> 8) & 0xffu);
         out[i * 4 + 3] = (unsigned char)(state->h[i] & 0xffu);
     }
-    memset(state, 0, sizeof(*state));
+    kr_wipe(state, sizeof(*state));
 }
 
 void
@@ -187,9 +230,9 @@ kr_hmac_sha256(const unsigned char *key, size_t key_len, const unsigned char *me
     kr_sha256_update(&state, inner, sizeof(inner));
     kr_sha256_final(&state, out);
 
-    memset(block, 0, sizeof(block));
-    memset(inner, 0, sizeof(inner));
-    memset(shortened, 0, sizeof(shortened));
+    kr_wipe(block, sizeof(block));
+    kr_wipe(inner, sizeof(inner));
+    kr_wipe(shortened, sizeof(shortened));
 }
 
 int

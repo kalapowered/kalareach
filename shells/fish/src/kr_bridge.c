@@ -1121,6 +1121,9 @@ kr_bridge_activate(void)
         return;
     }
     if (!kr_base64url_decode(secret, kr.secret, sizeof(kr.secret), &kr.secret_len)) {
+        /* The decoder writes as it reads, so a refusal can leave part of the secret behind. */
+        kr_wipe(kr.secret, sizeof(kr.secret));
+        kr.secret_len = 0;
         return;
     }
     strcpy(kr.endpoint, endpoint);
@@ -1138,7 +1141,7 @@ kr_bridge_activate(void)
 
     kr.fd = kr_connect(kr.endpoint);
     if (kr.fd < 0) {
-        memset(kr.secret, 0, sizeof(kr.secret));
+        kr_wipe(kr.secret, sizeof(kr.secret));
         kr.secret_len = 0;
         return;
     }
@@ -1146,6 +1149,8 @@ kr_bridge_activate(void)
     kr_write_transcript(&transcript);
     if (transcript.failed) {
         kr_cbor_writer_free(&transcript);
+        kr_wipe(kr.secret, sizeof(kr.secret));
+        kr.secret_len = 0;
         kr_disconnect(0);
         return;
     }
@@ -1156,7 +1161,7 @@ kr_bridge_activate(void)
     kr_send(&hello);
 
     if (!kr_await_handshake()) {
-        memset(kr.secret, 0, sizeof(kr.secret));
+        kr_wipe(kr.secret, sizeof(kr.secret));
         kr.secret_len = 0;
         kr_disconnect(0);
         return;
