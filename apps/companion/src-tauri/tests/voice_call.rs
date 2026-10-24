@@ -1165,6 +1165,8 @@ async fn signing_out_during_a_call_ends_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_return() {
     let mut scene = scene().await;
+    // The service takes its time over what the device sends it.
+    scene.stand_in.control().hold_requests(true);
     scene.start().await;
     scene
         .state_where("an attached control", |state| {

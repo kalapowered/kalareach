@@ -110,6 +110,7 @@ struct State {
     drop_after_ready: bool,
     closure_delay: Option<Duration>,
     closure_held: bool,
+    requests_held: bool,
     admissions_twice: bool,
     announced: Vec<String>,
     ready_call: String,
@@ -186,6 +187,7 @@ impl ControlRoute {
                 drop_after_ready: false,
                 closure_delay: None,
                 closure_held: false,
+                requests_held: false,
                 admissions_twice: false,
                 announced: Vec::new(),
                 ready_call: CALL.to_owned(),
@@ -313,6 +315,12 @@ impl ControlRoute {
     /// Holds the service's answer to a closure, once it has read the request, until told not to.
     pub fn hold_closures(&self, hold: bool) {
         self.edit(|state| state.closure_held = hold);
+    }
+
+    /// Reads each request a device sends and does not take it up, neither counting it nor
+    /// answering it, until told not to, as a service that is busy does. Heartbeats are answered.
+    pub fn hold_requests(&self, hold: bool) {
+        self.edit(|state| state.requests_held = hold);
     }
 
     /// Sends the provider's admission of every request twice, as a socket opened just before the
@@ -497,6 +505,9 @@ where
                     break;
                 }
                 let Some(text) = message.as_text() else { continue };
+                if text.contains(r#""type":"context""#) {
+                    while_requests_are_held(&shared).await;
+                }
                 let (answers, drop_after) = answer(&shared, text);
                 let late = shared
                     .state
@@ -564,6 +575,25 @@ where
         .sockets
         .retain(|(socket, _)| *socket != id);
     shared.changed.notify_waiters();
+}
+
+/// Returns once the route no longer holds the requests it reads.
+async fn while_requests_are_held(shared: &Shared) {
+    loop {
+        let changed = shared.changed.notified();
+        tokio::pin!(changed);
+        // Registered before the flag is read, so a release between the two is not lost.
+        changed.as_mut().enable();
+        if !shared
+            .state
+            .lock()
+            .expect("the route's state")
+            .requests_held
+        {
+            return;
+        }
+        changed.await;
+    }
 }
 
 /// What the route answers to one text frame, in the service's order, and whether it then drops
