@@ -6616,13 +6616,19 @@ request names, up to eight of each. Every scan reads such a record again, so a r
 the refusal while the feed holds the record, and nothing is stored for it. It ends when the owner at the machine revokes what the
 request names, which needs no confirmation. Pairing the owner again is no way to end it, because
 pairing waits for an owner device's confirmation, which is refused while the refusal stands. A
-withdrawal that names every owner device has a cost: once the owner at the machine has revoked them,
-as the remedy says, the host has no owner device left to confirm for it, and the terminal confirms
-nothing on an owned host. The way out is the one for any host whose owner devices are all revoked
-or gone ("Two kinds of host have no route to establish the clock"): on a host that is exclusively
-organisation-managed the person at the terminal ends exclusive management, and pairs an owner device
-again. A feed that shows a revocation complete that no owner made can only keep remote access
-refused this way. It cannot revive a device, and the owner at the machine can always end it. While
+withdrawal that names every owner device needs care. Never revoke the last owner device while the
+refusal stands: the terminal confirms nothing on an owned host and no command removes the owner, so a
+host left with no owner device cannot pair one again ("Two kinds of host have no route to establish
+the clock"). On a host that is exclusively organisation-managed the person at the terminal can end
+exclusive management and do nothing else. The route that exists keeps an owner device. The owner
+removes `authority.origin` from the configuration document and starts the daemon again. The host keeps
+nothing of the refusal and reads no feed, so the refusal ends and a device the withdrawal names
+confirms again. The owner pairs a new owner device, revokes the devices and grants the withdrawal
+names, sets `authority.origin` back and starts the daemon again. The cost is that the host serves the
+named devices until the owner has revoked them, and learns no remote revocation while it reads no
+feed. A feed that shows a revocation complete that no owner made cannot revive a device. It keeps
+remote access refused until the owner at the machine revokes what the request names or takes this
+route. While
 the refusal stands, the devices the request names keep no standing over the feed, and neither does a
 device that holds a key one of them holds. A feed removes the host by a key, so the host takes those
 keys out of the list of keys the feed takes a removal from as soon as it finds the withdrawal,
