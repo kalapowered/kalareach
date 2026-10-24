@@ -91,6 +91,9 @@ pub enum Error {
         /// Which column.
         field: &'static str,
     },
+    /// The secret a new store derives its item keys under could not be drawn.
+    #[error("the attention feature store's key secret could not be drawn: {0}")]
+    KeySecretUnavailable(#[from] kr_crypto::CryptoError),
 }
 
 /// What kind of failure the feature store reported.
