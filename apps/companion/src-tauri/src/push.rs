@@ -816,6 +816,7 @@ impl PushDesk {
                 .record
                 .hosts
                 .get(&id.to_string())
+                .filter(|kept| kept.phase == Phase::On && !kept.lost)
                 .and_then(|kept| kept.told_differs().then_some(kept.registered).flatten());
             match due {
                 Some(registered) => state.claim(id).map(|run| {
