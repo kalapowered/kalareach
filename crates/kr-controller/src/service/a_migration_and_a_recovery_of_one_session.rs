@@ -117,6 +117,28 @@ pub(super) async fn after_the_first_pass(controller: &Controller) {
     .expect("the collection is still there");
 }
 
+/// How many times a case asks again for a migration that the daemon has put off.
+const ASKS: usize = 10_000;
+
+/// Asks again until `made` holds of the answer. The gate in front of a migration answers that a
+/// worker may remain while another task of the daemon holds the registry, so one ask after an
+/// explicit hold has ended can find the migration put off for that moment. The asks are bounded in
+/// number and not in time, and yield between them.
+pub(super) async fn until_made<T, Fut: std::future::Future<Output = T>>(
+    mut ask: impl FnMut() -> Fut,
+    made: impl Fn(&T) -> bool,
+) -> T {
+    let mut answer = ask().await;
+    for _ in 0..ASKS {
+        if made(&answer) {
+            break;
+        }
+        tokio::task::yield_now().await;
+        answer = ask().await;
+    }
+    answer
+}
+
 pub(super) fn version_of(controller: &Controller, session_id: SessionId) -> i64 {
     kr_worker::journal::Journal::recorded_schema_version(
         controller.paths().journal_database(session_id),
@@ -173,10 +195,12 @@ async fn a_migration_is_refused_while_a_recovery_holds_the_session() {
     );
 
     drop(recovery);
-    let after = controller
-        .session_archive(session_id)
-        .await
-        .expect("the archive answers");
+    let after = until_made(
+        || controller.session_archive(session_id),
+        |_| version_of(&controller, session_id) == kr_worker::persistence::migration::CURRENT,
+    )
+    .await
+    .expect("the archive answers");
     assert_eq!(
         version_of(&controller, session_id),
         kr_worker::persistence::migration::CURRENT,
@@ -211,10 +235,12 @@ async fn a_recovery_is_refused_while_a_migration_holds_the_session() {
         });
     }
 
-    controller
-        .session_archive(session_id)
-        .await
-        .expect("the archive answers");
+    until_made(
+        || controller.session_archive(session_id),
+        |_| answer.lock().expect("the answer").is_some(),
+    )
+    .await
+    .expect("the archive answers");
 
     let asked = answer.lock().expect("the answer").take();
     assert!(
