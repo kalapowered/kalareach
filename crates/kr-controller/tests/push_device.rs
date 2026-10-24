@@ -1058,6 +1058,21 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         json!(kr_protocol::push::FREE_PUSH_BURST),
     );
     report.insert("burst_at_rest".to_owned(), json!(at_rest));
+    // The allowance refills while the burst is admitted, so what the host accepts is the allowance
+    // plus what the span between its first and last admission refilled. The host's own clock says
+    // how long that was.
+    let admitted: Vec<u64> = fresh
+        .iter()
+        .map(|record| record.admitted_at_ms.get())
+        .collect();
+    report.insert(
+        "burst_span_ms".to_owned(),
+        json!(admitted.iter().max().copied().unwrap_or(0) - admitted.iter().min().copied().unwrap_or(0)),
+    );
+    report.insert(
+        "burst_refill_ms".to_owned(),
+        json!(kr_delivery::budget::BURST_REFILL_MS),
+    );
     report.insert(
         "burst_details".to_owned(),
         json!(
