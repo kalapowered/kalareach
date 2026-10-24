@@ -1374,8 +1374,16 @@ connection that keeps it and a margin, and the service is asked for another only
 the application's own refresh is due, or the host refuses the one that is, as a host does that
 restarted or whose clock has passed the lease's end. A connection that is kept beside the
 application's own, as the inbox keeps its visits to the hosts it is not using, presents the lease
-again before each use, because nothing refreshes the lease of a host that is not in use and the host
-refuses a connection once the lease it holds has ended. The standing links the companion opens to a
+again with `Presentation::IfDue`, which sends nothing until the lease the host holds is due to be
+replaced and then asks the service for a new one, because nothing refreshes the lease of a host that
+is not in use and the host refuses a connection once the lease it holds has ended; a presentation is
+an action the host records and never removes, so one at each use would write a row on the host for
+each. A renewal that cannot be had while the lease the host holds still lasts is no failure of the
+connection. A host that refuses a read on such a connection as not permitted may have lost the lease
+before this device's clock said it was due, and the inbox presents the lease the device holds
+(`Presentation::First`, which asks for a new one if the host refuses it) and reads once more, when
+the refusal says the host holds no lease it will answer under (`organisation::lease_is_refused`), and
+not for any other refusal, which a presentation does not mend. The standing links the companion opens to a
 host's sessions use `connect_paired_transport`, present nothing, and rely on the lease the
 application's own connection keeps. The companion keeps one keeper for each host, and makes another
 when the organisation, the device's key or the account signed in differs, or when the person has
@@ -1385,9 +1393,14 @@ A keeper belongs to the account that was signed in when it was made. The lease c
 account is signed in before the keeper asks for a lease or for the chain of keys and again before it
 presents a lease, and asks only under the token of the account it was made for, so a lease that
 arrives after the account changed is not presented (`LeaseStop::AccountChanged`), and a refresh
-that begins after a sign-out does not begin (`SignIn`). The companion's connection to the host ends
-at once when the account it keeps the lease for signs out or is replaced, whatever the keeper is
-doing, and its reason says which.
+that begins after a sign-out does not begin (`SignIn`). A connection is the account's that was signed
+in before it was dialled (`LeaseDesk::account_of`), and not whichever account is signed in when its
+keeper starts: a connection that finds another account signed in once it has presented is refused
+where it opens, the companion's connection to the host ends at once when that account signs out or
+is replaced, whatever the keeper is doing and though the replacement came before the keeper began,
+and its reason says which. A caller that uses a connection for more than its opening asks again, after it
+has presented a lease on it, whether the account is still the one (`Connection::account_unchanged`):
+the inbox does before each read, and lets go of a kept connection that another account has replaced.
 
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
 service answers. A lease that has ended, that the host installed before its restart, or that a newer
@@ -1400,10 +1413,14 @@ than a minute and sends the service at most one lease request after each wait. W
 connection asks the service either, for a lease or for the chain of keys. A delay that outlasts the
 lease the host holds ends the keeper with `LeaseStop::Later` when that lease ends. A delay of more
 than five seconds is not waited out inside a connection: the connection ends with `LeaseStop::Later`
-and the delay. A first presentation takes ten seconds at the most, which covers that wait and a
-request, and a caller may give it less (a visit and a listing give ten seconds for the dial, the
-presentation and the reads together). A request its caller gives up on counts as one the service did
-not answer: the keeper sends none for a minute after it. A chain the host does not accept is tried
+and the delay. A first presentation takes ten seconds at the most, which is less than a request that names a
+delay, the wait and the request after it can take, so a service that is slow and then names a delay
+ends the presentation as unreachable; a caller may give it less (a visit and a listing give ten
+seconds for the dial, the presentation and the reads together). A request its caller gives up on
+counts as one the service did not answer: the keeper sends none for a minute after it, the request
+for the chain of keys that a presentation already under way makes after its lease included. The hold
+is against the service only: a connection presents the lease the keeper holds whatever is held, and
+one that has none is told the stop. A chain the host does not accept is tried
 three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
 and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no longer takes
 the sign-in (`TokenRefused`), when the account is not a member, or when the host refuses the lease

@@ -30,8 +30,16 @@
 //! the service did not answer, and the keeper sends none for a minute after it. A stop that a
 //! person or an administrator mends is remembered: the keeper answers a later connection with the
 //! same stop and sends nothing until the stop has been held for the time [`LeaseStop::holds_for`]
-//! names. A token the service rejects is replaced once by the service client before the keeper
-//! hears of it, so a second rejection ends in `TokenRefused`.
+//! names. A hold is against the service: it stops every request to it, the chain of keys asked
+//! for by a presentation already under way as much as a lease asked for by one that begins later,
+//! and it stops a presentation only when no lease is held that the host would take. A token the
+//! service rejects is replaced once by the service client before the keeper hears of it, so a
+//! second rejection ends in `TokenRefused`.
+//!
+//! A connection that is kept beside the one that keeps the lease fresh, as the inbox keeps its
+//! visits, presents again only when the lease the host holds is due to be replaced
+//! ([`LeaseKeeper::present_if_due`]): every presentation is an action the host records and never
+//! removes, so one a pass would write a row on each host for as long as the connection is kept.
 //!
 //! A keeper belongs to the account that was signed in when it was made. The service client checks
 //! which account is signed in before the keeper asks for a lease and again before it presents one,
@@ -90,10 +98,13 @@ const LONGEST_WAIT_AT_CONNECT: Duration = Duration::from_secs(5);
 const LEASE_MARGIN: Duration = Duration::from_secs(30);
 
 /// The most a connection's first presentation takes in all, counting its requests to the service
-/// and its waits: the longest delay it waits out and one request of the service client, which is
-/// given five seconds at the most. A caller may give less (a visit and a listing give ten seconds
-/// for the dial, the presentation and the reads together); a presentation it cuts off while a
-/// request is under way holds the service off for itself.
+/// and its waits. The service client gives each request five seconds at the most, and a presentation
+/// can make a request that names a delay, wait the delay out (five seconds at the most) and make the
+/// request the delay was named for; a token the service rejects adds a renewal and a second request
+/// to either. Ten seconds is less than that, so a service that is slow and names a delay ends the
+/// presentation as unreachable, not as a delay. A caller may give less (a visit and a listing give
+/// ten seconds for the dial, the presentation and the reads together); a presentation it cuts off
+/// while a request is under way holds the service off for itself.
 const PRESENT_WITHIN: Duration = Duration::from_secs(10);
 
 /// How much earlier than a wait ends, by the wall clock, a request may go: a clock that was set
@@ -294,6 +305,9 @@ enum Next {
     WithTheChain,
     /// Wait for the delay the service named.
     After(Duration),
+    /// A stop is held against the service for the time that is left of it: no request goes until it
+    /// is over.
+    Held(LeaseStop, Duration),
     /// Wait out the backoff.
     BackOff,
     /// Wait out the backoff, and ask the service for a new lease that carries the chain of keys.
@@ -432,9 +446,9 @@ impl LeaseKeeper {
 
     /// Presents a lease as the first thing on the connection.
     ///
-    /// The lease the host took last is presented again while it lasts; the service is asked only
-    /// when none is held, or the host refuses the one that is. A failure that asking again mends is
-    /// mended here, and one that time mends is waited out.
+    /// The lease the host took last is presented again while it lasts, whatever is held against the
+    /// service; the service is asked only when none is held, or the host refuses the one that is. A
+    /// failure that asking again mends is mended here, and one that time mends is waited out.
     ///
     /// # Errors
     ///
@@ -442,9 +456,6 @@ impl LeaseKeeper {
     /// connection. A stop that a person or an administrator mends is returned again, with nothing
     /// sent, until the time it is held for has passed.
     pub async fn present_first(&self, session: &Session) -> Result<(), LeaseStop> {
-        if let Some(stop) = self.held_back() {
-            return Err(stop);
-        }
         // The caller's own limit is shorter than a few slow requests add up to, and a hold is
         // recorded only by a stop, so the keeper stops itself first.
         match tokio::time::timeout(
@@ -456,6 +467,42 @@ impl LeaseKeeper {
             Ok(held) => held.map(|_| ()),
             Err(_) => Err(self.stopped(LeaseStop::Unreachable)),
         }
+    }
+
+    /// Presents again, over a connection that presented first and is kept, when the lease the host
+    /// holds is due to be replaced; sends nothing while it is not.
+    ///
+    /// A presentation is an action the host records and keeps, so a connection that presented
+    /// again at each use would write a row on the host for each. A new lease is asked for once, with
+    /// no waits; when it cannot be got while the lease the host holds still lasts, that is no
+    /// failure of the connection, and the service is not asked again until what was held against it
+    /// is over.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host holds no lease that lasts and will not without a person or a new
+    /// connection.
+    pub async fn present_if_due(&self, session: &Session) -> Result<(), LeaseStop> {
+        if !self.due() {
+            return Ok(());
+        }
+        let stop = match tokio::time::timeout(
+            PRESENT_WITHIN,
+            self.until_held(session, &mut Pace::once(), Reuse::Unaccepted),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(stop)) => stop,
+            Err(_) => self.stopped(LeaseStop::Unreachable),
+        };
+        let lasts = self
+            .left_on_the_lease()
+            .is_some_and(|left| left > LEASE_MARGIN);
+        if lasts && matches!(stop, LeaseStop::Unreachable | LeaseStop::Later(_)) {
+            return Ok(());
+        }
+        Err(stop)
     }
 
     /// Keeps the lease until something stops it. It begins with a wait until the lease the host
@@ -470,6 +517,16 @@ impl LeaseKeeper {
                 Err(stop) => return stop,
             }
         }
+    }
+
+    /// Whether the lease the host holds is due to be replaced: none is held, or the moment to replace
+    /// it has come.
+    fn due(&self) -> bool {
+        let now = self.timer.now_ms();
+        self.kept()
+            .lease
+            .as_ref()
+            .is_none_or(|held| held.due_at_ms.is_none_or(|due| due <= now))
     }
 
     /// How long until the lease the host holds is due to be replaced.
@@ -494,15 +551,22 @@ impl LeaseKeeper {
             .map(|held| Duration::from_millis(held.ends_at_ms.saturating_sub(now)))
     }
 
-    /// The stop that is held, while it is, with the delay it still has to run.
-    fn held_back(&self) -> Option<LeaseStop> {
+    /// The stop that is held, while it is, and the time it still has to run. A held `Later` names
+    /// that time as its delay.
+    fn held_back(&self) -> Option<(LeaseStop, Duration)> {
         let now = self.timer.now_ms();
         let mut kept = self.kept();
         match &kept.held_back {
-            Some((until, stop)) if *until > now => Some(match stop {
-                LeaseStop::Later(_) => LeaseStop::Later(Duration::from_millis(*until - now)),
-                other => other.clone(),
-            }),
+            Some((until, stop)) if *until > now => {
+                let left = Duration::from_millis(*until - now);
+                Some((
+                    match stop {
+                        LeaseStop::Later(_) => LeaseStop::Later(left),
+                        other => other.clone(),
+                    },
+                    left,
+                ))
+            }
             Some(_) => {
                 kept.held_back = None;
                 None
@@ -540,7 +604,12 @@ impl LeaseKeeper {
                     pace.chain = true;
                     None
                 }
-                Next::After(delay) => {
+                // What is held against the service ends a presentation that has to ask it, with the
+                // stop; a refresh that asks only for a lease the stop did not spoil waits it out.
+                Next::Held(stop, _) if pace.connecting || stop.spoils_the_lease() => {
+                    return Err(stop);
+                }
+                Next::After(delay) | Next::Held(_, delay) => {
                     if pace.connecting && delay > LONGEST_WAIT_AT_CONNECT {
                         return Err(self.stopped(LeaseStop::Later(delay)));
                     }
@@ -615,9 +684,13 @@ impl LeaseKeeper {
         }
     }
 
-    /// No request goes to the service while a delay it named, or a failure the keeper is waiting out,
-    /// has time to run. Asked before a lease and before the chain of keys alike.
+    /// No request goes to the service while a stop is held against it, or a delay it named, or a
+    /// failure the keeper is waiting out, has time to run. Asked before a lease and before the chain
+    /// of keys alike, by every connection and by the refresh, however far its presentation has got.
     fn must_wait(&self) -> Result<(), Next> {
+        if let Some((stop, left)) = self.held_back() {
+            return Err(Next::Held(stop, left));
+        }
         let now = self.timer.now_ms();
         let not_before = self.kept().not_before_ms;
         if not_before > now.saturating_add(CLOCK_SLACK_MS) {
@@ -639,7 +712,8 @@ impl LeaseKeeper {
     }
 
     /// A request to the service is given up on before it answers: the service did not answer, as
-    /// far as the next caller can tell, and is not asked again at once.
+    /// far as the next caller can tell, and is not asked again at once. Only the service is held
+    /// off: a connection presents a lease that is held whatever happened to the request.
     fn unanswered(&self) {
         let until = self
             .timer
@@ -806,6 +880,14 @@ impl Pace {
         }
     }
 
+    /// The pace of a renewal that is tried once: it waits for nothing, and a failure ends it.
+    fn once() -> Self {
+        Self {
+            waits_left: Some(0),
+            ..Self::first()
+        }
+    }
+
     /// The pace of the refresh, which never asks oftener than once a minute and goes on until
     /// something stops it.
     fn keeping() -> Self {
@@ -914,6 +996,14 @@ fn rule_of(message: &str) -> Option<&str> {
     rule.bytes()
         .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
         .then_some(rule)
+}
+
+/// Whether a host's refusal says it holds no lease for this device that it will answer under: none,
+/// one that ended, or one its pinned authority did not sign. A device that is refused for any other
+/// reason is not helped by presenting a lease again, and a presentation is an action the host keeps.
+#[must_use]
+pub fn lease_is_refused(code: ErrorCode, message: &str) -> bool {
+    code == ErrorCode::PermissionDenied && message.contains("membership lease")
 }
 
 /// The rules of a lease the host can refuse, and what each calls for.

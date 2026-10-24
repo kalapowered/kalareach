@@ -152,9 +152,21 @@ pub trait Preauth: Send {
 /// The network configuration of the host in use, when there is one, as it stands when it is asked.
 pub type HostInUse<'a> = dyn Fn() -> Option<NetworkConfig> + Send + Sync + 'a;
 
+/// When a member's device presents its lease on a connection to a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presentation {
+    /// The first thing on a connection: the lease the device holds is presented while it lasts, and
+    /// the organisation's service is asked for another when none is held or the host refuses it.
+    First,
+    /// Again, on a connection that presented already and is kept: nothing is sent while the lease
+    /// the host holds is not due to be replaced, and a new lease is asked for and presented when
+    /// it is. A new lease that cannot be got is no failure while the lease the host holds lasts.
+    IfDue,
+}
+
 /// What gives a host the membership lease a member's device needs on a connection to it.
 pub trait MembershipPresenter: Send + Sync {
-    /// Presents the lease `host`'s grant needs, as the first thing on `session`, which proves
+    /// Presents the lease `host`'s grant needs, as `presentation` says, on `session`, which proves
     /// `device_key`, or does nothing for a host whose grant answers to no organisation.
     ///
     /// # Errors
@@ -165,6 +177,7 @@ pub trait MembershipPresenter: Send + Sync {
         session: &'a Session,
         host: &'a PairedHost,
         device_key: AuthorisationKey,
+        presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>>;
 }
 
@@ -243,7 +256,9 @@ pub trait HostLink: Send + Sync {
     }
 
     /// Gives the host what it needs of this device before it will answer anything else on
-    /// `session`, the first thing done on a connection to a paired host.
+    /// `session`: the first thing done on a connection to a paired host
+    /// ([`Presentation::First`]), and again on a connection that is kept, when the lease it holds is
+    /// due to be replaced ([`Presentation::IfDue`]).
     ///
     /// A device whose grant answers to an organisation is refused every other method until the host
     /// holds a membership lease the organisation signed for it, and no lease survives a host's
@@ -259,6 +274,7 @@ pub trait HostLink: Send + Sync {
         _session: &'a Session,
         _host: &'a PairedHost,
         _identity: &'a LocalIdentity,
+        _presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>> {
         Box::pin(async { Ok(()) })
     }
@@ -301,7 +317,10 @@ async fn presenting<L: HostLink + ?Sized>(
     identity: &LocalIdentity,
 ) -> Result<Session, LinkError> {
     let session = Session::start(transport).map_err(|error| LinkError::lost(error.said()))?;
-    if let Err(error) = link.present_membership(&session, host, identity).await {
+    if let Err(error) = link
+        .present_membership(&session, host, identity, Presentation::First)
+        .await
+    {
         session.close();
         return Err(error);
     }
@@ -791,9 +810,15 @@ impl HostLink for IrohLink {
         session: &'a Session,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
+        presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>> {
         match &self.membership {
-            Some(presenter) => presenter.present(session, host, *identity.authorisation.public()),
+            Some(presenter) => presenter.present(
+                session,
+                host,
+                *identity.authorisation.public(),
+                presentation,
+            ),
             None => Box::pin(async { Ok(()) }),
         }
     }
