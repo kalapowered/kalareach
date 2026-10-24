@@ -7,6 +7,8 @@ import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import to.kala.reach.companion.mobile.CallBridgeHolder
+import to.kala.reach.companion.mobile.CurrentTokenHolder
+import to.kala.reach.companion.push.FirebaseCurrentToken
 import to.kala.reach.companion.voice.VoiceCallBridge
 
 class MainActivity : TauriActivity() {
@@ -16,6 +18,9 @@ class MainActivity : TauriActivity() {
     // application's context and no activity, so a call outlives the activity that started it, and
     // it is made once for the process: a recreated activity finds the bridge the call is held by.
     CallBridgeHolder.registerOnce { VoiceCallBridge(applicationContext) }
+    // The way to ask the provider for its current token, which the platform plugin finds when the
+    // application reads the token. Registered here because this module holds the provider's library.
+    CurrentTokenHolder.registerOnce { FirebaseCurrentToken() }
     super.onCreate(savedInstanceState)
     // The web view draws behind the system bars and the display cutout, and how much of that a
     // page hears about depends on the web view's version: an older one reports no inset for the
