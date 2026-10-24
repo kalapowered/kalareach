@@ -1070,7 +1070,9 @@ impl Controller {
     /// spend that read the word before it was raised, and each spend that begins after reads it
     /// raised: when this returns, no confirmation can be spent under the standing the refusal took
     /// away. A wait the database cuts short is made again, up to the number of attempts below; the
-    /// time a spend holds the lock is a few milliseconds.
+    /// time a spend holds the lock is a few milliseconds. After the last attempt this returns as if
+    /// every spend had ended, so a spend that held the lock for as long as all the attempts wait,
+    /// about a minute, can still commit under the standing the refusal took away.
     async fn wait_for_the_confirmations_being_spent(&self) {
         for _ in 0..MOST_DRAIN_ATTEMPTS {
             let devices = Arc::clone(&self.devices);

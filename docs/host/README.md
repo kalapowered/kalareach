@@ -6715,7 +6715,10 @@ An owner confirmation that a remote owner device signed is not spent while eithe
 Every spend of one is refused with `PERMISSION_DENIED` and the refusal's words, because the refusal
 takes that device's standing away whole. The confirmation is checked inside the write that spends
 it, and a refusal that rises waits for each such write that began before it, so none is spent under
-a standing the refusal took away. What a spend that had committed before the refusal rose goes on
+a standing the refusal took away. The wait asks for the pairing records' write lock, and asks again
+when the database is busy, twelve times at most: about a minute. After that it ends as if every spend
+had ended, so a spend that holds the lock for longer than that could still commit under the standing
+the refusal took away. What a spend that had committed before the refusal rose goes on
 to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
 nothing else, so a refusal never turns into a weaker way to confirm. What the owner at the machine
@@ -6728,7 +6731,12 @@ connection under such a grant had admitted before the removal is held to it wher
 where its answer is written, as it is for the two refusals above, and the default owner grant is
 not refused. A share a connection acts under is asked as well as the grant it was admitted under,
 because a share keeps the organisation requirement of what it was delegated from. A relayed batch
-stays with the policy's epoch. The owner at the machine
+stays with the policy's epoch. The grants the removal refuses can widen after it: the owner bounds
+offline validity or makes the host exclusively organisation-managed, and personal grants rest on the
+feed from then on. The refusal then reaches a personal grant at every decision and where work
+commits. The host does not end the link to the worker of a connection it newly reaches, and a write
+that checked the standing just before the change can commit under it, so input that a worker already
+holds for such a connection can still reach the terminal. The owner at the machine
 is never refused, and can stop any session locally.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
