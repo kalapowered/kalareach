@@ -278,6 +278,9 @@ impl Fidelity {
 mod tests {
     use super::*;
 
+    /// KR-REQ-08.52, the part about the final underscore: a record is written as
+    /// `CSI Vk;Sc;Uc;Kd;Cs;Rc_` with all six fields (`\x1b[65;30;97;1;0;1_`), ending in an
+    /// underscore and not an APC string, and reads back as the record it was written from.
     #[test]
     fn a_record_is_encoded_with_the_final_underscore_and_not_an_apc_string() {
         // `A` pressed: virtual key 0x41, scan code 0x1E, the code unit, key down, no modifiers,
@@ -296,6 +299,9 @@ mod tests {
         assert_eq!(decode(&encode(&record)), Ok(record));
     }
 
+    /// KR-REQ-08.52, the part about omitted fields: a record with none is `0,0,0,0,0,1`, a reader
+    /// fills in the same defaults for fields that were not sent and for an empty field between two
+    /// that were, and a record whose later fields are all default is still written in full.
     #[test]
     fn omitted_fields_mean_zero_zero_zero_zero_zero_one() {
         // Every field is written, and a record with none of them is the defaults themselves.
