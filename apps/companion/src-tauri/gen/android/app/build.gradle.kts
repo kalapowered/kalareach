@@ -44,6 +44,16 @@ check(handWrittenNativeDeviceTests.isDirectory) {
 }
 
 /**
+ * The messages the receiver is held to: the gateway's recorded ones and the preview the host's own
+ * code sealed, the same files the unit tests and the Rust and Swift halves read. The device tests
+ * read them from the test package's assets.
+ */
+val receiverFixtures = file("../../../../native/platform/fixtures/push")
+check(receiverFixtures.isDirectory) {
+    "The receiver's recorded messages are not at $receiverFixtures"
+}
+
+/**
  * Firebase's configuration, as the string resources Firebase reads at start.
  *
  * It belongs to the account that owns the Firebase project, so it is made from the file
@@ -141,6 +151,7 @@ android {
     sourceSets {
         getByName("main").java.srcDir(handWrittenNativeSources)
         getByName("androidTest").java.srcDir(handWrittenNativeDeviceTests)
+        getByName("androidTest").assets.srcDir(receiverFixtures)
     }
 }
 

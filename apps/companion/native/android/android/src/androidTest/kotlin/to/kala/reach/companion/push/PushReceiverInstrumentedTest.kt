@@ -22,6 +22,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import to.kala.reach.companion.mobile.PendingFile
+import to.kala.reach.companion.mobile.PreviewKeySet
 import to.kala.reach.companion.mobile.PushStores
 import to.kala.reach.platform.KeystoreSealer
 
@@ -56,6 +57,7 @@ class PushReceiverInstrumentedTest {
     fun leaveNothing() {
         notifications.cancelAll()
         PushStores.pending(noBackup).clear()
+        PushStores.limited(noBackup, KeystoreSealer()).replace(PreviewKeySet.of(emptyList(), emptyList()))
         WorkManager.getInstance(context).cancelAllWork()
     }
 
@@ -97,6 +99,87 @@ class PushReceiverInstrumentedTest {
                 }
             }
         assertTrue("the receiver showed the notification", shown)
+    }
+
+    /**
+     * The preview the host's own code sealed (the file the Rust opener and the Swift receiver read
+     * too), with its keys: the receiver is handed it as the provider hands over a message.
+     */
+    private fun sealedPreview(): JSONObject =
+        JSONObject(
+            instrumentation.context.assets.open("recorded-preview.json").use {
+                String(it.readBytes(), Charsets.UTF_8)
+            }
+        )
+
+    /** Files the golden's seed, and the host's key when `senderFiled`, as the application does. */
+    private fun fileKeys(golden: JSONObject, senderFiled: Boolean) {
+        val standard = java.util.Base64.getDecoder()
+        val url = java.util.Base64.getUrlDecoder()
+        PushStores.limited(noBackup, KeystoreSealer())
+            .replace(
+                PreviewKeySet.of(
+                    listOf(
+                        url.decode(golden.getString("recipient_key_id")) to
+                            standard.decode(golden.getString("recipient_seed"))
+                    ),
+                    if (senderFiled) {
+                        listOf(
+                            url.decode(golden.getString("sender_key_id")) to
+                                standard.decode(golden.getString("sender_key"))
+                        )
+                    } else {
+                        emptyList()
+                    }
+                )
+            )
+    }
+
+    private fun deliverGolden(golden: JSONObject, tag: String) =
+        deliver(
+            mapOf(
+                "notification_id" to UUID.randomUUID().toString(),
+                "collapse_id" to tag,
+                "alert" to golden.getString("alert"),
+                "preview" to golden.getString("preview")
+            )
+        )
+
+    private fun shownText(tag: String): String? =
+        notifications.activeNotifications
+            .firstOrNull { it.tag == tag }
+            ?.notification
+            ?.extras
+            ?.getCharSequence("android.text")
+            ?.toString()
+
+    // KR-REQ-16.15, 13.24, 16.11: the receiver opens a preview the host sealed, with the library the
+    // application ships, in the process the system built for the message, and shows what was sealed.
+    @Test
+    fun aPreviewTheHostSealedIsOpenedByTheReceiverAlone() {
+        val golden = sealedPreview()
+        fileKeys(golden, senderFiled = true)
+        val tag = "instrumented-" + UUID.randomUUID()
+        deliverGolden(golden, tag)
+        assertTrue(
+            "the receiver showed the sealed text",
+            until(30) { shownText(tag) == golden.getString("summary") }
+        )
+    }
+
+    // KR-REQ-16.11: a host this phone holds no key for, as one whose previews were turned off,
+    // is not opened: the generic alert stands, and the sealed text is nowhere in the notification.
+    @Test
+    fun aPreviewFromAHostWithNoKeyFiledShowsTheGenericAlert() {
+        val golden = sealedPreview()
+        fileKeys(golden, senderFiled = false)
+        val tag = "instrumented-" + UUID.randomUUID()
+        deliverGolden(golden, tag)
+        assertTrue(
+            "the receiver showed the generic alert",
+            until(30) { shownText(tag) == golden.getString("alert") }
+        )
+        assertTrue(shownText(tag) != golden.getString("summary"))
     }
 
     /** A gateway on this device's loopback interface that answers a post with 200 once it is up. */
