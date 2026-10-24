@@ -426,8 +426,9 @@ async fn a_paired_device_is_refused_the_revocation_of_a_device_and_the_owner_is_
 
 /// KR-REQ-23.27, KR-REQ-10.45: `device.revoke` through the daemon, with a worker inside a dispatch
 /// transition, is answered as pending with that worker named and the reason, and the fence the
-/// worker makes afterwards completes it: asking again answers a barrier that holds, with the
-/// undispatched action the revoked device had in the worker named.
+/// worker makes afterwards completes it: asking again under a new action identifier answers a
+/// barrier that holds, with the undispatched action the revoked device had in the worker named.
+/// Not shown here: a repeat under the first call's own action identifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_device_revocation_is_pending_for_a_held_worker_until_the_worker_fences() {
     let net_support::worker::Adopted {
