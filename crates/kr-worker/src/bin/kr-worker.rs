@@ -27,6 +27,7 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::hostinfo::configuration::platform_variable_name;
 use kr_protocol::ids::{EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
@@ -681,6 +682,13 @@ fn session_config(
         launch_environment.sources.terminfo.describe()
     );
     let mut environment_pairs = launch_environment.to_pairs();
+    // What the package's own launch sets: the runtime a shell that is not built here needs to
+    // find, and the directory its module is found in by name, put first. It goes in before the
+    // bootstrap pair below, so nothing a record names can stand in the way of the two values the
+    // worker owns, and it replaces the creator's own value of a name it sets.
+    if let Some(package) = package {
+        apply_launch(&mut environment_pairs, package);
+    }
     if let Some(bridge) = bridge {
         // The two reserved bootstrap values, and the only two. They come from the worker, they name
         // this session's own endpoint, and the integration removes them from the exported
@@ -748,6 +756,16 @@ fn session_config(
         }),
     };
     (config, sources)
+}
+
+/// Puts what a package's launch sets over a session's environment: each name it sets replaces the
+/// value the environment had under that name, however the platform spells the name.
+fn apply_launch(environment: &mut Vec<(String, String)>, package: &ShellPackage) {
+    for (name, value) in package.launch_environment(environment, cfg!(windows)) {
+        let folded = platform_variable_name(&name);
+        environment.retain(|(held, _)| platform_variable_name(held) != folded);
+        environment.push((name, value));
+    }
 }
 
 /// Why a session whose root is a command is not started, when it is not.
@@ -929,6 +947,69 @@ mod tests {
         assert_eq!(
             startup_mode(&profile(ShellStartup::Login)),
             StartupMode::Login
+        );
+    }
+
+    /// A package's launch is set over the environment the session built: its runtime
+    /// location replaces the creator's, its module directory goes first on the creator's list, and
+    /// nothing else is touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_packages_launch_is_set_over_the_environment_the_session_built() {
+        let root = tempfile::tempdir().expect("a directory");
+        let host = root.path().join("host/pwsh");
+        std::fs::create_dir_all(host.parent().expect("a directory")).expect("the host's place");
+        std::fs::write(&host, b"#!/bin/sh\n").expect("the host");
+        let package = root.path().join("powershell/identity-1");
+        std::fs::create_dir_all(package.join("modules")).expect("the package");
+        std::fs::write(
+            package.join("kr-shell-identity.json"),
+            serde_json::json!({
+                "identity": "identity-1",
+                "shell": {
+                    "kind": "powershell", "executable": host, "upstream_version": "7.6.6",
+                    "editor_abi": "psreadline-2.4", "integration_version": "1", "patches": [],
+                    "modules": [{
+                        "name": "KalaReach.ShellBridge",
+                        "search_path": package.join("modules"),
+                        "editor_abi": "psreadline-2.4",
+                    }],
+                },
+                "startup_entry": { "file": "startup/kr-profile.ps1" },
+                "launch": {
+                    "environment": { "DOTNET_ROOT": "/packages/dotnet" },
+                    "search_paths": { "PSModulePath": [package.join("modules")] },
+                },
+            })
+            .to_string(),
+        )
+        .expect("the record");
+        let package = kr_shell_integration::host::package::ShellPackage::read(&package)
+            .expect("the package reads");
+
+        let mut environment = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("DOTNET_ROOT".to_owned(), "/creators".to_owned()),
+            ("PSModulePath".to_owned(), "/competing:/mine".to_owned()),
+        ];
+        super::apply_launch(&mut environment, &package);
+        let held = |name: &str| {
+            environment
+                .iter()
+                .filter(|(held, _)| held == name)
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(held("DOTNET_ROOT"), ["/packages/dotnet"]);
+        let modules = root.path().join("powershell/identity-1/modules");
+        assert_eq!(
+            held("PSModulePath"),
+            [format!("{}:/competing:/mine", modules.display())]
+        );
+        assert_eq!(
+            held("PATH"),
+            ["/usr/bin"],
+            "nothing the launch does not name is touched"
         );
     }
 

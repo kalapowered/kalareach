@@ -2790,7 +2790,7 @@ impl RealShell {
             let record =
                 kr_shell_integration::host::startup::EntryRecord::in_state_directory(&state);
             for target in kr_shell_integration::host::startup::powershell_targets(
-                &package.executable(),
+                &kr_shell_integration::host::startup::PowerShell::plain(package.executable()),
                 all_hosts,
                 current_host,
             ) {

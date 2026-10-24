@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use kr_protocol::session::{ClosureReason, ClosureRecord, SessionState};
+use kr_shell_integration::host::package::PUBLISH_COMMAND;
 use tokio::sync::{Notify, mpsc};
 
 use crate::error::{Result, WorkerError};
@@ -1817,6 +1818,7 @@ impl SessionRuntime {
     ) -> std::result::Result<(), kr_protocol::error::ProtocolError> {
         use kr_protocol::error::{ErrorCode, ProtocolError};
 
+        let powershell = names_powershell(self.session().shell_program());
         let deadline = tokio::time::Instant::now() + within;
         loop {
             {
@@ -1836,7 +1838,7 @@ impl SessionRuntime {
                         refusal.refused.error.message,
                         refusal.diagnostic
                     );
-                    return Err(qualification_answer(&refusal.refused));
+                    return Err(qualification_answer(&refusal.refused, powershell));
                 }
                 if session.state() != SessionState::Live {
                     return Err(ProtocolError::new(
@@ -1858,14 +1860,7 @@ impl SessionRuntime {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(ProtocolError::new(
-                    ErrorCode::ShellIntegrationUnsupported,
-                    format!(
-                        "the root integration did not qualify within {} seconds; the session is \
-                         closed and an explicit compatibility retry is a new create request",
-                        within.as_secs()
-                    ),
-                ));
+                return Err(not_qualified_in_time(within, powershell));
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -1881,20 +1876,64 @@ impl SessionRuntime {
     }
 }
 
+/// What a create fails with when the root integration has said nothing in the time it was given.
+///
+/// PowerShell's package qualifies the editor and the host the person has, so a wait that ends
+/// without a hello has two causes the person can mend: no profile entry, or an editor or host
+/// updated since the package was published, which the module declines by saying nothing.
+fn not_qualified_in_time(
+    within: std::time::Duration,
+    powershell: bool,
+) -> kr_protocol::error::ProtocolError {
+    let mend = if powershell {
+        format!(
+            "; for PowerShell that is a profile without the entry (run `kr shell install`) or a \
+             PowerShell or PSReadLine updated since the package was published (run \
+             {PUBLISH_COMMAND} in PowerShell)"
+        )
+    } else {
+        String::new()
+    };
+    kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::ShellIntegrationUnsupported,
+        format!(
+            "the root integration did not qualify within {} seconds{mend}; the session is closed \
+             and an explicit compatibility retry is a new create request",
+            within.as_secs()
+        ),
+    )
+}
+
+/// Whether a session's root shell is PowerShell, which is the one shell whose package a person
+/// publishes themselves and so the one whose refusals name that command.
+fn names_powershell(program: &str) -> bool {
+    let name = std::path::Path::new(program)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(program);
+    name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("powershell")
+}
+
 /// What a create fails with when the root integration was refused: the reason's own name, the
 /// refusal's words, and the choices the person has. A capability failure is a configuration
 /// answer, and the session reports it with the named choices rather than substituting a shell.
 fn qualification_answer(
     refused: &kr_shell_integration::contract::transport::BridgeRefused,
+    powershell: bool,
 ) -> kr_protocol::error::ProtocolError {
     use kr_shell_integration::contract::qualification::QualificationReason;
 
+    let publish = format!(
+        "run {PUBLISH_COMMAND} in PowerShell if it or PSReadLine was updated since the package \
+         was published, or create the session with --shell-mode native_compat"
+    );
     let choices = match refused.reason {
         QualificationReason::ModuleTreeUnsupported => {
             "rebuild the module for this reader, stop loading it in KalaReach sessions, or create \
              the session with --shell-mode native_compat; where a name is missing, load the module \
              that provides it before this one"
         }
+        _ if powershell => publish.as_str(),
         _ => {
             "use a shell package this build qualifies, or create the session with --shell-mode native_compat"
         }
@@ -2705,5 +2744,52 @@ mod tests {
             .release();
         let _ =
             tokio::time::timeout(std::time::Duration::from_secs(30), runtime.wait_closed()).await;
+    }
+
+    /// After a PowerShell update the refusal of a host that is not the one the
+    /// package qualified names the command that qualifies the new one.
+    #[test]
+    fn the_refusal_of_a_stale_powershell_package_names_the_command_that_publishes_a_new_one() {
+        use kr_shell_integration::contract::qualification::QualificationReason;
+        use kr_shell_integration::contract::transport::BridgeRefused;
+        use kr_shell_integration::host::package::PUBLISH_COMMAND;
+
+        let refused = BridgeRefused::new(
+            QualificationReason::PackageMismatch,
+            "it says upstream 7.6.7 and this package is 7.6.6",
+        );
+        assert!(
+            super::qualification_answer(&refused, true)
+                .message
+                .contains(PUBLISH_COMMAND)
+        );
+        assert!(
+            !super::qualification_answer(&refused, false)
+                .message
+                .contains(PUBLISH_COMMAND),
+            "a shell whose package a person does not publish is not told to"
+        );
+    }
+
+    /// The wait that ends because PSReadLine changed and the module said nothing
+    /// names the same command, and the profile entry it may be missing.
+    #[test]
+    fn the_wait_for_a_stale_powershell_package_names_the_command_that_publishes_a_new_one() {
+        use kr_shell_integration::host::package::PUBLISH_COMMAND;
+
+        let waited = std::time::Duration::from_secs(30);
+        let powershell = super::not_qualified_in_time(waited, true).message;
+        assert!(powershell.contains(PUBLISH_COMMAND), "{powershell}");
+        assert!(powershell.contains("kr shell install"), "{powershell}");
+        assert!(
+            !super::not_qualified_in_time(waited, false)
+                .message
+                .contains(PUBLISH_COMMAND)
+        );
+        assert!(super::names_powershell(
+            "/opt/microsoft/powershell/7/pwsh.EXE"
+        ));
+        assert!(super::names_powershell("/usr/local/bin/pwsh"));
+        assert!(!super::names_powershell("/bin/zsh"));
     }
 }
