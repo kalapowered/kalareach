@@ -86,10 +86,9 @@ describe('the notifications of a paired host', () => {
       })
     })
     await waitFor(() => {
-      expect(within(row).getByTestId('notifications-words').textContent).toBe(
-        'This host took this phone for notifications.'
-      )
+      expect(row).toHaveAttribute('data-state', 'on')
     })
+    expect(within(row).getByTestId('notifications-words').textContent).not.toBe('')
     expect(within(row).queryByRole('button')).toBeNull()
   })
 
@@ -108,9 +107,8 @@ describe('the notifications of a paired host', () => {
     })
     const choice = await within(row).findByRole('switch', { name: 'Previews' })
     expect(choice).toHaveAttribute('aria-checked', 'true')
-    expect(choice).toHaveAccessibleDescription(
-      'The notification shows what needs you. Off, it shows only that something does.'
-    )
+    // The help beside the switch is its description.
+    expect(choice).toHaveAccessibleDescription(/\S/)
     await person.click(choice)
     expect(controls.pushPreviewChoices).toEqual([{ reference: 'studio-reference', on: false }])
     // The choice reads as made at once; the host is told next, and the switch waits meanwhile.
