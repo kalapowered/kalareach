@@ -271,18 +271,16 @@ fn the_manifest_of_a_tree_names_the_pins_and_the_identity_the_build_recorded() {
             assert_eq!(module.editor_abi, pins["editor_abi"]);
         }
     }
-    // The patch whose source is a published upstream change keeps it apart from its base.
-    if let Some(zsh) = manifest.shells.iter().find(|listed| listed.shell == "zsh") {
-        let terminfo = zsh
+    // A patch whose source is a published upstream change keeps it apart from its base: the
+    // official patches of the pinned Bash release name themselves as their source.
+    if let Some(bash) = manifest.shells.iter().find(|listed| listed.shell == "bash") {
+        let official = bash
             .patches
             .iter()
-            .find(|patch| patch.name == "terminfo-variable-checks")
-            .expect("the terminfo patch");
-        assert_eq!(
-            terminfo.source_commit.as_deref(),
-            Some("4c89849c98172c951a9def3690e8647dae76308f")
-        );
-        assert_eq!(terminfo.base_revision, "zsh-5.9");
+            .find(|patch| patch.name == "bash53-011")
+            .expect("the official patch");
+        assert_eq!(official.source_commit.as_deref(), Some("bash53-011"));
+        assert_eq!(official.base_revision, "bash-5.3");
     }
 
     // The daemon's own protocol and public majors, which nothing in the tree states.
@@ -453,7 +451,10 @@ fn a_tree_that_disagrees_with_the_pins_is_refused_before_it_is_signed() {
             .as_str()
             .expect("a path")
             .to_owned();
-        let moved = search.replace("lib/zsh/5.9", "bin");
+        let (package, _) = search
+            .rsplit_once("/lib/")
+            .expect("the record names a directory under the package's lib");
+        let moved = format!("{package}/bin");
         assert_ne!(moved, search, "the record names the pinned directory");
         record["shell"]["modules"][0]["search_path"] = serde_json::json!(moved);
     });

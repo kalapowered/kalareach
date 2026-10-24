@@ -1,22 +1,21 @@
 {
   "shell": "zsh",
   "integration_version": "1",
-  "editor_abi": "zle-5.9",
+  "editor_abi": "zle-5.9.2",
   "mailbox_mechanism": "key_sequence_boundary_mailbox",
   "pre_eof_mechanism": "native_hook",
   "upstream": {
-    "version": "5.9",
-    "revision": "zsh-5.9",
-    "archive": "zsh-5.9.tar.xz",
-    "url": "https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz",
-    "sha256": "9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5",
-    "directory": "zsh-5.9"
+    "version": "5.9.2",
+    "revision": "zsh-5.9.2",
+    "archive": "zsh-5.9.2.tar.xz",
+    "url": "https://downloads.sourceforge.net/project/zsh/zsh/5.9.2/zsh-5.9.2.tar.xz",
+    "sha256": "36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81",
+    "directory": "zsh-5.9.2"
   },
   "configure": [
     "--enable-multibyte",
     "--disable-gdbm",
-    "--disable-pcre",
-    "--with-tcsetpgrp=yes"
+    "--disable-pcre"
   ],
   "cflags": [
     "-O2",
@@ -27,7 +26,7 @@
     "-Wno-implicit-function-declaration"
   ],
   "binary": "bin/zsh",
-  "module_directory": "lib/zsh/5.9",
+  "module_directory": "lib/zsh/5.9.2",
   "source_directory": "Src/Zle",
   "modules": [
     "zsh/zle"
@@ -44,13 +43,6 @@
       "file": "patches/0002-zle-reader-state.patch",
       "revision": "1",
       "purpose": "The reader states the detach condition and the cancellation report are evaluated against: a quoted insertion waiting for its character, a numeric argument being accumulated, and an open bracketed paste."
-    },
-    {
-      "name": "terminfo-variable-checks",
-      "file": "patches/0003-terminfo-variable-checks.patch",
-      "revision": "1",
-      "upstream_revision": "4c89849c98172c951a9def3690e8647dae76308f",
-      "purpose": "The published upstream fix for the terminfo capability-name probes, zsh commit 4c89849c98172c951a9def3690e8647dae76308f (workers/52383), which is after the 5.9 release this package pins. Without it a compiler that rejects a discarded qualifier fails the probe, the shell defines its own copy of an array the terminal header already declares, and the termcap module does not compile."
     },
     {
       "name": "exec-command-resolve",

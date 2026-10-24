@@ -189,6 +189,8 @@ put("m_test_reason", manifest["upstream_tests"].get("reason", ""))
 put("m_configure", " ".join(manifest["configure"]))
 put("m_cflags", " ".join(manifest["cflags"]))
 put("m_patches", " ".join(patch["file"] for patch in manifest["patches"]))
+put("m_patch_strips", " ".join(str(patch.get("strip", 1)) for patch in manifest["patches"]))
+put("m_patch_digests", " ".join(patch.get("sha256", "-") for patch in manifest["patches"]))
 put("m_patch_names", " ".join(patch["name"] for patch in manifest["patches"]))
 put("m_patch_revisions", " ".join(patch["revision"] for patch in manifest["patches"]))
 put("m_sources", " ".join("%s:%s" % (source["file"], source["install"])
@@ -936,7 +938,7 @@ build_package() {
     local m_build_system m_environment
     local m_upstream_version m_archive m_url m_sha256 m_directory m_revision
     local m_binary m_module_directory m_source_directory m_test_command m_test_reason
-    local m_configure m_cflags m_patches m_patch_names m_patch_revisions m_sources
+    local m_configure m_cflags m_patches m_patch_strips m_patch_digests m_patch_names m_patch_revisions m_sources
     local m_modules m_startup
 
     eval "$(manifest_env "$package/manifest.json")"
@@ -1043,14 +1045,29 @@ startup=$(digest "$package/$m_startup") $m_startup"
         exit 1
     fi
 
+    # The patches go in the manifest's order. A patch the upstream project published as a file of its
+    # own is named with the strip level it is applied with (its paths are relative to the release's
+    # directory, so 0), and the patches written for this package are applied with 1.
+    # A published patch also carries the digest the manifest pins for it, and is checked against it
+    # before it is applied.
+    local -a patch_strips patch_digests
+    read -r -a patch_strips <<< "$m_patch_strips"
+    read -r -a patch_digests <<< "$m_patch_digests"
+    local patch_index=0
     for patch_file in $m_patches; do
+        if [ "${patch_digests[$patch_index]}" != "-" ] \
+            && [ "$(digest "$package/$patch_file")" != "${patch_digests[$patch_index]}" ]; then
+            echo "build-shells: $patch_file is not the patch the manifest pins" >&2
+            exit 1
+        fi
         echo "build-shells: applying $patch_file"
         # --forward and no fuzz: a patch that does not apply exactly to the pinned release is a
         # failure to report, never something to reconcile by hand.
-        if ! patch -p1 --forward --batch --fuzz=0 -d "$source_tree" < "$package/$patch_file"; then
+        if ! patch "-p${patch_strips[$patch_index]}" --forward --batch --fuzz=0 -d "$source_tree" < "$package/$patch_file"; then
             echo "build-shells: $patch_file does not apply cleanly to $m_directory" >&2
             exit 1
         fi
+        patch_index=$((patch_index + 1))
     done
 
     for entry in $m_sources; do

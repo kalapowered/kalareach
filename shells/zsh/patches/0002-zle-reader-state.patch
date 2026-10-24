@@ -19,7 +19,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  /* insert a zle string, with repetition and suffix removal */
  
  /**/
-@@ -753,6 +756,7 @@
+@@ -754,6 +757,7 @@
      size_t current = 0;
      int next, timeout;
  
@@ -27,7 +27,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      while (endesc[endpos]) {
  	if (current + 1 >= psize)
  	    pbuf = zrealloc(pbuf, psize *= 2);
-@@ -768,6 +772,7 @@
+@@ -769,6 +773,7 @@
  	else
  	    pbuf[current++] = next;
      }
@@ -35,7 +35,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      pbuf[current-endpos] = '\0';
      return pbuf;
  }
-@@ -869,7 +874,9 @@
+@@ -870,7 +875,9 @@
      sob.sg_flags = (sob.sg_flags | RAW) & ~ECHO;
      ioctl(SHTTY, TIOCSETN, &sob);
  #endif
@@ -45,7 +45,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  #ifndef HAS_TIO
      zsetterm();
  #endif
-@@ -970,6 +977,7 @@
+@@ -971,6 +978,7 @@
       *
       * Hence for now this remains byte-by-byte.
       */
@@ -53,7 +53,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      while ((gotk = getbyte(0L, NULL, 1)) != EOF) {
  	if (gotk == '-' && !digcnt) {
  	    minus = -1;
-@@ -986,6 +994,7 @@
+@@ -987,6 +995,7 @@
  	    }
  	}
      }

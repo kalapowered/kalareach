@@ -25,7 +25,7 @@ makes in their startup files are made after this and win as they always did.
  /**/
  int noexitct = 0;
  
-@@ -877,8 +881,95 @@
+@@ -881,8 +885,95 @@
  }
  
  /* Initialize lots of global variables and hash tables */
@@ -121,7 +121,7 @@ makes in their startup files are made after this and win as they always did.
  void
  setupvals(char *cmd, char *runscript, char *zsh_name)
  {
-@@ -1044,6 +1135,7 @@
+@@ -1048,6 +1139,7 @@
      mailpath = mkarray(NULL);
      psvar    = mkarray(NULL);
      module_path = mkarray(ztrdup(MODULE_DIR));

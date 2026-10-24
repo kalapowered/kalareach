@@ -10,15 +10,15 @@ or later; see shells/bash/LICENSE.
 
 --- a/Makefile.in
 +++ b/Makefile.in
-@@ -444,6 +444,7 @@
+@@ -478,6 +478,7 @@
  
  # The main source code for the Bourne Again SHell.
  CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
 +	   kr_bridge_bash.c \
- 	   dispose_cmd.c execute_cmd.c variables.c $(GLOBC) version.c \
+ 	   dispose_cmd.c execute_cmd.c variables.c version.c \
  	   expr.c copy_cmd.c flags.c subst.c hashcmd.c hashlib.c mailcheck.c \
- 	   test.c trap.c alias.c jobs.c nojobs.c $(ALLOC_FILES) braces.c \
-@@ -494,7 +495,7 @@
+ 	   test.c trap.c alias.c jobs.c nojobs.c braces.c \
+@@ -532,7 +533,7 @@
  	   trap.o input.o unwind_prot.o pathexp.o sig.o test.o version.o \
  	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \
  	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
@@ -37,7 +37,7 @@ or later; see shells/bash/LICENSE.
  #  include "bashline.h"
  #endif
  
-@@ -714,6 +715,13 @@
+@@ -719,6 +720,13 @@
  	  t = dollar_vars[0];
  	  dollar_vars[0] = exec_argv0 ? savestring (exec_argv0) : savestring (shell_script_filename);
  	}
@@ -53,7 +53,7 @@ or later; see shells/bash/LICENSE.
  	{
 --- a/builtins/Makefile.in
 +++ b/builtins/Makefile.in
-@@ -144,7 +144,8 @@
+@@ -152,7 +152,8 @@
  	  $(srcdir)/times.def $(srcdir)/trap.def $(srcdir)/type.def \
  	  $(srcdir)/ulimit.def $(srcdir)/umask.def $(srcdir)/wait.def \
  	  $(srcdir)/reserved.def $(srcdir)/pushd.def $(srcdir)/shopt.def \
@@ -63,7 +63,7 @@ or later; see shells/bash/LICENSE.
  
  STATIC_SOURCE = common.c evalstring.c evalfile.c getopt.c bashgetopt.c \
  		getopt.h 
-@@ -156,7 +157,8 @@
+@@ -164,7 +165,8 @@
  	jobs.o kill.o let.o mapfile.o \
  	pushd.o read.o return.o set.o setattr.o shift.o source.o \
  	suspend.o test.o times.o trap.o type.o ulimit.o umask.o \

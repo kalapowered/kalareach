@@ -5,7 +5,10 @@ own patch set. This page is the register of those sources, the record of what ha
 against them, and the update target each package is published under.
 
 Upstream is never vendored: `scripts/place-shell-sources.sh` fetches the pinned archive,
-`scripts/build-shells.sh` checks its digest and applies the ordered patches in `shells/<shell>/patches`. The pins live in
+`scripts/build-shells.sh` checks its digest and applies the ordered patches in `shells/<shell>/patches`.
+The one exception is the official patch series of the pinned Bash release, which GNU publishes as
+files of their own: `shells/bash/patches/upstream/` keeps each exactly as ftp.gnu.org publishes it,
+and the manifest pins each file's digest, so the release tool states them beside the package's own. The pins live in
 `shells/<shell>/manifest.json`, and the identity record the build writes beside the binary
 (`kr-shell-identity.json`) carries the archive it actually fetched, its digest, the patches it
 applied and the module tree it installed. The qualification reads all three and refuses a package
@@ -17,8 +20,8 @@ a test failing.
 <!-- kr:pins -->
 | Package | Upstream | Pinned revision | Source | SHA-256 | Advisories watched |
 | --- | --- | --- | --- | --- | --- |
-| zsh | Zsh | zsh-5.9 | https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz | 9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5 | the zsh-announce and zsh-workers lists, and the project's own release notes |
-| bash | GNU Bash | bash-5.2.37 | https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz | 9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff | the bug-bash list and the official patch series under ftp.gnu.org/gnu/bash/bash-5.2-patches |
+| zsh | Zsh | zsh-5.9.2 | https://downloads.sourceforge.net/project/zsh/zsh/5.9.2/zsh-5.9.2.tar.xz | 36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81 | the zsh-announce and zsh-workers lists, and the project's own release notes |
+| bash | GNU Bash | bash-5.3 | https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz | 0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba | the bug-bash list and the official patch series under ftp.gnu.org/gnu/bash/bash-5.3-patches, which the package applies through bash53-020 |
 | fish | fish-shell | fish-4.9.3 | https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz | 20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c | the fish-shell repository's security advisories and its release notes, RustSec advisories published from 2026-09-20 against the crates and repositories in fish's `Cargo.lock`, and, where the build compiles or links PCRE2, PCRE2's own advisories published from that day |
 | psreadline | PSReadLine | psreadline-2.3.4 to 3.0.0 on PowerShell 7.4 or later, except a release below the fixed release of an advisory in the triage record (CVE-2026-62801: 7.4.20, 7.5.11 and 7.6.6), or on Linux and macOS a host on a .NET runtime below the fixed runtime of CVE-2026-96225 (8.0.32, 9.0.21, 10.0.13 and 11.0.0-rc.2, which PowerShell 7.4.21, 7.5.12 and 7.6.7 carry) | https://github.com/PowerShell/PowerShell | qualified rather than fetched | PowerShell/Announcements, and the PSReadLine and PowerShell repositories' security advisories |
 <!-- /kr:pins -->

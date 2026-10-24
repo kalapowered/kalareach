@@ -20,7 +20,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* Forward declarations. */
  static int rl_change_case (int, int);
  static int _rl_char_search (int, int, int);
-@@ -1041,9 +1044,13 @@
+@@ -1040,9 +1043,13 @@
  {
    int c;
  
@@ -61,5 +61,5 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
    RL_UNSETSTATE (RL_STATE_MOREINPUT);
 +  kr_rl_pending_paste (0);
  
-   if (c >= 0)
-     {
+   if (len == cap)
+     buf = xrealloc (buf, cap + 1);
