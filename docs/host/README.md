@@ -6633,12 +6633,15 @@ commits. Every mutation asks for the refusal at its write, beside the admission 
 a push registration that waited for the gateway is among them. An answer decided before the refusal
 rose is written as the refusal, whether it waits for the writer or has only been decided, and an
 answer being written when the refusal rises ends with the connection. A device's close, and a read
-or raw input that waited for the link to the session's worker, are refused when the link opens.
-Three things remain. A mutation already forwarded to a worker runs for what is left of its dispatch
-lease, five seconds at most. A voice call a device started is not ended, as a revocation ends it,
-and runs to its deadline. An owner confirmation that a remote owner device signed, spent at the
-machine after the refusal rose, is spent under the standing the signer had. The owner at the machine
-is never refused, and can stop any session locally.
+or raw input that waited for the link to the session's worker or for its write half, are refused
+when they have it. Four things remain. A frame already being written to a session's worker when the
+refusal rises is not taken back, and a mutation already forwarded runs for what is left of its
+dispatch lease, five seconds at most. A voice call a device started is not ended, as a revocation
+ends it, and runs to its deadline. An owner confirmation that a remote owner device signed, spent at
+the machine after the refusal rose, is spent under the standing the signer had. The refusal a
+removed feed puts on the grants that rest on it applies by kind of grant and stays with the policy's
+epoch, so work admitted before the removal is not held to it. The owner at the machine is never
+refused, and can stop any session locally.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says

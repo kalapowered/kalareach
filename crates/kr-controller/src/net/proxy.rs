@@ -211,6 +211,9 @@ pub struct WorkerProxy {
     next_request: AtomicU64,
     /// The level the worker stated, which every frame on this link is read and written under.
     level: kr_protocol::retained::Level,
+    /// How many calls have begun to wait for the write half.
+    #[cfg(test)]
+    calls_at_the_writer: AtomicU64,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -311,6 +314,8 @@ impl WorkerProxy {
             reader,
             next_request: AtomicU64::new(1),
             level,
+            #[cfg(test)]
+            calls_at_the_writer: AtomicU64::new(0),
         }))
     }
 
@@ -335,15 +340,20 @@ impl WorkerProxy {
     /// ([`kr_protocol::local::may_travel_to_a_worker`]): a mutation vouched for with it is refused
     /// before anything is sent.
     ///
+    /// `still_admitted` is asked again once this call has the write half of the link, which it can
+    /// wait for, and before any of the frame is written: an error from it is returned and nothing
+    /// is sent.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the rights hold a voice right, when the link fails, or when the
-    /// worker does not answer in time.
+    /// Returns an error when the rights hold a voice right, when the link fails, when the worker
+    /// does not answer in time, or when `still_admitted` refuses.
     pub async fn forward_mutation(
         &self,
         mutation: &MutationRequest,
         vouched: Vouched<'_>,
         accepted_deadline_boot_ms: U64,
+        still_admitted: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Forwarded> {
         if !kr_protocol::local::may_travel_to_a_worker(vouched.grant_rights) {
             return Err(ControllerError::PermissionDenied {
@@ -372,7 +382,7 @@ impl WorkerProxy {
                 .lease
                 .filter(|_| mutation.method.method().is_none_or(needs_a_dispatch_lease)),
         }));
-        self.call(request_id, &frame).await
+        self.call(request_id, &frame, still_admitted).await
     }
 
     /// The level of the worker this link is to, which the answers it carries are read under.
@@ -395,6 +405,7 @@ impl WorkerProxy {
         actor: &ActorEnvelope,
         authority_deadline_boot_ms: Nullable<U64>,
         history: Option<&HistoryScope>,
+        still_admitted: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Response> {
         let request_id = self.next_request_id();
         let mut forwarded = request.clone();
@@ -406,7 +417,10 @@ impl WorkerProxy {
             history: history.cloned(),
         }));
         // A read is a read whichever way the worker answered it, so the marker means nothing here.
-        Ok(self.call(request_id, &frame).await?.response)
+        Ok(self
+            .call(request_id, &frame, still_admitted)
+            .await?
+            .response)
     }
 
     /// Calls one read on this link as the daemon itself, for its own housekeeping.
@@ -430,7 +444,7 @@ impl WorkerProxy {
             method_version: method.entry().version,
             params,
         });
-        Ok(self.call(request_id, &frame).await?.response)
+        Ok(self.call(request_id, &frame, &|| Ok(())).await?.response)
     }
 
     /// Ends the link.
@@ -450,7 +464,12 @@ impl WorkerProxy {
         self.lost.notify_waiters();
     }
 
-    async fn call(&self, request_id: RequestId, frame: &ControlFrame) -> Result<Forwarded> {
+    async fn call(
+        &self,
+        request_id: RequestId,
+        frame: &ControlFrame,
+        still_admitted: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<Forwarded> {
         let receiver = {
             let mut waiters = self.waiters();
             if waiters.ended {
@@ -470,14 +489,25 @@ impl WorkerProxy {
         // writer refuses to continue one: the link ends rather than staying open with a suffix the
         // worker is still waiting for. Whether the frame reached the worker is then unknown, which
         // is what the caller is told.
+        //
+        // The write half is shared by every call on the link, so a call can wait for it behind a
+        // frame the worker is slow to read. What this call was admitted for is asked again once it
+        // has the half and before a byte of its frame goes: a refusal that rose while it waited,
+        // and that moves nothing the worker would find, stops it there. A frame already being
+        // written is not taken back.
         let exchange = async {
+            #[cfg(test)]
+            self.calls_at_the_writer.fetch_add(1, Ordering::SeqCst);
             let mut held = self.writer.lock().await;
+            if let Err(refusal) = still_admitted() {
+                return Err(refusal);
+            }
             let Some(writer) = held.as_mut() else {
-                return (
+                return Ok((
                     Err(kr_ipc::IpcError::UnexpectedMessage("this link has ended")),
                     false,
                     false,
-                );
+                ));
             };
             let written = writer.write(frame).await;
             let interrupted = writer.is_mid_frame();
@@ -488,10 +518,14 @@ impl WorkerProxy {
             if unusable {
                 held.take();
             }
-            (written, interrupted, unusable)
+            Ok((written, interrupted, unusable))
         };
         let sent = match tokio::time::timeout(CALL_TIMEOUT, exchange).await {
-            Ok((written, interrupted, unusable)) => {
+            Ok(Err(refusal)) => {
+                self.waiters().pending.remove(&request_id);
+                return Err(refusal);
+            }
+            Ok(Ok((written, interrupted, unusable))) => {
                 if unusable && !interrupted {
                     // The half is gone, so this link cannot carry anything else. Ending it is what
                     // the worker reads as the connection going, which detaches what it held.
@@ -536,6 +570,20 @@ impl WorkerProxy {
                 })
             }
         }
+    }
+
+    /// How many calls have begun to wait for the write half of this link.
+    #[cfg(test)]
+    pub(crate) fn calls_at_the_writer(&self) -> u64 {
+        self.calls_at_the_writer.load(Ordering::SeqCst)
+    }
+
+    /// Takes the write half, as a call writing a frame does, and holds it until it is dropped.
+    #[cfg(test)]
+    pub(crate) async fn hold_the_writer(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, Option<kr_ipc::client::LinkWriter>> {
+        self.writer.lock().await
     }
 
     /// Resolves once this link has ended.
