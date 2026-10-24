@@ -445,6 +445,17 @@ impl From<OwnershipRefusal> for ControllerError {
     }
 }
 
+/// What [`ArchiveService::bring_forward`] left of a session's store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forward {
+    /// There was nothing to make, or it was made: the store is not there, is at the current
+    /// version, is older than the ladder, or was brought forward.
+    Settled,
+    /// A migration is due and was not made, because a worker may still own the store or another
+    /// recovery holds it. A later look may make it.
+    HeldBack,
+}
+
 /// What a daemon tells its archive about the workers of its sessions: whether one may still own a
 /// session's stores, by everything the daemon holds (the registry's worker row, closure and
 /// reservation, and the published descriptor).
@@ -569,8 +580,9 @@ impl ArchiveService {
     /// There is no process to validate here: the caller's `a_worker_may_remain` is every piece of
     /// evidence the host holds that one is gone, asked **with the lock held**, so that no other
     /// recovery can change the answer between the question and the use. A closure the registry
-    /// recorded, a worker row, the closure's own list of a worker it never saw end and the
-    /// published descriptor are the evidence, and the caller reads all of them.
+    /// recorded, a worker row, the closure's own list of a worker it never saw end, the process
+    /// the session's launch ran and the published descriptor are the evidence, and the caller reads
+    /// all of them.
     ///
     /// # Errors
     ///
@@ -605,11 +617,12 @@ impl ArchiveService {
     /// query the platform declines establishes nothing, which is not the same as establishing
     /// that there is nothing there.
     ///
-    /// This is one of three things that can say so, and it is the one a live session has: a
+    /// This is one of four things that can say so, and it is the one a live session has: a
     /// worker publishes a descriptor when it starts. It does not outlast a closure - writing one
     /// retires the descriptor along with the registry's worker row - so a session closed without a
-    /// confirmed death is answered for by the closure's own surviving list instead. The daemon's
-    /// `a_worker_may_still_own` asks all three; this half is here because a migration is a write
+    /// confirmed death is answered for by the closure's own surviving list instead, and one whose
+    /// worker has not yet exited by the process its launch ran. The daemon's
+    /// `a_worker_may_still_own` asks all four; this half is here because a migration is a write
     /// and must be able to refuse on its own.
     #[must_use]
     pub fn a_worker_may_still_own(&self, session_id: SessionId) -> bool {
@@ -652,8 +665,8 @@ impl ArchiveService {
     /// An archive that belongs to a daemon ([`Self::asking`]) also asks the daemon, once a
     /// migration is due, whether a worker of the session may remain, and leaves the store where it
     /// is when one may.
-    pub fn bring_forward(&self, session_id: SessionId) {
-        self.bring_forward_with(session_id, None);
+    pub fn bring_forward(&self, session_id: SessionId) -> Forward {
+        self.bring_forward_with(session_id, None)
     }
 
     /// Brings a store forward as [`Self::bring_forward`] does, for the recovery that owns it.
@@ -664,26 +677,30 @@ impl ArchiveService {
         self.bring_forward_with(ownership.session_id, Some(ownership));
     }
 
-    fn bring_forward_with(&self, session_id: SessionId, owned: Option<&RecoveryOwnership>) {
+    fn bring_forward_with(
+        &self,
+        session_id: SessionId,
+        owned: Option<&RecoveryOwnership>,
+    ) -> Forward {
+        let path = self.paths.journal_database(session_id);
+        if !path.exists() {
+            return Forward::Settled;
+        }
+        let Ok(recorded) = Journal::recorded_schema_version(&path) else {
+            return Forward::Settled;
+        };
+        if recorded == kr_worker::persistence::migration::CURRENT
+            || kr_worker::persistence::migration::plan(recorded).is_err()
+        {
+            return Forward::Settled;
+        }
         // A migration is a write, so it asks the question recovery ownership asks, and asks it
         // here rather than trusting a caller: a session whose published descriptor names a process
         // the kernel has not said ended may still own this store, and a closure written over an
         // unvalidated death does not change that. The store is then left where it is and the
         // reader reports it, which is the safe direction.
         if self.a_worker_may_still_own(session_id) {
-            return;
-        }
-        let path = self.paths.journal_database(session_id);
-        if !path.exists() {
-            return;
-        }
-        let Ok(recorded) = Journal::recorded_schema_version(&path) else {
-            return;
-        };
-        if recorded == kr_worker::persistence::migration::CURRENT
-            || kr_worker::persistence::migration::plan(recorded).is_err()
-        {
-            return;
+            return Forward::HeldBack;
         }
         // The daemon's evidence is asked only now that there is something to write, and not for the
         // recovery that owns the store: its death was validated by the kernel.
@@ -693,7 +710,7 @@ impl ArchiveService {
                 .as_ref()
                 .is_some_and(|ask| (ask.0)(session_id))
         {
-            return;
+            return Forward::HeldBack;
         }
         // The lock is taken only when there is something to write, and not waited for: a store
         // another recovery holds is left to it, and the reader reports it until it is done.
@@ -702,7 +719,7 @@ impl ArchiveService {
         } else {
             match RecoveryLock::take(&self.paths, session_id) {
                 Ok(lock) => Some(lock),
-                Err(_) => return,
+                Err(_) => return Forward::HeldBack,
             }
         };
         #[cfg(test)]
@@ -710,6 +727,7 @@ impl ArchiveService {
         // `Journal::open` migrates and then holds the current schema. Dropping it immediately is
         // what keeps this a migration rather than a second reader.
         drop(Journal::open(&path));
+        Forward::Settled
     }
 
     /// Removes the worker's published endpoint and descriptor, and returns whether anything went.

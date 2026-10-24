@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use kr_controller::attention::{AttentionModule, Caller, Reach};
+use kr_controller::attention::{AttentionModule, Caller, ClosedJournal, Reach};
 use kr_controller::authority::AdmittedMutation;
 use kr_controller::directory::KnownWorker;
 use kr_crypto::keys::DeviceKeys;
@@ -359,18 +359,24 @@ impl Reach for TestReach {
         Box::pin(async move { unaccounted })
     }
 
-    fn closed_journal(&self, session_id: SessionId) -> Option<kr_worker::journal::Journal> {
+    fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
         self.journals_opened.fetch_add(1, Ordering::SeqCst);
         if self.unreadable.load(Ordering::SeqCst) {
-            return None;
+            return ClosedJournal::Unreadable;
         }
-        let path = self
+        let Some(path) = self
             .workers
             .lock()
             .expect("not poisoned")
             .get(&session_id)
-            .map(|reached| reached.journal.clone())?;
-        kr_worker::journal::Journal::open_read_only(path).ok()
+            .map(|reached| reached.journal.clone())
+        else {
+            return ClosedJournal::Unreadable;
+        };
+        kr_worker::journal::Journal::open_read_only(path)
+            .map_or(ClosedJournal::Unreadable, |journal| {
+                ClosedJournal::Open(Box::new(journal))
+            })
     }
 
     fn output_floor(&self, _session_id: SessionId) -> Option<u64> {

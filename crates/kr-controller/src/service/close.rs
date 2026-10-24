@@ -596,7 +596,9 @@ impl Controller {
     /// Section 7's second half comes before the session identity is released: whatever the session
     /// still owns is stopped, and what this host cannot account for is recorded. A closure written
     /// before that would be a closure a crash between the two could not lead back to. A worker that
-    /// wrote its own closure before it went has stopped what it owned, and its account stands.
+    /// wrote its own closure before it went has stopped what it owned, and its account stands,
+    /// except where its endpoint cannot be removed: the closure is then this host's, and the
+    /// worker's journal is not read for it.
     ///
     /// One flight per session at a time: the second caller waits, and finds the closure.
     pub(super) async fn crash_flight(
@@ -1354,7 +1356,11 @@ impl Controller {
         never_claimed: bool,
     ) -> tokio::task::JoinHandle<()> {
         let holds = Arc::clone(self.project().service().holds());
-        let archive = self.archive();
+        // The kernel says this worker's process has ended before the journal is read, so the
+        // store is not a live worker's and the daemon's evidence is not asked: this look is the
+        // only one, and a store held back for a busy registry would keep the registration for
+        // good.
+        let archive = crate::archive::ArchiveService::new(self.paths.clone());
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
             while tokio::time::Instant::now() < deadline {
