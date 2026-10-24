@@ -543,6 +543,12 @@ async fn an_exports_output_carries_a_soft_reset_from_the_alternate_buffer() {
 
 /// The file says what it is, whose it is and how the session ended; what the archive does not keep
 /// is declared; and the chunks start at the cursor the output was retained at.
+///
+/// KR-REQ-25.25, the part about the semantic JSON's dimensions and declared omissions: the document
+/// carries the session's dimensions, 100 columns by 30 rows as of its last size, and declares the
+/// output times, the earlier dimensions and the archive's completeness as omissions where the
+/// daemon records no times, and no gap, truncation or missing record for a closed session held
+/// whole. Not shown here: the times of the output, which a case below shows.
 #[tokio::test]
 async fn the_file_names_the_session_its_closure_and_what_the_archive_does_not_keep() {
     let mut daemon = Scripted::new(vec![
@@ -1296,6 +1302,11 @@ async fn a_write_that_fails_leaves_nothing_behind() {
 /// way gives the same file. This one holds a drawn line, a clipboard write the engine dropped, a
 /// bell, a gap in the archive and the output that follows it, and the closure, so each part of the
 /// format is in it.
+///
+/// KR-REQ-25.25, the part about the semantic JSON as a whole: the golden document carries the time
+/// of each piece of output, the session's dimensions and the omissions declared with their counts
+/// (a gap, a clipboard write, a bell, a question to the terminal and the bytes not carried), over
+/// output from which those side effects are gone.
 #[tokio::test]
 async fn the_document_is_the_same_bytes_for_the_same_session() {
     let after = b"\x18\x1b[32mafter the gap\r\n";
