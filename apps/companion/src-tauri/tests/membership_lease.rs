@@ -50,6 +50,7 @@
 //! | KR-REQ-17.53 | `a_confirmation_in_the_ceremony_when_the_account_signs_out_is_not_completed` |
 //! | KR-REQ-17.53 | `an_inbox_pass_whose_account_leaves_while_the_host_is_asked_publishes_nothing` |
 //! | KR-REQ-17.53 | `a_kept_visit_whose_account_leaves_before_its_session_list_publishes_nothing` |
+//! | KR-REQ-17.53 | `a_token_the_service_turns_back_is_not_replaced_during_the_hold_a_cancelled_request_left` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -2298,6 +2299,52 @@ async fn a_kept_visit_whose_account_leaves_before_its_session_list_publishes_not
     assert!(row.result.is_none(), "nothing was published: {row:?}");
     let said = row.refusal.expect("the reason").message;
     assert!(said.contains("sign in"), "{said}");
+}
+
+/// KR-REQ-17.53: when the service turns a token back while the service is held off for a minute
+/// because another caller gave up on a request, the request that replaces the token waits out the
+/// minute with the rest: nothing is sent, the token is not replaced, and the connection is told the
+/// service did not give the lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_the_service_turns_back_is_not_replaced_during_the_hold_a_cancelled_request_left() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+    let refreshed = rig.served.web().token_refreshes();
+
+    // The lease the device holds is too short to present again, so each connection asks.
+    rig.waits.time_passes(Duration::from_secs(14 * 60 + 30));
+    rig.refuses_the_lease_request(1, Moment::Gate);
+    rig.refuses_the_lease_request(2, Moment::Gate);
+    let mut gives_up = Box::pin(rig.dials());
+    let mut goes_on = Box::pin(rig.dials());
+    tokio::select! {
+        _ = &mut gives_up => panic!("the service holds the request"),
+        _ = &mut goes_on => panic!("the service holds the request"),
+        () = rig.until_lease_requests(requests + 2) => {}
+    }
+    drop(gives_up);
+    rig.served.web().expire_token(TOKEN);
+    rig.served.web().release_held();
+
+    let told = goes_on
+        .await
+        .expect_err("the service is held off for the minute");
+    assert!(
+        told.to_string().contains("did not give this device"),
+        "{told}"
+    );
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 2,
+        "no request followed the one the service turned back"
+    );
+    assert_eq!(
+        rig.served.web().token_refreshes(),
+        refreshed,
+        "the token was not replaced during the hold"
+    );
 }
 
 /// The host answers what it is, to a connection that holds a lease.
