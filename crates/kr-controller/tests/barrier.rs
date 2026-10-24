@@ -3487,24 +3487,43 @@ fn an_issued_grant(hosted: &Hosted) -> kr_protocol::ids::GrantId {
     held.grant_id
 }
 
+/// How many names one page of the worker's evidence carries in the cases that read the answer to
+/// a revocation, so that a fence which spans pages is a few actions and not hundreds.
+///
+/// Each action the fence takes back is a durable commit of its own, and the daemon waits for the
+/// worker's acknowledgement for a bound of its own (five seconds). A disk that takes tens of
+/// milliseconds for a durable write, as a hosted Windows runner's does, makes a fence of five
+/// hundred actions last half a minute, and the daemon answers the revocation as pending before the
+/// worker has fenced: section 9's answer for a worker that has not yet acknowledged, and not the
+/// answer these cases read.
+const NAMES_A_PAGE_CARRIES: usize = 8;
+
 /// A real revocation of a grant, sent by the local owner, whose answer leaves names to come.
 ///
 /// A worker that is busy for a moment refuses the announcement, and the answer is then pending
 /// (section 9): nothing has been fenced, so nothing is left unasked, and a later announcement
 /// does not change the answer the daemon kept of the mutation. The cases that use this read that
 /// answer itself, so when it is pending the arrangement is made again on a new worker, until an
-/// answer holds. One deadline bounds the attempts.
+/// answer holds. One deadline bounds the attempts, and a failure says what each attempt answered.
 async fn a_revocation_that_left_names_unasked() -> Unasked {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut attempts = Vec::new();
     let left = loop {
+        let started = tokio::time::Instant::now();
         let left = a_revocation_answered_once().await;
         if left.given.barrier.holds() {
             break left;
         }
+        attempts.push(format!(
+            "{:?} after {:?}: {}",
+            worker_report(&left.given.barrier, left.hosted.session_id).state,
+            started.elapsed(),
+            worker_report(&left.given.barrier, left.hosted.session_id).detail
+        ));
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no answer to a revocation held within a minute of attempts: {:?}",
-            left.given.barrier
+            "no answer to a revocation held within a minute of {} attempts: {attempts:#?}",
+            attempts.len()
         );
     };
     let reported = worker_report(&left.given.barrier, left.hosted.session_id);
@@ -3520,8 +3539,14 @@ async fn a_revocation_answered_once() -> Unasked {
     let hosted = hosted_worker().await;
     let granted = an_issued_grant(&hosted);
     hosted.controller.limit_evidence_pages_for_tests(0);
+    hosted
+        .runtime
+        .session()
+        .journal_mut()
+        .expect("a journal")
+        .limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
     let device = actor("device:phone");
-    let affected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS * 2 + 5;
+    let affected = NAMES_A_PAGE_CARRIES * 2 + 5;
     seed_undispatched_intents(&hosted, &device, affected);
 
     let mut client = LocalClient::connect(&hosted.client_endpoint, LocalClientKind::Cli, build())
