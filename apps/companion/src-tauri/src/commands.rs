@@ -182,6 +182,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // screen a tap on a notification opened.
     ("push_view", None),
     ("push_enable", None),
+    ("push_previews", None),
     ("push_refresh", None),
     ("notification_route", None),
     // Voice. The start names its method for the table, and this process refuses it before sending.
@@ -337,6 +338,7 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         "push_enable",
         &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
     ),
+    ("push_previews", &[Method::DevicePushRegister]),
     (
         "push_refresh",
         &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
@@ -634,6 +636,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         inbox_hosts,
         push_view,
         push_enable,
+        push_previews,
         push_refresh,
         notification_route,
         voice_prepare,
@@ -2585,6 +2588,24 @@ pub fn push_enable(state: State<'_, AppState>, reference: String) -> Result<crat
         .enable(&reference)
 }
 
+/// Chooses whether the notifications of the host the page named show what needs the person, or only
+/// that something does.
+///
+/// The choice is recorded and applied on this phone at once; a host that is on is told next, and
+/// the page is told where it stands on `kr://push`.
+#[tauri::command]
+pub async fn push_previews(
+    state: State<'_, AppState>,
+    reference: String,
+    on: bool,
+) -> Result<crate::push::PushView> {
+    state
+        .push()
+        .ok_or_else(|| CommandError::unsupported("notifications are a phone's"))?
+        .set_previews(&reference, on)
+        .await
+}
+
 /// Looks again at where notifications stand, and mends what a change since the last look needs.
 #[tauri::command]
 pub async fn push_refresh(state: State<'_, AppState>) -> Result<crate::push::PushView> {
@@ -3619,6 +3640,7 @@ mod tests {
         "inbox_hosts",
         "push_view",
         "push_enable",
+        "push_previews",
         "push_refresh",
         "notification_route",
         "host_info",
@@ -3849,6 +3871,7 @@ mod tests {
                 // own receiver, and hands the host the credential; the page names a host.
                 "push_view",
                 "push_enable",
+                "push_previews",
                 "push_refresh",
                 "notification_route",
                 // Setup's own two. Neither performs a protocol operation: one reads this
