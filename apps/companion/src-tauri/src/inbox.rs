@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kr_client::ClientError;
-use kr_client::pairing::link::LinkError;
+use kr_client::organisation::lease_is_refused;
+use kr_client::pairing::link::{LinkError, Presentation};
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult};
 use kr_protocol::error::ErrorCode;
@@ -279,25 +280,29 @@ impl InboxDesk {
 }
 
 /// Reads `host`'s inbox over the connection held, or over a fresh one when there is none or it no
-/// longer answers. A refusal on the connection held is the host's answer, and a fresh connection
-/// is not made to ask again.
+/// longer answers. A refusal on the connection held is the host's answer, unless it may be the end
+/// of the lease, and a fresh connection is not made to ask again.
 ///
 /// A host that answers a member's device only while it holds the lease its organisation signed
 /// stops answering the connection held when that lease ends, and nothing keeps the lease of a host
-/// that is not in use fresh. So the lease is presented again over the connection before each read:
-/// the lease the device holds is presented as it is while it lasts, with no request to the
-/// organisation's service, and a new one is asked for when it has ended.
+/// that is not in use fresh. So the lease is presented again over the connection when the one the
+/// host holds is due to be replaced, which asks the organisation's service for a new one, and not
+/// before: each presentation is a row the host keeps. A host that refuses a read as not permitted
+/// may have lost the lease, and is given the lease the device holds, or a new one if the host
+/// refuses that, before the read is made once more.
+///
+/// A connection is the account's that was signed in when it was dialled. A fresh one is refused when
+/// another has signed in since ([`Connection::visited`]); a kept one opened under another is let go,
+/// and the visit goes on over a fresh connection; and after a presentation the account is asked
+/// about again before the host is read, so that nothing is read of a host under the lease of an
+/// account that has signed out or been replaced.
 async fn read_host(
     device: &Arc<Device>,
     host: &PairedHost,
     held: Option<Arc<Connection>>,
 ) -> Visited {
     if let Some(connection) = held {
-        let read = match present_again(device, host, &connection).await {
-            Ok(()) => read_over(&connection).await,
-            Err(missed) => Err(missed),
-        };
-        match read {
+        match read_kept(device, host, &connection).await {
             Ok((result, sessions)) => return Visited::Read((connection, result, sessions)),
             Err(missed) => {
                 connection.session().close();
@@ -320,18 +325,45 @@ async fn read_host(
     }
 }
 
-/// Presents again, over `connection`, what the host needs of this device before it answers: the
-/// lease of a member's device, and nothing for a host whose grant answers to no organisation.
-async fn present_again(
+/// Reads the inbox over a connection kept from an earlier visit.
+async fn read_kept(
     device: &Arc<Device>,
     host: &PairedHost,
     connection: &Connection,
+) -> Result<(AttentionReadResult, Vec<NumberedSession>), Missed> {
+    // Opened under another account: not this one's to read with. The visit goes on over a fresh
+    // connection, which presents the lease of the account signed in.
+    if connection.account_unchanged(device).await.is_err() {
+        return Err(Missed::Unreached);
+    }
+    present(device, host, connection, Presentation::IfDue).await?;
+    bound(device, connection).await?;
+    match read_over(connection).await {
+        Err(Missed::Refused(refusal)) if lease_is_refused(refusal.code, &refusal.message) => {
+            // The lease the host holds ended on its clock before this device's said it was due, or
+            // the host lost it: it is presented again at once, whatever the lease is due.
+            present(device, host, connection, Presentation::First).await?;
+            bound(device, connection).await?;
+            read_over(connection).await
+        }
+        read => read,
+    }
+}
+
+/// Presents, over `connection`, what the host needs of this device before it answers, as
+/// `presentation` says: the lease of a member's device, and nothing for a host whose grant answers
+/// to no organisation.
+async fn present(
+    device: &Arc<Device>,
+    host: &PairedHost,
+    connection: &Connection,
+    presentation: Presentation,
 ) -> Result<(), Missed> {
     let pairing = device.pairing();
     let identity = pairing.candidate.paired_identity(host.device_id);
     pairing
         .link
-        .present_membership(&connection.session(), host, &identity)
+        .present_membership(&connection.session(), host, &identity, presentation)
         .await
         .map_err(|error| match error {
             LinkError::Refused(refusal) | LinkError::Membership(refusal) => {
@@ -339,6 +371,14 @@ async fn present_again(
             }
             LinkError::Lost(_) | LinkError::Configuration(_) => Missed::Unreached,
         })
+}
+
+/// Whether `connection` is still the account's that is signed in, as the words of why not.
+async fn bound(device: &Arc<Device>, connection: &Connection) -> Result<(), Missed> {
+    connection
+        .account_unchanged(device)
+        .await
+        .map_err(Missed::Refused)
 }
 
 /// Reads the whole inbox and the session numbers over `connection`.
