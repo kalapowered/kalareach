@@ -7737,7 +7737,7 @@ async fn withheld_as_not_drained(wired: &mut Wired, why: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again() {
-    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
         let package = installed_package_of(kind);
         let shell = RealShell::start(
             &package,
@@ -7748,27 +7748,40 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
         .await;
         // Taking the keys is what starts an exchange, and the real reader answers it.
         let _keys = shell.keys();
-        until_fenced(&shell.runtime).await;
-        let proved = shell
-            .runtime
-            .session()
-            .fence()
-            .expect("a driver")
-            .fence()
-            .map(|fence| fence.fence_id)
-            .expect("the reader proved a fence");
-
-        {
-            let mut session = shell.runtime.session();
-            session.ingest_output(b"\x1b[c");
-            shell.runtime.flush_input();
-            let driver = session.fence().expect("a driver");
-            assert!(
-                driver.fence().is_none(),
-                "{kind:?}: the answer reached the reader's terminal behind the fence it proved"
-            );
-            assert_eq!(driver.host_reply_bytes(), b"\x1b[?62;22c".len() as u64);
-        }
+        // A reader may ask the terminal questions of its own at start (fish does), and the host
+        // answers those as it answers the application. So the answer under test is counted from
+        // the moment the proved fence is seen, and it is queued under the same hold of the session,
+        // which no other answer can enter.
+        let proved = tokio::time::timeout(SOON, async {
+            loop {
+                {
+                    let mut session = shell.runtime.session();
+                    let proved = session
+                        .fence()
+                        .expect("a driver")
+                        .fence()
+                        .map(|fence| fence.fence_id);
+                    if let Some(proved) = proved {
+                        let before = session.fence().expect("a driver").host_reply_bytes();
+                        session.ingest_output(b"\x1b[c");
+                        shell.runtime.flush_input();
+                        let driver = session.fence().expect("a driver");
+                        assert!(
+                            driver.fence().is_none(),
+                            "{kind:?}: the answer reached the reader's terminal behind the fence it proved"
+                        );
+                        assert_eq!(
+                            driver.host_reply_bytes() - before,
+                            b"\x1b[?62;22c".len() as u64
+                        );
+                        return proved;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved a fence"));
         // The reader consumes what it was sent and idles, which is where the exchange is asked for
         // again, and it answers from its own snapshot.
         tokio::time::timeout(Duration::from_secs(30), async {
