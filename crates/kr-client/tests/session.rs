@@ -2787,18 +2787,25 @@ impl RelayLeaseService for ForkServices {
 }
 
 impl kr_client::services::PushService for ForkServices {
-    fn register<'a>(
+    fn propose<'a>(
         &'a self,
-        _token: &'a str,
-    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::PushRegistration> {
-        self.refuses("push.register")
+        _proposal: kr_protocol::push::PushRegistrationProposal,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::push::Registration> {
+        self.refuses("push.propose")
     }
 
-    fn revoke<'a>(
+    fn answer<'a>(
         &'a self,
-        _installation_id: kr_protocol::ids::InstallationId,
-    ) -> kr_client::services::ServiceFuture<'a, ()> {
-        self.refuses("push.revoke")
+        _answer: kr_protocol::push::PushRegistrationAnswer,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::push::Registration> {
+        self.refuses("push.answer")
+    }
+
+    fn issue<'a>(
+        &'a self,
+        _request: kr_protocol::push::PushSenderIssueRequest,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::push::Issued> {
+        self.refuses("push.issue")
     }
 }
 
@@ -2984,6 +2991,17 @@ impl kr_client::services::ManagedVoiceService for ForkServices {
     }
 }
 
+/// A registration proposal for the push client of a fork to refuse.
+fn a_push_proposal() -> kr_protocol::push::PushRegistrationProposal {
+    kr_protocol::push::PushRegistrationProposal {
+        installation_key: kr_protocol::scalars::AuthorisationKey::from_bytes([8; 32]),
+        platform: kr_protocol::push::PushPlatform::Android,
+        registration_id: kr_protocol::ids::PushRegistrationId::new(Uuid::from_bytes([9; 16])),
+        registration_token: kr_protocol::push::RegistrationToken::new("a-push-token")
+            .expect("a registration token"),
+    }
+}
+
 /// KR-REQ-17.14: every managed service a client uses is a replaceable client, and what a client
 /// knows of its services explains availability and protects nothing. A fork puts its own client in
 /// each of the places: account login, relay leases, push, sync and backup (settings sync, managed
@@ -3057,7 +3075,7 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             .push
             .as_ref()
             .expect("the fork's push client")
-            .register("a-push-token")
+            .propose(a_push_proposal())
             .await
             .err(),
         clients
@@ -3099,7 +3117,7 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             "account.revoke",
             "membership.lease",
             "relay.issue",
-            "push.register",
+            "push.propose",
             "sync.fetch",
             "storage.status",
             "manifest.fetch",

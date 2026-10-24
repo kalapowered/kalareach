@@ -135,10 +135,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use kr_protocol::archive::{BackupGenerationPublication, BackupWriterRecord};
-use kr_protocol::ids::{
-    ArchiveId, BackupGeneration, BackupObjectId, InstallationId, RelayLeaseId, SyncConflictId,
-};
+use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, RelayLeaseId, SyncConflictId};
 use kr_protocol::pairing::GenerationCheckpoint;
+use kr_protocol::push::{PushRegistrationAnswer, PushRegistrationProposal, PushSenderIssueRequest};
 use kr_protocol::scalars::{EndpointKey, Nullable, Uuid};
 use serde::{Deserialize, Serialize};
 
@@ -351,13 +350,6 @@ pub enum LeaseEndReason {
     Finished,
 }
 
-/// A push registration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PushRegistration {
-    /// The installation this registration belongs to.
-    pub installation_id: InstallationId,
-}
-
 /// Where relay leases are obtained.
 ///
 /// The service holds the ledger the lease spends from, signs the lease with the admission key the
@@ -413,16 +405,30 @@ pub trait RelayLeaseService: Send + Sync + std::fmt::Debug {
     ) -> ServiceFuture<'a, relay::RelayPayerAuthorisation>;
 }
 
-/// Where a device registers for push.
+/// The push gateway, as an installation and the hosts it is paired with use it.
 ///
-/// Registration uses the installation's own key proof, not a managed-account login, which is what
-/// keeps account-free push working.
+/// An installation proposes the token its provider gave it and answers the challenge the gateway
+/// sends to that token, and takes the credential a paired host sends its pushes with. Every call
+/// is signed by the installation's own key, never by a managed-account login, which is what keeps
+/// account-free push working.
 pub trait PushService: Send + Sync + std::fmt::Debug {
-    /// Registers this installation for push.
-    fn register<'a>(&'a self, token: &'a str) -> ServiceFuture<'a, PushRegistration>;
+    /// Proposes a provider token: the gateway records the attempt and sends a challenge through the
+    /// provider to that token.
+    fn propose<'a>(
+        &'a self,
+        proposal: PushRegistrationProposal,
+    ) -> ServiceFuture<'a, push::Registration>;
 
-    /// Revokes this installation's registration.
-    fn revoke<'a>(&'a self, installation_id: InstallationId) -> ServiceFuture<'a, ()>;
+    /// Presents the signed answer to a challenge and activates the binding.
+    fn answer<'a>(
+        &'a self,
+        answer: PushRegistrationAnswer,
+    ) -> ServiceFuture<'a, push::Registration>;
+
+    /// Authorises one paired host and takes the credential to hand it. Asking again under the same
+    /// authorisation identifier for the same host gives a fresh credential and keeps the one
+    /// authorisation.
+    fn issue<'a>(&'a self, request: PushSenderIssueRequest) -> ServiceFuture<'a, push::Issued>;
 }
 
 /// The name a synchronisation service gives one write of one object.
@@ -1479,11 +1485,21 @@ impl RelayLeaseService for NullService {
 }
 
 impl PushService for NullService {
-    fn register<'a>(&'a self, _token: &'a str) -> ServiceFuture<'a, PushRegistration> {
+    fn propose<'a>(
+        &'a self,
+        _proposal: PushRegistrationProposal,
+    ) -> ServiceFuture<'a, push::Registration> {
         unconfigured(ManagedService::Push.as_str())
     }
 
-    fn revoke<'a>(&'a self, _installation_id: InstallationId) -> ServiceFuture<'a, ()> {
+    fn answer<'a>(
+        &'a self,
+        _answer: PushRegistrationAnswer,
+    ) -> ServiceFuture<'a, push::Registration> {
+        unconfigured(ManagedService::Push.as_str())
+    }
+
+    fn issue<'a>(&'a self, _request: PushSenderIssueRequest) -> ServiceFuture<'a, push::Issued> {
         unconfigured(ManagedService::Push.as_str())
     }
 }
@@ -1693,8 +1709,7 @@ mod tests {
             payer: None,
             lease_id: None,
         };
-        let error = NullService
-            .issue(&request)
+        let error = RelayLeaseService::issue(&NullService, &request)
             .await
             .expect_err("nothing is configured");
         assert!(error.to_string().contains("relay leases"));
