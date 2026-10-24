@@ -11,7 +11,7 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{ClosureReason, OwnershipCoverage};
 
 use super::a_migration_and_a_recovery_of_one_session::{
-    put_back_to_an_earlier_schema, version_of, written_journal,
+    after_the_first_pass, put_back_to_an_earlier_schema, version_of, written_journal,
 };
 use super::a_previous_boot_left_to_a_held_recovery::{recorded_ended_worker, recorded_worker_of};
 use crate::service::Controller;
@@ -165,6 +165,7 @@ async fn a_start_that_closes_a_session_it_cannot_unpublish_holds_its_repository(
 async fn a_gone_desktop_bound_workers_journal_is_not_opened_to_say_why_it_went() {
     let temp = kr_ipc::testing::TempHost::create();
     let controller = daemon(&temp).await;
+    after_the_first_pass(&controller).await;
     // A desktop of another boot is a desktop that has ended, on every platform.
     let desktop = kr_protocol::identity::DesktopBinding {
         desktop_session_id: Nullable::some(

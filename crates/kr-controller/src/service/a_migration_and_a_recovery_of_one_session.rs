@@ -103,6 +103,20 @@ pub(super) fn put_back_to_an_earlier_schema(controller: &Controller, session_id:
     assert_eq!(version_of(controller, session_id), 3);
 }
 
+/// Waits until the daemon's collection has ended its first pass, which starts with the daemon and
+/// takes a closed session the registry holds no record of: it would migrate a journal a case has
+/// just written, under an assertion about its version.
+pub(super) async fn after_the_first_pass(controller: &Controller) {
+    let mut passes = controller.collection().passes();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        passes.wait_for(|ended| *ended >= 1),
+    )
+    .await
+    .expect("the daemon's collection ran")
+    .expect("the collection is still there");
+}
+
 pub(super) fn version_of(controller: &Controller, session_id: SessionId) -> i64 {
     kr_worker::journal::Journal::recorded_schema_version(
         controller.paths().journal_database(session_id),
@@ -136,6 +150,7 @@ async fn closed_session_of_an_earlier_build(controller: &Controller) -> SessionI
 async fn a_migration_is_refused_while_a_recovery_holds_the_session() {
     let temp = TempHost::create();
     let controller = daemon(&temp).await;
+    after_the_first_pass(&controller).await;
     let session_id = closed_session_of_an_earlier_build(&controller).await;
     let ended = kr_ipc::identity::ended_process_identity(4_000_011);
     let recovery = controller
@@ -179,6 +194,7 @@ async fn a_migration_is_refused_while_a_recovery_holds_the_session() {
 async fn a_recovery_is_refused_while_a_migration_holds_the_session() {
     let temp = TempHost::create();
     let controller = daemon(&temp).await;
+    after_the_first_pass(&controller).await;
     let session_id = closed_session_of_an_earlier_build(&controller).await;
     let answer = std::sync::Arc::new(std::sync::Mutex::new(None));
     let archive = controller.archive();

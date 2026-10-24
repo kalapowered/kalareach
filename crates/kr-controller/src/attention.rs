@@ -289,12 +289,34 @@ pub trait Reach: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 
     /// Returns the journal of a closed session, brought to the schema this build reads, when it
-    /// can be opened.
-    fn closed_journal(&self, session_id: SessionId) -> Option<kr_worker::journal::Journal>;
+    /// can be opened, and says when it is held back for now instead.
+    fn closed_journal(&self, session_id: SessionId) -> ClosedJournal;
 
     /// Returns the oldest output position a closed session's spool still retains, when it can be
     /// read.
     fn output_floor(&self, session_id: SessionId) -> Option<u64>;
+}
+
+/// What a closed session's journal can be asked for.
+pub enum ClosedJournal {
+    /// The journal, at the schema this build reads.
+    Open(Box<kr_worker::journal::Journal>),
+    /// The journal is of an earlier schema and cannot be brought forward yet, because a worker of
+    /// the session may still own it or another recovery holds it. A later look may open it.
+    HeldBack,
+    /// The journal is not there or cannot be read.
+    Unreadable,
+}
+
+impl ClosedJournal {
+    /// The journal, where it can be opened.
+    #[must_use]
+    pub fn open(self) -> Option<kr_worker::journal::Journal> {
+        match self {
+            Self::Open(journal) => Some(*journal),
+            Self::HeldBack | Self::Unreadable => None,
+        }
+    }
 }
 
 /// The worker one session is reached at.
@@ -1607,7 +1629,7 @@ impl AttentionModule {
         for (session_id, wanted) in by_session {
             let owner = self.text_owner(session_id);
             let journal = if matches!(owner, TextOwner::Journal) {
-                reach.closed_journal(session_id)
+                reach.closed_journal(session_id).open()
             } else {
                 None
             };
@@ -2559,11 +2581,14 @@ impl AttentionModule {
             // Only now is the journal the session's last word, and only now is its text read from
             // it.
             self.origins().closing.insert(session_id);
-            let read = reach
-                .closed_journal(session_id)
-                .map_or(Err(Unfinished::Journal), |journal| {
-                    self.read_to_the_end(session_id, &journal)
-                });
+            let read = match reach.closed_journal(session_id) {
+                ClosedJournal::Open(journal) => self.read_to_the_end(session_id, &journal),
+                ClosedJournal::HeldBack => Err(Unfinished::Store(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "a closed session's journal cannot be brought forward yet",
+                ))),
+                ClosedJournal::Unreadable => Err(Unfinished::Journal),
+            };
             match read {
                 Ok(()) => self.finalise(session_id),
                 Err(Unfinished::Journal) => self
@@ -4186,13 +4211,70 @@ pub(crate) mod tests {
             Box::pin(async move { unaccounted })
         }
 
-        fn closed_journal(&self, _session_id: SessionId) -> Option<kr_worker::journal::Journal> {
-            None
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            ClosedJournal::Unreadable
         }
 
         fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
             None
         }
+    }
+
+    /// A reach whose closed journal is held back for now.
+    struct HeldBack;
+
+    impl Reach for HeldBack {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            ClosedJournal::HeldBack
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A closed session whose journal is held back for now, because a worker may still own it or
+    /// the daemon was busy, is tried again later. It is not finished with gaps that have no end,
+    /// which is what a journal that cannot be read is, and which nothing tries again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_held_back_for_now_is_tried_again_and_not_finished_with_gaps() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let held = SessionId::new(kr_ipc::new_uuid());
+        let unreadable = SessionId::new(kr_ipc::new_uuid());
+
+        module.session_closed(&HeldBack, held).await;
+        module
+            .session_closed(&Stub { unaccounted: false }, unreadable)
+            .await;
+
+        assert!(
+            !module.finalised(held),
+            "a held back journal is not finished"
+        );
+        assert!(
+            module.origins().unfinished.contains(&held),
+            "and is on the list to be tried again"
+        );
+        assert!(
+            module.finalised(unreadable),
+            "control: a journal that cannot be read is finished with gaps"
+        );
     }
 
     fn module(temp: &kr_ipc::testing::TempHost) -> Arc<AttentionModule> {
@@ -6047,8 +6129,8 @@ pub(crate) mod tests {
             Box::pin(async { false })
         }
 
-        fn closed_journal(&self, _session_id: SessionId) -> Option<kr_worker::journal::Journal> {
-            None
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            ClosedJournal::Unreadable
         }
 
         fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
@@ -7431,8 +7513,8 @@ pub(crate) mod tests {
             })
         }
 
-        fn closed_journal(&self, _session_id: SessionId) -> Option<kr_worker::journal::Journal> {
-            None
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            ClosedJournal::Unreadable
         }
 
         fn output_floor(&self, _session_id: SessionId) -> Option<u64> {

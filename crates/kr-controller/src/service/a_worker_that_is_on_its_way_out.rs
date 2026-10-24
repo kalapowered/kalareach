@@ -10,9 +10,10 @@ use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::session::DisplayNumber;
 
 use super::a_migration_and_a_recovery_of_one_session::{
-    RECOVERED, closure_of, put_back_to_an_earlier_schema, version_of, written_journal,
+    RECOVERED, after_the_first_pass, closure_of, put_back_to_an_earlier_schema, version_of,
+    written_journal,
 };
-use crate::attention::Reach as _;
+use crate::attention::ClosedJournal;
 use crate::registry::Reservation;
 use crate::service::Controller;
 use crate::service::net::tests::daemon;
@@ -74,6 +75,7 @@ async fn the_launchs_process_ends(controller: &Controller, reservation: &Reserva
 async fn a_read_is_refused_while_the_process_the_launch_ran_still_runs() {
     let temp = TempHost::create();
     let controller = daemon(&temp).await;
+    after_the_first_pass(&controller).await;
     let (session_id, reservation) = closed_while_its_launchs_process_runs(&controller).await;
 
     let refused = controller.session_archive(session_id).await;
@@ -106,6 +108,7 @@ async fn a_read_is_refused_while_the_process_the_launch_ran_still_runs() {
 async fn no_reader_migrates_a_store_while_the_process_the_launch_ran_still_runs() {
     let temp = TempHost::create();
     let controller = daemon(&temp).await;
+    after_the_first_pass(&controller).await;
     let (session_id, reservation) = closed_while_its_launchs_process_runs(&controller).await;
     let closure = closure_of(session_id);
     let reach = controller.attention_reach();
@@ -129,12 +132,12 @@ async fn no_reader_migrates_a_store_while_the_process_the_launch_ran_still_runs(
         "the list is built from the closure alone"
     );
     assert!(
-        reach.closed_journal(session_id).is_none(),
-        "the attention store reads no journal it cannot open as it stands"
+        matches!(reach.closed_journal(session_id), ClosedJournal::HeldBack),
+        "the attention store is told the journal is held back for now, and not that it is unreadable"
     );
     assert!(
         sweep(&controller).await.contains(&session_id),
-        "the sweep keeps what was submitted to a session whose worker may remain"
+        "the sweep reads the archive as it stands and keeps what a store it cannot read held"
     );
     assert_eq!(
         version_of(&controller, session_id),
@@ -150,6 +153,10 @@ async fn no_reader_migrates_a_store_while_the_process_the_launch_ran_still_runs(
         listed.cwd, RECOVERED,
         "control: once it has ended it is read"
     );
+    assert!(matches!(
+        reach.closed_journal(session_id),
+        ClosedJournal::Open(_)
+    ));
     assert_eq!(
         version_of(&controller, session_id),
         kr_worker::persistence::migration::CURRENT

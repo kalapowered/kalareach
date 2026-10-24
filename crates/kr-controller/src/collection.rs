@@ -357,8 +357,7 @@ impl Controller {
     ///
     /// The transfer sweep's question, answered for exactly the sessions it names. A session with a
     /// worker, or a launch under way, or no closure the registry recorded, keeps what was
-    /// submitted to it, and so does one whose worker may still be there (the process its launch ran
-    /// has not ended). A session that has closed is asked of its archive, with the host's reading
+    /// submitted to it. A session that has closed is asked of its archive, with the host's reading
     /// of the clock when it can prove one ([`crate::archive::Archive::retains_submissions`]).
     /// It blocks on the registry's lock.
     ///
@@ -373,28 +372,16 @@ impl Controller {
         let archive = self.archive();
         let mut retained = BTreeSet::new();
         for &session_id in sessions {
-            let (row, closure, reservation) = {
+            let (known, closure) = {
                 let registry = self.registry_handle().blocking_lock();
-                let row = registry
+                let known = registry
                     .workers()?
                     .into_iter()
-                    .find(|row| row.session_id == session_id);
-                (
-                    row,
-                    registry.closure(session_id)?,
-                    registry.reservation_for_session(session_id)?,
-                )
+                    .any(|row| row.session_id == session_id)
+                    || registry.reservation_for_session(session_id)?.is_some();
+                (known, registry.closure(session_id)?)
             };
-            let known = row.is_some() || reservation.is_some();
-            // A session whose worker may still be there keeps what was submitted to it, and its
-            // archive is not read: that would migrate a store the worker may still write.
-            let held = if (known && closure.is_none())
-                || self.worker_may_remain(
-                    session_id,
-                    row.as_ref(),
-                    closure.as_ref(),
-                    reservation.as_ref(),
-                ) {
+            let held = if known && closure.is_none() {
                 true
             } else {
                 archive.retains_submissions(session_id, closure, proven)?

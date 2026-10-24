@@ -1483,9 +1483,9 @@ impl Session {
         // A watch that had nothing to bind to when the shell started adopts the desktop as soon as
         // the platform answers. What it adopted is what this session reports from then on, so the
         // record, the closure and a status read never name a different desktop from the one being
-        // watched. The journal's copy is written again with it, because that copy is what a later
-        // control daemon reads to say whether a worker that has gone went with its desktop, and it
-        // was written once when the shell started.
+        // watched. The journal's copy is written again with it, so that a reader of the journal
+        // sees the desktop that was watched and not the one the shell started with. The control
+        // daemon's registry takes the desktop when it next describes the worker.
         if !self.config.desktop.desktop_session_id.is_present()
             && let Some(bound) = self.desktop.bound_binding()
         {
