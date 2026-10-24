@@ -1458,6 +1458,60 @@ async fn a_change_to_the_feeds_list_taken_after_the_feed_was_removed_does_not_en
     );
 }
 
+/// KR-REQ-24.15: a change to the list of keys that may remove the feed, which the feed answers by
+/// saying it removed this host, ends the pass as the read's own answer does: the grants that rest
+/// on the feed are refused when the answer is read, and not when the next read finds the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_to_the_feeds_list_answered_by_its_removal_refuses_the_grants_that_rest_on_it_at_once()
+ {
+    let rig = Rig::start().await;
+    rig.the_owner_bounds_offline_validity();
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    let session = connect(&rig.host, &phone, &record).await;
+    rig.until_the_carrier_is_idle().await;
+    rig.doctor_as(&session)
+        .await
+        .expect("inside the bound, with the feed standing");
+
+    // The owner paired next changes the list, and the feed holds the change until the key it still
+    // lists has removed the feed.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "delegate", 1, Moment::Gate);
+    let delegated = rig.arrivals("delegate");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    let _next_owner = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    rig.until_arrivals("delegate", delegated + 1).await;
+    rig.remote
+        .remove(rig.feed())
+        .await
+        .expect("a key the host named removes the feed");
+    rig.served.web().release_held();
+    within("the pass the change was made in ends", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+
+    assert!(
+        rig.shown().await.list.feed_removed,
+        "the host shows that the feed removed it"
+    );
+    let refused = rig
+        .doctor_as(&session)
+        .await
+        .expect_err("the grant rests on a feed that removed the host");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        refused.to_string().contains("was removed"),
+        "refused for the feed's removal and not for something else: {refused}"
+    );
+}
+
 /// A change to the list of keys that may remove the feed, turned back with a delay, ends the pass:
 /// the host asks the feed for nothing more until the delay is over, as it does for any request the
 /// feed turns back with one.
