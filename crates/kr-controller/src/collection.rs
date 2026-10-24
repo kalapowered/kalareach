@@ -345,30 +345,20 @@ impl Controller {
                 return Ok(false);
             }
         }
-        // A worker hands its closure over before it exits, and the closure erases its registry
-        // row and its descriptor. The reservation still names the process the launch ran, and that
-        // process is the worker until the kernel says it ended: until then the worker may still
-        // write the stores a collection would open.
-        if reservation
-            .as_ref()
-            .and_then(|row| row.launcher_identity.as_ref())
-            .is_some_and(|launched| {
-                !matches!(
-                    kr_ipc::identity::process_state(launched),
-                    kr_ipc::identity::ProcessState::Ended
-                )
-            })
-        {
-            return Ok(false);
-        }
-        Ok(!self.worker_may_remain(session_id, row.as_ref(), closure.as_ref()))
+        Ok(!self.worker_may_remain(
+            session_id,
+            row.as_ref(),
+            closure.as_ref(),
+            reservation.as_ref(),
+        ))
     }
 
     /// Returns those of `sessions` whose retention still covers what was submitted to them.
     ///
     /// The transfer sweep's question, answered for exactly the sessions it names. A session with a
     /// worker, or a launch under way, or no closure the registry recorded, keeps what was
-    /// submitted to it. A session that has closed is asked of its archive, with the host's reading
+    /// submitted to it, and so does one whose worker may still be there (the process its launch ran
+    /// has not ended). A session that has closed is asked of its archive, with the host's reading
     /// of the clock when it can prove one ([`crate::archive::Archive::retains_submissions`]).
     /// It blocks on the registry's lock.
     ///
@@ -383,16 +373,28 @@ impl Controller {
         let archive = self.archive();
         let mut retained = BTreeSet::new();
         for &session_id in sessions {
-            let (known, closure) = {
+            let (row, closure, reservation) = {
                 let registry = self.registry_handle().blocking_lock();
-                let known = registry
+                let row = registry
                     .workers()?
                     .into_iter()
-                    .any(|row| row.session_id == session_id)
-                    || registry.reservation_for_session(session_id)?.is_some();
-                (known, registry.closure(session_id)?)
+                    .find(|row| row.session_id == session_id);
+                (
+                    row,
+                    registry.closure(session_id)?,
+                    registry.reservation_for_session(session_id)?,
+                )
             };
-            let held = if known && closure.is_none() {
+            let known = row.is_some() || reservation.is_some();
+            // A session whose worker may still be there keeps what was submitted to it, and its
+            // archive is not read: that would migrate a store the worker may still write.
+            let held = if (known && closure.is_none())
+                || self.worker_may_remain(
+                    session_id,
+                    row.as_ref(),
+                    closure.as_ref(),
+                    reservation.as_ref(),
+                ) {
                 true
             } else {
                 archive.retains_submissions(session_id, closure, proven)?
