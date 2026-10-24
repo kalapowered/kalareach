@@ -127,7 +127,7 @@ publishes them, and four of the package's own.
 | `bash53-001` to `bash53-020` | `patches/upstream/` | The fixes the Bash project published for 5.3, unchanged |
 | `0001-readline-reader-mailbox` | `lib/readline/{Makefile.in,input.c,macro.c,readline.c}` | The mailbox, the reader's private counts, the cancellation and the pre-EOF decision |
 | `0002-readline-reader-state` | `lib/readline/{text.c,kill.c}` | Two reader states Readline keeps no flag for |
-| `0003-bash-bridge-activation` | `Makefile.in`, `shell.c`, `builtins/{Makefile.in,read.def}` | Loading the bridge, the prompt context and the builtin |
+| `0003-bash-bridge-activation` | `Makefile.in`, `shell.c`, `builtins/Makefile.in` | Loading the bridge, the prompt context and the builtin |
 | `0004-bash-command-resolve` | `execute_cmd.c` | The question in front of each command a line starts, and the launcher its answer can name |
 
 Readline's buffering is why the mailbox is where it is. The reader returns pending and macro input
@@ -466,7 +466,9 @@ A package is built on one machine and installed on others, so none of its native
 on a library that only the builder had. fish builds its own PCRE2. Bash is configured with
 `--disable-nls`: it looks for its message catalogues under the prefix the build named, which a
 moved tree no longer has, and on a runner whose package manager keeps gettext among the compiler's
-default paths the executable would name that library. Each shell's test file reads the load commands
+default paths the executable would name that library. The cost is that a script's `$"..."` strings
+are not translated, because bash does that through `gettext` and this build has none: they print as
+written. Each shell's test file reads the load commands
 (macOS) or the dynamic section (Linux) of every native file in the package, the executable and each
 module or loadable builtin, and fails on a macOS library outside `/usr/lib` and `/System`, or a
 Linux library outside the C library, the compiler's runtime and the terminal-information library.
