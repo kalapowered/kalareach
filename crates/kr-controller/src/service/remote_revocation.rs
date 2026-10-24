@@ -213,6 +213,23 @@ impl Controller {
         Ok(Judged::Apply(plan))
     }
 
+    /// Whether `request` names one of `devices`, or a grant one of them holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device directory or the grant store cannot be read.
+    pub(crate) fn request_names_one_of(
+        &self,
+        request: &RevocationRequest,
+        devices: &std::collections::BTreeSet<DeviceId>,
+    ) -> Result<bool> {
+        Ok(self
+            .plan_of(request)?
+            .devices
+            .iter()
+            .any(|device| devices.contains(device)))
+    }
+
     /// The error a standing this host could not decide comes to, for the pass that could not
     /// finish because of it.
     pub(crate) fn undecided_standing(refusal: &Refusal) -> crate::error::ControllerError {

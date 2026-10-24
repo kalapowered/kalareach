@@ -6553,9 +6553,11 @@ reading this host has not written down, or on a clock it has not proven, is not 
 request is refused for it. The request waits, and so does each request behind it that the feed does
 not show complete, because requests are judged in the order the feed holds them. The scan goes on
 for what the feed shows complete, which asks no clock: those are carried out again, and a withdrawal
-this host cannot verify among them raises its refusal as ever. The pass then ends as one this host
-could not finish, so nothing is shown as read, and it asks again after its backoff. A device whose grant holds no right to
-manage the host is turned away whatever the clock says.
+this host cannot verify among them raises its refusal as ever. A record that would revoke the
+device that made the waiting request is not carried out ahead of it, so the scan ends there, as it
+ends at the request. The pass then ends as one this host could not finish, so nothing is shown as
+read, and it asks again after its backoff. A device whose grant holds no right to manage the host is
+turned away whatever the clock says.
 
 A request that passes is written down before it takes effect. It is then carried out through the
 same revocation the owner at the machine makes, issued the revision the daemon's registry

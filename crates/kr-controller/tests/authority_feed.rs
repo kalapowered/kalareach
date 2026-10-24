@@ -1357,6 +1357,52 @@ async fn the_doctor_names_eight_of_the_devices_a_withdrawal_names_and_counts_the
     );
 }
 
+/// KR-REQ-24.15: a withdrawal the feed shows complete that would revoke the issuer of a request the
+/// host cannot judge yet is not carried out ahead of that request: the request would be refused
+/// later for a revocation that came after it, and what it named would stay live. The pass ends at the
+/// withdrawal, as it ends at the request, and the scan after the clock is proven carries the request
+/// out and then the withdrawal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_that_would_revoke_the_issuer_of_a_request_the_host_cannot_decide_waits_behind_it()
+ {
+    let Undecidable {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(Behind::AKnownOwnersWithdrawalOfTheIssuer, 0)
+        .await;
+    let key = issuer.0.keys().authorisation.clone();
+    assert!(
+        !rig.has_revoked(issuer.1.device_id).await,
+        "the withdrawal of the issuer is not carried out ahead of the issuer's request"
+    );
+    assert_eq!(
+        rig.held_as(&key, &first).await.rejected.0,
+        None,
+        "and the request is not refused for it"
+    );
+
+    rig.host.controller().utc_floor().establish_continuity();
+    rig.poll().await;
+    let carried_out = rig.held_as(&key, &first).await;
+    assert_eq!(
+        carried_out
+            .acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "the scan after the clock is proven carries the request out: {carried_out:?}"
+    );
+    assert!(rig.has_revoked(target.1.device_id).await);
+    assert!(
+        rig.has_revoked(issuer.1.device_id).await,
+        "and then the withdrawal"
+    );
+}
+
 /// KR-REQ-24.15: a device a withdrawal the host cannot verify names keeps no standing over the
 /// feed. It is not among the keys the host names as permitted to remove the feed, so removing the
 /// feed does not end the refusal for it, while another owner's key is named and does. Else the
@@ -2388,17 +2434,30 @@ struct Undecidable {
     fillers: Vec<(AuthorisationKeyPair, RevocationRequest)>,
 }
 
+/// The withdrawal the feed shows complete behind a request whose issuer cannot be judged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Behind {
+    /// By an owner the host does not know, of a device other than the issuer.
+    AnUnknownOwnersWithdrawal,
+    /// By an owner the host knows, of the issuer.
+    AKnownOwnersWithdrawalOfTheIssuer,
+}
+
 /// Pairs an owner whose grant expires, a device its request will name and a device the withdrawal
-/// names, publishes the request, `fillers` requests of strangers and then a withdrawal by an owner
-/// the host does not know, and makes the feed hold that withdrawal as an earlier run of the host
-/// would have left it. The clock is unproven when the host reads the feed.
-async fn a_request_whose_issuer_the_host_cannot_decide(fillers: usize) -> Undecidable {
+/// names, publishes the request, `fillers` requests of strangers and then the withdrawal `behind`,
+/// and makes the feed hold that withdrawal as an earlier run of the host would have left it. The
+/// clock is unproven when the host reads the feed.
+async fn a_request_whose_issuer_the_host_cannot_decide(
+    behind: Behind,
+    fillers: usize,
+) -> Undecidable {
     let rig = Rig::start().await;
     let rights = [ActionRight::HostManage, ActionRight::SessionView];
     let issuer = rig.pairs(&rights).await;
     let target = rig.pairs(&[ActionRight::SessionView]).await;
     let named = rig.pairs(&[ActionRight::SessionView]).await;
     let spare = rig.pairs(&[ActionRight::SessionView]).await;
+    let known_owner = rig.pairs(&rights).await;
     // Every pass the pairings woke has ended, so none reads the feed before the case has made it.
     rig.until_the_carrier_is_idle().await;
     rig.host.controller().utc_floor().lose_continuity();
@@ -2424,14 +2483,19 @@ async fn a_request_whose_issuer_the_host_cannot_decide(fillers: usize) -> Undeci
         rig.published_as(key, &request).await;
         published.push((key.clone(), request));
     }
-    let withdrawer_key = AuthorisationKeyPair::generate().expect("a key");
-    let withdrawer = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16]));
-    let withdrawal = rig.request_of(
-        &withdrawer_key,
-        withdrawer,
-        0xf2,
-        devices(named.1.device_id),
-    );
+    let (withdrawer_key, withdrawer, withdrawn) = match behind {
+        Behind::AnUnknownOwnersWithdrawal => (
+            AuthorisationKeyPair::generate().expect("a key"),
+            DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+            named.1.device_id,
+        ),
+        Behind::AKnownOwnersWithdrawalOfTheIssuer => (
+            known_owner.0.keys().authorisation.clone(),
+            known_owner.1.device_id,
+            issuer.1.device_id,
+        ),
+    };
+    let withdrawal = rig.request_of(&withdrawer_key, withdrawer, 0xf2, devices(withdrawn));
     rig.published_as(&withdrawer_key, &withdrawal).await;
     rig.an_earlier_run_carried_out(&withdrawal, 0, 1).await;
     if fillers > 0 {
@@ -2463,7 +2527,7 @@ async fn a_request_the_host_cannot_decide_does_not_stop_the_scan_before_a_withdr
         target,
         first,
         ..
-    } = a_request_whose_issuer_the_host_cannot_decide(0).await;
+    } = a_request_whose_issuer_the_host_cannot_decide(Behind::AnUnknownOwnersWithdrawal, 0).await;
 
     let check = rig.shown().await.check.expect("the feed check");
     assert!(
@@ -2518,7 +2582,7 @@ async fn a_request_the_host_cannot_decide_holds_the_requests_behind_it_across_th
         first,
         fillers,
         ..
-    } = a_request_whose_issuer_the_host_cannot_decide(70).await;
+    } = a_request_whose_issuer_the_host_cannot_decide(Behind::AnUnknownOwnersWithdrawal, 70).await;
 
     let check = rig.shown().await.check.expect("the feed check");
     assert!(
