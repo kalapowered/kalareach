@@ -922,17 +922,31 @@ struct Unverifiable {
     kept: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// The owner the registry no longer holds, who made the withdrawal.
     owner: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// A share of a session that the other device holds, which a second withdrawal names.
+    share: kr_protocol::grant::Grant,
 }
 
-/// Pairs the device the withdrawal will name with `victim_rights` and one it will not, takes a copy
-/// of the registry, pairs another owner, has that owner withdraw the first device from the feed,
-/// carries it out, and puts the registry back to the copy.
+/// Pairs the device the withdrawal will name with `victim_rights` and one it will not, which is
+/// given a share of a session, takes a copy of the registry, pairs another owner, has that owner
+/// withdraw the first device and the share from the feed, carries both out, and puts the registry
+/// back to the copy. With `list_stays`, the feed turns back every change the host makes to the
+/// keys it lists as permitted to remove it, so it lists the keys it listed before the withdrawal.
 async fn a_withdrawal_by_an_owner_the_host_does_not_know(
     victim_rights: &[ActionRight],
+    list_stays: bool,
 ) -> Unverifiable {
     let rig = Rig::start().await;
     let victim = rig.pairs(victim_rights).await;
     let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let session_id = net_support::an_open_session(&rig.host).0;
+    let share = net_support::worker::share(
+        &rig.host,
+        session_id,
+        &kept.0,
+        &kept.1,
+        kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer),
+    )
+    .await;
     rig.until_the_carrier_is_idle().await;
     let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
 
@@ -941,44 +955,75 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
         .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
         .await;
     rig.until_the_carrier_is_idle().await;
-    let request = kr_pairing::grants::sign_revocation_request(
-        &owner.0.keys().authorisation,
-        RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([0xc1; 16])),
-        owner.1.device_id,
-        rig.host_device(),
-        devices(victim.1.device_id),
-        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
-    )
-    .expect("a signed request");
-    // The feed shows each publisher what it published, so the owner reads its own request.
+    if list_stays {
+        // Every change of the list the host makes from here on, before and after the registry is
+        // put back, is turned back: the feed keeps the list the host made before the withdrawal.
+        for nth in 1..=64 {
+            rig.served.web().fail_with_member(
+                AUTHORITY,
+                "delegate",
+                nth,
+                Moment::Refuse {
+                    status: 503,
+                    code: "SERVICE_UNAVAILABLE",
+                    retry_after_seconds: None,
+                },
+            );
+        }
+    }
+    let sign = |id: u8, target: RevocationTarget| {
+        kr_pairing::grants::sign_revocation_request(
+            &owner.0.keys().authorisation,
+            RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([id; 16])),
+            owner.1.device_id,
+            rig.host_device(),
+            target,
+            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("a signed request")
+    };
+    let requests = [
+        sign(0xc1, devices(victim.1.device_id)),
+        sign(
+            0xc2,
+            RevocationTarget::Grants {
+                grant_ids: [share.grant_id].into_iter().collect::<CanonicalSet<_>>(),
+            },
+        ),
+    ];
+    // The feed shows each publisher what it published, so the owner reads its own requests.
     let publisher = client_for(rig.served.origin(), owner.0.keys().authorisation.clone());
-    publisher
-        .publish(rig.feed(), &request, None)
-        .await
-        .expect("the feed stores the request");
+    for request in &requests {
+        publisher
+            .publish(rig.feed(), request, None)
+            .await
+            .expect("the feed stores the request");
+    }
     rig.poll().await;
     let mut passes = rig.runtime().passes();
-    let completion = within(
-        "the host carries the revocation out and acknowledges it",
-        async {
-            loop {
-                let _ = *passes.borrow_and_update();
-                let state = publisher
-                    .read(rig.feed(), None, false)
-                    .await
-                    .expect("the feed answers the owner");
-                if let Some(acknowledged) = state
-                    .record(request.request_id)
-                    .and_then(|record| record.acknowledgement.0.as_ref())
-                {
-                    return acknowledged.completion;
+    for request in &requests {
+        let completion = within(
+            "the host carries the revocation out and acknowledges it",
+            async {
+                loop {
+                    let _ = *passes.borrow_and_update();
+                    let state = publisher
+                        .read(rig.feed(), None, false)
+                        .await
+                        .expect("the feed answers the owner");
+                    if let Some(acknowledged) = state
+                        .record(request.request_id)
+                        .and_then(|record| record.acknowledgement.0.as_ref())
+                    {
+                        return acknowledged.completion;
+                    }
+                    passes.changed().await.expect("the carrier runs");
                 }
-                passes.changed().await.expect("the carrier runs");
-            }
-        },
-    )
-    .await;
-    assert_eq!(completion, RevocationCompletion::Complete);
+            },
+        )
+        .await;
+        assert_eq!(completion, RevocationCompletion::Complete);
+    }
 
     // The registry goes back to before that owner was paired.
     let rig = rig
@@ -991,6 +1036,7 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
         victim,
         kept,
         owner,
+        share,
     }
 }
 
@@ -1018,7 +1064,8 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         victim,
         kept,
         owner,
-    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView]).await;
+        share,
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView], false).await;
 
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
@@ -1041,11 +1088,12 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         "a refusal that stands is a warning"
     );
     assert!(check.remedy().is_some(), "and it says what to do about it");
-    // It names what the owner at the machine acts on: the device the withdrawal names, the owner
-    // who made it as the request says, and that owner's key.
+    // It names what the owner at the machine acts on: the device and the share the withdrawals
+    // name, the owner who made them as the requests say, and that owner's key.
     let issuer_key = owner.0.keys().authorisation.key_id();
     for named in [
         victim.1.device_id.to_string(),
+        share.grant_id.to_string(),
         owner.1.device_id.to_string(),
         issuer_key.as_bytes()[..8]
             .iter()
@@ -1072,6 +1120,13 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
     .await
     .expect("the owner at the machine revokes the device");
     rig.until_the_carrier_is_idle().await;
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(
+        says_an_owner_is_unknown(&refused),
+        "the share the other withdrawal names is still live, so the host still waits: {refused:?}"
+    );
+    net_support::worker::revoke(&rig.host, share.grant_id).await;
+    rig.until_the_carrier_is_idle().await;
 
     let session = connect(&rig.host, &kept.0, &kept.1).await;
     rig.doctor_as(&session)
@@ -1096,10 +1151,10 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
 async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_removing_the_feed() {
     let Unverifiable {
         rig, victim, kept, ..
-    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[
-        ActionRight::HostManage,
-        ActionRight::SessionView,
-    ])
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::HostManage, ActionRight::SessionView],
+        false,
+    )
     .await;
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(says_an_owner_is_unknown(&refused), "{refused:?}");
@@ -1110,11 +1165,42 @@ async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_rem
         vec![rig.owner.authorisation.key_id()],
         "the owner the host knows is named, and the device the withdrawal names is not"
     );
-    client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
+    let named_device = client_for(rig.served.origin(), victim.0.keys().authorisation.clone());
+    named_device
         .remove(rig.feed())
         .await
         .expect_err("a key the host does not name cannot remove the feed");
+    // A request the device publishes is not heard either: it has no owner authority, whatever the
+    // request names. It names a device the host does not hold, so a host that judged the device by
+    // its grant would have refused it for that.
+    let request = kr_pairing::grants::sign_revocation_request(
+        &victim.0.keys().authorisation,
+        RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([0xd1; 16])),
+        victim.1.device_id,
+        rig.host_device(),
+        devices(DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [0xee; 16],
+        ))),
+        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+    )
+    .expect("a signed request");
+    named_device
+        .publish(rig.feed(), &request, None)
+        .await
+        .expect("the feed stores the request");
     rig.poll().await;
+    let record = named_device
+        .read(rig.feed(), None, false)
+        .await
+        .expect("the feed answers the device")
+        .record(request.request_id)
+        .expect("the record")
+        .clone();
+    assert_eq!(
+        record.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "a device the withdrawal names has no owner authority over the feed"
+    );
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
         says_an_owner_is_unknown(&refused),
@@ -1127,6 +1213,48 @@ async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_rem
     rig.doctor_as(&session)
         .await
         .expect("the other device is served once the feed is removed");
+}
+
+/// KR-REQ-24.15: a refusal a device a withdrawal names would end by removing the feed stands when
+/// the feed still lists that device's key. The feed turns back every change the host makes to the
+/// list of keys that may remove it, so the list after the registry is put back is the list from
+/// before the withdrawal, and the device removes the feed with it. The removal says nothing of an
+/// owner having acted, so the host goes on refusing remote access, as it does until the owner at
+/// the machine acts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_that_still_lists_the_key_of_a_device_a_withdrawal_names_does_not_end_the_refusal_when_removed()
+ {
+    let Unverifiable {
+        rig, victim, kept, ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::HostManage, ActionRight::SessionView],
+        true,
+    )
+    .await;
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(says_an_owner_is_unknown(&refused), "{refused:?}");
+    let listed = rig.feed_as_the_owner_sees_it().await.summary.removal_keys;
+    assert!(
+        listed.contains(&victim.0.keys().authorisation.key_id()),
+        "the feed still lists the device's key: {listed:?}"
+    );
+
+    client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
+        .remove(rig.feed())
+        .await
+        .expect("the feed takes the removal from a key it lists");
+    rig.poll().await;
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(
+        says_an_owner_is_unknown(&refused),
+        "a removal by a key the withdrawal takes the right from does not end the refusal: {refused:?}"
+    );
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        check.detail().contains("an owner this host does not know"),
+        "the host still says what it waits for: {}",
+        check.detail()
+    );
 }
 
 /// KR-REQ-24.15: a request on a page the scan has left behind is judged before the feed counts as
