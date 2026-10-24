@@ -426,19 +426,22 @@ else:
     allowance = report.get("burst_policy_burst")
     say("the host's journal retained every one of the burst's events (16.17)",
         report.get("burst_settled") is True and report.get("burst_events_retained") == asked, f"events {report.get('burst_events_retained')} of {asked}")
-    # The allowance refills as the burst is admitted: a whole allowance every `burst_refill_ms`, so
-    # the host may accept that much more for each of them its own clock saw pass, and one fewer when
-    # a notification a moment before the burst had spent one.
+    # What the host sends is the allowance, and what the burst's own time refilled: a whole allowance
+    # every `burst_refill_ms` of its own clock, and one fewer when a notification a moment before the
+    # burst had spent one. The rest is collapsed into at most one attention update, which is an
+    # accepted delivery of its own and is counted apart.
     span = report.get("burst_span_ms")
     refill = report.get("burst_refill_ms")
-    accepted = report.get("burst_accepted")
-    ints = all(isinstance(value, int) for value in (asked, allowance, span, refill, accepted))
-    most = min(asked, allowance + allowance * span // refill + 1) if ints else None
-    say("each event is one delivery record, and the host accepted as many as its allowance gives, and what the burst's own time refilled, and collapsed the rest (16.17)",
+    sends = report.get("burst_sends")
+    updates = report.get("burst_updates")
+    ints = all(isinstance(value, int) for value in (asked, allowance, span, refill, sends, updates))
+    most = allowance + allowance * span // refill if ints else None
+    say("each event is one delivery record: the host sent as many as its allowance gives, and what the burst's own time refilled, collapsed the rest, and sent at most one attention update (16.17)",
         report.get("burst_deliveries_written") == asked and ints
-        and min(asked, allowance) - 1 <= accepted <= most
-        and report.get("burst_collapsed") == asked - accepted and report.get("burst_other") == 0,
-        f"states {report.get('burst_states')} allowance {allowance} span {span} ms")
+        and min(asked, allowance) - 1 <= sends <= min(asked, most)
+        and updates <= 1
+        and report.get("burst_collapsed") == asked - sends - updates and report.get("burst_other") == 0,
+        f"states {report.get('burst_states')} sends {sends} updates {updates} allowance {allowance} span {span} ms")
     say("what reached the provider is exactly what the host's journal says the gateway accepted (16.17)",
         report.get("burst_provider_caught_up") is True and report.get("burst_at_the_provider") == report.get("burst_accepted"),
         f"provider {report.get('burst_at_the_provider')} accepted {report.get('burst_accepted')}")
