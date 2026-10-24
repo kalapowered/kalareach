@@ -3382,7 +3382,13 @@ struct Scan {
     unread: Vec<String>,
     /// How many bytes were read.
     bytes: u64,
+    /// How many pages the kernel refused to read as guard pages, which hold nothing.
+    guards: u64,
 }
+
+/// The size of a page of the machines this case runs on, for stepping over a guard page.
+#[cfg(target_os = "linux")]
+const PAGE: u64 = 4096;
 
 /// Looks for `needle` in every mapping of a running process that is both readable and writable,
 /// which is where a static buffer, the heap and the stack are.
@@ -3406,6 +3412,7 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
         copies: Vec::new(),
         unread: Vec::new(),
         bytes: 0,
+        guards: 0,
     };
     let mut chunk = vec![0u8; 1 << 20];
     for line in maps.lines() {
@@ -3435,6 +3442,16 @@ fn scan_memory(pid: u32, needle: &[u8]) -> Scan {
                 .and_then(|_| memory.read(&mut chunk[..want]));
             let read = match outcome {
                 Ok(read) => read,
+                // A guard page of a thread's stack stays inside a mapping that reads as writable,
+                // and the kernel refuses to read it with an input/output error. Nothing a process
+                // wrote can be in a page that faults on every access, so the scan goes on past it
+                // and counts it; any other refusal ends the mapping unread.
+                Err(error) if error.raw_os_error() == Some(5) => {
+                    scan.guards += 1;
+                    offset += PAGE;
+                    carried.clear();
+                    continue;
+                }
                 Err(error) => {
                     refused = format!(" (at {offset:x}: {error})");
                     0
@@ -3503,9 +3520,10 @@ pub fn the_bootstrap_secret_does_not_outlive_the_accepted_handshake(kind: ShellK
         );
         assert!(
             scan.unread.is_empty() && scan.bytes > 0,
-            "{} bytes of the {} shell's memory were read, and these writable mappings were not read to their end:\n{}",
+            "{} bytes of the {} shell's memory were read ({} guard pages stepped over), and these writable mappings were not read to their end:\n{}",
             scan.bytes,
             kind.as_str(),
+            scan.guards,
             scan.unread.join("\n")
         );
         assert!(
