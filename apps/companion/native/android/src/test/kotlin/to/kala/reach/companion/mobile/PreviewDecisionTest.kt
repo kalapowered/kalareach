@@ -66,14 +66,45 @@ class PreviewDecisionTest {
     }
 
     @Test
-    fun theGenericAlertStandsBeforeTheFirstUnlock() {
-        val decision =
-            PreviewDecider(
-                    failingKeys(PreviewKeyUnavailable.LockedBeforeFirstUnlock),
-                    refusingOpener()
-                )
-                .decide(payload(), now)
+    fun theGenericAlertStandsBeforeTheFirstUnlockWhicheverKeyIsAskedFirst() {
+        val locked = failingKeys(PreviewKeyUnavailable.LockedBeforeFirstUnlock)
+        val decision = PreviewDecider(locked, refusingOpener()).decide(payload(), now)
         assertEquals(PreviewDecision.Generic(GenericReason.LOCKED_BEFORE_FIRST_UNLOCK), decision)
+        // The seed is there and the host's key cannot be read yet: the same answer, not a missing key.
+        val senderLocked =
+            object : PreviewKeyReading {
+                override fun recipientSeed(recipientKeyId: ByteArray) =
+                    Result.success(ByteArray(32) { 0x44 })
+
+                override fun senderKey(senderKeyId: ByteArray): Result<ByteArray> =
+                    Result.failure(
+                        PreviewKeyUnavailableException(PreviewKeyUnavailable.LockedBeforeFirstUnlock)
+                    )
+            }
+        assertEquals(
+            PreviewDecision.Generic(GenericReason.LOCKED_BEFORE_FIRST_UNLOCK),
+            PreviewDecider(senderLocked, refusingOpener()).decide(payload(), now)
+        )
+    }
+
+    @Test
+    fun aHostThisDeviceHoldsNoKeyForIsNotOpened() {
+        var opened = 0
+        val opener = PreviewOpening { _, _, _, _, _ ->
+            opened += 1
+            PreviewOpened.Text("secret")
+        }
+        val withoutTheSender =
+            object : PreviewKeyReading {
+                override fun recipientSeed(recipientKeyId: ByteArray) =
+                    Result.success(ByteArray(32) { 0x44 })
+
+                override fun senderKey(senderKeyId: ByteArray): Result<ByteArray> =
+                    Result.failure(PreviewKeyUnavailableException(PreviewKeyUnavailable.NotProvisioned))
+            }
+        val decision = PreviewDecider(withoutTheSender, opener).decide(payload(), now)
+        assertEquals(PreviewDecision.Generic(GenericReason.SENDER_UNKNOWN), decision)
+        assertEquals(0, opened)
     }
 
     @Test
@@ -83,10 +114,17 @@ class PreviewDecisionTest {
     }
 
     @Test
-    fun theGenericAlertStandsWhenThisBuildCarriesNoOpener() {
-        val decision =
-            PreviewDecider(providingKeys(), SharedClientPreviewOpener).decide(payload(), now)
-        assertEquals(PreviewDecision.Generic(GenericReason.DECRYPTION_FAILED), decision)
+    fun aRefusalIsReportedByTheCheckThatMadeIt() {
+        val expired = PreviewOpening { _, _, _, _, _ -> PreviewOpened.Refused("expired") }
+        assertEquals(
+            PreviewDecision.Generic(GenericReason.EXPIRED),
+            PreviewDecider(providingKeys(), expired).decide(payload(), now)
+        )
+        val nothing = PreviewOpening { _, _, _, _, _ -> PreviewOpened.Refused("empty_preview") }
+        assertEquals(
+            PreviewDecision.Generic(GenericReason.EMPTY_PREVIEW),
+            PreviewDecider(providingKeys(), nothing).decide(payload(), now)
+        )
     }
 
     @Test
@@ -105,36 +143,28 @@ class PreviewDecisionTest {
 
     @Test
     fun anExpiredPreviewIsNotOpened() {
-        var reads = 0
-        val keys = PreviewKeyReading {
-            reads += 1
-            Result.success(ByteArray(32))
-        }
+        val keys = CountingKeys()
         val decision =
             PreviewDecider(keys, openingTo("secret")).decide(payload(expiresAtMillis = now - 1), now)
         assertEquals(PreviewDecision.Generic(GenericReason.EXPIRED), decision)
-        assertEquals(0, reads)
+        assertEquals(0, keys.reads)
     }
 
     @Test
     fun aPreviewForAnotherDeviceIsNotOpened() {
-        var reads = 0
-        val keys = PreviewKeyReading {
-            reads += 1
-            Result.success(ByteArray(32))
-        }
+        val keys = CountingKeys()
         val held = recipient.joinToString("") { "%02x".format(it) }
         val decision =
             PreviewDecider(keys, openingTo("secret"), setOf(held))
                 .decide(payload(recipientKeyId = ByteArray(32) { 0x33 }), now)
         assertEquals(PreviewDecision.Generic(GenericReason.NOT_FOR_THIS_DEVICE), decision)
-        assertEquals(0, reads)
+        assertEquals(0, keys.reads)
     }
 
     @Test
     fun anEmptyPlaintextIsNotShownAsAPreview() {
         val decision = PreviewDecider(providingKeys(), openingTo("   ")).decide(payload(), now)
-        assertEquals(PreviewDecision.Generic(GenericReason.DECRYPTION_FAILED), decision)
+        assertEquals(PreviewDecision.Generic(GenericReason.EMPTY_PREVIEW), decision)
     }
 
     @Test
@@ -168,15 +198,43 @@ class PreviewDecisionTest {
         assertEquals(PreviewEnvelope.NONCE_LENGTH, parsed.envelope.nonce.size)
     }
 
-    private fun providingKeys() = PreviewKeyReading { Result.success(ByteArray(32) { 0x44 }) }
+    private fun providingKeys() =
+        object : PreviewKeyReading {
+            override fun recipientSeed(recipientKeyId: ByteArray) =
+                Result.success(ByteArray(32) { 0x44 })
+
+            override fun senderKey(senderKeyId: ByteArray) = Result.success(ByteArray(32) { 0x55 })
+        }
 
     private fun failingKeys(unavailable: PreviewKeyUnavailable) =
-        PreviewKeyReading { Result.failure(PreviewKeyUnavailableException(unavailable)) }
+        object : PreviewKeyReading {
+            override fun recipientSeed(recipientKeyId: ByteArray): Result<ByteArray> =
+                Result.failure(PreviewKeyUnavailableException(unavailable))
+
+            override fun senderKey(senderKeyId: ByteArray): Result<ByteArray> =
+                Result.failure(PreviewKeyUnavailableException(unavailable))
+        }
+
+    /** Keys that count how often they are asked. */
+    private class CountingKeys : PreviewKeyReading {
+        var reads = 0
+
+        override fun recipientSeed(recipientKeyId: ByteArray): Result<ByteArray> {
+            reads += 1
+            return Result.success(ByteArray(32))
+        }
+
+        override fun senderKey(senderKeyId: ByteArray): Result<ByteArray> {
+            reads += 1
+            return Result.success(ByteArray(32))
+        }
+    }
 
     private fun refusingOpener() =
-        PreviewOpening { _, _ -> Result.failure(IllegalStateException("does not authenticate")) }
+        PreviewOpening { _, _, _, _, _ -> PreviewOpened.Refused("authentication") }
 
-    private fun openingTo(text: String) = PreviewOpening { _, _ -> Result.success(text) }
+    private fun openingTo(text: String) =
+        PreviewOpening { _, _, _, _, _ -> PreviewOpened.Text(text) }
 
     /** base64url without padding, written out so the test does not need a platform decoder. */
     private fun encode(bytes: ByteArray): String {

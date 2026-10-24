@@ -447,7 +447,7 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   @objc public func pushPendingSet(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushPendingGet(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushPendingClear(_ invoke: Invoke) { forwardPush(invoke) }
-  @objc public func pushLimitedKey(_ invoke: Invoke) { forwardPush(invoke) }
+  @objc public func pushPreviewKeys(_ invoke: Invoke) { forwardPush(invoke) }
   @objc public func pushRoute(_ invoke: Invoke) { forwardPush(invoke) }
 
   /// Hands one command to the application's notification adapter and answers `invoke` with what it
