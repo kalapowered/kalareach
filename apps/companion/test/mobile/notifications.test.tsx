@@ -6,7 +6,9 @@
  * the page asked for. The steps native code takes (the system's permission, the notification
  * service, the challenge, the host's destination) are proved on the devices and in the backend's
  * own suite; what these hold the page to is what the person sees, the one thing they can do, and
- * that a tap on a notification lands on the attention screen.
+ * that a tap on a notification lands on the attention screen. No case here names a requirement row:
+ * the clauses of those rows (a credential registered, an action that reaches the host) are shown
+ * by the backend suite and the device legs, and no assertion here shows one.
  */
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
@@ -48,7 +50,7 @@ async function openHosts(): Promise<HTMLElement> {
   return screen.findByTestId('host-notifications')
 }
 
-describe('the notifications of a paired host (KR-REQ-16.08)', () => {
+describe('the notifications of a paired host', () => {
   it('says they are off and offers the one thing the person can do', async () => {
     start()
     const row = await openHosts()
@@ -170,7 +172,7 @@ describe('the notifications of a paired host (KR-REQ-16.08)', () => {
   })
 })
 
-describe('a tap on a notification (KR-REQ-09.21)', () => {
+describe('a tap on a notification', () => {
   const current = (): string =>
     screen.getAllByRole('button').find((each) => each.getAttribute('aria-current') === 'page')
       ?.textContent ?? ''
