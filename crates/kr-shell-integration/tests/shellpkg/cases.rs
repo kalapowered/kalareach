@@ -3603,6 +3603,79 @@ pub fn the_powershell_bootstrap_secret_is_cleared_once_the_handshake_is_accepted
     );
 }
 
+/// KR-REQ-07.40: the PowerShell bridge decodes the secret into one byte array and clears that
+/// array.
+///
+/// A function's output is enumerated into the pipeline, so a byte array returned bare reaches its
+/// caller as an array of boxed bytes and the buffer the decoder made is left uncleared behind it.
+/// The case decodes a known secret in the module's own scope, puts the result where the module
+/// keeps its secret, clears it as the module does, and reads the result it decoded: it has to be
+/// the byte array itself, and every byte of it has to be gone.
+///
+/// # Panics
+///
+/// Panics when the decoder returns anything but a byte array, or the clear leaves a byte.
+pub fn the_powershell_secret_is_decoded_into_one_byte_array_that_is_cleared() {
+    let package = Package::built(ShellKind::PowerShell);
+    let directory = package
+        .executable
+        .parent()
+        .and_then(Path::parent)
+        .expect("the package directory");
+    let module = directory
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         & (Get-Module KalaReach.ShellBridge) {{ \
+           $decoded = ConvertFrom-KrBase64Url 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'; \
+           $script:Kr.Secret = $decoded; \
+           $type = $decoded.GetType().FullName; $length = $decoded.Length; \
+           Clear-KrSecret; \
+           $left = @($decoded | Where-Object {{ $_ -ne 0 }}).Count; \
+           Write-Output \"kr-decoded=[$type|$length|$left]\" }}"
+    );
+    let asked = std::process::Command::new(&package.executable)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    assert!(
+        said.lines()
+            .any(|line| line == "kr-decoded=[System.Byte[]|32|0]"),
+        "the decoded secret is not one byte array of 32 bytes with none left after the clear:\n{said}\n{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+}
+
+/// KR-REQ-07.37: an error in the PowerShell handshake leaves the bridge unregistered, with no
+/// secret and no connection.
+///
+/// A worker's answer that does not decode is an error inside the handshake, and the host's error
+/// preference decides whether the code after it runs. Whatever runs, a bridge the worker never
+/// accepted must not be marked registered or managed, because the reader then acts as a managed
+/// shell for a worker that has not admitted it. The case answers the bridge's opening frame with
+/// one that cannot be decoded and reads the module's state once the shell is answering.
+///
+/// # Panics
+///
+/// Panics when the module is registered or managed, keeps a connection, or holds secret bytes.
+pub fn an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered() {
+    let package = Package::built(ShellKind::PowerShell);
+    let mut session = Session::start_answered_with_a_frame_that_does_not_decode(&package);
+    let probe = "Write-Output ('kr-bridge=' + (& (Get-Module KalaReach.ShellBridge) { '{0}/{1}/{2}/{3}' -f $script:Kr.Registered, $script:Kr.Managed, ($null -eq $script:Kr.Socket), $script:Kr.Secret.Length }))";
+    assert!(
+        session.run(probe, "kr-bridge=False/False/True/0"),
+        "the module is registered or managed, keeps its connection or holds secret bytes after an \
+         answer it could not decode:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// The libraries a built executable asks the loader for, by the name or path the file records.
 ///
 /// # Panics

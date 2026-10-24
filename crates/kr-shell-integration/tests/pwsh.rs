@@ -32,6 +32,20 @@ fn the_bootstrap_secret_is_cleared_once_the_handshake_is_accepted() {
     shellpkg::the_powershell_bootstrap_secret_is_cleared_once_the_handshake_is_accepted();
 }
 
+/// KR-REQ-07.40: the decoded secret is one byte array, and the clear reaches it.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_decoded_secret_is_one_byte_array_that_is_cleared() {
+    shellpkg::the_powershell_secret_is_decoded_into_one_byte_array_that_is_cleared();
+}
+
+/// KR-REQ-07.37: an answer the bridge cannot decode leaves it unregistered.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_error_in_the_handshake_leaves_the_bridge_unregistered() {
+    shellpkg::an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered();
+}
+
 /// KR-REQ-07.37, KR-REQ-07.85
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

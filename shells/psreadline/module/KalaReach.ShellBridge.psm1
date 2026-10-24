@@ -435,9 +435,10 @@ function Initialize-KalaReachBridge {
     $script:Kr.Secret = $secretBytes
     $script:Kr.Endpoint = $endpoint
     # Whatever stops the exchange before the handshake is accepted, an error or the person's
-    # interrupt included, must not leave the secret in the module for the life of the process, so
-    # it is cleared on the way out of anything that is not an acceptance. A `finally` changes
-    # nothing else: an error that the caller's preference lets continue goes on as it did.
+    # interrupt included, must leave neither the secret in the module for the life of the process
+    # nor a connection the worker did not accept, so both go on the way out of anything that is not
+    # an acceptance. An error that the caller's preference lets continue runs the statements after
+    # the `try`, which is why they check that the exchange was accepted before they act on it.
     $accepted = $false
     try {
         $script:Kr.Identity = Get-KrProcessIdentity
@@ -451,17 +452,19 @@ function Initialize-KalaReachBridge {
         try { $proof = $mac.ComputeHash($transcript) } finally { $mac.Dispose() }
 
         if (-not (Send-KrFrame @{ hello = (New-KrHello $script:Kr.Identity $proof $script:Kr.Package) })) {
-            Disconnect-KrEndpoint
             return
         }
         if (-not (Wait-KrHandshake)) {
-            Disconnect-KrEndpoint
             return
         }
         $accepted = $true
     } finally {
-        if (-not $accepted) { Clear-KrSecret }
+        if (-not $accepted) {
+            Disconnect-KrEndpoint
+            Clear-KrSecret
+        }
     }
+    if (-not $accepted) { return }
     $script:Kr.Registered = $true
     $script:Kr.Managed = $true
     Write-KrTrace 'registered'
