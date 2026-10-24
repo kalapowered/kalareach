@@ -475,13 +475,13 @@ fn bundled_package(name: &str) -> PathBuf {
 /// daemon opens the catalogue. Returns the directory the generation is published in, which has to
 /// stay while the daemon runs.
 ///
-/// The capabilities granted are the ones the manifest asks for but a native bridge's: that one
-/// writes into the person's own agent directory, and nothing here may.
+/// Every capability the manifest asks for is granted, as the install requires. A native bridge's is
+/// among them, and on Windows the host applies no bridge, so nothing is written into the person's
+/// own agent directory.
 async fn install_package(
     prepared: &Prepared,
     directory: &Path,
     repository: &str,
-    withheld: &[PluginCapability],
 ) -> tempfile::TempDir {
     let environment = prepared.tree.environment();
     let environment_id = environment.environment_id();
@@ -505,7 +505,6 @@ async fn install_package(
         .map(|entry| {
             serde_json::from_value(entry["capability"].clone()).expect("a known capability")
         })
-        .filter(|capability| !withheld.contains(capability))
         .collect();
 
     let generation_home = tempfile::tempdir().expect("a directory on the internal disk");
@@ -596,16 +595,10 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     );
 
     let prepared = Prepared::new();
-    let withheld = [PluginCapability::NativeBridgeInstall];
-    let _claude_published = install_package(
-        &prepared,
-        &bundled_package("claude-code"),
-        "claude",
-        &withheld,
-    )
-    .await;
+    let _claude_published =
+        install_package(&prepared, &bundled_package("claude-code"), "claude").await;
     let _qoder_published =
-        install_package(&prepared, &bundled_package("qoder-cli"), "qoder", &withheld).await;
+        install_package(&prepared, &bundled_package("qoder-cli"), "qoder").await;
     let managed = Managed::start(prepared).await;
     managed.install_entries().await;
     for plugin in ["kalareach/claude-code", "kalareach/qoder-cli"] {
@@ -803,7 +796,7 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     let prepared = Prepared::new();
     let package = tempfile::tempdir().expect("a directory on the internal disk");
     let directory = component_package(package.path(), &component);
-    let _published = install_package(&prepared, &directory, "development", &[]).await;
+    let _published = install_package(&prepared, &directory, "development").await;
     let managed = Managed::start(prepared).await;
     managed.install_entries().await;
     let enabled = managed
