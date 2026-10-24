@@ -1728,12 +1728,16 @@ fn a_slow_component_spends_its_call_and_still_answers() {
 
 // A document the caller never received leaves a stale view, and the answer is the one a lost
 // observation gets: the component draws again.
+//
+// The runtime's epoch is held: a snapshot call is stopped by its elapsed deadline, so a machine
+// that keeps the thread making the call off the CPU for that long faults the component, which says
+// nothing about whether it is asked to draw again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    let host = host();
+    let host = held_host();
     let (events, mut received) = events();
     let handle = host
         .runtime
