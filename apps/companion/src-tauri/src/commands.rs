@@ -338,7 +338,10 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         "push_enable",
         &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
     ),
-    ("push_previews", &[Method::DevicePushRegister]),
+    (
+        "push_previews",
+        &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
+    ),
     (
         "push_refresh",
         &[Method::DevicePushRegister, Method::DevicePreviewKeyUpdate],
