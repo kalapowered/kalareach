@@ -4966,17 +4966,30 @@ fn an_installation_holding_every_package_still_resolves_each_of_them() {
             package.kind.as_str(),
             executable.display()
         );
-        // Every path a package records is its own, so the one the host would launch is inside the
-        // package it came from rather than in somebody else's installation.
         let directory = shellpkg::package_root()
             .join(package.kind.as_str())
             .join(&package.identity);
-        assert!(
-            executable.starts_with(&directory),
-            "the {} package would launch {}, which is outside {}",
-            package.kind.as_str(),
-            executable.display(),
-            directory.display()
-        );
+        if package.kind == ShellKind::PowerShell {
+            // This package builds no shell: it names the PowerShell it qualified, by an absolute
+            // path to a `pwsh`, and every other path it records is its own.
+            assert!(
+                executable.is_absolute()
+                    && executable
+                        .file_stem()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("pwsh")),
+                "the powershell package would launch {}, which is not an absolute path to pwsh",
+                executable.display()
+            );
+        } else {
+            // Every path a package records is its own, so the one the host would launch is inside
+            // the package it came from rather than in somebody else's installation.
+            assert!(
+                executable.starts_with(&directory),
+                "the {} package would launch {}, which is outside {}",
+                package.kind.as_str(),
+                executable.display(),
+                directory.display()
+            );
+        }
     }
 }
