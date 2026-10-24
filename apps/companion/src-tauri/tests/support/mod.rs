@@ -158,6 +158,23 @@ pub fn owner_device_with(
     device
 }
 
+/// The host's owner device, whose connections to the host `control` governs.
+pub fn owner_device_governed(
+    host: &Host,
+    owner_keys: &DeviceKeys,
+    data: &std::path::Path,
+    control: &Arc<LinkControl>,
+) -> Arc<Device> {
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    store_device_keys(&*secrets, "device", owner_keys).expect("the owner's keys are kept");
+    let mut governed = parts(secrets, Arc::new(host.room.clone()));
+    govern(&mut governed, control);
+    let device = Device::with(data, governed, || {}).expect("the device opens");
+    device.start();
+    record_owned(&device, host, "the test host");
+    device
+}
+
 /// Records `host`, which was started with this computer's keys as its owner, as a host this
 /// computer owns, named `name`.
 pub fn record_owned(device: &Device, host: &Host, name: &str) {
@@ -984,6 +1001,10 @@ pub struct LinkControl {
     /// How many connections to a paired host were asked for.
     asked: std::sync::atomic::AtomicUsize,
     state: Mutex<LinkState>,
+    /// Told each time a connection has presented its lease.
+    presentations: tokio::sync::Notify,
+    /// Told when the connections held after their presentation are let go.
+    released: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -997,6 +1018,13 @@ struct LinkState {
     /// at once does.
     ending: bool,
     refusing: Option<kr_protocol::error::ErrorCode>,
+    /// Whether a connection to a host whose grant answers to an organisation is held the moment its
+    /// lease has been presented, before anything else is done on it.
+    holding_presented: bool,
+    /// How many connections to such a host have presented their lease.
+    presented: usize,
+    /// What every presentation fails with, when it does.
+    failing_presentation: Option<kr_protocol::error::ProtocolError>,
     waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The host in use each visit was made beside, in the order the visits were asked for.
     visits: Vec<Option<kr_protocol::pairing::NetworkConfig>>,
@@ -1090,6 +1118,62 @@ impl LinkControl {
     /// Makes the host refuse every connection at admission with `code`, or stops that.
     pub fn refuse(&self, code: Option<kr_protocol::error::ErrorCode>) {
         self.state.lock().expect("the record").refusing = code;
+    }
+
+    /// Holds each connection to a host whose grant answers to an organisation, from now on, the
+    /// moment its lease has been presented and before anything else is done on it, until the test
+    /// releases them.
+    pub fn hold_after_presenting(&self) {
+        self.state.lock().expect("the record").holding_presented = true;
+    }
+
+    /// Lets the connections held after their presentation go on.
+    pub fn release_presented(&self) {
+        self.state.lock().expect("the record").holding_presented = false;
+        self.released.notify_waiters();
+    }
+
+    /// How many connections to a host whose grant answers to an organisation have presented a lease.
+    pub fn presented(&self) -> usize {
+        self.state.lock().expect("the record").presented
+    }
+
+    /// Waits until `count` presentations in all have been made.
+    pub async fn until_presented(&self, count: usize) {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let arrived = self.presentations.notified();
+                tokio::pin!(arrived);
+                arrived.as_mut().enable();
+                if self.presented() >= count {
+                    return;
+                }
+                arrived.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} presentations were made, not {count}", self.presented()));
+    }
+
+    /// Makes every presentation of a lease fail, on every connection to any host, as a device that
+    /// cannot get its lease does, with `error`, or stops that.
+    pub fn fail_presentation(&self, error: Option<kr_protocol::error::ProtocolError>) {
+        self.state.lock().expect("the record").failing_presentation = error;
+    }
+
+    /// Counts a presentation, and waits while the test holds the connections that made one.
+    async fn after_presenting(&self) {
+        self.state.lock().expect("the record").presented += 1;
+        self.presentations.notify_waiters();
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.state.lock().expect("the record").holding_presented {
+                return;
+            }
+            released.await;
+        }
     }
 }
 
@@ -1225,7 +1309,23 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         host: &'a kr_client::pairing::paired::PairedHost,
         identity: &'a kr_transport::handshake::LocalIdentity,
     ) -> kr_client::pairing::BoxFuture<'a, Result<(), kr_client::pairing::link::LinkError>> {
-        self.own.present_membership(session, host, identity)
+        Box::pin(async move {
+            let failing = self
+                .control
+                .state
+                .lock()
+                .expect("the record")
+                .failing_presentation
+                .clone();
+            if let Some(error) = failing {
+                return Err(kr_client::pairing::link::LinkError::Membership(error));
+            }
+            self.own.present_membership(session, host, identity).await?;
+            if host.proposed_grant.organisation.as_ref().is_some() {
+                self.control.after_presenting().await;
+            }
+            Ok(())
+        })
     }
 
     fn hold<'a>(
