@@ -656,6 +656,15 @@ pub struct Session {
     _directory: tempfile::TempDir,
 }
 
+/// What the worker answers the bridge's opening frame with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandshakeAnswer {
+    /// The worker's own decision, which accepts the package under test.
+    Accept,
+    /// A frame whose body is not a value of the contract at all, which the bridge cannot decode.
+    NotDecodable,
+}
+
 impl Session {
     /// Starts the packaged shell and completes the handshake.
     ///
@@ -741,7 +750,34 @@ impl Session {
         gesture: kr_shell_integration::contract::events::EofGesture,
         profile: Profile<'_>,
     ) -> Self {
-        Self::start_as(package, environment, gesture, profile, true)
+        Self::start_as(
+            package,
+            environment,
+            gesture,
+            profile,
+            true,
+            HandshakeAnswer::Accept,
+        )
+    }
+
+    /// Starts the packaged shell and answers its opening frame with one the bridge cannot decode.
+    ///
+    /// The shell is the person's own shell afterwards, with no worker behind it: what a case
+    /// reads from this session is what the bridge made of the answer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not connect or opens with anything but a hello.
+    #[must_use]
+    pub fn start_answered_with_a_frame_that_does_not_decode(package: &Package) -> Self {
+        Self::start_as(
+            package,
+            &[],
+            kr_shell_integration::contract::events::EofGesture::default(),
+            Profile::ORDINARY,
+            true,
+            HandshakeAnswer::NotDecodable,
+        )
     }
 
     /// Starts the packaged shell as an ordinary shell of a person's: the same binary, the same
@@ -766,6 +802,7 @@ impl Session {
             kr_shell_integration::contract::events::EofGesture::default(),
             profile,
             false,
+            HandshakeAnswer::Accept,
         )
     }
 
@@ -775,6 +812,7 @@ impl Session {
         gesture: kr_shell_integration::contract::events::EofGesture,
         profile: Profile<'_>,
         managed: bool,
+        answer: HandshakeAnswer,
     ) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("kr-shell-")
@@ -980,6 +1018,22 @@ impl Session {
             "the proof this package's bridge computed is not the worker's HMAC-SHA-256 of the same \
              transcript"
         );
+
+        if answer == HandshakeAnswer::NotDecodable {
+            // A length that a frame may have and a body that is no value of the contract.
+            let body = [0xff_u8; 3];
+            let mut bytes = u32::try_from(body.len())
+                .expect("a short body")
+                .to_be_bytes()
+                .to_vec();
+            bytes.extend_from_slice(&body);
+            session
+                .stream
+                .write_all(&bytes)
+                .expect("the bridge takes the frame");
+            session.hello = hello;
+            return session;
+        }
 
         let expectation = WorkerExpectation {
             session_id: session.session_id,

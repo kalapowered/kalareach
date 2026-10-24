@@ -204,7 +204,9 @@ function ConvertFrom-KrBase64Url {
         3 { $padded += '=' }
         1 { return $null }
     }
-    try { [Convert]::FromBase64String($padded) } catch { $null }
+    # The comma keeps the array whole: a bare array in the output is enumerated, and the caller
+    # would hold boxed copies of the bytes with the decoded buffer left behind, out of reach of a clear.
+    try { , [Convert]::FromBase64String($padded) } catch { $null }
 }
 
 function ConvertFrom-KrUuidText {
