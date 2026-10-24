@@ -1621,7 +1621,7 @@ async fn a_devices_close_waiting_for_the_workers_link_is_refused_once_a_feed_ref
             async {
                 arrived.await.expect("the close reaches the worker's door");
                 if refused {
-                    controller.authority_feed_withdrawal_unverified(true).await;
+                    controller.raise_the_unverified_withdrawal_refusal().await;
                 }
                 go.send(()).expect("the close is waiting");
             }
@@ -1692,7 +1692,7 @@ async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refu
         let (answer, ()) = tokio::join!(connection.read(&read), async {
             arrived.await.expect("the read reaches the worker's door");
             if refused {
-                controller.authority_feed_withdrawal_unverified(true).await;
+                controller.raise_the_unverified_withdrawal_refusal().await;
             }
             go.send(()).expect("the read is waiting");
         });
