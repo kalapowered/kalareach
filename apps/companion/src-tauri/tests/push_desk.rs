@@ -3351,3 +3351,34 @@ async fn a_page_callback_that_fails_in_the_look_does_not_leave_a_host_working_wi
         "each host registered the token the provider holds"
     );
 }
+
+/// A host this phone is no longer paired with when the application starts keeps nothing in the
+/// record: the start writes the record without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_drops_what_the_record_kept_of_a_host_no_longer_paired() {
+    let (_host, phone, _reference) = a_phone_with_notifications_on().await;
+    let paired = phone
+        .device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .remove(0);
+    phone
+        .device
+        .forget_host(paired.host_device_id)
+        .expect("the pairing is forgotten");
+    let file = find(phone._phone.data.path(), "push.json").expect("the record");
+    let kept: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("json");
+    assert_eq!(kept["hosts"].as_object().expect("hosts").len(), 1);
+
+    drop(reopened(&phone));
+
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(&file).expect("the record")).expect("json");
+    assert!(
+        written["hosts"].as_object().expect("hosts").is_empty(),
+        "{written}"
+    );
+}

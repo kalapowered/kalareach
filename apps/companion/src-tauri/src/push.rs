@@ -596,8 +596,24 @@ impl PushDesk {
             })?;
         let file = data.join(DIRECTORY).join(RECORD);
         let now = (wiring.clock)();
+        let mut pruned = false;
         let (record, write_blocked, lost) = match read_record(&file) {
-            Loaded::Record(record) => (after_a_restart(record, now), false, false),
+            Loaded::Record(record) => {
+                let mut record = after_a_restart(record, now);
+                // A host this phone stopped being paired with while the application was not
+                // running, or whose forgetting did not reach the record, keeps nothing here. A list
+                // that cannot be read is not an empty one, and prunes nothing.
+                if let Ok(hosts) = device.pairing().hosts.list() {
+                    let paired: BTreeSet<String> = hosts
+                        .iter()
+                        .map(|host| host.host_device_id.to_string())
+                        .collect();
+                    let before = record.hosts.len();
+                    record.hosts.retain(|host, _| paired.contains(host));
+                    pruned = record.hosts.len() != before;
+                }
+                (record, false, false)
+            }
             loss => {
                 // What the record said of each host is gone, and the hosts paired now are marked.
                 // The paired hosts are read first: a list that cannot be read is not an empty one,
@@ -654,8 +670,9 @@ impl PushDesk {
             changed: Box::new(changed),
             write_blocked,
         });
-        if lost {
-            // The marks that say which hosts were lost are kept, so that they outlast this start.
+        if lost || pruned {
+            // The marks that say which hosts were lost are kept, so that they outlast this start,
+            // and so is the record without the hosts that are no longer paired.
             let state = lock(&desk.state);
             desk.keep(&state.record);
         }
