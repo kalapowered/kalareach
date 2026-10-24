@@ -60,6 +60,20 @@ pub struct PairedHost {
     pub name: Option<String>,
     /// When the pairing committed, in UTC milliseconds.
     pub paired_at_ms: u64,
+    /// The revision of this device's own keys that the host holds, which a connection offers: the
+    /// host refuses a device that offers another. It is 1 from the pairing and moves forward only,
+    /// when the host takes a higher revision of this device's preview key. A record at 1 leaves it
+    /// out, so the file is what a device wrote before the revision was kept.
+    #[serde(default = "first_revision", skip_serializing_if = "is_first_revision")]
+    pub device_key_revision: DeviceKeyRevision,
+}
+
+fn first_revision() -> DeviceKeyRevision {
+    DeviceKeyRevision::new(1)
+}
+
+fn is_first_revision(revision: &DeviceKeyRevision) -> bool {
+    *revision == first_revision()
 }
 
 crate::debug_fields!(PairedHost {
@@ -67,7 +81,8 @@ crate::debug_fields!(PairedHost {
     host_key_revision,
     device_id,
     grant_id,
-    paired_at_ms
+    paired_at_ms,
+    device_key_revision
 });
 
 impl PairedHost {
@@ -269,6 +284,34 @@ impl PairedHosts {
         self.write_hosts(hosts)
     }
 
+    /// Records that the host holds `revision` of this device's keys, for the pairing that gave this
+    /// device `device_id` on `host_device_id`. The revision moves forward only: one that is not
+    /// higher than the record's changes nothing, and a pairing that is another's is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FailureKind::StoreFailed`] when the records cannot be read or written.
+    pub fn raise_revision(
+        &self,
+        host_device_id: DeviceId,
+        device_id: DeviceId,
+        revision: DeviceKeyRevision,
+    ) -> Result<(), PairingFailure> {
+        let _writing = self.lock();
+        let mut hosts = self.list()?;
+        let Some(host) = hosts
+            .iter_mut()
+            .find(|host| host.host_device_id == host_device_id && host.device_id == device_id)
+        else {
+            return Ok(());
+        };
+        if revision <= host.device_key_revision {
+            return Ok(());
+        }
+        host.device_key_revision = revision;
+        self.write_hosts(hosts)
+    }
+
     /// Forgets a paired host.
     ///
     /// # Errors
@@ -465,6 +508,7 @@ mod tests {
             proposed_grant: grant(actions),
             name: Some("r on macos".to_owned()),
             paired_at_ms: 1_764_000_000_000,
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
         }
     }
 
@@ -498,6 +542,46 @@ mod tests {
         renamed.name = Some("studio".to_owned());
         reopened.record(renamed.clone()).expect("recorded");
         assert_eq!(reopened.list().expect("readable"), vec![viewer, renamed]);
+    }
+
+    /// The revision of this device's keys the host holds moves forward only, for the pairing it
+    /// names, and a record at the first revision is the file an earlier build wrote.
+    #[test]
+    fn the_revision_the_host_holds_moves_forward_only_for_its_own_pairing() {
+        let directory = tempfile::tempdir().expect("a directory on the internal disk");
+        let store = PairedHosts::open(directory.path().join("pairing")).expect("a store");
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        let first = std::fs::read(store.directory().join(HOSTS_FILE)).expect("the file");
+        assert!(
+            !String::from_utf8_lossy(&first).contains("device_key_revision"),
+            "a record at the first revision leaves it out"
+        );
+        let held = |store: &PairedHosts| {
+            store
+                .by_device(paired.host_device_id)
+                .expect("readable")
+                .expect("the host")
+                .device_key_revision
+                .get()
+        };
+        let revision = DeviceKeyRevision::new;
+
+        store
+            .raise_revision(paired.host_device_id, paired.device_id, revision(3))
+            .expect("raised");
+        assert_eq!(held(&store), 3);
+        store
+            .raise_revision(paired.host_device_id, paired.device_id, revision(2))
+            .expect("a lower revision changes nothing");
+        assert_eq!(held(&store), 3);
+        let another = DeviceId::new(Uuid::from_bytes([9; 16]));
+        store
+            .raise_revision(paired.host_device_id, another, revision(5))
+            .expect("another pairing is left alone");
+        assert_eq!(held(&store), 3);
+        let reopened = PairedHosts::open(directory.path().join("pairing")).expect("a store");
+        assert_eq!(held(&reopened), 3, "it is kept");
     }
 
     /// Records that cannot be read are an error, never an empty list.

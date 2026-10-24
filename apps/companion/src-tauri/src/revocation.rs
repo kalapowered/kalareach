@@ -1526,7 +1526,7 @@ async fn visit(
         Host::Paired(paired) => {
             let listing = async {
                 let pairing = device.pairing();
-                let identity = pairing.candidate.paired_identity(paired.device_id);
+                let identity = pairing.paired_identity_for(&paired);
                 let connected = async {
                     match pairing.link.connect_paired(paired, &identity).await {
                         Ok(session) => listed(&Arc::new(session)).await,
