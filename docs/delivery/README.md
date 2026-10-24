@@ -162,13 +162,24 @@ delegate, and the legs there call the delegate method themselves.
 
 The companion's core waits by reading the record each half second. That is a read of a local file
 and sends nothing. When the record says `answered` it checks that the phone is still paired with the
-host the person chose, asks the gateway for `push.sender.issue` under the authorisation identifier
-the phone keeps for that host (a new one the first time), and hands the credential to the host with
-`device.push.register` and the preview key with `device.preview_key.update`. The credential lives in
-memory between the two calls and is never kept. The preview key's seed goes to a store that a
-receiver reads and nothing else is put in: on Android a directory of its own beside the secure
-store, which separates files and not processes, and on iOS the shared keychain group the extension
-reads.
+host the person chose, files the preview keys the receivers hold, connects to the host, asks the
+gateway for `push.sender.issue` under the authorisation identifier the phone keeps for that host (a
+new one the first time), and hands the credential to the host with `device.push.register` and the
+preview key with `device.preview_key.update`. The host is reached before the gateway issues, because
+an issue replaces the credential the host holds at once: a host that cannot be reached keeps the
+one it has. The credential lives in memory between the issue and the registration and is never kept.
+`device.push.register` carries whether the person wants previews, which is a choice made for each
+host. A host told that it is off seals no preview and names no recipient key in its notifications.
+Changing the choice for a host that is on repeats the connection, the issue and the registration,
+under the same authorisation identifier and with no new token proposal and no challenge.
+
+The receivers read the keys that open a preview from a store that nothing else is put in: this
+phone's preview seed, and the preview public key of each paired host whose previews are on. The
+application replaces the whole set each time it changes, so a host whose previews are off or that
+the person forgot is out of it, and the seed is in it only while a host that may use it is. On
+Android the store is one sealed item in a directory of its own beside the secure store, which
+separates files and not processes, and on iOS it is items in the shared keychain group the
+extension reads.
 
 Every step can be repeated. A lost answer, a restart or a changed token is mended by starting again
 from the proposal or the issue under a new action. Issuing again under the same record identifier
@@ -189,14 +200,23 @@ registrations for several hosts go one at a time. A provider makes its registrat
 after the person agrees, and the phone waits up to twenty seconds for it before it stops and says
 so.
 
-The phone shows the host's generic alert and nothing more. A sealed preview is delivered and left
-unopened, and the key is filed so that an opener added later needs no new registration. Android
-receives a data message, which the gateway sends at high priority for every push because a
-normal-priority one waits for an application that is not in front, and shows the notification
-itself, under the identifier the host gave it and with a tap that opens the attention screen. On
-iOS the system shows the alert, and a tap is routed by the notification delegate, which is set
-before the launch ends. The notification service extension is installed with the application and
-has nothing to open until a preview opener exists.
+Each receiver opens a sealed preview with one Rust function (`companion-preview`), which Android
+reaches through JNI and the iOS extension links as a static library of its own. It is given the
+envelope as the gateway sent it, this phone's preview seed, the sending host's public key and the
+generic alert the message is shown with. It opens the envelope only if the routing outside it
+matches what the seal authenticated, the two key identifiers inside it name the keys that opened
+it, it has not expired, and the alert it repeats is the one shown. It answers the text to show or the
+name of the check that refused, never anything the preview held. The generic alert stands for a
+preview that does not open, for one from a host this phone holds no key for (`sender_unknown`), for
+one sealed to a key this phone does not hold, for one read before the first unlock, and for one that
+opens to no text (`empty_preview`). The seal holds text only for the sentences the host raises
+itself; what a session said is not in it, so a session's question opens to nothing and keeps the
+generic alert. Android receives a data message, which the gateway sends at high priority for every
+push because a normal-priority one waits for an application that is not in front, and shows the
+notification itself, under the identifier the host gave it and with a tap that opens the attention
+screen. On iOS the system shows the alert, the notification service extension replaces its body when
+a preview opens, and a tap is routed by the notification delegate, which is set before the launch
+ends.
 
 ### What neither question shows
 

@@ -279,32 +279,45 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 The iOS Notification Service Extension and the Android messaging service are started by the system,
 with no application and no JavaScript context anywhere. Each makes one decision, which has its own
 tests; neither is connected to a registration with the gateway. A push message carries only strings,
-so the iOS extension reads the sealed preview as the JSON text the gateway puts under `preview`. On
-Android, the receiver reads from keys which are not sent by the gateway, so it always shows the
-generic alert. Both make the same decision in the same order.
+so both read the sealed preview as the JSON text the gateway puts under `preview`. Both make the same
+decision in the same order.
 
-On iOS the extension shows the generic alert the payload carried. On Android the receiver shows it
-where the payload alone decides the content; work it hands to the scheduler finishes without
-publishing anything, so a deferred message shows nothing at all. The decision itself, in both
-places, is:
+On iOS the extension shows the generic alert the payload carried unless a preview was opened. On
+Android the receiver shows it where the payload alone decides the content; work it hands to the
+scheduler finishes without publishing anything, so a deferred message shows nothing at all. The
+decision itself, in both places, is:
 
 1. A message with no preview shows the generic alert the host chose.
 2. A preview this build cannot read, or one whose lifetime has run out, or one addressed to a key
    this device does not hold, shows the generic alert, and none of them touches the keychain.
-3. A device that has not been unlocked since it started shows the generic alert.
-4. A preview that does not decrypt shows the generic alert.
-5. Only a key that opened a live envelope addressed to this device replaces the alert.
+3. A device that has not been unlocked since it started shows the generic alert, whichever of the
+   two keys it was reading.
+4. A preview from a host this device holds no key for shows the generic alert (`sender_unknown`).
+5. A preview that does not open shows the generic alert. It opens only if its routing matches what
+   the seal authenticated, its two key identifiers name the keys that opened it, it has not
+   expired, and the alert it repeats is the one the message is shown with.
+6. A preview that opens to no text shows the generic alert (`empty_preview`).
+7. Only text from a live envelope that this device's seed opened, sealed by a host this device holds
+   a key for, replaces the alert.
 
-The key is a limited preview key and nothing else. On iOS it is in a Keychain access group the
-extension is entitled to; the device authorisation key is in this application's own group, which is
-listed first so that a write naming no group cannot land in the shared one. Both groups carry the
-team prefix the build resolves, and a build that states none refuses to read or write rather than
-searching its own default group. On Android the key is wrapped by the hardware-backed keystore.
-Nothing here can decrypt: the sealing construction belongs to the shared client library and neither
-the extension nor the worker links it, so every preview falls back to the generic alert, which is
-the specified behaviour for a preview that cannot be opened. Neither the extension nor the
-background worker can sign anything; signing needs the application's own authentication, and they
-have none.
+The receivers hold the keys that open a preview and nothing else: this device's preview seed, under
+the identifier of its public half, and the public key of each paired host whose previews are on,
+under the identifier its previews name it by. The application hands them over as one set, with the
+`pushPreviewKeys` command, whenever the record or the paired hosts change, and the store is made
+equal to the set: a host whose previews are turned off or that the person forgot is out of it, and
+the seed stays only while a host that may use it does. On iOS they are Keychain items in the access
+group the extension is entitled to, readable after the first unlock; the device authorisation key is
+in this application's own group, which is listed first so that a write naming no group cannot land
+in the shared one. Both groups carry the team prefix the build resolves, and a build that states
+none refuses to read or write rather than searching its own default group. On Android the set is one
+item in a directory of its own, wrapped by the hardware-backed keystore.
+
+The opening is one Rust function, `companion-preview`, so a sealed preview is read in one place. On
+Android the application's library carries it and the receiver calls it through JNI. On iOS the
+extension links it as a static library of its own, built for the extension's platform by a build
+phase, so the extension carries that function and what it depends on and not the application's
+archive. Neither receiver nor the background worker can sign anything; signing needs the
+application's own authentication, and they have none.
 
 Android hands work on rather than attempting it: anything that needs the host, or that would run
 past the message callback's budget, goes to the platform's scheduler, which runs it when the device
