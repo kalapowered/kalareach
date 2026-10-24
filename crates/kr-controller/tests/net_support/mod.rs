@@ -221,6 +221,64 @@ impl MovedWall {
     }
 }
 
+/// A wall clock and a continuous clock a suite moves by hand together, each the machine's own and
+/// the time added to it, as a machine that slept past the end of a grant reads them.
+#[derive(Clone, Debug, Default)]
+pub struct MovedClocks {
+    wall_ms: Arc<std::sync::atomic::AtomicU64>,
+    continuous_ns: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The machine's continuous clock, taken forward by what a suite adds to it.
+#[derive(Debug)]
+struct ContinuousAhead {
+    machine: kr_transport::clock::SystemContinuousClock,
+    ahead_ns: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl kr_transport::clock::ContinuousClock for ContinuousAhead {
+    fn now(&self) -> kr_transport::clock::ContinuousInstant {
+        let now = self.machine.now();
+        let ahead = Duration::from_nanos(self.ahead_ns.load(std::sync::atomic::Ordering::Acquire));
+        now.checked_add(ahead).unwrap_or(now)
+    }
+}
+
+impl MovedClocks {
+    /// Clocks that read the machine's own until they are moved.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Moves both clocks `by` forward.
+    pub fn advance(&self, by: Duration) {
+        self.wall_ms.fetch_add(
+            u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.continuous_ns.fetch_add(
+            u64::try_from(by.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// The daemon's clocks.
+    #[must_use]
+    pub fn clocks(&self) -> Clocks {
+        let wall_ms = Arc::clone(&self.wall_ms);
+        Clocks {
+            continuous: Arc::new(ContinuousAhead {
+                machine: kr_transport::clock::SystemContinuousClock::new(),
+                ahead_ns: Arc::clone(&self.continuous_ns),
+            }),
+            wall: WallClock::from_fn(move || {
+                kr_ipc::now_ms().get() + wall_ms.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+        }
+    }
+}
+
 /// What a suite hands a daemon besides its network settings.
 #[derive(Clone, Default)]
 pub struct Waits {
