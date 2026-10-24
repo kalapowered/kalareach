@@ -41,6 +41,7 @@
 //! | KR-REQ-17.53 | `a_connection_that_ends_under_a_refresh_does_not_stop_the_next_from_presenting_the_lease_the_device_holds` |
 //! | KR-REQ-17.53 | `a_request_given_up_on_holds_back_the_chain_request_of_a_presentation_already_under_way` |
 //! | KR-REQ-17.53 | `an_owner_that_cannot_get_its_lease_is_shown_why_and_is_not_out_of_contact` |
+//! | KR-REQ-17.53 | `a_push_run_sends_its_changes_only_under_the_account_its_connection_was_opened_under` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -1740,6 +1741,40 @@ async fn an_owner_that_cannot_get_its_lease_is_shown_why_and_is_not_out_of_conta
             .is_some_and(|words| words.contains("sign in to your account")),
         "{row}"
     );
+}
+
+/// KR-REQ-17.53: a run of the push desk changes nothing on a member's host once the account its
+/// connection was opened under has left. The registration comes back, another account signs in, and
+/// the preview key is not sent: the host would take it under the lease of the account that left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_run_sends_its_changes_only_under_the_account_its_connection_was_opened_under() {
+    use companion_tauri::push::{ConnectionRegistrar, Reach, Registrar as _};
+
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let device = rig.companion().device();
+    let host = device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .into_iter()
+        .find(|host| host.proposed_grant.organisation.as_ref().is_some())
+        .expect("the member host");
+    let registrar = ConnectionRegistrar(Arc::clone(&device));
+    let mut line = registrar
+        .connect(&host, Reach::Visit)
+        .await
+        .expect("a line to the host");
+
+    rig.signs_in_as("bea").await;
+    let key = *device.identity().keys.notification_preview.public();
+    let refused = line
+        .update_preview_key(key)
+        .await
+        .expect_err("the key is not sent for an account that has left");
+    assert!(refused.contains("changed"), "{refused}");
 }
 
 /// The host answers what it is, to a connection that holds a lease.
