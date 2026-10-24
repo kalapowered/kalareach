@@ -71,8 +71,6 @@ struct ReceiverState {
     /// one the platform gave when it was asked, and reaches the asker when the test lets it.
     permission_held: BTreeSet<usize>,
     permission_released: BTreeSet<usize>,
-    /// How many reads of the permission have answered.
-    permission_answered: usize,
     /// The reads of the token, by their number, that wait to be released in the same way.
     token_held: BTreeSet<usize>,
     token_released: BTreeSet<usize>,
@@ -107,7 +105,6 @@ impl Receiver {
                 permission_panics: false,
                 permission_held: BTreeSet::new(),
                 permission_released: BTreeSet::new(),
-                permission_answered: 0,
                 token_held: BTreeSet::new(),
                 token_released: BTreeSet::new(),
                 token_reads: 0,
@@ -153,11 +150,10 @@ impl Native for Receiver {
             // The answer is the one the platform had when it was asked, whenever it arrives.
             loop {
                 {
-                    let mut state = self.state.lock().expect("the receiver");
+                    let state = self.state.lock().expect("the receiver");
                     if !state.permission_held.contains(&number)
                         || state.permission_released.contains(&number)
                     {
-                        state.permission_answered += 1;
                         break;
                     }
                 }
@@ -1296,22 +1292,18 @@ async fn the_run_of_a_forgotten_host_does_not_use_the_consent_of_the_run_that_re
     })
     .await;
 
-    // The first run's answer arrives first, and is let finish before the second run's does.
+    // The first run's answer arrives first. A run holds the desk for as long as its task lives, so
+    // the count of those who hold it falls when the first run has ended; only then is the second
+    // run's answer let go, so that the second run cannot take the consent before the first run
+    // has had its say.
+    let holders = Arc::strong_count(&phone.desk);
     phone.receiver.with(|state| {
         state.permission_released.insert(1);
     });
-    eventually("the first run's answer reached it", || {
-        phone
-            .receiver
-            .state
-            .lock()
-            .expect("the receiver")
-            .permission_answered
-            >= 1
+    eventually("the first run ended", || {
+        Arc::strong_count(&phone.desk) < holders
     })
     .await;
-    // The second run's answer is let go next. It notices that at its next look at the gate, which
-    // is later than the first run needs to take what it takes, a few steps with nothing awaited.
     phone.receiver.with(|state| {
         state.permission_released.insert(2);
     });
