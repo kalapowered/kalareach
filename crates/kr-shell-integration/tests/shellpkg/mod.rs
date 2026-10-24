@@ -2,9 +2,10 @@
 //!
 //! Each test here is the worker's side of one session: it creates the owner-only endpoint, starts
 //! the packaged shell under a pseudo-terminal with the two bootstrap variables, answers the
-//! handshake with `decide_handshake`, and then asks the reader the three questions the contract
-//! puts to it. The expectations come from the committed scenarios under `fixtures/shell-bridge/`,
-//! so a package and the worker are checked against one corpus rather than against each other.
+//! handshake with `handshake::admit_observed`, and then asks the reader the three questions the
+//! contract puts to it. The expectations come from the committed scenarios under
+//! `fixtures/shell-bridge/`, so a package and the worker are checked against one corpus rather than
+//! against each other.
 //!
 //! Nothing a launched process touches is inside the workspace: the shell's executable is the
 //! installed package, and its home directory, its runtime directory and its endpoint are all on
@@ -21,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, KeyInit, Mac};
+use kr_crypto::secret::SymmetricKey;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, RequestId, SessionId};
@@ -37,10 +38,9 @@ use kr_shell_integration::contract::qualification::{BridgeAbi, ShellKind};
 use kr_shell_integration::contract::requests::{BridgeAnswer, WorkerRequest};
 use kr_shell_integration::contract::transport::{
     BOOTSTRAP_SECRET_LEN, BRIDGE_PROTOCOL, BridgeAccepted, BridgeEndpoint, BridgeFrame,
-    BridgeHello, EventOutcome, HandshakeOutcome, ObservedPeer, ProofVerdict, WorkerExpectation,
-    bootstrap_transcript, decide_handshake, frame_codec,
+    BridgeHello, EventOutcome, HandshakeOutcome, ObservedPeer, WorkerExpectation, frame_codec,
 };
-use kr_shell_integration::host::startup;
+use kr_shell_integration::host::{handshake, startup};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// How long a reader is given to answer before a test calls it a failure.
@@ -961,22 +961,27 @@ impl Session {
             other => panic!("the bridge opened with {other:?}"),
         };
 
-        // The proof is checked here, against the transcript this contract defines, rather than
-        // taken on trust: it is what binds this shell's own process and this endpoint.
-        let transcript = bootstrap_transcript(
+        // The proof is the worker's own: the bridge's SHA-256 and HMAC-SHA-256 are written in C
+        // and the worker's are RustCrypto's, so the two tags are compared here, over the
+        // transcript this contract defines, before the handshake is decided. A package whose hash
+        // or MAC is wrong fails on this line, and not as a refusal further on.
+        let secret_key = SymmetricKey::from_bytes(
+            <[u8; BOOTSTRAP_SECRET_LEN]>::try_from(secret.as_slice())
+                .expect("the bootstrap secret has its fixed length"),
+        );
+        let workers_proof = handshake::proof_bytes(
+            &secret_key,
             session.session_id,
             &endpoint,
             &hello.shell_process,
             &hello.shell.integration_version,
         )
         .expect("the transcript encodes");
-        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&secret).expect("any key length");
-        mac.update(&transcript);
-        let verdict = if mac.verify_slice(hello.proof.as_slice()).is_ok() {
-            ProofVerdict::Verified
-        } else {
-            ProofVerdict::Failed
-        };
+        assert_eq!(
+            hello.proof, workers_proof,
+            "the proof this package's bridge computed is not the worker's HMAC-SHA-256 of the same \
+             transcript"
+        );
 
         let expectation = WorkerExpectation {
             session_id: session.session_id,
@@ -991,7 +996,9 @@ impl Session {
             uid: endpoint_owner(&endpoint_path),
             process: Some(hello.shell_process.clone()),
         };
-        let outcome = decide_handshake(&expectation, &peer, &hello, verdict);
+        let outcome =
+            handshake::admit_observed(&secret_key, &expectation, &endpoint, &peer, &hello)
+                .expect("the transcript encodes");
         let accepted = match outcome {
             HandshakeOutcome::Accepted(accepted) => accepted,
             HandshakeOutcome::Refused(refused) => {
