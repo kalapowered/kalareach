@@ -6830,7 +6830,7 @@ pub mod export {
     /// An identifier a sentence may name in full.
     ///
     /// The list is closed and every member is a type that composes what it prints: a session
-    /// identifier, an environment's, a device's, the revision of a capability record, and
+    /// identifier, an environment's, a device's, a grant's, the revision of a capability record, and
     /// [`BuildIdentity`], which is read out of a reply and stores a word from a closed set and
     /// three numbers rather than the text it was read from. A `String` is not one of them, so a
     /// sentence cannot come to name one because a caller passed something that happened to print.
@@ -6853,6 +6853,8 @@ pub mod export {
     impl HostIdentifier for crate::ids::EnvironmentId {}
     impl sealed::Generated for crate::ids::DeviceId {}
     impl HostIdentifier for crate::ids::DeviceId {}
+    impl sealed::Generated for crate::ids::GrantId {}
+    impl HostIdentifier for crate::ids::GrantId {}
     impl sealed::Generated for crate::worker::ReservationId {}
     impl HostIdentifier for crate::worker::ReservationId {}
     impl sealed::Generated for crate::ids::AuthorityRevision {}
