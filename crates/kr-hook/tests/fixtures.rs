@@ -24,8 +24,10 @@
 //! What a launch adds comes from each release's own command integration, which its manifest
 //! declares. The manifests of the three released packages are under `fixtures/plugins/released/`,
 //! copied byte for byte from the plugins repository at `bb50ebb41f7ebe4e5fb8cb388b816c849007306d`,
-//! and pinned by their SHA-256 digests, which are the package hashes an owner confirms at
-//! installation.
+//! and pinned by their SHA-256 digests. A copy pins what the release declares, which is all this
+//! suite reads from it. It is not the manifest the bundled catalogue ships: that one differs from
+//! the copy in `source.revision` alone, so it has another package hash, and the hash an owner
+//! confirms at installation is the bundled one.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -434,9 +436,10 @@ fn declared(package: &str) -> kr_plugin_sdk::integration::CommandIntegration {
     integration
 }
 
-/// Each released manifest is the package its release names: the file's SHA-256 digest is the
-/// package hash the development generation's signed index gives that release, so a change to a
-/// release's declaration is a deliberate new copy.
+/// Each released manifest is the copy it was made as: the file's SHA-256 digest pins the
+/// declaration this suite reads, so a change to a release's declaration is a deliberate new copy.
+/// The digest is not the package hash of the bundled catalogue's manifest for the same release,
+/// which differs from the copy in `source.revision`.
 #[test]
 fn the_released_manifests_are_the_pinned_packages() {
     for (package, digest) in [

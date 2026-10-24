@@ -12,9 +12,11 @@ is tested against the declarations a real release makes rather than against ones
 ## What it is
 
 Each file is the manifest byte for byte. A package's hash is the SHA-256 digest of its manifest, and
-the manifest names every other file of the package by digest, so these three files are the package
-identities an owner confirms when installing those releases. The rest of each package is not copied:
-these files pin what each release declares, not a whole package a host could install.
+the manifest names every other file of the package by digest. The rest of each package is not
+copied: these files pin what each release declares, not a whole package a host could install, and
+not the package an owner confirms at installation. The manifests the bundled catalogue ships for the
+same versions differ from these copies in `source.revision` alone, so their package hashes are
+others.
 
 `crates/kr-hook/tests/fixtures.rs` pins each file by that digest, checks that its command
 integration is one the package contract accepts, and checks that Qoder CLI's flags are the two
