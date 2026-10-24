@@ -283,9 +283,10 @@ so both read the sealed preview as the JSON text the gateway puts under `preview
 decision in the same order.
 
 On iOS the extension shows the generic alert the payload carried unless a preview was opened. On
-Android the receiver shows it where the payload alone decides the content; work it hands to the
-scheduler finishes without publishing anything, so a deferred message shows nothing at all. The
-decision itself, in both places, is:
+Android the receiver shows the notification itself where the payload alone decides the content; a
+message that needs the host, or that would run past the callback's budget, goes to the scheduler, whose
+worker makes the same decision and shows the same notification. The decision itself, in both places,
+is:
 
 1. A message with no preview shows the generic alert the host chose.
 2. A preview this build cannot read, or one whose lifetime has run out, or one addressed to a key
