@@ -1,5 +1,7 @@
 [
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (September 11, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-09-11*\n",
   "created_at": "2026-09-11T22:43:35Z",
   "labels": [
    "Security",
@@ -11,6 +13,8 @@
   "updated_at": "2026-09-23T21:26:52Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (September 11, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-09-11*\n",
   "created_at": "2026-09-11T22:42:50Z",
   "labels": [
    "Security",
@@ -22,6 +26,8 @@
   "updated_at": "2026-09-11T22:43:59Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV2.0 (September 11, 2026): Advisory re-published.\nV1.0 (July 20, 2026): Initial advisory, this affected PowerShell 7.4 where version < 7.4.18 (on Windows platform only)\n*Version 2.0*\n*Last Updated 2026-09-11*\n",
   "created_at": "2026-09-11T22:37:41Z",
   "labels": [
    "Security",
@@ -33,6 +39,8 @@
   "updated_at": "2026-09-17T09:25:34Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (September 11, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-09-11*\n",
   "created_at": "2026-09-11T22:33:26Z",
   "labels": [
    "Security",
@@ -44,6 +52,8 @@
   "updated_at": "2026-09-11T22:43:52Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:57:58Z",
   "labels": [
    "Security",
@@ -55,6 +65,8 @@
   "updated_at": "2026-08-17T22:58:25Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:57:04Z",
   "labels": [
    "Security",
@@ -66,6 +78,8 @@
   "updated_at": "2026-08-17T22:57:08Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:56:13Z",
   "labels": [
    "Security",
@@ -77,6 +91,8 @@
   "updated_at": "2026-08-17T22:56:23Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:55:23Z",
   "labels": [
    "Security",
@@ -88,6 +104,8 @@
   "updated_at": "2026-08-17T22:55:28Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:52:59Z",
   "labels": [
    "Security",
@@ -99,6 +117,8 @@
   "updated_at": "2026-08-17T22:53:06Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:52:21Z",
   "labels": [
    "Security",
@@ -110,6 +130,8 @@
   "updated_at": "2026-08-17T22:59:08Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:51:31Z",
   "labels": [
    "Security",
@@ -121,6 +143,8 @@
   "updated_at": "2026-08-17T22:51:40Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:50:44Z",
   "labels": [
    "Security",
@@ -132,6 +156,8 @@
   "updated_at": "2026-08-17T22:59:26Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:50:10Z",
   "labels": [
    "Security",
@@ -143,6 +169,8 @@
   "updated_at": "2026-08-17T22:50:16Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:49:17Z",
   "labels": [
    "Security",
@@ -154,6 +182,8 @@
   "updated_at": "2026-08-17T22:49:23Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:48:27Z",
   "labels": [
    "Security",
@@ -165,6 +195,8 @@
   "updated_at": "2026-08-17T22:48:38Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:47:15Z",
   "labels": [
    "Security",
@@ -176,6 +208,8 @@
   "updated_at": "2026-08-17T22:47:25Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (August 17, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-08-17*\n",
   "created_at": "2026-08-17T22:42:50Z",
   "labels": [
    "Security",
@@ -187,6 +221,8 @@
   "updated_at": "2026-08-17T22:46:08Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n\nV1.0 (April 21, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-04-21*\n",
   "created_at": "2026-04-21T20:23:19Z",
   "labels": [],
   "number": 83,
@@ -195,6 +231,8 @@
   "updated_at": "2026-04-21T20:23:19Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\nV1.0 (April 14, 2026): Advisory published.\n\n*Version 1.0*\n*Last Updated 2026-04-14*\n",
   "created_at": "2026-04-14T14:00:58Z",
   "labels": [
    "Security",
@@ -206,6 +244,8 @@
   "updated_at": "2026-04-14T14:00:58Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n\nV1.0 (October 21, 2025): Advisory published.\n\n*Version 1.0*\n*Last Updated 2023-10-21*\n",
   "created_at": "2025-10-21T20:22:38Z",
   "labels": [
    "Security",
@@ -217,6 +257,8 @@
   "updated_at": "2025-10-21T20:22:45Z"
  },
  {
+  "author_association": "NONE",
+  "body": "",
   "created_at": "2025-09-26T21:50:01Z",
   "labels": [],
   "number": 79,
@@ -225,6 +267,8 @@
   "updated_at": "2025-10-15T22:21:18Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\nV1.0 (September 10, 2025): Advisory published.\n\n*Version 1.0*\n*Last Updated 2025-09-10*\n",
   "created_at": "2025-09-10T15:54:23Z",
   "labels": [
    "Security",
@@ -236,6 +280,8 @@
   "updated_at": "2025-09-10T15:54:37Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\n\nV1.0 (June 25, 2025): Advisory published.\n\n*Version 1.0*\n*Last Updated 2025-06-25*\n",
   "created_at": "2025-06-25T16:10:03Z",
   "labels": [
    "Security",
@@ -247,6 +293,8 @@
   "updated_at": "2025-06-25T16:10:03Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\nV1.1 (May 15, 2025): Added acknowledgment.\n\nV1.0 (May 15, 2025): Advisory published.\n\n*Version 1.1*\n*Last Updated 2023-05-15*\n",
   "created_at": "2025-05-15T18:32:28Z",
   "labels": [
    "Security",
@@ -258,6 +306,8 @@
   "updated_at": "2025-05-15T21:10:59Z"
  },
  {
+  "author_association": "NONE",
+  "body": "",
   "created_at": "2025-03-26T18:54:55Z",
   "labels": [
    "PowerShell"
@@ -268,6 +318,8 @@
   "updated_at": "2025-03-26T19:03:40Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\nV1.0 (January 28, 2025): Advisory published.\n\n*Version 1.0*\n*Last Updated 2025-01-28*\n",
   "created_at": "2025-01-28T20:24:29Z",
   "labels": [
    "Security",
@@ -279,6 +331,8 @@
   "updated_at": "2025-01-28T20:24:45Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\nV1.0 (January 28, 2025): Advisory published.\n\n*Version 1.0*\n*Last Updated 2025-01-28*\n",
   "created_at": "2025-01-28T20:23:35Z",
   "labels": [
    "Security",
@@ -290,6 +344,8 @@
   "updated_at": "2025-01-28T20:23:42Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\n\n\nV1.0 (January 28, 2025): Advisory published.\n\n*Version 1.0*\n*Last Updated 2025-01-28*\n",
   "created_at": "2025-01-28T20:22:24Z",
   "labels": [
    "Security",
@@ -301,6 +357,8 @@
   "updated_at": "2025-01-28T20:22:36Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\n\nV1.1 (January, 28, 2025): Affected Software updated\nV1.0 (October 22, 2024): Advisory published.\n\n*Version 1.1*\n*Last Updated 2025-01-28*",
   "created_at": "2024-10-22T22:33:18Z",
   "labels": [
    "Security",
@@ -312,6 +370,8 @@
   "updated_at": "2025-01-28T20:20:32Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (October 22, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-10-22*\r\n",
   "created_at": "2024-10-22T22:32:45Z",
   "labels": [
    "Security",
@@ -323,6 +383,8 @@
   "updated_at": "2024-10-22T22:32:46Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (October 22, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-10-22*\r\n",
   "created_at": "2024-10-22T22:32:06Z",
   "labels": [
    "Security",
@@ -334,6 +396,8 @@
   "updated_at": "2024-10-24T08:16:29Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (August 20, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-08-20*\r\n",
   "created_at": "2024-08-21T18:27:01Z",
   "labels": [
    "Security",
@@ -345,6 +409,8 @@
   "updated_at": "2024-08-21T18:27:14Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "",
   "created_at": "2024-08-02T17:59:18Z",
   "labels": [],
   "number": 67,
@@ -353,6 +419,8 @@
   "updated_at": "2024-08-02T17:59:45Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (July 23, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-07-23*\r\n",
   "created_at": "2024-08-01T17:38:31Z",
   "labels": [
    "Security",
@@ -364,6 +432,8 @@
   "updated_at": "2024-08-01T17:38:38Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (July 23, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-07-23*\r\n",
   "created_at": "2024-07-23T20:48:18Z",
   "labels": [
    "Security",
@@ -375,6 +445,8 @@
   "updated_at": "2024-07-23T20:48:27Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (July 23, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-07-23*\r\n",
   "created_at": "2024-07-23T20:47:47Z",
   "labels": [
    "Security",
@@ -386,6 +458,8 @@
   "updated_at": "2024-09-17T14:11:28Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (July 11, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-07-11*\r\n",
   "created_at": "2024-07-12T01:44:01Z",
   "labels": [
    "Security",
@@ -397,6 +471,8 @@
   "updated_at": "2024-07-12T16:56:04Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (June 18, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-06-18*\r\n",
   "created_at": "2024-06-19T20:14:31Z",
   "labels": [
    "Security",
@@ -408,6 +484,8 @@
   "updated_at": "2024-06-19T20:14:36Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\n\n<!-- TBD: update date -->\nV1.0 (April 09, 2024): Advisory published.\nv1.1 (March 24, 2025): Updated How do I know if I am affected section\n\n*Version 1.1*\n*Last Updated 2025-03-24*\n",
   "created_at": "2024-04-16T16:30:17Z",
   "labels": [
    "Security",
@@ -419,6 +497,8 @@
   "updated_at": "2025-03-24T16:37:34Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (April 09, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-04-09*",
   "created_at": "2024-04-16T16:29:22Z",
   "labels": [
    "Security",
@@ -430,6 +510,8 @@
   "updated_at": "2024-04-16T16:29:22Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (April 09, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-04-09*\r\n",
   "created_at": "2024-04-16T16:28:38Z",
   "labels": [
    "Security",
@@ -441,6 +523,8 @@
   "updated_at": "2024-04-16T16:28:44Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (April 09, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-04-09*\r\n",
   "created_at": "2024-04-16T16:25:34Z",
   "labels": [
    "Security",
@@ -452,6 +536,8 @@
   "updated_at": "2024-04-16T16:25:40Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\n<!-- TBD: update date -->\r\nV1.0 (January 11, 2024): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2024-01-11*\r\n",
   "created_at": "2024-01-16T21:15:41Z",
   "labels": [
    "Security",
@@ -463,6 +549,8 @@
   "updated_at": "2024-01-16T21:15:41Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Nov 16, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-11-16*\r\n",
   "created_at": "2023-11-16T18:02:42Z",
   "labels": [
    "Security",
@@ -474,6 +562,8 @@
   "updated_at": "2023-11-16T18:02:58Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Nov 16, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-11-16*\r\n",
   "created_at": "2023-11-16T17:56:56Z",
   "labels": [
    "Security",
@@ -485,6 +575,8 @@
   "updated_at": "2023-11-16T18:00:18Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (October 25, 2023): Advisory published.\r\nV1.1 (October 26, 2023): Corrected advisory publish date.\r\n\r\n*Version 1.1*\r\n*Last Updated 2023-10-26*\r\n\r\n",
   "created_at": "2023-10-26T18:43:56Z",
   "labels": [
    "Security",
@@ -496,6 +588,8 @@
   "updated_at": "2023-10-26T18:46:17Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (October 25, 2023): Advisory published.\r\nV1.1 (October 26, 2023): Corrected advisory publish date.\r\n\r\n*Version 1.1*\r\n*Last Updated 2023-10-26*\r\n",
   "created_at": "2023-10-26T18:43:09Z",
   "labels": [
    "Security",
@@ -507,6 +601,8 @@
   "updated_at": "2023-10-26T18:46:26Z"
  },
  {
+  "author_association": "COLLABORATOR",
+  "body": "### Revisions\r\n\r\nV1.0 (October 25, 2023): Advisory published.\r\nV1.1 (October 26, 2023): Corrected advisory publish date.\r\nv1.2 (October 26, 2023): Updated affected version and noted that this is a duplicate announcement.\r\n\r\n*Version 1.2*\r\n*Last Updated 2023-10-26*",
   "created_at": "2023-10-26T18:41:46Z",
   "labels": [
    "Security",
@@ -518,6 +614,8 @@
   "updated_at": "2023-10-26T20:08:32Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Sep 18, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-09-18*\r\n",
   "created_at": "2023-09-19T18:45:05Z",
   "labels": [
    "Security",
@@ -529,6 +627,8 @@
   "updated_at": "2023-09-19T18:45:16Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (September 19, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-09-19*\r\n",
   "created_at": "2023-09-19T18:43:31Z",
   "labels": [
    "Security",
@@ -540,6 +640,8 @@
   "updated_at": "2023-09-19T18:45:29Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (July 13, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-07-13*\r\n",
   "created_at": "2023-07-13T22:53:13Z",
   "labels": [
    "Security",
@@ -551,6 +653,8 @@
   "updated_at": "2023-07-13T22:53:24Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:51:21Z",
   "labels": [
    "Security",
@@ -562,6 +666,8 @@
   "updated_at": "2023-06-28T18:51:42Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\n<!-- TBD: update date -->\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:49:59Z",
   "labels": [
    "Security",
@@ -573,6 +679,8 @@
   "updated_at": "2023-06-28T18:49:59Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:48:42Z",
   "labels": [
    "Security",
@@ -584,6 +692,8 @@
   "updated_at": "2023-06-28T18:48:49Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\n\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:47:11Z",
   "labels": [
    "Security",
@@ -595,6 +705,8 @@
   "updated_at": "2023-06-28T18:47:45Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:45:49Z",
   "labels": [
    "Security",
@@ -606,6 +718,8 @@
   "updated_at": "2023-06-28T18:47:34Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\n\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:44:07Z",
   "labels": [
    "Security",
@@ -617,6 +731,8 @@
   "updated_at": "2023-06-28T18:44:17Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (June 28, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-06-28*\r\n",
   "created_at": "2023-06-28T18:43:05Z",
   "labels": [
    "Security",
@@ -628,6 +744,8 @@
   "updated_at": "2023-06-28T18:57:47Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (April 13, 2023): Advisory published.\r\nV1.1 (April 13, 2023): Update language about .NET in Summary.\r\n\r\n*Version 1.1*\r\n*Last Updated 2023-04-13*\r\n",
   "created_at": "2023-04-13T19:39:31Z",
   "labels": [
    "Security",
@@ -639,6 +757,8 @@
   "updated_at": "2023-04-13T20:02:27Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Feb 24, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-02-24*\r\n",
   "created_at": "2023-02-24T18:37:19Z",
   "labels": [
    "Security",
@@ -650,6 +770,8 @@
   "updated_at": "2023-02-24T18:37:28Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jan 24, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-01-24*\r\n",
   "created_at": "2023-01-24T19:38:32Z",
   "labels": [
    "Security",
@@ -661,6 +783,8 @@
   "updated_at": "2023-01-24T19:38:46Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\n\r\nV1.0 (Jan 24, 2023): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2023-01-24*\r\n",
   "created_at": "2023-01-24T19:37:27Z",
   "labels": [
    "Security",
@@ -672,6 +796,8 @@
   "updated_at": "2023-01-24T19:39:13Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (December 13, 2022): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2022-12-13*\r\n",
   "created_at": "2022-12-13T17:46:21Z",
   "labels": [
    "Security",
@@ -683,6 +809,8 @@
   "updated_at": "2022-12-13T17:46:38Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "",
   "created_at": "2022-11-09T21:30:52Z",
   "labels": [
    "Security",
@@ -694,6 +822,8 @@
   "updated_at": "2022-11-09T22:06:35Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\n<!-- 08/11/2022: update date -->\r\nV1.0 (August 11, 2022): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2022-08-11*\r\n",
   "created_at": "2022-08-11T22:23:56Z",
   "labels": [
    "Security",
@@ -705,6 +835,8 @@
   "updated_at": "2022-08-11T22:25:28Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (May 17, 2022): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2022-05-17*\r\n",
   "created_at": "2022-05-17T20:23:57Z",
   "labels": [
    "Security",
@@ -716,6 +848,8 @@
   "updated_at": "2022-05-17T20:23:57Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.1 (April 27, 2022): Fixed typo.\r\nV1.0 (April 27, 2022): Advisory published.\r\n\r\n*Version 1.1*\r\n*Last Updated 2022-04-27*\r\n",
   "created_at": "2022-04-27T18:04:59Z",
   "labels": [
    "Security",
@@ -727,6 +861,8 @@
   "updated_at": "2022-04-28T18:13:42Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (March 16, 2022): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2022-03-16*\r\n",
   "created_at": "2022-03-16T20:43:02Z",
   "labels": [
    "Security",
@@ -738,6 +874,8 @@
   "updated_at": "2022-03-16T20:43:10Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (March 16, 2022): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2022-03-16*\r\n",
   "created_at": "2022-03-16T20:41:52Z",
   "labels": [
    "Security",
@@ -749,6 +887,8 @@
   "updated_at": "2022-03-16T20:42:13Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (December 14, 2021): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2021-12-14*\r\n",
   "created_at": "2021-12-14T22:10:59Z",
   "labels": [
    "Security",
@@ -760,6 +900,8 @@
   "updated_at": "2021-12-14T22:11:53Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (October 14, 2021): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2021-10-14*\r\n",
   "created_at": "2021-10-14T18:54:45Z",
   "labels": [
    "Security",
@@ -771,6 +913,8 @@
   "updated_at": "2021-10-14T18:55:06Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (October 14, 2021): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2021-10-14*\r\n",
   "created_at": "2021-10-14T18:52:24Z",
   "labels": [
    "Security",
@@ -782,6 +926,8 @@
   "updated_at": "2021-10-14T18:55:27Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (August 12, 2021): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2021-08-12*\r\n",
   "created_at": "2021-08-12T22:06:16Z",
   "labels": [
    "Security",
@@ -793,6 +939,8 @@
   "updated_at": "2021-08-12T22:06:32Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (August 12, 2021): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2021-08-12*\r\n",
   "created_at": "2021-08-12T22:05:02Z",
   "labels": [
    "Security",
@@ -804,6 +952,8 @@
   "updated_at": "2021-08-12T22:05:23Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (March 11, 2021): Advisory published.\r\nv1.1 (March 11, 2021): Updated link for installing PowerShell.\r\nv1.2 (March 11, 2021): Updated link for installing PowerShell to an aka.ms link.\r\n\r\n*Version 1.2*\r\n*Last Updated 2021-03-11*\r\n",
   "created_at": "2021-03-11T23:37:55Z",
   "labels": [
    "Security",
@@ -815,6 +965,8 @@
   "updated_at": "2021-03-12T00:01:49Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\n\r\nV1.0 (Feb 11, 2021): Advisory published.\r\nv1.1 (March 11, 2021): Updated link for installing PowerShell to an aka.ms link.\r\n\r\n*Version 1.1*\r\n*Last Updated 2021-03-11*\r\n",
   "created_at": "2021-02-11T23:54:36Z",
   "labels": [
    "Security",
@@ -826,6 +978,8 @@
   "updated_at": "2021-03-12T00:02:50Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.1 (December 10, 2020): Updated Affected products with details about what versions of PowerShell are affected.\r\nV1.0 (October 13, 2020): Advisory published.\r\n\r\n*Version 1.1*\r\n*Last Updated 2020-12-10*\r\n",
   "created_at": "2020-10-13T19:02:11Z",
   "labels": [],
   "number": 21,
@@ -834,6 +988,8 @@
   "updated_at": "2020-12-10T21:58:37Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (May 14, 2020): Advisory published.\r\n\r\nv1.1 (May 16, 2020): Updated install link.\r\n\r\nv1.2 (June 11, 2020): Updated version containing fix.\r\n\r\n*Version 1.2*\r\n*Last Updated 2020-06-11*\r\n",
   "created_at": "2020-05-15T00:09:27Z",
   "labels": [
    "Security",
@@ -845,6 +1001,8 @@
   "updated_at": "2020-06-11T21:05:16Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "",
   "created_at": "2019-07-16T17:26:14Z",
   "labels": [
    "Security",
@@ -856,6 +1014,8 @@
   "updated_at": "2020-06-11T19:00:15Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (May 21, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-05-21*\r\n",
   "created_at": "2019-05-21T18:08:57Z",
   "labels": [
    "Security",
@@ -867,6 +1027,8 @@
   "updated_at": "2019-05-21T18:09:18Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (May 21, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-05-21*\r\n",
   "created_at": "2019-05-21T18:06:24Z",
   "labels": [
    "Security",
@@ -878,6 +1040,8 @@
   "updated_at": "2019-05-21T18:06:44Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (May 21, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-05-21*\r\n",
   "created_at": "2019-05-21T18:04:03Z",
   "labels": [
    "Security",
@@ -889,6 +1053,8 @@
   "updated_at": "2019-05-21T19:45:24Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (May 21, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-05-21*\r\n",
   "created_at": "2019-05-21T18:02:13Z",
   "labels": [
    "Security",
@@ -900,6 +1066,8 @@
   "updated_at": "2019-05-21T18:07:05Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Feb 19, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-02-19*\r\n",
   "created_at": "2019-02-19T18:27:37Z",
   "labels": [
    "Security",
@@ -911,6 +1079,8 @@
   "updated_at": "2019-02-19T18:27:37Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Feb 19, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-02-19*\r\n",
   "created_at": "2019-02-19T18:26:40Z",
   "labels": [
    "Security",
@@ -922,6 +1092,8 @@
   "updated_at": "2019-02-19T18:26:53Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jan 15, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2019-01-15*\r\n",
   "created_at": "2019-01-15T20:11:15Z",
   "labels": [
    "Security",
@@ -933,6 +1105,8 @@
   "updated_at": "2019-01-15T20:11:37Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jan 15, 2019): Advisory published.\r\nV1.1 (Jan 15, 2019): Fix link to CVE.\r\n\r\n*Version 1.1*\r\n*Last Updated 2019-01-15*\r\n",
   "created_at": "2019-01-15T20:08:39Z",
   "labels": [
    "Security",
@@ -944,6 +1118,8 @@
   "updated_at": "2019-01-15T20:16:23Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jan 15, 2019): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2018-01-15*\r\n",
   "created_at": "2019-01-15T20:06:13Z",
   "labels": [
    "Security",
@@ -955,6 +1131,8 @@
   "updated_at": "2019-01-15T20:06:26Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (November 13, 2018): Advisory published.\r\nv1.1 (November 13, 2018): Updated Acknowledgments\r\n\r\n*Version 1.1*\r\n*Last Updated 2018-11-13*\r\n",
   "created_at": "2018-11-13T18:14:14Z",
   "labels": [
    "Security",
@@ -966,6 +1144,8 @@
   "updated_at": "2018-11-13T18:43:13Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (November 13, 2018): Advisory published.\r\nV1.1 (November 14, 2018): Fix typo in how to tell if `Microsoft.PowerShell.Archive' in affected when installed from the PowerShell Gallery.\r\n\r\n*Version 1.1*\r\n*Last Updated 2018-11-14*\r\n",
   "created_at": "2018-11-13T18:08:09Z",
   "labels": [
    "Security",
@@ -977,6 +1157,8 @@
   "updated_at": "2018-11-14T18:41:53Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Oct 9, 2018): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2018-01-24*",
   "created_at": "2018-10-09T23:31:27Z",
   "labels": [
    "Security",
@@ -988,6 +1170,8 @@
   "updated_at": "2018-10-09T23:32:17Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (July 19, 2018): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2018-07-19*",
   "created_at": "2018-07-19T23:07:28Z",
   "labels": [
    "Security",
@@ -999,6 +1183,8 @@
   "updated_at": "2018-08-13T22:43:23Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jul 10, 2018): Advisory published.\r\nV1.1 (Jul 19, 2018): Added CVE link.\r\n\r\n*Version 1.1*\r\n*Last Updated 2018-07-19*",
   "created_at": "2018-07-11T17:34:50Z",
   "labels": [
    "Security",
@@ -1011,6 +1197,8 @@
   "updated_at": "2018-07-19T17:18:11Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Mar 15, 2018): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2018-03-15*",
   "created_at": "2018-03-15T17:54:41Z",
   "labels": [
    "Security",
@@ -1022,6 +1210,8 @@
   "updated_at": "2018-04-05T21:28:24Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jan 25, 2018): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2018-01-25*",
   "created_at": "2018-01-25T18:42:41Z",
   "labels": [
    "Security",
@@ -1033,6 +1223,8 @@
   "updated_at": "2018-01-25T21:58:41Z"
  },
  {
+  "author_association": "MEMBER",
+  "body": "### Revisions\r\n\r\nV1.0 (Jan 25, 2018): Advisory published.\r\n\r\n*Version 1.0*\r\n*Last Updated 2018-01-25*",
   "created_at": "2018-01-25T18:41:42Z",
   "labels": [
    "Security",

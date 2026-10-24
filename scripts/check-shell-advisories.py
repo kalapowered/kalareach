@@ -8,8 +8,8 @@ this script. It reads them and fails on a change the register has no row for:
   * the security advisories of the fish, PowerShell, PSReadLine and PCRE2 repositories (fish
     links PCRE2, so a PCRE2 advisory is a fish advisory);
   * the issues of PowerShell/Announcements that are security advisories, which is where Microsoft
-    publishes the advisories that reach PowerShell, the .NET ones included (not every one carries
-    the Security label, so the title decides);
+    publishes the advisories that reach PowerShell, the .NET ones included (the Security label,
+    or a title that says so or names a CVE on an issue a member of the organisation opened);
   * the stable releases of fish and PowerShell, the tags of zsh and the releases and patches of
     bash that are newer than what the packages pin. Neither zsh nor bash publishes a machine
     readable advisory feed, so a new release or patch is the only signal either gives;
@@ -210,30 +210,55 @@ def repository_advisories(api, token, repository, package, pinned, may_be_empty=
     return found
 
 
+MONTHS = {name: number for number, name in enumerate(
+    "January February March April May June July August September October November December".split(), 1)}
+
+
+def revised_day(body, created):
+    """The day an Announcements advisory was last revised, from the revision list and the
+    "Last Updated" line Microsoft writes into its body. A comment on the issue moves `updated_at`
+    and revises nothing, so that field is not used. An issue that carries neither line was never
+    revised after it was opened."""
+    days = []
+    for match in re.finditer(r"V\d+\.\d+ \((\w+) (\d{1,2}), (\d{4})\)", body or ""):
+        month = MONTHS.get(match.group(1))
+        if month:
+            days.append(datetime.date(int(match.group(3)), month, int(match.group(2))))
+    for match in re.finditer(r"Last Updated\s*(\d{4}-\d{2}-\d{2})", body or ""):
+        days.append(datetime.date.fromisoformat(match.group(1)))
+    return max(days + [created]) if created else (max(days) if days else None)
+
+
 def announcements(api, token):
     """The advisories Microsoft publishes for PowerShell, the .NET ones that reach it included.
-    Not every one carries the Security label, so an issue is an advisory when its title says so or
-    names a CVE, and the issues that are pull requests are not issues."""
+    An issue is an advisory when it carries the Security label, or when its title says it is one or
+    names a CVE and a member of the organisation opened it: not every advisory is labelled, and
+    anyone can open an issue. Pull requests are not issues."""
     url = "%s/repos/PowerShell/Announcements/issues?state=all" % api
     found = []
     for item in fetch_pages(url, token):
         title = item.get("title") or ""
         cves = re.findall(r"CVE-\d{4}-\d{4,}", title)
-        if "pull_request" in item or not (cves or re.search(r"Security Advisory", title, re.I)):
+        labelled = "Security" in [
+            label if isinstance(label, str) else (label or {}).get("name") for label in item.get("labels") or []
+        ]
+        titled = bool(cves or re.search(r"Security Advisory", title, re.I)) and item.get(
+            "author_association"
+        ) in ("MEMBER", "OWNER", "COLLABORATOR")
+        if "pull_request" in item or not (labelled or titled):
             continue
         identifier = cves[0] if cves else "PowerShell/Announcements#%d" % item["number"]
-        created, updated = day(item.get("created_at")), day(item.get("updated_at"))
-        recent = (created is not None and created >= STARTED) or (
-            updated is not None and updated >= STARTED
-        )
+        created = day(item.get("created_at"))
+        revised = revised_day(item.get("body"), created)
+        recent = (created is not None and created >= STARTED) or (revised is not None and revised >= STARTED)
         found.append(
             finding(
                 "PowerShell/Announcements",
                 "psreadline",
                 identifier,
-                ["https://github.com/PowerShell/Announcements/issues/%d" % item["number"]],
+                ["github.com/PowerShell/Announcements/issues/%d" % item["number"]],
                 created,
-                updated,
+                revised,
                 needs_row=recent,
             )
         )
@@ -314,22 +339,29 @@ def bash_listing(ftp, path, pattern, missing_ok=False):
     return entries
 
 
-def bash_releases(ftp, pinned):
+PATCH_GRACE_DAYS = 60
+
+
+def bash_releases(ftp, pinned, now):
     """Releases of a series newer than the pinned one, the newest patch of each such series (bash
     fixes land in the newest series, and a patch to it that fixes a defect the pinned series also
-    has gets no other announcement), and the patches of the pinned series above the pinned patch."""
+    has gets no other announcement), and the patches of the pinned series above the pinned patch.
+    The pinned series' patch directory must be there. A newer series gets its first patches within
+    weeks of its release, so its directory may be missing or empty for sixty days after the release
+    and not after: a directory that stays missing is a source that failed."""
     found = []
     pin = numbers(pinned)
     releases = bash_listing(ftp, "", r"bash-(?:\d+\.\d+(?:\.\d+)?)\.tar\.gz")
     if not releases:
         raise SourceError("%s/: the listing holds no release" % ftp)
-    series = set()
+    series = {}
     for name, published in releases:
         version = numbers(name.replace(".tar.gz", ""))
         if version > pin:
             found.append(finding("bash releases", "bash", name.replace(".tar.gz", ""), [], published))
         if version[:2] > pin[:2]:
-            series.add(version[:2])
+            first = series.get(version[:2])
+            series[version[:2]] = min(first, published) if first and published else (first or published)
     pinned_patches = "bash-%d.%d-patches/" % pin[:2]
     patches = bash_listing(ftp, pinned_patches, r"bash%d%d-\d+" % pin[:2])
     if not patches:
@@ -337,11 +369,16 @@ def bash_releases(ftp, pinned):
     for name, published in patches:
         if int(name.rsplit("-", 1)[1]) > pin[2]:
             found.append(finding("bash patches", "bash", name, [], published))
-    for major, minor in sorted(series):
-        newer = bash_listing(ftp, "bash-%d.%d-patches/" % (major, minor), r"bash%d%d-\d+" % (major, minor), True)
+    for (major, minor), released in sorted(series.items()):
+        directory = "bash-%d.%d-patches/" % (major, minor)
+        newer = bash_listing(ftp, directory, r"bash%d%d-\d+" % (major, minor), True)
         if newer:
             name, published = max(newer, key=lambda entry: int(entry[0].rsplit("-", 1)[1]))
             found.append(finding("bash patches", "bash", name, [], published))
+        elif released is None or (now - released).days > PATCH_GRACE_DAYS:
+            raise SourceError(
+                "%s/%s: the listing of a series released %s holds no patch" % (ftp, directory, released)
+            )
     return found
 
 
@@ -526,7 +563,7 @@ def pinned_versions(root):
     }
 
 
-def collect(root, api, ftp, token, facts, audit):
+def collect(root, api, ftp, token, facts, audit, now):
     pins = pinned_versions(root)
     pcre2 = None
     if facts:
@@ -543,7 +580,7 @@ def collect(root, api, ftp, token, facts, audit):
     found += powershell_releases(api, token, pins["floors"])
     found += fish_releases(api, token, pins["fish"])
     found += zsh_tags(api, token, pins["zsh"])
-    found += bash_releases(ftp, pins["bash"])
+    found += bash_releases(ftp, pins["bash"], now)
     found += audited_lock(audit)
     return found
 
@@ -557,7 +594,7 @@ def check(args, register_text=None):
     triage_days = figure_within(block(register_text, "target"), "working day")
     if triage_days is None:
         raise SourceError("%s states no time within which a change is triaged" % REGISTER)
-    findings = collect(args.root, args.github_api, args.gnu_bash, token, args.facts, args.audit)
+    findings = collect(args.root, args.github_api, args.gnu_bash, token, args.facts, args.audit, now)
     problems, waiting = judge(findings, triage_rows(register_text), now, triage_days)
     return findings, problems, waiting
 
@@ -792,7 +829,7 @@ def run_self_test():
         needing = [item["id"] for item in findings if item["needs_row"]]
         for identifier in (
             "GHSA-r9hj-j2rw-4q3m", "RUSTSEC-2026-0204", "RUSTSEC-2026-0253", "v7.6.7", "zsh-5.9.2", "bash-5.3",
-            "bash53-020", "CVE-2026-69806",
+            "bash53-020",
         ):
             expect("the control reads " + identifier, identifier in needing, str(needing))
 
@@ -801,7 +838,6 @@ def run_self_test():
             ("GHSA-r9hj-j2rw-4q3m", "PCRE2 JIT stack row"),
             ("RUSTSEC-2026-0253", "RustSec row"),
             ("v7.6.7", "PowerShell release row"),
-            ("issues/101", "Announcements row"),
             ("zsh-5.9.2", "zsh tag row"),
             ("bash-5.3", "bash release row"),
         ):
@@ -824,6 +860,7 @@ def run_self_test():
             return items + [{
                 "number": 9001, "title": "Microsoft Security Advisory CVE-2026-99999: PowerShell Remote Code Execution",
                 "created_at": "2026-10-20T10:00:00Z", "updated_at": "2026-10-20T10:00:00Z", "state": "open", "labels": [],
+                "author_association": "MEMBER", "body": "",
             }]
         outcome = attempt(edited(routes(), issues, unlabelled))
         expect("an advisory with no label", says(outcome, "CVE-2026-99999", "no triage row"), str(outcome))
@@ -835,14 +872,39 @@ def run_self_test():
         outcome = attempt(edited(routes(), issues, chatter))
         expect("an announcement that is no advisory", not isinstance(outcome, SourceError) and not says(outcome, "9002"), str(outcome))
 
-        # A revision after the newest row is a new fact, and a newer row answers it.
+        # A revision Microsoft dates in the advisory after the newest row is a new fact, and a newer
+        # row answers it. A comment moves `updated_at` and revises nothing.
         def revised(items):
+            for item in items:
+                if item["number"] == 101:
+                    item["body"] += "V1.1 (October 30, 2026): Affected versions revised.\n"
+                    item["updated_at"] = "2026-10-30T09:00:00Z"
+            return items
+        def commented(items):
             for item in items:
                 if item["number"] == 101:
                     item["updated_at"] = "2026-10-30T09:00:00Z"
             return items
         outcome = attempt(edited(routes(), issues, revised), now="2026-11-10")
         expect("a revised advisory", says(outcome, "CVE-2026-69806", "revised 2026-10-30"), str(outcome))
+        outcome = attempt(edited(routes(), issues, commented), now="2026-11-10")
+        expect("a comment on an advisory", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-69806"), str(outcome))
+        def spam(items):
+            return items + [{
+                "number": 9003, "title": "Advisory: CVE-2026-77777 PowerShell Remote Code Execution", "labels": [],
+                "created_at": "2026-10-20T10:00:00Z", "updated_at": "2026-10-20T10:00:00Z", "state": "closed",
+                "author_association": "NONE", "body": "",
+            }]
+        outcome = attempt(edited(routes(), issues, spam), now="2026-11-10")
+        expect("an advisory-shaped issue from outside the organisation", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-77777"), str(outcome))
+        def labelled_only(items):
+            return items + [{
+                "number": 9004, "title": "OpenSSL 4.0 Security Release", "labels": ["Security", "PowerShell"],
+                "created_at": "2026-10-20T10:00:00Z", "updated_at": "2026-10-20T10:00:00Z", "state": "open",
+                "author_association": "MEMBER", "body": "",
+            }]
+        outcome = attempt(edited(routes(), issues, labelled_only), now="2026-11-10")
+        expect("a labelled security issue with no CVE", says(outcome, "Announcements#9004", "no triage row"), str(outcome))
         answer = with_row(
             "| 2026-11-02 | CVE-2026-69806, revised again at github.com/PowerShell/Announcements/issues/101; released 2026-09-11 "
             "| psreadline | The revision was read and the bound still covers it. | 2026-09-25 | not-affected |"
@@ -892,6 +954,23 @@ def run_self_test():
         )
         outcome = attempt(table, now="2026-10-28")
         expect("a patch of the newer bash series", says(outcome, "bash53-021", "no triage row"), str(outcome))
+        table = routes()
+        del table["/gnu/bash/bash-5.3-patches/"]
+        outcome = attempt(table)
+        expect("a patch directory that went missing", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        table = routes()
+        table["/gnu/bash/bash-5.3-patches/"] = b"<html>no listing</html>"
+        outcome = attempt(table)
+        expect("a patch listing with nothing in it", isinstance(outcome, SourceError) and "bash-5.3-patches" in str(outcome), str(outcome))
+        table = routes()
+        del table["/gnu/bash/bash-5.2-patches/"]
+        outcome = attempt(table)
+        expect("the pinned series' patch directory missing", isinstance(outcome, SourceError) and "bash-5.2-patches" in str(outcome), str(outcome))
+        table = routes()
+        table["/gnu/bash/"] += b'<a href="bash-5.4.tar.gz">bash-5.4.tar.gz</a> 2026-10-20 10:00  11M\n'
+        outcome = attempt(table, now="2026-10-24", text=with_row(
+            "| 2026-10-24 | bash-5.4, the series after 5.3; released 2026-10-20 | bash | Read. | 2026-11-03 | not-affected |"))
+        expect("a new series with no patch yet", not isinstance(outcome, SourceError) and not says(outcome, "bash-5.4"), str(outcome))
         outcome = attempt(table, now="2026-10-26")
         expect("a new patch inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "bash53-021"), str(outcome))
         with open(audit) as handle:
