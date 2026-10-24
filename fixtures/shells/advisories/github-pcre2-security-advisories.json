@@ -1,0 +1,155 @@
+[
+ {
+  "cve_id": "CVE-2026-103111",
+  "ghsa_id": "GHSA-r9hj-j2rw-4q3m",
+  "published_at": "2026-09-28T12:15:37Z",
+  "severity": "high",
+  "summary": "PCRE2: out-of-bounds write in JIT matching with large stack allocations",
+  "updated_at": "2026-10-01T16:18:01Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.49",
+    "vulnerable_version_range": "<=10.48"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2026-89156",
+  "ghsa_id": "GHSA-2p8c-ff85-vh9x",
+  "published_at": "2026-08-31T14:20:08Z",
+  "severity": "low",
+  "summary": "PCRE2: out-of-bounds read in pcre2_match() after JIT fallback with invalid UTF",
+  "updated_at": "2026-09-18T09:28:31Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.48",
+    "vulnerable_version_range": "<= 10.47"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2026-86145",
+  "ghsa_id": "GHSA-3r4p-g7gg-ppmf",
+  "published_at": "2026-08-31T14:20:34Z",
+  "severity": "high",
+  "summary": "PCRE2: out-of-bounds write in pcre2_dfa_match() with recursive patterns under a low heap limit",
+  "updated_at": "2026-09-07T12:14:28Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.48",
+    "vulnerable_version_range": ">= 10.32, <= 10.47"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2026-89157",
+  "ghsa_id": "GHSA-q8g2-wprr-34m9",
+  "published_at": "2026-08-31T14:20:45Z",
+  "severity": "medium",
+  "summary": "PCRE2: out-of-bounds write in pcre2_pattern_convert() with large patterns on 32-bit systems",
+  "updated_at": "2026-09-18T09:29:30Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.48",
+    "vulnerable_version_range": ">= 10.30, <= 10.47"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2026-89160",
+  "ghsa_id": "GHSA-9qww-pwc4-77qq",
+  "published_at": "2026-08-31T14:20:56Z",
+  "severity": "low",
+  "summary": "PCRE2: out-of-bounds reads in pcre2_match() when matching invalid UTF subjects with PCRE2_MATCH_INVALID_UTF",
+  "updated_at": "2026-09-18T09:31:08Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.48",
+    "vulnerable_version_range": ">= 10.34, <= 10.47"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2026-89158",
+  "ghsa_id": "GHSA-fmgr-6ggq-9859",
+  "published_at": "2026-08-31T14:21:10Z",
+  "severity": "medium",
+  "summary": "PCRE2: integer overflow in pcre2_compile_32() causes out-of-bounds write on 32-bit systems",
+  "updated_at": "2026-09-18T09:30:15Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.48",
+    "vulnerable_version_range": "<= 10.47"
+   }
+  ]
+ },
+ {
+  "cve_id": null,
+  "ghsa_id": "GHSA-q7rw-r7qq-2hx6",
+  "published_at": "2025-10-25T09:51:34Z",
+  "severity": "low",
+  "summary": "PCRE2: uninitialized memory disclosure in pcre2_serialize_encode()",
+  "updated_at": "2026-08-24T11:13:58Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.48",
+    "vulnerable_version_range": ">= 10.45"
+   }
+  ]
+ },
+ {
+  "cve_id": null,
+  "ghsa_id": "GHSA-43gg-c3xx-7w7g",
+  "published_at": "2025-10-24T17:19:37Z",
+  "severity": "low",
+  "summary": "PCRE2: out-of-bounds read in JIT-compiled pcre2_match() on AArch64",
+  "updated_at": "2026-08-24T11:13:36Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.47",
+    "vulnerable_version_range": "< 10.47"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2025-58050",
+  "ghsa_id": "GHSA-c2gv-xgf5-5cc2",
+  "published_at": "2025-08-27T17:18:37Z",
+  "severity": "medium",
+  "summary": "PCRE2: out-of-bounds read in pcre2_match() with (scs:) and (ACCEPT)",
+  "updated_at": "2026-08-24T09:30:03Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PCRE2"
+    },
+    "patched_versions": "10.46",
+    "vulnerable_version_range": "10.45"
+   }
+  ]
+ }
+]

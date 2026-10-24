@@ -8,6 +8,23 @@ description: >-
   and the database are public downloads, so the action needs no credential. Core-ci and the daily
   advisories workflow both run this action, so the two cannot differ.
 
+  With `lock` set, the action audits that lock file instead of the workspace's, from a directory of
+  its own so that the workspace's policy and its accepted advisories do not apply, and writes
+  cargo-audit's JSON report to `report`. It then succeeds whatever the report holds, because what
+  the report holds is for the next step to judge against the shell packages' register; it fails when
+  cargo-audit did not load its database or wrote no well-formed report. The shell advisories
+  workflow runs it this way over fish's lock.
+
+inputs:
+  lock:
+    description: A Cargo.lock to audit instead of the workspace's, with no policy applied.
+    required: false
+    default: ""
+  report:
+    description: Where the JSON report goes. Required with `lock`.
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -16,6 +33,8 @@ runs:
       env:
         CARGO_AUDIT_VERSION: "0.22.2"
         CARGO_AUDIT_SHA256: "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
+        AUDIT_LOCK: ${{ inputs.lock }}
+        AUDIT_REPORT: ${{ inputs.report }}
       run: |
         set -euo pipefail
         release="cargo-audit-x86_64-unknown-linux-musl-v$CARGO_AUDIT_VERSION"
@@ -25,7 +44,24 @@ runs:
         echo "$CARGO_AUDIT_SHA256  $RUNNER_TEMP/$release.tgz" | sha256sum --check --strict
         tar --extract --gzip --file "$RUNNER_TEMP/$release.tgz" --directory "$RUNNER_TEMP"
         status=0
-        "$RUNNER_TEMP/$release/cargo-audit" audit || status=$?
+        if [ -n "$AUDIT_LOCK" ]; then
+          if [ -z "$AUDIT_REPORT" ]; then
+            echo "::error::an audited lock needs a report to write"
+            exit 1
+          fi
+          scratch="$RUNNER_TEMP/rustsec-audit-scratch"
+          mkdir -p "$scratch"
+          # cargo-audit reads .cargo/audit.toml from where it runs, so it runs where there is none.
+          (cd "$scratch" && "$RUNNER_TEMP/$release/cargo-audit" audit --json --file "$AUDIT_LOCK" > "$AUDIT_REPORT") || true
+          python3 - "$AUDIT_REPORT" <<'PY' || status=$?
+        import json, sys
+        report = json.load(open(sys.argv[1]))
+        assert report["database"]["advisory-count"] > 0, "no advisory was loaded"
+        assert "list" in report["vulnerabilities"] and "warnings" in report, "the report is not whole"
+        PY
+        else
+          "$RUNNER_TEMP/$release/cargo-audit" audit || status=$?
+        fi
         # Which state of the database this run was judged against, pass or fail. `cargo audit`
         # keeps it in the Cargo home.
         git -C "${CARGO_HOME:-$HOME/.cargo}/advisory-db" log -1 \

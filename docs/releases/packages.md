@@ -427,7 +427,7 @@ consumer verifies against.
 The managed shell packages are upstream releases with KalaReach's own patch sets, so a security
 update to one of those upstream projects is a release of ours.
 
-Each is triaged within one working day of the advisory, an advisory published from 2026-09-20 against a crate or repository that the fish build compiles included. The package it affects is rebuilt against
+Each is triaged within one working day of the advisory, an advisory published from 2026-09-20 against a crate, repository or PCRE2 that the fish build compiles included, and an earlier advisory whose affected range includes what a package pins. A daily workflow reads the upstreams' advisories and fails when one has no row in the register. The package it affects is rebuilt against
 the fixed upstream release, requalified against the whole corpus under `tests/shells/`, and
 published within fourteen days of that release. No binary is
 distributed before its requalification passes, and no package is swapped into a session that is

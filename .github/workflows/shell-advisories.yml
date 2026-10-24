@@ -1,0 +1,62 @@
+name: shell-advisories
+
+# The register of the shell packages' upstream sources (docs/shell-integration/upstream.md) says
+# which advisories each package watches and records what was made of every one. Nothing read the
+# sources until this workflow, which reads them once a day and fails on a change the register has no
+# row for: the security advisories of the fish, PowerShell, PSReadLine and PCRE2 repositories, the
+# security issues of PowerShell/Announcements, the releases of the upstreams that are newer than the
+# packages pin, and the RustSec advisories against the crates in fish's Cargo.lock.
+# `scripts/check-shell-advisories.py` says what counts as a change, when a row covers it, and how
+# long a change may wait for its row.
+#
+# The run reads public sources and the repository with the automatic read-only token, needs no
+# secret and calls no deployment. The token goes to api.github.com only, to lift the rate limit. A
+# finding fails the run, and the failed run is the report, through the repository's ordinary
+# notification of a failed workflow; no other channel is used. A source that cannot be read fails
+# the run too, and names itself. The time is off the hour, because GitHub can delay scheduled runs
+# when an hour starts, and a scheduled run belongs to the default branch's latest commit. GitHub
+# switches a schedule off in a public repository that has had no activity for 60 days.
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-advisories:
+    name: daily check of the shell upstreams' advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # The check is put through what it must refuse, over recorded answers of the real sources, before
+      # it is trusted with the live ones.
+      - name: Test the check
+        run: python3 scripts/check-shell-advisories.py self-test
+
+      # fish's lock is inside its pinned archive, and the PCRE2 it builds is inside the pinned
+      # bindings, so both come from the sources the build uses, placed and checked against their pins.
+      - name: Place fish's sources
+        run: bash scripts/place-shell-sources.sh --fish
+
+      - name: Read fish's lock and the PCRE2 it builds
+        run: python3 scripts/check-shell-advisories.py facts --out "$RUNNER_TEMP/fish-facts"
+
+      - name: Fish's lock against the RustSec advisories
+        uses: ./.github/actions/rustsec-audit
+        with:
+          lock: ${{ runner.temp }}/fish-facts/Cargo.lock
+          report: ${{ runner.temp }}/fish-audit.json
+
+      - name: The upstreams' advisories against the register
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/check-shell-advisories.py check \
+            --facts "$RUNNER_TEMP/fish-facts" --audit "$RUNNER_TEMP/fish-audit.json"

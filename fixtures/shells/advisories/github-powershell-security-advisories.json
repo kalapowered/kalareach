@@ -1,0 +1,60 @@
+[
+ {
+  "cve_id": "CVE-2020-0605",
+  "ghsa_id": "GHSA-jcmq-5rrv-j2g4",
+  "published_at": "2020-05-14T17:00:22Z",
+  "severity": "high",
+  "summary": "Microsoft Security Advisory CVE-2020-0605: .NET Framework Remote Code Execution Vulnerability",
+  "updated_at": "2020-05-14T17:00:22Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "PowerShell"
+    },
+    "patched_versions": "7.0.0",
+    "vulnerable_version_range": "< 7.0.0-RC.2"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2019-1301",
+  "ghsa_id": "GHSA-62gw-3rmj-wmp2",
+  "published_at": "2019-09-12T21:23:26Z",
+  "severity": "high",
+  "summary": "Microsoft Security Advisory CVE-2019-1301: Denial of Service Vulnerability in .NET Core",
+  "updated_at": "2025-04-01T19:36:31Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "System.Management.Automation"
+    },
+    "patched_versions": "6.2.3",
+    "vulnerable_version_range": ">= 6.2.0, <6.2.3"
+   },
+   {
+    "package": {
+     "name": "System.Management.Automation"
+    },
+    "patched_versions": "6.1.6",
+    "vulnerable_version_range": ">=6.0.0, < 6.1.6"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2019-1167",
+  "ghsa_id": "GHSA-5frh-8cmj-gc59",
+  "published_at": "2019-07-16T17:24:27Z",
+  "severity": "high",
+  "summary": "Microsoft Security Advisory CVE-2019-1167: Windows Defender Application Control Security Feature Bypass Vulnerability",
+  "updated_at": "2019-07-16T17:27:27Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "System.Management.Automation"
+    },
+    "patched_versions": "6.2.2,6.1.5",
+    "vulnerable_version_range": "<6.2.2"
+   }
+  ]
+ }
+]
