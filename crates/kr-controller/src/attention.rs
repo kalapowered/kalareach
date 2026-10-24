@@ -4448,6 +4448,50 @@ pub(crate) mod tests {
         );
     }
 
+    /// A session whose journal was held back is read to its end by the first try that is due once
+    /// the hold has lifted. It is then finished, and neither its wait nor its place on the list of
+    /// sessions to try again is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_whose_hold_lifts_is_finished_and_keeps_no_wait() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let held = HeldBack::default();
+        let readable = Readable {
+            path: temp.environment().state_dir().join("closed.sqlite3"),
+        };
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let seconds = |seconds: u64| seconds * 1_000;
+
+        module
+            .session_closed_at(&held, session_id, seconds(100))
+            .await;
+        module.finish_again_at(&held, seconds(105)).await;
+        assert!(
+            module.origins().held_back.contains_key(&session_id),
+            "two tries found it held back, so the next is due ten seconds on"
+        );
+
+        module.finish_again_at(&readable, seconds(114)).await;
+        assert!(!module.finalised(session_id), "and is not made before then");
+        module.finish_again_at(&readable, seconds(115)).await;
+        assert!(module.finalised(session_id), "the try that is due reads it");
+        {
+            let origins = module.origins();
+            assert!(origins.held_back.is_empty(), "and keeps no wait");
+            assert!(
+                origins.unfinished.is_empty()
+                    && !origins.closing.contains(&session_id)
+                    && !origins.ended.contains(&session_id),
+                "or any hold on the session's items"
+            );
+        }
+        assert_eq!(
+            module.closure_retry_wait(seconds(115)),
+            MAINTENANCE,
+            "so the loop has nothing of it to wake for"
+        );
+    }
+
     fn module(temp: &kr_ipc::testing::TempHost) -> Arc<AttentionModule> {
         Arc::new(
             AttentionModule::open(
