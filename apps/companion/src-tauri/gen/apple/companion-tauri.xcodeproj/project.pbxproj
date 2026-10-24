@@ -1082,6 +1082,9 @@
 		0B172CCE49B18988F3404D39 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
 				CODE_SIGN_ENTITLEMENTS = KalaReachNotificationService/KalaReachNotificationService.entitlements;
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
 				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
@@ -1100,6 +1103,7 @@
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
 			};
 			name = debug;
 		};
@@ -1141,6 +1145,9 @@
 		4C0D2A46D801F1179D0839DB /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1154,6 +1161,7 @@
 				PRODUCT_NAME = KalaReachNativeTests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
 			};
 			name = debug;
 		};
@@ -1237,6 +1245,9 @@
 		AFA473B15126C4F82D7950CC /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1250,12 +1261,16 @@
 				PRODUCT_NAME = KalaReachNativeTests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
 			};
 			name = release;
 		};
 		B541E7FCB1D838EF89ED1E5A /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = (
+					arm64,
+				);
 				CODE_SIGN_ENTITLEMENTS = KalaReachNotificationService/KalaReachNotificationService.entitlements;
 				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "$(KR_SIGN_IDENTITY:default=iPhone Developer)";
 				"CODE_SIGN_STYLE[sdk=iphoneos*]" = "$(KR_SIGN_STYLE:default=Automatic)";
@@ -1274,6 +1289,7 @@
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
 			};
 			name = release;
 		};
