@@ -36,6 +36,14 @@ fn the_bootstrap_secret_is_wiped_once_the_handshake_is_accepted() {
     shellpkg::the_bootstrap_secret_does_not_outlive_the_accepted_handshake(FISH);
 }
 
+/// KR-REQ-07.40: the scan that looks for the secret does not report a region that went while it
+/// read.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mapping_that_goes_while_the_scan_reads_is_not_memory_left_unread() {
+    shellpkg::a_mapping_that_goes_while_the_scan_reads_is_not_memory_left_unread();
+}
+
 /// KR-REQ-07.36, KR-REQ-07.85, KR-REQ-20.03: the proof the package's own SHA-256 and HMAC-SHA-256
 /// compute is the worker's HMAC-SHA-256 of the same transcript.
 #[test]
