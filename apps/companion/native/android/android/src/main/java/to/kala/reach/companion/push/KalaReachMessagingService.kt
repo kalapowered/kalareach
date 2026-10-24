@@ -12,7 +12,6 @@ import to.kala.reach.companion.mobile.IncomingWork
 import to.kala.reach.companion.mobile.PreviewDecider
 import to.kala.reach.companion.mobile.PushMessage
 import to.kala.reach.companion.mobile.PushStores
-import to.kala.reach.companion.mobile.SharedClientPreviewOpener
 import to.kala.reach.companion.mobile.WorkPlacement
 import to.kala.reach.companion.mobile.placeWork
 import to.kala.reach.companion.mobile.planNotification
@@ -112,8 +111,10 @@ class KalaReachMessagingService : FirebaseMessagingService() {
                 )
             return
         }
-        Notifier.show(applicationContext, plan(delivery))
-        Log.i(TAG, "delivery: shown")
+        val plan = plan(delivery)
+        Notifier.show(applicationContext, plan)
+        // By reason and never by content: why the alert stands, or that a preview was shown.
+        Log.i(TAG, "delivery: shown (${plan.reason.ifEmpty { "revealed" }})")
     }
 
     private fun plan(delivery: PushMessage.Delivery) =
@@ -121,7 +122,7 @@ class KalaReachMessagingService : FirebaseMessagingService() {
             delivery,
             PreviewDecider(
                     keys = KeystorePreviewKeys(applicationContext),
-                    opener = SharedClientPreviewOpener
+                    opener = RustPreviewOpening()
                 )
                 .decide(delivery.data, System.currentTimeMillis())
         )

@@ -5,7 +5,6 @@ import androidx.work.Worker
 import androidx.work.WorkerParameters
 import to.kala.reach.companion.mobile.PreviewDecider
 import to.kala.reach.companion.mobile.PushMessage
-import to.kala.reach.companion.mobile.SharedClientPreviewOpener
 import to.kala.reach.companion.mobile.planNotification
 import to.kala.reach.companion.mobile.readMessage
 
@@ -28,7 +27,7 @@ class PreviewWorker(context: Context, parameters: WorkerParameters) :
         val decision =
             PreviewDecider(
                     keys = KeystorePreviewKeys(applicationContext),
-                    opener = SharedClientPreviewOpener
+                    opener = RustPreviewOpening()
                 )
                 .decide(data, System.currentTimeMillis())
         // Either decision is a finished outcome, not a failure to retry: retrying would produce

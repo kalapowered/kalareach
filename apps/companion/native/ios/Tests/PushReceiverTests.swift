@@ -245,10 +245,10 @@ final class PushAdapterTests: XCTestCase {
     }
 
     private final class Keys: LimitedKeyWriting {
-        var filed: [(String, Data)] = []
+        var filed: [PreviewKeySet] = []
 
-        func write(recipientKeyID: String, seed: Data) -> Bool {
-            filed.append((recipientKeyID, seed))
+        func replace(with keys: PreviewKeySet) -> Bool {
+            filed.append(keys)
             return true
         }
     }
@@ -345,24 +345,49 @@ final class PushAdapterTests: XCTestCase {
         XCTAssertTrue(answer(held, "pushPendingGet")?["record"] is NSNull)
     }
 
-    /// KR-REQ-10.48: what the adapter files in the store the extension reads is the preview key, by
-    /// the identifier of its public half, and nothing else.
-    func testOnlyThePreviewKeyIsFiledInTheStoreTheExtensionReads() {
+    /// KR-REQ-10.48: what the adapter files in the store the extension reads is the set of preview
+    /// keys the application hands over, whole, and nothing else: the seed by the identifier of its
+    /// public half, and the public key of each host that may seal a preview to it.
+    func testOnlyThePreviewKeysAreFiledInTheStoreTheExtensionReads() {
         let keys = Keys()
         let held = adapter(keys: keys)
+        let recipient = Data(repeating: 0x91, count: 32)
         let seed = Data(repeating: 3, count: 32)
-        let arguments = String(
-            data: try! JSONSerialization.data(withJSONObject: [
-                "recipient_key_id": Data(repeating: 0x91, count: 32).base64EncodedString(),
-                "seed": seed.base64EncodedString(),
-            ]),
-            encoding: .utf8)!
-        XCTAssertNotNil(answer(held, "pushLimitedKey", arguments))
+        let host = Data(repeating: 0x21, count: 32)
+        let hostKey = Data(repeating: 5, count: 32)
+        func set(_ recipients: [[String: String]], _ senders: [[String: String]]) -> String {
+            String(
+                data: try! JSONSerialization.data(withJSONObject: ["recipients": recipients, "senders": senders]),
+                encoding: .utf8)!
+        }
+        let one = set(
+            [["id": recipient.base64EncodedString(), "seed": seed.base64EncodedString()]],
+            [["id": host.base64EncodedString(), "key": hostKey.base64EncodedString()]])
+        XCTAssertNotNil(answer(held, "pushPreviewKeys", one))
         XCTAssertEqual(keys.filed.count, 1)
-        XCTAssertEqual(keys.filed.first?.0, Data(repeating: 0x91, count: 32).base64EncodedString())
-        XCTAssertEqual(keys.filed.first?.1, seed)
-        XCTAssertNil(answer(held, "pushLimitedKey", "{}"), "a request that names no key files none")
-        XCTAssertEqual(keys.filed.count, 1)
+        XCTAssertEqual(keys.filed.first?.recipients, [recipient: seed])
+        XCTAssertEqual(keys.filed.first?.senders, [host: hostKey])
+
+        // An empty set is a set: every host is off, and the store is made empty.
+        XCTAssertNotNil(answer(held, "pushPreviewKeys", set([], [])))
+        XCTAssertEqual(keys.filed.last, PreviewKeySet(recipients: [:], senders: [:]))
+
+        // What is not made of keys files nothing: the store is never handed half of a set.
+        XCTAssertNil(answer(held, "pushPreviewKeys", "{}"), "a request that names no keys files none")
+        XCTAssertNil(
+            answer(
+                held, "pushPreviewKeys",
+                set([["id": recipient.base64EncodedString(), "seed": Data(count: 31).base64EncodedString()]], [])),
+            "a seed of another length")
+        XCTAssertNil(
+            answer(
+                held, "pushPreviewKeys",
+                set([], [
+                    ["id": host.base64EncodedString(), "key": hostKey.base64EncodedString()],
+                    ["id": host.base64EncodedString(), "key": hostKey.base64EncodedString()],
+                ])),
+            "one host twice")
+        XCTAssertEqual(keys.filed.count, 2)
     }
 
     func testATapOnANotificationOpensAttentionOnceAndOnlyWhenTheDefaultActionWasTaken() {
