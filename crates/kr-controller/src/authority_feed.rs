@@ -735,7 +735,7 @@ async fn pass(
                     // this machine has dealt with what it names.
                     contiguous = false;
                     unverified = true;
-                    controller.authority_feed_withdrawal_unverified(true);
+                    controller.authority_feed_withdrawal_unverified(true).await;
                     shared.observed().unverified = true;
                 }
                 Settled::Waiting => {
@@ -779,7 +779,9 @@ async fn pass(
     shared.scan_unverified.store(false, Ordering::SeqCst);
     // Read through, the scan has seen every withdrawal the feed shows complete that is not settled:
     // the refusal is lifted when it saw none, and stands when it saw one.
-    controller.authority_feed_withdrawal_unverified(unverified);
+    controller
+        .authority_feed_withdrawal_unverified(unverified)
+        .await;
     shared.observed().unverified = unverified;
     if let Some(latest) = latest {
         // A registry found behind the feed is raised to the feed's revision, in one barrier, before

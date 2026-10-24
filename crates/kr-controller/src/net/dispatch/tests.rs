@@ -1488,6 +1488,19 @@ async fn close_for_a_device_of(
     close: &MutationRequest,
     rights: &[kr_protocol::rights::ActionRight],
 ) -> crate::service::net::ClosedRemotely {
+    try_close_for_a_device_of(controller, accepted, connection, close, rights)
+        .await
+        .expect("the worker answers the close")
+}
+
+/// As [`close_for_a_device_of`], and the refusal the close settled as when it was refused.
+async fn try_close_for_a_device_of(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    accepted: kr_transport::window::AcceptedDeadline,
+    connection: &super::RemoteConnection,
+    close: &MutationRequest,
+    rights: &[kr_protocol::rights::ActionRight],
+) -> crate::error::Result<crate::service::net::ClosedRemotely> {
     let rights: CanonicalSet<_> = rights.iter().copied().collect();
     let envelope = connection.envelope(
         connection.pairing_acting().grant.grant_id,
@@ -1513,10 +1526,7 @@ async fn close_for_a_device_of(
             connection.receive,
         )
         .await;
-    answered
-        .await
-        .expect("the close settles")
-        .expect("the worker answers the close")
+    answered.await.expect("the close settles")
 }
 
 /// KR-REQ-09.12: a device's close that a closure overtakes between the daemon's reading of the
@@ -1570,6 +1580,143 @@ async fn a_devices_close_that_a_closure_overtakes_is_answered_from_the_closure()
         answered.closure.as_ref().map(|record| record.session_id),
         Some(world.session_id)
     );
+}
+
+/// KR-REQ-24.15: a device's close that had been admitted, and waits for the link to the session's
+/// worker, is refused when the link opens if the authority feed has raised a refusal on remote
+/// grants meanwhile, and nothing is asked of the worker. The control: with no refusal raised, the
+/// close goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_close_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::{SessionCloseResult, SessionState};
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_link_that_is_not_given_back::Served;
+
+    for refused in [false, true] {
+        let world = Served::start().await;
+        let controller = &world.controller;
+        let connection =
+            super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 24));
+        let close = fake::close_request(controller.paths().environment_id(), world.session_id);
+        let accepted = kr_transport::window::AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(std::time::Duration::from_secs(300))
+                .expect("a deadline five minutes out"),
+            bound: kr_transport::window::DeadlineBound::RequestedTtl,
+        };
+        let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+
+        let (closed, ()) = tokio::join!(
+            try_close_for_a_device_of(
+                controller,
+                accepted,
+                &connection,
+                &close,
+                &[ActionRight::SessionView, ActionRight::SessionClose],
+            ),
+            async {
+                arrived.await.expect("the close reaches the worker's door");
+                if refused {
+                    controller.authority_feed_withdrawal_unverified(true).await;
+                }
+                go.send(()).expect("the close is waiting");
+            }
+        );
+        if refused {
+            let error = closed.expect_err("the close is refused");
+            assert!(
+                matches!(
+                    error,
+                    crate::error::ControllerError::PermissionDenied { .. }
+                ),
+                "{error:?}"
+            );
+        } else {
+            let closed = closed.expect("the close goes through");
+            let answered: SessionCloseResult = closed.value.to_typed().expect("a close result");
+            assert_eq!(
+                answered.state,
+                SessionState::Closing,
+                "the worker took the close"
+            );
+        }
+    }
+}
+
+/// KR-REQ-24.15: a device's read, and with it raw input, that had been admitted and waits for the
+/// link to the session's worker is refused when the link opens if the authority feed has raised a
+/// refusal on remote grants meanwhile, and no worker is asked. The control: with no refusal raised,
+/// the read reaches the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
+    use std::sync::Arc;
+
+    use kr_protocol::agent::{AgentApprovalInspectParams, AgentSubject};
+    use kr_protocol::error::ErrorCode;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for refused in [false, true] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(move |request: &kr_protocol::envelope::Request| {
+                (request.method.method()? == Method::AgentApprovalInspect).then(ParamsValue::empty)
+            }),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let device = paired_with_every_right(controller, 25);
+        let connection = super::RemoteConnection::for_test(controller, device);
+        let read = device_request(
+            1,
+            Method::AgentApprovalInspect,
+            &AgentApprovalInspectParams {
+                subject: AgentSubject {
+                    session_id: world.session_id,
+                    application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                        Uuid::from_bytes([5; 16]),
+                    ),
+                },
+                resource_id: kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([6; 16])),
+            },
+        );
+        let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+
+        let (answer, ()) = tokio::join!(connection.read(&read), async {
+            arrived.await.expect("the read reaches the worker's door");
+            if refused {
+                controller.authority_feed_withdrawal_unverified(true).await;
+            }
+            go.send(()).expect("the read is waiting");
+        });
+        if refused {
+            let error = refusal(answer);
+            assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+            assert!(
+                forwarded_reads(&recorded).is_empty(),
+                "a read refused at the link reaches no worker"
+            );
+        } else {
+            match answer {
+                kr_protocol::envelope::ControlFrame::Response(
+                    kr_protocol::envelope::Response {
+                        outcome: kr_protocol::envelope::Outcome::Ok(value),
+                        ..
+                    },
+                ) => assert_eq!(value, ParamsValue::empty()),
+                other => panic!("the read was not answered: {other:?}"),
+            }
+            assert_eq!(forwarded_reads(&recorded).len(), 1);
+        }
+        world.serving.abort();
+    }
 }
 
 /// KR-REQ-09.12: a paired device that reads a session that has closed is told that it closed,

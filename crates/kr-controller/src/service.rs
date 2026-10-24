@@ -697,6 +697,15 @@ pub struct Controller {
     /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
     /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
     authority_epoch: std::sync::atomic::AtomicU64,
+    /// Which of the two refusals the authority feed puts on every remote grant stands now: bit 1
+    /// while this host is behind its feed, bit 2 while the feed shows a withdrawal this host
+    /// cannot verify.
+    ///
+    /// One word, so a reader sees both refusals in one reading. It mirrors the two flags of the
+    /// policy and is changed with them under the policy's lock, because a check that runs inside
+    /// a transaction cannot take that lock again. Work admitted before a refusal rose is held to
+    /// it here ([`Controller::feed_refusal`]).
+    feed_refusal: std::sync::atomic::AtomicU8,
     /// What this daemon has told its session workers the host's local owner may do, and what each
     /// has acknowledged.
     local_access: local_access::LocalAccessState,
@@ -1209,6 +1218,9 @@ mod a_feed_request_written_down_before_it_takes_effect;
 
 #[cfg(test)]
 mod a_completed_request_carried_out_again;
+
+#[cfg(test)]
+mod a_refusal_the_feed_raises_after_admission;
 
 #[cfg(test)]
 mod one_fence_for_one_debt;

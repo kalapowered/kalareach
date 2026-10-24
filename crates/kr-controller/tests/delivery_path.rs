@@ -3911,6 +3911,60 @@ async fn a_bearer_confirmed_before_a_renewal_that_retired_it_does_not_outlast_th
 }
 
 // ---------------------------------------------------------------------------------------------
+// A refusal the authority feed raises while a registration waits for the gateway
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-24.15: a registration that had been admitted and waits for the gateway to confirm its
+/// bearer is refused if the authority feed raises a refusal on remote grants meanwhile: the refusal
+/// moves no revision and withdraws no registration, so nothing else would stop the device's
+/// destination being written under the standing the device had when it asked. Nothing is written
+/// and the bearer is not kept. The control: with no refusal raised, the registration is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_registration_waiting_for_the_gateway_is_refused_once_a_feed_refusal_rises() {
+    for refused in [false, true] {
+        let environment = Environment::start().await;
+        let phone = environment.phone().await;
+        let credential = environment.gateway.issue(
+            PushSenderRecordId::new(uuid(0xc1)),
+            phone.installation(),
+            environment.host_signing_key(),
+        );
+        // The gateway holds the request that confirms the bearer until the refusal has been raised.
+        let confirming = environment.gateway.hold_before(RENEW_ROUTE, 0);
+        let driver = async {
+            confirming.reached().await;
+            if refused {
+                environment
+                    .controller()
+                    .raise_the_unverified_withdrawal_refusal()
+                    .await;
+            }
+            confirming.release();
+        };
+        let (registered, ()) = tokio::join!(phone.register(&environment, &credential), driver);
+        if refused {
+            let error = registered.expect_err("the registration is refused");
+            assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+            assert!(
+                error.message.contains("an owner this host does not know"),
+                "{error:?}"
+            );
+            assert!(
+                environment.destination(phone.device_id()).is_none(),
+                "no destination was written"
+            );
+            assert!(
+                !secret_store_holds(&environment, bytes_of(&credential)),
+                "and the bearer was not kept"
+            );
+        } else {
+            registered.expect("the registration is accepted");
+            assert!(environment.destination(phone.device_id()).is_some());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // External destinations the owner configures
 // ---------------------------------------------------------------------------------------------
 
