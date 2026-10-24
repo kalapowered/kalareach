@@ -126,6 +126,46 @@ fn paired_on(
     expires_at_ms: Option<u64>,
     organisation: Nullable<kr_protocol::grant::OrganisationRequirement>,
 ) -> DeviceRecord {
+    paired_on_at(
+        controller,
+        byte,
+        authorisation,
+        rights,
+        expires_at_ms,
+        organisation,
+        1,
+    )
+}
+
+/// As [`paired_signing_as`], for a device paired at `paired_at_ms`, which decides its place in
+/// pairing order.
+pub(super) fn paired_signing_as_at(
+    controller: &Controller,
+    byte: u8,
+    authorisation: kr_protocol::scalars::AuthorisationKey,
+    rights: &[ActionRight],
+    paired_at_ms: u64,
+) -> DeviceRecord {
+    paired_on_at(
+        controller,
+        byte,
+        authorisation,
+        rights,
+        None,
+        Nullable::null(),
+        paired_at_ms,
+    )
+}
+
+fn paired_on_at(
+    controller: &Controller,
+    byte: u8,
+    authorisation: kr_protocol::scalars::AuthorisationKey,
+    rights: &[ActionRight],
+    expires_at_ms: Option<u64>,
+    organisation: Nullable<kr_protocol::grant::OrganisationRequirement>,
+    paired_at_ms: u64,
+) -> DeviceRecord {
     let revision = controller.policy().authority_revision();
     let device_id = DeviceId::new(kr_ipc::new_uuid());
     let device = DeviceRecord {
@@ -141,7 +181,7 @@ fn paired_on(
             organisation,
             ..grant(device_id, rights, expires_at_ms, revision)
         },
-        paired_at_ms: TimestampMs::new(1),
+        paired_at_ms: TimestampMs::new(paired_at_ms),
         revoked_at_ms: None,
         committed_invitation_id: None,
         expired_at_ms: None,
