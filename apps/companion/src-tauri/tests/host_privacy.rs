@@ -79,6 +79,10 @@ impl ControlTransport for EarlierBuild {
         self.inner.reach()
     }
 
+    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+        self.inner.ended_by_this_device()
+    }
+
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         if let ControlFrame::Request(request) = frame
             && request.method.as_str() == Method::HostInfo.as_str()

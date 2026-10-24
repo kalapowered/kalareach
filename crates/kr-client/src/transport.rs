@@ -19,6 +19,7 @@ use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::envelope::ControlFrame;
+use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::StreamHeader;
 use kr_protocol::hello::{ALPN, ActionWindow, ReceiveLimits};
 use kr_protocol::ids::ConnectionId;
@@ -70,6 +71,13 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     fn reach(&self) -> Option<Reach> {
         None
     }
+
+    /// Why this device ended the connection itself, in the words a person is told, when it did:
+    /// the account the connection was opened under signed out or was replaced. A transport that
+    /// ends only as the host or the network ends it, or has not ended, says none. Asking also
+    /// settles whether the connection should have ended already, so the answer is the latest one,
+    /// and a transport that wraps another forwards the question or loses the words.
+    fn ended_by_this_device(&self) -> Option<ProtocolError>;
 
     /// Sends one control frame.
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()>;
@@ -208,6 +216,10 @@ impl ControlTransport for NetworkTransport {
 
     fn reach(&self) -> Option<Reach> {
         Some(self.reach.clone())
+    }
+
+    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        None
     }
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {

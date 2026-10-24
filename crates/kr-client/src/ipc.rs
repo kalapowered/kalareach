@@ -191,6 +191,10 @@ impl ControlTransport for IpcTransport {
         reach_of(&self.context)
     }
 
+    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+        None
+    }
+
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         Box::pin(async move {
             // One frame at a time. A second caller waits for the first's turn rather than finding

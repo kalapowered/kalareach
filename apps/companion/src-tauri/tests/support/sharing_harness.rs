@@ -87,6 +87,10 @@ impl ControlTransport for Lossy {
         self.inner.reach()
     }
 
+    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+        self.inner.ended_by_this_device()
+    }
+
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         Box::pin(async move {
             if let ControlFrame::Request(_) = frame {
