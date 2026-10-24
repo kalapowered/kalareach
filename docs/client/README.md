@@ -1352,9 +1352,10 @@ feed, the mailbox and delivery are built where those start, from their own confi
 the membership lease the organisation signed for the signed-in account and the device's authorisation
 key (`POST /api/account/organisations/{id}/lease`, with the account's token for the
 `organisation.lease` scope), and reads the chain of keys that signs the organisation's leases (`GET
-.../policy-authority`). A request the service turns back as `UNAUTHENTICATED` is sent again once with
-a renewed token (`SignedInAccount::token_of_account` with `renew`), because a token can end in
-transit or on a clock that runs behind the service's. `ServiceClients::membership_leases` is the slot
+.../policy-authority`). A request the service turns back as `UNAUTHENTICATED` is not sent again by the
+client: the keeper that asks through it sends it once more under a renewed token (`Token::Renewed`,
+which asks `SignedInAccount::token_marked` to replace the token), because a token can end in transit
+or on a clock that runs behind the service's. `ServiceClients::membership_leases` is the slot
 for it and counts under account login; the companion's lease desk builds its client from the account
 signed in on the device.
 
