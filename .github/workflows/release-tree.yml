@@ -251,6 +251,9 @@ jobs:
           cargo test --locked -p kr-shell-integration \
             --test zsh --test bash --test fish --test fish_sources --test module_abi \
             -- --test-threads=1 --include-ignored
+          # A filter that matches no case runs none and passes, so the case has to be there to run.
+          cargo test --locked -p kr-shell-integration --test qualification \
+            -- --list --include-ignored | grep -q '^the_packages_built_here_were_built_from_the_registers_pins: test$'
           cargo test --locked -p kr-shell-integration --test qualification \
             -- the_packages_built_here_were_built_from_the_registers_pins --include-ignored
 
