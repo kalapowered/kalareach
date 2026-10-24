@@ -256,6 +256,17 @@ impl Worker {
         &self._runtime
     }
 
+    /// Makes a page of this worker's revocation evidence carry at most `names` names, so that a
+    /// fence of a few actions spans pages. Each action a fence takes back is a durable commit of
+    /// its own, so a fence of hundreds is as slow as the disk's durable write makes it.
+    pub fn limit_evidence_page_for_tests(&self, names: usize) {
+        self._runtime
+            .session()
+            .journal_mut()
+            .expect("a journal")
+            .limit_evidence_page_for_tests(names);
+    }
+
     /// Accepts `count` intents from `actor` that the worker never dispatches, so that a fence for
     /// a revocation takes them back and names them.
     pub fn seed_undispatched_intents(&self, actor: &kr_protocol::ids::ActorId, count: usize) {
