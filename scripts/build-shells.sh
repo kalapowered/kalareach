@@ -843,10 +843,15 @@ check_hmac_sha256(void)
     }
 }
 
-/* The hash clears its state when the digest is taken: memory the caller owns, so it can be read. */
+/*
+ * What the code clears in memory the caller owns, which can be read: the hash state when the digest
+ * is taken, and the range a wipe is given. The temporaries inside the hash and the MAC are on the
+ * stack and are not read back.
+ */
 static void
-check_state_cleared(void)
+check_wipes(void)
 {
+    unsigned char buffer[48];
     kr_sha256 state;
     unsigned char out[KR_SHA256_LEN];
     const unsigned char *bytes = (const unsigned char *)&state;
@@ -864,6 +869,18 @@ check_state_cleared(void)
         failures++;
         printf("FAIL the hash state is cleared when the digest is taken\n");
     }
+
+    memset(buffer, 0xa5, sizeof(buffer));
+    kr_wipe(buffer + 8, 32);
+    clear = 1;
+    for (i = 0; i < sizeof(buffer); i++) {
+        clear = clear && buffer[i] == ((i >= 8 && i < 40) ? 0 : 0xa5);
+    }
+    cases++;
+    if (!clear) {
+        failures++;
+        printf("FAIL a wipe clears the bytes it is given and no others\n");
+    }
 }
 
 int
@@ -871,29 +888,33 @@ main(void)
 {
     check_sha256();
     check_hmac_sha256();
-    check_state_cleared();
+    check_wipes();
     printf("%d checks, %d failed\n", cases, failures);
     return failures == 0 ? 0 : 1;
 }
 C
-    # shellcheck disable=SC2086
-    if ! ${CC:-cc} $cflags ${CPPFLAGS:-} -I "$(dirname "$source")" -o "$driver" "$driver.c" "$source" \
-        ${LDFLAGS:-} > "$work/crypto-check-build.log" 2>&1; then
-        tail -40 "$work/crypto-check-build.log" >&2
-        echo "build-shells: the $shell_name bridge's SHA-256 check did not compile" >&2
-        exit 1
-    fi
-    local status=0
-    "$driver" > "$work/crypto-check.log" 2>&1 || status=$?
-    if [ "$status" -ne 0 ]; then
-        cat "$work/crypto-check.log" >&2
-        if [ "$status" -eq 1 ]; then
-            echo "build-shells: the $shell_name bridge's SHA-256 or HMAC-SHA-256 does not give the published answers" >&2
-        else
-            echo "build-shells: the $shell_name bridge's SHA-256 check did not run to its end (exit $status)" >&2
+    # The wipe has a portable form beside the platform's own, and the check runs both.
+    local variant
+    for variant in "" "-DKR_PORTABLE_WIPE"; do
+        # shellcheck disable=SC2086
+        if ! ${CC:-cc} $cflags ${CPPFLAGS:-} $variant -I "$(dirname "$source")" -o "$driver" "$driver.c" \
+            "$source" ${LDFLAGS:-} > "$work/crypto-check-build.log" 2>&1; then
+            tail -40 "$work/crypto-check-build.log" >&2
+            echo "build-shells: the $shell_name bridge's SHA-256 check did not compile${variant:+ ($variant)}" >&2
+            exit 1
         fi
-        exit 1
-    fi
+        local status=0
+        "$driver" > "$work/crypto-check.log" 2>&1 || status=$?
+        if [ "$status" -ne 0 ]; then
+            cat "$work/crypto-check.log" >&2
+            if [ "$status" -eq 1 ]; then
+                echo "build-shells: the $shell_name bridge's SHA-256 or HMAC-SHA-256 does not give the published answers${variant:+ ($variant)}" >&2
+            else
+                echo "build-shells: the $shell_name bridge's SHA-256 check did not run to its end (exit $status)${variant:+ ($variant)}" >&2
+            fi
+            exit 1
+        fi
+    done
     echo "build-shells: the $shell_name bridge's SHA-256 and HMAC-SHA-256 give the published answers ($(tail -1 "$work/crypto-check.log"))"
 }
 
