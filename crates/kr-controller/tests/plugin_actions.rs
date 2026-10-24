@@ -289,13 +289,21 @@ async fn kr_req_23_30_arguments_other_than_the_declared_ones_are_rejected_before
     assert_eq!(frame["params"]["parameters"]["reason"], "because");
 }
 
-/// KR-REQ-23.30: an action whose component is being asked has a receipt that says so. An exact
-/// repeat is answered with it and prepares nothing a second time; the connection goes on serving
-/// the same client meanwhile; a cancellation rejects the action; and the action that comes back
-/// from its preparation transmits nothing.
+/// KR-REQ-23.30: an action waiting for its component has a receipt that says so. An exact repeat
+/// is answered with it and prepares nothing a second time; the connection goes on serving the same
+/// client meanwhile; a cancellation rejects the action; and the action that comes back from its
+/// preparation transmits nothing.
+///
+/// The worker holds the preparation before it asks the component, until the case lets it go. The
+/// action's accepted deadline is on a clock the case never moves, and the preparation's own bound
+/// starts at the release, so neither runs out while the case reads the receipt, however long the
+/// machine takes to do that. A cancellation that lands while a component call is outstanding is
+/// shown by `kr_req_23_30_an_action_cancelled_while_prepared_claims_nothing` in
+/// `plugin_insertion.rs`, which holds the plugin host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_and_cancelled() {
-    let Some(acting) = Acting::start().await else {
+    let Some(acting) = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await
+    else {
         return;
     };
     let mut asking = acting.client().await;
@@ -303,7 +311,7 @@ async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_a
     let mutation = acting.invocation(&asking, "turn.cancel", b"{}");
     let action_id = mutation.action_id;
 
-    acting.stop_host();
+    let (arrived, release) = acting.hosted._service.stall_next_preparation();
     asking
         .writer()
         .write_message(&ControlFrame::Mutation(Box::new(mutation.clone())))
@@ -312,11 +320,20 @@ async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_a
     // The action is accepted and waiting: its receipt says so, and nothing has been dispatched.
     let waiting = until_receipt(&mut other, action_id, ReceiptState::Accepted).await;
     assert_eq!(waiting.state, ReceiptState::Accepted);
+    tokio::time::timeout(PATIENCE, arrived)
+        .await
+        .expect("the preparation reaches its stop")
+        .expect("the stop is not dropped before the preparation reaches it");
+    // Armed again and let go at once: a second preparation of this action would arrive at the stop
+    // and go on, and the case would see that it had, whatever else it did. The repeat below
+    // prepares nothing.
+    let (mut again, _) = acting.hosted._service.stall_next_preparation();
 
     // The same connection still serves its client while the action waits: a read is answered
     // before the action is.
-    let own = read_receipt(&mut asking, action_id)
+    let own = tokio::time::timeout(PATIENCE, read_receipt(&mut asking, action_id))
         .await
+        .expect("the action's own connection answers a read in time")
         .expect("the action's own connection answers a read");
     assert_eq!(own.state, ReceiptState::Accepted);
 
@@ -350,10 +367,11 @@ async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_a
         Some(&kr_protocol::receipt::RejectionReason::Cancelled)
     );
 
-    // The host is let go. The preparation ends, the action comes back for its marker, finds its
-    // receipt is no longer accepted, and transmits nothing.
-    let host = acting.hosted.published().expect("the host is published");
-    signal(&host, rustix::process::Signal::CONT);
+    // The preparation is let go. It ends, the action comes back for its marker, finds its receipt
+    // is no longer accepted, and transmits nothing.
+    release
+        .send(())
+        .expect("the preparation is waiting at its stop");
     let finished = answer(&mut asking, Some(1)).await;
     let Outcome::Ok(value) = finished else {
         panic!("a cancelled action is answered with the receipt it has: {finished:?}");
@@ -368,6 +386,10 @@ async fn kr_req_23_30_an_action_waiting_for_its_component_can_be_read_repeated_a
             .expect("a receipt")
             .state,
         ReceiptState::Rejected
+    );
+    assert!(
+        again.try_recv().is_err(),
+        "the action was prepared a second time"
     );
     assert!(
         acting.frames().is_empty(),
