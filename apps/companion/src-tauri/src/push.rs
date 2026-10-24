@@ -242,26 +242,26 @@ pub trait Native: Send + Sync {
     fn route(&self) -> PushFuture<'_, Option<String>>;
 }
 
-/// Whether the run that is registering is still wanted: it still holds its host, and this phone is
-/// still paired with it.
-pub type StillWanted<'a> = dyn Fn() -> bool + Send + Sync + 'a;
-
-/// How this phone hands a delivery credential to the host it is paired with.
+/// How this phone reaches a host it is paired with, to hand it a delivery credential.
 pub trait Registrar: Send + Sync {
-    /// Sends `device.push.register` and `device.preview_key.update` to `host` over the paired
-    /// connection, and answers what the host answered.
-    ///
-    /// The person can forget the host at any moment, and a call that waits (the connection, the
-    /// host's answer) outlives that. `wanted` is asked before the connection is made, after it,
-    /// and before each change is sent, and nothing is sent to a host once it says no: the call
-    /// then answers with an error.
-    fn register<'a>(
-        &'a self,
-        host: &'a PairedHost,
+    /// Opens the paired connection to `host`.
+    fn connect<'a>(&'a self, host: &'a PairedHost) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
+}
+
+/// An open connection to a host, and the two changes the phone makes there. The desk asks whether
+/// its run is still wanted before it makes the connection and before each change, so a host the
+/// person forgot meanwhile is sent nothing.
+pub trait HostLine: Send {
+    /// Sends `device.push.register`, and answers what the host answered.
+    fn register(
+        &mut self,
         params: DevicePushRegisterParams,
+    ) -> PushFuture<'_, DevicePushRegisterResult>;
+    /// Sends `device.preview_key.update`, which says which preview key this phone holds.
+    fn update_preview_key(
+        &mut self,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
-        wanted: &'a StillWanted<'a>,
-    ) -> PushFuture<'a, DevicePushRegisterResult>;
+    ) -> PushFuture<'_, ()>;
 }
 
 /// How the gateway at an origin is reached.
@@ -890,7 +890,8 @@ impl PushDesk {
         let gateway = PushGateway::new(origin.clone(), http, signer.clone());
 
         // The turn and the token may have taken a while, and the person may have forgotten the host
-        // meanwhile: a run that is not wanted must not take the phone's one registration slot.
+        // meanwhile: a run that is not wanted must not write a pending registration and propose a
+        // token for it, with the registration slot it holds.
         if !self.wanted(host.host_device_id, run) {
             return Err(forgotten_host());
         }
@@ -969,31 +970,38 @@ impl PushDesk {
             .await
             .map_err(|error| gateway_words(&error))?;
         let keys = &self.device.identity().keys;
-        // The gateway's answer may have come after the person forgot the host: the registrar asks
-        // before it sends the host anything.
+        // The person can forget the host during any of the waits that follow, so the host is
+        // sent nothing until the run is asked about again: before the connection, after it, and
+        // before each of the two changes.
         let wanted = || self.wanted(host.host_device_id, run);
-        self.registrar
-            .register(
-                host,
-                DevicePushRegisterParams {
-                    credential: issued.credential,
-                    // The host seals a preview to the key it holds for this phone. The phone shows
-                    // the generic alert; the key is filed so a later opener needs no registration.
-                    previews_enabled: true,
-                },
-                *keys.notification_preview.public(),
-                &wanted,
-            )
+        let not_taken = |words: String| -> Stop {
+            if wanted() {
+                format!("The host did not take this phone as a destination: {words}").into()
+            } else {
+                forgotten_host()
+            }
+        };
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        let mut line = self.registrar.connect(host).await.map_err(not_taken)?;
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        line.register(DevicePushRegisterParams {
+            credential: issued.credential,
+            // The host seals a preview to the key it holds for this phone. The phone shows the
+            // generic alert; the key is filed so a later opener needs no registration.
+            previews_enabled: true,
+        })
+        .await
+        .map_err(not_taken)?;
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        line.update_preview_key(*keys.notification_preview.public())
             .await
-            .map_err(|words| {
-                if wanted() {
-                    Stop::from(format!(
-                        "The host did not take this phone as a destination: {words}"
-                    ))
-                } else {
-                    forgotten_host()
-                }
-            })?;
+            .map_err(not_taken)?;
 
         let name = kr_crypto::store::SecretName::device_key(
             crate::device::identity::SCOPE,
@@ -1338,34 +1346,41 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
 pub struct ConnectionRegistrar(pub Arc<Device>);
 
 impl Registrar for ConnectionRegistrar {
-    fn register<'a>(
-        &'a self,
-        host: &'a PairedHost,
-        params: DevicePushRegisterParams,
-        preview_key: kr_protocol::scalars::NotificationPreviewKey,
-        wanted: &'a StillWanted<'a>,
-    ) -> PushFuture<'a, DevicePushRegisterResult> {
+    fn connect<'a>(&'a self, host: &'a PairedHost) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
         Box::pin(async move {
-            use kr_protocol::envelope::ActionTarget;
-            use kr_protocol::method::Method;
-            use kr_protocol::sharing::DevicePreviewKeyUpdateParams;
-
-            let no_longer = || "this phone is no longer paired with that host".to_owned();
-            if !wanted() {
-                return Err(no_longer());
-            }
             let connection = crate::connection::Connection::paired(&self.0, host)
                 .await
                 .map_err(|error| error.message)?;
-            if !wanted() {
-                return Err(no_longer());
-            }
-            let session = connection.session();
-            let target = ActionTarget::environment(connection.environment_id());
-            let settled = session
+            Ok(Box::new(ConnectionLine {
+                connection,
+                device_id: host.device_id,
+            }) as Box<dyn HostLine + 'a>)
+        })
+    }
+}
+
+/// The paired connection to one host.
+struct ConnectionLine {
+    connection: crate::connection::Connection,
+    /// The host's identifier for this phone.
+    device_id: DeviceId,
+}
+
+impl HostLine for ConnectionLine {
+    fn register(
+        &mut self,
+        params: DevicePushRegisterParams,
+    ) -> PushFuture<'_, DevicePushRegisterResult> {
+        Box::pin(async move {
+            use kr_protocol::envelope::ActionTarget;
+            use kr_protocol::method::Method;
+
+            let settled = self
+                .connection
+                .session()
                 .mutate(
                     Method::DevicePushRegister,
-                    target.clone(),
+                    ActionTarget::environment(self.connection.environment_id()),
                     None,
                     &crate::commands::NoPreconditions {},
                     &params,
@@ -1373,36 +1388,46 @@ impl Registrar for ConnectionRegistrar {
                 )
                 .await
                 .map_err(|error| CommandError::from(error).message)?;
-            let registered: DevicePushRegisterResult = match settled {
+            match settled {
                 kr_client::Settled::Result(value) => value
                     .to_typed()
-                    .map_err(|_| "its answer was not one this phone reads".to_owned())?,
+                    .map_err(|_| "its answer was not one this phone reads".to_owned()),
                 kr_client::Settled::Receipt(_) => {
-                    return Err("it did not say it had taken the registration".to_owned());
+                    Err("it did not say it had taken the registration".to_owned())
                 }
-            };
+            }
+        })
+    }
+
+    fn update_preview_key(
+        &mut self,
+        preview_key: kr_protocol::scalars::NotificationPreviewKey,
+    ) -> PushFuture<'_, ()> {
+        Box::pin(async move {
+            use kr_protocol::envelope::ActionTarget;
+            use kr_protocol::method::Method;
+            use kr_protocol::sharing::DevicePreviewKeyUpdateParams;
+
             // The key the host seals previews to is the one it recorded when this phone paired. The
             // call says the phone holds it and at which revision: the same key at the same revision
             // is answered as already recorded, and any other is refused rather than taken.
-            if !wanted() {
-                return Err(no_longer());
-            }
-            session
+            self.connection
+                .session()
                 .mutate(
                     Method::DevicePreviewKeyUpdate,
-                    target,
+                    ActionTarget::environment(self.connection.environment_id()),
                     None,
                     &crate::commands::NoPreconditions {},
                     &DevicePreviewKeyUpdateParams {
-                        device_id: host.device_id,
+                        device_id: self.device_id,
                         notification_preview: preview_key,
                         revision: DeviceKeyRevision::new(1),
                     },
                     crate::commands::MUTATION_TTL,
                 )
                 .await
-                .map_err(|error| CommandError::from(error).message)?;
-            Ok(registered)
+                .map(|_| ())
+                .map_err(|error| CommandError::from(error).message)
         })
     }
 }
