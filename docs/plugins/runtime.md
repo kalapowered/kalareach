@@ -729,9 +729,10 @@ An action whose implementation is `component` runs in two passes, so that the ca
 process never happens inside the boundary that revalidates an action and writes its dispatch marker.
 
 How far the plan reaches is the connector table's. The host writes a plan only as an operation the
-table spells, which today is a cancellation: a component's plan for a prompt, a steer, an
-attachment, terminal text or a method of its own is refused as `UNSUPPORTED_CAPABILITY` before the
-marker, a package's action is refused on a Claude Code channel, and no connector table in the bundled
+table spells, which today is a cancellation (`operations.turn_cancel`): an action declared as a
+prompt, an attachment or a method of its own is refused as `UNSUPPORTED_CAPABILITY` before the
+marker, a plan for another operation than the declared one is refused as `INVALID_ARGUMENT`, a
+package's action is refused on a Claude Code channel, and no connector table in the bundled
 generation declares operations ([Agent methods](../host/README.md#agent-methods)).
 
 1. The first pass is the admission. The request goes through everything any mutation goes through
