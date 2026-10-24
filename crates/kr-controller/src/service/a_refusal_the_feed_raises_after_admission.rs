@@ -59,7 +59,7 @@ async fn a_connection_admitted_before_a_feed_refusal_rose_is_refused_where_it_co
         "the control"
     );
 
-    controller.authority_feed_withdrawal_unverified(true).await;
+    controller.raise_the_unverified_withdrawal_refusal().await;
     assert_eq!(asked(&controller, &remote).await, [false, false]);
     assert_eq!(
         asked(&controller, &local).await,
@@ -75,7 +75,10 @@ async fn a_connection_admitted_before_a_feed_refusal_rose_is_refused_where_it_co
         "{refused:?}"
     );
 
-    controller.authority_feed_withdrawal_unverified(false).await;
+    controller
+        .settle_unverified_withdrawals(None)
+        .await
+        .expect("the directory reads");
     assert_eq!(
         asked(&controller, &remote).await,
         [true, true],
@@ -86,8 +89,11 @@ async fn a_connection_admitted_before_a_feed_refusal_rose_is_refused_where_it_co
         .authority_feed_behind(u64::MAX)
         .await
         .expect("the registry reads");
-    controller.authority_feed_withdrawal_unverified(true).await;
-    controller.authority_feed_withdrawal_unverified(false).await;
+    controller.raise_the_unverified_withdrawal_refusal().await;
+    controller
+        .settle_unverified_withdrawals(None)
+        .await
+        .expect("the directory reads");
     assert_eq!(
         asked(&controller, &remote).await,
         [false, false],

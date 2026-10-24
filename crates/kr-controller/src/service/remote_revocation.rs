@@ -96,13 +96,58 @@ pub(crate) struct Applied {
 }
 
 /// What carrying out again a request the feed shows complete came to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Replay {
     /// Nothing more is to be done for the request: what it names is withdrawn here, or its owner is
     /// known and it is not a request this host could have carried out.
     Done,
     /// The request names something live here, and its owner is not one this host knows.
-    Unverified,
+    Unverified(Unverified),
+}
+
+/// What withdrawals the feed shows complete, and this host cannot verify, name: the owners that
+/// made them as far as they say who they are, and what they would withdraw if they were the
+/// owners' words.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Unverified {
+    /// The identifier and the key each request names for its issuer.
+    pub(crate) issuers: std::collections::BTreeSet<(DeviceId, KeyId)>,
+    /// The devices this host holds live that the requests name, the holders of a pairing grant a
+    /// request names among them.
+    pub(crate) devices: std::collections::BTreeSet<DeviceId>,
+    /// The grants in the grant store, live, that the requests name.
+    pub(crate) grants: std::collections::BTreeSet<GrantId>,
+}
+
+impl Unverified {
+    /// What one request that names `plan` and says it was made by `issuer`, with `key`, comes to.
+    fn of(issuer: DeviceId, key: KeyId, plan: &Plan) -> Self {
+        Self {
+            issuers: [(issuer, key)].into_iter().collect(),
+            devices: plan.devices.iter().copied().collect(),
+            grants: plan.grants.iter().copied().collect(),
+        }
+    }
+
+    /// Adds what `other` found.
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.issuers.extend(other.issuers.iter().copied());
+        self.devices.extend(other.devices.iter().copied());
+        self.grants.extend(other.grants.iter().copied());
+    }
+
+    /// Whether no request was found.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.issuers.is_empty()
+    }
+}
+
+/// What a withdrawal this host cannot verify takes from the devices it names: the devices, and the
+/// keys they hold, which a feed removes by. Found again at every scan, like the refusal.
+#[derive(Debug, Default)]
+pub(crate) struct Withheld {
+    found: Unverified,
+    keys: std::collections::BTreeSet<kr_protocol::scalars::AuthorisationKey>,
 }
 
 /// What the registry shows of who made a request the feed shows complete.
@@ -193,6 +238,12 @@ impl Controller {
     /// else, the rights, the selectors, an organisation's lease, an exclusive management, the
     /// ceiling and the clock, is decided as it is for the device's own request.
     fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
+        // A device a withdrawal this host cannot verify names keeps no standing over the feed, nor
+        // does one that holds a key it holds, because a feed removes by key. Else the device the
+        // withdrawal would take its standing from could end the refusal by removing the feed.
+        if self.withheld_from_the_feed(device) {
+            return Standing::Not;
+        }
         let ceiling = self.configured_rights_ceiling();
         // A device whose grant, narrowed by this host's ceiling, holds no right to manage this host
         // is turned away whatever the clock says. Asking the clock first would leave the pass
@@ -645,7 +696,13 @@ impl Controller {
         match self.issuer_of_a_completed_request(request, &held) {
             Issuer::Could => {}
             Issuer::CouldNot => return Ok(Replay::Done),
-            Issuer::Unknown => return Ok(Replay::Unverified),
+            Issuer::Unknown => {
+                return Ok(Replay::Unverified(Unverified::of(
+                    request.issuer_device_id,
+                    request.issuer_key_id,
+                    &plan,
+                )));
+            }
         }
         if self
             .authority_feed_record(request.request_id)
@@ -702,16 +759,90 @@ impl Controller {
         }
     }
 
-    /// Records whether the feed shows complete a withdrawal this host cannot verify, and moves the
-    /// authority epoch when that changes what a remote grant is decided to be.
-    pub(crate) async fn authority_feed_withdrawal_unverified(&self, unverified: bool) {
+    /// Records that the feed shows complete a withdrawal this host cannot verify, which names
+    /// what `found` holds, and refuses every remote grant from this moment. What a scan found so
+    /// far is added to what the host holds, so a device is not given its standing back while the
+    /// scan goes on to the request that names it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device directory cannot be read. The refusal is raised all the
+    /// same.
+    pub(crate) async fn note_unverified_withdrawal(&self, found: &Unverified) -> Result<()> {
+        let keys = self.keys_of_the_named(found);
+        {
+            let mut held = self.feed_withheld();
+            held.found.extend(found);
+            if let Ok(keys) = &keys {
+                held.keys.extend(keys.iter().copied());
+            }
+        }
         self.move_a_feed_refusal(
             WITHDRAWAL_UNVERIFIED,
-            unverified,
+            true,
             crate::grants::HostPolicy::withdrawal_unverified,
             crate::grants::HostPolicy::set_withdrawal_unverified,
         )
         .await;
+        keys.map(|_| ())
+    }
+
+    /// Records what a scan that has read the feed through found of withdrawals this host cannot
+    /// verify: what it found is what the host holds from now, and the refusal is lifted when it
+    /// found none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device directory cannot be read. The refusal follows what was
+    /// found all the same.
+    pub(crate) async fn settle_unverified_withdrawals(
+        &self,
+        found: Option<&Unverified>,
+    ) -> Result<()> {
+        let keys = found.map_or_else(|| Ok(Vec::new()), |found| self.keys_of_the_named(found));
+        {
+            let mut held = self.feed_withheld();
+            held.found = found.cloned().unwrap_or_default();
+            held.keys = keys
+                .as_ref()
+                .map(|keys| keys.iter().copied().collect())
+                .unwrap_or_default();
+        }
+        self.move_a_feed_refusal(
+            WITHDRAWAL_UNVERIFIED,
+            found.is_some(),
+            crate::grants::HostPolicy::withdrawal_unverified,
+            crate::grants::HostPolicy::set_withdrawal_unverified,
+        )
+        .await;
+        keys.map(|_| ())
+    }
+
+    fn feed_withheld(&self) -> std::sync::MutexGuard<'_, Withheld> {
+        self.feed_withheld
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The authorisation keys of the devices `found` names, as the directory holds them.
+    fn keys_of_the_named(
+        &self,
+        found: &Unverified,
+    ) -> Result<Vec<kr_protocol::scalars::AuthorisationKey>> {
+        Ok(self
+            .devices
+            .devices()?
+            .into_iter()
+            .filter(|record| found.devices.contains(&record.device_id))
+            .map(|record| record.authorisation)
+            .collect())
+    }
+
+    /// Whether `device` is one a withdrawal this host cannot verify names, or holds a key one of
+    /// them holds.
+    fn withheld_from_the_feed(&self, device: &DeviceRecord) -> bool {
+        let held = self.feed_withheld();
+        held.found.devices.contains(&device.device_id) || held.keys.contains(&device.authorisation)
     }
 
     /// Raises or lifts one of the two refusals the feed puts on every remote grant: the policy's
@@ -796,9 +927,11 @@ impl Controller {
 
     /// Raises the refusal a withdrawal this host cannot verify puts on remote grants, as a scan of
     /// the feed does, for a suite that checks what a request admitted before it comes to.
-    #[cfg(feature = "testing")]
+    #[cfg(any(test, feature = "testing"))]
     pub async fn raise_the_unverified_withdrawal_refusal(&self) {
-        self.authority_feed_withdrawal_unverified(true).await;
+        let _ = self
+            .note_unverified_withdrawal(&Unverified::default())
+            .await;
     }
 
     /// Raises the registry to the revision the feed holds, in one barrier, and then lets the host
@@ -837,7 +970,7 @@ impl Controller {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
         // A feed that was removed shows nothing to compare, so it cannot keep a withdrawal unverified.
-        self.authority_feed_withdrawal_unverified(false).await;
+        let _ = self.settle_unverified_withdrawals(None).await;
         {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);
@@ -1075,10 +1208,11 @@ impl Controller {
 
 #[cfg(test)]
 mod tests {
-    use super::MANAGEMENT_PROBE;
+    use super::{MANAGEMENT_PROBE, Unverified};
     use kr_protocol::actor::ActorIngress;
     use kr_protocol::authority::{AuthorityDecision, RequiredAuthority, RightCondition};
     use kr_protocol::method::MethodVersion;
+    use kr_protocol::pairing::KeyPurpose;
     use kr_protocol::rights::ActionRight;
 
     /// The decision that stands for a paired device's right to manage the host is the right and
@@ -1112,6 +1246,76 @@ mod tests {
                 },
                 RightCondition::Always
             )]
+        );
+    }
+    /// KR-REQ-24.15: a feed removes the host by a key, so a device that holds a key a withdrawal this
+    /// host cannot verify names a holder of is named to the feed no more than the named device is,
+    /// and another owner's key still is. The control: before the withdrawal is found, both keys are
+    /// named.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_that_a_named_device_holds_is_not_named_to_the_feed() {
+        use kr_crypto::keys::AuthorisationKeyPair;
+
+        use crate::service::a_transfer_left_unanswered::daemon;
+        use crate::service::a_voice_grant_on_the_floor::paired_signing_as;
+
+        let (_temp, controller) = daemon().await;
+        let shared = AuthorisationKeyPair::generate().expect("a key");
+        let other = AuthorisationKeyPair::generate().expect("a key");
+        let named = paired_signing_as(
+            &controller,
+            1,
+            *shared.public(),
+            &[ActionRight::HostManage],
+            None,
+        );
+        let _sharing = paired_signing_as(
+            &controller,
+            2,
+            *shared.public(),
+            &[ActionRight::HostManage],
+            None,
+        );
+        let _owner = paired_signing_as(
+            &controller,
+            3,
+            *other.public(),
+            &[ActionRight::HostManage],
+            None,
+        );
+        let key_of = |pair: &AuthorisationKeyPair| {
+            kr_crypto::keys::key_id(KeyPurpose::Authorisation, pair.public().as_bytes())
+        };
+
+        let (before, _) = controller.owner_key_ids().expect("the directory reads");
+        assert!(
+            before.contains(&key_of(&shared)) && before.contains(&key_of(&other)),
+            "the control: both keys are named"
+        );
+
+        let found = Unverified {
+            devices: [named.device_id].into_iter().collect(),
+            ..Unverified::default()
+        };
+        controller
+            .note_unverified_withdrawal(&found)
+            .await
+            .expect("the directory reads");
+        let (after, _) = controller.owner_key_ids().expect("the directory reads");
+        assert_eq!(
+            after,
+            vec![key_of(&other)],
+            "the key the named device holds is no longer named, whoever else holds it"
+        );
+
+        controller
+            .settle_unverified_withdrawals(None)
+            .await
+            .expect("the directory reads");
+        let (lifted, _) = controller.owner_key_ids().expect("the directory reads");
+        assert!(
+            lifted.contains(&key_of(&shared)),
+            "named again once the refusal is lifted"
         );
     }
 }

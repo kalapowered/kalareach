@@ -6483,7 +6483,13 @@ again, so a restart does not lose the refusal, and nothing is stored for it. It 
 at the machine revokes what the request names, or pairs the owner again, whose key the request names
 and whose request is then carried out. A feed that shows a revocation complete that no owner made
 can only keep remote access refused this way. It cannot revive a device, and the owner at the
-machine can always end it. A request the feed holds that is not shown complete waits until the host
+machine can always end it. While the refusal stands, the devices the request names keep no standing
+over the feed, and neither does a device that holds a key one of them holds, because a feed removes
+the host by a key: none of those keys is named to the feed as permitted to remove it, and a request
+one of them publishes is refused as lacking owner authority. Another owner can still remove the
+feed, which ends the refusal. If the named device is the only owner, no key can remove a lost host
+while the refusal stands. A host that starts again reads no removed feed, so nothing finds the
+condition again. A request the feed holds that is not shown complete waits until the host
 has caught up, and is then judged on the registry as it stands, in a scan of its own that is the
 synchronisation a connection waits for, so the owner is not refused for the host's being behind.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier

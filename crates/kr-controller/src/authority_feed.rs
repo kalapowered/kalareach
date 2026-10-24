@@ -77,7 +77,7 @@ use crate::error::{ControllerError, Result};
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
 use crate::quiet::{Quiet, Timer};
 use crate::service::Controller;
-use crate::service::remote_revocation::{Judged, Replay};
+use crate::service::remote_revocation::{Judged, Replay, Unverified};
 
 /// The deadlines the feed's exchanges are made under. A request and its answer are small.
 pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
@@ -221,9 +221,8 @@ struct Shared {
     scan_unfinished: AtomicBool,
     /// Whether a record the scan met so far was put off because the host is behind its feed.
     scan_put_off: AtomicBool,
-    /// Whether a record the scan met so far is a withdrawal the feed shows complete and this host
-    /// cannot verify.
-    scan_unverified: AtomicBool,
+    /// What the scan met so far of withdrawals the feed shows complete and this host cannot verify.
+    scan_found: Mutex<Unverified>,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
     /// How many passes have finished, for whatever waits on one.
@@ -289,7 +288,7 @@ impl FeedRuntime {
                 scan_cursor: AtomicU64::new(0),
                 scan_unfinished: AtomicBool::new(false),
                 scan_put_off: AtomicBool::new(false),
-                scan_unverified: AtomicBool::new(false),
+                scan_found: Mutex::default(),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
                 passes: tokio::sync::watch::channel(0).0,
@@ -687,7 +686,15 @@ async fn pass(
     let starting = resumed == 0;
     let mut unfinished = shared.scan_unfinished.load(Ordering::SeqCst);
     let mut put_off = !starting && shared.scan_put_off.load(Ordering::SeqCst);
-    let mut unverified = !starting && shared.scan_unverified.load(Ordering::SeqCst);
+    let mut found = if starting {
+        Unverified::default()
+    } else {
+        shared
+            .scan_found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    };
     let mut cursor = if starting {
         shared.settled_through.load(Ordering::SeqCst)
     } else {
@@ -730,12 +737,15 @@ async fn pass(
                         through = record.sequence.get();
                     }
                 }
-                Settled::Unverified => {
+                Settled::Unverified(these) => {
                     // Refused from this moment, and read again by every scan until the owner at
                     // this machine has dealt with what it names.
                     contiguous = false;
-                    unverified = true;
-                    controller.authority_feed_withdrawal_unverified(true).await;
+                    found.extend(&these);
+                    controller
+                        .note_unverified_withdrawal(&found)
+                        .await
+                        .map_err(Stopped::local)?;
                     shared.observed().unverified = true;
                 }
                 Settled::Waiting => {
@@ -763,7 +773,10 @@ async fn pass(
     }
     shared.scan_unfinished.store(unfinished, Ordering::SeqCst);
     shared.scan_put_off.store(put_off, Ordering::SeqCst);
-    shared.scan_unverified.store(unverified, Ordering::SeqCst);
+    *shared
+        .scan_found
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = found.clone();
     if !read_through {
         // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
         // as read, the bounded offline validity is not extended from it, and nothing waits for
@@ -776,13 +789,17 @@ async fn pass(
     shared.scan_cursor.store(0, Ordering::SeqCst);
     shared.scan_unfinished.store(false, Ordering::SeqCst);
     shared.scan_put_off.store(false, Ordering::SeqCst);
-    shared.scan_unverified.store(false, Ordering::SeqCst);
+    *shared
+        .scan_found
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Unverified::default();
     // Read through, the scan has seen every withdrawal the feed shows complete that is not settled:
-    // the refusal is lifted when it saw none, and stands when it saw one.
+    // the refusal is lifted when it saw none, and stands, naming what they name, when it saw one.
     controller
-        .authority_feed_withdrawal_unverified(unverified)
-        .await;
-    shared.observed().unverified = unverified;
+        .settle_unverified_withdrawals((!found.is_empty()).then_some(&found))
+        .await
+        .map_err(Stopped::local)?;
+    shared.observed().unverified = !found.is_empty();
     if let Some(latest) = latest {
         // A registry found behind the feed is raised to the feed's revision, in one barrier, before
         // the feed is called read: until then what the host decides stands on an earlier state.
@@ -837,7 +854,7 @@ async fn name_owners(
 }
 
 /// How a record the feed holds stands after this host has dealt with it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Settled {
     /// The feed has nothing more to wait for on it.
     Done,
@@ -845,7 +862,7 @@ enum Settled {
     Waiting,
     /// The feed shows it complete, and this host holds what it names live and cannot tell whose
     /// word it is. It stays unsettled, so every scan reads it again.
-    Unverified,
+    Unverified(Unverified),
 }
 
 /// Settles one record the feed holds: refuses it, or carries it out and acknowledges it.
@@ -872,7 +889,7 @@ async fn settle(
                 controller.authority_feed_settled(id, shared.host_device_id);
                 Ok(Settled::Done)
             }
-            Replay::Unverified => Ok(Settled::Unverified),
+            Replay::Unverified(found) => Ok(Settled::Unverified(found)),
         };
     }
     Ok(

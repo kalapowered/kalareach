@@ -706,6 +706,9 @@ pub struct Controller {
     /// a transaction cannot take that lock again. Work admitted before a refusal rose is held to
     /// it here ([`Controller::feed_refusal`]).
     feed_refusal: std::sync::atomic::AtomicU8,
+    /// What a withdrawal the feed shows complete and this host cannot verify names, while one
+    /// stands: the devices, and the keys they hold, that keep no standing over the feed.
+    feed_withheld: std::sync::Mutex<remote_revocation::Withheld>,
     /// What this daemon has told its session workers the host's local owner may do, and what each
     /// has acknowledged.
     local_access: local_access::LocalAccessState,

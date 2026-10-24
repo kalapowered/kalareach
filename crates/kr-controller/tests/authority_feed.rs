@@ -906,19 +906,24 @@ impl Rig {
     }
 }
 
-/// KR-REQ-24.15: a withdrawal the feed shows complete that the host cannot verify keeps remote
-/// access refused until the owner at the machine acts.
-///
-/// The registry is put back to before an owner was paired, and that owner's completed revocation
-/// is in the feed. The registry holds the device it named live and no owner to say whose word that
-/// was, so the host does not serve the device, and does not serve any other remote device either.
-/// Every pass reads the record again. The owner at the machine revokes the device, and the host
-/// serves the others again while the device stays revoked.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_refused_until_the_owner_at_the_machine_acts()
- {
+/// A host whose registry was put back to before an owner was paired, with the feed showing that
+/// owner's completed withdrawal of a device the registry holds live.
+struct Unverifiable {
+    rig: Rig,
+    /// The device the withdrawal names.
+    victim: (Device, kr_controller::service::net::devices::DeviceRecord),
+    /// A device it does not name.
+    kept: (Device, kr_controller::service::net::devices::DeviceRecord),
+}
+
+/// Pairs the device the withdrawal will name with `victim_rights` and one it will not, takes a copy
+/// of the registry, pairs another owner, has that owner withdraw the first device from the feed,
+/// carries it out, and puts the registry back to the copy.
+async fn a_withdrawal_by_an_owner_the_host_does_not_know(
+    victim_rights: &[ActionRight],
+) -> Unverifiable {
     let rig = Rig::start().await;
-    let victim = rig.pairs(&[ActionRight::SessionView]).await;
+    let victim = rig.pairs(victim_rights).await;
     let kept = rig.pairs(&[ActionRight::SessionView]).await;
     rig.until_the_carrier_is_idle().await;
     let earlier = a_copy_of_the_registry(&rig.host, "registry-before-the-owner.sqlite3");
@@ -973,22 +978,39 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         .await;
     rig.until_the_carrier_is_idle().await;
     rig.until_the_carrier_is_idle().await;
+    Unverifiable { rig, victim, kept }
+}
 
-    let says_so = |outcome: &Result<(), kr_client::ClientError>| {
-        outcome.as_ref().is_err_and(|error| {
-            error
-                .to_string()
-                .contains("an owner this host does not know")
-        })
-    };
+fn says_an_owner_is_unknown(outcome: &Result<(), kr_client::ClientError>) -> bool {
+    outcome.as_ref().is_err_and(|error| {
+        error
+            .to_string()
+            .contains("an owner this host does not know")
+    })
+}
+
+/// KR-REQ-24.15: a withdrawal the feed shows complete that the host cannot verify keeps remote
+/// access refused until the owner at the machine acts.
+///
+/// The registry is put back to before an owner was paired, and that owner's completed revocation
+/// is in the feed. The registry holds the device it named live and no owner to say whose word that
+/// was, so the host does not serve the device, and does not serve any other remote device either.
+/// Every pass reads the record again. The owner at the machine revokes the device, and the host
+/// serves the others again while the device stays revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_refused_until_the_owner_at_the_machine_acts()
+ {
+    let Unverifiable { rig, victim, kept } =
+        a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView]).await;
+
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
-        says_so(&refused),
+        says_an_owner_is_unknown(&refused),
         "a device the feed does not name is refused, and told why: {refused:?}"
     );
     let refused = rig.answers(&victim.0, &victim.1).await;
     assert!(
-        says_so(&refused),
+        says_an_owner_is_unknown(&refused),
         "the device the withdrawal names is not served: {refused:?}"
     );
     let shown = rig.shown().await;
@@ -1026,6 +1048,45 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
             .is_some_and(|check| !check.detail().contains("an owner this host does not know")),
         "the host no longer waits"
     );
+}
+
+/// KR-REQ-24.15: a device a withdrawal the host cannot verify names keeps no standing over the
+/// feed. It is not among the keys the host names as permitted to remove the feed, so removing the
+/// feed does not end the refusal for it, while another owner's key is named and does. Else the
+/// device the withdrawal would take its standing from could lift the refusal itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_removing_the_feed() {
+    let Unverifiable { rig, victim, kept } = a_withdrawal_by_an_owner_the_host_does_not_know(&[
+        ActionRight::HostManage,
+        ActionRight::SessionView,
+    ])
+    .await;
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(says_an_owner_is_unknown(&refused), "{refused:?}");
+
+    let named = rig.feed_as_the_owner_sees_it().await.summary.removal_keys;
+    assert_eq!(
+        named,
+        vec![rig.owner.authorisation.key_id()],
+        "the owner the host knows is named, and the device the withdrawal names is not"
+    );
+    client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
+        .remove(rig.feed())
+        .await
+        .expect_err("a key the host does not name cannot remove the feed");
+    rig.poll().await;
+    let refused = rig.answers(&kept.0, &kept.1).await;
+    assert!(
+        says_an_owner_is_unknown(&refused),
+        "the refusal stands after the named device tried: {refused:?}"
+    );
+
+    // The control: the owner the host knows can remove the feed, and that ends the refusal.
+    rig.the_feed_removes_the_host().await;
+    let session = connect(&rig.host, &kept.0, &kept.1).await;
+    rig.doctor_as(&session)
+        .await
+        .expect("the other device is served once the feed is removed");
 }
 
 /// KR-REQ-24.15: a request on a page the scan has left behind is judged before the feed counts as

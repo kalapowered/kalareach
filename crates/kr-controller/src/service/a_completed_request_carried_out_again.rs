@@ -114,19 +114,24 @@ async fn a_completed_request_is_carried_out_again_only_when_its_issuer_could_man
         "a request of a device that could not manage the host is not carried out"
     );
 
+    let stranger = DeviceId::new(Uuid::from_bytes([9; 16]));
+    let request = signed(&controller, &stranger_key, stranger, kept.device_id, 9);
+    let Replay::Unverified(found) = controller
+        .replay_feed_request(&request)
+        .await
+        .expect("the stranger's request is passed over")
+    else {
+        panic!("an issuer this host does not hold is neither obeyed nor dismissed");
+    };
     assert_eq!(
-        controller
-            .replay_feed_request(&signed(
-                &controller,
-                &stranger_key,
-                DeviceId::new(Uuid::from_bytes([9; 16])),
-                kept.device_id,
-                9,
-            ))
-            .await
-            .expect("the stranger's request is passed over"),
-        Replay::Unverified,
-        "an issuer this host does not hold is neither obeyed nor dismissed"
+        found.issuers,
+        [(stranger, request.issuer_key_id)].into_iter().collect(),
+        "it names the issuer it says made the request"
+    );
+    assert_eq!(
+        found.devices,
+        [kept.device_id].into_iter().collect(),
+        "and the device it would withdraw"
     );
     assert!(
         !is_revoked(&controller, kept.device_id),
@@ -308,18 +313,21 @@ async fn a_completed_request_whose_key_only_a_revoked_device_holds_is_left_unver
         .revoke(first.device_id, TimestampMs::new(2))
         .expect("the first pairing is revoked");
 
-    assert_eq!(
-        controller
-            .replay_feed_request(&signed(
-                &controller,
-                &key,
-                DeviceId::new(Uuid::from_bytes([10; 16])),
-                named.device_id,
-                9,
-            ))
-            .await
-            .expect("the request is left"),
-        Replay::Unverified
+    assert!(
+        matches!(
+            controller
+                .replay_feed_request(&signed(
+                    &controller,
+                    &key,
+                    DeviceId::new(Uuid::from_bytes([10; 16])),
+                    named.device_id,
+                    9,
+                ))
+                .await
+                .expect("the request is left"),
+            Replay::Unverified(_)
+        ),
+        "the host cannot place the key"
     );
     assert!(
         !is_revoked(&controller, named.device_id),
