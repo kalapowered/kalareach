@@ -1714,9 +1714,116 @@ async fn a_record_that_cannot_be_read_is_set_aside_and_its_hosts_are_marked_lost
     }
 }
 
+/// A phone with one host turned on, whose record is then replaced by `bytes`. The host is returned
+/// to keep it running.
+async fn a_phone_whose_record_was_spoiled(bytes: &[u8]) -> (Host, Desk) {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    let record = phone._phone.data.path().join("push").join("push.json");
+    kr_ipc::paths::write_owner_only_file(&record, bytes).expect("the record is spoiled");
+    (host, phone)
+}
+
+/// The desk, opened again over the phone's record.
+fn reopened(phone: &Desk) -> Opened {
+    open_over(
+        phone._phone.data.path(),
+        &phone.device,
+        &phone.receiver,
+        &phone.registered,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+/// A start that ends after it set the record aside and before it wrote the marks leaves no record
+/// and one set aside: the next start marks the hosts then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_ended_after_setting_the_record_aside_marks_the_hosts_at_the_next() {
+    let (_host, phone) = a_phone_whose_record_was_spoiled(b"{ not a record").await;
+    let data = phone._phone.data.path();
+    let record = data.join("push").join("push.json");
+    drop(reopened(&phone));
+    assert_eq!(set_aside(data).len(), 1);
+    std::fs::remove_file(&record).expect("the marks are lost with the end of the start");
+
+    let restarted = reopened(&phone);
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+    assert!(record.exists(), "the marks were written");
+    assert_eq!(set_aside(data).len(), 1, "set aside once");
+}
+
+/// A start that cannot read the paired hosts cannot say which to mark: the record stays where it
+/// is, and the next start that can read them sets it aside and marks them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_could_not_read_the_paired_hosts_leaves_the_record_for_the_next() {
+    let (_host, phone) = a_phone_whose_record_was_spoiled(b"{ not a record").await;
+    let data = phone._phone.data.path();
+    let file = find(data, "hosts.json").expect("the paired hosts' file");
+    let kept = std::fs::read(&file).expect("the paired hosts");
+    std::fs::write(&file, b"{ not a list").expect("spoiled");
+    drop(reopened(&phone));
+    assert!(set_aside(data).is_empty(), "it was left where it is");
+    std::fs::write(&file, kept).expect("mended");
+
+    let restarted = reopened(&phone);
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+    assert_eq!(set_aside(data).len(), 1, "now it was set aside");
+}
+
+/// A lost host the person started over is an ordinary host again: a try that stops is tried again
+/// by a look, and is not left to the person for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_host_the_person_started_over_is_tried_again_like_any_other() {
+    let (_host, phone) = a_phone_whose_record_was_spoiled(b"{ not a record").await;
+    let restarted = reopened(&phone);
+    let reference = phone.references().remove(0);
+    // The run's own read of the token for the registration is answered, the one for its comparison is not.
+    phone.receiver.with(|state| {
+        state.token_readable_for = Some(state.token_reads + 1);
+    });
+    restarted
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    eventually("the run ended", || Arc::strong_count(&restarted.desk) == 1).await;
+    let view = restarted.desk.view();
+    assert_eq!(view.hosts[0].state, PushState::NeedsAttention);
+    assert!(
+        view.hosts[0].words.contains("notification token"),
+        "it stopped for want of the token, and is no longer lost: {}",
+        view.hosts[0].words
+    );
+
+    phone.receiver.with(|state| state.token_readable_for = None);
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+}
+
+/// Whether this account ignores file permissions, as one that owns the machine does: a case that
+/// takes access away has nothing to show for it, and says so.
+#[cfg(unix)]
+fn ignores_permissions(path: &Path, case: &str) -> bool {
+    if std::fs::read(path).is_ok() || std::fs::read_dir(path).is_ok() {
+        eprintln!("{case}: skipped, this account reads what it was refused");
+        return true;
+    }
+    false
+}
+
 /// A record that the system fails to read may be fine at the next start: it is left where it is,
-/// nothing is written until a start can read it, and the person can still turn a host on, in
-/// memory.
+/// nothing is written until a start can read it, no host is started in the meantime, and the page
+/// says to start the application again.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over() {
@@ -1724,8 +1831,7 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
 
     let owner = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner).await;
-    let receiver = Receiver::new(FIRST_TOKEN);
-    let phone = desk(&[&host], &owner, Arc::clone(&receiver)).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
     phone.desk.enable(&reference).expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
@@ -1734,28 +1840,27 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
     let original = std::fs::read(&record).expect("the record");
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000))
         .expect("the record is made unreadable");
-    if std::fs::read(&record).is_ok() {
-        // An account that ignores file permissions reads it all the same: nothing to show.
+    if ignores_permissions(&record, "a_record_the_system_fails_to_read") {
         return;
     }
 
-    let restarted = open_over(
-        data,
-        &phone.device,
-        &receiver,
-        &phone.registered,
-        Arc::new(AtomicBool::new(false)),
-    );
+    let restarted = reopened(&phone);
     assert_eq!(
         restarted.desk.view().hosts[0].state,
         PushState::NeedsAttention
     );
     assert!(set_aside(data).is_empty(), "it was left where it is");
+    // Neither turning the host on nor forgetting it changes the record.
     restarted
         .desk
         .enable(&reference)
         .expect("the person asks again");
-    states_until(&restarted.desk, |states| states == [PushState::On]).await;
+    let paired = phone
+        .device
+        .host_by_reference(&reference)
+        .expect("the host");
+    restarted.desk.forgotten(paired.host_device_id);
+    assert_eq!(Arc::strong_count(&restarted.desk), 1, "no run was started");
 
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
         .expect("the record is made readable");
@@ -1764,4 +1869,45 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
         original,
         "nothing was written over it"
     );
+}
+
+/// A record that was read and is not one this build knows, and that cannot be moved aside, is left
+/// where it is and is not written over, even when the directory can be written to again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_could_not_be_set_aside_is_not_written_over() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_host, phone) = a_phone_whose_record_was_spoiled(b"{ not a record").await;
+    let data = phone._phone.data.path();
+    let directory = data.join("push");
+    let record = directory.join("push.json");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made unwritable");
+    if std::fs::write(directory.join("probe"), b"").is_ok() {
+        eprintln!(
+            "a_record_that_could_not_be_set_aside: skipped, this account writes where it was refused"
+        );
+        return;
+    }
+
+    let restarted = reopened(&phone);
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention
+    );
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is made writable again");
+    let reference = phone.references().remove(0);
+    restarted
+        .desk
+        .enable(&reference)
+        .expect("the person asks again");
+    assert_eq!(Arc::strong_count(&restarted.desk), 1, "no run was started");
+    assert_eq!(
+        std::fs::read(&record).expect("the record"),
+        b"{ not a record",
+        "nothing was written over it"
+    );
+    assert!(set_aside(data).is_empty());
 }
