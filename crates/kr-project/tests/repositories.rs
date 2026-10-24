@@ -1,7 +1,7 @@
 //! Project repositories: identity, authorised destinations, staged publication, the credential
 //! rule and the reconciliation of an interrupted publish.
 //!
-//! KR-REQ-06.09, 14.06, 14.17, 14.18, 14.19, 23.42.
+//! KR-REQ-14.06, 14.17, 14.18, 14.19, 23.42.
 //!
 //! Every test here asks the project service to run Git. On Windows it runs none: an application
 //! container cannot keep a repository from being executed from and cannot bound which ports a
@@ -216,6 +216,10 @@ fn an_existing_destination_is_refused_unless_the_adoption_flow_is_chosen() {
     assert!(refusal.to_string().contains("no checkout to adopt"));
 }
 
+/// KR-REQ-06.09, the part about `project_repository_id`: the creation action sent twice is
+/// answered with the one `project_repository_id` and a listing that names one repository. Not
+/// shown here: `workspace_id`, the change set identifier and version, the workflow identifiers and
+/// `causal_root_id`.
 #[test]
 fn two_copies_of_one_creation_action_produce_one_repository() {
     let fixture = Fixture::create();
@@ -1533,6 +1537,10 @@ fn a_recorded_staging_name_whose_object_was_replaced_is_left_alone() {
     );
 }
 
+/// KR-REQ-06.09, the part about `project_repository_id`: a creation repeated after a recovery
+/// settled the claim an earlier daemon left open is answered with the `project_repository_id` the
+/// first creation gave. Not shown here: `workspace_id`, the change set identifier and version, the
+/// workflow identifiers and `causal_root_id`.
 #[test]
 fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
     // A claim is opened with the state it changes and filled in when the effect settles, so a

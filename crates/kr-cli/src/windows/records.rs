@@ -619,6 +619,10 @@ mod tests {
         )
     }
 
+    /// KR-REQ-08.54, the part about the legacy VT input path: what a record becomes in it is its
+    /// text and nothing else, so no scan code is sent. A repeat is that many characters, a key
+    /// coming up says nothing, a dead key carries no character and a surrogate pair is put back
+    /// together as its character. Not shown here: the fidelity a session reports for it.
     #[test]
     fn legacy_input_carries_the_text_and_nothing_it_cannot_say() {
         let mut reader = encoder();
