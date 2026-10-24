@@ -1418,9 +1418,10 @@ delay, the wait and the request after it can take, so a service that is slow and
 ends the presentation as unreachable; a caller may give it less (a visit and a listing give ten
 seconds for the dial, the presentation and the reads together). A request its caller gives up on
 counts as one the service did not answer: the keeper sends none for a minute after it, the request
-for the chain of keys that a presentation already under way makes after its lease included. The hold
-is against the service only: a connection presents the lease the keeper holds whatever is held, and
-one that has none is told the stop. A chain the host does not accept is tried
+for the chain of keys that a presentation already under way makes after its lease included. A request
+already sent is not recalled, so the hold covers what is asked after the caller gave up, and not the
+answer to a request that was already on its way. The hold is against the service only: a connection
+presents the lease the keeper holds whatever is held, and one that has none is told the stop. A chain the host does not accept is tried
 three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
 and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no longer takes
 the sign-in (`TokenRefused`), when the account is not a member, or when the host refuses the lease
