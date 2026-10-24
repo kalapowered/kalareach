@@ -102,21 +102,37 @@ fn fingerprint(path: &Path) -> String {
     }
 }
 
+/// One case at a time writes the account's profiles: they are the account's, and a second case that
+/// saved them while the first had written would put the first's entries back.
+static PROFILE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The two profile files PowerShell reads for this account, as they were before a case wrote to
 /// them, and the directories above them that did not exist; put back when this is dropped.
+///
+/// What was in a file is also kept in a file of its own, so a run that is stopped halfway leaves the
+/// bytes to put back as well as the entries to take out.
 struct Profiles {
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
     made: Vec<PathBuf>,
+    _copies: tempfile::TempDir,
+    _writer: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Profiles {
     /// Records the files the package's own PowerShell names for the account.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a file that is there cannot be read, since it could not be put back.
     fn saved(package: &ShellPackage) -> Self {
         assert!(
             std::env::var(PROFILE_SWITCH).is_ok_and(|value| value == "1"),
             "this case writes the account's PowerShell profiles; set {PROFILE_SWITCH}=1 where that \
              is allowed"
         );
+        let writer = PROFILE_WRITER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let layout = HomeLayout::from_environment().launching(PowerShell::of_package(package));
         let mut paths: Vec<PathBuf> = layout
             .targets(ShellKind::PowerShell)
@@ -140,32 +156,54 @@ impl Profiles {
                 parent = directory.parent();
             }
         }
+        let copies = tempfile::Builder::new()
+            .prefix("kr-profile-copies-")
+            .tempdir()
+            .expect("a directory on the internal disk");
         let files = paths
             .into_iter()
-            .map(|path| {
+            .enumerate()
+            .map(|(number, path)| {
                 eprintln!(
                     "profile before: {} sha256={}",
                     path.display(),
                     fingerprint(&path)
                 );
-                let before = std::fs::read(&path).ok();
+                let before = match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        std::fs::write(copies.path().join(format!("profile-{number}")), &bytes)
+                            .expect("a copy of the profile");
+                        Some(bytes)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        panic!("{} cannot be read to be put back: {error}", path.display())
+                    }
+                };
                 (path, before)
             })
             .collect();
-        Self { files, made }
+        Self {
+            files,
+            made,
+            _copies: copies,
+            _writer: writer,
+        }
     }
 }
 
 impl Drop for Profiles {
     fn drop(&mut self) {
         for (path, before) in &self.files {
-            match before {
-                Some(bytes) => {
-                    let _ = std::fs::write(path, bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(path);
-                }
+            let restored = match before {
+                Some(bytes) => std::fs::write(path, bytes),
+                None => match std::fs::remove_file(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            if let Err(error) = restored {
+                eprintln!("PROFILE NOT RESTORED: {}: {error}", path.display());
             }
             eprintln!(
                 "profile after: {} sha256={}",
@@ -424,50 +462,170 @@ async fn a_default_session_is_refused_without_the_entry_and_managed_with_it() {
     assert!(closed.status.success());
 }
 
-/// KR-REQ-12.07, KR-REQ-07.45: the bundled Claude Code
-/// and Qoder CLI packages, with their integrations turned on, launch the program a person types
-/// in the managed shell through the forwarder, which adds the flags each package declares and
-/// gives the program the variables of its registration. The control is the same program started
-/// by its path, which is not integrated and runs as typed.
+/// The directory the bundle ships a package in.
+fn bundled_package(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bundled-plugins/targets/packages/kalareach")
+        .join(name)
+        .join("0.5.0")
+}
+
+/// Publishes the package in `directory` in a signed generation of its own, enrols that repository,
+/// and installs and enables the package as the owner who confirmed what it may do, before any
+/// daemon opens the catalogue. Returns the directory the generation is published in, which has to
+/// stay while the daemon runs.
+///
+/// The capabilities granted are the ones the manifest asks for but a native bridge's: that one
+/// writes into the person's own agent directory, and nothing here may.
+async fn install_package(
+    prepared: &Prepared,
+    directory: &Path,
+    repository: &str,
+    withheld: &[PluginCapability],
+) -> tempfile::TempDir {
+    let environment = prepared.tree.environment();
+    let environment_id = environment.environment_id();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("plugin.json")).expect("a manifest"))
+            .expect("a manifest");
+    let plugin = PluginId::new(format!(
+        "{}/{}",
+        manifest["publisher_id"].as_str().expect("a publisher"),
+        manifest["plugin_name"].as_str().expect("a name")
+    ))
+    .expect("a plugin identifier");
+    let version = kr_plugin_sdk::version::PackageVersion::parse(
+        manifest["version"].as_str().expect("a version"),
+    )
+    .expect("a version");
+    let grants: Vec<PluginCapability> = manifest["capabilities"]
+        .as_array()
+        .expect("capabilities")
+        .iter()
+        .map(|entry| {
+            serde_json::from_value(entry["capability"].clone()).expect("a known capability")
+        })
+        .filter(|capability| !withheld.contains(capability))
+        .collect();
+
+    let generation_home = tempfile::tempdir().expect("a directory on the internal disk");
+    let generation = generations::Generation::build(
+        generation_home.path(),
+        generations::GenerationSpec {
+            package: Some(directory.to_path_buf()),
+            ..generations::GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = Catalogue::open(
+        &environment.state_dir().join("catalogue"),
+        std::sync::Arc::new(RepositoryTransport::local_only(
+            "this test reads its repository from disk",
+        )),
+    )
+    .expect("an openable catalogue");
+    let id = RepositoryId::new(repository).expect("an identifier");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                id.clone(),
+                RepositoryKind::Local,
+                generations::directory_url(&generation.metadata_dir()),
+                generations::directory_url(&generation.targets_dir()),
+                generation.root_bytes(),
+                kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    catalogue.sync(&id).await.expect("a generation");
+    let digest = catalogue
+        .index(&id)
+        .expect("activated")
+        .find(&plugin, &version)
+        .expect("the package")
+        .manifest_digest;
+    catalogue
+        .install_with(
+            &id,
+            environment_id,
+            &plugin,
+            &version,
+            digest,
+            InstallationGrant::with(grants),
+            None,
+            &mut Change::new(&Owner::confirming()),
+        )
+        .await
+        .expect("installed");
+    catalogue
+        .set_enabled(environment_id, &plugin, true)
+        .await
+        .expect("enabled");
+    generation_home
+}
+
+/// KR-REQ-12.07, KR-REQ-07.45: the bundled Claude Code and Qoder CLI packages (the release's own
+/// files, published in a generation of the test's own), with their integrations turned on, launch
+/// the program a person types in the managed shell through the forwarder, which adds the flags
+/// each package declares and gives the program the variables of its registration. The controls are
+/// the same program started by its path, which is not integrated and runs as typed, and a shim
+/// found first, which is never launched through the forwarder.
 ///
 /// The programs are copies of the command shell, which prints what it is given after `/c` once it
-/// has expanded the variables in it, so the launch is read from what the program printed.
+/// has expanded the variables in it, so the launch is read from what the program printed. Each
+/// marker the case waits for is one the typed line cannot spell, since the terminal echoes the line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = writes_profiles!()]
 async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the_forwarder() {
-    let managed = Managed::start(Prepared::new()).await;
-    managed.host.seed_bundled_agents().await;
+    // Gemini CLI's hooks are for a POSIX shell, so the release does not publish its package for
+    // Windows.
+    let gemini: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(bundled_package("gemini-cli").join("plugin.json")).expect("a manifest"),
+    )
+    .expect("a manifest");
+    assert!(
+        !gemini["platforms"]
+            .as_array()
+            .expect("platforms")
+            .iter()
+            .any(|platform| platform["os"] == "windows"),
+        "Gemini CLI's package is published for Windows"
+    );
+
+    let prepared = Prepared::new();
+    let withheld = [PluginCapability::NativeBridgeInstall];
+    let _claude_published = install_package(
+        &prepared,
+        &bundled_package("claude-code"),
+        "claude",
+        &withheld,
+    )
+    .await;
+    let _qoder_published =
+        install_package(&prepared, &bundled_package("qoder-cli"), "qoder", &withheld).await;
+    let managed = Managed::start(prepared).await;
     managed.install_entries().await;
     for plugin in ["kalareach/claude-code", "kalareach/qoder-cli"] {
         let enabled = managed
             .host
             .kr(&["--json", "plugin", "integration", "enable", plugin], &[])
             .await;
-        eprintln!(
-            "kr plugin integration enable {plugin}: {}{}",
+        assert!(
+            enabled.status.success(),
+            "{}{}",
             String::from_utf8_lossy(&enabled.stdout),
             String::from_utf8_lossy(&enabled.stderr)
         );
-        eprintln!(
-            "the doctor on {plugin}: {}",
-            integration_report(&managed.host, plugin).await
+        let report = integration_report(&managed.host, plugin).await;
+        eprintln!("the doctor on {plugin}: {report}");
+        assert!(
+            report.contains("\"state\":\"on\""),
+            "the doctor does not read {plugin}'s integration as on: {report}"
         );
-        assert!(enabled.status.success());
     }
-
-    // Which of the bundled agents this host offers: Gemini CLI's hooks are for a POSIX shell, so
-    // its package is not published for Windows and is not here.
-    let listed = managed.host.kr(&["--json", "plugin", "list"], &[]).await;
-    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
-    eprintln!("the plugins this host holds: {listed}");
-    assert!(
-        listed.contains("kalareach/claude-code") && listed.contains("kalareach/qoder-cli"),
-        "{listed}"
-    );
-    assert!(
-        !listed.contains("kalareach/gemini-cli"),
-        "Gemini CLI is offered on Windows: {listed}"
-    );
 
     let programs = stand_ins();
     let claude = stand_in(programs.path(), "claude");
@@ -477,8 +635,10 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     answering(&mut terminal).await;
     first_on_the_path(&mut terminal, programs.path()).await;
 
+    // `^n` is `n` to the command shell, so the line the terminal echoes does not hold the marker
+    // the program prints.
     terminal
-        .type_line("claude /c echo claude-reg^=%KR_REGISTRATION% claude-end")
+        .type_line("claude /c echo claude-reg^=%KR_REGISTRATION% claude-e^nd")
         .await;
     terminal
         .shown("claude-end", "the program started by its name prints")
@@ -486,7 +646,10 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     let printed = after(&terminal, "claude-reg=");
     eprintln!("claude printed: {printed}");
     assert!(
-        !printed.starts_with('%'),
+        printed
+            .split_whitespace()
+            .next()
+            .is_some_and(|registration| !registration.is_empty() && !registration.starts_with('%')),
         "the program was given no registration: {printed}"
     );
     assert!(
@@ -496,7 +659,7 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     );
 
     terminal
-        .type_line("qodercli /c echo qoder-reg^=%KR_REGISTRATION% qoder-end")
+        .type_line("qodercli /c echo qoder-reg^=%KR_REGISTRATION% qoder-e^nd")
         .await;
     terminal
         .shown("qoder-end", "the program started by its name prints")
@@ -504,7 +667,10 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     let printed = after(&terminal, "qoder-reg=");
     eprintln!("qodercli printed: {printed}");
     assert!(
-        !printed.starts_with('%'),
+        printed
+            .split_whitespace()
+            .next()
+            .is_some_and(|registration| !registration.is_empty() && !registration.starts_with('%')),
         "the program was given no registration: {printed}"
     );
     assert!(
@@ -515,7 +681,7 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
     // The control: the same program started by its path is not asked about and runs as typed.
     terminal
         .type_line(&format!(
-            "& '{}' /c echo path-reg^=%KR_REGISTRATION% path-end",
+            "& '{}' /c echo path-reg^=%KR_REGISTRATION% path-e^nd",
             claude.display()
         ))
         .await;
@@ -524,7 +690,7 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
         .await;
     let printed = after(&terminal, "path-reg=");
     assert!(
-        printed.starts_with('%') || printed.starts_with(' '),
+        printed.starts_with('%'),
         "a program started by its path was given a registration: {printed}"
     );
     assert!(
@@ -573,25 +739,19 @@ async fn the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the
         .await;
 }
 
-/// The package the third case installs: Claude Code's integration and connector, with the
-/// built test component in it, and Windows among the platforms it is published for.
-async fn install_component_package(prepared: &Prepared, component: &[u8]) {
-    let environment = prepared.tree.environment();
-    let environment_id = environment.environment_id();
-    let written = prepared.tree.root().join("written");
+/// Claude Code's integration and connector as the test fixtures shape them, with the built test
+/// component in it and Windows among the platforms it is published for, written under `into`.
+fn component_package(into: &Path, component: &[u8]) -> PathBuf {
     let shape = kr_worker::broker::connectors::fixture::Shape {
         native_bridge: false,
         component: true,
         ..kr_worker::broker::connectors::fixture::Shape::claude_code()
     };
-    let source = kr_worker::broker::connectors::fixture::package(
-        &written,
-        &prepared.tree.root().join("kr-hook.exe"),
-        &shape,
-    )
-    .expect("the package is written");
-    // The fixture's component is a stand-in for the bytes, and its platforms are the Unix ones.
-    let directory = &source.package_dir;
+    let source =
+        kr_worker::broker::connectors::fixture::package(into, &into.join("kr-hook.exe"), &shape)
+            .expect("the package is written");
+    // The fixture's component stands for the bytes, and its platforms are the Unix ones.
+    let directory = source.package_dir;
     std::fs::write(directory.join("component.wasm"), component).expect("the component");
     let manifest_path = directory.join("plugin.json");
     let mut manifest: serde_json::Value =
@@ -613,75 +773,7 @@ async fn install_component_package(prepared: &Prepared, component: &[u8]) {
         serde_json::to_vec_pretty(&manifest).expect("a manifest"),
     )
     .expect("the manifest");
-
-    let generation_home = tempfile::tempdir().expect("a directory on the internal disk");
-    let generation = generations::Generation::build(
-        generation_home.path(),
-        generations::GenerationSpec {
-            package: Some(source.package_dir.clone()),
-            ..generations::GenerationSpec::default()
-        },
-    )
-    .await;
-    let plugin = PluginId::new("kalareach/claude-code").expect("a plugin identifier");
-    let mut catalogue = Catalogue::open(
-        &environment.state_dir().join("catalogue"),
-        std::sync::Arc::new(RepositoryTransport::local_only(
-            "this test reads its repository from disk",
-        )),
-    )
-    .expect("an openable catalogue");
-    let id = RepositoryId::new("development").expect("an identifier");
-    catalogue
-        .enrol(
-            Enrolment::new(
-                id.clone(),
-                RepositoryKind::Local,
-                generations::directory_url(&generation.metadata_dir()),
-                generations::directory_url(&generation.targets_dir()),
-                generation.root_bytes(),
-                kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
-                CapabilityCeiling::default_ceiling(),
-            )
-            .expect("an enrollable repository"),
-            true,
-        )
-        .expect("the owner adopted the root");
-    catalogue.sync(&id).await.expect("a generation");
-    let version = kr_plugin_sdk::version::PackageVersion::parse("0.3.0").expect("a version");
-    let digest = catalogue
-        .index(&id)
-        .expect("activated")
-        .find(&plugin, &version)
-        .expect("the package")
-        .manifest_digest;
-    catalogue
-        .install_with(
-            &id,
-            environment_id,
-            &plugin,
-            &version,
-            digest,
-            InstallationGrant::with([
-                PluginCapability::MetadataMatch,
-                PluginCapability::DeclarativePresentation,
-                PluginCapability::BrokerSemanticEvents,
-                PluginCapability::UpstreamAction,
-                PluginCapability::ApprovalDecode,
-                PluginCapability::ApprovalRespond,
-                PluginCapability::CommandIntegrationLaunch,
-            ]),
-            None,
-            &mut Change::new(&Owner::confirming()),
-        )
-        .await
-        .expect("installed");
-    catalogue
-        .set_enabled(environment_id, &plugin, true)
-        .await
-        .expect("enabled");
-    // The generation's files are read when the package is admitted, so they stay for the case.
-    std::mem::forget(generation_home);
+    directory
 }
 
 /// Loads the built test component, or says how to build it.
@@ -709,7 +801,9 @@ fn well_behaved() -> Vec<u8> {
 async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_windows() {
     let component = well_behaved();
     let prepared = Prepared::new();
-    install_component_package(&prepared, &component).await;
+    let package = tempfile::tempdir().expect("a directory on the internal disk");
+    let directory = component_package(package.path(), &component);
+    let _published = install_package(&prepared, &directory, "development", &[]).await;
     let managed = Managed::start(prepared).await;
     managed.install_entries().await;
     let enabled = managed
@@ -733,16 +827,21 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     );
 
     let environment = managed.host.tree.environment();
-    assert!(
+    let published = || {
         kr_plugin_service::launcher::read_descriptor(
             &environment,
-            &kr_plugin_service::protocol::HostProtocol::THIS
+            &kr_plugin_service::protocol::HostProtocol::THIS,
         )
         .ok()
         .flatten()
-        .is_none(),
+    };
+    assert!(
+        published().is_none(),
         "a plugin host was published before any program was typed"
     );
+    // The plugin host is the environment's own job, which no test teardown ends: it goes when this
+    // case does, whatever way the case goes.
+    let _host_ends = HostEnding(&published);
 
     let programs = stand_ins();
     let _claude = stand_in(programs.path(), "claude");
@@ -751,10 +850,11 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     answering(&mut terminal).await;
     first_on_the_path(&mut terminal, programs.path()).await;
 
-    // The program waits for a while, then the line ends: `rem` takes the flags the integration
-    // adds after what was typed, so they reach the command shell as a comment.
+    // The program waits for a line to be typed to it, then the line ends; `rem` takes the flags the
+    // integration adds after what was typed, so they reach the command shell as a comment. The
+    // binding lasts as long as the program does, which is until this case says so.
     terminal
-        .type_line("claude /c 'ping -n 60 127.0.0.1 > nul & rem'")
+        .type_line("claude /c 'set /p kr_release=waiting & rem'")
         .await;
 
     let controller = managed.host.controller();
@@ -779,17 +879,45 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     };
     assert_eq!(registered, [ComponentState::Registered]);
 
-    let published = kr_plugin_service::launcher::read_descriptor(
-        &environment,
-        &kr_plugin_service::protocol::HostProtocol::THIS,
-    )
-    .ok()
-    .flatten()
-    .expect("the plugin host is published");
-    eprintln!("plugin host published: {published:?}");
+    let host = published().expect("the plugin host is published");
+    eprintln!("plugin host published: {host:?}");
     let client = kr_plugin_service::client::PluginClient::connect(&environment)
         .await
         .expect("the plugin host answers");
     let health = client.health().await.expect("the host reports its health");
     assert_eq!(health.live_bindings, 1, "{health:?}");
+
+    // The program ends when it is given its line, and the shell comes back.
+    terminal.type_line("").await;
+    answering(&mut terminal).await;
+}
+
+/// Ends the plugin host that was published when this is dropped, by the identity it was started
+/// under.
+struct HostEnding<'a, F: Fn() -> Option<kr_plugin_service::protocol::HostDescriptor>>(&'a F);
+
+impl<F: Fn() -> Option<kr_plugin_service::protocol::HostDescriptor>> Drop for HostEnding<'_, F> {
+    fn drop(&mut self) {
+        use kr_ipc::identity::{ProcessState, Stop, stop_process};
+
+        let Some(host) = (self.0)() else {
+            return;
+        };
+        let process = host.process_start_identity;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let _ = stop_process(&process, Stop::Kill);
+            if kr_ipc::identity::process_state(&process) == ProcessState::Ended
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!(
+            "plugin host {} is {:?}",
+            process.pid.get(),
+            kr_ipc::identity::process_state(&process)
+        );
+    }
 }
