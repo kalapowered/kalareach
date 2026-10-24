@@ -8,6 +8,10 @@
 //! This module is the application's half: it sequences those steps for one host, remembers where
 //! each stands, and says so in words.
 //!
+//! The host is reached before the gateway issues its credential: an issue stops the credential the
+//! host holds at once, so a host that cannot be reached keeps the one it has and the person is
+//! told so.
+//!
 //! # What the person sees
 //!
 //! One action per host, "turn on notifications", and where it stands: off, working, on, or needing
@@ -1118,14 +1122,6 @@ impl PushDesk {
         if !self.wanted(host.host_device_id, run) {
             return Err(forgotten_host());
         }
-        let issued = gateway
-            .issue(PushSenderIssueRequest {
-                host_endpoint_key: host.host_endpoint_id,
-                host_signing_key: host.host_keys.authorisation,
-                sender_record_id,
-            })
-            .await
-            .map_err(|error| gateway_words(&error))?;
         let keys = &self.device.identity().keys;
         // The person can forget the host during any of the waits that follow, so the host is
         // sent nothing until the run is asked about again: before the connection, after it, and
@@ -1150,6 +1146,19 @@ impl PushDesk {
             .connect(host, reach)
             .await
             .map_err(|words| not_taken(LineStop::Host(words)))?;
+        if !wanted() {
+            return Err(forgotten_host());
+        }
+        // The gateway issues once the host is reached: an issue replaces the credential the host
+        // holds at once, so a host that cannot be reached keeps the one it has.
+        let issued = gateway
+            .issue(PushSenderIssueRequest {
+                host_endpoint_key: host.host_endpoint_id,
+                host_signing_key: host.host_keys.authorisation,
+                sender_record_id,
+            })
+            .await
+            .map_err(|error| gateway_words(&error))?;
         if !wanted() {
             return Err(forgotten_host());
         }
