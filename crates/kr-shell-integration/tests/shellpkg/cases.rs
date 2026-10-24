@@ -3891,8 +3891,9 @@ pub fn an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered() {
 /// could not be read proves nothing.
 fn linked_libraries(file: &Path) -> Vec<String> {
     if cfg!(target_os = "macos") {
+        // Every architecture of a universal file, not the one the host would run.
         let output = std::process::Command::new("otool")
-            .arg("-l")
+            .args(["-arch", "all", "-l"])
             .arg(file)
             .output()
             .expect("otool to run");
