@@ -69,10 +69,13 @@ fn build() -> BuildId {
 /* -------------------------------------------------------------------------------------------- */
 
 /// The keys this process's releases are signed with: the channel root's own key, the key it names
-/// for its targets role, and one key it names for nothing.
+/// for its targets role, the keys it names for its snapshot and timestamp roles, and one key it
+/// names for nothing.
 struct Keys {
     root: Ed25519KeyPair,
     targets: Ed25519KeyPair,
+    snapshot: Ed25519KeyPair,
+    timestamp: Ed25519KeyPair,
     /// The targets key a rotation of the channel's root names in place of `targets`.
     next_targets: Ed25519KeyPair,
     stranger: Ed25519KeyPair,
@@ -89,6 +92,8 @@ fn keys() -> &'static Keys {
         Keys {
             root: pair(),
             targets: pair(),
+            snapshot: pair(),
+            timestamp: pair(),
             next_targets: pair(),
             stranger: pair(),
         }
@@ -117,11 +122,31 @@ fn channel_root(version: u64, root_key: &Ed25519KeyPair, signers: &[&Ed25519KeyP
 }
 
 /// A channel root at `version` naming `root_key` for its root role and `targets_key` for its
-/// targets role, signed by each of `signers`.
+/// targets role, and the harness's own key for each of its other two roles, signed by each of
+/// `signers`.
 fn channel_root_naming(
     version: u64,
     root_key: &Ed25519KeyPair,
     targets_key: &Ed25519KeyPair,
+    signers: &[&Ed25519KeyPair],
+) -> String {
+    channel_root_over(
+        version,
+        [
+            root_key,
+            targets_key,
+            &keys().snapshot,
+            &keys().timestamp,
+        ],
+        signers,
+    )
+}
+
+/// A channel root at `version` naming `[root, targets, snapshot, timestamp]` for its four roles,
+/// whether or not they are four keys, signed by each of `signers`.
+fn channel_root_over(
+    version: u64,
+    [root_key, targets_key, snapshot_key, timestamp_key]: [&Ed25519KeyPair; 4],
     signers: &[&Ed25519KeyPair],
 ) -> String {
     use tough::schema::{RoleKeys, RoleType, Root, Signed};
@@ -133,13 +158,14 @@ fn channel_root_naming(
         _extra: HashMap::new(),
     };
     let mut keys_named = HashMap::new();
-    keys_named.insert(key_id(root_key), tough::sign::Sign::tuf_key(root_key));
-    keys_named.insert(key_id(targets_key), tough::sign::Sign::tuf_key(targets_key));
+    for pair in [root_key, targets_key, snapshot_key, timestamp_key] {
+        keys_named.insert(key_id(pair), tough::sign::Sign::tuf_key(pair));
+    }
     let mut roles = HashMap::new();
     roles.insert(RoleType::Root, named(root_key));
     roles.insert(RoleType::Targets, named(targets_key));
-    roles.insert(RoleType::Snapshot, named(root_key));
-    roles.insert(RoleType::Timestamp, named(root_key));
+    roles.insert(RoleType::Snapshot, named(snapshot_key));
+    roles.insert(RoleType::Timestamp, named(timestamp_key));
     let root = Root {
         spec_version: "1.0.0".to_owned(),
         consistent_snapshot: false,

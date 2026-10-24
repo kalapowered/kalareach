@@ -23,8 +23,13 @@ name.
 Each key is generated, held and pinned on its own, and none can sign what another signs. A host
 checks an update only against the channel root it trusts, which is the newer of the root of the release it runs and the one it recorded at its last switch, and a catalogue only against the
 root it adopted; a relay checks a lease only against the issuer keys it pins; and an organisation's
-lease or policy only against the chain the host enrolled for that organisation. A catalogue root
-that named one key for all four of its roles is refused by the pipeline that builds it.
+lease or policy only against the chain the host enrolled for that organisation. A root that names
+one key for two of its roles is refused where each is read: an update channel root by the release
+tool and by a host; a catalogue root only by the pipeline that builds a generation (it checks every
+root the generation ships), since a host's check of a catalogue root does not compare roles. The channel root names a key of its own for each of its four roles, the
+snapshot and timestamp roles included, though a host checks neither of them. A host that holds an
+update channel root made by an older `kr-release dev-keys`, which gave the root key to three roles,
+is installed again in a new store.
 
 No private key or official credential is written in a repository. `scripts/check-release-secrets.py
 scan --tracked` refuses a private key, a raw key seed or an official credential in this repository's

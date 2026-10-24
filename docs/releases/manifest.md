@@ -182,12 +182,19 @@ manifest again, refuses a `release.json` that is not what the tree makes, and si
 key. The channel's root names the keys that may sign and how many must; a release signed by one
 key of a two-key threshold, or by one key described twice, does not verify. A release key is an
 Ed25519 key of 32 bytes, the one spelling of a key; a root that names a key of another kind or
-size, or one key under two identifiers in a role, is refused. `check` refuses a tree whose `release.json` is not what the tree now makes, without signing.
+size, one key under two identifiers in a role, or one key for two roles, is refused: each role
+(root, targets, snapshot and timestamp) has keys of its own, so the key that signs a release signs
+nothing else. The tool and a host refuse such a root in the same place. A host that holds one,
+which only a root made by an older `kr-release dev-keys` is, is installed again in a new store.
+`check` refuses a tree whose `release.json` is not what the tree now makes, without signing.
 `--development` lets the record keep a pending class, which a release does not. `verify` is a host's
 own check of a release: the signatures against the root, then every file against the manifest.
 
 `kr-release dev-keys --out DIR` makes a root and the keys for it (`--signers N` sets how many keys
-must sign and how many are made, two by default). A run that proves the pipeline
+must sign and how many are made, two by default): `root-key.pk8`, `snapshot-key.pk8`,
+`timestamp-key.pk8` and one `targets-<n>.pk8` for each signer, with a root that names each role's own
+key. A host checks no snapshot or timestamp of the update channel, but a root has a key for each
+role, and each is a key of its own. A run that proves the pipeline
 signs with those and throws them away with the run; the channel's own keys are in hardware and on
 offline media, never in a tree, an archive or a repository.
 

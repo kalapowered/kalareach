@@ -13,7 +13,8 @@
 //! to sign a `release.json` that is not what the tree now makes, and signs it with each key.
 //! `verify` is a host's own check of a release: the signatures against the update channel's root,
 //! then every file against the manifest. `dev-keys` makes a root and the keys that sign for it, for
-//! a run that signs with nothing but keys of its own.
+//! a run that signs with nothing but keys of its own: a key for each of the root, snapshot and
+//! timestamp roles, and as many for the targets role as must sign.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -105,7 +106,8 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
-    /// Makes a root and the keys that sign for it, in a directory of their own.
+    /// Makes a root and the keys that sign for it, in a directory of their own. Each role of the
+    /// root has a key of its own.
     DevKeys {
         #[arg(long)]
         out: PathBuf,

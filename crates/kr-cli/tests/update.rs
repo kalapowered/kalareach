@@ -2565,6 +2565,62 @@ fn a_channel_root_is_followed_only_by_its_successor() {
     assert!(carried(channel_root(1, &keys().root, &[&keys().stranger])).is_err());
 }
 
+/// KR-REQ-26.40: a channel root gives each of its roles a key of its own. One that names a key for
+/// two roles is not root metadata a host reads, whether a release carries it or the host kept it,
+/// and what the host says names that cause and, for a root it kept, the new store that replaces it.
+#[test]
+fn a_channel_root_that_gives_one_key_to_two_roles_is_not_trusted() {
+    let carried = |text: String| {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join(kr_cli::update::release::CHANNEL_ROOT);
+        std::fs::create_dir_all(path.parent().expect("share")).expect("share");
+        std::fs::write(&path, text).expect("the root");
+        kr_cli::update::release::ChannelRoot::read(directory.path())
+    };
+    let k = keys();
+
+    // The control: four keys, one for each role, are read.
+    carried(channel_root_over(
+        1,
+        [&k.root, &k.targets, &k.snapshot, &k.timestamp],
+        &[&k.root],
+    ))
+    .unwrap_or_else(|error| panic!("four keys are read: {error}"))
+    .expect("the root is there");
+
+    // The root key also named for the snapshot role, and the targets key for the timestamp role.
+    for (what, named) in [
+        ("snapshot", [&k.root, &k.targets, &k.root, &k.timestamp]),
+        ("timestamp", [&k.root, &k.targets, &k.snapshot, &k.targets]),
+    ] {
+        let text = channel_root_over(1, named, &[&k.root]);
+        let error = carried(text.clone())
+            .err()
+            .unwrap_or_else(|| panic!("a key shared with the {what} role is read"));
+        let said = error.to_string();
+        assert!(
+            said.contains("one key") && said.contains("two roles"),
+            "{what}: {said}"
+        );
+        assert!(
+            !said.contains("is not signed by"),
+            "the cause is not a missing signature: {said}"
+        );
+
+        // A root the host kept is refused the same way, and the remedy is named.
+        let kept: tough::schema::Signed<tough::schema::Root> =
+            serde_json::from_str(&text).expect("root metadata");
+        let error = kr_cli::update::release::ChannelRoot::kept(kept)
+            .err()
+            .unwrap_or_else(|| panic!("a kept root with a key shared with the {what} role"));
+        let said = error.to_string();
+        assert!(
+            said.contains("one key") && said.contains("two roles") && said.contains("new store"),
+            "{what}: {said}"
+        );
+    }
+}
+
 /// KR-REQ-26.09: an archive is refused at its first entry that is not a file or a directory of the
 /// one release under one top directory, and an archive that is only files unpacks.
 #[test]
