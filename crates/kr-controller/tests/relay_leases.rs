@@ -5216,6 +5216,17 @@ impl kr_client::pairing::link::HostLink for Counting {
     > {
         self.inner.hold(network)
     }
+
+    fn visit_hold<'a>(
+        &'a self,
+        network: &'a kr_protocol::pairing::NetworkConfig,
+        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
+    > {
+        self.inner.visit_hold(network, in_use)
+    }
 }
 
 /// A pre-authorisation surface that counts the host's answers.

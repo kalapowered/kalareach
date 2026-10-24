@@ -223,6 +223,16 @@ pub trait HostLink: Send + Sync {
         network: &'a NetworkConfig,
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>>;
 
+    /// Holds the endpoint for `network` for a visit, as [`Self::hold`] does, except that it never
+    /// closes the endpoint the host in use is reached through ([`Self::visit_paired_transport`]
+    /// has the rule): a host whose endpoint cannot be had without that is refused as a connection
+    /// lost.
+    fn visit_hold<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+        in_use: &'a HostInUse<'a>,
+    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>>;
+
     /// Whether a dial to `endpoint` that failed was held back by the managed service having no free
     /// capacity to admit this device through the relay the dial addresses.
     ///
@@ -481,17 +491,50 @@ impl EndpointPool {
     ) -> Result<Endpoint, LinkError> {
         let config = self.config(network)?;
         let mut endpoints = self.endpoints.lock().await;
+        self.refuse_beside_the_host_in_use(&config, in_use)?;
+        let open = self.open_for(&mut endpoints, config).await?;
+        Ok(open.endpoint.clone())
+    }
+
+    /// Holds the endpoint for `network`'s services for a visit, bound now if none is open, until
+    /// the returned hold is dropped: as [`Self::hold`] does, and refused as [`Self::visit_endpoint`]
+    /// refuses. The hold is taken in the same request as the check, so no other request closes the
+    /// endpoint between the two.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::visit_endpoint`].
+    pub async fn visit_hold(
+        &self,
+        network: &NetworkConfig,
+        in_use: &HostInUse<'_>,
+    ) -> Result<EndpointHold, LinkError> {
+        let config = self.config(network)?;
+        let mut endpoints = self.endpoints.lock().await;
+        self.refuse_beside_the_host_in_use(&config, in_use)?;
+        let open = self.open_for(&mut endpoints, config).await?;
+        Ok(EndpointHold {
+            _holds: Arc::clone(&open.holds),
+        })
+    }
+
+    /// Refuses `config` when its services are not the host in use's and share a relay with them.
+    /// The caller holds the pool, so the answer stands for as long as it keeps it.
+    fn refuse_beside_the_host_in_use(
+        &self,
+        config: &EndpointConfig,
+        in_use: &HostInUse<'_>,
+    ) -> Result<(), LinkError> {
         // A host in use whose configuration cannot be used has no endpoint to cut off.
         if let Some(using) = in_use().and_then(|using| self.config(&using).ok()) {
-            let (using, services) = (Services::of(&using), Services::of(&config));
+            let (using, services) = (Services::of(&using), Services::of(config));
             if services != using && services.share_a_relay(&using) {
                 return Err(LinkError::lost(Shown::said(
                     "the relay this host is reached through is in use for the host this device is using",
                 )));
             }
         }
-        let open = self.open_for(&mut endpoints, config).await?;
-        Ok(open.endpoint.clone())
+        Ok(())
     }
 
     /// Holds the endpoint for `network`'s services, bound now if none is open, until the returned
@@ -698,6 +741,14 @@ impl HostLink for IrohLink {
         network: &'a NetworkConfig,
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
         Box::pin(self.pool.hold(network))
+    }
+
+    fn visit_hold<'a>(
+        &'a self,
+        network: &'a NetworkConfig,
+        in_use: &'a HostInUse<'a>,
+    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
+        Box::pin(self.pool.visit_hold(network, in_use))
     }
 }
 
@@ -1109,6 +1160,76 @@ mod tests {
             .expect("no host is in use");
         pool.endpoint(&in_use).await.expect("the host chosen later");
         assert!(visited.is_closed());
+        pool.close().await;
+    }
+
+    /// A hold taken for a visit is refused as the visit is, beside the host in use, and cuts
+    /// nothing off; one taken on a relay no host in use shares keeps a later visit to a host on
+    /// that relay from closing the endpoint it holds, however the visit is served.
+    #[tokio::test]
+    async fn a_visit_hold_cuts_nothing_off_and_is_not_cut_off() {
+        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+            .bound_to("127.0.0.1:0".parse().expect("loopback"));
+        let in_use = network(&[], Some("http://127.0.0.1:24/pkarr"), &[]);
+        let held_config = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:25/pkarr"),
+            &[],
+        );
+        let beside_held = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:26/pkarr"),
+            &[],
+        );
+        let beside_in_use = network(
+            &["https://relay.in-use.test"],
+            Some("http://127.0.0.1:27/pkarr"),
+            &[],
+        );
+        let in_use_endpoint = pool.endpoint(&in_use).await.expect("the host in use");
+        let using_it = using(&in_use);
+
+        // Beside the host in use the hold is refused. A host in use that shares its relay with
+        // the host held is one such host.
+        let sharing = network(
+            &["https://relay.in-use.test"],
+            Some("http://127.0.0.1:28/pkarr"),
+            &[],
+        );
+        let in_use_on_a_relay = pool
+            .endpoint(&sharing)
+            .await
+            .expect("a host in use on a relay");
+        let using_sharing = using(&sharing);
+        assert!(matches!(
+            pool.visit_hold(&beside_in_use, &using_sharing).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(!in_use_on_a_relay.is_closed(), "nothing was cut off");
+        assert_eq!(binds(&pool), 2, "nothing was bound on its relay");
+
+        // Elsewhere it is granted, and a visit to a host on that relay is refused for as long as
+        // the hold lives.
+        let hold = pool
+            .visit_hold(&held_config, &using_it)
+            .await
+            .expect("a hold beside no host in use");
+        assert!(!in_use_endpoint.is_closed());
+        assert!(matches!(
+            pool.visit_endpoint(&beside_held, &using_it).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(matches!(
+            pool.visit_hold(&beside_held, &using_it).await,
+            Err(LinkError::Lost(_))
+        ));
+        assert!(pool.holds(&held_config).await, "the held endpoint is open");
+        let binds_before = binds(&pool);
+        drop(hold);
+        pool.visit_endpoint(&beside_held, &using_it)
+            .await
+            .expect("served once the hold is dropped");
+        assert_eq!(binds(&pool), binds_before + 1);
         pool.close().await;
     }
 
