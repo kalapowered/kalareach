@@ -37,7 +37,7 @@ struct RustPreviewOpener: PreviewOpening {
             let input = PreviewOpenerJson.input(
                 preview: preview, senderKey: senderKey, alert: alert, nowMilliseconds: nowMilliseconds)
         else { return .refused("input") }
-        // The seed is held only for the call, and cleared after it.
+        // The copy of the seed made for the call is cleared after it.
         var held = [UInt8](seed)
         defer { for index in held.indices { held[index] = 0 } }
         let answered: UnsafeMutablePointer<CChar>? = input.withCString { text in

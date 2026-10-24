@@ -68,10 +68,18 @@ final class PreviewDecisionTests: XCTestCase {
         XCTAssertEqual(decision, .reveal("Allow scripts/release.sh?"))
     }
 
-    func testTheGenericAlertStandsWhenNoKeyHasBeenProvisioned() {
-        let decision = decider(keys: FailingKeys(.notProvisioned))
+    func testTheGenericAlertStandsWhenThisDeviceHoldsNoSeed() {
+        let decision = decider(keys: SeedFailingKeys(.notProvisioned))
             .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
         XCTAssertEqual(decision, .generic(.keyUnavailable))
+    }
+
+    func testADeviceWhoseEveryHostHasPreviewsOffHoldsNeitherKeyAndSaysTheHostIsUnknown() {
+        // The seed is filed only while some host may seal to it, so a device with every host off
+        // holds neither key: the reason is the host's key, which is the one asked first.
+        let decision = decider(keys: FailingKeys(.notProvisioned))
+            .decide(userInfo: payload(), alert: alert, nowMilliseconds: now)
+        XCTAssertEqual(decision, .generic(.senderUnknown))
     }
 
     func testTheGenericAlertStandsBeforeTheFirstUnlockWhicheverKeyIsAskedFirst() {
@@ -288,6 +296,14 @@ private struct FailingKeys: PreviewKeyReading {
     init(_ failure: PreviewKeyUnavailable) { self.failure = failure }
     func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data { throw failure }
     func senderKey(forSender senderKeyID: Data) throws -> Data { throw failure }
+}
+
+/// The host's key is there; the seed is not to be had.
+private struct SeedFailingKeys: PreviewKeyReading {
+    let failure: PreviewKeyUnavailable
+    init(_ failure: PreviewKeyUnavailable) { self.failure = failure }
+    func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data { throw failure }
+    func senderKey(forSender senderKeyID: Data) throws -> Data { Data(repeating: 0x55, count: 32) }
 }
 
 /// The seed is there; the host's key is not to be had.
