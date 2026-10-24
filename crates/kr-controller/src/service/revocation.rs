@@ -211,18 +211,19 @@ impl Controller {
         // before the fence, which takes it again. The block is what drops it: nothing this holds
         // may be alive across the await below.
         let (revocation, lapsed, owes, own, recorded) = {
-            let registry = match carried {
-                Some(carried) => {
-                    let registry = self.registry.lock().await;
-                    self.check_admission(&registry, carried)?;
-                    Some(registry)
-                }
-                None => None,
-            };
+            // The guard is taken whether or not the revocation carries an admission. A push
+            // registration reads its device again and writes its destination under it, so a
+            // revocation without one (the feed's, and the replay's) could mark the device and end
+            // its destination between the two, and the registration would then write a destination
+            // for a device that is no longer paired, which nothing ends.
+            let registry = self.registry.lock().await;
+            if let Some(carried) = carried {
+                self.check_admission(&registry, carried)?;
+            }
             let revocation = self.sharing.grants().revoke_device(
                 device_id,
                 now_ms,
-                || self.still_admitted(registry.as_deref(), carried),
+                || self.still_admitted(Some(&*registry), carried),
                 claim,
             )?;
             // The transaction that revoked is the restriction, and it has committed.
@@ -251,7 +252,7 @@ impl Controller {
             // between here and it gets its own check.
             let withdrew = !revocation.revoked.is_empty();
             if !withdrew {
-                self.still_admitted(registry.as_deref(), carried)?;
+                self.still_admitted(Some(&*registry), carried)?;
             }
             let record_is_live = self
                 .devices
@@ -259,7 +260,7 @@ impl Controller {
                 .is_some_and(|record| record.revoked_at_ms.is_none());
             let record_debt = if record_is_live {
                 if !withdrew {
-                    self.still_admitted(registry.as_deref(), carried)?;
+                    self.still_admitted(Some(&*registry), carried)?;
                 }
                 Some(self.owe_debt(
                     &format!("the revocation of device {device_id}'s record"),
@@ -274,7 +275,7 @@ impl Controller {
             let lapsed = if withdrew {
                 None
             } else {
-                self.still_admitted(registry.as_deref(), carried).err()
+                self.still_admitted(Some(&*registry), carried).err()
             };
             let recorded = if lapsed.is_none() {
                 self.devices
