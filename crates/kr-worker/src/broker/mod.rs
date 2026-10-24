@@ -348,10 +348,13 @@ pub const THREAD_NOT_READ: &str = "the terminal's conversation is not read from 
 /// What the broker holds that says what a session's application is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ApplicationFacts {
-    /// A request is waiting for a decision: an approval, interpreted, that nothing has settled.
+    /// A request is waiting for a decision: an approval, interpreted, that can still be answered.
     pub approval_pending: bool,
     /// An instance is running a turn.
     pub turn_running: bool,
+    /// When the earliest of the waiting approvals that has a deadline stops being answerable,
+    /// where one has.
+    pub next_deadline: Option<TimestampMs>,
 }
 
 /// One managed application instance.
@@ -1311,21 +1314,47 @@ impl Broker {
         Arc::clone(&self.state().application_changes)
     }
 
-    /// Returns what the broker holds that says what the session's application is doing: whether a
-    /// request is waiting for a decision, and whether an instance is running a turn.
+    /// Returns what the broker holds that says what the session's application is doing at `now`:
+    /// whether a request is waiting for a decision, and whether an instance is running a turn.
     ///
     /// A request counts only once it is an approval, which is when the connector's table answers
     /// its method and a binding that holds the decoding grant has interpreted it; a reverse request
-    /// that nothing interpreted is no approval. It counts until its resource reaches a state
-    /// nothing follows.
+    /// that nothing interpreted is no approval. It counts while somebody can still answer it: from
+    /// the moment it is waiting until its resource reaches a state nothing follows, or until the
+    /// deadline the upstream put on it, since an answer is refused from that moment and the
+    /// request is no longer one a person is on the way to. An answer already in flight is counted
+    /// whatever the deadline says, because the claim decides what became of it and not the clock.
+    /// The facts name the earliest deadline still ahead, which is when to look again.
     #[must_use]
-    pub fn application(&self) -> ApplicationFacts {
+    pub fn application(&self, now: TimestampMs) -> ApplicationFacts {
         let state = self.state();
+        let mut approval_pending = false;
+        let mut next_deadline: Option<TimestampMs> = None;
+        for pending in state.arbitration.iter() {
+            if pending.resource.kind != kr_protocol::gateway::PendingKind::Approval {
+                continue;
+            }
+            match pending.resource.state {
+                PendingState::Claimed => approval_pending = true,
+                PendingState::Pending => match pending.resource.deadline_ms.as_ref() {
+                    None => approval_pending = true,
+                    Some(deadline) if deadline.get() > now.get() => {
+                        approval_pending = true;
+                        next_deadline = Some(next_deadline.map_or(*deadline, |earliest| {
+                            TimestampMs::new(earliest.get().min(deadline.get()))
+                        }));
+                    }
+                    Some(_) => {}
+                },
+                PendingState::Resolved
+                | PendingState::Cancelled
+                | PendingState::Expired
+                | PendingState::Uncertain => {}
+            }
+        }
         ApplicationFacts {
-            approval_pending: state.arbitration.iter().any(|pending| {
-                pending.resource.kind == kr_protocol::gateway::PendingKind::Approval
-                    && !pending.resource.state.is_terminal()
-            }),
+            approval_pending,
+            next_deadline,
             turn_running: state
                 .instances
                 .values()

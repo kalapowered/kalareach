@@ -511,7 +511,7 @@ async fn kr_req_19_08_a_phone_decides_an_approval_the_agent_asked_for() {
     let worker = &adopted.workers[0];
     let upstream = Arc::new(Upstream::default());
     let instance = worker.register_agent(Arc::clone(&upstream));
-    let resource = worker.offer_approval(instance, Arc::clone(&upstream) as _);
+    let resource = worker.offer_approval(instance, Arc::clone(&upstream) as _, None);
     let session = worker.session_id;
     let phone = phone_under(
         &adopted,

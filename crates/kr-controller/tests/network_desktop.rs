@@ -27,6 +27,7 @@ use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::session::ApplicationState;
 use net_support::Host;
 use net_support::worker::{Adopted, Upstream};
 
@@ -605,8 +606,68 @@ async fn kr_req_03_27_what_an_agent_waits_for_is_a_pending_request_a_device_read
     // An approval the connector's table answers.
     let upstream = std::sync::Arc::new(Upstream::default());
     let instance = worker.register_agent(std::sync::Arc::clone(&upstream));
-    let _approval = worker.offer_approval(instance, upstream);
+    let _approval = worker.offer_approval(instance, upstream, None);
     demand_reaches(&session, 1).await;
+
+    session.close();
+    adopted.stop().await;
+}
+
+/// KR-REQ-03.27: an approval nobody can answer any more is no pending request, and the host stops
+/// counting it when its deadline passes, with nothing else happening.
+///
+/// Two sessions each have an approval waiting, one the upstream will take an answer to for an
+/// hour and one it set no deadline on. Each worker's clock is moved past the hour, which is what a
+/// real hour would do, except that the first is moved to two seconds short of the deadline: the
+/// move wakes the worker, which reads the approval as still answerable and sets its timer for the
+/// two seconds, and after that only the timer can lift it. A worker refuses an answer after the
+/// upstream's deadline, and a request it refuses is not one the person is on the way to, so only
+/// the session whose approval has no deadline is still counted. That session is the control: the
+/// same move leaves it counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_03_27_an_approval_whose_deadline_has_passed_is_no_pending_request() {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.preferences.sleep_inhibition =
+        kr_protocol::scalars::Nullable::some(SleepInhibitionSetting::BatteryToo);
+    let adopted = Adopted::start_with_document(2, &document).await;
+    let (_device, session) =
+        net_support::paired_device(&adopted.host, &adopted.owner, VIEWER).await;
+    let [expiring, lasting] = &adopted.workers[..] else {
+        panic!("two workers were started");
+    };
+
+    let hour = std::time::Duration::from_secs(60 * 60);
+    let in_an_hour = kr_protocol::scalars::TimestampMs::new(
+        kr_ipc::now_ms().get() + u64::try_from(hour.as_millis()).expect("a number of milliseconds"),
+    );
+    let upstream = std::sync::Arc::new(Upstream::default());
+    let instance = expiring.register_agent(std::sync::Arc::clone(&upstream));
+    let _expiring = expiring.offer_approval(instance, upstream, Some(in_an_hour));
+    let upstream = std::sync::Arc::new(Upstream::default());
+    let instance = lasting.register_agent(std::sync::Arc::clone(&upstream));
+    let _lasting = lasting.offer_approval(instance, upstream, None);
+    demand_reaches(&session, 2).await;
+
+    // Two seconds short of the deadline as it is now, which the set-up above has not spent.
+    let short =
+        std::time::Duration::from_millis(in_an_hour.get().saturating_sub(kr_ipc::now_ms().get()))
+            .saturating_sub(std::time::Duration::from_secs(2));
+    expiring.service.move_application_clock(short);
+    lasting.service.move_application_clock(hour * 2);
+    demand_reaches(&session, 1).await;
+    // The session the host still counts is the one whose approval has no deadline.
+    let waiting =
+        |worker: &net_support::worker::Worker| worker.service.application().application().state;
+    assert_eq!(
+        waiting(lasting),
+        Some(ApplicationState::AwaitingApproval),
+        "the approval with no deadline is still waited on"
+    );
+    assert_ne!(
+        waiting(expiring),
+        Some(ApplicationState::AwaitingApproval),
+        "and the one whose deadline passed is not"
+    );
 
     session.close();
     adopted.stop().await;

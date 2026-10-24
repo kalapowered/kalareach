@@ -440,11 +440,12 @@ impl Worker {
     ///
     /// This is the native half of an approval: the qualified table, the authenticated connection,
     /// the transport that carries an answer out, and one request offering a single decision,
-    /// `allow`.
+    /// `allow`. The upstream's own deadline for the request is `deadline`, where it states one.
     pub fn offer_approval(
         &self,
         instance: ApplicationInstanceId,
         upstream: Arc<dyn UpstreamDispatch>,
+        deadline: Option<TimestampMs>,
     ) -> kr_protocol::ids::PendingResourceId {
         use kr_protocol::gateway::{
             DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, RichMethodEntry,
@@ -570,7 +571,7 @@ impl Worker {
                         label: "Allow".to_owned(),
                     }],
                 },
-                None,
+                deadline,
                 TimestampMs::new(3),
             )
             .expect("interpreted")

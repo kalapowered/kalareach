@@ -256,6 +256,9 @@ pub struct WorkerService {
     /// What this session's application is doing: the worker's own account of what holds the
     /// terminal and what its agents are waiting for.
     application: Arc<crate::application::Producer>,
+    /// The wall clock the application's approvals are measured against, which a test can move.
+    #[cfg(feature = "testing")]
+    deadline_clock: crate::application::DeadlineClock,
     /// How many times a request for the attention sources has found nothing to answer with and
     /// begun to wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -459,6 +462,14 @@ impl WorkerService {
         &self.application
     }
 
+    /// Moves the clock the application's approvals are measured against forward by `by`, for this
+    /// host's own tests, and has the producer read again.
+    #[cfg(feature = "testing")]
+    pub fn move_application_clock(&self, by: std::time::Duration) {
+        self.deadline_clock.move_forward(by);
+        self.broker().application_changes().notify_waiters();
+    }
+
     /// Whether the session still counts `attachment_id` among the attachments made under a grant,
     /// for the host crates' own tests: an entry holds no lease, so nothing else shows one that
     /// outlived its attachment.
@@ -612,8 +623,10 @@ impl WorkerService {
         // when either changes, by a task that ends with the session. A worker built outside a
         // runtime, which nothing can wake, follows nothing.
         let application = crate::application::Producer::new(Arc::downgrade(&runtime));
+        let deadline_clock = crate::application::DeadlineClock::default();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let clock = Arc::clone(&shared_clock);
+            let wall = deadline_clock.clone();
             handle.spawn(crate::application::follow_evidence(
                 Arc::clone(&application),
                 Arc::clone(&runtime),
@@ -624,6 +637,7 @@ impl WorkerService {
                     utc_ms: kr_ipc::now_ms(),
                     boot_ms: clock.boot_elapsed_ms(),
                 },
+                wall,
             ));
         }
         Ok(Self {
@@ -661,6 +675,8 @@ impl WorkerService {
             attention_reader: Mutex::new(None),
             journal_changes,
             application,
+            #[cfg(feature = "testing")]
+            deadline_clock,
             #[cfg(feature = "testing")]
             held_attention_requests: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
