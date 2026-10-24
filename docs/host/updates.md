@@ -233,7 +233,10 @@ A release is taken in only whole and checked:
   its targets role. The root the host trusts is the newer of the one the current release carries,
   at `share/update-root.json`, and the one `install.json` recorded when the host last switched to
   a release (see "Rolling back"); a release carries that root or the one that follows it, the next
-  version, signed by a threshold of the current root's root keys as well as its own.
+  version, signed by a threshold of the current root's root keys as well as its own. A root that
+  names one key for two of its roles, or one key under two identifiers in a role, is refused
+  wherever the host reads it, the root it kept included; a host that kept such a root (a root made
+  by an older `kr-release dev-keys` is one) is installed again in a new store.
 - Every file the manifest lists is there with its length and digest, and nothing else is.
 - The following programs must all be listed as programs of `bin/` in order for a release to be
   accepted, regardless of who signed it: `kr`, `kr-attach-guard`, `kr-controller`, `kr-worker`,

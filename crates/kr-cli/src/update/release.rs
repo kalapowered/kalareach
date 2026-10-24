@@ -77,8 +77,8 @@ impl ChannelRoot {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when the root cannot be read, is not root metadata, or is not signed by
-    /// its own root keys.
+    /// Returns a refusal when the root cannot be read, is not root metadata, gives one key to two
+    /// roles, or is not signed by its own root keys.
     pub fn read(release: &Path) -> Result<Option<Self>> {
         let path = release.join(CHANNEL_ROOT);
         let bytes = match read_bounded(&path, MAX_ROOT_LEN) {
@@ -100,11 +100,19 @@ impl ChannelRoot {
                     Shown::json(&error)
                 ))
             })?;
-        kr_release::verify_root_itself(&signed).map_err(|_| {
-            CliError::Other(shown!(
-                "the update channel's root at {} is not signed by the root keys it names",
-                Shown::root(&path)
-            ))
+        kr_release::verify_root_itself(&signed).map_err(|error| {
+            CliError::Other(match error {
+                kr_release::VerifyError::SharedKey { .. } => shown!(
+                    "the update channel's root at {} gives one key to two roles: an older \
+                     `kr-release dev-keys` made such a root, and a host that holds one is \
+                     installed again in a new store, from a release made again",
+                    Shown::root(&path)
+                ),
+                _ => shown!(
+                    "the update channel's root at {} is not signed by the root keys it names",
+                    Shown::root(&path)
+                ),
+            })
         })?;
         Ok(Some(Self { signed }))
     }
@@ -113,12 +121,20 @@ impl ChannelRoot {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when it is not signed by its own root keys.
+    /// Returns a refusal when it gives one key to two roles or is not signed by its own root keys.
     pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
-        kr_release::verify_root_itself(&signed).map_err(|_| {
-            CliError::Other(Shown::said(
-                "the update channel's root this host kept is not signed by the root keys it names",
-            ))
+        kr_release::verify_root_itself(&signed).map_err(|error| {
+            CliError::Other(Shown::said(match error {
+                kr_release::VerifyError::SharedKey { .. } => {
+                    "the update channel's root this host kept gives one key to two roles: an older \
+                     `kr-release dev-keys` made such a root, so this host is installed again in a \
+                     new store, from a release made again"
+                }
+                _ => {
+                    "the update channel's root this host kept is not signed by the root keys it \
+                     names"
+                }
+            }))
         })?;
         Ok(Self { signed })
     }
@@ -161,11 +177,18 @@ impl ChannelRoot {
                 this_version
             )));
         }
-        kr_release::verify_root_by(&self.signed.signed, &next.signed).map_err(|_| {
-            CliError::Other(Shown::said(
-                "the release's update channel root is not signed by the root keys this host \
-                 trusts",
-            ))
+        kr_release::verify_root_by(&self.signed.signed, &next.signed).map_err(|error| {
+            CliError::Other(Shown::said(match error {
+                kr_release::VerifyError::SharedKey { .. } => {
+                    "the release's update channel root, or the one this host trusts, gives one key \
+                     to two roles: an older `kr-release dev-keys` made such a root, and a host that \
+                     holds one is installed again in a new store, from a release made again"
+                }
+                _ => {
+                    "the release's update channel root is not signed by the root keys this host \
+                     trusts"
+                }
+            }))
         })
     }
 
@@ -184,6 +207,7 @@ impl ChannelRoot {
                     Shown::json(&error)
                 )),
                 kr_release::VerifyError::ReusedKey { .. }
+                | kr_release::VerifyError::SharedKey { .. }
                 | kr_release::VerifyError::UnsupportedKey { .. }
                 | kr_release::VerifyError::Threshold => CliError::Other(Shown::said(
                     "the release's manifest is not signed by the release keys the update \

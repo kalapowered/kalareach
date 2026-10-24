@@ -14,7 +14,8 @@
 //! A threshold counts keys, not names for a key. The Update Framework names a key by a digest of
 //! its description, so one public key described twice, once with a member added, has two names, and
 //! one private key could answer for both. A root that names one key under two identifiers in a role
-//! is refused here, before any signature is counted.
+//! is refused here, before any signature is counted, and so is a root that names one key for two of
+//! its roles: a role holds the authority of its keys, so each role has keys of its own.
 
 mod agents;
 pub mod assemble;

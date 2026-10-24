@@ -3,7 +3,8 @@
 //! A release is signed by a threshold of keys that the update channel's root names. The keys of the
 //! channel live in hardware and on offline media, and nothing here touches them. A run that proves
 //! the whole signing path makes a root and keys of its own, signs with them, and throws them away
-//! with the run: a release they sign is trusted by no host.
+//! with the run: a release they sign is trusted by no host. The root gives each of its roles a key
+//! of its own, as a root a host reads must.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -15,8 +16,9 @@ use tough::sign::Sign;
 
 use crate::refusal::{Refusal, Result};
 
-/// Writes `root.json`, `root-key.pk8` and `targets-<n>.pk8` for each of `signers` keys that must
-/// sign, in a directory that only its owner reads.
+/// Writes `root.json`, `root-key.pk8`, `snapshot-key.pk8`, `timestamp-key.pk8` and
+/// `targets-<n>.pk8` for each of `signers` keys that must sign, in a directory that only its owner
+/// reads. Each role of the root names a key of its own, and each key it names is one of the files.
 ///
 /// # Errors
 ///
@@ -34,6 +36,8 @@ pub fn write_keys(out: &Path, signers: u64) -> Result<()> {
             .map_err(|_| Refusal("a key could not be read back".to_owned()))
     };
     let root_key = make("root-key.pk8")?;
+    let snapshot_key = make("snapshot-key.pk8")?;
+    let timestamp_key = make("timestamp-key.pk8")?;
     let mut targets = Vec::new();
     for index in 1..=signers {
         targets.push(make(&format!("targets-{index}.pk8"))?);
@@ -47,6 +51,10 @@ pub fn write_keys(out: &Path, signers: u64) -> Result<()> {
     let mut keys = HashMap::new();
     let root_id = identifier(&root_key)?;
     keys.insert(root_id.clone(), Sign::tuf_key(&root_key));
+    let snapshot_id = identifier(&snapshot_key)?;
+    keys.insert(snapshot_id.clone(), Sign::tuf_key(&snapshot_key));
+    let timestamp_id = identifier(&timestamp_key)?;
+    keys.insert(timestamp_id.clone(), Sign::tuf_key(&timestamp_key));
     let mut target_ids = Vec::new();
     for pair in &targets {
         let id = identifier(pair)?;
@@ -62,8 +70,8 @@ pub fn write_keys(out: &Path, signers: u64) -> Result<()> {
     let mut roles = HashMap::new();
     roles.insert(RoleType::Root, named(vec![root_id.clone()], one));
     roles.insert(RoleType::Targets, named(target_ids, threshold));
-    roles.insert(RoleType::Snapshot, named(vec![root_id.clone()], one));
-    roles.insert(RoleType::Timestamp, named(vec![root_id.clone()], one));
+    roles.insert(RoleType::Snapshot, named(vec![snapshot_id], one));
+    roles.insert(RoleType::Timestamp, named(vec![timestamp_id], one));
     let root = Root {
         spec_version: "1.0.0".to_owned(),
         consistent_snapshot: false,

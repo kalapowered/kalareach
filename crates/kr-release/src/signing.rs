@@ -46,6 +46,14 @@ pub enum VerifyError {
         /// The role.
         role: &'static str,
     },
+    /// Two roles of the root name one key.
+    #[error("the root names one key for its {first} role and for its {second} role")]
+    SharedKey {
+        /// The first of the two roles, in the order of their names.
+        first: &'static str,
+        /// The second.
+        second: &'static str,
+    },
     /// A role of the root names a key that is not an Ed25519 key of 32 bytes.
     #[error("the root names a key for its {role} role that is not an Ed25519 key of 32 bytes")]
     UnsupportedKey {
@@ -87,16 +95,24 @@ fn release_key(key: &Key) -> Option<[u8; 32]> {
     }
 }
 
-/// Checks that no role of `root` names one key under two identifiers, and that every key a role
-/// names is a release key.
+/// Checks that no role of `root` names one key under two identifiers, that every key a role names
+/// is a release key, and that no two roles name the same key.
+///
+/// A role holds the authority of its keys, so a key that two roles share lets whoever holds it act
+/// for both, and a root cannot say afterwards which of the two the key was meant for. The roles
+/// are compared after each has passed its own checks, so by then a key has one spelling, its 32
+/// bytes.
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError::ReusedKey`] naming the first role that names a key twice, and
-/// [`VerifyError::UnsupportedKey`] naming the first role that names a key of another kind or size.
+/// Returns [`VerifyError::ReusedKey`] naming the first role that names a key twice,
+/// [`VerifyError::UnsupportedKey`] naming the first role that names a key of another kind or size,
+/// and [`VerifyError::SharedKey`] naming the first two roles, in the order of their names, that name
+/// one key.
 pub fn check_root_keys(root: &Root) -> Result<(), VerifyError> {
     let mut roles: Vec<_> = root.roles.iter().collect();
     roles.sort_by_key(|(role, _)| role_name(**role));
+    let mut named = Vec::with_capacity(roles.len());
     for (role, keys) in roles {
         let mut identifiers = HashSet::new();
         let mut material = HashSet::new();
@@ -124,6 +140,14 @@ pub fn check_root_keys(root: &Root) -> Result<(), VerifyError> {
                 role: role_name(*role),
             });
         }
+        named.push((role_name(*role), material));
+    }
+    for (at, (first, keys)) in named.iter().enumerate() {
+        for (second, others) in &named[at + 1..] {
+            if !keys.is_disjoint(others) {
+                return Err(VerifyError::SharedKey { first, second });
+            }
+        }
     }
     Ok(())
 }
@@ -138,14 +162,14 @@ const fn role_name(role: RoleType) -> &'static str {
     }
 }
 
-/// Checks a release manifest's document against `root`: that it is a signed envelope, that no role
-/// of the root names one key twice, and that a threshold of the keys the root names for its targets
-/// role signed it. Returns the members as the signer wrote them.
+/// Checks a release manifest's document against `root`: that it is a signed envelope, that the root
+/// passes [`check_root_keys`], and that a threshold of the keys the root names for its targets role
+/// signed it. Returns the members as the signer wrote them.
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] for a document that is not an envelope, a root that reuses a key or names
-/// one that is not a release key, or signatures short of the threshold.
+/// Returns [`VerifyError`] for a document that is not an envelope, a root that [`check_root_keys`]
+/// refuses, or signatures short of the threshold.
 pub fn verify_manifest(root: &Root, document: &[u8]) -> Result<SignedMembers, VerifyError> {
     let signed: Signed<Signable> =
         serde_json::from_slice(document).map_err(VerifyError::Document)?;
@@ -159,7 +183,8 @@ pub fn verify_manifest(root: &Root, document: &[u8]) -> Result<SignedMembers, Ve
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] when a role reuses a key or the signatures are short of the threshold.
+/// Returns [`VerifyError`] when [`check_root_keys`] refuses the root or the signatures are short of
+/// the threshold.
 pub fn verify_root_itself(signed: &Signed<Root>) -> Result<(), VerifyError> {
     verify_root_by(&signed.signed, signed)
 }
@@ -168,8 +193,8 @@ pub fn verify_root_itself(signed: &Signed<Root>) -> Result<(), VerifyError> {
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] when `trusted` or `next` reuses a key in a role, or the signatures are
-/// short of the threshold.
+/// Returns [`VerifyError`] when [`check_root_keys`] refuses `trusted` or `next`, or the signatures
+/// are short of the threshold.
 pub fn verify_root_by(trusted: &Root, next: &Signed<Root>) -> Result<(), VerifyError> {
     check_root_keys(trusted)?;
     check_root_keys(&next.signed)?;

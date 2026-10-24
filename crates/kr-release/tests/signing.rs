@@ -10,7 +10,10 @@ use aws_lc_rs::signature::{
     ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair,
 };
 use kr_protocol::update::SignedMembers;
-use kr_release::{VerifyError, check_root_keys, sign_manifest, verify_manifest, verify_root_by};
+use kr_release::{
+    VerifyError, check_root_keys, sign_manifest, verify_manifest, verify_root_by,
+    verify_root_itself,
+};
 use tough::schema::key::Key;
 use tough::schema::{RoleKeys, RoleType, Root, Signature, Signed};
 use tough::sign::Sign;
@@ -21,26 +24,26 @@ fn pair() -> Ed25519KeyPair {
     Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("a key pair")
 }
 
-/// A root whose targets role is `named` with `threshold`, its other roles naming `named[0]` alone.
-fn root_with(named: &[Key], threshold: u64) -> Root {
-    let identifiers: Vec<_> = named
-        .iter()
-        .map(|key| key.key_id().expect("a key identifier"))
-        .collect();
+/// A root with the keys `named` for each role, each role's threshold being the one it is given.
+fn root_of(named: &[(RoleType, Vec<Key>, u64)]) -> Root {
     let mut keys = HashMap::new();
-    for (identifier, key) in identifiers.iter().zip(named) {
-        keys.insert(identifier.clone(), key.clone());
-    }
-    let role = |ids: Vec<_>, threshold: u64| RoleKeys {
-        keyids: ids,
-        threshold: NonZeroU64::new(threshold).expect("a threshold"),
-        _extra: HashMap::new(),
-    };
     let mut roles = HashMap::new();
-    roles.insert(RoleType::Root, role(vec![identifiers[0].clone()], 1));
-    roles.insert(RoleType::Targets, role(identifiers.clone(), threshold));
-    roles.insert(RoleType::Snapshot, role(vec![identifiers[0].clone()], 1));
-    roles.insert(RoleType::Timestamp, role(vec![identifiers[0].clone()], 1));
+    for (role, role_keys, threshold) in named {
+        let mut identifiers = Vec::new();
+        for key in role_keys {
+            let identifier = key.key_id().expect("a key identifier");
+            keys.insert(identifier.clone(), key.clone());
+            identifiers.push(identifier);
+        }
+        roles.insert(
+            *role,
+            RoleKeys {
+                keyids: identifiers,
+                threshold: NonZeroU64::new(*threshold).expect("a threshold"),
+                _extra: HashMap::new(),
+            },
+        );
+    }
     Root {
         spec_version: "1.0.0".to_owned(),
         consistent_snapshot: false,
@@ -50,6 +53,17 @@ fn root_with(named: &[Key], threshold: u64) -> Root {
         roles,
         _extra: HashMap::new(),
     }
+}
+
+/// A root whose targets role is `named` with `threshold`, its other roles each naming a key of
+/// their own.
+fn root_with(named: &[Key], threshold: u64) -> Root {
+    root_of(&[
+        (RoleType::Root, vec![tuf_key(&pair())], 1),
+        (RoleType::Targets, named.to_vec(), threshold),
+        (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+        (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+    ])
 }
 
 fn members(kind: &str) -> SignedMembers {
@@ -289,4 +303,185 @@ fn a_signature_over_other_metadata_is_not_a_release_s() {
         verify_manifest(&root, moved.to_string().as_bytes()),
         Err(VerifyError::Threshold)
     ));
+}
+
+const ROLES: [RoleType; 4] = [
+    RoleType::Root,
+    RoleType::Targets,
+    RoleType::Snapshot,
+    RoleType::Timestamp,
+];
+
+fn name_of(role: RoleType) -> &'static str {
+    match role {
+        RoleType::Root => "root",
+        RoleType::Targets => "targets",
+        RoleType::Snapshot => "snapshot",
+        RoleType::Timestamp => "timestamp",
+        RoleType::DelegatedTargets => "delegated targets",
+    }
+}
+
+/// `root`, signed by `signer`.
+fn signed_root(root: Root, signer: &Ed25519KeyPair) -> Signed<Root> {
+    use tough::schema::Role;
+
+    let canonical = Role::canonical_form(&root).expect("canonical");
+    Signed {
+        signatures: vec![Signature {
+            keyid: tuf_key(signer).key_id().expect("an identifier"),
+            sig: signer.sign(&canonical).as_ref().to_vec().into(),
+        }],
+        signed: root,
+    }
+}
+
+/// KR-REQ-26.40: the keys of the roles are distinct. A root that names one key for two of its
+/// roles is refused wherever a root is read, whichever two roles share it, and a root that gives
+/// each role a key of its own is the control.
+#[test]
+fn a_key_that_two_roles_share_is_refused_wherever_a_root_is_read() {
+    let written = members("kalareach-release");
+    let checked = |roles: [Ed25519KeyPair; 4], shared: Option<(RoleType, RoleType)>| {
+        // The key each role names: its own, but for the second of a shared pair, which names the
+        // first's.
+        let index = |role: RoleType| ROLES.iter().position(|r| *r == role).expect("a role");
+        let key_of = |role: RoleType| match shared {
+            Some((first, second)) if role == second => &roles[index(first)],
+            _ => &roles[index(role)],
+        };
+        let root = root_of(
+            &ROLES
+                .iter()
+                .map(|role| (*role, vec![tuf_key(key_of(*role))], 1))
+                .collect::<Vec<_>>(),
+        );
+        let root_signer = key_of(RoleType::Root);
+        let targets_signer = key_of(RoleType::Targets);
+        let manifest = signed_by(&written, &[targets_signer]);
+        let own = signed_root(root.clone(), root_signer);
+        // A trusted root of four distinct keys, and the root under test as the successor it signs.
+        let trusted_signer = pair();
+        let trusted = root_of(&[
+            (RoleType::Root, vec![tuf_key(&trusted_signer)], 1),
+            (RoleType::Targets, vec![tuf_key(&pair())], 1),
+            (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+            (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+        ]);
+        let successor = signed_root(root.clone(), &trusted_signer);
+        // The root under test as the trusted root, over a successor of four distinct keys that the
+        // root key it names signs: only the trusted side can be what is refused.
+        let clean = signed_root(
+            root_of(&[
+                (RoleType::Root, vec![tuf_key(&pair())], 1),
+                (RoleType::Targets, vec![tuf_key(&pair())], 1),
+                (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+                (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+            ]),
+            root_signer,
+        );
+        (
+            check_root_keys(&root),
+            verify_manifest(&root, manifest.as_bytes()).map(|_| ()),
+            verify_root_itself(&own),
+            verify_root_by(&root, &clean),
+            verify_root_by(&trusted, &successor),
+        )
+    };
+    let four = || [pair(), pair(), pair(), pair()];
+
+    let control = checked(four(), None);
+    assert!(control.0.is_ok(), "four keys: {:?}", control.0);
+    assert!(control.1.is_ok(), "four keys: {:?}", control.1);
+    assert!(control.2.is_ok(), "four keys: {:?}", control.2);
+    assert!(control.3.is_ok(), "four keys: {:?}", control.3);
+    assert!(control.4.is_ok(), "four keys: {:?}", control.4);
+
+    for (at, first) in ROLES.iter().enumerate() {
+        for second in &ROLES[at + 1..] {
+            let mut names = [name_of(*first), name_of(*second)];
+            names.sort_unstable();
+            let verdicts = checked(four(), Some((*first, *second)));
+            for (call, verdict) in [
+                ("check_root_keys", verdicts.0),
+                ("verify_manifest", verdicts.1),
+                ("verify_root_itself", verdicts.2),
+                ("verify_root_by, trusted", verdicts.3),
+                ("verify_root_by, next", verdicts.4),
+            ] {
+                assert!(
+                    matches!(
+                        verdict,
+                        Err(VerifyError::SharedKey { first, second })
+                            if [first, second] == names
+                    ),
+                    "{call} for {names:?}: {verdict:?}"
+                );
+            }
+        }
+    }
+}
+
+/// KR-REQ-26.40: the root `kr-release dev-keys` writes gives each role a key of its own, every key
+/// it names is a file in the keys directory, the keys the targets role names sign a release that
+/// the root verifies, and a host takes the root.
+#[test]
+fn the_development_root_gives_each_role_a_key_of_its_own() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let keys = directory.path().join("keys");
+    kr_release::dev::write_keys(&keys, 2).expect("the keys are made");
+
+    let signed: Signed<Root> =
+        serde_json::from_slice(&std::fs::read(keys.join("root.json")).expect("a root"))
+            .expect("root metadata");
+    verify_root_itself(&signed).expect("the root passes the checks a host makes");
+
+    let identifier_of = |name: &str| {
+        let bytes =
+            std::fs::read(keys.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let pair = Ed25519KeyPair::from_pkcs8(&bytes).expect("a key pair");
+        tuf_key(&pair).key_id().expect("an identifier")
+    };
+    let named = |role: RoleType| signed.signed.roles[&role].keyids.clone();
+    assert_eq!(named(RoleType::Root), [identifier_of("root-key.pk8")]);
+    assert_eq!(
+        named(RoleType::Snapshot),
+        [identifier_of("snapshot-key.pk8")]
+    );
+    assert_eq!(
+        named(RoleType::Timestamp),
+        [identifier_of("timestamp-key.pk8")]
+    );
+    let mut targets = named(RoleType::Targets);
+    targets.sort_by(|left, right| left[..].cmp(&right[..]));
+    let mut files = vec![
+        identifier_of("targets-1.pk8"),
+        identifier_of("targets-2.pk8"),
+    ];
+    files.sort_by(|left, right| left[..].cmp(&right[..]));
+    assert_eq!(targets, files);
+    let mut every: Vec<_> = signed
+        .signed
+        .roles
+        .values()
+        .flat_map(|role| role.keyids.iter().map(|id| id[..].to_vec()))
+        .collect();
+    every.sort();
+    every.dedup();
+    assert_eq!(every.len(), 5, "five keys for four roles with two signers");
+    assert_eq!(signed.signed.keys.len(), 5);
+
+    let pair_of = |name: &str| {
+        Ed25519KeyPair::from_pkcs8(&std::fs::read(keys.join(name)).expect("a key"))
+            .expect("a key pair")
+    };
+    let written = members("kalareach-release");
+    let document = signed_by(
+        &written,
+        &[&pair_of("targets-1.pk8"), &pair_of("targets-2.pk8")],
+    );
+    assert_eq!(
+        verify_manifest(&signed.signed, document.as_bytes()).expect("both targets keys sign it"),
+        written
+    );
 }
