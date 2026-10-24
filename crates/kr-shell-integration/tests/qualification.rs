@@ -2680,6 +2680,150 @@ fn register_problems(
     problems
 }
 
+/// The name a triage row gives its change: the words of the change cell up to the first comma or
+/// semicolon, which is where a row says which change it is about and starts to describe it.
+fn change_name(change: &str) -> &str {
+    change.split([',', ';']).next().unwrap_or(change).trim()
+}
+
+/// The rows that are still `scheduled` past their target release and are the newest assessment of
+/// their change, as lines to print.
+///
+/// The newest row about a change is the assessment that stands, and the rows before it are the
+/// record of what was thought earlier, so a `scheduled` row that a later row about the same
+/// change and package replaces is history and not a missed deadline. A later row is one of the
+/// same day or after, further down the table.
+fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> Vec<String> {
+    let mut late = Vec::new();
+    for (index, row) in triage.iter().enumerate() {
+        let [date, change, packages, _assessment, target_release, status] = row.as_slice() else {
+            continue;
+        };
+        if status != "scheduled" || as_date(target_release) >= now {
+            continue;
+        }
+        let replaced = triage[index + 1..].iter().any(|later| {
+            let [later_date, later_change, later_packages, ..] = later.as_slice() else {
+                return false;
+            };
+            as_date(later_date) >= as_date(date)
+                && change_name(later_change) == change_name(change)
+                && later_packages
+                    .split(", ")
+                    .any(|package| packages.split(", ").any(|own| own == package))
+        });
+        if !replaced {
+            late.push(format!(
+                "{date}: {} (target {target_release})",
+                change_name(change)
+            ));
+        }
+    }
+    late
+}
+
+/// KR-REQ-07.88: a row that is still scheduled after its target stands as a missed deadline only
+/// when it is the newest assessment of its change.
+///
+/// A replacement appended beneath a scheduled row makes that row history, and a row about another
+/// change, another package or an earlier day replaces nothing. The deadline is read from the
+/// table's own rows with a date as the caller's, so the case does not depend on the day it runs.
+#[test]
+fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newest_for_its_change()
+{
+    let row = |date: &str, change: &str, packages: &str, target: &str, status: &str| {
+        vec![
+            date.to_owned(),
+            change.to_owned(),
+            packages.to_owned(),
+            "an assessment of more than eight words".to_owned(),
+            target.to_owned(),
+            status.to_owned(),
+        ]
+    };
+    let now = (2026, 10, 28);
+    let scheduled = row(
+        "2026-10-24",
+        "PowerShell v7.4.21, a release of the 7.4 series; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "scheduled",
+    );
+    assert_eq!(
+        scheduled_past_their_target(std::slice::from_ref(&scheduled), now).len(),
+        1,
+        "a scheduled row past its target and alone is a missed deadline"
+    );
+    let mut table = vec![scheduled.clone()];
+    table.push(row(
+        "2026-10-24",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    ));
+    assert!(
+        scheduled_past_their_target(&table, now).is_empty(),
+        "a later row about the same change replaces the scheduled one"
+    );
+    for (name, other) in [
+        (
+            "another change",
+            row(
+                "2026-10-24",
+                "PowerShell v7.5.12; released 2026-10-13",
+                "psreadline",
+                "2026-10-27",
+                "not-affected",
+            ),
+        ),
+        (
+            "another package",
+            row(
+                "2026-10-24",
+                "PowerShell v7.4.21; released 2026-10-13",
+                "zsh",
+                "2026-10-27",
+                "not-affected",
+            ),
+        ),
+        (
+            "an earlier day",
+            row(
+                "2026-10-23",
+                "PowerShell v7.4.21; released 2026-10-13",
+                "psreadline",
+                "2026-10-27",
+                "not-affected",
+            ),
+        ),
+    ] {
+        let table = vec![scheduled.clone(), other];
+        assert_eq!(
+            scheduled_past_their_target(&table, now).len(),
+            1,
+            "a row about {name} replaced the scheduled one"
+        );
+    }
+    let mut table = vec![scheduled.clone()];
+    table.push(row(
+        "2026-10-25",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "scheduled",
+    ));
+    assert_eq!(
+        scheduled_past_their_target(&table, now).len(),
+        1,
+        "a newest row that is itself scheduled past its target is the missed deadline"
+    );
+    assert!(
+        scheduled_past_their_target(std::slice::from_ref(&scheduled), (2026, 10, 27)).is_empty(),
+        "a row is on time on the day of its target"
+    );
+}
+
 /// KR-REQ-07.88: the register and the pins are one thing, and the release page carries its target.
 ///
 /// What is installed is checked against the same pins by
@@ -2818,14 +2962,7 @@ fn the_upstream_register_agrees_with_the_pins() {
                 "the triage row of {date} says a package was released and names no identity"
             );
         }
-        let due = as_date(target_release);
-        if due < now && status == "scheduled" {
-            panic!(
-                "the triage row of {date} is past its target release and is still scheduled; a \
-                 package that cannot meet its target is flagged with its compatibility-mode \
-                 choices"
-            );
-        }
+        let _ = as_date(target_release);
         for package in packages.split(", ") {
             assert!(
                 pins.iter().any(|pin| pin[0] == package),
@@ -2833,6 +2970,13 @@ fn the_upstream_register_agrees_with_the_pins() {
             );
         }
     }
+    let late = scheduled_past_their_target(&triage, now);
+    assert!(
+        late.is_empty(),
+        "a row is past its target release and still scheduled; a package that cannot meet its \
+         target is flagged with its compatibility-mode choices:\n{}",
+        late.join("\n")
+    );
     for pin in &pins {
         assert!(
             triage
