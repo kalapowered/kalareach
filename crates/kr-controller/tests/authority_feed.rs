@@ -41,6 +41,13 @@ use net_support::{Device, Host, MovedWall, connect, pair_with, paired_dial, prop
 
 const AUTHORITY: &str = "/api/authority/sync";
 
+/// A change the feed turns back without acting on it.
+const TURNED_BACK: Moment = Moment::Refuse {
+    status: 503,
+    code: "SERVICE_UNAVAILABLE",
+    retry_after_seconds: None,
+};
+
 /// A remote owner's installation key, signing as one.
 #[derive(Debug)]
 struct Installation(AuthorisationKeyPair);
@@ -954,16 +961,25 @@ struct Unverifiable {
     owner: (Device, kr_controller::service::net::devices::DeviceRecord),
     /// A share of a session that the other device holds, which a second withdrawal names.
     share: kr_protocol::grant::Grant,
+    /// How many changes to the list of keys that may remove the feed had reached the feed when the
+    /// registry was put back, when `delegations` named faults.
+    delegated: usize,
 }
 
 /// Pairs the device the withdrawal will name with `victim_rights` and one it will not, which is
 /// given a share of a session, takes a copy of the registry, pairs another owner, has that owner
 /// withdraw the first device and the share from the feed, carries both out, and puts the registry
-/// back to the copy. With `list_stays`, the feed turns back every change the host makes to the
-/// keys it lists as permitted to remove it, so it lists the keys it listed before the withdrawal.
+/// back to the copy.
+///
+/// `delegations` are faults for the changes the host makes to the keys it lists as permitted to
+/// remove the feed, counted from the first change after the other owner is paired: the first of
+/// them is the change that follows the withdrawal, and the feed turning it back is what leaves the
+/// device's key listed when the registry is put back. The host is then left to run on its own after
+/// the restart only when `then_idle`; else the case waits for what it wants to see.
 async fn a_withdrawal_by_an_owner_the_host_does_not_know(
     victim_rights: &[ActionRight],
-    list_stays: bool,
+    delegations: &[(u32, Moment)],
+    then_idle: bool,
 ) -> Unverifiable {
     let rig = Rig::start().await;
     let victim = rig.pairs(victim_rights).await;
@@ -985,22 +1001,12 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
         .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
         .await;
     rig.until_the_carrier_is_idle().await;
-    if list_stays {
-        // Every change of the list the host makes from here on, before and after the registry is
-        // put back, is turned back: the feed keeps the list the host made before the withdrawal.
-        for nth in 1..=64 {
-            rig.served.web().fail_with_member(
-                AUTHORITY,
-                "delegate",
-                nth,
-                Moment::Refuse {
-                    status: 503,
-                    code: "SERVICE_UNAVAILABLE",
-                    retry_after_seconds: None,
-                },
-            );
-        }
+    for (nth, moment) in delegations {
+        rig.served
+            .web()
+            .fail_with_member(AUTHORITY, "delegate", *nth, *moment);
     }
+    let delegated_before = rig.arrivals("delegate");
     let sign = |id: u8, target: RevocationTarget| {
         kr_pairing::grants::sign_revocation_request(
             &owner.0.keys().authorisation,
@@ -1054,19 +1060,38 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
         .await;
         assert_eq!(completion, RevocationCompletion::Complete);
     }
+    if !delegations.is_empty() {
+        // The change that follows the withdrawal has reached the feed, which turned it back: the
+        // feed still lists the key of the device the withdrawal names.
+        within("the host's change to the list reaches the feed", async {
+            while rig.arrivals("delegate") <= delegated_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let listed = rig.feed_as_the_owner_sees_it().await.summary.removal_keys;
+        assert!(
+            listed.contains(&victim.0.keys().authorisation.key_id()),
+            "the feed still lists the device's key: {listed:?}"
+        );
+    }
+    let delegated = rig.arrivals("delegate");
 
     // The registry goes back to before that owner was paired.
     let rig = rig
         .restarted(false, |tree| put_the_registry_back(tree, &earlier))
         .await;
-    rig.until_the_carrier_is_idle().await;
-    rig.until_the_carrier_is_idle().await;
+    if then_idle {
+        rig.until_the_carrier_is_idle().await;
+        rig.until_the_carrier_is_idle().await;
+    }
     Unverifiable {
         rig,
         victim,
         kept,
         owner,
         share,
+        delegated,
     }
 }
 
@@ -1095,7 +1120,9 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know_keeps_remote_access_ref
         kept,
         owner,
         share,
-    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView], false).await;
+        ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(&[ActionRight::SessionView], &[], true)
+        .await;
 
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
@@ -1183,7 +1210,8 @@ async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_rem
         rig, victim, kept, ..
     } = a_withdrawal_by_an_owner_the_host_does_not_know(
         &[ActionRight::HostManage, ActionRight::SessionView],
-        false,
+        &[],
+        true,
     )
     .await;
     let refused = rig.answers(&kept.0, &kept.1).await;
@@ -1243,30 +1271,35 @@ async fn a_device_an_unverifiable_withdrawal_names_cannot_end_the_refusal_by_rem
     rig.doctor_as(&session)
         .await
         .expect("the other device is served once the feed is removed");
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        !check.detail().contains("an owner this host does not know"),
+        "and the host no longer says it waits: {}",
+        check.detail()
+    );
 }
 
 /// KR-REQ-24.15: a refusal a device a withdrawal names would end by removing the feed stands when
 /// the feed still lists that device's key. The feed turns back every change the host makes to the
 /// list of keys that may remove it, so the list after the registry is put back is the list from
 /// before the withdrawal, and the device removes the feed with it. The removal says nothing of an
-/// owner having acted, so the host goes on refusing remote access, as it does until the owner at
-/// the machine acts.
+/// owner having acted, so the host goes on refusing remote access, and says it will until the
+/// daemon starts again: a feed that was removed is read no more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_that_still_lists_the_key_of_a_device_a_withdrawal_names_does_not_end_the_refusal_when_removed()
  {
+    let turned_back: Vec<(u32, Moment)> = (1..=64).map(|nth| (nth, TURNED_BACK)).collect();
     let Unverifiable {
         rig, victim, kept, ..
     } = a_withdrawal_by_an_owner_the_host_does_not_know(
         &[ActionRight::HostManage, ActionRight::SessionView],
+        &turned_back,
         true,
     )
     .await;
-    let refused = rig.answers(&kept.0, &kept.1).await;
-    assert!(says_an_owner_is_unknown(&refused), "{refused:?}");
-    let listed = rig.feed_as_the_owner_sees_it().await.summary.removal_keys;
     assert!(
-        listed.contains(&victim.0.keys().authorisation.key_id()),
-        "the feed still lists the device's key: {listed:?}"
+        rig.answers(&kept.0, &kept.1).await.is_err(),
+        "remote access is refused"
     );
 
     client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
@@ -1276,14 +1309,139 @@ async fn a_feed_that_still_lists_the_key_of_a_device_a_withdrawal_names_does_not
     rig.poll().await;
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
-        says_an_owner_is_unknown(&refused),
-        "a removal by a key the withdrawal takes the right from does not end the refusal: {refused:?}"
+        refused.is_err(),
+        "a removal by a key the withdrawal takes the right from does not end the refusal"
     );
     let check = rig.shown().await.check.expect("the feed check");
     assert!(
         check.detail().contains("an owner this host does not know"),
         "the host still says what it waits for: {}",
         check.detail()
+    );
+    assert!(
+        check.detail().contains("until the daemon starts again"),
+        "and what ends it, which is not the owner at the machine revoking what is named: {}",
+        check.detail()
+    );
+}
+
+/// KR-REQ-24.15: the host takes the key of a device a withdrawal names off the list of keys that
+/// may remove the feed when it finds the withdrawal, not when the scan has read the feed through.
+/// The list the feed holds when the registry is put back still names the device; the host's
+/// change that follows the withdrawal is taken, and the change that ends the scan is turned back,
+/// so the scan stops there. The list then lacks the device's key, still names the other owners'
+/// as they were, and the device cannot remove the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_key_of_a_device_a_withdrawal_names_is_taken_off_the_feeds_list_when_it_is_found() {
+    // The first change is the one after the withdrawal, turned back; the second is the host's
+    // first after the registry is put back, which is the one this case is about, and is taken;
+    // every later one is turned back, so the scan ends with the list as that change left it.
+    let faults: Vec<(u32, Moment)> = std::iter::once((1, TURNED_BACK))
+        .chain((3..=64).map(|nth| (nth, TURNED_BACK)))
+        .collect();
+    let Unverifiable {
+        rig,
+        victim,
+        kept,
+        owner,
+        ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::HostManage, ActionRight::SessionView],
+        &faults,
+        true,
+    )
+    .await;
+
+    let listed = rig.feed_as_the_owner_sees_it().await.summary.removal_keys;
+    assert!(
+        !listed.contains(&victim.0.keys().authorisation.key_id()),
+        "the device's key is off the list: {listed:?}"
+    );
+    assert!(
+        listed.contains(&rig.owner.authorisation.key_id())
+            && listed.contains(&owner.0.keys().authorisation.key_id()),
+        "and the host changed nothing else, as the scan did not end: {listed:?}"
+    );
+    client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
+        .remove(rig.feed())
+        .await
+        .expect_err("a key taken off the list cannot remove the feed");
+    assert!(
+        rig.answers(&kept.0, &kept.1).await.is_err(),
+        "remote access is refused"
+    );
+}
+
+/// KR-REQ-24.15: a change to the list of keys that may remove the feed, taken by a feed that was
+/// removed while the change waited, does not show the device's key cleared: the device removed the
+/// feed with the key the list still held when it did, and the host cannot tell who did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_to_the_feeds_list_taken_after_the_feed_was_removed_does_not_end_the_refusal() {
+    // The first change is turned back, as above. The second is the host's first after the registry
+    // is put back: the feed holds it until the case lets it go, which is after the device has
+    // removed the feed.
+    let Unverifiable {
+        rig,
+        victim,
+        kept,
+        delegated,
+        ..
+    } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::HostManage, ActionRight::SessionView],
+        &[(1, TURNED_BACK), (2, Moment::Gate)],
+        false,
+    )
+    .await;
+    within("the host's change reaches the feed", async {
+        while rig.arrivals("delegate") <= delegated {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    client_for(rig.served.origin(), victim.0.keys().authorisation.clone())
+        .remove(rig.feed())
+        .await
+        .expect("the feed takes the removal from a key it lists");
+    rig.served.web().release_held();
+    rig.poll().await;
+    rig.poll().await;
+    assert!(
+        rig.answers(&kept.0, &kept.1).await.is_err(),
+        "a change taken after the removal does not end the refusal"
+    );
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        check.detail().contains("an owner this host does not know"),
+        "the host still says what it waits for: {}",
+        check.detail()
+    );
+}
+
+/// A change to the list of keys that may remove the feed, turned back with a delay, ends the pass:
+/// the host asks the feed for nothing more until the delay is over, as it does for any request the
+/// feed turns back with one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_to_the_feeds_list_turned_back_with_a_delay_is_the_last_request_of_the_pass() {
+    let delayed = Moment::Refuse {
+        status: 503,
+        code: "SERVICE_UNAVAILABLE",
+        retry_after_seconds: Some(120),
+    };
+    let Unverifiable { rig, delegated, .. } = a_withdrawal_by_an_owner_the_host_does_not_know(
+        &[ActionRight::HostManage, ActionRight::SessionView],
+        &[(1, TURNED_BACK), (2, delayed)],
+        false,
+    )
+    .await;
+    let (waited, _release) = within("the carrier waits", rig.timer.next_wait()).await;
+    assert!(
+        waited >= Duration::from_secs(120),
+        "the carrier waits out the delay the feed asked for: {waited:?}"
+    );
+    assert_eq!(
+        rig.arrivals("delegate"),
+        delegated + 1,
+        "and the change the feed turned back was the last request of the pass that made it"
     );
 }
 

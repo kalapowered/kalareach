@@ -503,12 +503,19 @@ impl FeedRuntime {
             detail
         };
         let detail = if observed.unverified {
+            // A removed feed is read no more, so nothing finds the withdrawal settled before the
+            // daemon starts again.
+            let ends = if status.removed_at_ms.0.is_some() {
+                "until the daemon starts again"
+            } else {
+                "until that owner is paired again or the owner at this machine revokes them"
+            };
             detail.stated(
                 "; the feed shows complete a revocation by an owner this host does not know, so the \
                  devices it names may still be live here, and this host refuses every grant but the \
-                 owner's at this machine until that owner is paired again or the owner at this \
-                 machine revokes them",
+                 owner's at this machine ",
             )
+            .stated(ends)
             .sentence(&names_of(&controller.unverified_withdrawals()))
         } else {
             detail
@@ -834,9 +841,9 @@ async fn pass(
                     // The feed takes a removal from the keys it lists, so the keys of the devices
                     // this names are taken out of the list now, not when the scan has read the
                     // feed through: a scan that stops half way leaves the list as it is. A change
-                    // the feed turns back does not hold up the catching up that follows; the end
-                    // of the scan makes it again and reports it.
-                    let _ = withhold_from_the_feed(shared, controller, &mut now).await;
+                    // the feed turns back stops the pass like any other request it turns back,
+                    // with the delay it asked for.
+                    withhold_from_the_feed(shared, controller, &mut now).await?;
                 }
                 Settled::Waiting => {
                     contiguous = false;
@@ -933,11 +940,16 @@ async fn name_owners(
     wanted.sort();
     listed.sort();
     if wanted != listed {
-        shared
+        let answer = shared
             .client
             .delegate(&named)
             .await
             .map_err(|error| Stopped::of(&error, &shared.quiet))?;
+        if answer.summary.removed {
+            // A feed that was removed in between takes the change and says so, and a list changed
+            // after the removal proves nothing about who removed it.
+            return Ok(());
+        }
     }
     // The list the feed holds is the owners this host names, and none of them is a key a
     // withdrawal this host cannot verify takes the right from.
@@ -961,11 +973,15 @@ async fn withhold_from_the_feed(
         .copied()
         .collect();
     if kept.len() != latest.removal_keys.len() {
-        shared
+        let answer = shared
             .client
             .delegate(&kept)
             .await
             .map_err(|error| Stopped::of(&error, &shared.quiet))?;
+        if answer.summary.removed {
+            // See `name_owners`: the list proves nothing once the feed has been removed.
+            return Ok(());
+        }
         latest.removal_keys = kept;
     }
     controller.feed_lists_no_withheld_key();
