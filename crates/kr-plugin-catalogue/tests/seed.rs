@@ -1111,6 +1111,72 @@ async fn an_expired_seed_is_reported_and_a_fresh_sync_replaces_it() {
         .expect("a fresh generation is taken");
 }
 
+/// KR-REQ-11.08: one generation number names one index. A store that holds generation two refuses a
+/// repository that publishes other bytes under two, keeps the index it holds and what it installed
+/// from it, and takes the same repository once it publishes the change as generation three.
+#[tokio::test]
+async fn a_store_holding_generation_two_refuses_another_index_under_two_and_takes_three() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), adapter_spec(2)).await;
+    let bundle = seed_bundle(&generation);
+    let mut catalogue = offline(home.path());
+    let outcome = catalogue.seed(&bundle, environment(), budgets()).await;
+    assert_eq!(
+        outcome.activated,
+        Some(bundle.generation()),
+        "{}",
+        outcome.report()
+    );
+    assert_eq!(bundle.generation().get(), 2);
+
+    let id = kr_plugin_catalogue::RepositoryId::new("official").expect("an identifier");
+    let mut official = catalogue
+        .repository(&id)
+        .expect("records")
+        .expect("enrolled");
+    official.metadata_url = generation.metadata_url();
+    official.targets_url = generation.targets_url();
+    catalogue
+        .update_enrolment(official, false)
+        .expect("the owner points it at a mirror");
+
+    // The repository is rebuilt under the number the store holds, with a different package.
+    generation
+        .rewrite_with(GenerationSpec {
+            package_version: "0.2.0".to_owned(),
+            ..adapter_spec(2)
+        })
+        .await;
+    let refusal = catalogue
+        .sync(&id)
+        .await
+        .expect_err("other bytes under a number the store holds");
+    assert!(
+        matches!(refusal, CatalogueError::Untrusted { .. })
+            && refusal.to_string().contains("written once"),
+        "{refusal}"
+    );
+    assert_eq!(
+        catalogue.index(&id).expect("still active").generation.get(),
+        2,
+        "the generation the store holds stays in use"
+    );
+    assert_eq!(
+        installed(&catalogue).expect("still installed").version,
+        version()
+    );
+
+    // The same change published as the next number is taken.
+    generation
+        .rewrite_with(GenerationSpec {
+            package_version: "0.2.0".to_owned(),
+            ..adapter_spec(3)
+        })
+        .await;
+    catalogue.sync(&id).await.expect("the next number is taken");
+    assert_eq!(catalogue.index(&id).expect("activated").generation.get(), 3);
+}
+
 // ---------------------------------------------------------------------------------------------
 // A network that moved on
 // ---------------------------------------------------------------------------------------------
