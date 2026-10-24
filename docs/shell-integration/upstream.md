@@ -19,7 +19,7 @@ a test failing.
 | --- | --- | --- | --- | --- | --- |
 | zsh | Zsh | zsh-5.9 | https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz | 9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5 | the zsh-announce and zsh-workers lists, and the project's own release notes |
 | bash | GNU Bash | bash-5.2.37 | https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz | 9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff | the bug-bash list and the official patch series under ftp.gnu.org/gnu/bash/bash-5.2-patches |
-| fish | fish-shell | fish-4.9.3 | https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz | 20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c | the fish-shell repository's security advisories and its release notes |
+| fish | fish-shell | fish-4.9.3 | https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz | 20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c | the fish-shell repository's security advisories and its release notes, RustSec advisories against the crates and repositories in fish's `Cargo.lock`, and, where the build compiles or links PCRE2, PCRE2's own advisories |
 | psreadline | PSReadLine | psreadline-2.3.4 to 3.0.0 on PowerShell 7.4 or later | https://github.com/PowerShell/PowerShell | qualified rather than fetched | PowerShell/Announcements, and the PSReadLine and PowerShell repositories' security advisories |
 <!-- /kr:pins -->
 
@@ -35,7 +35,7 @@ qualification recorded, and it gets a row of its own below.
 
 ## The crates and repositories the fish build uses
 
-The fish package is built from Rust, and its release names more than its own archive. Its `Cargo.lock` file, included in its archive, lists the crates it takes from crates.io, each with a checksum. It also includes 3 git repositories at a locked revision: `fluent-rs` and `rust-pcre2` from github.com, and `fluent-ftl-tools` from codeberg.org. Cargo downloads none of them. Instead, the crates and a git bundle of each of the repositories are placed in the sources cache beside the archive by `scripts/place-shell-sources.sh`. Then, when building, `scripts/build-shells.sh` first checks each of them against its pin before cargo sees it: the lock's checksum pins a crate, and the `cargo.git` list in `shells/fish/manifest.json` pins a repository. The latter pins the locked revision for each repository and also the digest of the files within the repository at that revision. This means that cargo reaches no server, and if the lock names a git repository that the manifest does not pin, or a source of any other kind, the build will stop with an error naming it. (These pins are not rows of the register above, because they change with the fish release.)
+The fish package is built from Rust, and its release names more than its own archive. Its `Cargo.lock` file, included in its archive, lists the crates it takes from crates.io, each with a checksum. It also includes 3 git repositories at a locked revision: `fluent-rs` and `rust-pcre2` from github.com, and `fluent-ftl-tools` from codeberg.org. Cargo downloads none of them. Instead, the crates and a git bundle of each of the repositories are placed in the sources cache beside the archive by `scripts/place-shell-sources.sh`. Then, when building, `scripts/build-shells.sh` first checks each of them against its pin before cargo sees it: the lock's checksum pins a crate, and the `cargo.git` list in `shells/fish/manifest.json` pins a repository. The latter pins the locked revision for each repository and also the digest of the files within the repository at that revision. This means that cargo reaches no server, and if the lock names a git repository that the manifest does not pin, or a source of any other kind, the build will stop with an error naming it. (These pins are not rows of the register above, because they change with the fish release.) An advisory against any of these crates or repositories, or against PCRE2 where the build compiles or links it, affects the fish package and gets a triage row with the same target as an advisory against fish itself.
 
 If the lock file changes with a new release of fish, running `bash scripts/build-shells.sh --fish --check-sources` will name the first repository it now depends on that is not pinned in the manifest, and it stops there, so run it again after each fix. A pin that the new lock no longer uses is refused too, and has to be removed. Add a pin to the manifest for a new repository with a digest of 64 zeros, then run `bash scripts/place-shell-sources.sh --fish` to get its git bundle. Then re-run the check and it will refuse the repository because the digest is wrong, but this time it will print the digest of the files it found, which is the value to pin.
 
@@ -62,7 +62,7 @@ choices are:
   claim either.
 * **Run a different managed shell.** The other packages are unaffected by one upstream's delay.
 
-Each is an explicit selection. Nothing falls back on its own.
+The first is what a session does when the person selects nothing; the other two are selected by the person, and nothing falls back to either on its own.
 
 ## Triage record
 
