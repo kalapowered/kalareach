@@ -10,8 +10,10 @@
 //! Which sign-in is in force is read from the status the account publishes, never from its store
 //! after the connection is opened, so the question costs nothing and is asked of every call. A call
 //! made after a sign-out has returned, whether it sends or waits for a frame, finds the connection
-//! ended: it is not left to a task to have run first. The words of why are kept before the
-//! connection is closed, so whoever finds it closed can ask for them.
+//! ended: it is not left to a task to have run first, and not to another caller that found the
+//! change before it, since the status is read as it stands and not as it changed since the last
+//! question. The words of why are kept before the connection is closed, so whoever finds it closed
+//! can ask for them.
 //!
 //! A change the account object does not publish is not heard: another process of the application
 //! that shares its store on a desktop, or a publish whose status could not be read. The keeper of
@@ -24,7 +26,7 @@
 //! the host on that lease.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 use kr_client::error::{ClientError, Result};
 use kr_client::organisation::LeaseStop;
@@ -45,8 +47,10 @@ pub type LeaseGate = Arc<dyn Fn() -> std::result::Result<(), LeaseStop> + Send +
 pub struct Binding {
     /// The sign-in the connection was opened under.
     generation: String,
-    /// What the account has published since the connection last looked.
-    changes: Mutex<watch::Receiver<AccountStatus>>,
+    /// What the account publishes. It is read as it stands and never marked as seen, so every look
+    /// finds a change published since the connection was opened, whichever look found it first and
+    /// whether or not the reason has been kept yet.
+    published: watch::Receiver<AccountStatus>,
     lease: LeaseGate,
     /// Whether the connection has presented a lease of its own, which the host then judges.
     presented: AtomicBool,
@@ -64,7 +68,7 @@ impl Binding {
     ) -> Arc<Self> {
         Arc::new(Self {
             generation,
-            changes: Mutex::new(changes),
+            published: changes,
             lease,
             presented: AtomicBool::new(false),
             inner,
@@ -81,14 +85,14 @@ impl Binding {
         self.account_left().map(|stop| self.end(&stop))
     }
 
+    /// Why the account that published last is not the sign-in this connection was opened under, when
+    /// it is not. Nothing is marked or kept here, so a caller that asks while another is between
+    /// finding the change and keeping the reason finds the change too.
     fn account_left(&self) -> Option<LeaseStop> {
-        let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
-        if !changes.has_changed().unwrap_or(false) {
+        if !self.published.has_changed().unwrap_or(false) {
             return None;
         }
-        // Marked seen before it is read, so a publish that follows the read is seen by the next
-        // question and not lost.
-        match &*changes.borrow_and_update() {
+        match &*self.published.borrow() {
             AccountStatus::SignedIn { generation, .. } if *generation == self.generation => None,
             AccountStatus::SignedIn { .. } => Some(LeaseStop::AccountChanged),
             AccountStatus::SignedOut | AccountStatus::Ended => Some(LeaseStop::SignIn),
