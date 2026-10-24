@@ -222,15 +222,25 @@ pub trait Native: Send + Sync {
     fn route(&self) -> PushFuture<'_, Option<String>>;
 }
 
+/// Whether the run that is registering is still wanted: it still holds its host, and this phone is
+/// still paired with it.
+pub type StillWanted<'a> = dyn Fn() -> bool + Send + Sync + 'a;
+
 /// How this phone hands a delivery credential to the host it is paired with.
 pub trait Registrar: Send + Sync {
     /// Sends `device.push.register` and `device.preview_key.update` to `host` over the paired
     /// connection, and answers what the host answered.
+    ///
+    /// The person can forget the host at any moment, and a call that waits (the connection, the
+    /// host's answer) outlives that. `wanted` is asked before the connection is made, after it,
+    /// and before each change is sent, and nothing is sent to a host once it says no: the call
+    /// then answers with an error.
     fn register<'a>(
         &'a self,
         host: &'a PairedHost,
         params: DevicePushRegisterParams,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        wanted: &'a StillWanted<'a>,
     ) -> PushFuture<'a, DevicePushRegisterResult>;
 }
 
@@ -732,6 +742,13 @@ impl PushDesk {
         entry.updated_ms = now;
     }
 
+    /// Whether `run` is still wanted: it holds its host, and this phone is still paired with it.
+    /// Forgetting a host takes the pairing first and the run's claim after, so both are asked.
+    fn wanted(&self, host: DeviceId, run: u64) -> bool {
+        let held = lock(&self.state).holds(host, run);
+        held && self.device.is_paired_with(host).unwrap_or(false)
+    }
+
     /// Says where a host's notifications stand while `run` holds it: working, in `words`. It keeps
     /// that and tells the page, and says whether it did: a run that no longer holds its host (the
     /// host was forgotten) writes nothing.
@@ -833,6 +850,11 @@ impl PushDesk {
         let http = (self.wiring.http)(&origin).map_err(|_| unreachable_gateway())?;
         let gateway = PushGateway::new(origin.clone(), http, signer.clone());
 
+        // The turn and the token may have taken a while, and the person may have forgotten the host
+        // meanwhile: a run that is not wanted must not take the phone's one registration slot.
+        if !self.wanted(host.host_device_id, run) {
+            return Err(forgotten_host());
+        }
         // The record is written before the token is proposed, so a challenge that arrives before the
         // gateway's answer to the proposal is the challenge of a registration the receiver knows.
         let registration_token = RegistrationToken::new(token).map_err(|_| {
@@ -890,14 +912,8 @@ impl PushDesk {
 
         // The host is the one the person chose. A phone that was unpaired or forgot the host
         // while the challenge was awaited stops here, before the host is asked anything.
-        if !self
-            .device
-            .is_paired_with(host.host_device_id)
-            .unwrap_or(false)
-        {
-            return Err("This phone is no longer paired with that host."
-                .to_owned()
-                .into());
+        if !self.wanted(host.host_device_id, run) {
+            return Err(forgotten_host());
         }
         if !self.working(host.host_device_id, run, "Telling the host.") {
             return Err(forgotten_host());
@@ -914,6 +930,9 @@ impl PushDesk {
             .await
             .map_err(|error| gateway_words(&error))?;
         let keys = &self.device.identity().keys;
+        // The gateway's answer may have come after the person forgot the host: the registrar asks
+        // before it sends the host anything.
+        let wanted = || self.wanted(host.host_device_id, run);
         self.registrar
             .register(
                 host,
@@ -924,10 +943,17 @@ impl PushDesk {
                     previews_enabled: true,
                 },
                 *keys.notification_preview.public(),
+                &wanted,
             )
             .await
             .map_err(|words| {
-                format!("The host did not take this phone as a destination: {words}")
+                if wanted() {
+                    Stop::from(format!(
+                        "The host did not take this phone as a destination: {words}"
+                    ))
+                } else {
+                    forgotten_host()
+                }
             })?;
 
         let name = kr_crypto::store::SecretName::device_key(
@@ -1250,15 +1276,23 @@ impl Registrar for ConnectionRegistrar {
         host: &'a PairedHost,
         params: DevicePushRegisterParams,
         preview_key: kr_protocol::scalars::NotificationPreviewKey,
+        wanted: &'a StillWanted<'a>,
     ) -> PushFuture<'a, DevicePushRegisterResult> {
         Box::pin(async move {
             use kr_protocol::envelope::ActionTarget;
             use kr_protocol::method::Method;
             use kr_protocol::sharing::DevicePreviewKeyUpdateParams;
 
+            let no_longer = || "this phone is no longer paired with that host".to_owned();
+            if !wanted() {
+                return Err(no_longer());
+            }
             let connection = crate::connection::Connection::paired(&self.0, host)
                 .await
                 .map_err(|error| error.message)?;
+            if !wanted() {
+                return Err(no_longer());
+            }
             let session = connection.session();
             let target = ActionTarget::environment(connection.environment_id());
             let settled = session
@@ -1283,6 +1317,9 @@ impl Registrar for ConnectionRegistrar {
             // The key the host seals previews to is the one it recorded when this phone paired. The
             // call says the phone holds it and at which revision: the same key at the same revision
             // is answered as already recorded, and any other is refused rather than taken.
+            if !wanted() {
+                return Err(no_longer());
+            }
             session
                 .mutate(
                     Method::DevicePreviewKeyUpdate,
