@@ -8744,3 +8744,48 @@ async fn kr_req_26_43_an_answer_that_was_not_written_is_counted_though_its_calle
         "an answer that went counts nothing, whoever waited for it"
     );
 }
+
+/// KR-REQ-26.43: a request of the terminal's that the upstream reads and never answers is one
+/// failure of its adapter, a timeout, counted when this host gives the request up, and counted once.
+#[tokio::test(start_paused = true)]
+async fn kr_req_26_43_a_request_the_upstream_never_answers_is_counted_as_a_timeout() {
+    let broker = broker();
+    let (owner, _upstream, _client, writes) = duplex_over_pipes(&broker, 1 << 20);
+    let drained = tokio::spawn(writes);
+    owner
+        .from_client(
+            br#"{"id":1,"method":"session/update","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the terminal's request is carried");
+    assert_eq!(owner.forwarded_client_requests(), 1);
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![],
+        "a request still waiting is not a failure yet"
+    );
+
+    // The upstream reads it and answers nothing. The deadline is what gives the request up.
+    tokio::time::advance(
+        kr_worker::broker::CLIENT_REPLY_DEADLINE + std::time::Duration::from_secs(30),
+    )
+    .await;
+    for _ in 0..200 {
+        if owner.forwarded_client_requests() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(owner.forwarded_client_requests(), 0);
+    let timeout = vec![(Adapter::Codex, MetricOutcome::Timeout, 1)];
+    assert_eq!(adapter_failures(&broker), timeout);
+
+    // Nothing is waiting any more, so time passing again adds nothing.
+    tokio::time::advance(kr_worker::broker::CLIENT_REPLY_DEADLINE).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(adapter_failures(&broker), timeout);
+
+    owner.shutdown();
+    let _ = tokio::time::timeout(LIVENESS_DEADLINE, drained).await;
+}
