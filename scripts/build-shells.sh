@@ -14,6 +14,12 @@
 # the ordered patches in shells/<shell>/patches and copies the bridge sources from
 # shells/<shell>/src into the tree.
 #
+# Before a package is configured, the bridge's own SHA-256 and HMAC-SHA-256 are compiled from the
+# tree about to be built, with that build's compiler and flags, and run against published answers:
+# NIST's examples and byte-oriented test vectors for SHA-256 and RFC 4231 for HMAC-SHA-256. A
+# package whose hash or MAC gives another answer is never built, so every package and every build
+# of one runs the check, whatever the shell's own test suite is told to do.
+#
 # A shell whose tree holds a Cargo.lock is also built without a fetch. The lock names every crate
 # and every git repository the compiler would download. This script checks each crate against the
 # checksum the lock holds and each repository against the revision and the tree digest the
@@ -578,6 +584,319 @@ print("build-shells: %d crates and %d repositories checked against their pins" %
 PYTHON
 }
 
+# Holds the bridge's SHA-256 and HMAC-SHA-256 to published answers. The bridge computes its
+# bootstrap proof with them, and the worker checks that proof with the RustCrypto implementations,
+# so a wrong answer here is a package that no worker admits. $2 is the tree's own copy of
+# kr_bridge_crypto.c, compiled with the compiler and the flags the package's manifest and the
+# environment give; $3 is a scratch directory; $4 is the manifest's compiler flags.
+check_bridge_crypto() {
+    local shell_name="$1"
+    local source="$2"
+    local work="$3"
+    local cflags="$4"
+    local driver="$work/kr-bridge-crypto-check"
+
+    cat > "$driver.c" <<'C'
+/*
+ * Known answers for the bridge's SHA-256 and HMAC-SHA-256.
+ *
+ * Each case names where its answer comes from. NIST's examples and the byte-oriented vectors of
+ * its Cryptographic Algorithm Validation Program are copied as published; where NIST publishes
+ * none for a length that the code treats separately, the answer was taken from OpenSSL and from
+ * Perl's Digest::SHA, which agree. Every message is hashed three ways: whole, one byte at a time and
+ * in uneven pieces, which reach every state of the 64-byte buffer.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kr_bridge_crypto.h"
+
+typedef struct {
+    const char *text;
+    const char *hex;
+    unsigned char fill;
+    size_t repeat;
+} blob;
+
+#define TEXT(value) { value, NULL, 0, 0 }
+#define HEX(value) { NULL, value, 0, 0 }
+#define FILL(byte, count) { NULL, NULL, byte, count }
+
+typedef struct {
+    const char *name;
+    blob message;
+    const char *digest;
+} sha_case;
+
+typedef struct {
+    const char *name;
+    blob key;
+    blob message;
+    const char *mac;
+    size_t mac_bytes;
+} hmac_case;
+
+static const sha_case sha_cases[] = {
+    { "the empty message (NIST CAVP SHA256ShortMsg, Len = 0)", TEXT(""),
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    { "abc, one block (FIPS 180-2 B.1)", TEXT("abc"),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+    { "448 bits, the padding spills into a second block (FIPS 180-2 B.2)",
+      TEXT("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+      "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1" },
+    { "one million a, many blocks (FIPS 180-2 B.3)", FILL('a', 1000000),
+      "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0" },
+    { "55 bytes, the longest message whose padding fits the block (NIST CAVP SHA256ShortMsg, Len = 440)",
+      HEX("3ebfb06db8c38d5ba037f1363e118550aad94606e26835a01af05078533cc25f2f39573c04b632f62f68c294ab31f2a3e2a1a0d8c2be51"),
+      "6595a2ef537a69ba8583dfbf7f5bec0ab1f93ce4c8ee1916eff44a93af5749c4" },
+    { "56 bytes, the shortest message whose padding needs a second block (NIST CAVP SHA256ShortMsg, Len = 448)",
+      HEX("2d52447d1244d2ebc28650e7b05654bad35b3a68eedc7f8515306b496d75f3e73385dd1b002625024b81a02f2fd6dffb6e6d561cb7d0bd7a"),
+      "cfb88d6faf2de3a69d36195acec2e255e2af2b7d933997f348e09f6ce5758360" },
+    { "57 bytes (NIST CAVP SHA256ShortMsg, Len = 456)",
+      HEX("4cace422e4a015a75492b3b3bbfbdf3758eaff4fe504b46a26c90dacc119fa9050f603d2b58b398cad6d6d9fa922a154d9e0bc4389968274b0"),
+      "4d54b2d284a6794581224e08f675541c8feab6eefa3ac1cfe5da4e03e62f72e4" },
+    { "63 bytes, one short of a full block (NIST CAVP SHA256ShortMsg, Len = 504)",
+      HEX("e2f76e97606a872e317439f1a03fcd92e632e5bd4e7cbc4e97f1afc19a16fde92d77cbe546416b51640cddb92af996534dfd81edb17c4424cf1ac4d75aceeb"),
+      "18041bd4665083001fba8c5411d2d748e8abbfdcdfd9218cb02b68a78e7d4c23" },
+    { "64 bytes, exactly one block (NIST CAVP SHA256ShortMsg, Len = 512)",
+      HEX("5a86b737eaea8ee976a0a24da63e7ed7eefad18a101c1211e2b3650c5187c2a8a650547208251f6d4237e661c7bf4c77f335390394c37fa1a9f9be836ac28509"),
+      "42e61e174fbb3897d6dd6cef3dd2802fe67b331953b06114a65c772859dfc1aa" },
+    { "65 bytes of a, one byte into the second block (OpenSSL, Perl Digest::SHA)", FILL('a', 65),
+      "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0" },
+    { "119 bytes of a, the padding fits the second block (OpenSSL, Perl Digest::SHA)", FILL('a', 119),
+      "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb" },
+    { "120 bytes of a, the padding needs a third block (OpenSSL, Perl Digest::SHA)", FILL('a', 120),
+      "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c" },
+    { "121 bytes of a (OpenSSL, Perl Digest::SHA)", FILL('a', 121),
+      "e9615320128cc7a3d6078e9af05603188e5ccbf0d07d8b735d3df5e8e0c1281f" },
+    { "127 bytes of a (OpenSSL, Perl Digest::SHA)", FILL('a', 127),
+      "c57e9278af78fa3cab38667bef4ce29d783787a2f731d4e12200270f0c32320a" },
+    { "128 bytes of a, exactly two blocks (OpenSSL, Perl Digest::SHA)", FILL('a', 128),
+      "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e" },
+    { "129 bytes of a (OpenSSL, Perl Digest::SHA)", FILL('a', 129),
+      "c12cb024a2e5551cca0e08fce8f1c5e314555cc3fef6329ee994a3db752166ae" },
+};
+
+static const hmac_case hmac_cases[] = {
+    { "RFC 4231 test case 1", FILL(0x0b, 20), TEXT("Hi There"),
+      "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", 32 },
+    { "RFC 4231 test case 2", TEXT("Jefe"), TEXT("what do ya want for nothing?"),
+      "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", 32 },
+    { "RFC 4231 test case 3", FILL(0xaa, 20), FILL(0xdd, 50),
+      "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe", 32 },
+    { "RFC 4231 test case 4", HEX("0102030405060708090a0b0c0d0e0f10111213141516171819"), FILL(0xcd, 50),
+      "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b", 32 },
+    { "RFC 4231 test case 5, the published 128-bit truncation", FILL(0x0c, 20),
+      TEXT("Test With Truncation"), "a3b6167473100ee06e0c796c2955552b", 16 },
+    { "RFC 4231 test case 6, a key longer than the block", FILL(0xaa, 131),
+      TEXT("Test Using Larger Than Block-Size Key - Hash Key First"),
+      "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", 32 },
+    { "RFC 4231 test case 7, a key and a message longer than the block", FILL(0xaa, 131),
+      TEXT("This is a test using a larger than block-size key and a larger than block-size data. "
+           "The key needs to be hashed before being used by the HMAC algorithm."),
+      "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2", 32 },
+    { "a 63-byte key, one short of the block (OpenSSL, Perl Digest::SHA)", FILL(0x01, 63), TEXT("abc"),
+      "641bf86650693361480d13ef8d9cd821b18230bc2290b3d1425b4ea31819b1be", 32 },
+    { "a 64-byte key, exactly the block (OpenSSL, Perl Digest::SHA)", FILL(0x01, 64), TEXT("abc"),
+      "0c462fe9789424c45ebeb37b90d6e879e8e0580849c91a84198b267a90c77250", 32 },
+    { "a 65-byte key, one past the block (OpenSSL, Perl Digest::SHA)", FILL(0x01, 65), TEXT("abc"),
+      "fb1e9b9f783337ca807b11cd396d1c31eb5267d95d2d2bb0f1d83ffafbbf64e9", 32 },
+    { "an empty key and an empty message (OpenSSL, Perl Digest::SHA)", TEXT(""), TEXT(""),
+      "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad", 32 },
+};
+
+static int failures;
+static int cases;
+
+static int
+nibble(char digit)
+{
+    if (digit >= '0' && digit <= '9') {
+        return digit - '0';
+    }
+    if (digit >= 'a' && digit <= 'f') {
+        return digit - 'a' + 10;
+    }
+    return -1;
+}
+
+static unsigned char *
+materialise(const blob *spec, size_t *length)
+{
+    unsigned char *bytes;
+    size_t i;
+
+    if (spec->text != NULL) {
+        *length = strlen(spec->text);
+        bytes = malloc(*length + 1);
+        if (bytes != NULL) {
+            memcpy(bytes, spec->text, *length);
+        }
+    } else if (spec->hex != NULL) {
+        *length = strlen(spec->hex) / 2;
+        bytes = malloc(*length + 1);
+        for (i = 0; bytes != NULL && i < *length; i++) {
+            bytes[i] = (unsigned char)(nibble(spec->hex[i * 2]) * 16 + nibble(spec->hex[i * 2 + 1]));
+        }
+    } else {
+        *length = spec->repeat;
+        bytes = malloc(*length + 1);
+        if (bytes != NULL) {
+            memset(bytes, spec->fill, *length);
+        }
+    }
+    if (bytes == NULL) {
+        fprintf(stderr, "out of memory\n");
+        exit(2);
+    }
+    return bytes;
+}
+
+static void
+as_hex(const unsigned char *bytes, size_t length, char *text)
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t i;
+
+    for (i = 0; i < length; i++) {
+        text[i * 2] = digits[bytes[i] >> 4];
+        text[i * 2 + 1] = digits[bytes[i] & 15];
+    }
+    text[length * 2] = '\0';
+}
+
+static void
+expect(const char *name, const char *how, const unsigned char *got, size_t bytes, const char *want)
+{
+    char text[2 * KR_SHA256_LEN + 1];
+
+    cases++;
+    as_hex(got, bytes, text);
+    if (strcmp(text, want) != 0) {
+        failures++;
+        printf("FAIL %s, %s\n  got  %s\n  want %s\n", name, how, text, want);
+    }
+}
+
+/* How a message is handed to the hash: whole, one byte at a time, or in uneven pieces. */
+static void
+digest(const unsigned char *message, size_t length, int how, unsigned char out[KR_SHA256_LEN])
+{
+    static const size_t pieces[] = { 1, 63, 2, 64, 65, 7 };
+    kr_sha256 state;
+    size_t done = 0;
+    size_t turn = 0;
+
+    kr_sha256_init(&state);
+    if (how == 0) {
+        kr_sha256_update(&state, message, length);
+    }
+    while (how != 0 && done < length) {
+        size_t take = how == 1 ? 1 : pieces[turn++ % (sizeof(pieces) / sizeof(pieces[0]))];
+        if (take > length - done) {
+            take = length - done;
+        }
+        kr_sha256_update(&state, message + done, take);
+        done += take;
+    }
+    kr_sha256_final(&state, out);
+}
+
+static void
+check_sha256(void)
+{
+    static const char *const ways[] = { "fed whole", "fed a byte at a time", "fed in uneven pieces" };
+    size_t i;
+    int how;
+
+    for (i = 0; i < sizeof(sha_cases) / sizeof(sha_cases[0]); i++) {
+        size_t length;
+        unsigned char *message = materialise(&sha_cases[i].message, &length);
+        unsigned char out[KR_SHA256_LEN];
+
+        for (how = 0; how < 3; how++) {
+            digest(message, length, how, out);
+            expect(sha_cases[i].name, ways[how], out, KR_SHA256_LEN, sha_cases[i].digest);
+        }
+        free(message);
+    }
+}
+
+static void
+check_hmac_sha256(void)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(hmac_cases) / sizeof(hmac_cases[0]); i++) {
+        size_t key_length;
+        size_t message_length;
+        unsigned char *key = materialise(&hmac_cases[i].key, &key_length);
+        unsigned char *message = materialise(&hmac_cases[i].message, &message_length);
+        unsigned char out[KR_SHA256_LEN];
+
+        kr_hmac_sha256(key, key_length, message, message_length, out);
+        expect(hmac_cases[i].name, "HMAC-SHA-256", out, hmac_cases[i].mac_bytes, hmac_cases[i].mac);
+        free(key);
+        free(message);
+    }
+}
+
+/* The hash clears its state when the digest is taken: memory the caller owns, so it can be read. */
+static void
+check_state_cleared(void)
+{
+    kr_sha256 state;
+    unsigned char out[KR_SHA256_LEN];
+    const unsigned char *bytes = (const unsigned char *)&state;
+    size_t i;
+    int clear = 1;
+
+    kr_sha256_init(&state);
+    kr_sha256_update(&state, "abc", 3);
+    kr_sha256_final(&state, out);
+    for (i = 0; i < sizeof(state); i++) {
+        clear = clear && bytes[i] == 0;
+    }
+    cases++;
+    if (!clear) {
+        failures++;
+        printf("FAIL the hash state is cleared when the digest is taken\n");
+    }
+}
+
+int
+main(void)
+{
+    check_sha256();
+    check_hmac_sha256();
+    check_state_cleared();
+    printf("%d checks, %d failed\n", cases, failures);
+    return failures == 0 ? 0 : 1;
+}
+C
+    # shellcheck disable=SC2086
+    if ! ${CC:-cc} $cflags ${CPPFLAGS:-} -I "$(dirname "$source")" -o "$driver" "$driver.c" "$source" \
+        ${LDFLAGS:-} > "$work/crypto-check-build.log" 2>&1; then
+        tail -40 "$work/crypto-check-build.log" >&2
+        echo "build-shells: the $shell_name bridge's SHA-256 check did not compile" >&2
+        exit 1
+    fi
+    local status=0
+    "$driver" > "$work/crypto-check.log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ]; then
+        cat "$work/crypto-check.log" >&2
+        if [ "$status" -eq 1 ]; then
+            echo "build-shells: the $shell_name bridge's SHA-256 or HMAC-SHA-256 does not give the published answers" >&2
+        else
+            echo "build-shells: the $shell_name bridge's SHA-256 check did not run to its end (exit $status)" >&2
+        fi
+        exit 1
+    fi
+    echo "build-shells: the $shell_name bridge's SHA-256 and HMAC-SHA-256 give the published answers ($(tail -1 "$work/crypto-check.log"))"
+}
+
 build_package() {
     local shell_name="$1"
     local package="$root/shells/$shell_name"
@@ -752,6 +1071,20 @@ startup=$(digest "$package/$m_startup") $m_startup"
         echo "build-shells: $shell_name sources check out ($identity)"
         return 0
     fi
+
+    # The patches and the sources are in place and nothing has been configured: the hash and the MAC
+    # the bridge will be compiled with are held to their published answers first.
+    local crypto_source=""
+    for entry in $m_sources; do
+        if [ "${entry%%:*}" = "src/kr_bridge_crypto.c" ]; then
+            crypto_source="$source_tree/${entry#*:}"
+        fi
+    done
+    if [ -z "$crypto_source" ]; then
+        echo "build-shells: the $shell_name manifest installs no src/kr_bridge_crypto.c" >&2
+        exit 1
+    fi
+    check_bridge_crypto "$shell_name" "$crypto_source" "$work" "$m_cflags"
 
     # A patch to a file a release also ships a generated form of — a configure script beside its
     # configure.ac, a parser beside its grammar — leaves the source newer than the product, and
