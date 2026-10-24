@@ -241,6 +241,62 @@ async fn answering(terminal: &mut WorkerTerminal) {
         .await;
 }
 
+/// The lines of `whoami`'s own account and group reports that tell one principal from another: the
+/// account's identifier, the integrity level, and the Administrators group with the state it is in.
+fn standing() -> Vec<String> {
+    let whoami = PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
+        .join("System32")
+        .join("whoami.exe");
+    let mut lines = Vec::new();
+    for switch in ["/user", "/groups"] {
+        let output = Command::new(&whoami)
+            .args([switch, "/fo", "csv", "/nh"])
+            .output()
+            .expect("whoami runs");
+        assert!(output.status.success(), "whoami {switch} failed");
+        lines.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| {
+                    switch == "/user"
+                        || line.contains("Mandatory Label")
+                        || line.contains("S-1-5-32-544")
+                })
+                .map(str::to_owned),
+        );
+    }
+    lines
+}
+
+/// KR-REQ-06.12: the managed root shell runs as the account and at the integrity level of the host
+/// that started it, with the Administrators group in the state this process has it in. The shell
+/// is asked what `whoami` says of it, and this process is asked the same.
+async fn the_shell_runs_as_this_process(terminal: &mut WorkerTerminal) {
+    let expected = standing();
+    assert!(
+        expected.len() >= 2,
+        "whoami told this process nothing to compare: {expected:?}"
+    );
+    terminal
+        .type_line(
+            "& \"$env:SystemRoot\\System32\\whoami.exe\" /user /fo csv /nh; \
+             & \"$env:SystemRoot\\System32\\whoami.exe\" /groups /fo csv /nh; \
+             Write-Output ('kr-' + 'whoami-done')",
+        )
+        .await;
+    terminal
+        .shown("kr-whoami-done", "the managed shell says who it is")
+        .await;
+    let shown = terminal.text();
+    for line in expected {
+        let flat: String = line.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+        assert!(
+            shown.contains(&flat),
+            "the managed shell does not read as this process does ({flat}); it showed: {shown}"
+        );
+    }
+}
+
 /// What the terminal shows after the last copy of `marker`.
 fn after(terminal: &WorkerTerminal, marker: &str) -> String {
     let text = terminal.text();
@@ -358,6 +414,7 @@ async fn a_default_session_is_refused_without_the_entry_and_managed_with_it() {
     );
     let mut terminal = managed.terminal(&created).await;
     answering(&mut terminal).await;
+    the_shell_runs_as_this_process(&mut terminal).await;
 
     drop(terminal);
     let closed = managed
@@ -652,7 +709,7 @@ async fn a_program_whose_package_ships_a_component_starts_the_plugin_host_on_win
     // The program waits for a while, then the line ends: `rem` takes the flags the integration
     // adds after what was typed, so they reach the command shell as a comment.
     terminal
-        .type_line("claude /c ping -n 60 127.0.0.1 > nul & rem")
+        .type_line("claude /c 'ping -n 60 127.0.0.1 > nul & rem'")
         .await;
 
     let controller = managed.host.controller();
