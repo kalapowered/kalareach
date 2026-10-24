@@ -6640,8 +6640,9 @@ into approval authority, and it never settles an image's acceptance or a mutatio
 attachment is accepted only on the upstream's typed acknowledgement of the offer
 ([Offering an attachment to an agent](../transfer/README.md#offering-an-attachment-to-an-agent)), the
 result of a request to the upstream comes from its typed answer, an approval's answer is resolved by
-the completed write of the verdict on the native connection (which says the verdict left KalaReach
-and never that the vendor took it), and an inferred screen never moves a receipt ([Journals and the receipt contract](#journals-and-the-receipt-contract)).
+the completed write of the verdict (on a gateway, to the vendor's connection; on a Claude Code
+channel, to KalaReach's own forwarder, which checks it before it passes it on), which says the worker
+wrote the verdict and never that the vendor took it, and an inferred screen never moves a receipt ([Journals and the receipt contract](#journals-and-the-receipt-contract)).
 
 ### Decoding trust
 
@@ -7484,8 +7485,10 @@ relays goes through the same native admission as any upstream request and is rec
 resource with its source frame; whether that can be answered is decided by the decoding trust and
 the arbitration above, as for any connection. A frame its table does not route towards this host
 closes it. However it closes, and in any mode, it settles what it relayed as what has already
-happened: what was never dispatched is cancelled and what was dispatched is uncertain, so no closed
-channel holds a recovery open. The Claude Code bridge is described in
+happened: a pending resource with no answer marked as sent, one that was never answered or whose
+answer was claimed and not yet marked included, is cancelled; one whose answer was marked as sent
+and not yet recorded as written is uncertain; and one whose verdict was written stays resolved,
+which is no proof that the vendor took it. So no closed channel holds a recovery open. The Claude Code bridge is described in
 [`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
 
 ## Agent methods
