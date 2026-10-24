@@ -6,17 +6,17 @@ is tested against the declarations a real release makes rather than against ones
 | | |
 | --- | --- |
 | Source | `kalareach-plugins`, `snapshots/development/targets/packages/kalareach/<package>/<version>/plugin.json` |
-| Commit | `bb50ebb41f7ebe4e5fb8cb388b816c849007306d` |
+| Commit | `2e93bc8d82bea7b5ad8021394b08e3768f7ff1e6` |
 | Packages | `claude-code`, `gemini-cli` and `qoder-cli`, each at 0.5.0 |
 
 ## What it is
 
-Each file is the manifest byte for byte. A package's hash is the SHA-256 digest of its manifest, and
-the manifest names every other file of the package by digest. The rest of each package is not
-copied: these files pin what each release declares, not a whole package a host could install, and
-not the package an owner confirms at installation. The manifests the bundled catalogue ships for the
-same versions differ from these copies in `source.revision` alone, so their package hashes are
-others.
+Each file is the manifest byte for byte, and the manifest the bundled catalogue ships for the same
+version (`bundled-plugins/targets/packages/kalareach/<package>/<version>/plugin.json`). A package's
+hash is the SHA-256 digest of its manifest, so each digest in the suite is the package hash the
+bundle's lock records, and the manifest names every other file of the package by digest. The rest of
+each package is not copied: these files pin what each release declares, not a whole package a host
+could install.
 
 `crates/kr-hook/tests/fixtures.rs` pins each file by that digest, checks that its command
 integration is one the package contract accepts, and checks that Qoder CLI's flags are the two

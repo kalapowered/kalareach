@@ -3,7 +3,7 @@
 //! The Claude Code connector package installs three files into the user's own Claude Code
 //! directory, and those files are what start this forwarder. Their copies under
 //! `fixtures/bridges/claude-code/` are the bytes the package publishes (the plugins repository at
-//! `f369c549f2ec5fa851d5d5f849261f225f7fd65c`, `plugins/kalareach/claude-code/bridge/`), pinned here
+//! `c16eeb830debdf3d2ce29b5ae18f87415708c47e`, `plugins/kalareach/claude-code/bridge/`), pinned here
 //! by the SHA-256 digests the package's own recipe names. They name the forwarder by the
 //! placeholder `{kr_hook}`, which the host replaces with the installed forwarder's path when it
 //! writes the files; this suite checks the placeholder stands where the host replaces it, and that
@@ -13,7 +13,7 @@
 //! The Gemini CLI connector package installs an extension, three files, into the user's own Gemini
 //! CLI directory: its manifest, its hooks and its install record. Their copies under
 //! `fixtures/bridges/gemini-cli/` are the bytes the package publishes (the plugins repository at
-//! `f369c549f2ec5fa851d5d5f849261f225f7fd65c`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
+//! `c16eeb830debdf3d2ce29b5ae18f87415708c47e`, `plugins/kalareach/gemini-cli/bridge/`), pinned the
 //! same way.
 //!
 //! Qoder CLI reads its hooks from the settings its launch is given, so nothing is installed for it:
@@ -23,11 +23,9 @@
 //!
 //! What a launch adds comes from each release's own command integration, which its manifest
 //! declares. The manifests of the three released packages are under `fixtures/plugins/released/`,
-//! copied byte for byte from the plugins repository at `bb50ebb41f7ebe4e5fb8cb388b816c849007306d`,
-//! and pinned by their SHA-256 digests. A copy pins what the release declares, which is all this
-//! suite reads from it. It is not the manifest the bundled catalogue ships: that one differs from
-//! the copy in `source.revision` alone, so it has another package hash, and the hash an owner
-//! confirms at installation is the bundled one.
+//! copied byte for byte from the bundled catalogue's packages, and pinned by their SHA-256 digests,
+//! which are the packages' hashes. A copy pins what the release declares, which is all this suite
+//! reads from it.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -436,24 +434,23 @@ fn declared(package: &str) -> kr_plugin_sdk::integration::CommandIntegration {
     integration
 }
 
-/// Each released manifest is the copy it was made as: the file's SHA-256 digest pins the
-/// declaration this suite reads, so a change to a release's declaration is a deliberate new copy.
-/// The digest is not the package hash of the bundled catalogue's manifest for the same release,
-/// which differs from the copy in `source.revision`.
+/// Each released manifest is the copy it was made as: the file's SHA-256 digest, which is the
+/// package's hash, pins the declaration this suite reads, so a change to a release's declaration is
+/// a deliberate new copy.
 #[test]
 fn the_released_manifests_are_the_pinned_packages() {
     for (package, digest) in [
         (
             "claude-code",
-            "4e967df9fc5c0e3c1feddb1a7767e04f0c6ad02831fc6e455f8291a0882f5214",
+            "836eca7865fbec409b5623f4062c26e44fe3f30e7babdd5eb3bb54130f5963ff",
         ),
         (
             "gemini-cli",
-            "72dd20cf01448d3e1d8cfed962a13f7cf7bc69c7a5abdc5a20b9edcd664f2c4b",
+            "fee5ede173ebfa22f9cab27f1f9a06185a01aa24d0575ca893cdfe51a02308d1",
         ),
         (
             "qoder-cli",
-            "839be8df1b15cdc500c9f6e4bb5564a6bfff0f2bb6fb8a0497821b9762165a14",
+            "35a7b0390b68f69aa63a9bcfa76943a962c58c6de3f735d3e4a1593de2cdaee8",
         ),
     ] {
         assert_eq!(sha256(&released(package)), digest, "{package}");
