@@ -2461,6 +2461,220 @@ fn as_date(cell: &str) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// The day number of a date, counted from the civil epoch: the inverse of [`today`]'s arithmetic.
+fn day_number((year, month, day): (i64, u32, u32)) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let shifted_month = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// A number written as a word or as digits.
+fn number_word(word: &str) -> Option<u32> {
+    const WORDS: [&str; 31] = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+        "twenty-one",
+        "twenty-two",
+        "twenty-three",
+        "twenty-four",
+        "twenty-five",
+        "twenty-six",
+        "twenty-seven",
+        "twenty-eight",
+        "twenty-nine",
+        "thirty",
+    ];
+    let word = word
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    WORDS
+        .iter()
+        .position(|known| *known == word)
+        .and_then(|number| u32::try_from(number).ok())
+        .or_else(|| word.parse().ok())
+}
+
+/// The figure in the first "within <figure> <unit>" of `text`: "within fourteen days" is 14 for the
+/// unit "days". Line breaks count as spaces.
+fn figure_within(text: &str, unit: &str) -> Option<u32> {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut rest = flat.as_str();
+    while let Some(at) = rest.find("within ") {
+        rest = &rest[at + "within ".len()..];
+        let Some((word, after)) = rest.split_once(' ') else {
+            break;
+        };
+        if after.starts_with(unit)
+            && let Some(figure) = number_word(word)
+        {
+            return Some(figure);
+        }
+    }
+    None
+}
+
+/// The text between a pair of the register's markers.
+fn marked_block(body: &str, marker: &str) -> String {
+    let open = format!("<!-- kr:{marker} -->");
+    let close = format!("<!-- /kr:{marker} -->");
+    let start = body
+        .find(&open)
+        .unwrap_or_else(|| panic!("docs/shell-integration/upstream.md has no {open}"))
+        + open.len();
+    let end = body[start..]
+        .find(&close)
+        .unwrap_or_else(|| panic!("docs/shell-integration/upstream.md has no {close}"))
+        + start;
+    body[start..end].to_owned()
+}
+
+/// The day the triage record started: a row of this date is an assessment of what was already out.
+const REGISTER_STARTED: (i64, u32, u32) = (2026, 9, 20);
+
+/// The date after `label` in `text`, written `YYYY-MM-DD`.
+fn dated_after(text: &str, label: &str) -> Option<(i64, u32, u32)> {
+    let at = text.find(label)? + label.len();
+    let token = text.get(at..at + 10)?;
+    token
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '-')
+        .then(|| as_date(token))
+}
+
+/// What is wrong with the register's figures, as lines to print: the update target it states, the
+/// release page's statement of the same target, the date every new row counts its target from,
+/// and the advisories the PowerShell package refuses.
+///
+/// A phrase such as "within fourteen days" proves nothing about a row, so this reads the figures.
+/// The target is the number of days after the upstream release (the date in a row's change cell
+/// after "released"), not after the day a row was written, so a late assessment cannot move its own
+/// deadline. Rows of the day the record started are assessments of what was already out, and a row
+/// that names an advisory of the fish lock by its RustSec identifier is an audit of the lock.
+fn register_problems(
+    register: &str,
+    page: &str,
+    powershell_advisories: &serde_json::Value,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    let block = marked_block(register, "target");
+    let triage_days = figure_within(&block, "working day");
+    let requalify_days = figure_within(&block, "days");
+    let section = page
+        .split("## The shell packages' update target")
+        .nth(1)
+        .map(|rest| rest.split("\n## ").next().unwrap_or(rest).to_owned())
+        .unwrap_or_default();
+    if triage_days.is_none() || requalify_days.is_none() {
+        problems.push(format!(
+            "the register's target states no figures: {triage_days:?} working days to triage, {requalify_days:?} days to publish"
+        ));
+    }
+    if figure_within(&section, "working day") != triage_days
+        || figure_within(&section, "days") != requalify_days
+    {
+        problems.push(format!(
+            "the release page and the register state different targets: the register {triage_days:?} working days and {requalify_days:?} days, the page {:?} and {:?}",
+            figure_within(&section, "working day"),
+            figure_within(&section, "days")
+        ));
+    }
+    let from_register = dated_after(register, "published from ");
+    let from_page = dated_after(&section, "published from ");
+    if from_register.is_none() || from_register != from_page {
+        problems.push(format!(
+            "the register and the release page count the fish build's advisories from different days: {from_register:?} and {from_page:?}"
+        ));
+    }
+
+    let triage = register_rows(register, "triage");
+    for row in &triage {
+        let [
+            date,
+            change,
+            _packages,
+            _assessment,
+            target_release,
+            _status,
+        ] = row.as_slice()
+        else {
+            continue;
+        };
+        let audit = change.contains("RUSTSEC-");
+        if as_date(date) == REGISTER_STARTED || audit {
+            continue;
+        }
+        let Some(released) = dated_after(change, "released ") else {
+            problems.push(format!(
+                "the triage row of {date} ({change}) names no upstream release date after \"released\""
+            ));
+            continue;
+        };
+        let due = day_number(as_date(target_release)) - day_number(released);
+        if let Some(allowed) = requalify_days
+            && due > i64::from(allowed)
+        {
+            problems.push(format!(
+                "the triage row of {date} ({change}) targets {due} days after the upstream release and the register allows {allowed}"
+            ));
+        }
+    }
+
+    let pins = register_rows(register, "pins");
+    let pin = pins.iter().find(|row| row[0] == "psreadline");
+    let listed = powershell_advisories
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for advisory in listed {
+        let id = advisory["id"].as_str().unwrap_or_default();
+        if !triage
+            .iter()
+            .any(|row| row[1].contains(id) && row[2].split(", ").any(|p| p == "psreadline"))
+        {
+            problems.push(format!(
+                "the PowerShell package refuses {id}, and the triage record has no row for it"
+            ));
+        }
+        for fixed in advisory["first_fixed"]
+            .as_object()
+            .into_iter()
+            .flat_map(serde_json::Map::values)
+        {
+            let fixed = fixed.as_str().unwrap_or_default();
+            if !pin.is_some_and(|row| row[2].contains(fixed)) {
+                problems.push(format!(
+                    "the PowerShell pin row does not name {fixed}, the first fixed release of {id}"
+                ));
+            }
+        }
+    }
+    problems
+}
+
 /// KR-REQ-07.88: the register and the pins are one thing, and the release page carries its target.
 ///
 /// What is installed is checked against the same pins by
@@ -2509,6 +2723,24 @@ fn the_upstream_register_agrees_with_the_pins() {
             "the release page does not carry the update target: no {phrase:?}"
         );
     }
+
+    // The figures the register states, and the dates its rows count from, are read rather than
+    // looked for.
+    let psreadline_manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repository_root().join("shells/psreadline/manifest.json"))
+            .expect("the PowerShell manifest"),
+    )
+    .expect("the PowerShell manifest decodes");
+    let problems = register_problems(
+        &body,
+        &releases,
+        &psreadline_manifest["qualified"]["powershell_advisories"],
+    );
+    assert!(
+        problems.is_empty(),
+        "the register does not hold its figures:\n{}",
+        problems.join("\n")
+    );
 
     // Every pin the register names is the pin the builder uses.
     for row in &pins {
@@ -2633,6 +2865,95 @@ fn the_upstream_register_agrees_with_the_pins() {
             "the register does not offer {choice:?} as a compatibility-mode choice"
         );
     }
+}
+
+/// KR-REQ-07.88: the register's figures are read, so a target that is too far from the upstream
+/// release, a row that names no release date, a release the PowerShell pin row leaves out and an
+/// advisory the package refuses that has no row each fail by name, and the committed register passes.
+#[test]
+fn the_register_check_reads_the_figures_it_states() {
+    let register =
+        std::fs::read_to_string(repository_root().join("docs/shell-integration/upstream.md"))
+            .expect("the register is committed");
+    let page = std::fs::read_to_string(repository_root().join("docs/releases/packages.md"))
+        .expect("the release page is committed");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repository_root().join("shells/psreadline/manifest.json"))
+            .expect("the PowerShell manifest"),
+    )
+    .expect("the PowerShell manifest decodes");
+    let advisories = manifest["qualified"]["powershell_advisories"].clone();
+
+    assert_eq!(
+        register_problems(&register, &page, &advisories),
+        Vec::<String>::new(),
+        "the committed register holds its figures"
+    );
+
+    // A target 30 days after the release it answers, in a row written after the record started.
+    let late = register.replace(
+        "| 2026-09-25 | not-affected |",
+        "| 2026-10-11 | not-affected |",
+    );
+    assert_ne!(late, register, "the register has a row to move");
+    let problems = register_problems(&late, &page, &advisories);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("targets 30 days after the upstream release")),
+        "a target 30 days after the release passed: {problems:?}"
+    );
+
+    // A row after the record started that names no release date.
+    let undated = register.replace("; released 2026-09-11", "");
+    assert_ne!(undated, register, "the register has a row to change");
+    let problems = register_problems(&undated, &page, &advisories);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("names no upstream release date")),
+        "a row with no release date passed: {problems:?}"
+    );
+
+    // A first fixed release the PowerShell pin row leaves out.
+    let unpinned = register.replace("7.4.20, 7.5.11 and 7.6.6", "7.4.20 and 7.6.6");
+    assert_ne!(unpinned, register, "the register has a pin row to change");
+    let problems = register_problems(&unpinned, &page, &advisories);
+    assert!(
+        problems.iter().any(|problem| problem.contains("7.5.11")),
+        "a pin row without a first fixed release passed: {problems:?}"
+    );
+
+    // An advisory the package refuses that the triage record never assessed.
+    let mut more = advisories.clone();
+    more.as_array_mut()
+        .expect("a list")
+        .push(serde_json::json!({
+            "id": "CVE-2099-00001",
+            "url": "https://example.invalid/advisory",
+            "first_fixed": { "7.6": "7.6.99" },
+        }));
+    let problems = register_problems(&register, &page, &more);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("CVE-2099-00001") && problem.contains("no row")),
+        "an advisory with no triage row passed: {problems:?}"
+    );
+
+    // The release page states another target than the register.
+    let slower = page.replace(
+        "within fourteen days of that release",
+        "within twenty days of that release",
+    );
+    assert_ne!(slower, page, "the release page states the target");
+    let problems = register_problems(&register, &slower, &advisories);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("different targets")),
+        "a page that states another target passed: {problems:?}"
+    );
 }
 
 /// KR-REQ-07.88: each package built here was built from the pin the register names for it.
