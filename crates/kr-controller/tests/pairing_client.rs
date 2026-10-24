@@ -605,6 +605,38 @@ fn severed() -> LinkError {
     LinkError::Lost("the test cut the host off".to_owned())
 }
 
+impl WatchedLink {
+    /// A connection to a paired host, counted, cut or gated as the test says, as a visit beside
+    /// the host in use when `visiting` is `Some`.
+    fn paired<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        identity: &'a LocalIdentity,
+        visiting: Option<&'a kr_client::pairing::link::HostInUse<'a>>,
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
+        self.paired_connects.fetch_add(1, Ordering::SeqCst);
+        if self.severed.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(severed()) });
+        }
+        Box::pin(async move {
+            if let Some(gate) = &self.paired_gate {
+                gate.passed().await;
+            }
+            if self.sever_paired {
+                return Err(severed());
+            }
+            match visiting {
+                Some(in_use) => {
+                    self.inner
+                        .visit_paired_transport(host, identity, in_use)
+                        .await
+                }
+                None => self.inner.connect_paired_transport(host, identity).await,
+            }
+        })
+    }
+}
+
 impl HostLink for WatchedLink {
     fn dial<'a>(
         &'a self,
@@ -680,28 +712,16 @@ impl HostLink for WatchedLink {
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        self.paired_connects.fetch_add(1, Ordering::SeqCst);
-        if self.severed.load(Ordering::SeqCst) {
-            return Box::pin(async { Err(severed()) });
-        }
-        Box::pin(async move {
-            if let Some(gate) = &self.paired_gate {
-                gate.passed().await;
-            }
-            if self.sever_paired {
-                return Err(severed());
-            }
-            self.inner.connect_paired_transport(host, identity).await
-        })
+        self.paired(host, identity, None)
     }
 
     fn visit_paired_transport<'a>(
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-        in_use: Option<&'a NetworkConfig>,
+        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        self.inner.visit_paired_transport(host, identity, in_use)
+        self.paired(host, identity, Some(in_use))
     }
 
     fn hold<'a>(

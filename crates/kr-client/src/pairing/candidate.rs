@@ -2799,7 +2799,7 @@ mod tests {
             &'a self,
             _host: &'a PairedHost,
             _identity: &'a LocalIdentity,
-            _in_use: Option<&'a kr_protocol::pairing::NetworkConfig>,
+            _in_use: &'a super::super::link::HostInUse<'a>,
         ) -> BoxFuture<'a, Result<Arc<dyn crate::transport::ControlTransport>, LinkError>> {
             unreachable!("the host commits nothing")
         }

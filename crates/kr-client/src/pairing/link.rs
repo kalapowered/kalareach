@@ -21,9 +21,9 @@
 //! A visit is a look at a host that is not the one in use, made in the background: the inbox reads
 //! the hosts a device is paired with, and the owner's watcher asks the hosts it owns what they want
 //! confirmed. The host in use is the one the person is working with, and a visit never cuts it off:
-//! a visit to a host whose configuration shares a relay with the host in use's, without being the
-//! same, is refused ([`EndpointPool::visit_endpoint`]) as a connection lost, for as long as the
-//! other host is the one in use.
+//! a visit to a host whose services differ from the host in use's and share a relay with them is
+//! refused ([`EndpointPool::visit_endpoint`]) as a connection lost, for as long as the other host
+//! is the one in use.
 //!
 //! [`HostLink`] is the whole of what the pairing flows ask of the network, so a test can put a
 //! dialler that reaches another host, or a layer that alters an answer, in its place. [`IrohLink`]
@@ -142,6 +142,9 @@ pub trait Preauth: Send {
     ) -> BoxFuture<'a, Result<PairStatusResult, LinkError>>;
 }
 
+/// The network configuration of the host in use, when there is one, as it stands when it is asked.
+pub type HostInUse<'a> = dyn Fn() -> Option<NetworkConfig> + Send + Sync + 'a;
+
 /// Everything the pairing flows ask of the network.
 pub trait HostLink: Send + Sync {
     /// Dials `endpoint` through the endpoint for `network`, with that configuration's hints.
@@ -174,8 +177,9 @@ pub trait HostLink: Send + Sync {
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
 
     /// Connects to a paired host as a visit: as [`Self::connect_paired_transport`], except that it
-    /// never closes the endpoint the host in use is reached through. `in_use` is the host in use's
-    /// network configuration, when there is a host in use.
+    /// never closes the endpoint the host in use is reached through. `in_use` says which host is in
+    /// use at the moment it is asked, which is when the endpoint is chosen and not before: the
+    /// person can choose another host while a visit waits.
     ///
     /// A visit whose host cannot be reached without closing that endpoint fails as a connection
     /// lost, and nothing the host in use has is touched.
@@ -183,7 +187,7 @@ pub trait HostLink: Send + Sync {
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-        in_use: Option<&'a NetworkConfig>,
+        in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
 
     /// Connects to a paired host as a visit, and starts a session on the connection.
@@ -191,7 +195,7 @@ pub trait HostLink: Send + Sync {
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-        in_use: Option<&'a NetworkConfig>,
+        in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
         Box::pin(async move {
             let transport = self.visit_paired_transport(host, identity, in_use).await?;
@@ -459,9 +463,13 @@ impl EndpointPool {
 
     /// The endpoint for `network`'s services for a visit, bound now if none is open, as
     /// [`Self::endpoint`] gives it, except that it is refused when `network`'s services are not
-    /// the host in use's (`in_use`) and share a relay with them. Binding it would close the
-    /// endpoint the host in use is reached through, or take the relay from it when it is not open
-    /// at this moment, and a visit is not worth that.
+    /// the host in use's and share a relay with them. Binding it would close the endpoint the host
+    /// in use is reached through, or take the relay from it when it is not open at this moment, and
+    /// a visit is not worth that.
+    ///
+    /// `in_use` is asked once the pool is this request's to change, and nothing waits between the
+    /// answer and the close it decides: a host chosen while the visit waited for the pool is the
+    /// host in use here.
     ///
     /// # Errors
     ///
@@ -469,11 +477,12 @@ impl EndpointPool {
     pub async fn visit_endpoint(
         &self,
         network: &NetworkConfig,
-        in_use: Option<&NetworkConfig>,
+        in_use: &HostInUse<'_>,
     ) -> Result<Endpoint, LinkError> {
         let config = self.config(network)?;
+        let mut endpoints = self.endpoints.lock().await;
         // A host in use whose configuration cannot be used has no endpoint to cut off.
-        if let Some(using) = in_use.and_then(|using| self.config(using).ok()) {
+        if let Some(using) = in_use().and_then(|using| self.config(&using).ok()) {
             let (using, services) = (Services::of(&using), Services::of(&config));
             if services != using && services.share_a_relay(&using) {
                 return Err(LinkError::lost(Shown::said(
@@ -481,7 +490,6 @@ impl EndpointPool {
                 )));
             }
         }
-        let mut endpoints = self.endpoints.lock().await;
         let open = self.open_for(&mut endpoints, config).await?;
         Ok(open.endpoint.clone())
     }
@@ -676,7 +684,7 @@ impl HostLink for IrohLink {
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-        in_use: Option<&'a NetworkConfig>,
+        in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         Box::pin(connect_paired_over(
             host,
@@ -1018,6 +1026,17 @@ mod tests {
         pool.close().await;
     }
 
+    /// The host in use, as a visit is told of it: this configuration.
+    fn using(config: &NetworkConfig) -> impl Fn() -> Option<NetworkConfig> + Send + Sync {
+        let config = config.clone();
+        move || Some(config.clone())
+    }
+
+    /// No host in use.
+    fn nobody() -> Option<NetworkConfig> {
+        None
+    }
+
     /// A visit never closes the endpoint the host in use is reached through, nor takes its relay
     /// while that endpoint is not open: the host in use's services are served as ever, a visit on
     /// its own services shares its endpoint, and a visit that shares no relay with it is bound.
@@ -1044,33 +1063,40 @@ mod tests {
         let elsewhere = network(&[], Some("http://127.0.0.1:21/pkarr"), &[]);
 
         // The host in use is open, and not held: a visit on its relay is refused all the same.
-        let using = pool.endpoint(&in_use).await.expect("the host in use");
+        let using_it = pool.endpoint(&in_use).await.expect("the host in use");
         assert!(matches!(
-            pool.visit_endpoint(&beside, Some(&in_use)).await,
+            pool.visit_endpoint(&beside, &using(&in_use)).await,
             Err(LinkError::Lost(_))
         ));
-        assert!(!using.is_closed(), "the host in use's endpoint stays open");
+        assert!(
+            !using_it.is_closed(),
+            "the host in use's endpoint stays open"
+        );
         assert!(pool.holds(&in_use).await);
         assert_eq!(binds(&pool), 1, "nothing was bound on its relay");
 
         // A visit on the host in use's own services is served by its endpoint; one on no shared
         // relay is bound beside it.
         let same = pool
-            .visit_endpoint(&same_services, Some(&in_use))
+            .visit_endpoint(&same_services, &using(&in_use))
             .await
             .expect("the same services");
-        assert_eq!(same.bound_sockets(), using.bound_sockets(), "one endpoint");
-        pool.visit_endpoint(&elsewhere, Some(&in_use))
+        assert_eq!(
+            same.bound_sockets(),
+            using_it.bound_sockets(),
+            "one endpoint"
+        );
+        pool.visit_endpoint(&elsewhere, &using(&in_use))
             .await
             .expect("no shared relay");
         assert_eq!(binds(&pool), 2);
-        assert!(!using.is_closed());
+        assert!(!using_it.is_closed());
 
         // The host in use's endpoint is not open at this moment: a visit still leaves its relay to
         // it, so the host in use can open it again without finding the relay taken.
         pool.close().await;
         assert!(matches!(
-            pool.visit_endpoint(&beside, Some(&in_use)).await,
+            pool.visit_endpoint(&beside, &using(&in_use)).await,
             Err(LinkError::Lost(_))
         ));
         assert_eq!(binds(&pool), 2, "nothing was bound on its relay");
@@ -1078,11 +1104,54 @@ mod tests {
         // With no host in use, a visit is served like any request, and a request for the host
         // chosen afterwards closes it, as it closes any endpoint nobody holds.
         let visited = pool
-            .visit_endpoint(&beside, None)
+            .visit_endpoint(&beside, &nobody)
             .await
             .expect("no host is in use");
         pool.endpoint(&in_use).await.expect("the host chosen later");
         assert!(visited.is_closed());
+        pool.close().await;
+    }
+
+    /// The person can choose a host while a visit waits for the pool. The host in use is the one
+    /// chosen when the visit's turn comes, so a visit that was asked before the choice still leaves
+    /// the chosen host's relay to it.
+    #[tokio::test]
+    async fn a_host_chosen_while_a_visit_waits_for_the_pool_is_left_its_relay() {
+        let pool = Arc::new(
+            EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+                .bound_to("127.0.0.1:0".parse().expect("loopback")),
+        );
+        let chosen = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:22/pkarr"),
+            &[],
+        );
+        let beside = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:23/pkarr"),
+            &[],
+        );
+        let chosen_endpoint = pool.endpoint(&chosen).await.expect("the host chosen later");
+
+        // Another request has the pool; the visit is asked for meanwhile.
+        let turn = pool.endpoints.lock().await;
+        let choice: Arc<std::sync::Mutex<Option<NetworkConfig>>> = Arc::default();
+        let visit = tokio::spawn({
+            let (pool, beside, choice) = (Arc::clone(&pool), beside.clone(), Arc::clone(&choice));
+            async move {
+                let in_use = || choice.lock().expect("the choice").clone();
+                pool.visit_endpoint(&beside, &in_use).await
+            }
+        });
+        *choice.lock().expect("the choice") = Some(chosen.clone());
+        drop(turn);
+
+        assert!(matches!(
+            visit.await.expect("the visit ran"),
+            Err(LinkError::Lost(_))
+        ));
+        assert!(!chosen_endpoint.is_closed());
+        assert_eq!(binds(&pool), 1, "nothing was bound on its relay");
         pool.close().await;
     }
 

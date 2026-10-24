@@ -340,10 +340,11 @@ impl Owner {
         let pairing = self.device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
         let session = if visiting {
-            let in_use = self.device.host_in_use().map(|using| using.network_config);
+            let device = &self.device;
+            let in_use = || device.host_in_use().map(|using| using.network_config);
             pairing
                 .link
-                .visit_paired(host, &identity, in_use.as_ref())
+                .visit_paired(host, &identity, &in_use)
                 .await
                 .ok()?
         } else {
