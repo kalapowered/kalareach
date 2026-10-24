@@ -449,9 +449,10 @@ Whatever the kind, the message ends with the sentence that says anyone who can r
 can read it, and configuring a Slack, Discord, Telegram or email destination's credential answers
 with the same fact in that kind's own words. A chat message is the host's own sentences, sent as text and never as markup the host builds:
 Slack's `&`, `<` and `>` are escaped, Discord is told to ping nobody and to suppress link embeds, and
-Telegram parses no entities, so a name in a sentence cannot mention a channel, notify everyone or
-turn into a link the service fetches. Discord still renders its own Markdown in the text it is
-given. Discord takes 2,000 characters and Telegram 4,096, and a Slack message is
+Telegram parses no entities and shows no link previews, so a name in a sentence cannot make Slack or
+Discord notify anyone or make a service fetch a link preview. A service still shows what it
+recognises in plain text: Discord its Markdown and its channel references (`<#id>`), and Telegram
+`@name` mentions and web addresses. Discord takes 2,000 characters and Telegram 4,096, and a Slack message is
 held well inside Slack's own limit; a longer message keeps its opening, says it was shortened, and
 still ends with that sentence.
 
