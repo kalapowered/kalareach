@@ -1840,6 +1840,100 @@ async fn a_devices_input_waiting_for_the_workers_writer_is_refused_once_a_feed_r
     }
 }
 
+/// The mutations a worker was forwarded, in the order they arrived.
+fn forwarded_mutations(
+    recorded: &crate::service::a_close_a_worker_never_answers::Recorded,
+) -> usize {
+    recorded
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|frame| matches!(frame, kr_protocol::envelope::ControlFrame::Forwarded(_)))
+        .count()
+}
+
+/// KR-REQ-24.15: a device's mutation that waits for the write half of its link to the session's
+/// worker, behind a frame the worker is slow to take, is refused once it has the half if the
+/// authority feed has raised a refusal on remote grants meanwhile, and nothing is sent. The
+/// control: the same wait with no refusal raised ends with the mutation at the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_devices_mutation_waiting_for_the_workers_writer_is_refused_once_a_feed_refusal_rises() {
+    use std::sync::Arc;
+
+    use kr_protocol::error::ErrorCode;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for refused in [false, true] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(|_: &kr_protocol::envelope::Request| None),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        fake::acknowledged(controller, world.session_id);
+        let device = paired_with_every_right(controller, 27);
+        let connection = super::RemoteConnection::for_test(controller, device);
+        let prompt = |id: u64| {
+            device_mutation(
+                &world,
+                &connection,
+                Method::AgentPromptSubmit,
+                id,
+                ParamsValue::empty(),
+            )
+        };
+        // The first mutation opens the link, and is the call the second one waits behind.
+        connection.mutate(&prompt(1)).await;
+        assert_eq!(
+            forwarded_mutations(&recorded),
+            1,
+            "the first reached the worker"
+        );
+        let proxy = connection
+            .proxy
+            .lock()
+            .await
+            .clone()
+            .expect("the first mutation opened the link");
+        let held = proxy.hold_the_writer().await;
+        let waiting = proxy.calls_at_the_writer() + 1;
+
+        let second = prompt(2);
+        let (answer, ()) = tokio::join!(connection.mutate(&second), async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while proxy.calls_at_the_writer() < waiting {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the mutation waits for the writer");
+            if refused {
+                controller.raise_the_unverified_withdrawal_refusal().await;
+            }
+            drop(held);
+        });
+        if refused {
+            let error = refusal(answer);
+            assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+            assert_eq!(
+                forwarded_mutations(&recorded),
+                1,
+                "a mutation refused at the writer reaches no worker"
+            );
+        } else {
+            assert_eq!(
+                forwarded_mutations(&recorded),
+                2,
+                "the control: the mutation reaches the worker"
+            );
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-24.15: a frame the worker has part of when the check a call is admitted under refuses,
 /// which is the refusal the authority feed raises on remote grants, is not finished. The rest of it
 /// is not written, the link ends, and the call is refused: the worker reads a frame that stops
