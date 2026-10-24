@@ -2571,6 +2571,8 @@ enum Then {
     AWaitingRequestOfTheOtherOwner,
     /// A withdrawal, shown complete, by an owner the host does not know, of `named`.
     AnUnknownOwnersWithdrawal,
+    /// A withdrawal, shown complete, by an owner the host does not know, of the issuer.
+    AnUnknownOwnersWithdrawalOfTheIssuer,
     /// A withdrawal, shown complete, by the host's first owner, of the issuer.
     TheOwnersWithdrawalOfTheIssuer,
     /// A withdrawal, shown complete, by the host's first owner, of the second owner.
@@ -2646,6 +2648,11 @@ async fn a_request_whose_issuer_the_host_cannot_decide(
                 AuthorisationKeyPair::generate().expect("a key"),
                 DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
                 named.1.device_id,
+            ),
+            Then::AnUnknownOwnersWithdrawalOfTheIssuer => (
+                AuthorisationKeyPair::generate().expect("a key"),
+                DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+                issuer.1.device_id,
             ),
             Then::TheOwnersWithdrawalOfTheIssuer => {
                 (owner_key.clone(), rig.owner_device(), issuer.1.device_id)
@@ -2734,6 +2741,42 @@ async fn a_request_the_host_cannot_decide_does_not_stop_the_scan_before_a_withdr
         "the withdrawal the host cannot verify still refuses remote access: {}",
         check.detail()
     );
+}
+
+/// KR-REQ-24.15: a withdrawal of the issuer of a waiting request by an owner the host does not know
+/// raises the refusal while the clock is unproven. The scan holds a complete record that the host
+/// would carry out and that would revoke the waiting issuer, so that the request is judged first;
+/// this record is no such record, because the host cannot show who made it, so it is neither held
+/// nor carried out. It is found, and the host refuses remote access for it as it does for any
+/// withdrawal it cannot verify. Held, it would raise nothing, and the host would withhold nothing
+/// for a withdrawal the feed shows complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_owners_withdrawal_of_the_issuer_of_a_waiting_request_raises_the_refusal() {
+    let Undecidable {
+        rig,
+        issuer,
+        target,
+        first,
+        ..
+    } = a_request_whose_issuer_the_host_cannot_decide(
+        &[Then::AnUnknownOwnersWithdrawalOfTheIssuer],
+        0,
+    )
+    .await;
+
+    let check = rig.shown().await.check.expect("the feed check");
+    assert!(
+        check.detail().contains("an owner this host does not know"),
+        "the withdrawal behind the request is found while the clock is unproven: {}",
+        check.detail()
+    );
+    let waiting = rig.held_as(&issuer.0.keys().authorisation, &first).await;
+    assert_eq!(
+        (waiting.rejected.0, waiting.acknowledgement.0),
+        (None, None),
+        "the request is neither refused nor carried out while the clock is unproven"
+    );
+    assert!(!rig.has_revoked(target.1.device_id).await);
 }
 
 /// KR-REQ-24.15: the request that waits for the clock keeps its place across the pages of a scan:
