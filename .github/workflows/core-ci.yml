@@ -1408,6 +1408,11 @@ jobs:
           echo "$RUNNER_TEMP/powershell" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/powershell/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
+      # The check that reads the shell upstreams' advisories is put through what it must refuse, over
+      # recorded answers of the real sources, and the register has to cover every change they hold.
+      - name: Test the shell advisories check
+        run: python3 scripts/check-shell-advisories.py self-test
+
       - name: Restore the cargo cache
         uses: ./.github/actions/cargo-cache-restore
         with:
