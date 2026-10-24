@@ -1033,6 +1033,16 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     };
     let accepted = count_of(kr_delivery::journal::DeliveryState::Accepted);
     let collapsed = count_of(kr_delivery::journal::DeliveryState::Collapsed);
+    // What the host sent for the allowance, and the one attention update it sends for the rest: the
+    // update is an accepted delivery that carries the suppression it stands for.
+    let updates = fresh
+        .iter()
+        .filter(|record| {
+            record.state == kr_delivery::journal::DeliveryState::Accepted
+                && record.suppression.is_some()
+        })
+        .count();
+    let sends = accepted - updates;
     // Whatever the host handed the gateway and the gateway took reaches the stand-in; let the last
     // of it arrive before counting.
     let reached = until(DELIVERY_WAIT.min(run.left()), || {
@@ -1097,6 +1107,8 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     );
     report.insert("burst_deliveries_written".to_owned(), json!(fresh.len()));
     report.insert("burst_accepted".to_owned(), json!(accepted));
+    report.insert("burst_sends".to_owned(), json!(sends));
+    report.insert("burst_updates".to_owned(), json!(updates));
     report.insert("burst_collapsed".to_owned(), json!(collapsed));
     report.insert(
         "burst_other".to_owned(),
