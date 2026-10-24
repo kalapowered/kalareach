@@ -1063,8 +1063,11 @@ all read as an earlier boot once, after the upgrade. The daemon closes the sessi
 recorded, as it would after a restart, and `kr bind` skips its workers' descriptors.
 
 A process identifier alone is never enough. Every ownership check compares the start value as well,
-so a recycled identifier reads as a different process. A query the operating system refuses is
-reported as unknown, never as death: a recovery path that treated a failed query as a death would
+so a recycled identifier reads as a different process. Neither carries a boot. On Linux the start
+value counts clock ticks since boot, so a process of a later boot that repeats a recorded worker's
+identifier and tick reads as that worker for as long as it runs: a start that finds the sessions of
+an earlier boot leaves such a session open, and it closes later as a crash and not as the host's
+restart. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
 A process query answers one of three things: the process and its start identity, gone, or cannot
@@ -4158,7 +4161,10 @@ that cannot lose a file), while it has a summary and no closure (a session still
 whose end was never recorded), and until thirty days after its closure. The thirty days are a
 decision of the wall clock and are made only on a clock the host can prove: without a proved
 reading the answer is *kept*, and a range that aged out is a gap and not a reason to keep a file for
-ever. A session the registry holds with a worker or a launch under way, or with no closure, or whose
+ever. The age is counted from the time the closure recorded, which is the wall clock's reading when
+the closure was written, with no record of whether the clock could be proved then. Once nothing else
+keeps a file, a clock that was behind at that moment and has been corrected since shortens the thirty
+days by the error. A session the registry holds with a worker or a launch under way, or with no closure, or whose
 launch's process has not ended, keeps what was submitted to it; one neither the registry nor the
 archive knows about keeps nothing.
 
