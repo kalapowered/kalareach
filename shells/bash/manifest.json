@@ -13,7 +13,8 @@
     "directory": "bash-5.2.37"
   },
   "configure": [
-    "--without-bash-malloc"
+    "--without-bash-malloc",
+    "--disable-nls"
   ],
   "cflags": [
     "-g",
