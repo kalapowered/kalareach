@@ -3554,7 +3554,10 @@ fn the_package_binds_into_the_editor_it_was_qualified_against() {
 /// package's to update that host. What it can do is refuse to bind into one that an advisory
 /// names. The module's own list of advisories is asked about the releases around each series'
 /// first fixed release, including a pre-release of it and a series the advisory does not list, and
-/// the list the package publishes in its record is the one the manifest holds.
+/// the list the package publishes in its record is the one the manifest holds. A preview of a series
+/// the advisory does not list passes whether it was released before the fix or after it, so the
+/// first and the last preview that came before the fixed releases are in the table with the one
+/// that came after.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
 fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
@@ -3567,7 +3570,7 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
         .to_owned();
 
     // Release, then the advisory and the first fixed release it names, or nothing.
-    let table: [(&str, Option<(&str, &str)>); 11] = [
+    let table: [(&str, Option<(&str, &str)>); 13] = [
         ("7.4.19", Some(("CVE-2026-62801", "7.4.20"))),
         ("7.4.20", None),
         ("7.4.20-preview.1", Some(("CVE-2026-62801", "7.4.20"))),
@@ -3577,6 +3580,8 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
         ("7.6.6", None),
         ("7.6.6-rc.1", Some(("CVE-2026-62801", "7.6.6"))),
         ("7.6.10", None),
+        ("7.7.0-preview.1", None),
+        ("7.7.0-preview.4", None),
         ("7.7.0-preview.5", None),
         ("8.0.0", None),
     ];

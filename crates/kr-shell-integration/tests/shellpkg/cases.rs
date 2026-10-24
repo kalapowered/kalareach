@@ -3425,11 +3425,37 @@ fn page_entry(pagemap: &mut std::fs::File, address: u64, page: u64) -> Option<u6
 /// That is a page the kernel marks as a guard (bit 58, Linux 6.15 and later, for a guard installed
 /// with `MADV_GUARD_INSTALL`), and a page that is neither in memory (bit 63) nor swapped out
 /// (bit 62): a process that wrote to a page leaves it in one of the two, so such a page holds no
-/// copy of anything. The second is also what a guard looks like on the Linux versions that have
-/// guards and no bit for them, and what an address that is no longer mapped looks like.
+/// copy of anything. The second is also what an address that is no longer mapped looks like.
+///
+/// Linux 6.13 and 6.14 can install a guard and have no bit for it, and report one as swapped out
+/// (bit 62), which this takes for memory that holds data. Nothing in the entry or in the mapping's
+/// `Swap` figure tells a guard from a page whose swap entry is a migration, a device page or a
+/// poisoned one, so the page is left unread and [`unread_note`] says why when it matters. A guard
+/// is installed in a thread stack by glibc 2.42 and later, so the pair that fails a correct
+/// package is those kernels with that library.
 #[cfg(target_os = "linux")]
 fn entry_holds_nothing(entry: u64) -> bool {
     (entry >> 58) & 1 == 1 || (entry >> 62) & 0b11 == 0
+}
+
+/// What to add to a report of unread memory when the kernel is one that cannot tell a guard page
+/// from swapped memory: Linux 6.13 and 6.14 install guards and report them as swapped out. Nothing
+/// when the kernel is another, or its release cannot be read.
+#[cfg(target_os = "linux")]
+fn unread_note() -> String {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut numbers = release
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    match (numbers.next(), numbers.next()) {
+        (Some(6), Some(13 | 14)) => format!(
+            "\nthis kernel ({}) can install a guard page and reports it as swapped-out memory, so the scan cannot tell it from memory it must read; the case needs Linux 6.15 or later to separate them",
+            release.trim()
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Looks for `needle` in every mapping of a running process that is both readable and writable,
@@ -3579,11 +3605,12 @@ pub fn the_bootstrap_secret_does_not_outlive_the_accepted_handshake(kind: ShellK
         );
         assert!(
             scan.unread.is_empty() && scan.bytes > 0,
-            "{} bytes of the {} shell's memory were read ({} pages that hold nothing stepped over), and these writable mappings were not read to their end:\n{}",
+            "{} bytes of the {} shell's memory were read ({} pages that hold nothing stepped over), and these writable mappings were not read to their end:\n{}{}",
             scan.bytes,
             kind.as_str(),
             scan.guards,
-            scan.unread.join("\n")
+            scan.unread.join("\n"),
+            unread_note()
         );
         assert!(
             scan.copies.is_empty(),
