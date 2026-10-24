@@ -309,6 +309,41 @@ describe('the inbox of a phone paired with two hosts', () => {
     expect(contact).toHaveAttribute('data-host', 'laptop')
   })
 
+  // A visit's answer is as old as the visit: a host the person forgot since shows nothing of what
+  // that visit found, whichever way it ended.
+  it('shows nothing of a host the person forgot, whatever the visit before it found', async () => {
+    const { controls } = start()
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(2)
+    })
+    act(() => {
+      controls.setPairing({ hosts: [STUDIO] })
+    })
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(0)
+    })
+
+    // Lost, refused or read, the stale answer shows no contact, no refusal and no row.
+    for (const stale of [
+      lostLaptop(Date.now() - 5 * 60_000),
+      refusingLaptop({
+        code: 'PERMISSION_DENIED',
+        message: 'this device may not read this host',
+        user_action: 'fix_configuration'
+      }),
+      laptopRead()
+    ]) {
+      controls.setInboxHosts([stale])
+      readNow()
+      await waitFor(() => {
+        expect(rowsOf('studio').length).toBeGreaterThan(0)
+      })
+      expect(document.querySelector('[data-testid="inbox-contact"][data-host="laptop"]')).toBeNull()
+      expect(document.querySelector('[data-testid="inbox-refusal"][data-host="laptop"]')).toBeNull()
+      expect(rowsOf('laptop')).toHaveLength(0)
+    }
+  })
+
   // Nothing is claimed before the host in use has answered, whatever another host has.
   it('says it is reading until the host in use has answered, though another host has', async () => {
     const { port, controls } = fakeHost()
