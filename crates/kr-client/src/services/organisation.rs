@@ -13,7 +13,6 @@
 //! the holder can use.
 
 use std::fmt;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +52,16 @@ impl fmt::Debug for IssuedLease {
     }
 }
 
+/// Which token a request to the service carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Token {
+    /// The one the account holds, refreshed first when it is near its end.
+    Held,
+    /// One the account replaces first, whatever the held token's age: the service turned the held
+    /// one back, and a token can end in transit or on a clock that runs behind the service's.
+    Renewed,
+}
+
 /// Whether the account signed in is the one a lease client asks as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccountNow {
@@ -78,7 +87,10 @@ pub trait MembershipLeaseService: Send + Sync + fmt::Debug {
     /// Returns why the account could not be read.
     fn account_now(&self) -> Result<AccountNow>;
 
-    /// Asks for a lease for the account signed in, naming `device_key` as the device it is for.
+    /// Asks for a lease for the account signed in, naming `device_key` as the device it is for,
+    /// under `token`. A service that rejects the token is answered with its refusal as it is: the
+    /// caller decides whether to ask again under a renewed one, so that the second request meets
+    /// the same pacing as the first.
     ///
     /// # Errors
     ///
@@ -88,6 +100,7 @@ pub trait MembershipLeaseService: Send + Sync + fmt::Debug {
         &'a self,
         organisation: OrganisationId,
         device_key: AuthorisationKey,
+        token: Token,
     ) -> ServiceFuture<'a, IssuedLease>;
 
     /// Reads the chain of keys that signs the organisation's leases, which a host follows from the
@@ -96,7 +109,11 @@ pub trait MembershipLeaseService: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns the service's refusal, or why no account token could be had.
-    fn authority<'a>(&'a self, organisation: OrganisationId) -> ServiceFuture<'a, PolicyAuthority>;
+    fn authority<'a>(
+        &'a self,
+        organisation: OrganisationId,
+        token: Token,
+    ) -> ServiceFuture<'a, PolicyAuthority>;
 }
 
 impl MembershipLeaseService for super::NullService {
@@ -108,6 +125,7 @@ impl MembershipLeaseService for super::NullService {
         &'a self,
         _organisation: OrganisationId,
         _device_key: AuthorisationKey,
+        _token: Token,
     ) -> ServiceFuture<'a, IssuedLease> {
         unconfigured(super::ManagedService::AccountLogin.as_str())
     }
@@ -115,6 +133,7 @@ impl MembershipLeaseService for super::NullService {
     fn authority<'a>(
         &'a self,
         _organisation: OrganisationId,
+        _token: Token,
     ) -> ServiceFuture<'a, PolicyAuthority> {
         unconfigured(super::ManagedService::AccountLogin.as_str())
     }
@@ -201,31 +220,6 @@ impl ManagedMembershipLeaseService {
         Ok(format!("Bearer {}", token.expose()))
     }
 
-    /// Makes a request with the account's token, and once more with a renewed one when the service
-    /// rejects the first as `UNAUTHENTICATED`: a token can end in transit, or on a clock that runs
-    /// behind the service's, and nothing a person does mends that. A second rejection is the
-    /// service's last word.
-    ///
-    /// Sound for a request that is safe to send again, as both of this client's are: a request the
-    /// service rejected for its token did nothing.
-    async fn with_token<T, F, Fut>(&self, mut request: F) -> Result<T>
-    where
-        F: FnMut(String) -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        let mut renew = false;
-        loop {
-            let authorisation = self.authorisation(renew).await?;
-            match request(authorisation).await {
-                Err(ClientError::Refused {
-                    service_code: Some("UNAUTHENTICATED"),
-                    ..
-                }) if !renew => renew = true,
-                other => return other,
-            }
-        }
-    }
-
     fn path(&self, organisation: OrganisationId, tail: &str) -> String {
         format!(
             "{}/api/account/organisations/{organisation}/{tail}",
@@ -266,6 +260,7 @@ impl MembershipLeaseService for ManagedMembershipLeaseService {
         &'a self,
         organisation: OrganisationId,
         device_key: AuthorisationKey,
+        token: Token,
     ) -> ServiceFuture<'a, IssuedLease> {
         Box::pin(async move {
             let body = serde_json::to_vec(&serde_json::json!({
@@ -281,19 +276,14 @@ impl MembershipLeaseService for ManagedMembershipLeaseService {
                 )
             })?;
             let path = self.path(organisation, "lease");
-            let answered: LeaseAnswer = self
-                .with_token(|authorisation| {
-                    let (body, path) = (&body, &path);
-                    async move {
-                        let answer = self
-                            .http
-                            .post_json(path, body, &[("authorization", authorisation.as_str())])
-                            .await?;
-                        serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
-                            .map_err(|error| unreadable_answer("a lease", &error))
-                    }
-                })
+            let authorisation = self.authorisation(token == Token::Renewed).await?;
+            let answer = self
+                .http
+                .post_json(&path, &body, &[("authorization", authorisation.as_str())])
                 .await?;
+            let answered: LeaseAnswer =
+                serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
+                    .map_err(|error| unreadable_answer("a lease", &error))?;
             Ok(IssuedLease {
                 lease: answered.lease,
                 refresh_after: Duration::from_secs(answered.refresh_after_seconds),
@@ -301,21 +291,20 @@ impl MembershipLeaseService for ManagedMembershipLeaseService {
         })
     }
 
-    fn authority<'a>(&'a self, organisation: OrganisationId) -> ServiceFuture<'a, PolicyAuthority> {
+    fn authority<'a>(
+        &'a self,
+        organisation: OrganisationId,
+        token: Token,
+    ) -> ServiceFuture<'a, PolicyAuthority> {
         Box::pin(async move {
             let path = self.path(organisation, "policy-authority");
-            self.with_token(|authorisation| {
-                let path = &path;
-                async move {
-                    let answer = self
-                        .http
-                        .get_json(path, &[("authorization", authorisation.as_str())])
-                        .await?;
-                    serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
-                        .map_err(|error| unreadable_answer("a policy authority", &error))
-                }
-            })
-            .await
+            let authorisation = self.authorisation(token == Token::Renewed).await?;
+            let answer = self
+                .http
+                .get_json(&path, &[("authorization", authorisation.as_str())])
+                .await?;
+            serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
+                .map_err(|error| unreadable_answer("a policy authority", &error))
         })
     }
 }

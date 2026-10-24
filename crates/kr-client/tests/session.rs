@@ -2716,6 +2716,7 @@ impl kr_client::services::MembershipLeaseService for ForkServices {
         &'a self,
         _organisation: kr_protocol::ids::OrganisationId,
         _device_key: kr_protocol::scalars::AuthorisationKey,
+        _token: kr_client::services::Token,
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::IssuedLease> {
         self.refuses("membership.lease")
     }
@@ -2723,6 +2724,7 @@ impl kr_client::services::MembershipLeaseService for ForkServices {
     fn authority<'a>(
         &'a self,
         _organisation: kr_protocol::ids::OrganisationId,
+        _token: kr_client::services::Token,
     ) -> kr_client::services::ServiceFuture<'a, kr_protocol::account::PolicyAuthority> {
         self.refuses("membership.authority")
     }
@@ -3065,6 +3067,7 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             .lease(
                 kr_protocol::ids::OrganisationId::new(Uuid::from_bytes([5; 16])),
                 kr_protocol::scalars::AuthorisationKey::from_bytes([6; 32]),
+                kr_client::services::Token::Held,
             )
             .await
             .err(),

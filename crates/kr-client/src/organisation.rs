@@ -33,8 +33,8 @@
 //! names. A hold is against the service: it stops every request to it, the chain of keys asked
 //! for by a presentation already under way as much as a lease asked for by one that begins later,
 //! and it stops a presentation only when no lease is held that the host would take. A token the
-//! service rejects is replaced once by the service client before the keeper hears of it, so a
-//! second rejection ends in `TokenRefused`.
+//! service rejects is replaced once, by the keeper, which asks again under the renewed token after
+//! looking at the hold once more; a second rejection ends in `TokenRefused`.
 //!
 //! A connection that is kept beside the one that keeps the lease fresh, as the inbox keeps its
 //! visits, presents again only when the lease the host holds is due to be replaced
@@ -63,7 +63,7 @@ use kr_transport::reconnect::Backoff;
 
 use crate::error::ClientError;
 use crate::retry::UserAction;
-use crate::services::{AccountNow, MembershipLeaseService};
+use crate::services::{AccountNow, MembershipLeaseService, ServiceFuture, Token};
 use crate::session::Session;
 use crate::shown::{Said, Shown};
 
@@ -747,6 +747,31 @@ impl LeaseKeeper {
         }
     }
 
+    /// Asks the service, once the hold has been looked at: nothing goes while a stop is held
+    /// against the service, or a delay it named, or a failure the keeper is waiting out has time to
+    /// run. A token the service turns back is replaced once and the request made again, after the
+    /// hold has been looked at again, so a request that follows a caller giving up on another
+    /// waits the minute out like any other.
+    async fn ask_service<'a, T>(
+        &'a self,
+        ask: impl Fn(Token) -> ServiceFuture<'a, T>,
+    ) -> Result<T, Next> {
+        let mut token = Token::Held;
+        loop {
+            self.must_wait()?;
+            let asking = Asking::of(self);
+            let answered = ask(token).await;
+            asking.answered();
+            match answered {
+                Err(ClientError::Refused {
+                    service_code: Some("UNAUTHENTICATED"),
+                    ..
+                }) if token == Token::Held => token = Token::Renewed,
+                other => return other.map_err(|error| self.service_refused(&error)),
+            }
+        }
+    }
+
     /// One lease presented, got from the service first when none is held to present. Returns the
     /// interval the service advised.
     async fn step(
@@ -768,11 +793,9 @@ impl LeaseKeeper {
         let mut held = if let Some(held) = reusable {
             held
         } else {
-            self.must_wait()?;
-            let asking = Asking::of(self);
-            let issued = self.leases.lease(self.organisation, self.device_key).await;
-            asking.answered();
-            let issued = issued.map_err(|error| self.service_refused(&error))?;
+            let issued = self
+                .ask_service(|token| self.leases.lease(self.organisation, self.device_key, token))
+                .await?;
             let payload = &issued.lease.payload;
             let lasts = payload
                 .expires_at_ms
@@ -792,11 +815,10 @@ impl LeaseKeeper {
         let newer = revision > self.kept().followed;
         // A chain the host refused for being behind is fetched again, not presented as it was.
         if force_chain || (held.authority.is_none() && newer) {
-            self.must_wait()?;
-            let asking = Asking::of(self);
-            let chain = self.leases.authority(self.organisation).await;
-            asking.answered();
-            held.authority = Some(chain.map_err(|error| self.service_refused(&error))?);
+            held.authority = Some(
+                self.ask_service(|token| self.leases.authority(self.organisation, token))
+                    .await?,
+            );
         }
         // Whatever was waited for, the lease is presented only for the account that asked for it.
         self.account_is_the_same()?;
@@ -960,8 +982,8 @@ fn from_the_service(error: &ClientError) -> Next {
         (Some("RATE_LIMITED" | "SERVICE_UNAVAILABLE"), Some(seconds)) => {
             Next::After(Duration::from_secs(*seconds))
         }
-        // The service client has already asked once more with a renewed token when the first was
-        // rejected, so a token it still rejects is the person's to replace.
+        // The keeper has already asked once more under a renewed token when the first was
+        // rejected, so a token the service still rejects is the person's to replace.
         (Some("REAUTHENTICATION_REQUIRED" | "UNAUTHENTICATED"), _) => {
             Next::Stop(LeaseStop::TokenRefused)
         }

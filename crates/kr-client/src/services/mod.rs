@@ -166,7 +166,7 @@ pub use mailbox::{
     MailboxPage, MailboxUsage,
 };
 pub use organisation::{
-    AccountNow, IssuedLease, ManagedMembershipLeaseService, MembershipLeaseService,
+    AccountNow, IssuedLease, ManagedMembershipLeaseService, MembershipLeaseService, Token,
 };
 pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
