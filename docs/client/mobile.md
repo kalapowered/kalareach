@@ -406,8 +406,12 @@ that its process has native code of the package mapped (the Rust library, which 
 uncompressed and the system maps from the package); that the web view lists the interface's own
 document, titled `KalaReach` and served by the application's own protocol (`tauri.localhost`); that
 the document's root holds what the interface drew and the page has text on it, which it asks the
-web view over its debugging protocol; that the screen shows the page; and that the log holds no
-fatal exception or signal for the application's process.
+web view over its debugging protocol; that the screen shows the page, and keeps the frame it found
+to show it as the screenshot; and that the log holds no fatal exception or signal for the
+application's process and the process is still the one that started. Once the application has a
+process, every wait ends when that process is found gone, and not at the deadline, and says how it
+ended from the device's log: a crash, or a device short of memory, whose low-memory killer ends the
+web view's renderer (which ends the application with it) or the application itself.
 
 `scripts/ios-app-launch.sh` checks that the built application defines the Swift plugin's entry
 point (`init_plugin_companion_platform`); that the application runs in the simulator and that a web
@@ -420,11 +424,11 @@ it, with its data, and again when they end.
 
 The `android-app` and `ios` jobs of the landing workflow build the debug application and then run
 the library's cases and the matching script on the hosted runner: in an x86_64 Android emulator
-(Android 16 with Google Play and 16 KB pages) and in an arm64 iPhone simulator. They keep the
-screenshots with the run's evidence (`test-evidence-android`, `test-evidence-ios`), and the `ios` job
-builds with no signing identity, certificate or profile. The `android` job and the `ios` job compile
-and lint the phone's other architectures and do not run them; the emulator exercises libsodium's
-x86_64 code paths.
+(Android 16 with Google Play and 16 KB pages, with 4 GB of memory) and in an arm64 iPhone
+simulator. They keep the screenshots with the run's evidence (`test-evidence-android`,
+`test-evidence-ios`), and the `ios` job builds with no signing identity, certificate or profile.
+The `android` job and the `ios` job compile and lint the phone's other architectures and do not
+run them; the emulator exercises libsodium's x86_64 code paths.
 
 `apps/companion/e2e/` takes the path of each screenshot from `e2e/evidence.ts`, which puts it under
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/companion-screenshots`. `scripts/check-test-evidence.sh`

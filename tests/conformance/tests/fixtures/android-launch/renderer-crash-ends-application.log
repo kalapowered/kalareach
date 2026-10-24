@@ -1,0 +1,81 @@
+10-24 08:27:39.753  2760  2760 F DEBUG   :       #22 pc 0000000000069ec8  /apex/com.android.runtime/lib64/bionic/libc.so (__libc_init+120) (BuildId: 2445fc73ede03b9536eef49355aff375)
+10-24 08:27:39.764   650  2155 I ActivityManager: Process com.google.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0 (pid 2760) has died: fg +1 BTOP
+10-24 08:27:39.764   650  2155 I am_proc_died: [0,2760,com.google.android.webview:sandboxed_process0:org.chromium.content.app.SandboxedProcessService0:0,1,3]
+10-24 08:27:39.767  2605  2755 W cr_ChildProcessConn: onServiceDisconnected (crash or killed by oom): pid=2760 bindings:W  S
+10-24 08:27:39.767   976   976 I Zygote  : Process 2760 exited due to signal 5 (Trap)
+10-24 08:27:39.768   650   690 I libprocessgroup: Removed cgroup /sys/fs/cgroup/apps/uid_99000/pid_2760
+10-24 08:27:39.768   650  2155 W ActivityManager: Scheduling restart of crashed service to.kala.reach/org.chromium.content.app.SandboxedProcessService0:0 in 1000ms for connection
+10-24 08:27:39.768   650  2155 I am_schedule_service_restart: [0,to.kala.reach/org.chromium.content.app.SandboxedProcessService0:0,1000]
+10-24 08:27:39.768   650  2155 I am_uid_stopped: 99000
+10-24 08:27:39.776  2605  2605 E chromium: [ERROR:aw_browser_terminator.cc(165)] Renderer process (2760) crash detected (code 5).
+10-24 08:27:39.776  2605  2674 I RustStdoutStderr: [ERROR:aw_browser_terminator.cc(165)] Renderer process (2760) crash detected (code 5).
+10-24 08:27:39.778  2605  2605 F chromium: [FATAL:crashpad_client_linux.cc(745)] Render process (2760)'s crash wasn't handled by all associated  webviews, triggering application crash.
+10-24 08:27:39.778  2605  2605 F libc    : Fatal signal 5 (SIGTRAP), code 1 (TRAP_BRKPT), fault addr 0x7ff54485b838 in tid 2605 (to.kala.reach), pid 2605 (to.kala.reach)
+10-24 08:27:39.778  2605  2674 I RustStdoutStderr: [FATAL:crashpad_client_linux.cc(745)] Render process (2760)'s crash wasn't handled by all associated  webviews, triggering application crash.
+10-24 08:27:39.783   650   698 W KernelCpuProcStringReader: File not found. It's normal if not implemented: /proc/uid_concurrent_policy_time
+10-24 08:27:39.812  3912  3912 I crash_dump64: obtaining output fd from tombstoned, type: kDebuggerdTombstoneProto
+10-24 08:27:39.814   273   273 I tombstoned: received crash request for pid 2605
+10-24 08:27:39.816  3912  3912 I crash_dump64: performing dump of process 2605 (target tid = 2605)
+10-24 08:27:39.927   650  2155 I am_mem_factor: [1,0]
+10-24 08:27:39.994  1224  1224 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.audit.service.START xflg=0x4 pkg=com.google.android.gms }
+10-24 08:27:40.013  3912  3912 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+10-24 08:27:40.013  3912  3912 F DEBUG   : Build fingerprint: 'google/sdk_gphone16k_arm64/emu64a16k:16/BE2A.250530.026.F3/13894323:user/dev-keys'
+10-24 08:27:40.013  3912  3912 F DEBUG   : Revision: '0'
+10-24 08:27:40.013  3912  3912 F DEBUG   : ABI: 'arm64'
+10-24 08:27:40.013  3912  3912 F DEBUG   : Timestamp: 2026-10-24 08:27:39.818995639+0200
+10-24 08:27:40.019   650  3915 I am_crash: [650,0,to.kala.reach,682147398,Native crash,Trap,unknown,0,0]
+10-24 08:27:40.022   650  3916 I DropBoxManagerService: add tag=data_app_native_crash isTagEnabled=true flags=0x2
+10-24 08:27:40.023   650   746 I DropBoxManagerService: add tag=SYSTEM_TOMBSTONE_PROTO_WITH_HEADERS isTagEnabled=true flags=0x4
+10-24 08:27:40.030   650  3915 W ActivityTaskManager:   Force finishing activity to.kala.reach/.MainActivity
+10-24 08:27:40.033   650   759 W InputDispatcher: channel 'e8e193c to.kala.reach/to.kala.reach.MainActivity' ~ Consumer closed input channel or an error occurred.  events=0x9
+10-24 08:27:40.033   650   759 E InputDispatcher: channel 'e8e193c to.kala.reach/to.kala.reach.MainActivity' ~ Channel is unrecoverably broken and will be disposed!
+10-24 08:27:40.035   447   447 I Zygote  : Process 2605 exited due to signal 5 (Trap)
+10-24 08:27:40.036   492   492 I adbd    : Remote process closed the socket (on MSG_PEEK)
+10-24 08:27:40.036   650  3915 I wm_finish_activity: [0,191135521,10,to.kala.reach/.MainActivity,force-crash]
+10-24 08:27:40.040   650  3915 I wm_task_moved: [1,1,0,1,2]
+10-24 08:27:40.041   650  3915 I wm_task_to_front: [0,5,0]
+10-24 08:27:40.041   650   807 D ConnectivityService: releasing NetworkRequest [ REQUEST id=113, [ Capabilities: INTERNET&NOT_RESTRICTED&TRUSTED&NOT_VCN_MANAGED&NOT_BANDWIDTH_CONSTRAINED Uid: 10213 RequestorUid: 10213 RequestorPkg: to.kala.reach UnderlyingNetworks: Null] ] (release request)
+10-24 08:27:40.041   650  1508 I ImeTracker: to.kala.reach:2976a8e2: onRequestHide at ORIGIN_SERVER reason HIDE_REMOVE_CLIENT fromUser false
+10-24 08:27:40.041   650  1508 I ImeTracker: to.kala.reach:2976a8e2: onCancelled at PHASE_SERVER_SHOULD_HIDE
+10-24 08:27:40.042   650  3915 I wm_task_moved: [5,1,0,1,2147483647]
+10-24 08:27:40.042   650  3915 I wm_focused_root_task: [0,0,1,10,finish-top adjustFocusToNextFocusableTask]
+10-24 08:27:40.043   650  3915 I wm_pause_activity: [0,191135521,to.kala.reach/.MainActivity,userLeaving=false,finish]
+10-24 08:27:40.047   650  3915 W ActivityManager: pid 650 system sent binder code 54 with flags 1 to frozen apps and got error -32
+10-24 08:27:40.047   650  3915 D ActivityManager: Too many transaction errors, throttling freezer binder callback.
+10-24 08:27:40.047  1459  1459 I SubtypeOperator: SubtypeOperator$1.onUnbindInput():43 
+10-24 08:27:40.050   650   746 I commit_sys_config_file: [log-files,17]
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: Failed to deliver transaction for ProcessRecord{4771b1b 2605:to.kala.reach/u0a213}
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: transaction=com.android.server.wm.ClientLifecycleManager@dbd1bbf
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: android.os.DeadObjectException
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at android.os.BinderProxy.transactNative(Native Method)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at android.os.BinderProxy.transact(BinderProxy.java:592)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at android.app.IApplicationThread$Stub$Proxy.scheduleTransaction(IApplicationThread.java:2308)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at android.app.IApplicationThread$Delegator.scheduleTransaction(IApplicationThread.java:439)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at android.app.servertransaction.ClientTransaction.schedule(ClientTransaction.java:245)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.ClientLifecycleManager.scheduleTransaction(ClientLifecycleManager.java:75)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.ClientLifecycleManager.dispatchPendingTransactions(ClientLifecycleManager.java:185)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.RootWindowContainer.performSurfacePlacementNoTrace(RootWindowContainer.java:792)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.RootWindowContainer.performSurfacePlacement(RootWindowContainer.java:746)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.WindowSurfacePlacer.performSurfacePlacementLoop(WindowSurfacePlacer.java:173)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.WindowSurfacePlacer.performSurfacePlacement(WindowSurfacePlacer.java:123)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.WindowSurfacePlacer.performSurfacePlacement(WindowSurfacePlacer.java:112)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.WindowSurfacePlacer.continueLayout(WindowSurfacePlacer.java:94)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.ActivityTaskManagerService.continueWindowLayout(ActivityTaskManagerService.java:4972)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.wm.ActivityTaskManagerService$LocalService.finishTopCrashedActivities(ActivityTaskManagerService.java:7183)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.am.AppErrors.handleAppCrashLSPB(AppErrors.java:964)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.am.AppErrors.makeAppCrashingLocked(AppErrors.java:797)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.am.AppErrors.crashApplicationInner(AppErrors.java:672)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.am.AppErrors.crashApplication(AppErrors.java:600)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.am.ActivityManagerService.handleApplicationCrashInner(ActivityManagerService.java:9424)
+10-24 08:27:40.050   650  3915 W ClientLifecycleManager: 	at com.android.server.am.NativeCrashListener$NativeCrashReporter.run(NativeCrashListener.java:91)
+10-24 08:27:40.051   650   759 I WindowManager: WINDOW DIED Window{e8e193c u0 to.kala.reach/to.kala.reach.MainActivity}
+10-24 08:27:40.053   650  2179 I WindowManager: WIN DEATH: Window{e8e193c u0 to.kala.reach/to.kala.reach.MainActivity EXITING}
+10-24 08:27:40.054   490   757 I BpBinder: onLastStrongRef automatically unlinking death recipients: 
+10-24 08:27:40.054   650   682 I input_focus: [Requesting to set focus to null window,reason=UpdateInputWindows]
+10-24 08:27:40.055   650   690 I libprocessgroup: Removed cgroup /sys/fs/cgroup/apps/uid_10213/pid_2605
+10-24 08:27:40.055   898   995 V WindowManagerShell: Transition requested (#13): android.os.BinderProxy@5b2b041 TransitionRequestInfo { type = CLOSE, triggerTask = TaskInfo{userId=0 taskId=10 effectiveUid=10213 displayId=0 isRunning=true baseIntent=Intent { flg=0x10000000 cmp=to.kala.reach/.MainActi
+10-24 08:27:40.056   650  3915 I sysui_multi_action: [757,316,758,4,759,-1]
+10-24 08:27:40.056   650  2170 I ActivityManager: Process to.kala.reach (pid 2605) has died: fg  TOP 
+10-24 08:27:40.056   650  2170 I am_proc_died: [0,2605,to.kala.reach,0,2]
+10-24 08:27:40.056   650  2170 I am_uid_stopped: 10213
+10-24 08:27:40.057   650  2170 I wm_set_resumed_activity: [0,com.google.android.apps.nexuslauncher/.NexusLauncherActivity,resumeTopActivity - onActivityStateChanged]
