@@ -450,10 +450,21 @@ pub fn package_fault(
              managed contract",
         ),
         Fault::Unreadable { .. } => shown!("a package under {} cannot be read", Shown::root(root)),
-        Fault::MissingExecutable { .. } => shown!(
-            "a package under {} names an executable that is not installed",
-            Shown::root(root)
-        ),
+        Fault::MissingExecutable { republish, .. } => {
+            let said = shown!(
+                "a package under {} names an executable that is not installed",
+                Shown::root(root)
+            );
+            if *republish {
+                shown!(
+                    "{}; run {} in PowerShell to qualify the one this account runs",
+                    said,
+                    kr_shell_integration::host::package::PUBLISH_COMMAND
+                )
+            } else {
+                said
+            }
+        }
         Fault::NotInteractive { .. } => {
             Shown::said("a script invocation is not an interactive root shell")
         }
@@ -1041,6 +1052,7 @@ mod tests {
             (
                 PackageFault::MissingExecutable {
                     path: format!("/opt/kalareach/shells/{MARKER}/current"),
+                    republish: false,
                 },
                 format!("a package under {said} names an executable that is not installed"),
             ),

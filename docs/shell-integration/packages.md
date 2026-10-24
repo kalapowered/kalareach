@@ -294,13 +294,23 @@ qualified at and the one it is at now. The record holds that directory and that 
 digest of the editor itself, so a different installation put at the recorded directory under the
 recorded version is not something the record can tell apart.
 
-It installs one executable of its own, `bin/pwsh`, which starts the host this qualification found
-with the runtime location that host needs. The host and the editor are the person's and live
-wherever they installed them, so the package records them under what it qualified rather than
-among the paths it holds: every path a package declares is inside the package, which is what lets
-a session resolve one without resolving into somebody else's installation. A record that named the
-person's own host as the package's executable could not be read at all, which refuses a managed
-PowerShell session by name and leaves the packages beside it alone.
+The rule is that a package's own files are inside it, and that a package that builds no shell names
+the host it qualified. This package installs no program: the host and the editor are the person's
+and live wherever they installed them, and the record names the host as `shell.executable`, by an
+absolute path to a `pwsh`, which a session starts directly. That keeps the shell the worker started
+the shell the bridge speaks from, and leaves the person's PowerShell updates to the person. The
+record's `launch` block adds what that host needs to its environment when it is started (the
+runtime's location and the package's module directory first on `PSModulePath`); the module and
+the startup entry stay inside the package, so a package that is moved starts its own. A session
+reads the package of the account it runs as, as it reads that account's profile: an elevated session
+reads the elevated account's package.
+
+A host or an editor that changed after the publish is not the one the package qualified. A new
+PowerShell version is refused at the handshake, and a new PSReadLine is declined by the module
+before any handshake, so the create waits out its bound; both answers name
+`Publish-KalaReachQualification`, which qualifies what the person has now. A Microsoft Store build of
+PowerShell cannot be published for: its programs sit under `WindowsApps` and are not started by their
+path, so the publish says so and the session can use `--shell-mode native_compat`.
 
 [README.md](README.md) states what this mechanism can and cannot establish. The short of it is that
 the reader is reached when it steps: the module's queue is serviced on the reader's own thread, and
@@ -439,8 +449,9 @@ build records the directory it was built in, which is a fresh temporary one each
 from the same inputs give the same identity and the same install path rather than an identical
 file.
 
-Packages are installed outside the repository, under `~/Library/Caches/kalareach/shells/` on macOS
-and `${XDG_CACHE_HOME:-~/.cache}/kalareach/shells/` elsewhere. A process a service manager starts
+Packages are installed outside the repository, under `~/Library/Caches/kalareach/shells/` on macOS,
+`%LOCALAPPDATA%\KalaReach\shells\` on Windows and `${XDG_CACHE_HOME:-~/.cache}/kalareach/shells/`
+elsewhere. A process a service manager starts
 gets its own privacy identity on macOS, and one that opens a path on a removable volume makes the
 operating system ask the person for permission first, so a built shell lives on the internal disk
 where a session can start it without a dialog.

@@ -34,7 +34,8 @@ step cargo test -p kr-worker --test fence -- --ignored --exact \
   a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed \
   a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt \
   a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for \
-  a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again
+  a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again \
+  a_moved_powershell_package_qualifies_with_its_own_module_over_a_competing_one
 step env -u KR_SHELL_PACKAGES PATH="$shell_path:$PATH" cargo test -p kr-worker --test shells -- --ignored
 
 exit "$failed"

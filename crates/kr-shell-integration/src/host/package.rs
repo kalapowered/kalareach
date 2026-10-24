@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::hostinfo::configuration::{host_owns_variable, platform_variable_name};
 use serde::{Deserialize, Serialize};
 
 use crate::contract::qualification::ShellKind;
@@ -28,6 +29,9 @@ pub const MANIFEST_BASENAME: &str = "kr-shell-identity.json";
 
 /// The file beside a shell's packages that names the identity this installation uses.
 pub const CURRENT_BASENAME: &str = "current";
+
+/// The variable that lists the directories PowerShell finds a module by name in.
+pub const MODULE_PATH_VARIABLE: &str = "PSModulePath";
 
 /// What a package's identity record says it is.
 ///
@@ -44,6 +48,30 @@ pub struct PackageManifest {
     pub shell: PackageShell,
     /// The guarded startup entry this package installs.
     pub startup_entry: PackageStartupEntry,
+    /// What a start of this package adds to the environment of its shell.
+    ///
+    /// A record that says nothing starts the shell in the environment the session built. The
+    /// block is limited to what a shell that is not built here needs to find its runtime and the
+    /// package's module; [`PackageLaunch`] says which names, and a record that goes past it is
+    /// refused when it is read.
+    #[serde(default)]
+    pub launch: PackageLaunch,
+}
+
+/// What a start of a package adds to its shell's environment.
+///
+/// Two kinds of thing and no more: the location of the .NET runtime a shell needs to start at all,
+/// which is the person's own and which the package records as it found it, and the directory the
+/// package's module is found in by name, put first on the list of module directories.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageLaunch {
+    /// Variables set to exactly these values: `DOTNET_ROOT` and its architecture forms.
+    #[serde(default)]
+    pub environment: std::collections::BTreeMap<String, String>,
+    /// Lists of directories the package goes first in, each by the variable that holds the list:
+    /// `PSModulePath` is the only one.
+    #[serde(default)]
+    pub search_paths: std::collections::BTreeMap<String, Vec<PathBuf>>,
 }
 
 /// What a package says about the shell inside it.
@@ -137,6 +165,7 @@ impl ShellPackage {
         if !package.executable().is_file() {
             return Err(PackageFault::MissingExecutable {
                 path: package.directory.display().to_string(),
+                republish: package.kind() == ShellKind::PowerShell,
             });
         }
         Ok(package)
@@ -180,16 +209,63 @@ impl ShellPackage {
         let tail = if let Ok(tail) = recorded.strip_prefix(&self.directory) {
             tail.to_path_buf()
         } else if recorded.is_absolute() {
-            let root = package_root(
-                &self.manifest.shell.executable,
-                self.kind(),
-                &self.manifest.identity,
-            )?;
+            let root = self.recorded_root()?;
             recorded.strip_prefix(&root).ok()?.to_path_buf()
         } else {
             recorded.to_path_buf()
         };
         within(&tail)
+    }
+
+    /// Returns the directory the build installed this package in, read from the paths the record
+    /// names.
+    ///
+    /// The shell's own path says it where the package holds its shell. A package that builds none
+    /// names the host it qualified, which is outside the package and says nothing of where the
+    /// package was installed, so the paths that are the package's own are read next: the module
+    /// directories, the directories the launch puts first, and the startup entry. The first that
+    /// names a directory of this package's identity gives the root for them all.
+    fn recorded_root(&self) -> Option<PathBuf> {
+        let shell = &self.manifest.shell;
+        std::iter::once(shell.executable.as_path())
+            .chain(
+                shell
+                    .modules
+                    .iter()
+                    .map(|module| Path::new(&module.search_path)),
+            )
+            .chain(
+                self.manifest
+                    .launch
+                    .search_paths
+                    .values()
+                    .flatten()
+                    .map(PathBuf::as_path),
+            )
+            .chain(std::iter::once(Path::new(
+                &self.manifest.startup_entry.file,
+            )))
+            .filter(|recorded| recorded.is_absolute())
+            .find_map(|recorded| package_root(recorded, self.kind(), &self.manifest.identity))
+    }
+
+    /// Returns whether this record names the host it qualified instead of a shell it holds.
+    ///
+    /// A package that builds no shell has no executable of its own. The one such package is
+    /// PowerShell's, which binds into the host the person already has and says which one it
+    /// qualified: an absolute path to a `pwsh`, so that starting it never searches for a name.
+    /// Everything else a record names is still the package's own and has to be inside it.
+    fn names_its_host(&self) -> bool {
+        let executable = self.manifest.shell.executable.as_path();
+        self.kind() == ShellKind::PowerShell
+            && executable.is_absolute()
+            && !executable.to_string_lossy().contains('\0')
+            && executable
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("pwsh") || name.eq_ignore_ascii_case("pwsh.exe")
+                })
     }
 
     /// Returns whether every path this record names is one this package can answer for.
@@ -202,19 +278,74 @@ impl ShellPackage {
         if self.manifest.identity.is_empty() {
             return false;
         }
-        let files = [
-            self.manifest.shell.executable.as_path(),
-            Path::new(&self.manifest.startup_entry.file),
-        ];
-        files.iter().all(|recorded| {
+        let a_file_inside = |recorded: &Path| {
             self.inside(recorded)
                 .is_some_and(|tail| !tail.as_os_str().is_empty())
-        }) && self
-            .manifest
-            .shell
-            .modules
-            .iter()
-            .all(|module| self.inside(Path::new(&module.search_path)).is_some())
+        };
+        (a_file_inside(&self.manifest.shell.executable) || self.names_its_host())
+            && a_file_inside(Path::new(&self.manifest.startup_entry.file))
+            && self
+                .manifest
+                .shell
+                .modules
+                .iter()
+                .all(|module| self.inside(Path::new(&module.search_path)).is_some())
+    }
+
+    /// Returns what is wrong with the launch block, when something is.
+    ///
+    /// The block is the one place a record reaches the environment of the shell a session starts,
+    /// so it is held to what a package needs and nothing else: `DOTNET_ROOT` and its architecture
+    /// forms set to a value with no NUL in it, and `PSModulePath` given directories of the
+    /// package's own. A name the host owns is never accepted, whatever it is for. Only the
+    /// PowerShell package has any launch at all.
+    fn launch_fault(&self) -> Option<String> {
+        let launch = &self.manifest.launch;
+        if launch.environment.is_empty() && launch.search_paths.is_empty() {
+            return None;
+        }
+        if self.kind() != ShellKind::PowerShell {
+            return Some("only the PowerShell package has a launch block".to_owned());
+        }
+        for (name, value) in &launch.environment {
+            if !is_runtime_location(name) || owned_by_the_host(name) {
+                return Some(format!(
+                    "the launch sets {name}, which a package does not set"
+                ));
+            }
+            if value.is_empty() || value.contains('\0') {
+                return Some(format!("the launch gives {name} no usable value"));
+            }
+        }
+        for (name, directories) in &launch.search_paths {
+            if platform_variable_name(name) != platform_variable_name(MODULE_PATH_VARIABLE)
+                || owned_by_the_host(name)
+            {
+                return Some(format!(
+                    "the launch puts directories first in {name}, which is not a list a package \
+                     adds to"
+                ));
+            }
+            for directory in directories {
+                let text = directory.to_string_lossy();
+                let separator = if cfg!(windows) { ';' } else { ':' };
+                if text.contains('\0') || text.contains(separator) {
+                    return Some(format!(
+                        "the launch names a directory that cannot be in {name}"
+                    ));
+                }
+                if !self
+                    .inside(directory)
+                    .is_some_and(|tail| !tail.as_os_str().is_empty())
+                {
+                    return Some(format!(
+                        "the launch names {} for {name}, which is not inside the package",
+                        directory.display()
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Returns the guarded startup entry this package installs.
@@ -321,16 +452,117 @@ impl ShellPackage {
     }
 }
 
+impl ShellPackage {
+    /// Returns the variables a start of this package sets, given the environment it starts in.
+    ///
+    /// The record's runtime locations are set as written. Each list the record puts directories
+    /// first in gets the package's directories at its front, once each, with every other entry
+    /// after them in the order it had: a list that already held the package's directory further
+    /// down has it moved to the front, so the module found by name is this package's own whatever
+    /// else the person's list names. A list the environment does not have starts as the package's
+    /// directories alone.
+    ///
+    /// Names are compared as the platform compares them, and `windows` says which platform that
+    /// is: callers pass `cfg!(windows)`, and a check can run both rules on one host. A name the
+    /// host owns is never returned, so the launch cannot set what a session's worker sets itself.
+    /// Every process this package's shell is asked something of, a session's root shell and the
+    /// ones that find a profile or place an entry in it, is started with these on top of the
+    /// environment it would otherwise have.
+    #[must_use]
+    pub fn launch_environment(
+        &self,
+        base: &[(String, String)],
+        windows: bool,
+    ) -> Vec<(String, String)> {
+        let fold = |name: &str| {
+            if windows {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_owned()
+            }
+        };
+        let launch = &self.manifest.launch;
+        let mut set: Vec<(String, String)> = launch
+            .environment
+            .iter()
+            .filter(|(name, _)| !owned_by_the_host(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        for (name, directories) in &launch.search_paths {
+            if owned_by_the_host(name) {
+                continue;
+            }
+            let ours: Vec<String> = directories
+                .iter()
+                .map(|directory| self.own(directory).display().to_string())
+                .collect();
+            let held = base
+                .iter()
+                .find(|(existing, _)| fold(existing) == fold(name))
+                .map(|(_, value)| value.as_str());
+            set.push((name.clone(), put_first(&ours, held, windows)));
+        }
+        set
+    }
+}
+
+/// Returns `held`, a list of directories, with `ours` at its front and no other entry equal to one
+/// of them.
+fn put_first(ours: &[String], held: Option<&str>, windows: bool) -> String {
+    let separator = if windows { ';' } else { ':' };
+    let same = |left: &str, right: &str| {
+        let plain = |text: &str| {
+            let trimmed = text.trim_end_matches(['/', '\\']);
+            if windows {
+                trimmed.replace('/', "\\").to_ascii_lowercase()
+            } else {
+                trimmed.trim_end_matches('/').to_owned()
+            }
+        };
+        plain(left) == plain(right)
+    };
+    let mut entries: Vec<&str> = Vec::new();
+    for entry in ours {
+        if !entries.iter().any(|kept| same(kept, entry)) {
+            entries.push(entry);
+        }
+    }
+    for entry in held.unwrap_or_default().split(separator) {
+        if entry.is_empty() || ours.iter().any(|mine| same(mine, entry)) {
+            continue;
+        }
+        entries.push(entry);
+    }
+    entries.join(&separator.to_string())
+}
+
+/// Whether `name` is one of the host's own, which no record sets.
+fn owned_by_the_host(name: &str) -> bool {
+    host_owns_variable(&platform_variable_name(name))
+}
+
+/// Whether `name` is the location of the .NET runtime: `DOTNET_ROOT`, or its form for one
+/// architecture.
+fn is_runtime_location(name: &str) -> bool {
+    name == "DOTNET_ROOT"
+        || name
+            .strip_prefix("DOTNET_ROOT_")
+            .is_some_and(|architecture| {
+                !architecture.is_empty()
+                    && architecture
+                        .bytes()
+                        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            })
+}
+
 /// Why a shell cannot be launched in managed mode.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PackageFault {
     /// No package directory is installed or configured.
-    #[error("no qualified shell packages are installed; {PACKAGE_ROOT_VARIABLE} names none either")]
+    #[error("{}", no_packages())]
     NoPackages,
     /// The shell the request named has no qualified package.
-    #[error(
-        "{requested} has no qualified KalaReach package, so it cannot claim the managed contract"
-    )]
+    #[error("{}", unqualified(requested))]
     Unqualified {
         /// What was asked for.
         requested: String,
@@ -344,10 +576,13 @@ pub enum PackageFault {
         detail: String,
     },
     /// The manifest names a binary that is not there.
-    #[error("the package at {path} names an executable that is not installed")]
+    #[error("the package at {path} names an executable that is not installed{}", republish_hint(*.republish))]
     MissingExecutable {
         /// Where the package is.
         path: String,
+        /// Whether the package is one a person publishes for the host they have, so that the host
+        /// having moved or gone is mended by publishing it again.
+        republish: bool,
     },
     /// A request for a non-interactive script, which never becomes an interactive session shell.
     #[error("a script invocation is not an interactive root shell: {detail}")]
@@ -356,6 +591,45 @@ pub enum PackageFault {
         detail: String,
     },
 }
+
+/// What follows "not installed" when publishing the package again mends it.
+#[must_use]
+pub fn republish_hint(republish: bool) -> String {
+    if republish {
+        format!("; run {PUBLISH_COMMAND} in PowerShell to qualify the one this account runs")
+    } else {
+        String::new()
+    }
+}
+
+/// The words for a host with no package: the Windows host has one shell to qualify, so it is told
+/// how.
+fn no_packages() -> String {
+    let said = format!(
+        "no qualified shell packages are installed; {PACKAGE_ROOT_VARIABLE} names none either"
+    );
+    if cfg!(windows) {
+        format!("{said}; run {PUBLISH_COMMAND} in PowerShell to qualify the one this account runs")
+    } else {
+        said
+    }
+}
+
+/// The words for a shell with no package, which tell a person who asked for PowerShell how to get
+/// one.
+fn unqualified(requested: &str) -> String {
+    let said = format!(
+        "{requested} has no qualified KalaReach package, so it cannot claim the managed contract"
+    );
+    if executable_name(requested) == "pwsh" || executable_name(requested) == "powershell" {
+        format!("{said}; run {PUBLISH_COMMAND} in PowerShell to qualify it")
+    } else {
+        said
+    }
+}
+
+/// The command that qualifies the PowerShell a person has and publishes the package for it.
+pub const PUBLISH_COMMAND: &str = "Publish-KalaReachQualification";
 
 impl PackageFault {
     /// Returns the stable protocol code this refusal carries.
@@ -384,6 +658,18 @@ impl PackageFault {
 /// finds them without being configured. [`PACKAGE_ROOT_VARIABLE`] overrides it.
 #[must_use]
 pub fn default_package_root() -> PathBuf {
+    // Windows keeps what a user's programs cache for themselves under the local application data
+    // folder, beside the host's state: `HOME` is not set there, and a path made from it would be
+    // one nothing wrote a package to.
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("KalaReach")
+            .join("shells")
+    }
+    #[cfg(not(windows))]
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -391,7 +677,7 @@ pub fn default_package_root() -> PathBuf {
     {
         home.join("Library/Caches/kalareach/shells")
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(not(windows), not(target_vendor = "apple")))]
     {
         std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
@@ -455,6 +741,12 @@ fn read_manifest(
         return Err(PackageFault::Unreadable {
             path: candidate.display().to_string(),
             detail: "it names paths outside the package it is in".to_owned(),
+        });
+    }
+    if let Some(detail) = package.launch_fault() {
+        return Err(PackageFault::Unreadable {
+            path: candidate.display().to_string(),
+            detail,
         });
     }
     Ok(Some(package))
@@ -587,6 +879,7 @@ impl PackageSet {
         if !package.executable().is_file() {
             return Err(PackageFault::MissingExecutable {
                 path: package.directory.display().to_string(),
+                republish: package.kind() == ShellKind::PowerShell,
             });
         }
         Ok(package)
@@ -802,6 +1095,7 @@ mod tests {
             startup_entry: PackageStartupEntry {
                 file: "share/entry.sh".to_owned(),
             },
+            launch: PackageLaunch::default(),
         }
     }
 
@@ -839,17 +1133,17 @@ mod tests {
     fn a_record_this_host_cannot_read_refuses_its_own_shell_and_no_other() {
         let root = tempfile::tempdir().expect("a directory");
         install(root.path(), ShellKind::Zsh, true);
-        // A PowerShell package whose record names a binary outside itself: an installation can
-        // hold one, and a session asking for Zsh is not about it.
+        // A PowerShell package whose record names a startup entry outside itself: an installation
+        // can hold one, and a session asking for Zsh is not about it.
         let powershell = root.path().join("powershell").join("identity-1");
         std::fs::create_dir_all(&powershell).expect("creates the package");
         std::fs::write(
             powershell.join(MANIFEST_BASENAME),
             r#"{"identity":"identity-1",
-               "shell":{"kind":"powershell","executable":"/opt/elsewhere/bin/pwsh",
+               "shell":{"kind":"powershell","executable":"bin/pwsh",
                         "upstream_version":"7.4","editor_abi":"psreadline-2.3",
                         "integration_version":"1","patches":[],"modules":[]},
-               "startup_entry":{"file":"startup/entry"}}"#,
+               "startup_entry":{"file":"/opt/elsewhere/startup/entry"}}"#,
         )
         .expect("writes the record");
         std::fs::write(
@@ -1284,6 +1578,12 @@ mod tests {
         let fault = set.select(None).expect_err("refused");
         assert!(matches!(fault, PackageFault::NoPackages), "{fault}");
         assert_eq!(fault.code(), ErrorCode::ShellIntegrationUnsupported);
+        // The one shell a Windows host has is the one a person publishes a package for.
+        assert_eq!(
+            fault.to_string().contains(PUBLISH_COMMAND),
+            cfg!(windows),
+            "{fault}"
+        );
     }
 
     #[test]
@@ -1304,6 +1604,406 @@ mod tests {
         assert!(
             refused.select(Some("zsh")).is_err(),
             "and so is a request for it"
+        );
+    }
+
+    /// The directory a test host stands in: a file named as a PowerShell is, outside every package.
+    fn a_host(directory: &Path) -> PathBuf {
+        let host = directory.join("PowerShell/7/pwsh");
+        std::fs::create_dir_all(host.parent().expect("a directory")).expect("creates the host");
+        std::fs::write(&host, b"#!/bin/sh\n").expect("writes the host");
+        host
+    }
+
+    /// The record the PowerShell package publishes for the host it qualified.
+    fn host_record(root: &Path, host: &Path) -> serde_json::Value {
+        let package = root.join("powershell/identity-1");
+        serde_json::json!({
+            "identity": "identity-1",
+            "shell": {
+                "kind": "powershell",
+                "executable": host,
+                "upstream_version": "7.6.6",
+                "editor_abi": "psreadline-2.4",
+                "integration_version": "1",
+                "patches": [],
+                "modules": [{
+                    "name": "KalaReach.ShellBridge",
+                    "search_path": package.join("modules"),
+                    "editor_abi": "psreadline-2.4",
+                }],
+            },
+            "startup_entry": { "file": "startup/kr-profile.ps1" },
+            "launch": {
+                "environment": { "DOTNET_ROOT": "/opt/dotnet" },
+                "search_paths": { "PSModulePath": [package.join("modules")] },
+            },
+        })
+    }
+
+    /// Writes a record into the package directory it describes and names it as current.
+    fn publish(root: &Path, record: &serde_json::Value) {
+        let package = root.join("powershell/identity-1");
+        std::fs::create_dir_all(package.join("modules")).expect("creates the package");
+        std::fs::create_dir_all(package.join("startup")).expect("creates the entry's place");
+        std::fs::write(package.join("startup/kr-profile.ps1"), b"# entry\n").expect("the entry");
+        std::fs::write(package.join(MANIFEST_BASENAME), record.to_string()).expect("the record");
+        std::fs::write(root.join("powershell").join(CURRENT_BASENAME), "identity-1")
+            .expect("names the identity");
+    }
+
+    /// A PowerShell that was updated, moved or removed since the package was published leaves a
+    /// package naming a host that is not there; the refusal says to publish it again.
+    #[test]
+    fn a_package_whose_host_has_gone_says_to_publish_it_again() {
+        let root = tempfile::tempdir().expect("a directory");
+        let elsewhere = tempfile::tempdir().expect("a directory");
+        let host = a_host(elsewhere.path());
+        publish(root.path(), &host_record(root.path(), &host));
+        std::fs::remove_file(&host).expect("the host goes");
+
+        let refused = ShellPackage::read(&root.path().join("powershell/identity-1"))
+            .expect_err("a package with no host is refused");
+        assert!(
+            matches!(
+                refused,
+                PackageFault::MissingExecutable {
+                    republish: true,
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains(PUBLISH_COMMAND), "{refused}");
+    }
+
+    /// KR-REQ-07.16: a package that builds no shell names the host it qualified, and a session
+    /// starts that host with the package's own launch in its environment. Its files are inside it.
+    #[test]
+    fn a_package_that_builds_no_shell_names_the_host_it_qualified() {
+        let root = tempfile::tempdir().expect("a directory");
+        let elsewhere = tempfile::tempdir().expect("a directory");
+        let host = a_host(elsewhere.path());
+        publish(root.path(), &host_record(root.path(), &host));
+
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let package = set.select(Some("pwsh")).expect("the qualified PowerShell");
+        let package_directory = root.path().join("powershell/identity-1");
+        assert_eq!(
+            package.executable(),
+            host,
+            "the host is what a session starts"
+        );
+        assert_eq!(
+            package.declaration().executable,
+            host.display().to_string(),
+            "and what the package states of its executable"
+        );
+        assert_eq!(
+            package.identity().modules[0].search_path,
+            package_directory.join("modules").display().to_string()
+        );
+        assert_eq!(
+            package.startup_entry(),
+            package_directory.join("startup/kr-profile.ps1")
+        );
+        let launch = package.launch_environment(&[], false);
+        assert!(
+            launch.contains(&("DOTNET_ROOT".to_owned(), "/opt/dotnet".to_owned())),
+            "{launch:?}"
+        );
+        assert!(
+            launch.contains(&(
+                "PSModulePath".to_owned(),
+                package_directory.join("modules").display().to_string()
+            )),
+            "{launch:?}"
+        );
+
+        // A record an earlier publish wrote, with the launcher script inside the package, is read
+        // by the general rule and starts the script.
+        let older = tempfile::tempdir().expect("a directory");
+        let mut record = host_record(older.path(), &host);
+        record["shell"]["executable"] = serde_json::json!("bin/pwsh");
+        record["launch"] = serde_json::json!({ "environment": {} });
+        publish(older.path(), &record);
+        std::fs::create_dir_all(older.path().join("powershell/identity-1/bin")).expect("bin");
+        std::fs::write(
+            older.path().join("powershell/identity-1/bin/pwsh"),
+            b"#!/bin/sh\n",
+        )
+        .expect("the script");
+        let set = PackageSet::discover(older.path()).expect("reads the packages");
+        assert_eq!(
+            set.select(Some("pwsh"))
+                .expect("the older package")
+                .executable(),
+            older.path().join("powershell/identity-1/bin/pwsh")
+        );
+    }
+
+    /// Everything a record names other than the host it qualified is the package's
+    /// own and has to be inside it, and the host has to be an absolute path to a PowerShell.
+    #[test]
+    fn a_record_names_nothing_outside_its_package_but_the_host() {
+        let host_directory = tempfile::tempdir().expect("a directory");
+        let host = a_host(host_directory.path());
+        let refused = |what: &str, change: &dyn Fn(&mut serde_json::Value)| {
+            let root = tempfile::tempdir().expect("a directory");
+            let mut record = host_record(root.path(), &host);
+            change(&mut record);
+            publish(root.path(), &record);
+            let set = PackageSet::discover(root.path()).expect("reads what it can");
+            let fault = set
+                .fault(ShellKind::PowerShell)
+                .unwrap_or_else(|| panic!("{what}: the record was accepted"));
+            assert!(
+                matches!(fault, PackageFault::Unreadable { .. }),
+                "{what}: {fault}"
+            );
+            assert!(set.select(Some("pwsh")).is_err(), "{what}");
+        };
+        refused("a host that is not a PowerShell", &|record| {
+            record["shell"]["executable"] = serde_json::json!("/usr/bin/bash");
+        });
+        refused("a module directory outside the package", &|record| {
+            record["shell"]["modules"][0]["search_path"] = serde_json::json!("/elsewhere/modules");
+        });
+        refused("a startup entry outside the package", &|record| {
+            record["startup_entry"]["file"] = serde_json::json!("/elsewhere/kr-profile.ps1");
+        });
+        // The same host, named by a package of a shell that builds its own, is the control: only
+        // the package that builds no shell may name one.
+        let root = tempfile::tempdir().expect("a directory");
+        let directory = root.path().join("zsh/identity-1");
+        std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
+        let mut record = serde_json::to_value(manifest(ShellKind::Zsh)).expect("encodes");
+        record["shell"]["executable"] = serde_json::json!(host);
+        std::fs::write(directory.join(MANIFEST_BASENAME), record.to_string()).expect("the record");
+        std::fs::write(root.path().join("zsh").join(CURRENT_BASENAME), "identity-1")
+            .expect("names the identity");
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        assert!(
+            set.fault(ShellKind::Zsh).is_some(),
+            "a Zsh record cannot name a host"
+        );
+    }
+
+    /// The launch block reaches the environment of a shell, so it is held to the
+    /// runtime's location and the module directory, and nothing a session's worker owns.
+    #[test]
+    fn a_launch_block_goes_no_further_than_the_runtime_and_the_modules() {
+        let host_directory = tempfile::tempdir().expect("a directory");
+        let host = a_host(host_directory.path());
+        let refused = |what: &str, change: &dyn Fn(&mut serde_json::Value)| {
+            let root = tempfile::tempdir().expect("a directory");
+            let mut record = host_record(root.path(), &host);
+            change(&mut record);
+            publish(root.path(), &record);
+            let set = PackageSet::discover(root.path()).expect("reads what it can");
+            let fault = set
+                .fault(ShellKind::PowerShell)
+                .unwrap_or_else(|| panic!("{what}: the record was accepted"));
+            assert!(
+                fault.to_string().contains("launch"),
+                "{what}: the refusal says it is the launch: {fault}"
+            );
+        };
+        for name in [
+            "KR_SHELL_BRIDGE",
+            "KR_SESSION",
+            "TERM",
+            "PATH",
+            "DOTNET_ROOT_x64",
+            "DOTNET_ROOTS",
+        ] {
+            refused(name, &|record| {
+                record["launch"]["environment"] = serde_json::json!({ name: "/opt/dotnet" });
+            });
+        }
+        refused("a value with a NUL in it", &|record| {
+            record["launch"]["environment"]["DOTNET_ROOT"] = serde_json::json!("/opt/\u{0}dotnet");
+        });
+        refused("an empty value", &|record| {
+            record["launch"]["environment"]["DOTNET_ROOT"] = serde_json::json!("");
+        });
+        refused("a list that is not the module directories", &|record| {
+            let ours = record["launch"]["search_paths"]["PSModulePath"].clone();
+            record["launch"]["search_paths"] = serde_json::json!({ "PATH": ours });
+        });
+        refused("a directory outside the package", &|record| {
+            record["launch"]["search_paths"]["PSModulePath"] = serde_json::json!(["/elsewhere"]);
+        });
+        refused("a directory with the list's separator in it", &|record| {
+            let root = record["shell"]["modules"][0]["search_path"].clone();
+            let separator = if cfg!(windows) { ';' } else { ':' };
+            let tricky = format!("{}{separator}x", root.as_str().expect("text"));
+            record["launch"]["search_paths"]["PSModulePath"] = serde_json::json!([tricky]);
+        });
+        // The architecture forms the module records are the other names it may set.
+        let root = tempfile::tempdir().expect("a directory");
+        let mut record = host_record(root.path(), &host);
+        record["launch"]["environment"] = serde_json::json!({ "DOTNET_ROOT": "/a", "DOTNET_ROOT_X64": "/b", "DOTNET_ROOT_ARM64": "/c" });
+        publish(root.path(), &record);
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        assert!(set.fault(ShellKind::PowerShell).is_none());
+    }
+
+    /// KR-REQ-07.86: a package that is moved, with the place it was built in gone, starts its own
+    /// modules and still states its record as the build wrote it.
+    #[test]
+    fn a_moved_package_that_builds_no_shell_finds_its_own_modules() {
+        let host_directory = tempfile::tempdir().expect("a directory");
+        let host = a_host(host_directory.path());
+        let built = tempfile::tempdir().expect("a directory");
+        publish(built.path(), &host_record(built.path(), &host));
+        let built_modules = built
+            .path()
+            .join("powershell/identity-1/modules")
+            .display()
+            .to_string();
+
+        let moved = tempfile::tempdir().expect("a directory");
+        copy_tree(
+            &built.path().join("powershell"),
+            &moved.path().join("powershell"),
+        );
+        drop(built);
+
+        let set = PackageSet::discover(moved.path()).expect("reads the moved package");
+        let package = set.select(Some("pwsh")).expect("qualified");
+        let modules = moved.path().join("powershell/identity-1/modules");
+        assert_eq!(
+            package.identity().modules[0].search_path,
+            modules.display().to_string(),
+            "the files this host opens are the moved package's own"
+        );
+        assert_eq!(
+            package.declaration().modules[0].search_path,
+            built_modules,
+            "and the record is stated as the build wrote it"
+        );
+        let launch = package.launch_environment(&[], false);
+        assert!(
+            launch.contains(&("PSModulePath".to_owned(), modules.display().to_string())),
+            "the module a session finds by name is the moved package's: {launch:?}"
+        );
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("creates the copy");
+        for entry in std::fs::read_dir(from).expect("reads the tree").flatten() {
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copies the file");
+            }
+        }
+    }
+
+    /// The package's directory goes first on the list of module directories, once,
+    /// and everything else on the list keeps its order, wherever the package's directory was.
+    #[cfg(unix)]
+    #[test]
+    fn the_packages_module_directory_goes_first_and_the_rest_keep_their_order() {
+        let host_directory = tempfile::tempdir().expect("a directory");
+        let host = a_host(host_directory.path());
+        let root = tempfile::tempdir().expect("a directory");
+        publish(root.path(), &host_record(root.path(), &host));
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let package = set.select(Some("pwsh")).expect("qualified");
+        let ours = root
+            .path()
+            .join("powershell/identity-1/modules")
+            .display()
+            .to_string();
+        let listed = |held: Option<&str>, name: &str| {
+            let base: Vec<(String, String)> = held
+                .map(|value| vec![(name.to_owned(), value.to_owned())])
+                .unwrap_or_default();
+            package
+                .launch_environment(&base, false)
+                .into_iter()
+                .find(|(set, _)| set == "PSModulePath")
+                .map(|(_, value)| value)
+                .expect("the list is set")
+        };
+        assert_eq!(
+            listed(None, "PSModulePath"),
+            ours,
+            "no list is the package's alone"
+        );
+        assert_eq!(
+            listed(Some("/a:/b:/c"), "PSModulePath"),
+            format!("{ours}:/a:/b:/c")
+        );
+        assert_eq!(
+            listed(Some(&format!("/a:{ours}:/c:{ours}/")), "PSModulePath"),
+            format!("{ours}:/a:/c"),
+            "an entry that was further down is moved up and not kept twice"
+        );
+        assert_eq!(
+            listed(Some("/a::/c"), "PSModulePath"),
+            format!("{ours}:/a:/c"),
+            "an empty entry is nothing"
+        );
+        // A competing module directory that was first is behind the package's now.
+        assert!(
+            listed(Some("/competing/modules:/a"), "PSModulePath")
+                .starts_with(&format!("{ours}:/competing/modules")),
+        );
+        // On a platform that compares names without regard to case the list is found under
+        // whichever case the environment has, and the entry is the same entry however it is cased.
+        let held = |name: &str| vec![(name.to_owned(), "/a".to_owned())];
+        let folded = package.launch_environment(&held("psmodulepath"), true);
+        assert!(
+            folded
+                .iter()
+                .any(|(name, value)| name == "PSModulePath" && value.ends_with(";/a")),
+            "{folded:?}"
+        );
+    }
+
+    /// The same rule with the spellings of a Windows host, which a Unix host cannot reach through a
+    /// package.
+    #[test]
+    fn a_list_of_module_directories_is_compared_as_windows_compares_paths() {
+        let ours =
+            vec![r"C:\Users\a\AppData\Local\KalaReach\shells\powershell\i\modules".to_owned()];
+        assert_eq!(
+            put_first(
+                &ours,
+                Some(r"C:\x;c:\users\A\appdata\local\kalareach\shells\powershell\i\modules\;D:\y;"),
+                true
+            ),
+            format!(r"{};C:\x;D:\y", ours[0])
+        );
+        assert_eq!(
+            put_first(
+                &ours,
+                Some(r"C:/x;C:\Users\a\AppData\Local\KalaReach\shells\powershell\i\modules/"),
+                true
+            ),
+            format!(r"{};C:/x", ours[0])
+        );
+    }
+
+    /// The words a person reads when PowerShell has no package name the command that makes one.
+    #[test]
+    fn a_refusal_for_want_of_a_powershell_package_names_the_command_that_publishes_it() {
+        let root = tempfile::tempdir().expect("a directory");
+        install(root.path(), ShellKind::Zsh, true);
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let powershell = set.select(Some("pwsh")).expect_err("no PowerShell package");
+        assert!(
+            powershell.to_string().contains(PUBLISH_COMMAND),
+            "{powershell}"
+        );
+        let bash = set.select(Some("bash")).expect_err("no Bash package");
+        assert!(
+            !bash.to_string().contains(PUBLISH_COMMAND),
+            "a shell a person does not publish is not told to: {bash}"
         );
     }
 }
