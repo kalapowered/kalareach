@@ -384,7 +384,7 @@ async fn present(
     presentation: Presentation,
 ) -> Result<(), Missed> {
     let pairing = device.pairing();
-    let identity = pairing.candidate.paired_identity(host.device_id);
+    let identity = pairing.paired_identity_for(&host);
     pairing
         .link
         .present_membership(&connection.session(), host, &identity, presentation)

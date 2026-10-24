@@ -241,6 +241,7 @@ fn host_record(device_id: DeviceId) -> Box<PairedHost> {
         },
         name: None,
         paired_at_ms: 0,
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
     })
 }
 

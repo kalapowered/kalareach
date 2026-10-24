@@ -124,7 +124,7 @@ fn code(refusal: &Value) -> &str {
 async fn redeem(phone: &Phone, host: &Host, invitation_id: InvitationId) {
     let device = phone.companion.device();
     let paired = device.host_in_use().expect("a host in use");
-    let identity = device.pairing().candidate.paired_identity(paired.device_id);
+    let identity = device.pairing().paired_identity_for(&paired);
     let session = device
         .pairing()
         .link
