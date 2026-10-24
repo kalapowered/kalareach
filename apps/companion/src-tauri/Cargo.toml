@@ -42,6 +42,9 @@ kr-cbor.workspace = true
 # screen's painter, which measures text with the pinned width model on every platform.
 kr-client.workspace = true
 kr-crypto.workspace = true
+# The text a host gives an unlisted method, which tells a host of an earlier build from one that
+# refuses for a reason of its own.
+kr-transport.workspace = true
 # The lock the application's own stores take: the removals still to be made, and the answers kept
 # on this device.
 kr-flush.workspace = true
@@ -123,7 +126,6 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # The sync service the recovery suite talks to over loopback, answering as the Worker did when it
 # was recorded.
 kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }
-kr-transport.workspace = true
 # The voice service's stand-in, which serves the control socket of a call on the daemon's behalf: its
 # route is kr-client's, included by path.
 futures-util.workspace = true
