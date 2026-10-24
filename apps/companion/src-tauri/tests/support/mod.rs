@@ -974,6 +974,9 @@ pub struct LinkControl {
 #[derive(Default)]
 struct LinkState {
     holding: bool,
+    /// Whether the connections the application makes for the host in use are held, and the visits
+    /// to the hosts it is not using are not.
+    holding_own: bool,
     unreachable: bool,
     /// Whether a connection that is let through is ended as it is made, as a network that drops it
     /// at once does.
@@ -993,6 +996,12 @@ impl LinkControl {
     /// Holds each connection asked for from now on until the test releases it.
     pub fn hold(&self) {
         self.state.lock().expect("the record").holding = true;
+    }
+
+    /// Holds each connection the application makes for the host in use from now on, as it
+    /// reconnects, until the test releases it; a visit to a host is let through.
+    pub fn hold_own(&self) {
+        self.state.lock().expect("the record").holding_own = true;
     }
 
     /// Lets connections through again. Those held stay held until released.
@@ -1093,7 +1102,7 @@ impl ControlledLink {
             if let Some(in_use) = visiting {
                 state.visits.push(in_use());
             }
-            if state.holding {
+            if state.holding || (state.holding_own && visiting.is_none()) {
                 let (sender, receiver) = tokio::sync::oneshot::channel();
                 state.waiting.push(Some(sender));
                 Some(receiver)
@@ -1215,6 +1224,14 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
     }
 }
 
+/// `parts`, with the connections to a paired host governed by `control`.
+pub fn govern(parts: &mut Parts, control: &Arc<LinkControl>) {
+    let control = Arc::clone(control);
+    parts.link = Some(Box::new(move |own| {
+        Arc::new(ControlledLink { own, control }) as Arc<dyn kr_client::pairing::link::HostLink>
+    }));
+}
+
 /// A phone that has paired with nothing, whose connections to a paired host `control` governs.
 pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Phone {
     let data = tempfile::tempdir().expect("a directory");
@@ -1222,10 +1239,7 @@ pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Pho
     let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
     let paste = StubIntake::holding("", false);
     let mut governed = parts(Arc::clone(&secrets), Arc::clone(&room));
-    let control = Arc::clone(control);
-    governed.link = Some(Box::new(move |own| {
-        Arc::new(ControlledLink { own, control }) as Arc<dyn kr_client::pairing::link::HostLink>
-    }));
+    govern(&mut governed, control);
     let companion = Companion::start(
         data.path(),
         governed,
