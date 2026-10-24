@@ -27,6 +27,14 @@
 //! | KR-REQ-17.53 | `a_lease_and_a_stop_belong_to_the_account_that_asked` |
 //! | KR-REQ-17.53 | `a_delay_the_service_names_binds_every_connection_until_it_is_over` |
 //! | KR-REQ-17.53 | `a_lease_the_host_refuses_as_ended_the_moment_it_is_signed_is_not_asked_for_again_and_again` |
+//! | KR-REQ-17.53 | `a_lease_that_arrives_after_the_account_changed_is_not_presented` |
+//! | KR-REQ-17.53 | `a_sign_out_ends_the_member_connection_at_once` |
+//! | KR-REQ-17.53 | `a_kept_visit_is_given_the_lease_again_when_the_one_it_holds_has_ended` |
+//! | KR-REQ-17.53 | `a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact` |
+//! | KR-REQ-17.53 | `a_sign_in_made_since_clears_what_was_held_against_the_account` |
+//! | KR-REQ-17.53 | `a_visit_does_not_ask_for_the_chain_of_keys_while_the_service_asks_for_a_wait` |
+//! | KR-REQ-17.53 | `a_reused_lease_lasts_until_the_first_refresh_of_the_connection_that_keeps_it` |
+//! | KR-REQ-17.53 | `a_presentation_its_caller_cuts_off_while_the_service_is_silent_holds_the_service_off` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -46,6 +54,7 @@ use std::time::Duration;
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
 use companion_tauri::connection::CONNECTION_EVENT;
+use companion_tauri::inbox::{HostInbox, HostInboxState, InboxDesk};
 use companion_tauri::lease::LeaseDesk;
 use kr_client::Session;
 use kr_client::organisation::LeaseTimer;
@@ -57,17 +66,20 @@ use kr_client::services::account::{
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedAccountService, managed_response_limits,
 };
+use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
 use kr_protocol::account::{MembershipLease, PolicyAuthority};
 use kr_protocol::grant::OrganisationRequirement;
 use kr_protocol::pairing::ProposedGrant;
 use kr_protocol::scalars::{AuthorisationKey, Nullable};
 use kr_service_stand_in::{Moment, OrganisationAuthority, Served, serve};
-use net_support::proposal;
+use net_support::{Host, proposal};
 use organisation_fixture::{Fixture, SERVED};
 use organisation_support::{MINUTE_MS, Organisation, member};
 use serde_json::json;
-use support::{Companion, NoOwner, Phone, StubIntake, WATCHDOG, pair_under, parts};
+use support::{
+    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, govern, pair_under, parts,
+};
 use tauri::Listener as _;
 use tokio::sync::{oneshot, watch};
 
@@ -380,6 +392,8 @@ struct Rig {
     tokens: Arc<SignedInAccount>,
     /// Counts each time the application tells the page where its connection stands.
     changes: watch::Receiver<u64>,
+    /// What the test does to the application's connections to the host.
+    control: Arc<LinkControl>,
 }
 
 /// The path the device asks the organisation's service for a lease on.
@@ -418,7 +432,8 @@ impl Rig {
             Arc::clone(&signing) as Arc<dyn OrganisationAuthority>,
         );
         let waits = HeldWaits::new();
-        let (phone, tokens) = signed_in_phone(&fixture, &served, &waits).await;
+        let control = LinkControl::new();
+        let (phone, tokens) = signed_in_phone(&fixture, &served, &waits, &control).await;
         let changes = {
             let (heard, changes) = watch::channel(0_u64);
             phone.companion.app.listen_any(CONNECTION_EVENT, move |_| {
@@ -442,6 +457,7 @@ impl Rig {
             phone,
             tokens,
             changes,
+            control,
         }
     }
 
@@ -535,6 +551,57 @@ impl Rig {
         self.served.web().fail(path, 1, moment);
     }
 
+    /// The next read of the organisation's chain of keys the service gets is refused as `moment`
+    /// says.
+    fn refuses_the_next_chain(&self, moment: Moment) {
+        let path: &'static str = Box::leak(
+            format!(
+                "/api/account/organisations/{}/policy-authority",
+                self.fixture.organisation.organisation_id
+            )
+            .into_boxed_str(),
+        );
+        self.served.web().fail(path, 1, moment);
+    }
+
+    /// The application is told to use another host, a plain one this device pairs with now, so that
+    /// the member host is one it only visits. The other host is returned to be kept running.
+    async fn uses_another_host(&self) -> Host {
+        let owner = DeviceKeys::generate().expect("keys");
+        let other = Host::start(&owner).await;
+        pair_under(&self.phone, &other, &owner, proposal(SERVED)).await;
+        let listed = self
+            .companion()
+            .call("pairing_view", json!({}))
+            .expect("the pairing screen");
+        let environment = other.environment_id.to_string();
+        // The rows carry no environment, so the other host is found by choosing each and asking
+        // where the connection went.
+        for row in listed["hosts"].as_array().expect("the paired hosts") {
+            let used = self
+                .companion()
+                .call(
+                    "hosts_use",
+                    json!({ "reference": row["reference"].as_str().expect("a reference") }),
+                )
+                .expect("the application uses the host");
+            if used["environment_id"] == environment.as_str() {
+                assert_eq!(used["connected"], true, "{used}");
+                return other;
+            }
+        }
+        panic!("the other host is among the hosts paired");
+    }
+
+    /// The row the inbox shows for the member host when the device visits it, as it does a host it
+    /// is not using.
+    async fn inbox_of(&self, desk: &Arc<InboxDesk>) -> HostInbox {
+        let device = self.companion().device();
+        let mut rows = desk.visit(&device).await;
+        assert_eq!(rows.len(), 1, "the member host is the one host visited");
+        rows.remove(0)
+    }
+
     /// The device reads the host, as a page does.
     fn reads(&self) -> Result<serde_json::Value, serde_json::Value> {
         self.companion().call("host_info", json!({}))
@@ -614,6 +681,7 @@ async fn signed_in_phone(
     fixture: &Fixture,
     served: &Served,
     waits: &Arc<HeldWaits>,
+    control: &Arc<LinkControl>,
 ) -> (Phone, Arc<SignedInAccount>) {
     let origin = kr_protocol::service::GatewayOrigin::new(served.origin()).expect("an origin");
     let http = HttpService::with(
@@ -660,6 +728,7 @@ async fn signed_in_phone(
     let paste = StubIntake::holding("", false);
     let mut device = parts(Arc::clone(&secrets), Arc::clone(&room));
     device.leases = Some(desk);
+    govern(&mut device, control);
     let companion = Companion::start_with_voice(
         data.path(),
         device,
@@ -1195,8 +1264,8 @@ async fn a_lease_the_host_refuses_as_ended_the_moment_it_is_signed_is_not_asked_
 /// KR-REQ-17.53: a visit to a paired host, which the application makes to read a host it is not
 /// using, is a connection of the device like any other, and the host refuses it every method until
 /// it holds the device's lease. So a visit presents the lease first, and is served. The
-/// application's own connection to the host cannot have done it here: the service holds the
-/// request that connection makes after the host's restart.
+/// application's own connections to the host are held, so that nothing but the visit can have
+/// presented one after the host restarted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_visit_to_a_host_that_holds_no_lease_presents_one_first() {
     let rig = Rig::start().await;
@@ -1204,10 +1273,8 @@ async fn a_visit_to_a_host_that_holds_no_lease_presents_one_first() {
     rig.waits.until_asked(1).await;
     let requests = rig.lease_requests();
 
-    // The host forgets the lease when it restarts, and the first request for a new one is held.
-    rig.refuses_the_next_lease(Moment::Hold);
+    rig.control.hold_own();
     let rig = rig.restarted().await;
-    rig.until_lease_requests(requests + 1).await;
 
     let visit = rig.visits().await.expect("a visit to the host");
     read_host_info(&visit)
@@ -1215,9 +1282,229 @@ async fn a_visit_to_a_host_that_holds_no_lease_presents_one_first() {
         .expect("the host serves a visit that presented the device's lease");
     assert_eq!(
         rig.lease_requests(),
-        requests + 2,
-        "the visit asked for its own lease"
+        requests + 1,
+        "the visit asked for the lease the host had forgotten"
     );
+}
+
+/// KR-REQ-17.53: a lease the service signs for one account is not presented for another. A lease
+/// that arrives after another member signed in on the device is the first member's, and the host
+/// binds the device to the first member and would take it: it is not presented, and the connection
+/// asks again as the member who is signed in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_that_arrives_after_the_account_changed_is_not_presented() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    // The host forgets its lease when it restarts, so the application asks the organisation's
+    // service for one as it reconnects, and the service takes its time over the answer.
+    let held_before = rig.host_holds().await;
+    rig.refuses_the_next_lease(Moment::Gate);
+    let rig = rig.restarted().await;
+    rig.until_lease_requests(requests + 1).await;
+    rig.signs_in_as("bea").await;
+    rig.served.web().release_held();
+
+    // The device is Ada's to the host, which refuses Bea's lease by name, and that is what is told.
+    let told = rig.down_because("account_mismatch").await;
+    assert_eq!(told["connected"], false, "{told}");
+    assert_eq!(
+        rig.host_holds().await,
+        held_before,
+        "the lease that arrived was Ada's, and nothing presented it"
+    );
+}
+
+/// KR-REQ-17.53: a member who signs out is out of the host at once. The connection that keeps the
+/// member's lease ends when the account signs out, whatever the keeper is doing, and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_ends_the_member_connection_at_once() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    // The refresh asks the service for a lease, which takes its time.
+    rig.refuses_the_next_lease(Moment::Gate);
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.waits.passes();
+    rig.until_lease_requests(requests + 1).await;
+
+    let _ = rig.tokens.sign_out().await;
+    let ended = rig.down_because("sign in").await;
+    assert_eq!(ended["connected"], false, "{ended}");
+    rig.served.web().release_held();
+}
+
+/// KR-REQ-17.53: the inbox keeps its connection to a host that is not in use between passes, and
+/// nothing keeps the lease of that host fresh. When the lease the host holds has ended, the next
+/// pass presents the device's lease again over the connection it kept, asks the organisation's
+/// service for a new one when the host refuses it, and reads the inbox, instead of showing a host
+/// that is reachable as having refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_is_given_the_lease_again_when_the_one_it_holds_has_ended() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+    let requests = rig.lease_requests();
+
+    // The lease the host holds ends on its clock, long before anything asks for another.
+    rig.fixture.pass_wall(Duration::from_millis(20 * MINUTE_MS));
+    let again = rig.inbox_of(&desk).await;
+    assert_eq!(again.state, HostInboxState::Read, "{:?}", again.refusal);
+    assert!(rig.lease_requests() > requests, "a new lease was asked for");
+}
+
+/// KR-REQ-17.53: a visit that cannot give the host the device's lease says why. A host that is
+/// reachable is not out of contact because this device is signed out: the row shows the reason in
+/// words, and no loss of contact is noted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let _ = rig.tokens.sign_out().await;
+
+    let row = rig.inbox_of(&Arc::new(InboxDesk::default())).await;
+    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
+    assert_eq!(row.lost_since_ms, None);
+    let said = row.refusal.expect("the reason").message;
+    assert!(said.contains("sign in"), "{said}");
+}
+
+/// KR-REQ-17.53: what was held against a sign-in is not held against the next one. The service
+/// turns the device's sign-in back, which the device is told to mend and is not asked about again
+/// meanwhile; the person signs in again, as the same account, and the next visit asks and is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_made_since_clears_what_was_held_against_the_account() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+
+    // The lease the device holds is about to end by its own clock, and the service turns its token
+    // back, even renewed.
+    rig.waits.time_passes(Duration::from_secs(14 * 60));
+    rig.refuses_the_next_lease(Moment::Refuse {
+        status: 403,
+        code: "REAUTHENTICATION_REQUIRED",
+        retry_after_seconds: None,
+    });
+    let turned_back = rig.inbox_of(&desk).await;
+    assert_eq!(turned_back.state, HostInboxState::Refused);
+    let said = turned_back.refusal.expect("the reason").message;
+    assert!(said.contains("does not take the sign-in"), "{said}");
+    let requests = rig.lease_requests();
+    let held = rig.inbox_of(&desk).await;
+    assert_eq!(held.state, HostInboxState::Refused);
+    assert_eq!(
+        rig.lease_requests(),
+        requests,
+        "a stop that is held asks nothing"
+    );
+
+    rig.signs_in_as(ACCOUNT).await;
+    let served = rig.inbox_of(&desk).await;
+    assert_eq!(served.state, HostInboxState::Read, "{:?}", served.refusal);
+    assert!(rig.lease_requests() > requests, "the new sign-in asked");
+}
+
+/// KR-REQ-17.53: the service's delay binds the request for the chain of keys as it binds the request
+/// for a lease. A refresh that got a new lease and was told to wait an hour for the chain leaves
+/// the lease cached, and a connection that reuses it asks the service for the chain no sooner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_does_not_ask_for_the_chain_of_keys_while_the_service_asks_for_a_wait() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let chains = rig.authority_requests();
+
+    // The organisation rotates its key, so the next lease needs the chain, and the service refuses
+    // the chain for an hour.
+    rig.fixture.pass_wall(Duration::from_millis(MINUTE_MS));
+    assert_eq!(rig.signing.rotates(), 3);
+    rig.fixture.pass_wall(Duration::from_millis(MINUTE_MS));
+    rig.refuses_the_next_chain(Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(3600),
+    });
+    rig.waits.passes();
+    rig.waits.until_asked(2).await;
+    assert_eq!(
+        rig.authority_requests(),
+        chains + 1,
+        "the chain was refused"
+    );
+
+    let told = rig.dials().await.expect_err("the service asked for a wait");
+    assert!(told.to_string().contains("wait"), "{told}");
+    assert_eq!(
+        rig.authority_requests(),
+        chains + 1,
+        "nothing asked for the chain while the hour ran"
+    );
+}
+
+/// KR-REQ-17.53: a lease that is reused lasts until the first refresh of the connection that keeps
+/// it. One with less left than that, and the margin, is replaced, so that a connection that
+/// presents it is not left without a lease between its presentation and its first refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_lease_lasts_until_the_first_refresh_of_the_connection_that_keeps_it() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    // By the device's clock the lease it holds has a minute left, which is the shortest a refresh
+    // waits and so too little.
+    rig.waits.time_passes(Duration::from_secs(14 * 60));
+    let session = rig
+        .dials()
+        .await
+        .expect("a connection beside the application's");
+    read_host_info(&session)
+        .await
+        .expect("the host serves the connection");
+    assert_eq!(
+        rig.lease_requests(),
+        requests + 1,
+        "a new lease was asked for"
+    );
+}
+
+/// KR-REQ-17.53: a caller that cuts a presentation off while the service has not answered has not
+/// been answered either, and the next presentation does not ask again at once: a service that
+/// answers nothing is not sent a request from every pass of every caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presentation_its_caller_cuts_off_while_the_service_is_silent_holds_the_service_off() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    let requests = rig.lease_requests();
+
+    // The lease the device holds is too short to present again, so a lease is asked for, and the
+    // service answers nothing. The caller gives up on it the moment the request has arrived.
+    rig.waits.time_passes(Duration::from_secs(14 * 60 + 30));
+    rig.refuses_the_next_lease(Moment::Hold);
+    tokio::select! {
+        _ = rig.dials() => panic!("the service answered nothing"),
+        () = rig.until_lease_requests(requests + 1) => {}
+    }
+
+    let told = rig.dials().await.expect_err("the service is held off");
+    assert!(
+        told.to_string().contains("did not give this device"),
+        "{told}"
+    );
+    assert_eq!(rig.lease_requests(), requests + 1, "nothing asked again");
     rig.served.web().release_held();
 }
 
