@@ -122,56 +122,6 @@ fn registered_under(controller: &Arc<Controller>, grant: Grant) -> AdmittedMutat
     }
 }
 
-/// KR-REQ-24.15: the removal of this host from its feed reaches a share a connection acts under,
-/// as it reaches the grant the connection was admitted under: a share keeps the organisation
-/// requirement of what it was delegated from, so it rests on the feed when the pairing grant does
-/// not. The control: a share that requires no organisation is left alone, and so is the connection
-/// before the removal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_connection_acting_under_a_share_that_rests_on_the_feed_is_refused_after_the_removal() {
-    use super::a_voice_grant_on_the_floor::{paired, paired_needing_a_lease};
-
-    let (_temp, controller) = daemon().await;
-    let under_an_organisations_share =
-        registered_under(&controller, paired(&controller, 1, None).grant);
-    controller.note_share(
-        under_an_organisations_share.connection_id,
-        &paired_needing_a_lease(
-            &controller,
-            2,
-            &[kr_protocol::rights::ActionRight::SessionView],
-        )
-        .grant,
-    );
-    let under_a_personal_share = registered_under(&controller, paired(&controller, 3, None).grant);
-    controller.note_share(
-        under_a_personal_share.connection_id,
-        &paired(&controller, 4, None).grant,
-    );
-    for admission in [&under_an_organisations_share, &under_a_personal_share] {
-        assert_eq!(
-            asked(&controller, admission).await,
-            [true, true],
-            "the control"
-        );
-    }
-
-    controller
-        .authority_feed_removed("https://feed.example")
-        .await
-        .expect("the removal is written down");
-    assert_eq!(
-        asked(&controller, &under_an_organisations_share).await,
-        [false, false],
-        "a share that rests on the feed is refused where it commits"
-    );
-    assert_eq!(
-        asked(&controller, &under_a_personal_share).await,
-        [true, true],
-        "a share that does not is left alone"
-    );
-}
-
 /// KR-REQ-24.15: the removal of this host from its feed is a refusal of one kind of grant, and it
 /// holds work admitted before it as the other two refusals do. A connection under a grant that
 /// rests on the feed, an organisation's, or a personal one once the owner has bounded offline

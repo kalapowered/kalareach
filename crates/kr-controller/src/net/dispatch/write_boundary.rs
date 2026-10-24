@@ -2437,8 +2437,21 @@ fn a_share_of(
     session_id: kr_protocol::ids::SessionId,
     expiry: kr_protocol::grant::GrantExpiry,
 ) -> kr_protocol::grant::Grant {
+    a_share_requiring(controller, device_id, session_id, expiry, Nullable::null())
+}
+
+/// As [`a_share_of`], for a share that keeps `organisation`, the requirement of the grant it was
+/// delegated from.
+fn a_share_requiring(
+    controller: &Controller,
+    device_id: DeviceId,
+    session_id: kr_protocol::ids::SessionId,
+    expiry: kr_protocol::grant::GrantExpiry,
+    organisation: Nullable<kr_protocol::grant::OrganisationRequirement>,
+) -> kr_protocol::grant::Grant {
     let (mut grant, _) =
         super::super::tests::granted(expiry, controller.policy().authority_revision());
+    grant.organisation = organisation;
     grant.issuer_device_id = controller.sharing().host_device_id();
     grant.recipient_device_id = device_id;
     grant.session_selector = kr_protocol::grant::SessionSelector::These {
@@ -2684,6 +2697,128 @@ async fn kr_req_25_10_a_shares_revocation_stops_the_answers_decided_under_it_alo
     assert!(decided_under_the_child.closed());
     assert!(!decided_under_the_pairing_grant.closed() && !owners_stream.closed());
     world.serving.abort();
+}
+
+/// Whether the two checks every mutation asks again where it commits, the admission and the
+/// registration, let the connection `connection_id` go on.
+async fn commit_checks(controller: &Controller, connection_id: ConnectionId) -> [bool; 2] {
+    let admission = crate::authority::AdmittedMutation {
+        connection_id,
+        admitted_revision: controller.policy().authority_revision(),
+        deadline: controller.clock.now().checked_add(Duration::from_secs(60)),
+    };
+    let registry = controller.registry.lock().await;
+    [
+        controller.check_admission(&registry, &admission).is_ok(),
+        controller.check_registration(&admission).is_ok(),
+    ]
+}
+
+/// KR-REQ-24.15: the removal of this host from its feed reaches a share a connection has decided a
+/// request under, as it reaches the grant the connection was admitted under. A share keeps the
+/// organisation requirement of what it was delegated from, so it rests on the feed when the pairing
+/// grant does not. A device paired under a personal grant holds two shares of a session, one that
+/// requires an organisation and one that requires none, and decides a request under each on a
+/// connection of its own. After the removal the connection that acted under the organisation's
+/// share is refused where it commits and where its answer is written, and the other is not. The
+/// control is the same two connections with the feed standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_that_decided_a_request_under_a_share_resting_on_the_feed_is_refused_after_the_removal()
+ {
+    for removed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let now = kr_ipc::now_ms().get();
+        let organisation = TestOrganisation::new(0x4a, now - 60 * 60 * 1000);
+        // The lease binds the device, whose pairing grant is a personal one.
+        let (member, _) = super::super::tests::leased_member(&controller, &organisation, now);
+        let (mut pairing, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        pairing.recipient_device_id = member.recipient_device_id;
+        let device = record_for(&pairing);
+        controller.devices().commit(&device).expect("paired");
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let organisations = a_share_requiring(
+            &controller,
+            device.device_id,
+            session_id,
+            kr_protocol::grant::GrantExpiry::Never,
+            member.organisation.clone(),
+        );
+        let personal = a_share_of(
+            &controller,
+            device.device_id,
+            session_id,
+            kr_protocol::grant::GrantExpiry::Never,
+        );
+        let acting_under = |share: &kr_protocol::grant::Grant| {
+            let stream = HeldStream::new(false);
+            stream.writer.add_permits(1);
+            let connection = super::RemoteConnection::for_test_writing_to(
+                &controller,
+                device.clone(),
+                Box::new(Arc::clone(&stream)),
+            );
+            let asked = connection
+                .ask_naming(
+                    Some(session_id),
+                    Method::QuestionRead.entry(),
+                    false,
+                    Some(share.grant_id),
+                )
+                .expect("the share answers for the session");
+            (connection, asked)
+        };
+        let (under_the_organisations, organisations_asked) = acting_under(&organisations);
+        let (under_the_personal, personal_asked) = acting_under(&personal);
+        for connection in [&under_the_organisations, &under_the_personal] {
+            assert_eq!(
+                commit_checks(&controller, connection.connection_id).await,
+                [true, true],
+                "the control: both connections go on before the removal"
+            );
+        }
+
+        if removed {
+            controller
+                .authority_feed_removed("https://feed.example")
+                .await
+                .expect("the removal is written down");
+        }
+        let refused = [false, false];
+        let goes_on = [true, true];
+        assert_eq!(
+            commit_checks(&controller, under_the_organisations.connection_id).await,
+            if removed { refused } else { goes_on },
+            "a share that rests on the feed is refused where it commits"
+        );
+        assert_eq!(
+            commit_checks(&controller, under_the_personal.connection_id).await,
+            goes_on,
+            "a share that rests on nothing is left alone"
+        );
+        for (connection, asked, written_after_the_removal) in [
+            (
+                &under_the_organisations,
+                &organisations_asked,
+                if removed {
+                    Written::Undecided
+                } else {
+                    Written::Sent
+                },
+            ),
+            (&under_the_personal, &personal_asked, Written::Sent),
+        ] {
+            let written = connection
+                .output()
+                .write_held(&batch(), &asked.decision.bounds(), None, true)
+                .await;
+            assert_eq!(written, written_after_the_removal);
+        }
+        drop(controller);
+    }
 }
 
 /// A share of `session_id` issued to `device_id`, active and without an end, as a delegation from
