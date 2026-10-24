@@ -3014,6 +3014,30 @@ async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_
     assert!(!phone.view().hosts[0].previews, "the choice stays recorded");
     assert!(held_keys(&phone).expect("keys").senders.is_empty());
 
+    // A host that needs the person is not told again by a second choice: the choice is recorded,
+    // and Try again sends it.
+    let reaches = phone.registered.lock().expect("the script").reaches.len();
+    phone
+        .desk
+        .set_previews(&reference, true)
+        .await
+        .expect("on again");
+    assert!(
+        phone.view().hosts[0].previews,
+        "the second choice is recorded"
+    );
+    assert_eq!(
+        phone.registered.lock().expect("the script").reaches.len(),
+        reaches,
+        "no run was started for a host that needs the person"
+    );
+    assert_eq!(phone.view().hosts[0].state, PushState::NeedsAttention);
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off again");
+
     phone.registered.lock().expect("the script").register_stops = None;
     phone.desk.enable(&reference).expect("Try again");
     phone.until(|states| states == [PushState::On]).await;
