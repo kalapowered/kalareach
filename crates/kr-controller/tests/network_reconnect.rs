@@ -15,7 +15,7 @@ use kr_protocol::metrics::{
     Environment, HostMetrics, MetricOutcome, MetricsReport, ReconnectAttempt,
 };
 use kr_protocol::rights::ActionRight;
-use net_support::{Device, Host, MovedWall, connect, pair_with, paired_dial, proposal};
+use net_support::{Device, Host, MovedClocks, connect, pair_with, paired_dial, proposal};
 
 /// A grant that sees a session and nothing more: all a device needs to hold a connection.
 const VIEWER: &[ActionRight] = &[ActionRight::SessionView];
@@ -107,8 +107,8 @@ async fn kr_req_26_43_a_device_that_comes_back_is_a_reconnection_in_what_the_hos
 async fn kr_req_09_17_a_device_that_comes_back_after_its_anchored_grant_ran_out_is_counted_refused()
 {
     let owner = DeviceKeys::generate().expect("owner keys");
-    let wall = MovedWall::new();
-    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    let moved = MovedClocks::new();
+    let host = Host::start_on_clocks(&owner, moved.clocks()).await;
     let device = Device::create().await;
     let record = pair_with(&host, &device, &owner, proposal(VIEWER)).await;
 
@@ -127,8 +127,9 @@ async fn kr_req_09_17_a_device_that_comes_back_after_its_anchored_grant_ran_out_
     .await
     .expect("the host sees the connection end");
 
-    // The grant is a day's: two days on, it has run out, and nothing has observed that.
-    wall.advance(std::time::Duration::from_secs(2 * 24 * 60 * 60));
+    // The grant is a day's: two days on, on both clocks, it has run out, and nothing has observed
+    // that.
+    moved.advance(std::time::Duration::from_secs(2 * 24 * 60 * 60));
     if let Ok(transport) = paired_dial(&host, &device, &record).try_dial().await {
         let session =
             kr_client::session::Session::start(std::sync::Arc::new(transport)).expect("a session");

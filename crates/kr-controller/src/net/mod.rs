@@ -1375,14 +1375,16 @@ impl Drop for ConnectionGuard {
         if let Some(watch) = self.watch.take() {
             watch.abort();
         }
+        // The gap is recorded before the connection leaves the table of those being served, so a
+        // reader that finds the table without it finds the gap begun.
+        self.host
+            .reconnects
+            .departed(self.device_id, self.clock.now());
         self.host
             .live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.connection_id);
-        self.host
-            .reconnects
-            .departed(self.device_id, self.clock.now());
         let remote = Arc::clone(&self.remote);
         let controller = Arc::clone(&self.controller);
         let connection_id = self.connection_id;
