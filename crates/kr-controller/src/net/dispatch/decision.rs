@@ -250,7 +250,10 @@ impl RemoteConnection {
         // or raw input that waited for the worker's link is forwarded after the wait, and the
         // refusal moves no revision for the worker to find. Decided again, it is refused as the
         // decision refuses.
-        let mut passed = self.controller.feed_refusal().is_some();
+        let mut passed = self
+            .controller
+            .feed_refusal_on(self.connection_id)
+            .is_some();
         let mut bound_by = |deadline: kr_transport::clock::ContinuousInstant| {
             passed |= now >= deadline;
             until = Some(until.map_or(deadline, |earliest| earliest.min(deadline)));

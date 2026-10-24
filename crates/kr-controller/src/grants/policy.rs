@@ -1366,6 +1366,14 @@ impl HostPolicy {
         }
     }
 
+    /// Whether a personal grant's validity rests on the authority feed now: the host is exclusively
+    /// organisation-managed, or the owner bounded offline validity. A feed that removed the host
+    /// refuses such a grant from a remote door and leaves the default owner grant alone.
+    #[must_use]
+    pub const fn personal_grants_rest_on_the_feed(&self) -> bool {
+        self.exclusively_managed || self.offline.is_some()
+    }
+
     /// Intersects one grant with this policy for one request.
     ///
     /// # Errors
@@ -1459,7 +1467,7 @@ impl HostPolicy {
                 // the owner's way to act at the host is through this door.
                 if self.feed_removed
                     && request.ingress != ActorIngress::LocalIpc
-                    && (self.exclusively_managed || self.offline.is_some())
+                    && self.personal_grants_rest_on_the_feed()
                 {
                     return Err(Refusal::AuthorityFeedRemoved);
                 }

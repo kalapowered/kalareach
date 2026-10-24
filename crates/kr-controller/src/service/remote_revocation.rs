@@ -13,7 +13,7 @@ use kr_client::services::authority::RejectionReason;
 use std::sync::Arc;
 
 use kr_protocol::actor::ActorIngress;
-use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
+use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, RevocationTarget};
 use kr_protocol::rights::ActionRight;
@@ -43,6 +43,14 @@ const BEHIND_ITS_FEED: u8 = 1;
 /// The bit of the refusal word that stands while the feed shows a withdrawal this host cannot
 /// verify.
 const WITHDRAWAL_UNVERIFIED: u8 = 2;
+
+/// The bit of the refusal word that stands once the feed has answered that it removed this host.
+/// Unlike the two above it refuses by kind of grant.
+const FEED_REMOVED: u8 = 4;
+
+/// The bit of the refusal word that says personal grants rest on the feed now, which is what makes
+/// the removal refuse them: it mirrors the policy, and is changed with it.
+pub(super) const PERSONAL_GRANTS_REST_ON_THE_FEED: u8 = 8;
 
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
@@ -668,7 +676,25 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !policy.feed_removed() {
             policy.set_feed_removed(true);
+            self.feed_refusal
+                .fetch_or(FEED_REMOVED, std::sync::atomic::Ordering::SeqCst);
             self.advance_authority_epoch();
+        }
+    }
+
+    /// Mirrors into the refusal word whether personal grants rest on the feed, from the policy that
+    /// has just been put in force. Called with the policy's lock held.
+    pub(super) fn mirror_the_feed_standing_of(&self, policy: &crate::grants::HostPolicy) {
+        if policy.personal_grants_rest_on_the_feed() {
+            self.feed_refusal.fetch_or(
+                PERSONAL_GRANTS_REST_ON_THE_FEED,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        } else {
+            self.feed_refusal.fetch_and(
+                !PERSONAL_GRANTS_REST_ON_THE_FEED,
+                std::sync::atomic::Ordering::SeqCst,
+            );
         }
     }
 
@@ -1080,25 +1106,48 @@ impl Controller {
     /// the refusal takes a remote device's standing away whole, so what was admitted under the
     /// standing it had does not complete under the one it has. The owner at this machine is never
     /// refused, as the policy keeps it.
-    pub(crate) fn feed_refusal(&self) -> Option<crate::grants::Refusal> {
+    ///
+    /// The removal of the feed is a refusal of one kind of grant: it stands for an organisation's
+    /// grant, and for a personal one while personal grants rest on the feed, and `grant` says which
+    /// this is. No grant is no removal.
+    pub(crate) fn feed_refusal(
+        &self,
+        grant: Option<&kr_protocol::grant::Grant>,
+    ) -> Option<crate::grants::Refusal> {
         let word = self.feed_refusal.load(std::sync::atomic::Ordering::SeqCst);
         if word & BEHIND_ITS_FEED != 0 {
             Some(crate::grants::Refusal::BehindItsFeed)
         } else if word & WITHDRAWAL_UNVERIFIED != 0 {
             Some(crate::grants::Refusal::WithdrawalUnverified)
+        } else if word & FEED_REMOVED != 0
+            && grant.is_some_and(|grant| {
+                grant.organisation.is_present() || word & PERSONAL_GRANTS_REST_ON_THE_FEED != 0
+            })
+        {
+            Some(crate::grants::Refusal::AuthorityFeedRemoved)
         } else {
             None
         }
     }
 
-    /// Refuses with the feed's refusal when one stands, for a remote path that commits after a
-    /// wait of its own and asks nothing of the registration.
+    /// The refusal the authority feed puts on `connection` now, when it came through the network
+    /// and one stands. The owner at this machine, a connection that is no longer registered and
+    /// one registered under no grant are not refused by it.
+    pub(crate) fn feed_refusal_on(
+        &self,
+        connection: ConnectionId,
+    ) -> Option<crate::grants::Refusal> {
+        self.feed_refusal_of(self.admitted_table().get(&connection))
+    }
+
+    /// Refuses with the feed's refusal for `connection` when one stands, for a remote path that
+    /// commits after a wait of its own and asks nothing of the registration.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::ControllerError::PermissionDenied`] with the refusal's words.
-    pub(crate) fn refuse_while_the_feed_refuses(&self) -> Result<()> {
-        match self.feed_refusal() {
+    pub(crate) fn refuse_while_the_feed_refuses(&self, connection: ConnectionId) -> Result<()> {
+        match self.feed_refusal_on(connection) {
             Some(refusal) => Err(crate::error::ControllerError::PermissionDenied {
                 detail: refusal.detail(),
             }),
