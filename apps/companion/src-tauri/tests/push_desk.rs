@@ -292,6 +292,8 @@ struct Registered {
     hold_answer: bool,
     /// What the registration ends in instead of the host's answer.
     register_stops: Option<LineStop>,
+    /// What a connection to the host fails with, when it does.
+    connect_fails: Option<String>,
 }
 
 /// Waits for as long as `held` says of the script that a step is held.
@@ -315,10 +317,14 @@ impl Registrar for HostLink {
         reach: Reach,
     ) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
         Box::pin(async move {
-            {
+            let fails = {
                 let mut script = self.0.lock().expect("what was handed");
                 script.reaches.push(reach);
                 script.connected.push(host.host_device_id);
+                script.connect_fails.clone()
+            };
+            if let Some(words) = fails {
+                return Err(words);
             }
             while_held(&self.0, |script| script.hold_connection).await;
             Ok(Box::new(Line {
@@ -359,7 +365,10 @@ impl HostLine for Line {
                 let mut script = self.script.lock().expect("what was handed");
                 script.credentials.push((
                     self.host,
-                    json!({ "sender_record_id": params.credential.sender_record_id.to_string() }),
+                    json!({
+                        "sender_record_id": params.credential.sender_record_id.to_string(),
+                        "previews_enabled": params.previews_enabled,
+                    }),
                 ));
                 script.register_stops.clone()
             };
@@ -1623,21 +1632,22 @@ fn sent(phone: &Desk) -> (usize, usize, usize) {
 }
 
 /// The person forgets the host (the application's record of it goes with the run's claim) while
-/// the gateway issues the host's authorisation: the host is not even connected to.
+/// the gateway issues the host's authorisation, which it does once the host is connected to: the
+/// host is told nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_forgotten_while_the_gateway_issues_for_it_is_not_connected_to() {
+async fn a_host_forgotten_while_the_gateway_issues_for_it_is_told_nothing() {
     let phone = the_host_is_forgotten_while(Step::GatewayIssue, |phone, paired| {
         phone.desk.forgotten(paired.host_device_id);
         true
     })
     .await;
-    assert_eq!(sent(&phone), (0, 0, 0));
+    assert_eq!(sent(&phone), (1, 0, 0));
 }
 
 /// Forgetting a host removes the pairing before the desk drops its claim; a run that wakes between
 /// the two is not wanted either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_unpaired_while_the_gateway_issues_for_it_is_not_connected_to() {
+async fn a_host_unpaired_while_the_gateway_issues_for_it_is_told_nothing() {
     let phone = the_host_is_forgotten_while(Step::GatewayIssue, |phone, paired| {
         phone
             .device
@@ -1646,7 +1656,44 @@ async fn a_host_unpaired_while_the_gateway_issues_for_it_is_not_connected_to() {
         false
     })
     .await;
-    assert_eq!(sent(&phone), (0, 0, 0));
+    assert_eq!(sent(&phone), (1, 0, 0));
+}
+
+/// KR-REQ-16.08: the gateway issues the authorisation for a host once the host has been reached.
+/// An issue replaces the credential the host holds at once, so a host that cannot be reached keeps
+/// the one it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_cannot_be_reached_is_not_issued_an_authorisation() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone
+        .registered
+        .lock()
+        .expect("the script")
+        .connect_fails = Some("the host did not answer in time".to_owned());
+    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .starts_with("The host did not take this phone as a destination"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+    assert_eq!(
+        phone.gateway.issue_requests(),
+        0,
+        "the gateway issued nothing for a host that was not reached"
+    );
+
+    phone.registered.lock().expect("the script").connect_fails = None;
+    phone.desk.enable(&reference).expect("the person asks again");
+    phone.until(|states| states == [PushState::On]).await;
+    assert_eq!(phone.gateway.issue_requests(), 1);
 }
 
 /// The person forgets the host while the connection to it is made: it is connected to, and told
