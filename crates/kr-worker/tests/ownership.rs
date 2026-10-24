@@ -16,6 +16,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -167,6 +168,31 @@ impl Tree {
             .collect()
     }
 
+    /// Waits until this tree holds no process outside `members`.
+    ///
+    /// The root shell collects a subshell some time after the subshell has exited, and until it
+    /// has, the subshell is a child of the root shell that an observation reads like any other
+    /// part of the tree. A case that names the tree's members waits for that to be over, so that
+    /// the tree holds nothing it does not name.
+    fn wait_until_it_holds_only(&self, members: &[u32]) {
+        let root = self.root();
+        let deadline = Instant::now() + LIVENESS;
+        loop {
+            let others: Vec<u32> = tree_listed(root)
+                .into_iter()
+                .filter(|pid| !members.contains(pid))
+                .collect();
+            if others.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the tree holds only the processes its script started, and also {others:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Stops every process this test started, the root shell included, so that none outlives it.
     fn end(self) {
         if let Some(owned) = self.session.owned() {
@@ -181,6 +207,42 @@ impl Tree {
             }
         }
     }
+}
+
+/// Returns the processes `/proc` lists as children of `pid`, whichever of its threads has them.
+fn children_listed(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .flat_map(|task| {
+            std::fs::read_to_string(task.path().join("children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|child| child.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Returns the processes a session whose root shell is `root` holds now, as `/proc` lists them: the
+/// root shell and everything below it, and each child of this process in the root shell's session,
+/// with everything below that. A process that has exited and is not yet collected is held.
+fn tree_listed(root: u32) -> BTreeSet<u32> {
+    let mut held = BTreeSet::new();
+    let mut pending = vec![root];
+    pending.extend(
+        children_listed(std::process::id())
+            .into_iter()
+            .filter(|child| session_of(*child) == Some(root)),
+    );
+    while let Some(pid) = pending.pop() {
+        if held.insert(pid) {
+            pending.extend(children_listed(pid));
+        }
+    }
+    held
 }
 
 /// Returns the parent a process has now, as `/proc/<pid>/stat` field 4 says.
@@ -312,9 +374,11 @@ fn an_idle_sessions_observation_reads_no_process_outside_its_own_tree() {
     let _turn = turn();
     let mut tree = Tree::start(KINDS, 3);
     // The worker, the root shell and what the root shell started are this worker's tree; nothing
-    // else is growing while this case has its turn.
+    // else is growing while this case has its turn, and the observation is made once the tree
+    // holds nothing but those, no subshell the root shell has yet to collect among it.
     let mut tree_members: Vec<u32> = tree.started.iter().map(|(_, pid)| *pid).collect();
     tree_members.extend([std::process::id(), tree.root()]);
+    tree.wait_until_it_holds_only(&tree_members);
 
     let ((), read) = kr_ipc::identity::processes_read_during(|| tree.session.observe_owned());
     assert!(!read.is_empty(), "the observation's reads are counted");
