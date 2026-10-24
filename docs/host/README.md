@@ -6086,8 +6086,7 @@ a grant is written, and the grant carries no role afterwards. Only controller an
 carries the notice explaining that an answer, including free text, is input the agent may act on
 under its own permissions.
 
-**A grant's consequences are stated in the host's words, and the host states no boundary the
-upstream does not enforce.** A grant that carries `terminal.input` types into the session's shell
+**A grant's consequences are stated in the host's words.** A grant that carries `terminal.input` types into the session's shell
 as the shell's user, so it exposes that user's account: no file rule, repository label or other
 selector on a grant limits what a command typed through the terminal does. A prompt, an approval or
 an answer, free text included, is input the agent may act on under its own permissions, and nothing
@@ -6109,7 +6108,12 @@ smaller or a larger set cannot get the grant written, and the words themselves c
 protocol's table, which the companion takes them from. The recipient is shown the same consequences,
 addressed to it, when it opens the invitation. A role's name promises nothing. The default viewer
 carries no notice, a viewer invited to answer the agent's questions carries `agent_permissions`, and
-the notices follow the actions and not the label.
+the notices follow the actions and not the label. The role the host names beside a grant (in a
+`grant.held` offer, in `kr share list` and in the role line of `kr share invite`) is the widest role
+whose default actions the grant carries, a label for a person to read that the host never decides
+from. A viewer invited to answer is therefore named a viewer there, and the role line of
+`kr share invite` says what a viewer sees, so only the notices say what the grant lets the
+recipient do.
 
 Restricted typed collaboration would be offered only where the upstream and the broker both enforce
 the boundary it states, and this host offers none today. A question always keeps its free-text
@@ -6171,7 +6175,8 @@ what invitations are open for that device, and what shares are currently active 
 sessions that are still open, up to 64 of each at a time. Reading may be resumed by specifying the
 key of the last entry previously read. The device is identified by the authentication of the
 connection, and is not specified in the request. The offer details include the session number, the
-actions, the history start point, whether the live screen is shared, the consequences of the
+actions, the widest role the actions cover (for a person reading the offer, null when they cover
+none), the history start point, whether the live screen is shared, the consequences of the
 actions, and the time at which the access will end. The text displayed to the issuer of the
 invitation is not included. The device the invitation names redeems it with `grant.redeem` over its
 own paired connection, and the redemption activates the grant, once. The activation, the
