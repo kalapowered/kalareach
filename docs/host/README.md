@@ -6731,8 +6731,10 @@ that does not end, or a registry that cannot take a write at all. The refusal st
 carrier reads no more of the feed, and `kr doctor` shows the check as a warning that says the
 refusal waits for the registry to take a write, since when, and why; the log says it when the
 wait is first found stuck and when its reason changes. The
-wait asks again by itself and goes on when the registry takes a write. A start that restores a
-removal waits for nothing, since no endpoint is bound yet and no confirmation can be under way. What
+wait asks again by itself and goes on when the registry takes a write. The feed's removal
+of the host does not wait: no owner confirmation reads it, so the carrier raises it and ends the
+links it reaches at once, and a start that restores it waits for nothing, since no endpoint is bound
+yet and no confirmation can be under way. What
 a spend that had committed before the refusal rose goes on
 to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
