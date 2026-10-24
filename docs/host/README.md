@@ -6486,7 +6486,8 @@ than answered with somebody else's revision.
 
 Revocation records are retained until every enrolled host has acknowledged them or that host is
 explicitly removed; they do not share mailbox expiry or notification coalescing. A settled record is
-kept rather than deleted, because its identity is what stops the request being applied again.
+kept for seven days after the host acknowledged it as complete and is then deleted; while it is kept,
+its identity is what stops the request being applied again.
 `device.list` shows the feed's staleness and the last time this host synchronised it, because an
 offline host cannot apply a revocation it has not received and a list that looked current because
 nothing had contradicted it would be worse than no list. The feed records that a synchronisation is
@@ -6570,7 +6571,7 @@ owner's at the machine, with `PERMISSION_DENIED` saying that it shows a revocati
 does not know. `kr doctor` shows the feed check as a warning with a remedy. It names the device the
 request says made it, the key the request gives for that device, and the devices and grants the
 request names, up to eight of each. Every scan reads such a record again, so a restart does not lose
-the refusal, and nothing is stored for it. It ends when the owner at the machine revokes what the
+the refusal while the feed holds the record, and nothing is stored for it. It ends when the owner at the machine revokes what the
 request names, or pairs the owner again, whose key the request names and whose request is then
 carried out. A feed that shows a revocation complete that no owner made can only keep remote access
 refused this way. It cannot revive a device, and the owner at the machine can always end it. While
@@ -6579,11 +6580,22 @@ device that holds a key one of them holds. A feed removes the host by a key, so 
 keys out of the list of keys the feed takes a removal from as soon as it finds the withdrawal,
 before it has read the feed through, and a request one of them publishes after the withdrawal is
 refused as lacking owner authority. Another owner can still remove the feed, which ends the refusal. If the named device is
-the only owner, no key can remove a lost host while the refusal stands. If the feed has not taken
-the change when it is removed, as when it turned the change back and still lists a key the
-withdrawal takes the right from, the removal says nothing of an owner having acted, and the refusal
-stands until the host starts again, which the owner at the machine can do. A host that starts again
-does not read a feed that has been removed, so nothing finds the condition again. A request the feed
+the only owner, no key can remove a lost host while the refusal stands. A feed that keeps turning
+the change back ends each scan at the first withdrawal the host cannot verify, with the delay it
+asked for, so the host carries out no later record until the feed takes the change or the owner at
+the machine revokes what the withdrawal names, and remote access stays refused meanwhile. If the
+feed has not taken the change when it is removed, as when it turned the change back and still lists
+a key the withdrawal takes the right from, the removal says nothing of an owner having acted, and
+the refusal stands until the host starts again, which the owner at the machine can do. A host that
+starts again does not read a feed that has been removed, so nothing finds the condition again.
+That ends the refusal and the exclusions without anything having shown that the owner dealt with
+what the withdrawal names. The host keeps nothing of the refusal, which gives it two limits. A
+restart after a removal that the refusal outlived ends it, as just described. And the feed deletes
+a settled record seven days after the host acknowledged it as complete, so a refusal that rests on
+a record acknowledged before the restore ends at the first complete scan after the deletion, with no
+act by the owner, and the devices the withdrawal named hold the standing the restored registry
+gives them. Holding the refusal across both needs a record in the registry of what the host found,
+written under a store version that releases already installed can read; this release writes none. A request the feed
 holds that is not shown complete waits until the host
 has caught up, and is then judged on the registry as it stands, in a scan of its own that is the
 synchronisation a connection waits for, so the owner is not refused for the host's being behind.
