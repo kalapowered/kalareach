@@ -1369,13 +1369,25 @@ not carried before travels with the chain of keys.
 
 The keeper holds the lease the host last took, and counts its life from when it arrived. A connection
 made beside the application's own (the pairing's confirmation, an owner's confirmation, the settings
-listing, a visit) presents that lease again while it lasts, and the service is asked for another only when
-none is held, the application's own refresh is due, or the host refuses the one that is, as a host
-does that restarted or whose clock has passed the lease's end. The standing links the companion opens
-to a host's sessions use `connect_paired_transport`, present nothing, and rely on the lease the
+listing, a visit) presents that lease again while it lasts as long as the first refresh of the
+connection that keeps it and a margin, and the service is asked for another only when none is held,
+the application's own refresh is due, or the host refuses the one that is, as a host does that
+restarted or whose clock has passed the lease's end. A connection that is kept beside the
+application's own, as the inbox keeps its visits to the hosts it is not using, presents the lease
+again before each use, because nothing refreshes the lease of a host that is not in use and the host
+refuses a connection once the lease it holds has ended. The standing links the companion opens to a
+host's sessions use `connect_paired_transport`, present nothing, and rely on the lease the
 application's own connection keeps. The companion keeps one keeper for each host, and makes another
-when the organisation, the device's key or the account signed in differs, or when the person forgets
-the host.
+when the organisation, the device's key or the account signed in differs, or when the person has
+signed in since, so that nothing held against the earlier sign-in is held against the later.
+
+A keeper belongs to the account that was signed in when it was made. The lease client asks which
+account is signed in before the keeper asks for a lease or for the chain of keys and again before it
+presents a lease, and asks only under the token of the account it was made for, so a lease that
+arrives after the account changed is not presented (`LeaseStop::AccountChanged`), and a refresh
+that begins after a sign-out does not begin (`SignIn`). The companion's connection to the host ends
+at once when the account it keeps the lease for signs out or is replaced, whatever the keeper is
+doing, and its reason says which.
 
 The keeper reads a refusal by the rule name the host ends its message with, and by the code the
 service answers. A lease that has ended, that the host installed before its restart, or that a newer
@@ -1384,25 +1396,28 @@ and the host refuses that way is not asked for again at once: the host's clock o
 from the service's, and a new lease would be refused the same way, so the keeper waits and tries up
 to three times, then stops and names the rule. A service that is down, a host clock in doubt and a
 delay the service names are waited out. While a lease is kept, the keeper begins no wait of less
-than a minute and sends the service at most one lease request after each wait, and while it waits no
-connection asks the service either; a delay that outlasts the lease the host holds ends the keeper
-with `LeaseStop::Later` when that lease ends. A delay of more than ten seconds is not waited out
-inside a connection, which is given twenty: the connection ends with `LeaseStop::Later` and the
-delay, and a first presentation takes eight seconds at the most. A chain the host does not accept
-is tried three times before the keeper stops, because nothing says whether time mends it. The keeper
-stops, and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no
-longer takes the sign-in (`TokenRefused`), when the account is not a member, or when the host
-refuses the lease for a reason only an administrator can change.
+than a minute and sends the service at most one lease request after each wait. While it waits, no
+connection asks the service either, for a lease or for the chain of keys. A delay that outlasts the
+lease the host holds ends the keeper with `LeaseStop::Later` when that lease ends. A delay of more
+than five seconds is not waited out inside a connection: the connection ends with `LeaseStop::Later`
+and the delay. A first presentation takes ten seconds at the most, which covers that wait and a
+request, and a caller may give it less (a visit and a listing give ten seconds for the dial, the
+presentation and the reads together). A request its caller gives up on counts as one the service did
+not answer: the keeper sends none for a minute after it. A chain the host does not accept is tried
+three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
+and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no longer takes
+the sign-in (`TokenRefused`), when the account is not a member, or when the host refuses the lease
+for a reason only an administrator can change. A visit that stops this way shows the reason in the
+inbox, as the host having refused, and not as a host out of contact.
 
 A stop is remembered, so that a device the organisation removed does not send a request at every
 reconnect: the service allows an account a hundred and twenty lease requests an hour, shared with its
 other devices. After a stop that an administrator mends (`NotAMember`, `Refused`, `Unusable`) a
 connection fails at once with the same stop and sends nothing for five minutes; after `TokenRefused`
 or `Unreachable` for a minute; after `Later` for the delay the service named, an hour at most. The
-words of a held `Later` give the time that is left. `SignIn` and the end of a connection are not
-remembered: the first made no request, and the second needs none. A keeper belongs to the account
-that was signed in when it was made, so a person who signs in as another member is asked about
-afresh.
+words of a held `Later` give the time that is left. `SignIn`, `AccountChanged` and the end of a
+connection are not remembered: the first two made no request that a later one would repeat, and the
+third needs none.
 
 A personal grant on an exclusively managed host needs a lease too and names no organisation, so the
 keeper does not serve it. The host's local owner presents with `kr organisation present`.

@@ -1008,7 +1008,10 @@ impl AccountTokenSource for HostTokens {
             let binding = match &self.held_to {
                 HeldTo::Nothing => return held.signed_in.token(scope).await,
                 HeldTo::Account(fixed) => {
-                    let (token, mark) = held.signed_in.token_marked(scope, &self.origin).await?;
+                    let (token, mark) = held
+                        .signed_in
+                        .token_marked(scope, &self.origin, false)
+                        .await?;
                     if mark != *fixed {
                         return Err(kr_client::ClientError::refusal(
                             ErrorCode::ResourceUnavailable,
@@ -1025,7 +1028,10 @@ impl AccountTokenSource for HostTokens {
             // The mark comes with the token from one read of the grant, and both are compared
             // with the binding after the read returns: a renewal can take seconds, and the binding
             // can be switched while it does.
-            let (token, mark) = held.signed_in.token_marked(scope, &self.origin).await?;
+            let (token, mark) = held
+                .signed_in
+                .token_marked(scope, &self.origin, false)
+                .await?;
             let bound = binding.read();
             let Some(account) = bound.mark else {
                 return Ok(token);

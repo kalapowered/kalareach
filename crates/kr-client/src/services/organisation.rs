@@ -23,7 +23,7 @@ use kr_protocol::ids::OrganisationId;
 use kr_protocol::scalars::{AuthorisationKey, to_base64url};
 use serde::Deserialize;
 
-use super::account::{LEASE_SCOPE, SignedInAccount};
+use super::account::{AccountMark, LEASE_SCOPE, SignedInAccount};
 use super::relay::ServiceHttp;
 use super::signed::{Repeat, data_or_refusal, unreadable_answer};
 use super::{ServiceFuture, unconfigured};
@@ -53,8 +53,31 @@ impl fmt::Debug for IssuedLease {
     }
 }
 
+/// Whether the account signed in is the one a lease client asks as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountNow {
+    /// The account the client was made for.
+    Same,
+    /// Another account: the one the client was made for signed out and someone signed in.
+    Replaced,
+    /// No account is signed in.
+    SignedOut,
+}
+
 /// Where a member's device gets the lease its organisation signed for it.
+///
+/// A client asks as one account, the one signed in when it was made, and never as another: a lease
+/// is signed for an account, and the host binds a device to the first account that presents one.
 pub trait MembershipLeaseService: Send + Sync + fmt::Debug {
+    /// Whether the account signed in now is the one this client asks as. Asked before a lease is
+    /// presented and before a lease is asked for, so that work begun for an account that has since
+    /// signed out ends and is not carried on for the account that signed in after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the account could not be read.
+    fn account_now(&self) -> Result<AccountNow>;
+
     /// Asks for a lease for the account signed in, naming `device_key` as the device it is for.
     ///
     /// # Errors
@@ -77,6 +100,10 @@ pub trait MembershipLeaseService: Send + Sync + fmt::Debug {
 }
 
 impl MembershipLeaseService for super::NullService {
+    fn account_now(&self) -> Result<AccountNow> {
+        Ok(AccountNow::Same)
+    }
+
     fn lease<'a>(
         &'a self,
         _organisation: OrganisationId,
@@ -99,6 +126,8 @@ pub struct ManagedMembershipLeaseService {
     origin: String,
     http: Arc<dyn ServiceHttp>,
     account: Arc<SignedInAccount>,
+    /// The account this client asks as, at `origin`.
+    asks_as: AccountMark,
 }
 
 impl fmt::Debug for ManagedMembershipLeaseService {
@@ -114,17 +143,20 @@ impl fmt::Debug for ManagedMembershipLeaseService {
 
 impl ManagedMembershipLeaseService {
     /// Builds a client against one origin, presenting the token `account` holds for
-    /// [`LEASE_SCOPE`].
+    /// [`LEASE_SCOPE`], and only while the account signed in is the one `asks_as` marks: a request
+    /// is never made under another account's token.
     #[must_use]
     pub fn new(
         origin: &kr_protocol::service::GatewayOrigin,
         http: Arc<dyn ServiceHttp>,
         account: Arc<SignedInAccount>,
+        asks_as: AccountMark,
     ) -> Self {
         Self {
             origin: origin.as_str().to_owned(),
             http,
             account,
+            asks_as,
         }
     }
 
@@ -140,25 +172,31 @@ impl ManagedMembershipLeaseService {
     /// An account that is not signed in, whose sign-in has ended, or whose sign-in was not granted
     /// the lease scope has no token to ask with, and asking for the sign-in again is what mends
     /// each. The account says so as a failure of this device's own, which this turns into the
-    /// refusal that names the action; a failure to read or renew a token stays as it was.
+    /// refusal that names the action; a failure to read or renew a token stays as it was. A token of
+    /// another account than the one this client asks as is never presented.
     async fn authorisation(&self, renew: bool) -> Result<String> {
-        let token = match self.account.token_of_account(LEASE_SCOPE, renew).await {
-            Ok(held) => held.token,
+        let (token, mark) = match self
+            .account
+            .token_marked(LEASE_SCOPE, &self.origin, renew)
+            .await
+        {
+            Ok(held) => held,
             Err(ClientError::Host(refusal))
                 if matches!(
                     refusal.code,
                     ErrorCode::HostNotConfigured | ErrorCode::PermissionDenied
                 ) =>
             {
-                return Err(ClientError::Refused {
-                    error: refusal,
-                    retry_after_seconds: None,
-                    action: UserAction::SignIn,
-                    service_code: None,
-                });
+                return Err(sign_in_again(refusal));
             }
             Err(other) => return Err(other),
         };
+        if mark != self.asks_as {
+            return Err(sign_in_again(crate::error::refusal(
+                ErrorCode::PermissionDenied,
+                Shown::said("another account is signed in than the one this request is for"),
+            )));
+        }
         // The one place the token is read. It goes into a header value and nowhere else.
         Ok(format!("Bearer {}", token.expose()))
     }
@@ -205,7 +243,25 @@ struct LeaseAnswer {
     refresh_after_seconds: u64,
 }
 
+/// The refusal for a request there is no token to make: the sign-in is what mends it.
+fn sign_in_again(refusal: kr_protocol::error::ProtocolError) -> ClientError {
+    ClientError::Refused {
+        error: refusal,
+        retry_after_seconds: None,
+        action: UserAction::SignIn,
+        service_code: None,
+    }
+}
+
 impl MembershipLeaseService for ManagedMembershipLeaseService {
+    fn account_now(&self) -> Result<AccountNow> {
+        Ok(match self.account.mark(&self.origin)? {
+            Some(mark) if mark == self.asks_as => AccountNow::Same,
+            Some(_) => AccountNow::Replaced,
+            None => AccountNow::SignedOut,
+        })
+    }
+
     fn lease<'a>(
         &'a self,
         organisation: OrganisationId,
