@@ -1,6 +1,10 @@
 [
  {
   "created_at": "2026-09-11T22:43:35Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 101,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-69806: .NET Elevation of Privilege Vulnerability",
@@ -8,6 +12,10 @@
  },
  {
   "created_at": "2026-09-11T22:42:50Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 100,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-58649: .NET Information Disclosure Vulnerability",
@@ -15,6 +23,10 @@
  },
  {
   "created_at": "2026-09-11T22:37:41Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 99,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-40400: PowerShell Remote Code Execution Vulnerability",
@@ -22,6 +34,10 @@
  },
  {
   "created_at": "2026-09-11T22:33:26Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 98,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62801: PowerShell Remote Code Execution Vulnerability",
@@ -29,6 +45,10 @@
  },
  {
   "created_at": "2026-08-17T22:57:58Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 97,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62898: .NET Information Disclosure Vulnerability",
@@ -36,6 +56,10 @@
  },
  {
   "created_at": "2026-08-17T22:57:04Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 96,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62899: .NET Security Feature Bypass Vulnerability",
@@ -43,6 +67,10 @@
  },
  {
   "created_at": "2026-08-17T22:56:13Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 95,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62901: .NET Denial of Service Vulnerability",
@@ -50,6 +78,10 @@
  },
  {
   "created_at": "2026-08-17T22:55:23Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 94,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62909: .NET Elevation of Privilege Vulnerability",
@@ -57,6 +89,10 @@
  },
  {
   "created_at": "2026-08-17T22:52:59Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 93,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62886: .NET Elevation of Privilege Vulnerability",
@@ -64,6 +100,10 @@
  },
  {
   "created_at": "2026-08-17T22:52:21Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 92,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62871: .NET Elevation of Privilege Vulnerability",
@@ -71,6 +111,10 @@
  },
  {
   "created_at": "2026-08-17T22:51:31Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 91,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-70354: .NET Core Remote Code Execution Vulnerability",
@@ -78,6 +122,10 @@
  },
  {
   "created_at": "2026-08-17T22:50:44Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 90,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62902: .NET Information Disclosure Vulnerability",
@@ -85,6 +133,10 @@
  },
  {
   "created_at": "2026-08-17T22:50:10Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 89,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-62897: .NET Remote Code Execution Vulnerability",
@@ -92,6 +144,10 @@
  },
  {
   "created_at": "2026-08-17T22:49:17Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 88,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-70338: PowerShell Security Feature Bypass Vulnerability",
@@ -99,6 +155,10 @@
  },
  {
   "created_at": "2026-08-17T22:48:27Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 87,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-70337: PowerShell Remote Code Execution Vulnerability in Web cmdlets",
@@ -106,6 +166,10 @@
  },
  {
   "created_at": "2026-08-17T22:47:15Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 86,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-50523: PowerShell Remote Code Execution Vulnerability",
@@ -113,13 +177,29 @@
  },
  {
   "created_at": "2026-08-17T22:42:50Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 85,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-58612: Server-Side Request Forgery Vulnerability in PowerShell",
   "updated_at": "2026-08-17T22:46:08Z"
  },
  {
+  "created_at": "2026-04-21T20:23:19Z",
+  "labels": [],
+  "number": 83,
+  "state": "open",
+  "title": "Microsoft Security Advisory CVE-2026-26171 \u2013 .NET Denial of Service Vulnerability",
+  "updated_at": "2026-04-21T20:23:19Z"
+ },
+ {
   "created_at": "2026-04-14T14:00:58Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 82,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2026-26143: Microsoft PowerShell Security Feature Bypass Vulnerability",
@@ -127,13 +207,29 @@
  },
  {
   "created_at": "2025-10-21T20:22:38Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 81,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2025-25004: PowerShell Elevation of Privilege Vulnerability",
   "updated_at": "2025-10-21T20:22:45Z"
  },
  {
+  "created_at": "2025-09-26T21:50:01Z",
+  "labels": [],
+  "number": 79,
+  "state": "closed",
+  "title": "Advisory: CVE-2020-0605 \u2014 Skeries advisory and release v0.1.0",
+  "updated_at": "2025-10-15T22:21:18Z"
+ },
+ {
   "created_at": "2025-09-10T15:54:23Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 78,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2025-49734: PowerShell Direct Elevation of Privilege Vulnerability",
@@ -141,6 +237,10 @@
  },
  {
   "created_at": "2025-06-25T16:10:03Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 77,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2025-30399 | .NET Remote Code Vulnerability",
@@ -148,13 +248,31 @@
  },
  {
   "created_at": "2025-05-15T18:32:28Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 76,
   "state": "open",
   "title": "Microsoft Security Advisory: PowerShell Defense in Depth Updates",
   "updated_at": "2025-05-15T21:10:59Z"
  },
  {
+  "created_at": "2025-03-26T18:54:55Z",
+  "labels": [
+   "PowerShell"
+  ],
+  "number": 75,
+  "state": "open",
+  "title": "Docker images containing PowerShell now maintained by the .NET team",
+  "updated_at": "2025-03-26T19:03:40Z"
+ },
+ {
   "created_at": "2025-01-28T20:24:29Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 74,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-43498 | .NET Remote Code Execution Vulnerability",
@@ -162,6 +280,10 @@
  },
  {
   "created_at": "2025-01-28T20:23:35Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 73,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-43499 | .NET Denial of Service Vulnerability",
@@ -169,6 +291,10 @@
  },
  {
   "created_at": "2025-01-28T20:22:24Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 72,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2025-21171 | .NET Remote Code Execution Vulnerability",
@@ -176,6 +302,10 @@
  },
  {
   "created_at": "2024-10-22T22:33:18Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 71,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-43485 | .NET Denial of Service Vulnerability",
@@ -183,6 +313,10 @@
  },
  {
   "created_at": "2024-10-22T22:32:45Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 70,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-43484 | .NET Denial of Service Vulnerability",
@@ -190,6 +324,10 @@
  },
  {
   "created_at": "2024-10-22T22:32:06Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 69,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-43483 | .NET Denial of Service Vulnerability",
@@ -197,13 +335,29 @@
  },
  {
   "created_at": "2024-08-21T18:27:01Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 68,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-38167 | .NET Information Disclosure Vulnerability",
   "updated_at": "2024-08-21T18:27:14Z"
  },
  {
+  "created_at": "2024-08-02T17:59:18Z",
+  "labels": [],
+  "number": 67,
+  "state": "open",
+  "title": "PowerShell 7 Upgrade MSI Setting Bug",
+  "updated_at": "2024-08-02T17:59:45Z"
+ },
+ {
   "created_at": "2024-08-01T17:38:31Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 66,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-38033: PowerShell Elevation of Privilege Vulnerability ",
@@ -211,6 +365,10 @@
  },
  {
   "created_at": "2024-07-23T20:48:18Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 65,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-30105 | .NET Denial of Service Vulnerability",
@@ -218,6 +376,10 @@
  },
  {
   "created_at": "2024-07-23T20:47:47Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 64,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-38095 | .NET Denial of Service Vulnerability",
@@ -225,6 +387,10 @@
  },
  {
   "created_at": "2024-07-12T01:44:01Z",
+  "labels": [
+   "Security",
+   "Win32-OpenSSH"
+  ],
   "number": 63,
   "state": "open",
   "title": "Microsoft Security Guidance CVE-2024-6387: OpenSSH regreSSHion",
@@ -232,6 +398,10 @@
  },
  {
   "created_at": "2024-06-19T20:14:31Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 62,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-30045 | .NET Remote code Execution Vulnerability",
@@ -239,6 +409,10 @@
  },
  {
   "created_at": "2024-04-16T16:30:17Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 61,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-0057 | NuGet Client Security Feature bypass Vulnerability",
@@ -246,6 +420,10 @@
  },
  {
   "created_at": "2024-04-16T16:29:22Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 60,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-21409 | .NET Elevation of Privilege Vulnerability",
@@ -253,6 +431,10 @@
  },
  {
   "created_at": "2024-04-16T16:28:38Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 59,
   "state": "open",
   "title": " Microsoft Security Advisory CVE-2024-21392: .NET Denial of Service Vulnerability",
@@ -260,6 +442,10 @@
  },
  {
   "created_at": "2024-04-16T16:25:34Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 58,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-26190 : Microsoft QUIC Denial of Service Vulnerability",
@@ -267,6 +453,10 @@
  },
  {
   "created_at": "2024-01-16T21:15:41Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 57,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2024-0057: .NET Security Feature bypass Vulnerability",
@@ -274,6 +464,10 @@
  },
  {
   "created_at": "2023-11-16T18:02:42Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 55,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-36013: Information Disclosure Vulnerability in PowerShell Web Cmdlets",
@@ -281,6 +475,10 @@
  },
  {
   "created_at": "2023-11-16T17:56:56Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 54,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-36049: .NET Elevation of Privilege Vulnerability",
@@ -288,6 +486,10 @@
  },
  {
   "created_at": "2023-10-26T18:43:56Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 53,
   "state": "open",
   "title": " Microsoft Security Advisory CVE-2023-38171: .NET Denial of Service Vulnerability",
@@ -295,6 +497,10 @@
  },
  {
   "created_at": "2023-10-26T18:43:09Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 52,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-36435: .NET Denial of Service Vulnerability",
@@ -302,6 +508,10 @@
  },
  {
   "created_at": "2023-10-26T18:41:46Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 51,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-36799: .NET Denial of Service Vulnerability",
@@ -309,6 +519,10 @@
  },
  {
   "created_at": "2023-09-19T18:45:05Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 50,
   "state": "open",
   "title": "Microsoft Security Advisory: Multiple issues involving `Microsoft.DiaSymReader.Native`",
@@ -316,6 +530,10 @@
  },
  {
   "created_at": "2023-09-19T18:43:31Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 49,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-36799: .NET Denial of Service Vulnerability",
@@ -323,6 +541,10 @@
  },
  {
   "created_at": "2023-07-13T22:53:13Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 48,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-33127: .NET Remote Code Execution Vulnerability",
@@ -330,6 +552,10 @@
  },
  {
   "created_at": "2023-06-28T18:51:21Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 47,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-33128: .NET Remote Code Execution Vulnerability",
@@ -337,6 +563,10 @@
  },
  {
   "created_at": "2023-06-28T18:49:59Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 46,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-33126: .NET Remote Code Execution Vulnerability",
@@ -344,6 +574,10 @@
  },
  {
   "created_at": "2023-06-28T18:48:42Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 45,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-32032: .NET Elevation of Privilege Vulnerability",
@@ -351,6 +585,10 @@
  },
  {
   "created_at": "2023-06-28T18:47:11Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 44,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-29331: .NET Denial of Service vulnerability",
@@ -358,6 +596,10 @@
  },
  {
   "created_at": "2023-06-28T18:45:49Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 42,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-24936: .NET Elevation of Privilege Vulnerability",
@@ -365,6 +607,10 @@
  },
  {
   "created_at": "2023-06-28T18:44:07Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 41,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-24895: .NET Remote Code Execution Vulnerability",
@@ -372,6 +618,10 @@
  },
  {
   "created_at": "2023-06-28T18:43:05Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 40,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-24897: .NET Remote Code Execution Vulnerability",
@@ -379,6 +629,10 @@
  },
  {
   "created_at": "2023-04-13T19:39:31Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 39,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-28260: .NET Remote Code Execution Vulnerability",
@@ -386,6 +640,10 @@
  },
  {
   "created_at": "2023-02-24T18:37:19Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 38,
   "state": "open",
   "title": " Microsoft Security Advisory CVE-2023-21808: .NET Remote Code Execution Vulnerability",
@@ -393,6 +651,10 @@
  },
  {
   "created_at": "2023-01-24T19:38:32Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 37,
   "state": "open",
   "title": " Microsoft Security Advisory CVE 2022-41089 | .NET Remote Code Execution Vulnerability",
@@ -400,6 +662,10 @@
  },
  {
   "created_at": "2023-01-24T19:37:27Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 36,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2023-21538 | .NET Denial of Service Vulnerability",
@@ -407,6 +673,10 @@
  },
  {
   "created_at": "2022-12-13T17:46:21Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 35,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2022-41076: PowerShell Remote Code Execution Vulnerability",
@@ -414,6 +684,10 @@
  },
  {
   "created_at": "2022-11-09T21:30:52Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 34,
   "state": "open",
   "title": "OpenSSL 3.0 November Security Release",
@@ -421,6 +695,10 @@
  },
  {
   "created_at": "2022-08-11T22:23:56Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 33,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2022-34716: .NET Information Disclosure Vulnerability",
@@ -428,6 +706,10 @@
  },
  {
   "created_at": "2022-05-17T20:23:57Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 32,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2022-23267 | .NET Denial of Service Vulnerability",
@@ -435,6 +717,10 @@
  },
  {
   "created_at": "2022-04-27T18:04:59Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 31,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2022-26788: PowerShell Elevation of Privilege Vulnerability",
@@ -442,6 +728,10 @@
  },
  {
   "created_at": "2022-03-16T20:43:02Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 30,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2020-8927 | .NET Remote Code Execution Vulnerability",
@@ -449,6 +739,10 @@
  },
  {
   "created_at": "2022-03-16T20:41:52Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 29,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2022-24512: PowerShell Remote Code Execution",
@@ -456,6 +750,10 @@
  },
  {
   "created_at": "2021-12-14T22:10:59Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 28,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2021-43896: Spoofing issue in PowerShell 7.2",
@@ -463,6 +761,10 @@
  },
  {
   "created_at": "2021-10-14T18:54:45Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 27,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2020-0951: Windows Defender Application Control Security Feature Bypass Vulnerability",
@@ -470,6 +772,10 @@
  },
  {
   "created_at": "2021-10-14T18:52:24Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 26,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2021-41355 | .NET Core Information Disclosure Vulnerability",
@@ -477,6 +783,10 @@
  },
  {
   "created_at": "2021-08-12T22:06:16Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 25,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2021-26423: .NET Core Denial of Service Vulnerability",
@@ -484,6 +794,10 @@
  },
  {
   "created_at": "2021-08-12T22:05:02Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 24,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2021-34485: .NET Core Information Disclosure Vulnerability",
@@ -491,6 +805,10 @@
  },
  {
   "created_at": "2021-03-11T23:37:55Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 23,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2021-26701: .NET Core Remote Code Execution Vulnerability",
@@ -498,13 +816,29 @@
  },
  {
   "created_at": "2021-02-11T23:54:36Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 22,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2021-1721: PowerShell Denial of Service Vulnerability",
   "updated_at": "2021-03-12T00:02:50Z"
  },
  {
+  "created_at": "2020-10-13T19:02:11Z",
+  "labels": [],
+  "number": 21,
+  "state": "open",
+  "title": "Microsoft Security Advisory CVE-2020-16886: PowerShellGet Module WDAC Bypass Vulnerability",
+  "updated_at": "2020-12-10T21:58:37Z"
+ },
+ {
   "created_at": "2020-05-15T00:09:27Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 20,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2020-1108: .NET Core Denial of Service Vulnerability",
@@ -512,6 +846,10 @@
  },
  {
   "created_at": "2019-07-16T17:26:14Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 19,
   "state": "open",
   "title": " Microsoft Security Advisory CVE-2019-1167: Windows Defender Application Control Security Feature Bypass Vulnerability",
@@ -519,6 +857,10 @@
  },
  {
   "created_at": "2019-05-21T18:08:57Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 18,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0733 - Windows Defender Application Control Security Feature Bypass Vulnerability",
@@ -526,6 +868,10 @@
  },
  {
   "created_at": "2019-05-21T18:06:24Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 17,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0981: .NET Core Denial of Service Vulnerability",
@@ -533,6 +879,10 @@
  },
  {
   "created_at": "2019-05-21T18:04:03Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 16,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0980: .NET Core Denial of Service Vulnerability",
@@ -540,6 +890,10 @@
  },
  {
   "created_at": "2019-05-21T18:02:13Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 15,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0820: .NET Core Denial of Service Vulnerability",
@@ -547,6 +901,10 @@
  },
  {
   "created_at": "2019-02-19T18:27:37Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 14,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0657: PowerShell Core Domain Spoofing Vulnerability",
@@ -554,6 +912,10 @@
  },
  {
   "created_at": "2019-02-19T18:26:40Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 13,
   "state": "open",
   "title": "Microsoft Security Advisory - Multiple UMCI bypass vulnerabilities",
@@ -561,6 +923,10 @@
  },
  {
   "created_at": "2019-01-15T20:11:15Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 12,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0564: ASP.NET Core Denial of Service Vulnerability",
@@ -568,6 +934,10 @@
  },
  {
   "created_at": "2019-01-15T20:08:39Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 11,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-8416: .NET Core Tampering Vulnerability",
@@ -575,6 +945,10 @@
  },
  {
   "created_at": "2019-01-15T20:06:13Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 10,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2019-0545: .NET Core Information Disclosure Vulnerability",
@@ -582,6 +956,10 @@
  },
  {
   "created_at": "2018-11-13T18:14:14Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 9,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-8415: Microsoft PowerShell Tampering Vulnerability",
@@ -589,6 +967,10 @@
  },
  {
   "created_at": "2018-11-13T18:08:09Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 8,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-8256: Microsoft PowerShell Remote Code Execution Vulnerability",
@@ -596,6 +978,10 @@
  },
  {
   "created_at": "2018-10-09T23:31:27Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 7,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-8292 - .NET Core Information Disclosure Vulnerability",
@@ -603,6 +989,10 @@
  },
  {
   "created_at": "2018-07-19T23:07:28Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 6,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-8356: .NET Framework Security Feature Bypass Vulnerability",
@@ -610,6 +1000,11 @@
  },
  {
   "created_at": "2018-07-11T17:34:50Z",
+  "labels": [
+   "Security",
+   "PowerShell Editor Services",
+   "PowerShell VS Code Extension"
+  ],
   "number": 5,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-8327: Critical Remote Code Execution in PowerShell Editor Services",
@@ -617,6 +1012,10 @@
  },
  {
   "created_at": "2018-03-15T17:54:41Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 4,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-0875: Hash Collision can cause Denial of Service",
@@ -624,6 +1023,10 @@
  },
  {
   "created_at": "2018-01-25T18:42:41Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 3,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-0786: Security Feature Bypass in X509 Certificate Validation",
@@ -631,6 +1034,10 @@
  },
  {
   "created_at": "2018-01-25T18:41:42Z",
+  "labels": [
+   "Security",
+   "PowerShell"
+  ],
   "number": 2,
   "state": "open",
   "title": "Microsoft Security Advisory CVE-2018-0764: Denial of Service when parsing XML documents",
