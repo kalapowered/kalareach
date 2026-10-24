@@ -835,8 +835,9 @@ attempt holds its host's endpoint from its first dial to its end, and an owner's
 host's while it runs. Nothing else the device does closes a held endpoint, and a connection that
 would have to is refused until the hold ends. A visit, a look in the background at a host that is
 not the one in use (`HostLink::visit_paired`), leaves the host in use's relay to it: a visit to a
-host whose configuration shares a relay with the host in use's, without being the same, is refused
-as a connection lost, whether or not the host in use's endpoint is open at that moment.
+host whose services (its relays and address lookups) differ from the host in use's and share a relay
+with them is refused as a connection lost, whether or not the host in use's endpoint is open at that
+moment. Which host is in use is asked when the visit's turn at the pool comes.
 
 The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
 function the host and the command line use. The device shows it only once the host's answer to

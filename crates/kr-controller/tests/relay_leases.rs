@@ -5196,7 +5196,7 @@ impl kr_client::pairing::link::HostLink for Counting {
         &'a self,
         host: &'a kr_client::pairing::paired::PairedHost,
         identity: &'a kr_transport::handshake::LocalIdentity,
-        in_use: Option<&'a kr_protocol::pairing::NetworkConfig>,
+        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
     ) -> kr_client::pairing::BoxFuture<
         'a,
         Result<

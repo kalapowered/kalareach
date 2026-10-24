@@ -228,11 +228,8 @@ impl Connection {
         let identity = pairing.candidate.paired_identity(host.device_id);
         let connecting = async {
             if visiting {
-                let in_use = device.host_in_use().map(|using| using.network_config);
-                pairing
-                    .link
-                    .visit_paired(host, &identity, in_use.as_ref())
-                    .await
+                let in_use = || device.host_in_use().map(|using| using.network_config);
+                pairing.link.visit_paired(host, &identity, &in_use).await
             } else {
                 pairing.link.connect_paired(host, &identity).await
             }
