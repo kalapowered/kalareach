@@ -286,8 +286,9 @@ export function Inbox({
   const notes = useMemo(() => (here ? inboxNotes(here.result) : []), [here])
   const shown = chosen === 'all' ? hosted : hosted.filter((each) => each.row.kind === chosen)
   const showContacts = chosen === 'all' || chosen === 'disconnected'
-  // A refusal is no kind of item, so it is listed with everything and under no other filter.
-  const showRefusals = chosen === 'all' && refusals.length > 0
+  // A refusal is no kind of item, and it hides what the host holds from every filter, so it is
+  // told under every filter.
+  const showRefusals = refusals.length > 0
   const whereOf = (entry: HostedRow): string => {
     const sessionId = entry.row.item.session_id
     const named = several ? `${entry.host.name} · ` : ''
@@ -394,7 +395,7 @@ export function Inbox({
             <li key={each.host.reference}>
               <div
                 className="m-row"
-                data-tone="warning"
+                data-tone="muted"
                 data-kind="refused"
                 data-host={each.host.name}
                 data-testid="inbox-refusal"

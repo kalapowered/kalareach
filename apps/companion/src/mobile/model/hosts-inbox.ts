@@ -47,10 +47,10 @@ export function useOtherHosts(): OtherHosts {
 
   useEffect(() => {
     let live = true
-    const cadence = readOnCadence(async () => {
-      // Who is in use is known as soon as the pairing screen's view answers, whatever a slow host
-      // has not said yet.
-      const looked = port.pairingView().then(
+    // Which host is in use is its own read, on a cadence of its own: a host that answers its visit
+    // slowly holds up the visits, and must not hold up the news of which host is in use.
+    const looking = readOnCadence(() => {
+      return port.pairingView().then(
         (view) => {
           if (!live) return
           const listed = view.hosts
@@ -63,7 +63,9 @@ export function useOtherHosts(): OtherHosts {
         },
         () => undefined
       )
-      const visited = port.inboxHosts().then(
+    }, ATTENTION_READ_CADENCE_MS)
+    const visiting = readOnCadence(() => {
+      return port.inboxHosts().then(
         (visits) => {
           if (!live) return
           setHosts(visits)
@@ -86,20 +88,20 @@ export function useOtherHosts(): OtherHosts {
         },
         () => undefined
       )
-      await Promise.all([looked, visited])
     }, ATTENTION_READ_CADENCE_MS)
+    const both = () => {
+      looking.now()
+      visiting.now()
+    }
     // The host in use is the connection's: a change of it is looked at at once, as the inbox's own
     // read is, and not at the next round.
-    const connection = watch([
-      port.onConnection(() => {
-        cadence.now()
-      })
-    ])
-    nudge.current = cadence.now
-    cadence.now()
+    const connection = watch([port.onConnection(both)])
+    nudge.current = both
+    both()
     return () => {
       live = false
-      cadence.stop()
+      looking.stop()
+      visiting.stop()
       connection.stop()
       nudge.current = () => undefined
     }

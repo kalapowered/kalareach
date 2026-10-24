@@ -148,7 +148,8 @@ impl From<Missed> for Visited {
 
 impl InboxDesk {
     /// Visits every paired host that is not the one in use, all at once, and answers with what each
-    /// said, in the order the pairing screen lists them.
+    /// said, in the order the pairing screen lists them. A host this device forgot, or began to use,
+    /// while it was visited is not among them.
     pub async fn visit(self: &Arc<Self>, device: &Arc<Device>) -> Vec<HostInbox> {
         let in_use = device.host_in_use().map(|host| host.host_device_id);
         let hosts: Vec<PairedHost> = device
@@ -184,7 +185,7 @@ impl InboxDesk {
             .collect();
         let mut found = Vec::new();
         for visit in visits {
-            if let Ok(each) = visit.await {
+            if let Ok(Some(each)) = visit.await {
                 found.push(each);
             }
         }
@@ -199,7 +200,9 @@ impl InboxDesk {
         }
     }
 
-    async fn visit_one(&self, device: &Arc<Device>, host: &PairedHost) -> HostInbox {
+    /// One visit to `host`. `None` when this device forgot the host, or began to use it, while it
+    /// was visited: it is no longer a host to report.
+    async fn visit_one(&self, device: &Arc<Device>, host: &PairedHost) -> Option<HostInbox> {
         let gate = Arc::clone(&self.kept().entry(host.host_device_id).or_default().gate);
         let _turn = gate.lock().await;
         let now = device.pairing().clock.wall_clock_ms();
@@ -238,7 +241,7 @@ impl InboxDesk {
                 connection.session().close();
             }
             kept.remove(&host.host_device_id);
-            return found;
+            return None;
         }
         let entry = kept.entry(host.host_device_id).or_default();
         match outcome {
@@ -264,7 +267,7 @@ impl InboxDesk {
                 found.lost_since_ms = Some(*entry.lost_since_ms.get_or_insert(now));
             }
         }
-        found
+        Some(found)
     }
 
     fn kept(&self) -> MutexGuard<'_, BTreeMap<DeviceId, Kept>> {

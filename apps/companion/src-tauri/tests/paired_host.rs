@@ -20,7 +20,8 @@
 //! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
 //! | KR-REQ-13.01 | `the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use` |
 //! | KR-REQ-13.01 | `a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refused` |
-//! | KR-REQ-13.01 | `an_owned_host_is_visited_beside_the_host_in_use_and_never_cuts_it_off` |
+//! | KR-REQ-13.01 | `a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported` |
+//! | KR-REQ-13.01 | `the_owner_watcher_visits_an_owned_host_beside_the_host_in_use` |
 //! | KR-REQ-23.32 | `a_paired_devices_questions_go_through_the_host` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
@@ -677,10 +678,70 @@ async fn a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refuse
     second.stop().await;
 }
 
+/// KR-REQ-13.01: a host the phone begins to use, or forgets, while it is being visited is no longer
+/// one of the other hosts: the visit's answer does not report it, whatever the visit found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let third = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
+    connection(companion, true).await;
+    let device = companion.device();
+    let id_of = |name_of: &Host| {
+        device
+            .pairing()
+            .hosts
+            .list()
+            .expect("the records")
+            .into_iter()
+            .find(|each| each.host_endpoint_id == name_of.network().endpoint_id())
+            .expect("the host is recorded")
+            .host_device_id
+    };
+    let (second_id, third_id) = (id_of(&second), id_of(&third));
+
+    // Both visits are under way, held at their connections.
+    control.hold();
+    let desk = Arc::new(companion_tauri::inbox::InboxDesk::default());
+    let visiting = tokio::spawn({
+        let (desk, device) = (Arc::clone(&desk), Arc::clone(&device));
+        async move { desk.visit(&device).await }
+    });
+    tokio::time::timeout(WATCHDOG, async {
+        while control.held() < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both visits are held");
+
+    // The person begins to use the second host and forgets the third.
+    device.use_host(second_id).expect("the second is chosen");
+    device
+        .forget_host(third_id)
+        .expect("the third is forgotten");
+    control.stop_holding();
+    control.release_all();
+
+    let found = visiting.await.expect("the visit ran");
+    assert!(found.is_empty(), "{found:?}");
+    first.stop().await;
+    second.stop().await;
+    third.stop().await;
+}
+
 /// KR-REQ-13.01: a host this computer owns is watched for what it wants confirmed, and the watcher
 /// visits it beside the host in use: it asks the link to leave the host in use's connection alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_owned_host_is_visited_beside_the_host_in_use_and_never_cuts_it_off() {
+async fn the_owner_watcher_visits_an_owned_host_beside_the_host_in_use() {
     let owner = DeviceKeys::generate().expect("keys");
     let first = Host::start(&owner).await;
     let second = Host::start(&owner).await;

@@ -2604,8 +2604,8 @@ fn unavailable_push_view() -> crate::push::PushView {
 ///
 /// The inbox is one across hosts, so each of the others is visited over a connection of its own,
 /// all at once and each within a bound, and the page is given what each said: its inbox and its
-/// sessions' numbers, that the device is out of contact with it and since when, or that its grant
-/// does not reach the inbox. The page names no host and no parameter.
+/// sessions' numbers, that the host answered and refused (with the refusal it sent), or that the
+/// device is out of contact with it and since when. The page names no host and no parameter.
 #[tauri::command]
 pub async fn inbox_hosts(state: State<'_, AppState>) -> Result<Vec<crate::inbox::HostInbox>> {
     let device = state.device()?;

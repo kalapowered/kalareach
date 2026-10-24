@@ -201,18 +201,17 @@ describe('the inbox of a phone paired with two hosts', () => {
     controls.setInboxHosts([
       refusingLaptop({
         code: 'PERMISSION_DENIED',
-        message: 'this device is no longer paired with this host',
-        user_action: 'pair_again'
+        message: 'this device may not read this host',
+        user_action: 'fix_configuration'
       })
     ])
     readNow()
     const refusal = await screen.findByTestId('inbox-refusal')
     expect(refusal).toHaveAttribute('data-kind', 'refused')
     expect(refusal).toHaveAttribute('data-host', 'laptop')
-    expect(refusal).toHaveTextContent('laptop refused to show its inbox')
     // The host's own words, and what the person can do about them.
-    expect(refusal).toHaveTextContent('this device is no longer paired with this host')
-    expect(refusal).toHaveTextContent('Pair this device with the host again.')
+    expect(refusal).toHaveTextContent('this device may not read this host')
+    expect(refusal).toHaveTextContent('Change a setting on this device or on the host.')
     // The host answered: the row says so, and does not say that contact is gone.
     expect(refusal).not.toHaveTextContent(/No contact/)
     expect(screen.queryByTestId('inbox-contact')).toBeNull()
@@ -222,6 +221,9 @@ describe('the inbox of a phone paired with two hosts', () => {
     expect(screen.getByRole('button', { name: /^Out of contact \(/ }).textContent).toBe(outBefore)
     expect(refusal).not.toHaveAttribute('data-kind', 'failed_action')
     expect(rowsOf('laptop')).toHaveLength(0)
+    // It hides what the host holds under every filter, so it is told under every filter.
+    await userEvent.setup().click(screen.getByRole('button', { name: /^Waiting for you \(/ }))
+    expect(screen.getByTestId('inbox-refusal')).toBeInTheDocument()
   })
 
   it('stops drawing the refusal once the host shows its inbox again', async () => {
@@ -233,7 +235,8 @@ describe('the inbox of a phone paired with two hosts', () => {
       refusingLaptop({ code: 'PERMISSION_DENIED', message: 'not for this device', user_action: 'nothing' })
     ])
     readNow()
-    await screen.findByTestId('inbox-refusal')
+    // The host's words run into the next sentence only after a full stop.
+    expect(await screen.findByTestId('inbox-refusal')).toHaveTextContent('not for this device. It answered')
     controls.setInboxHosts([laptopRead()])
     readNow()
     await waitFor(() => {
@@ -257,6 +260,30 @@ describe('the inbox of a phone paired with two hosts', () => {
     expect(studio).toHaveTextContent(/^.*No contact/)
     expect(screen.queryByText('The inbox could not be read')).toBeNull()
     expect(rowsOf('studio').length).toBeGreaterThan(0)
+  })
+
+  // A host that answers its visit slowly holds up the pass, not the news of which host is in use.
+  it('shows nothing of the host that was in use once another is, while a slow host holds the visits', async () => {
+    const { controls } = start()
+    await waitFor(() => {
+      expect(rowsOf('studio').length).toBeGreaterThan(0)
+    })
+    const release = controls.holdInboxHosts()
+    readNow()
+    act(() => {
+      controls.setPairing({
+        hosts: [
+          { ...STUDIO, in_use: false },
+          { ...LAPTOP, in_use: true }
+        ]
+      })
+      controls.setConnected(false)
+    })
+    await waitFor(() => {
+      expect(rowsOf('studio')).toHaveLength(0)
+    })
+    expect(await screen.findByTestId('inbox-contact')).toHaveAttribute('data-host', 'laptop')
+    release()
   })
 
   it('shows nothing of the host that was in use once another is, whatever the new one answers', async () => {

@@ -769,6 +769,11 @@ export interface FakeHostControls {
    */
   holdRegistrations(): () => void
   /**
+   * Holds every visit to the other hosts' inboxes from now on, as a host that takes the connection
+   * and answers nothing does until its bound. Returns the function that lets them answer.
+   */
+  holdInboxHosts(): () => void
+  /**
    * Sets how the host presents raw terminal views opened from now on: directly, as a viewport for
    * `reason`, as a viewport with no reason (which is how a worker built before reasons reports every
    * viewport), or with null, not as a terminal at all. A view declares a terminal profile of its own,
@@ -1219,6 +1224,7 @@ export function fakeHost(
   const forgottenHosts: string[] = []
   /** What a visit to each other paired host finds of its inbox, until a test sets another. */
   let inboxHosts: readonly HostInbox[] = []
+  let holdingInboxHosts: Promise<void> = Promise.resolve()
   /** The words the host refuses a preparation with while no voice grant stands, or none. */
   let voiceGrantMissing: string | null = null
   let voiceAllowFailure: string | null = null
@@ -2332,7 +2338,7 @@ export function fakeHost(
       return Promise.resolve(connectionNow())
     },
     inboxHosts: () =>
-      Promise.resolve(
+      holdingInboxHosts.then(() =>
         inboxHosts.filter(
           (each) => !pairing.hosts.some((host) => host.reference === each.reference && host.in_use)
         )
@@ -3472,6 +3478,16 @@ export function fakeHost(
       reviewOutcome = outcome
     },
     reviewed,
+    holdInboxHosts() {
+      let release = () => {}
+      holdingInboxHosts = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return () => {
+        release()
+        holdingInboxHosts = Promise.resolve()
+      }
+    },
     holdRegistrations() {
       let complete = () => {}
       registering = new Promise((resolve) => {
