@@ -679,6 +679,7 @@ impl Controller {
             self.feed_refusal
                 .fetch_or(FEED_REMOVED, std::sync::atomic::Ordering::SeqCst);
             self.advance_authority_epoch();
+            self.release_the_links_the_feed_refuses();
         }
     }
 
@@ -1098,6 +1099,9 @@ impl Controller {
         drop(policy);
         drop(registry);
         self.advance_authority_epoch();
+        if raised {
+            self.release_the_links_the_feed_refuses();
+        }
     }
 
     /// The refusal the authority feed puts on every remote grant now, if one stands.
