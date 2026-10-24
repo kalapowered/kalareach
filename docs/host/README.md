@@ -6669,6 +6669,14 @@ revoked, and for a restart that finds the issuer revoked. The request is shown r
 who published it, who can publish it again from a device the host holds live or revoke what it
 named at the machine. Carrying it out again by itself needs a record of the host's own that
 survives the restore, which is a stored place.
+A lost clock continuity brings about the same outcome. When the host lost the continuity of its clock
+and the issuer's grant stands on the clock, the request waits and the pass ends as one the host could
+not finish. If a withdrawal the host cannot verify names that issuer, the remedy has the owner revoke
+the device, and the next scan then refuses the request, because the registry holds its issuer
+revoked; what the request named is not withdrawn. `kr doctor` names each such device and says so.
+Establishing the clock does not end the wait, because an owner device's confirmation is refused while
+the refusal stands. A reboot of the machine ends a lost continuity, and the host then judges the
+request at its place and carries it out.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier
 that fences the workers and withdraws every connection admitted under the earlier state. The next
 revision it issues is then above everything it issued, and it decides again. A pass that stops
