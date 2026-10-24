@@ -128,10 +128,10 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
     } else {
         serde_json::from_slice(&received.body).map_err(|_| ())
     };
-    let handled = match parsed {
+    let handled = match &parsed {
         Ok(document) => web.handle(
             &received.path,
-            &document,
+            document,
             token.as_deref(),
             carries_content.then_some(received.body.as_slice()),
         ),
@@ -148,16 +148,17 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
         }
         Handled::Gated(epoch) => {
             web.held_until_released(epoch).await;
-            // Handled as if it had just arrived, without being recorded or counted again.
-            match serde_json::from_slice::<serde_json::Value>(&received.body) {
+            // Handled as if it had just arrived, without being recorded or counted again, as the
+            // document the request was read as.
+            match &parsed {
                 Ok(document) => Handled::Answer(web.answer(
                     &received.path,
-                    &document,
+                    document,
                     token.as_deref(),
                     carries_content.then_some(received.body.as_slice()),
                     false,
                 )),
-                Err(_) => Handled::Lost,
+                Err(()) => Handled::Lost,
             }
         }
         other => other,
