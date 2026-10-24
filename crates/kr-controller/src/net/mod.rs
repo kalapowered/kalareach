@@ -2343,6 +2343,21 @@ pub(crate) mod tests {
         .await
     }
 
+    /// As [`daemon_on`], once the sweep the daemon makes as it starts is over.
+    ///
+    /// That sweep reads the host's clocks to decide whether a record may be forgotten, and a
+    /// reading taken after a test has moved the continuous clock puts the moment that clock implies
+    /// into the host's floor. A test that moves its clocks starts its daemon here, so that no such
+    /// reading comes after its first step.
+    pub(in crate::service) async fn daemon_on_clocks_to_move(
+        temp: &kr_ipc::testing::TempHost,
+        clocks: crate::service::Clocks,
+    ) -> Arc<Controller> {
+        let controller = daemon_on(temp, clocks).await;
+        controller.transfer().until_a_sweep_has_ended().await;
+        controller
+    }
+
     /// Starts a daemon with `start`, and again while a daemon this test let go still holds the
     /// environment ([`crate::testing::taken_over`]). Any other failure fails the test.
     pub(crate) async fn started<F, S>(start: F) -> Arc<Controller>
@@ -3668,7 +3683,7 @@ pub(crate) mod tests {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = manual_clocks();
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
-        let controller = daemon_on(&temp, clocks).await;
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         // The bound is the owner's option: until one is chosen the grant is decided with none, and
@@ -3802,7 +3817,7 @@ pub(crate) mod tests {
         // clock stands still, so any moment the floor held past it would be one the continuous
         // clock implied.
         let (continuous, wall, clocks) = manual_clocks();
-        let controller = daemon_on(&temp, clocks).await;
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
@@ -3830,7 +3845,7 @@ pub(crate) mod tests {
     async fn a_shorter_offline_bound_after_a_rollback_never_ends_later() {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = manual_clocks();
-        let controller = daemon_on(&temp, clocks).await;
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 400);
@@ -3863,7 +3878,7 @@ pub(crate) mod tests {
     async fn an_offline_lapse_the_continuous_clock_found_is_written_down_once_storage_takes_it() {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = manual_clocks();
-        let controller = daemon_on(&temp, clocks).await;
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
@@ -3948,7 +3963,7 @@ pub(crate) mod tests {
     async fn the_record_task_writes_down_the_time_an_offline_bound_has_spent() {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = manual_clocks();
-        let controller = daemon_on(&temp, clocks).await;
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);
         let floor = controller.policy().utc_floor_ms();
@@ -3978,7 +3993,7 @@ pub(crate) mod tests {
     async fn push_writes_down_the_time_an_offline_bound_spent_when_it_finds_it_run_out() {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = manual_clocks();
-        let controller = daemon_on(&temp, clocks).await;
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
         let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
         choose_offline_bound(&controller, synchronised, 200);

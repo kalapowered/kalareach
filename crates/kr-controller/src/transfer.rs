@@ -117,6 +117,10 @@ pub struct TransferModule {
     /// answer is written. Compiled only with the `testing` feature.
     #[cfg(feature = "testing")]
     after_a_claim: Arc<crate::attention::Pause>,
+    /// How many sweeps the daemon's own sweep loop has ended, for this crate's tests to wait for
+    /// the one it makes as it starts. Compiled only into this crate's tests.
+    #[cfg(test)]
+    sweeps_ended: tokio::sync::watch::Sender<u64>,
 }
 
 /// The admission one transfer mutation arrived under, as the transfer service asks about it.
@@ -377,6 +381,8 @@ impl TransferModule {
             before_a_claim: Arc::new(crate::attention::Pause::default()),
             #[cfg(feature = "testing")]
             after_a_claim: Arc::new(crate::attention::Pause::default()),
+            #[cfg(test)]
+            sweeps_ended: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -1107,6 +1113,16 @@ impl TransferModule {
         )
     }
 
+    /// Waits until the daemon's own sweep loop has ended a sweep, which is the one it makes as it
+    /// starts. That sweep asks the host whether its clock may be trusted to let a record go, and a
+    /// test that moves the host's clocks by hand has to move them after that question and not
+    /// while it is still to come: the answer is read from the clocks as they stand.
+    #[cfg(test)]
+    pub(crate) async fn until_a_sweep_has_ended(&self) {
+        let mut ended = self.sweeps_ended.subscribe();
+        let _ = ended.wait_for(|ended| *ended > 0).await;
+    }
+
     /// Queues a sweep as [`TransferModule::sweep`] does, one that stops once the archive has said
     /// which sessions retain, until the test lets it go: the receiver hears it arrive there, and
     /// the sender lets it go on.
@@ -1399,6 +1415,13 @@ async fn sweep_forever(daemon: Weak<Controller>) {
             return;
         };
         let _ = swept.await;
+        #[cfg(test)]
+        if let Some(controller) = daemon.upgrade() {
+            controller
+                .transfer()
+                .sweeps_ended
+                .send_modify(|ended| *ended += 1);
+        }
     }
 }
 
