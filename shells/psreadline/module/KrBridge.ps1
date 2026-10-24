@@ -131,6 +131,8 @@ $script:Line = @{
     # the first time it is wanted.
     Route            = $null
     RouteRead        = $false
+    # The words that command is given when every one of them is a plain constant, or nothing.
+    RouteWords       = $null
 }
 
 # A line of diagnostics, when the session asked for them.

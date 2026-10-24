@@ -219,6 +219,29 @@ fn a_backend_runs_the_command_through_the_launcher_it_names() {
     shellpkg::a_backend_runs_the_command_through_the_launcher_it_names(PWSH);
 }
 
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_name_the_person_defined_runs_as_defined_and_the_worker_is_never_asked_about_it() {
+    shellpkg::a_name_the_person_has_defined_is_never_asked_about(PWSH);
+}
+
+/// KR-REQ-01.06, KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_program_the_worker_does_not_take_leaves_the_status_it_left() {
+    shellpkg::a_program_the_worker_does_not_take_leaves_the_status_it_left(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed() {
+    shellpkg::a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed(
+        PWSH,
+    );
+}
+
 /// KR-REQ-25.05
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
