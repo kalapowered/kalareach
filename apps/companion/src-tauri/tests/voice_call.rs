@@ -1165,7 +1165,8 @@ async fn signing_out_during_a_call_ends_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_return() {
     let mut scene = scene().await;
-    // The service takes its time over what the device sends it.
+    // The page is told the control is connected as the device queues the sentence for the model,
+    // and the service takes its time over it: the sentence is waited for, not looked for.
     scene.stand_in.control().hold_requests(true);
     scene.start().await;
     scene
@@ -1183,6 +1184,17 @@ async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_retur
             .filter(|sent| sent.command == "instructions")
             .count()
     };
+    scene.stand_in.control().hold_requests(false);
+    scene
+        .stand_in
+        .control()
+        .until("the sentence for what this version does", |report| {
+            report
+                .sent
+                .iter()
+                .any(|sent| sent.command == "instructions")
+        })
+        .await;
     assert_eq!(instructions(&scene), 1, "told once what this version does");
 
     // The connection to the host ends.
