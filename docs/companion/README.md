@@ -530,7 +530,9 @@ directory, because a device run has no provider; a release build reads neither.
 On a computer that is one of a host's owner devices, `src-tauri/src/owner.rs` asks each such host
 every two seconds what it wants confirmed. Each visit ends within ten seconds, so a host that takes
 the connection and answers nothing is out of contact until the next round and holds up no other
-host. These visits, like the inbox's, never cut off the host in use. The requests head Attention, and each row has its title,
+host. A host that is reached, and that this computer cannot give the lease its organisation signs
+for it (signed out, not a member, the organisation's service not answering), is in contact, and the
+pairing screen says why in the words of what stopped the lease. These visits, like the inbox's, never cut off the host in use. The requests head Attention, and each row has its title,
 its description in one line, the time left, and a button named for this computer's ceremony:
 "Confirm with Touch ID", "Confirm with your password" on a Mac without Touch ID, or "Confirm with
 Windows Hello". A phone names its own: "Confirm with Face ID", "Confirm with Touch ID" or "Confirm

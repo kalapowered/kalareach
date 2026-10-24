@@ -547,6 +547,30 @@ describe('pairing with a host', () => {
     expect(list.textContent).toContain('Can view sessions')
   })
 
+  it('says why a host that was reached cannot be used, beside its being in contact', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    act(() => {
+      controls.setPairing({
+        hosts: [
+          {
+            reference: 'studio-ref',
+            in_use: false,
+            name: 'studio',
+            owner: true,
+            authority: 'manage the host as an owner',
+            grant_expires_at_ms: null,
+            in_contact: true,
+            refusal: 'sign in to your account again: this device cannot ask for the lease'
+          }
+        ]
+      })
+    })
+    const list = await screen.findByTestId('paired-hosts')
+    expect(list.textContent).toContain('In contact')
+    expect(screen.getByTestId('host-refusal')).toHaveTextContent(/sign in to your account again/)
+  })
+
   it('reads the state once it is listening, so a change while it registers is not lost', async () => {
     const { port, controls } = fakeHost()
     const complete = controls.holdRegistrations()

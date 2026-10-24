@@ -649,6 +649,11 @@ export interface HostRow {
   readonly authority: string
   readonly grant_expires_at_ms: number | null
   readonly in_contact: boolean | null
+  /**
+   * Why this computer reached the host and could not use it, in words: it could not give the host
+   * the lease its organisation signs for it. Absent when there is nothing to say.
+   */
+  readonly refusal?: string
 }
 
 /** A session of a host, by the number the host gives it. */
