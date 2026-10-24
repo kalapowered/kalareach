@@ -37,6 +37,10 @@ use crate::service::net::devices::DeviceRecord;
 /// holds it to that.
 pub const MANAGEMENT_PROBE: Method = Method::DeviceList;
 
+/// How many times a refusal that rises asks for the pairing records' write lock to learn that every
+/// confirmation under way has ended. Each attempt waits as long as the database's busy timeout.
+const MOST_DRAIN_ATTEMPTS: usize = 12;
+
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
 
@@ -668,17 +672,17 @@ impl Controller {
     /// lease, and personal remote access under a bounded offline-validity policy or on a host
     /// that is exclusively organisation-managed. A restriction does not wait for its record to be
     /// written, so a registry that cannot take a write restricts all the same.
-    fn refuse_the_grants_that_rest_on_the_feed(&self) {
-        let mut policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !policy.feed_removed() {
-            policy.set_feed_removed(true);
-            self.feed_refusal.raise(RemoteRefusal::FEED_REMOVED);
-            self.advance_authority_epoch();
-            self.release_the_links_the_feed_refuses();
-        }
+    ///
+    /// It rises as the other two refusals do, in the order a withdrawal takes its locks in, so that
+    /// work which checked the refusal before it rose has committed before it returns.
+    async fn refuse_the_grants_that_rest_on_the_feed(&self) {
+        self.move_a_feed_refusal(
+            RemoteRefusal::FEED_REMOVED,
+            true,
+            crate::grants::HostPolicy::feed_removed,
+            crate::grants::HostPolicy::set_feed_removed,
+        )
+        .await;
     }
 
     /// Mirrors into the refusal word whether personal grants rest on the feed, from the policy that
@@ -1056,21 +1060,29 @@ impl Controller {
     /// Waits until every owner confirmation that was being spent when a refusal rose has been
     /// committed or refused.
     ///
-    /// A spend reads the word inside its transaction, which holds the pairing records' write lock
-    /// from its first statement. A write transaction of this one's own, taken after the word was
-    /// raised, therefore waits for each spend that read the word before it was raised, and each
-    /// spend that begins after reads it raised: when this returns, no confirmation can be spent
-    /// under the standing the refusal took away.
+    /// A spend reads the word inside its transaction, which holds the registry database's write
+    /// lock from its first statement, whichever handle on the database it runs through. A write
+    /// transaction of this one's own, taken after the word was raised, therefore waits for each
+    /// spend that read the word before it was raised, and each spend that begins after reads it
+    /// raised: when this returns, no confirmation can be spent under the standing the refusal took
+    /// away. A wait the database cuts short is made again, up to the number of attempts below; the
+    /// time a spend holds the lock is a few milliseconds.
     async fn wait_for_the_confirmations_being_spent(&self) {
-        let devices = Arc::clone(&self.devices);
-        match tokio::task::spawn_blocking(move || devices.transaction(|_| Ok(()))).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => eprintln!(
-                "kr-controller: could not wait for the owner confirmations being spent: {error}"
-            ),
-            Err(error) => eprintln!(
-                "kr-controller: could not wait for the owner confirmations being spent: {error}"
-            ),
+        for _ in 0..MOST_DRAIN_ATTEMPTS {
+            let devices = Arc::clone(&self.devices);
+            match tokio::task::spawn_blocking(move || devices.transaction(|_| Ok(()))).await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => eprintln!(
+                    "kr-controller: could not wait for the owner confirmations being spent: {error}"
+                ),
+                Err(error) => {
+                    eprintln!(
+                        "kr-controller: could not wait for the owner confirmations being \
+                         spent: {error}"
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -1174,7 +1186,7 @@ impl Controller {
     /// cursor stands above it.
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = self.wall_now_ms();
-        self.refuse_the_grants_that_rest_on_the_feed();
+        self.refuse_the_grants_that_rest_on_the_feed().await;
         // A feed that was removed shows nothing to compare, so it cannot keep a withdrawal
         // unverified, unless a key the withdrawal takes the right from may still have removed it:
         // the removal says nothing then of an owner having acted, and a removed feed is read no
@@ -1299,7 +1311,7 @@ impl Controller {
             Some(origin) if unusable || selected == Some(origin) => {
                 self.authority_feed()
                     .restore_removal(origin, held.at_ms.get());
-                self.refuse_the_grants_that_rest_on_the_feed();
+                self.refuse_the_grants_that_rest_on_the_feed().await;
                 removed = true;
             }
             // The owner pointed the host at another feed, or at none: the removal is no removal
@@ -1706,20 +1718,26 @@ mod tests {
     /// that was under way has ended. An owner confirmation reads the refusal inside its write, so
     /// one that read it before it rose has been committed by the time the rise returns, and one
     /// that begins after reads it raised: no confirmation is spent under a standing that a raise
-    /// that has returned took away. The write is held open here, the rise is started and the case
-    /// waits until the refusal stands, and the rise does not return until the write has ended.
+    /// that has returned took away. The write is held open here through a second handle on the
+    /// database, as the network's rows are, the rise is started and the case waits until the
+    /// refusal stands, and the rise does not return until the write has ended.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refusal_that_rises_waits_for_a_write_to_the_pairing_records_that_is_under_way() {
         use super::RemoteRefusal;
         use crate::service::a_transfer_left_unanswered::daemon;
+        use crate::service::net::devices::DeviceDirectory;
 
-        let (_temp, controller) = daemon().await;
+        let (temp, controller) = daemon().await;
+        let beside = DeviceDirectory::open_beside(
+            temp.environment().registry_database(),
+            controller.devices(),
+        )
+        .expect("a second handle on the registry");
         let (inside, under_way) = tokio::sync::oneshot::channel();
         let (go, held_open) = std::sync::mpsc::channel::<()>();
         let write = std::thread::spawn({
-            let controller = std::sync::Arc::clone(&controller);
             move || {
-                controller.devices().transaction(|_| {
+                beside.transaction(|_| {
                     inside.send(()).expect("the case waits for the write");
                     held_open.recv().expect("the case lets the write go on");
                     Ok(())

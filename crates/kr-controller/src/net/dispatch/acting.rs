@@ -254,6 +254,8 @@ impl RemoteConnection {
                 "this grant has been revoked",
             ));
         }
+        self.controller
+            .note_share(self.connection_id, &record.grant);
         Ok(record)
     }
 

@@ -687,8 +687,8 @@ impl Controller {
         // of what they answered, so the tables it writes exist from the first start, and the
         // network's registration binds the endpoint its listener serves to it.
         net::invitations::prepare(&devices)?;
-        // Whether the host is exclusively organisation-managed is the policy's, which the owner
-        // authority reads when it decides what the terminal can confirm.
+        // Which refusals of the authority feed stand: the owner authority's pairing records read the
+        // word where an owner device's confirmation is spent.
         let feed_refusal = Arc::new(crate::grants::RemoteRefusal::with(
             if policy
                 .lock()
@@ -700,6 +700,8 @@ impl Controller {
                 0
             },
         ));
+        // Whether the host is exclusively organisation-managed is the policy's, which the owner
+        // authority reads when it decides what the terminal can confirm.
         let exclusive = {
             let policy = Arc::clone(&policy);
             Arc::new(move || {

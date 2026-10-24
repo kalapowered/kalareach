@@ -6691,17 +6691,18 @@ the worker reads a frame that stops short and acts on nothing of it, and the cal
 moves no revision, so a worker would learn of it from nothing else: when a refusal rises, and when the
 feed removes the host, the host ends the link to its worker of each connection the refusal reaches. The
 worker then detaches the connection's attachments, which ends their input lease and discards the input
-it holds for them. Input the terminal has already taken is not taken back. The connection stays up and
-refused, and the device attaches again once the refusal has ended. Two things remain. A mutation
-already forwarded runs for what is left of its dispatch lease, five seconds at most. A voice call a
-device started is not ended, as a revocation ends it, and runs to its deadline.
+it holds for them. Input the terminal has already taken is not taken back. Ending the link ends the
+connection, as the end of any link does, and the device connects again once the refusal has ended;
+until then the host refuses what it asks. Two things remain. A mutation already forwarded runs for
+what is left of its dispatch lease, five seconds at most. A voice call a device started is not
+ended, as a revocation ends it, and runs to its deadline.
 
 An owner confirmation that a remote owner device signed is not spent while either refusal stands.
-Issuing an invitation, confirming a pairing and establishing the clock by the confirmation of an
-owner device are refused with `PERMISSION_DENIED` and the refusal's words, because the refusal takes
-that device's standing away whole. The confirmation is checked inside the write that spends it, and
-a refusal that rises waits for each such write that began before it, so none is spent under a
-standing the refusal took away. The terminal is left as it is: it confirms the pairing of a first
+Every spend of one is refused with `PERMISSION_DENIED` and the refusal's words, because the refusal
+takes that device's standing away whole. The confirmation is checked inside the write that spends
+it, and a refusal that rises waits for each such write that began before it, so none is spent under
+a standing the refusal took away. What a spend that had committed before the refusal rose goes on
+to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
 nothing else, so a refusal never turns into a weaker way to confirm. What the owner at the machine
 can do meanwhile is revoke the devices and grants a withdrawal names, which needs no confirmation
@@ -6711,7 +6712,9 @@ refusal by itself.
 The refusal a removed feed puts on the grants that rest on it applies by kind of grant: work that a
 connection under such a grant had admitted before the removal is held to it where it commits and
 where its answer is written, as it is for the two refusals above, and the default owner grant is
-not refused. A relayed batch stays with the policy's epoch. The owner at the machine
+not refused. A share a connection acts under is asked as well as the grant it was admitted under,
+because a share keeps the organisation requirement of what it was delegated from. A relayed batch
+stays with the policy's epoch. The owner at the machine
 is never refused, and can stop any session locally.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage

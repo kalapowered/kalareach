@@ -803,7 +803,13 @@ impl NetworkHost {
     /// connection stays up and refused, and a request it makes after the refusal ends opens a link
     /// again.
     fn release_the_links_that(&self, refused: impl Fn(&RemoteConnection) -> bool) {
-        for remote in self.live_connections(refused) {
+        // Asked of the connections taken out of the table, so that nothing the answer reads is
+        // read under the table's lock.
+        for remote in self
+            .live_connections(|_| true)
+            .into_iter()
+            .filter(|remote| refused(remote))
+        {
             // Releasing the worker link waits for a socket, so it belongs to a task rather than to
             // the critical section a refusal is raised in.
             tokio::spawn(async move {
@@ -1685,9 +1691,9 @@ impl Controller {
     /// reaches ends, and the device attaches again once the refusal has ended.
     pub(crate) fn release_the_links_the_feed_refuses(&self) {
         if let Some(guard) = self.network.get() {
-            guard
-                .host
-                .release_the_links_that(|remote| self.feed_refusal(Some(remote.grant())).is_some());
+            guard.host.release_the_links_that(|remote| {
+                self.feed_refusal_on(remote.connection_id()).is_some()
+            });
         }
     }
 
