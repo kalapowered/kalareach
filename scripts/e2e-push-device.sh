@@ -52,8 +52,8 @@ case "$platform" in
     *) printf 'usage: %s ios|android\n' "$0" >&2; exit 2 ;;
 esac
 web="${KR_WEB_TREE:-}"
-[ -f "$web/infra/scripts/testing/local-restore.mjs" ] \
-    || { printf 'KR_WEB_TREE names a built checkout of the web repository\n' >&2; exit 2; }
+[ -f "$web/infra/scripts/testing/local-restore.mjs" ] && [ -d "$web/apps/site/dist" ] \
+    || { printf 'KR_WEB_TREE names a built checkout of the web repository (pnpm install, then pnpm build)\n' >&2; exit 2; }
 
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
@@ -155,7 +155,11 @@ start_gateway() {
     say "starting the gateway at $gateway_origin, with the provider stand-in on port $fcm_port"
     node "$web/infra/scripts/testing/local-restore.mjs" start --state "$gateway_state" --name push \
         --port "$gateway_port" --fcm-stand-in "http://127.0.0.1:$fcm_port" >"$artefacts/gateway-start.json" 2>&1 \
-        || { say "the gateway did not start: $(head -c 300 "$artefacts/gateway-start.json")"; return 2; }
+        || {
+            cp "$gateway_state/push.log" "$artefacts/gateway.log" 2>/dev/null
+            say "the gateway did not start: $(head -c 300 "$artefacts/gateway-start.json")"
+            return 2
+        }
     gateway_started=1
 }
 
@@ -407,10 +411,6 @@ else:
     say("the phone's second registration ended in the host holding it again (16.16)",
         report.get("destination_back_in_service") is True)
     say("delivery resumed on the new token (16.16)", report.get("delivery_resumed_on_the_new_token") is True)
-    asked = report.get("burst_asked")
-    allowance = report.get("burst_policy_burst")
-    say("the host's journal retained every one of the burst's events (16.17)",
-        report.get("burst_settled") is True and report.get("burst_events_retained") == asked, f"events {report.get('burst_events_retained')} of {asked}")
     for choice in ("off", "on"):
         ran = read(f"phone-previews-{choice}.txt")
         say(f"the phone made the choice of previews {choice} through the command the page's switch uses, and the host was told (16.11)",
@@ -422,11 +422,23 @@ else:
         f"off {report.get('previews_off_carries_a_preview')} on {report.get('previews_on_carries_a_preview')}")
     say("both were put on the phone and shown",
         report.get("previews_off_put_on_the_phone") is True and report.get("previews_on_put_on_the_phone") is True)
-    say("each event is one delivery record, and the host accepted as many as its allowance gives and collapsed the rest (16.17)",
-        report.get("burst_deliveries_written") == asked and isinstance(allowance, int) and isinstance(asked, int)
-        and report.get("burst_accepted") == min(asked, allowance)
-        and report.get("burst_collapsed") == asked - min(asked, allowance) and report.get("burst_other") == 0,
-        f"states {report.get('burst_states')} allowance {allowance}")
+    asked = report.get("burst_asked")
+    allowance = report.get("burst_policy_burst")
+    say("the host's journal retained every one of the burst's events (16.17)",
+        report.get("burst_settled") is True and report.get("burst_events_retained") == asked, f"events {report.get('burst_events_retained')} of {asked}")
+    # The allowance refills as the burst is admitted: a whole allowance every `burst_refill_ms`, so
+    # the host may accept that much more for each of them its own clock saw pass, and one fewer when
+    # a notification a moment before the burst had spent one.
+    span = report.get("burst_span_ms")
+    refill = report.get("burst_refill_ms")
+    accepted = report.get("burst_accepted")
+    ints = all(isinstance(value, int) for value in (asked, allowance, span, refill, accepted))
+    most = min(asked, allowance + allowance * span // refill + 1) if ints else None
+    say("each event is one delivery record, and the host accepted as many as its allowance gives, and what the burst's own time refilled, and collapsed the rest (16.17)",
+        report.get("burst_deliveries_written") == asked and ints
+        and min(asked, allowance) - 1 <= accepted <= most
+        and report.get("burst_collapsed") == asked - accepted and report.get("burst_other") == 0,
+        f"states {report.get('burst_states')} allowance {allowance} span {span} ms")
     say("what reached the provider is exactly what the host's journal says the gateway accepted (16.17)",
         report.get("burst_provider_caught_up") is True and report.get("burst_at_the_provider") == report.get("burst_accepted"),
         f"provider {report.get('burst_at_the_provider')} accepted {report.get('burst_accepted')}")
@@ -589,6 +601,15 @@ steps_android() { # <adb> <serial>
             android_launch "$adb" "$serial" newtoken "{\"token\": \"$token-replaced\", \"enable\": true}"
             grep -c 'ok=1' "$artefacts/phone-newtoken.txt" >"$harness/done-newtoken" 2>/dev/null
         fi
+        for choice in off on; do
+            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
+                : >"$harness/started-previews-$choice"
+                local flag=false
+                [ "$choice" = on ] && flag=true
+                android_launch "$adb" "$serial" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
+                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
+            fi
+        done
         sleep 1
     done
 }
@@ -601,15 +622,6 @@ run_android() {
     if ! avd="$(kr_android_avd "$sdk/emulator/emulator")"; then
         say "$avd"
         return 3
-        for choice in off on; do
-            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
-                : >"$harness/started-previews-$choice"
-                local flag=false
-                [ "$choice" = on ] && flag=true
-                android_launch "$adb" "$serial" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
-                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
-            fi
-        done
     fi
 
     if [ -z "$apk" ]; then
@@ -664,14 +676,17 @@ run_android() {
     done
     steps_android "$adb" "$serial" &
     steps_pid=$!
+    "$adb" -s "$serial" logcat -G 16M >/dev/null 2>&1
     "$adb" -s "$serial" logcat -c
     android_launch "$adb" "$serial" register "$(python3 -c 'import json,sys; print(json.dumps({"invitation": open(sys.argv[1]).read().strip(), "enable": True}))' "$harness/invitation.txt")"
     wait_for_report || return 2
     "$adb" -s "$serial" shell run-as "$app_id" cat no_backup/push-pending.json >"$artefacts/phone-pending.json" 2>/dev/null
     "$adb" -s "$serial" shell run-as "$app_id" cat push/push.json >"$artefacts/phone-push.json" 2>/dev/null
     "$adb" -s "$serial" shell run-as "$app_id" ls no_backup/limited-keys 2>/dev/null | tr -d '\r' >"$artefacts/phone-limited.txt"
-    "$adb" -s "$serial" logcat -d -b all 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -3000 >"$artefacts/logcat.log"
+    "$adb" -s "$serial" logcat -d -b all 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper|s_gl|HWUI|RustStdoutStderr: s_' | tail -40000 >"$artefacts/logcat.log"
     "$adb" -s "$serial" logcat -d -b crash >"$artefacts/crash.log" 2>&1
+    # A crash or a stop of the application that the run does not expect is kept with its trace.
+    "$adb" -s "$serial" shell dumpsys dropbox --print data_app_native_crash data_app_crash data_app_anr >"$artefacts/dropbox.log" 2>&1
     touch "$harness/finish"
     cat "$harness/report.json" >"$artefacts/report.json"
     local status=0 line
@@ -862,6 +877,15 @@ steps_ios() { # <udid>
             ios_launch "$udid" newtoken "{\"token\": \"$token-replaced\", \"enable\": true}"
             grep -c 'ok=1' "$artefacts/phone-newtoken.txt" >"$harness/done-newtoken" 2>/dev/null
         fi
+        for choice in off on; do
+            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
+                : >"$harness/started-previews-$choice"
+                local flag=false
+                [ "$choice" = on ] && flag=true
+                ios_launch "$udid" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
+                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
+            fi
+        done
         sleep 1
     done
 }
@@ -877,15 +901,6 @@ ios_launch() { # <udid> <name> <json fields>
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
     xcrun simctl launch "$udid" "$app_id" >/dev/null
     while :; do
-        for choice in off on; do
-            if [ -e "$harness/step-previews-$choice.json" ] && [ ! -e "$harness/started-previews-$choice" ]; then
-                : >"$harness/started-previews-$choice"
-                local flag=false
-                [ "$choice" = on ] && flag=true
-                ios_launch "$udid" "previews-$choice" "{\"token\": \"$token-replaced\", \"previews\": $flag}"
-                grep -c 'ok=1' "$artefacts/phone-previews-$choice.txt" >"$harness/done-previews-$choice" 2>/dev/null
-            fi
-        done
         text="$(cat "$support/push-result-$name.txt" 2>/dev/null)"
         case "$text" in *done=1*) break ;; esac
         sleep 2
