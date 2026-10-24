@@ -460,6 +460,15 @@ answers "missing" where the truth is "did not compile": that is how a build ends
 states the platform assumption the probe cannot check without a controlling terminal. Both
 assumptions hold on the platforms these packages are built for.
 
+A package is built on one machine and installed on others, so none of its native files may depend
+on a library that only the builder had. fish builds its own PCRE2. Bash is configured with
+`--disable-nls`: it looks for its message catalogues under the prefix the build named, which a
+moved tree no longer has, and on a runner whose package manager keeps gettext among the compiler's
+default paths the executable would name that library. Each shell's test file reads the load commands
+(macOS) or the dynamic section (Linux) of every native file in the package, the executable and each
+module or loadable builtin, and fails on a macOS library outside `/usr/lib` and `/System`, or a
+Linux library outside the C library, the compiler's runtime and the terminal-information library.
+
 There are two notes on that last field. Bash's `make tests` passes with these patches. Zsh's
 `make check` runs 64 scripts and one of them, `A04redirect`, fails on macOS on arm64 over
 `print foo >&-`, which writes to a closed descriptor and prints where the test expects silence. An
