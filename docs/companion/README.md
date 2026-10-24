@@ -509,7 +509,9 @@ the file set aside), and a look leaves it alone. A start that finds a record set
 record, because the start before it ended in between, marks the hosts then. A file the system fails
 to read, one that cannot be moved aside, and a list of paired hosts that cannot be read leave the
 record where it is: nothing is written and no host is started until a start can deal with it, and
-the page says to close the application and open it again. `docs/delivery/README.md` ("What the phone does first") says what
+the page says to close the application and open it again for each host that was paired then. A list
+of paired hosts that cannot be read marks none: once it can be read, those hosts show notifications
+as off, with no words, and none is started until the application is opened again. `docs/delivery/README.md` ("What the phone does first") says what
 the steps are. The application looks again with `push_refresh` when it starts and each time it
 comes to the front, on whichever screen, because a person who left to change the system's setting
 comes back to the screen they left. A tap on a notification opens the application, and
