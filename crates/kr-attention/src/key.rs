@@ -26,6 +26,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use kr_protocol::attention::{AttentionKey, AttentionRule};
 use sha2::Sha256;
 
+use crate::error::Result;
+
 /// The character every derived subject starts with.
 ///
 /// It is what makes a key legible as a derivation rather than as something a session wrote.
@@ -57,20 +59,16 @@ impl core::fmt::Debug for KeySecret {
     }
 }
 
-impl Default for KeySecret {
-    fn default() -> Self {
-        Self::fresh()
-    }
-}
-
 impl KeySecret {
-    /// Returns a new random secret.
-    #[must_use]
-    pub fn fresh() -> Self {
+    /// Returns a new secret, all 256 bits of it drawn from the cryptography crate's random source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::KeySecretUnavailable`] when the random source is unavailable.
+    pub fn fresh() -> Result<Self> {
         let mut bytes = [0u8; SECRET_BYTES];
-        bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        Self(bytes)
+        kr_crypto::random_bytes(&mut bytes)?;
+        Ok(Self(bytes))
     }
 
     /// Returns the secret a store read back.
@@ -130,9 +128,28 @@ impl KeySecret {
 mod tests {
     use super::*;
 
+    /// A new secret is 256 bits from the random source: over 64 draws every bit of it is set in
+    /// some and clear in others. A secret built from two version-four identifiers fixes twelve of
+    /// its bits, the identifiers' version and variant, and fails here; a fair source leaves a bit
+    /// fixed in 64 draws with a chance of 2^-63.
+    #[test]
+    fn a_new_secret_takes_all_256_bits_from_the_random_source() {
+        let mut ever_set = [0u8; SECRET_BYTES];
+        let mut ever_clear = [0xffu8; SECRET_BYTES];
+        for _ in 0..64 {
+            let secret = KeySecret::fresh().expect("a secret");
+            for (index, byte) in secret.as_bytes().iter().enumerate() {
+                ever_set[index] |= byte;
+                ever_clear[index] &= byte;
+            }
+        }
+        assert_eq!(ever_set, [0xff; SECRET_BYTES], "a bit that was never set");
+        assert_eq!(ever_clear, [0; SECRET_BYTES], "a bit that was never clear");
+    }
+
     #[test]
     fn a_key_carries_a_digest_rather_than_the_subject() {
-        let secret = KeySecret::fresh();
+        let secret = KeySecret::fresh().expect("a secret");
         for subject in [
             "req-1",
             "git push --force origin main",
@@ -169,8 +186,8 @@ mod tests {
         // The whole of the attack this closes: there are not many things a notification says, so a
         // reader served the record without its text tries the candidates. Under a secret it does
         // not hold, none of them produces the key it was given.
-        let host = KeySecret::fresh();
-        let guesser = KeySecret::fresh();
+        let host = KeySecret::fresh().expect("a secret");
+        let guesser = KeySecret::fresh().expect("a secret");
         let subject = "s-1|deployment succeeded";
         let served = host.attention_key(AttentionRule::ApplicationNotice, subject);
         for guess in ["s-1|deployment succeeded", "s-1|deployment failed"] {
@@ -189,7 +206,7 @@ mod tests {
 
     #[test]
     fn two_subjects_that_differ_get_two_keys() {
-        let secret = KeySecret::fresh();
+        let secret = KeySecret::fresh().expect("a secret");
         let left = secret.attention_key(
             AttentionRule::CommandFailed,
             &format!("a{}", "x".repeat(400)),
@@ -203,7 +220,7 @@ mod tests {
 
     #[test]
     fn one_subject_under_two_rules_gets_two_keys() {
-        let secret = KeySecret::fresh();
+        let secret = KeySecret::fresh().expect("a secret");
         let approval = secret.attention_key(AttentionRule::PendingApproval, "req-1");
         let input = secret.attention_key(AttentionRule::PendingInput, "req-1");
         assert_ne!(approval, input);

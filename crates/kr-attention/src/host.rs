@@ -67,7 +67,7 @@ use crate::time::HostReading;
 use crate::visit::{Visit, Visits};
 
 /// Everything the feature store holds, in memory.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct State {
     engine: Engine,
     reviews: Reviews,
@@ -282,7 +282,7 @@ impl Attention {
 
     /// Builds the state one stored snapshot and one reading describe.
     fn restore(stored: StoredState, reading: HostReading) -> State {
-        let mut engine = Engine::new();
+        let mut engine = Engine::new(stored.keys);
         engine.install(Restored {
             items: stored.items,
             acks: stored.item_acks,
@@ -294,7 +294,6 @@ impl Attention {
             next_announcement: stored.next_announcement,
             next_revision: stored.next_revision,
             finalised: stored.finalised,
-            keys: stored.keys,
         });
         engine.reanchor(reading);
         let mut reviews = Reviews::new();

@@ -123,7 +123,7 @@ pub const OLDEST_SCHEMA_VERSION: i64 = 9;
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything the feature store holds.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredState {
     /// The inbox.
     pub(crate) items: Vec<Item>,
@@ -1711,7 +1711,7 @@ impl Store {
                 <[u8; crate::key::SECRET_BYTES]>::try_from(bytes.as_slice())
                     .map_err(|_| unreadable("key secret"))?,
             ),
-            None if Self::is_empty(connection)? => crate::key::KeySecret::fresh(),
+            None if Self::is_empty(connection)? => crate::key::KeySecret::fresh()?,
             None => return Err(unreadable("key secret")),
         };
         let counters: Option<(i64, i64)> = connection
