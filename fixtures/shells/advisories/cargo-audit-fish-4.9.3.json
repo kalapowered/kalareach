@@ -1,0 +1,88 @@
+{
+ "vulnerabilities": {
+  "count": 1,
+  "found": true,
+  "list": [
+   {
+    "advisory": {
+     "date": "2026-07-06",
+     "id": "RUSTSEC-2026-0204",
+     "package": "crossbeam-epoch",
+     "title": "Invalid pointer dereference in `fmt::Pointer` impl for `Atomic` and `Shared` when the underlying pointer is invalid"
+    },
+    "package": {
+     "name": "crossbeam-epoch",
+     "version": "0.9.18"
+    }
+   }
+  ]
+ },
+ "warnings": {
+  "unmaintained": [
+   {
+    "advisory": {
+     "date": "2024-10-07",
+     "id": "RUSTSEC-2024-0436",
+     "package": "paste",
+     "title": "paste - no longer maintained"
+    },
+    "kind": "unmaintained",
+    "package": {
+     "name": "paste",
+     "version": "1.0.15"
+    }
+   }
+  ],
+  "unsound": [
+   {
+    "advisory": {
+     "date": "2026-06-25",
+     "id": "RUSTSEC-2026-0190",
+     "package": "anyhow",
+     "title": "Unsoundness in `Error::downcast_mut()`"
+    },
+    "kind": "unsound",
+    "package": {
+     "name": "anyhow",
+     "version": "1.0.102"
+    }
+   },
+   {
+    "advisory": {
+     "date": "2026-05-12",
+     "id": "RUSTSEC-2026-0253",
+     "package": "lru",
+     "title": "Potential use-after-free due to lack of panic safety in `LruCache::pop()`"
+    },
+    "kind": "unsound",
+    "package": {
+     "name": "lru",
+     "version": "0.18.0"
+    }
+   },
+   {
+    "advisory": {
+     "date": "2026-07-06",
+     "id": "RUSTSEC-2026-0205",
+     "package": "scc",
+     "title": "`Array::insert` violates exception safety if compare function panics, leading to potential Double-Free"
+    },
+    "kind": "unsound",
+    "package": {
+     "name": "scc",
+     "version": "2.4.0"
+    }
+   }
+  ],
+  "yanked": [
+   {
+    "advisory": null,
+    "kind": "yanked",
+    "package": {
+     "name": "chacha20",
+     "version": "0.10.0"
+    }
+   }
+  ]
+ }
+}

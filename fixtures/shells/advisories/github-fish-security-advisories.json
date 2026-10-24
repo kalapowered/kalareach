@@ -1,0 +1,36 @@
+[
+ {
+  "cve_id": "CVE-2023-49284",
+  "ghsa_id": "GHSA-2j9r-pm96-wp4f",
+  "published_at": "2023-12-04T15:20:55Z",
+  "severity": "low",
+  "summary": "Command substitution output can trigger shell expansion",
+  "updated_at": "2023-12-04T15:20:56Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "fish-shell"
+    },
+    "patched_versions": "3.6.2",
+    "vulnerable_version_range": "< 3.6.2"
+   }
+  ]
+ },
+ {
+  "cve_id": "CVE-2022-20001",
+  "ghsa_id": "GHSA-pj5f-6vxj-f5mq",
+  "published_at": "2022-03-12T15:22:52Z",
+  "severity": "medium",
+  "summary": "Navigating to a compromised git repository may lead to arbitrary code exection",
+  "updated_at": "2022-03-12T15:22:52Z",
+  "vulnerabilities": [
+   {
+    "package": {
+     "name": "fish"
+    },
+    "patched_versions": "3.4.0",
+    "vulnerable_version_range": "3.1.0-3.3.1"
+   }
+  ]
+ }
+]
