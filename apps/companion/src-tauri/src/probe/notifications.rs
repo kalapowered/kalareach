@@ -19,6 +19,8 @@
 //!   longer accepts;
 //! * `look`: look again at where notifications stand, as the application does when it comes to the
 //!   front, and say where they stand;
+//! * `previews`: choose whether the notification shows what needs the person, the way the page's
+//!   switch does, and wait until the host has been told or the steps stop;
 //! * `route`: wait for a tap on a notification to open the application on a screen.
 //!
 //! The host, the gateway and what each of them saw are the script's and the host's suite to read:
@@ -68,6 +70,9 @@ pub struct Request {
     /// Whether to look again at where notifications stand.
     #[serde(default)]
     pub look: bool,
+    /// The choice of previews to make for the paired host, when one is to be made.
+    #[serde(default)]
+    pub previews: Option<bool>,
     /// Whether to wait for a tap on a notification.
     #[serde(default)]
     pub route: bool,
@@ -144,6 +149,9 @@ async fn run<R: Runtime>(
     }
     if request.look {
         look(app, &mut checks).await;
+    }
+    if let Some(on) = request.previews {
+        previews(app, on, &mut checks).await;
     }
     if request.route {
         route(app, &mut checks).await;
@@ -254,6 +262,38 @@ async fn reissue<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) {
             words,
         )),
     }
+}
+
+/// Chooses whether the notification shows what needs the person, the way the page's switch does, and
+/// waits for the end of the steps that tell the host.
+async fn previews<R: Runtime>(app: &AppHandle<R>, on: bool, checks: &mut Checks<'_>) {
+    let name = "the choice of previews was made";
+    let Some((reference, ..)) = standing(app) else {
+        checks.push(Check::found(name, false, "this phone has no paired host"));
+        return;
+    };
+    if let Err(error) = commands::push_previews(app.state(), reference, on).await {
+        checks.push(Check::found(name, false, format!("{error:?}")));
+        return;
+    }
+    let end = Instant::now() + ENABLED_WITHIN;
+    let mut last = String::new();
+    while let Some((_, state, words)) = standing(app) {
+        last = format!("{state}: {words}");
+        if matches!(state.as_str(), "on" | "needs_attention") || Instant::now() >= end {
+            break;
+        }
+        tokio::time::sleep(LOOK).await;
+    }
+    let chosen = commands::push_view(app.state())
+        .ok()
+        .and_then(|view| serde_json::to_value(view).ok())
+        .and_then(|view| view["hosts"][0]["previews"].as_bool());
+    checks.push(Check::found(
+        name,
+        last.starts_with("on:") && chosen == Some(on),
+        format!("previews {} -> {last}", if on { "on" } else { "off" }),
+    ));
 }
 
 /// Looks again, as the application does at each foreground, and says where things stand.
