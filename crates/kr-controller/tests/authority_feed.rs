@@ -3028,7 +3028,7 @@ async fn a_request_taken_from_one_feed_does_not_hold_up_the_feed_the_host_is_poi
     let (_third_phone, third) = rig.pairs(&[ActionRight::SessionView]).await;
     rig.owner_publishes(0xb1, devices(first.device_id)).await;
     let numbered_second = rig.owner_publishes(0xb2, devices(second.device_id)).await;
-    rig.poll().await;
+    rig.until_the_carrier_is_idle().await;
     assert_eq!(
         rig.held(&numbered_second)
             .await
@@ -3047,7 +3047,7 @@ async fn a_request_taken_from_one_feed_does_not_hold_up_the_feed_the_host_is_poi
         .await
         .expect("the second feed takes the request");
     let behind = rig.owner_publishes(0xb3, devices(third.device_id)).await;
-    rig.poll().await;
+    rig.until_the_carrier_is_idle().await;
 
     assert_eq!(
         rig.held(&numbered_second).await.rejected.0,
@@ -3232,7 +3232,7 @@ async fn a_start_does_not_write_the_feed_down_again_for_each_settled_record_it_r
         ))),
     )
     .await;
-    rig.poll().await;
+    rig.until_the_carrier_is_idle().await;
 
     let registry =
         rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
