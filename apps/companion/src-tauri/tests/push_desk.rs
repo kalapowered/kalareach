@@ -1988,7 +1988,17 @@ async fn a_record_the_system_fails_to_read_is_left_in_place_and_not_written_over
         .host_by_reference(&reference)
         .expect("the host");
     restarted.desk.forgotten(paired.host_device_id);
-    assert_eq!(Arc::strong_count(&restarted.desk), 1, "no run was started");
+    // Forgetting hands the receivers their keys again, which holds the desk for a moment; no run
+    // is left holding it, and the host still needs the person.
+    eventually("no run holds the desk", || {
+        Arc::strong_count(&restarted.desk) == 1
+    })
+    .await;
+    assert_eq!(
+        restarted.desk.view().hosts[0].state,
+        PushState::NeedsAttention,
+        "no run was started"
+    );
 
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600))
         .expect("the record is made readable");
