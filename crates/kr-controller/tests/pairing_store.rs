@@ -100,7 +100,11 @@ fn open_with(path: &Path, clock: &ManualClock) -> (Arc<DeviceDirectory>, Invitat
             .expect("the host's owner device");
     }
     prepare(&directory).expect("the pairing tables exist");
-    let rows = InvitationRows::new(Arc::clone(&directory), lifetimes(&directory, clock));
+    let rows = InvitationRows::new(
+        Arc::clone(&directory),
+        lifetimes(&directory, clock),
+        Arc::default(),
+    );
     (directory, rows)
 }
 
@@ -111,6 +115,7 @@ fn open_unowned(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
     let rows = InvitationRows::new(
         Arc::clone(&directory),
         lifetimes(&directory, &ManualClock::new()),
+        Arc::default(),
     );
     (directory, rows)
 }
@@ -1158,6 +1163,7 @@ fn an_owner_device_on_record_before_the_owner_record_counts_once() {
         let rows = InvitationRows::new(
             Arc::clone(&directory),
             lifetimes(&directory, &ManualClock::new()),
+            Arc::default(),
         );
         assert_eq!(
             rows.host_owner().expect("readable"),
@@ -1510,6 +1516,7 @@ fn an_owner_grant_that_runs_out_by_utc_first_commits_nothing() {
                 move || wall.load(Ordering::SeqCst)
             }),
         ),
+        Arc::default(),
     );
     let mut harness = Harness::answering(
         rows.clone(),

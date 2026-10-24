@@ -1335,6 +1335,7 @@ impl OwnerAuthority {
                 consume(
                     transaction,
                     lifetimes,
+                    self.rows.refusal(),
                     &spendable.proof,
                     "establish this host's clock",
                     established,

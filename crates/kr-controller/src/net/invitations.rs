@@ -458,6 +458,9 @@ impl StoredCommitment {
 pub struct InvitationRows {
     directory: Arc<DeviceDirectory>,
     lifetimes: Arc<GrantLifetimes>,
+    /// The refusals the authority feed puts on remote grants, which an owner device's confirmation
+    /// is not spent under.
+    refusal: Arc<crate::grants::RemoteRefusal>,
     issue: Option<Arc<Issuing>>,
     admission: WriteAdmission,
 }
@@ -473,12 +476,18 @@ struct Issuing {
 
 impl InvitationRows {
     /// Opens the records in `directory`'s database, whose devices' grants run out as `lifetimes`
-    /// decides. [`prepare`] must have run.
+    /// decides, and in which an owner device's confirmation is spent only while `refusal` says no
+    /// refusal of the authority feed stands. [`prepare`] must have run.
     #[must_use]
-    pub fn new(directory: Arc<DeviceDirectory>, lifetimes: Arc<GrantLifetimes>) -> Self {
+    pub fn new(
+        directory: Arc<DeviceDirectory>,
+        lifetimes: Arc<GrantLifetimes>,
+        refusal: Arc<crate::grants::RemoteRefusal>,
+    ) -> Self {
         Self {
             directory,
             lifetimes,
+            refusal,
             issue: None,
             admission: WriteAdmission::default(),
         }
@@ -491,6 +500,7 @@ impl InvitationRows {
         Self {
             directory: Arc::clone(&self.directory),
             lifetimes: Arc::clone(&self.lifetimes),
+            refusal: Arc::clone(&self.refusal),
             issue: Some(Arc::new(Issuing { terms, action })),
             admission: WriteAdmission::default(),
         }
@@ -506,6 +516,13 @@ impl InvitationRows {
     #[must_use]
     pub const fn lifetimes(&self) -> &Arc<GrantLifetimes> {
         &self.lifetimes
+    }
+
+    /// Returns the refusals of the authority feed that an owner device's confirmation is checked
+    /// against where it is spent.
+    #[must_use]
+    pub const fn refusal(&self) -> &Arc<crate::grants::RemoteRefusal> {
+        &self.refusal
     }
 
     /// Returns the admission slot of the invitation this handle issues.
@@ -791,7 +808,15 @@ impl InvitationRows {
         terminal: TerminalStanding,
     ) -> Result<()> {
         let consumed = self.directory.transaction(|transaction| {
-            consume(transaction, &self.lifetimes, proof, effect, now, terminal)
+            consume(
+                transaction,
+                &self.lifetimes,
+                &self.refusal,
+                proof,
+                effect,
+                now,
+                terminal,
+            )
         });
         self.lifetimes.settle();
         consumed
@@ -880,6 +905,7 @@ impl InvitationStore for InvitationRows {
             consume(
                 transaction,
                 &self.lifetimes,
+                &self.refusal,
                 issued_under,
                 &effect,
                 terms.issued_at_ms,
@@ -941,7 +967,14 @@ impl InvitationStore for InvitationRows {
             .action_for(&ActionSubject::Confirmed(commitment.invitation_id));
         let committed = self.directory.transaction(|transaction| {
             self.admission.check()?;
-            let outcome = commit_pairing(transaction, &self.lifetimes, expected, next, commitment)?;
+            let outcome = commit_pairing(
+                transaction,
+                &self.lifetimes,
+                &self.refusal,
+                expected,
+                next,
+                commitment,
+            )?;
             // The pairing is the confirmation's effect: recorded with it, and only when it is
             // written.
             if outcome == TransitionOutcome::Written
@@ -1022,6 +1055,7 @@ impl InvitationStore for InvitationRows {
 fn commit_pairing(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
+    refusal: &crate::grants::RemoteRefusal,
     expected: &InvitationRecord,
     next: &InvitationRecord,
     commitment: &PairingCommitment,
@@ -1060,6 +1094,7 @@ fn commit_pairing(
     consume(
         transaction,
         lifetimes,
+        refusal,
         &commitment.owner_confirmation,
         &format!("pair.confirm {}", commitment.invitation_id),
         commitment.committed_at_ms,
@@ -1344,12 +1379,13 @@ pub enum TerminalStanding {
 pub(super) fn consume(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
+    refusal: &crate::grants::RemoteRefusal,
     proof: &OwnerConfirmationProof,
     effect: &str,
     now: TimestampMs,
     terminal: TerminalStanding,
 ) -> Result<()> {
-    signer_still_authorised(transaction, lifetimes, proof, terminal)?;
+    signer_still_authorised(transaction, lifetimes, refusal, proof, terminal)?;
     destination_still_held(transaction, proof)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
@@ -1398,6 +1434,7 @@ pub(super) fn consume(
 fn signer_still_authorised(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
+    refusal: &crate::grants::RemoteRefusal,
     proof: &OwnerConfirmationProof,
     terminal: TerminalStanding,
 ) -> Result<()> {
@@ -1443,6 +1480,17 @@ fn signer_still_authorised(
             }
         }
         ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
+            // A refusal the authority feed puts on every remote grant takes an owner device's
+            // standing away whole, and what that device signed is spent under the standing the
+            // refusal leaves it. This is read inside the spend's transaction, which holds the
+            // pairing records' write lock, and a refusal that is raised waits for it
+            // ([`Controller::wait_for_the_confirmations_being_spent`]): a confirmation is spent
+            // wholly before the refusal rose or wholly refused by it.
+            if let Some(standing) = refusal.standing() {
+                return Err(ControllerError::PermissionDenied {
+                    detail: standing.detail(),
+                });
+            }
             let mut statement = transaction
                 .prepare(
                     "SELECT device_id, authorisation_key, grant FROM network_devices

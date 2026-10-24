@@ -23,7 +23,7 @@ use super::Controller;
 use super::revocation::Audience;
 use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
-use crate::grants::{AccessRequest, GrantRecord, Refusal, StoredRemoval};
+use crate::grants::{AccessRequest, GrantRecord, Refusal, RemoteRefusal, StoredRemoval};
 use crate::service::net::devices::DeviceRecord;
 
 /// The method whose decision stands for "this device holds `host.manage` at the paired-device
@@ -36,21 +36,6 @@ use crate::service::net::devices::DeviceRecord;
 /// rights, its selectors, this host's policy, the ceiling and the clock, and nothing else. A test
 /// holds it to that.
 pub const MANAGEMENT_PROBE: Method = Method::DeviceList;
-
-/// The bit of the refusal word that stands while this host is behind its feed.
-const BEHIND_ITS_FEED: u8 = 1;
-
-/// The bit of the refusal word that stands while the feed shows a withdrawal this host cannot
-/// verify.
-const WITHDRAWAL_UNVERIFIED: u8 = 2;
-
-/// The bit of the refusal word that stands once the feed has answered that it removed this host.
-/// Unlike the two above it refuses by kind of grant.
-const FEED_REMOVED: u8 = 4;
-
-/// The bit of the refusal word that says personal grants rest on the feed now, which is what makes
-/// the removal refuse them: it mirrors the policy, and is changed with it.
-pub(super) const PERSONAL_GRANTS_REST_ON_THE_FEED: u8 = 8;
 
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
@@ -684,8 +669,7 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !policy.feed_removed() {
             policy.set_feed_removed(true);
-            self.feed_refusal
-                .fetch_or(FEED_REMOVED, std::sync::atomic::Ordering::SeqCst);
+            self.feed_refusal.raise(RemoteRefusal::FEED_REMOVED);
             self.advance_authority_epoch();
             self.release_the_links_the_feed_refuses();
         }
@@ -695,15 +679,11 @@ impl Controller {
     /// has just been put in force. Called with the policy's lock held.
     pub(super) fn mirror_the_feed_standing_of(&self, policy: &crate::grants::HostPolicy) {
         if policy.personal_grants_rest_on_the_feed() {
-            self.feed_refusal.fetch_or(
-                PERSONAL_GRANTS_REST_ON_THE_FEED,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            self.feed_refusal
+                .raise(RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED);
         } else {
-            self.feed_refusal.fetch_and(
-                !PERSONAL_GRANTS_REST_ON_THE_FEED,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            self.feed_refusal
+                .lower(RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED);
         }
     }
 
@@ -723,7 +703,7 @@ impl Controller {
         let registry = self.authority_revision().await?;
         if feed_revision > registry.get() {
             self.move_a_feed_refusal(
-                BEHIND_ITS_FEED,
+                RemoteRefusal::BEHIND_ITS_FEED,
                 true,
                 crate::grants::HostPolicy::behind_its_feed,
                 crate::grants::HostPolicy::set_behind_its_feed,
@@ -755,7 +735,7 @@ impl Controller {
     /// A request that names a device or grant the registry holds live, and whose owner the registry
     /// cannot show it to be, can be neither carried out nor dismissed: it comes back as
     /// [`Replay::Unverified`], and the host refuses every grant but the owner's at this machine
-    /// until the owner at this machine has revoked what it names or paired the owner again. The
+    /// until the owner at this machine has revoked what it names. The
     /// registry cannot show the owner when it holds no device of the identity the request gives
     /// and no device that is not revoked that holds the key it names, and when the devices that
     /// hold the key include one that signed it but may not manage this host. A key held only by a
@@ -905,7 +885,7 @@ impl Controller {
             }
         }
         self.move_a_feed_refusal(
-            WITHDRAWAL_UNVERIFIED,
+            RemoteRefusal::WITHDRAWAL_UNVERIFIED,
             true,
             crate::grants::HostPolicy::withdrawal_unverified,
             crate::grants::HostPolicy::set_withdrawal_unverified,
@@ -950,7 +930,7 @@ impl Controller {
             held.unlisted.retain(|key| kept.contains_key(key));
         }
         self.move_a_feed_refusal(
-            WITHDRAWAL_UNVERIFIED,
+            RemoteRefusal::WITHDRAWAL_UNVERIFIED,
             found.is_some(),
             crate::grants::HostPolicy::withdrawal_unverified,
             crate::grants::HostPolicy::set_withdrawal_unverified,
@@ -1078,7 +1058,7 @@ impl Controller {
         set: fn(&mut crate::grants::HostPolicy, bool),
     ) {
         let stands = |word: u8| word & bit != 0;
-        if stands(self.feed_refusal.load(std::sync::atomic::Ordering::SeqCst)) == raised {
+        if stands(self.feed_refusal.word()) == raised {
             return;
         }
         let registry = if raised {
@@ -1086,30 +1066,55 @@ impl Controller {
         } else {
             None
         };
-        let mut policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if flag(&policy) == raised {
-            return;
-        }
         {
+            let mut policy = self
+                .policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if flag(&policy) == raised {
+                return;
+            }
             let _table = raised.then(|| self.admitted_table());
             set(&mut policy, raised);
             if raised {
-                self.feed_refusal
-                    .fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
+                self.feed_refusal.raise(bit);
             } else {
-                self.feed_refusal
-                    .fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
+                self.feed_refusal.lower(bit);
             }
         }
-        drop(policy);
         drop(registry);
         self.advance_authority_epoch();
         if raised {
             self.release_the_links_the_feed_refuses();
+            self.wait_for_the_confirmations_being_spent().await;
         }
+    }
+
+    /// Waits until every owner confirmation that was being spent when a refusal rose has been
+    /// committed or refused.
+    ///
+    /// A spend reads the word inside its transaction, which holds the pairing records' write lock
+    /// from its first statement. A write transaction of this one's own, taken after the word was
+    /// raised, therefore waits for each spend that read the word before it was raised, and each
+    /// spend that begins after reads it raised: when this returns, no confirmation can be spent
+    /// under the standing the refusal took away.
+    async fn wait_for_the_confirmations_being_spent(&self) {
+        let devices = Arc::clone(&self.devices);
+        match tokio::task::spawn_blocking(move || devices.transaction(|_| Ok(()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "kr-controller: could not wait for the owner confirmations being spent: {error}"
+            ),
+            Err(error) => eprintln!(
+                "kr-controller: could not wait for the owner confirmations being spent: {error}"
+            ),
+        }
+    }
+
+    /// The word that says which refusals the authority feed puts on remote grants now, which the
+    /// pairing records read where an owner confirmation is spent.
+    pub(crate) const fn remote_refusal(&self) -> &Arc<crate::grants::RemoteRefusal> {
+        &self.feed_refusal
     }
 
     /// The refusal the authority feed puts on every remote grant now, if one stands.
@@ -1126,20 +1131,16 @@ impl Controller {
         &self,
         grant: Option<&kr_protocol::grant::Grant>,
     ) -> Option<crate::grants::Refusal> {
-        let word = self.feed_refusal.load(std::sync::atomic::Ordering::SeqCst);
-        if word & BEHIND_ITS_FEED != 0 {
-            Some(crate::grants::Refusal::BehindItsFeed)
-        } else if word & WITHDRAWAL_UNVERIFIED != 0 {
-            Some(crate::grants::Refusal::WithdrawalUnverified)
-        } else if word & FEED_REMOVED != 0
-            && grant.is_some_and(|grant| {
-                grant.organisation.is_present() || word & PERSONAL_GRANTS_REST_ON_THE_FEED != 0
-            })
-        {
-            Some(crate::grants::Refusal::AuthorityFeedRemoved)
-        } else {
-            None
+        if let Some(standing) = self.feed_refusal.standing() {
+            return Some(standing);
         }
+        let word = self.feed_refusal.word();
+        (word & RemoteRefusal::FEED_REMOVED != 0
+            && grant.is_some_and(|grant| {
+                grant.organisation.is_present()
+                    || word & RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED != 0
+            }))
+        .then_some(crate::grants::Refusal::AuthorityFeedRemoved)
     }
 
     /// The refusal the authority feed puts on `connection` now, when it came through the network
@@ -1188,7 +1189,7 @@ impl Controller {
         self.catch_up_with_the_feed(AuthorityRevision::new(feed_revision))
             .await?;
         self.move_a_feed_refusal(
-            BEHIND_ITS_FEED,
+            RemoteRefusal::BEHIND_ITS_FEED,
             false,
             crate::grants::HostPolicy::behind_its_feed,
             crate::grants::HostPolicy::set_behind_its_feed,
@@ -1564,5 +1565,64 @@ mod tests {
             lifted.contains(&key_of(&shared)),
             "named again once the refusal is lifted"
         );
+    }
+
+    /// KR-REQ-24.15: a refusal that rises returns only when every write to the pairing records
+    /// that was under way has ended. An owner confirmation reads the refusal inside its write, so
+    /// one that read it before it rose has been committed by the time the rise returns, and one
+    /// that begins after reads it raised: no confirmation is spent under a standing that a raise
+    /// that has returned took away. The write is held open here, the rise is started and the case
+    /// waits until the refusal stands, and the rise does not return until the write has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_that_rises_waits_for_a_write_to_the_pairing_records_that_is_under_way() {
+        use super::RemoteRefusal;
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        let (_temp, controller) = daemon().await;
+        let (inside, under_way) = tokio::sync::oneshot::channel();
+        let (go, held_open) = std::sync::mpsc::channel::<()>();
+        let write = std::thread::spawn({
+            let controller = std::sync::Arc::clone(&controller);
+            move || {
+                controller.devices().transaction(|_| {
+                    inside.send(()).expect("the case waits for the write");
+                    held_open.recv().expect("the case lets the write go on");
+                    Ok(())
+                })
+            }
+        });
+        under_way.await.expect("the write is under way");
+
+        let rise = tokio::spawn({
+            let controller = std::sync::Arc::clone(&controller);
+            async move {
+                controller
+                    .move_a_feed_refusal(
+                        RemoteRefusal::WITHDRAWAL_UNVERIFIED,
+                        true,
+                        crate::grants::HostPolicy::withdrawal_unverified,
+                        crate::grants::HostPolicy::set_withdrawal_unverified,
+                    )
+                    .await;
+            }
+        });
+        while controller.remote_refusal().standing().is_none() {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..1000 {
+            assert!(
+                !rise.is_finished(),
+                "the refusal stands, and its rise has not returned while a write is under way"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        go.send(()).expect("the write goes on");
+        write
+            .join()
+            .expect("the write ends")
+            .expect("the write commits");
+        rise.await
+            .expect("the rise returns once the write has ended");
     }
 }

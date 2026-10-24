@@ -1461,7 +1461,11 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     // The daemon's one record of every grant's lifetime, read by the connections this host admits
     // and by the owner confirmations it spends, on the daemon's own clocks.
     let lifetimes = Arc::clone(controller.lifetimes());
-    let rows = invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes));
+    let rows = invitations::InvitationRows::new(
+        Arc::clone(&devices),
+        Arc::clone(&lifetimes),
+        Arc::clone(controller.remote_refusal()),
+    );
     // Section 10: a host restart cancels every invitation it left unfinished, because a
     // candidate's attempt lived only in memory and nothing can resume it. What an invitation
     // consumed, and how many failed confirmations it had spent, stays on record. This runs before
