@@ -548,6 +548,25 @@
     },
     {
       "entry": {
+        "store": "restored-policy",
+        "scope": "environment",
+        "path": "restored-policy.cbor",
+        "recording": {
+          "kind": "cbor_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "06afc78e53fa4e2a3e19497e9dc1fbf4eef347d2f4d23632d376aeffeb17758b",
+      "kept": [
+        "Record (crates/kr-controller/src/grants/restored.rs)",
+        "StoredPolicy, StoredEnrolment, StoredBinding, StoredLeaseRecord (crates/kr-controller/src/grants/durable.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "shell-entries",
         "scope": "state_root",
         "path": "shell-entries.json",

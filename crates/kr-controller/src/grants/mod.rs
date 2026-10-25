@@ -41,6 +41,7 @@ pub mod mirror;
 pub mod organisation;
 pub mod policy;
 pub mod remote_refusal;
+pub mod restored;
 pub mod store;
 pub mod vocabulary;
 
