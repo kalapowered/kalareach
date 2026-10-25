@@ -1381,7 +1381,7 @@ $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
 /// KR-REQ-12.07, KR-REQ-07.45: the root shell asks about a program only when the program is what
 /// the shell would run for the name. An alias, a function or a script that has the name, ahead of
 /// the program, is what runs and the worker is never asked; so is the answer of a lookup handler
-/// the person set, which the module leaves standing and calls first.
+/// the person set, which the module neither takes out nor puts behind its own.
 ///
 /// The control is the program itself: with the same backend, it is asked about and the launcher
 /// runs in its place.
@@ -1452,8 +1452,8 @@ pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
     let asked = session.run_asking("kr-probe control", "launcher-ran");
     assert_eq!(asked.len(), 1, "the program itself asks once: {asked:?}");
 
-    // The person's own handler, set before the module's, answers first and its answer stands. With
-    // it switched off, the module's handler is still there and the program is asked about.
+    // The person's own handler for a name about to be looked up answers first and its answer stands:
+    // the module has none in that place. With it switched off, the program is asked about.
     let mut session = a_session_with_probes_and(&package, &probes, OWN_LOOKUP_HANDLER);
     session.commands.policy = backend;
     defined(&mut session, "$global:KrOwn = $true");
@@ -1488,13 +1488,14 @@ pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
         session.terminal_output()
     );
 
-    // A handler the person sets after the module's is theirs and stays where they put it. One that
-    // calls the handler it replaced leaves the module's answering, once, however often the prompt
-    // comes round; one that does not answers by itself, and the commands run as it says.
+    // A handler the person sets after the module's, for the commands the engine has found, is
+    // theirs and stays where they put it. One that calls the handler it replaced leaves the module's
+    // answering, once, however often the prompt comes round; one that does not leaves the commands
+    // to run as it says, and the module is not asked.
     defined(
         &mut session,
-        "$kr_saved = $ExecutionContext.InvokeCommand.PreCommandLookupAction; \
-         $ExecutionContext.InvokeCommand.PreCommandLookupAction = { param($n, $e) \
+        "$kr_saved = $ExecutionContext.InvokeCommand.PostCommandLookupAction; \
+         $ExecutionContext.InvokeCommand.PostCommandLookupAction = { param($n, $e) \
          $kr_saved.Invoke($n, $e) }.GetNewClosure()",
     );
     for round in 0..3 {
@@ -1507,9 +1508,20 @@ pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
     }
     defined(
         &mut session,
-        "$ExecutionContext.InvokeCommand.PreCommandLookupAction = { param($n, $e) \
-         if ($n -eq 'kr-probe') { $e.CommandScriptBlock = { 'late-' + 'handler-ran' }; \
-         $e.StopSearch = $true } }",
+        "$ExecutionContext.InvokeCommand.PostCommandLookupAction = { param($n, $e) }",
+    );
+    let (runs, launches) = (probes.runs().len(), probes.launches().len());
+    let asked = session.run_asking("kr-probe set-aside", "probe-ran");
+    assert!(
+        asked.is_empty(),
+        "a handler that does not call the module's was passed over: {asked:?}"
+    );
+    assert_eq!(probes.runs().len(), runs + 1, "the program ran as typed");
+    assert_eq!(probes.launches().len(), launches);
+    defined(
+        &mut session,
+        "$ExecutionContext.InvokeCommand.PostCommandLookupAction = { param($n, $e) \
+         if ($n -eq 'kr-probe') { $e.CommandScriptBlock = { 'late-' + 'handler-ran' } } }",
     );
     let (runs, launches) = (probes.runs().len(), probes.launches().len());
     let asked = session.run_asking("kr-probe", "late-handler-ran");
@@ -1521,26 +1533,32 @@ pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
     assert_eq!(probes.launches().len(), launches);
 }
 
-/// A handler of the person's own that runs once the engine has found a command, and counts the
-/// commands it is asked about, by name.
+/// A handler of the person's own that runs once the engine has found a command: it counts the
+/// commands it is asked about, by name, and while `KrReplace` is set it makes the program a function.
 const OWN_AFTER_LOOKUP_HANDLER: &str = r#"
 $global:KrFound = @{}
+$global:KrReplace = $false
+function global:kr-replacement { 'replacement-' + 'ran' }
 $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
     param($CommandName, $EventArgs)
     $global:KrFound[$CommandName] = 1 + [int]$global:KrFound[$CommandName]
+    if ($global:KrReplace -and $CommandName -eq 'kr-probe' -and
+            $EventArgs.Command.CommandType -eq 'Application') {
+        $EventArgs.Command = $ExecutionContext.InvokeCommand.GetCommand('kr-replacement', 'Function')
+    }
 }
 "#;
 
 /// KR-REQ-12.07: a handler the person set to run after the engine finds a command is asked about a
-/// command once, however the integration decides what to do with it. The module looks at what the
-/// engine would run for a name before it asks the worker, and that look is the module's own: a
-/// handler asked by it would be asked again by the lookup that runs the command, and one that
-/// does something each time, such as counting or choosing differently, would do it twice.
+/// command once, and what it makes of the command is what the integration goes by. The handler is
+/// the module's to chain, not to ask on the side: a look of the module's own at what a name is would
+/// be a second lookup, and a handler that counts, or chooses differently each time, would be called
+/// twice for one command.
 ///
-/// The program the worker takes no interest in is the case that fails when the look is a lookup of
-/// the person's: nothing is substituted, so the engine's own lookup follows. The control is a
-/// program the worker takes, which the launcher runs in place.
-pub fn a_handler_the_person_runs_after_the_search_is_asked_once_about_a_command_left_alone(
+/// The control is the program the worker takes, which the launcher runs in place of the shell's own
+/// start. The person's handler is asked once about it, and a program it replaces is the function it
+/// chose, which the worker is not asked about.
+pub fn a_handler_the_person_runs_after_the_search_is_asked_once_and_chooses_the_command(
     kind: ShellKind,
 ) {
     assert_eq!(
@@ -1575,9 +1593,28 @@ pub fn a_handler_the_person_runs_after_the_search_is_asked_once_about_a_command_
     let asked = session.run_asking("kr-probe taken", "launcher-ran");
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
     assert_eq!(probes.launches().len(), 1);
-    // The lookup that runs this command is the engine's one, and the module's own look at the
-    // program is not another: the handler has been asked once about each of the two commands.
     counted(&mut session, "kr-probe", 2);
+
+    // The handler makes the program a function: that is the command, the worker is not asked
+    // about it, and neither the program nor the launcher runs.
+    let switched = format!(
+        "$global:KrReplace = $true; {}",
+        print_assembled(kind, "kr-switched")
+    );
+    assert!(
+        session.run(&switched, "kr-switched"),
+        "the switch was not set:\n{}",
+        session.terminal_output()
+    );
+    let (runs, launches) = (probes.runs().len(), probes.launches().len());
+    let asked = session.run_asking("kr-probe replaced", "replacement-ran");
+    assert!(
+        asked.is_empty(),
+        "the command the person's handler chose was asked about: {asked:?}"
+    );
+    assert_eq!(probes.runs().len(), runs, "the program ran");
+    assert_eq!(probes.launches().len(), launches, "the launcher ran");
+    counted(&mut session, "kr-probe", 3);
 }
 
 /// The shell's own `read` reading a line through the editor.

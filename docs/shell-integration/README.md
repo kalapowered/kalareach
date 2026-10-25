@@ -359,11 +359,15 @@ each runs as it was typed. A script is a process of its own, so only the interpr
 with is asked about. Zsh expands a filename pattern and applies the assignments in front of a
 command only in the child it forks, so a command with either is not asked about either: `PATH` or
 `ARGV0` there would change the file or the vector that runs. The PSReadLine package asks from a
-command-lookup handler of its own, which it puts in front of the person's when its hooks go live and
-takes off when it goes, putting the person's back only if its own is still the one installed. The
-person's handler is called first, and what it answers stands. A handler the person sets later is
-theirs and stays where they put it: one that calls the handler it replaced still reaches this
-one, and one that does not leaves the commands to run as typed. A handler the person runs after the search finds a command is asked once about each command the line runs, whether the shell runs it as typed or through the launcher. The handler acts on a line that is one
+handler of its own for the commands PowerShell has found (`PostCommandLookupAction`), which it puts in
+front of the person's when its hooks go live and takes off when it goes, putting the person's back
+only if its own is still the one installed. The person's handler is called first, and what it makes
+of the command stands, so a handler that replaces a program with a function of its own takes the
+program out of the integration, and it is asked once about each command the line runs, whether the
+shell runs it as typed or through the launcher. A handler the person sets later is theirs and stays
+where they put it: one that calls the handler it replaced still reaches this one, and one that does
+not leaves the commands to run as typed. The handler for a name about to be looked up
+(`PreCommandLookupAction`) is not touched. The handler acts on a line that is one
 native command whose words are all plain constants, and only when the command PowerShell would run
 for that name is the program: an alias, a function, a cmdlet or a script that has the name is what
 runs, and nothing is asked. It changes a lookup only when the worker answers with a backend, so
@@ -386,7 +390,7 @@ launcher is only ever the absolute path the answer gives and is never searched f
 an absolute path to an executable file is refused, and the command runs as it was typed.
 
 None of this changes what the person sees: no key binding, function, alias or hook is added or
-replaced (PowerShell's lookup handler goes in front of the person's own, which it calls first), the
+replaced (PowerShell's handler for found commands goes in front of the person's own, which it calls first), the
 history holds the line as it was typed, and `type` and `which` report the command as they did
 before.
 

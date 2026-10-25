@@ -75,15 +75,16 @@ $script:Hooks = @{
     InnerIsEditors     = $true
     Wrapper            = $null
     ReadLineInstalled  = $false
-    # The command-lookup handler this module puts in front of the person's own, the person's own
-    # (called first, and left standing when this module goes), and the handler as the engine holds
-    # it, to tell whether the person has replaced it since. A handler of the person's that was set
-    # after this module's and calls it keeps reaching it when the hooks go, and the person's own
-    # behind it keeps being called: LookupLive says whether it still does anything of its own.
+    # The handler this module puts in front of the person's own handler for the commands the engine
+    # has found, the person's own (called first, and left standing when this module goes), and the
+    # handler as the engine holds it, to tell whether the person has replaced it since. A handler of
+    # the person's that was set after this module's and calls it keeps reaching it when the hooks go,
+    # and the person's own behind it keeps being called: LookupLive says whether it does anything of
+    # its own.
     LookupPrior        = $null
     LookupInstalled    = $null
     LookupLive         = $false
-    # Held while this module asks the engine what a name is, which looks the name up again.
+    # Held while this module works out what to do with a command, which looks other names up.
     LookupBusy         = $false
     # What the one substituted command runs: the program, the vector it was asked about, the answer.
     Substitution       = $null
@@ -1405,63 +1406,21 @@ function Resolve-KalaReachCommand {
 
 # ---- the command-lookup handler ---------------------------------------------------------------------
 
-# Whether a program of this name is on the search path at all, found without asking the engine:
-# asking it about a name that is nowhere runs the person's own command-not-found handler, which the
-# real lookup then runs again.
-function Test-KrApplicationOnPath {
-    param([string]$Name)
-    $extensions = @('')
-    if ($IsWindows -and [System.IO.Path]::GetExtension($Name).Length -eq 0) {
-        $extensions = @(($env:PATHEXT -split ';') | Where-Object { $_ })
-        if ($extensions.Count -eq 0) { $extensions = @('.COM', '.EXE') }
-    }
-    foreach ($directory in ($env:PATH -split [System.IO.Path]::PathSeparator)) {
-        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
-        foreach ($extension in $extensions) {
-            if ([System.IO.File]::Exists([System.IO.Path]::Combine($directory, $Name + $extension))) { return $true }
-        }
-    }
-    $false
-}
-
-# What the engine finds first for a name, asked without the person's handler for the commands it has
-# found. Asking is a lookup, and a lookup calls that handler; when nothing is substituted the
-# engine's own lookup follows and calls it again, so a handler that counts, or chooses differently
-# each time, would be called twice for one command. It is asked once, by the lookup that runs the
-# command. The handler for names that are not found is not asked here either, since the caller has
-# found the name on the search path first. The handler for the lookup's start is this module's own,
-# which returns at once while this module is asking.
-function Get-KrFoundCommand {
-    param([string]$Name)
-    $invoke = $ExecutionContext.InvokeCommand
-    $after = $invoke.PostCommandLookupAction
-    $invoke.PostCommandLookupAction = $null
-    try {
-        $invoke.GetCommand($Name, [System.Management.Automation.CommandTypes]::All)
-    } finally {
-        $invoke.PostCommandLookupAction = $after
-    }
-}
-
 # The block that runs one integrated command, or nothing when the command is to run as it was typed.
 #
-# What decides is the line and what the engine would have run for it: the line is one command whose
-# words are plain constants, the command the engine finds first for the name is a program, and the
-# worker answers with a launch. Anything else is left to the engine untouched, which is what keeps
-# an alias, a function or a script of that name winning as it always has, and the status a command
-# leaves exactly the one it left.
+# What decides is the line and what the engine found for it: the line is one command whose words are
+# plain constants, the command the engine found, once the person's own handler has had its say, is a
+# program, and the worker answers with a launch. Anything else is left to the engine untouched, which
+# is what keeps an alias, a function or a script of that name winning as it always has, and the status
+# a command leaves exactly the one it left.
 function Get-KrLookupSubstitute {
-    param([string]$Name)
+    param([string]$Name, $found)
     if (-not (Test-KrCommandName $Name)) { return $null }
     $route = Get-KrRoute
     if ($null -eq $route -or -not [string]::Equals($route, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
     $line = $script:Line
     if ($null -eq $line.RouteWords) { return $null }
     [string[]]$words = @($line.RouteWords)
-    if (-not (Test-KrApplicationOnPath $Name)) { return $null }
-    $types = [System.Management.Automation.CommandTypes]
-    $found = Get-KrFoundCommand $Name
-    if ($null -eq $found -or $found.CommandType -ne $types::Application) { return $null }
     $program = "$($found.Source)"
     $launch = Resolve-KalaReachCommand -Origin 'Runspace' -Name $Name -Arguments $words -Executable $program
     if ($null -eq $launch) {
@@ -1501,34 +1460,37 @@ function Get-KrLookupSubstitute {
 # The cmdlet that puts a failed status back, found once.
 $script:WriteError = Get-Command -Name 'Microsoft.PowerShell.Utility\Write-Error' -CommandType Cmdlet
 
-# The handler the engine calls before it looks a name up. The person's own handler, if there was
-# one, runs first and its answer stands; this one acts only on the command a running line is, typed
-# at the prompt, and never changes what it does not substitute.
+# The handler the engine calls once it has found a command. The person's own handler, if there was
+# one, runs first and what it makes of the command stands; this one acts only on a program that is
+# still what the command is, typed at the prompt, and never changes what it does not substitute. It
+# is the one place the module decides, so the person's handler is asked once about each command.
 $script:LookupHandler = {
     param($CommandName, $EventArgs)
     $kept = $?
-    # A lookup this module makes itself, to see what a name is, is not one the person's handler is
-    # asked about again.
+    # A lookup this module makes itself is not one the person's handler is asked about again.
     if ($script:Hooks.LookupBusy) { return }
-    $prior = $script:Hooks.LookupPrior
-    if ($null -ne $prior) { $prior.Invoke($CommandName, $EventArgs) }
-    if (-not $script:Hooks.LookupLive) { return }
-    if ($EventArgs.StopSearch -or $null -ne $EventArgs.Command -or $null -ne $EventArgs.CommandScriptBlock) { return }
-    if (-not $script:Line.Running -or "$($EventArgs.CommandOrigin)" -cne 'Runspace') { return }
-    $script:Hooks.LookupBusy = $true
     try {
-        $block = Get-KrLookupSubstitute ([string]$CommandName)
-        if ($null -ne $block) {
-            $EventArgs.CommandScriptBlock = $block
-            $EventArgs.StopSearch = $true
+        $prior = $script:Hooks.LookupPrior
+        if ($null -ne $prior) { $prior.Invoke($CommandName, $EventArgs) }
+        if (-not $script:Hooks.LookupLive) { return }
+        if ($EventArgs.StopSearch -or $null -ne $EventArgs.CommandScriptBlock) { return }
+        $found = $EventArgs.Command
+        if ($null -eq $found -or $found.CommandType -ne [System.Management.Automation.CommandTypes]::Application) { return }
+        if (-not $script:Line.Running -or "$($EventArgs.CommandOrigin)" -cne 'Runspace') { return }
+        $script:Hooks.LookupBusy = $true
+        try {
+            $block = Get-KrLookupSubstitute ([string]$CommandName) $found
+            if ($null -ne $block) {
+                $EventArgs.CommandScriptBlock = $block
+            }
+        } catch {
+            Write-KrTrace "lookup failed: $($_.Exception.GetType().FullName)"
         }
-    } catch {
-        Write-KrTrace "lookup failed: $($_.Exception.GetType().FullName)"
     } finally {
-        # What the lookups above ran must not have changed the status the person's line reads. The
-        # last statement puts it back, with the cmdlet as it was found when this module loaded, so
-        # that putting it back is not a lookup of a name that the person's handler or a function of
-        # theirs could answer.
+        # What this handler ran must not have changed the status the person's line reads, whichever
+        # way it ends. The last statement puts it back, with the cmdlet as it was found when this
+        # module loaded, so that putting it back is not a lookup of a name that the person's handler
+        # or a function of theirs could answer.
         $script:Hooks.LookupBusy = $false
         if (-not $kept) { & $script:WriteError 'kalareach' -ErrorAction Ignore }
     }
@@ -1541,7 +1503,7 @@ $script:LookupHandler = {
 # this module's still answers; if it does not, the commands it would have asked about run as typed,
 # and the trace says so.
 function Install-KrLookupHandler {
-    $current = $ExecutionContext.InvokeCommand.PreCommandLookupAction
+    $current = $ExecutionContext.InvokeCommand.PostCommandLookupAction
     if ($null -ne $script:Hooks.LookupInstalled) {
         if (-not [object]::ReferenceEquals($current, $script:Hooks.LookupInstalled)) {
             Write-KrTrace 'the lookup handler was replaced by the person''s own; commands run as typed unless it calls this one'
@@ -1551,8 +1513,8 @@ function Install-KrLookupHandler {
         return
     }
     $script:Hooks.LookupPrior = $current
-    $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:LookupHandler
-    $script:Hooks.LookupInstalled = $ExecutionContext.InvokeCommand.PreCommandLookupAction
+    $ExecutionContext.InvokeCommand.PostCommandLookupAction = $script:LookupHandler
+    $script:Hooks.LookupInstalled = $ExecutionContext.InvokeCommand.PostCommandLookupAction
     $script:Hooks.LookupLive = $true
     Write-KrTrace ("lookup handler installed in front of " + $(if ($null -eq $current) { 'nothing' } else { 'the person''s own' }))
 }
@@ -1564,8 +1526,8 @@ function Install-KrLookupHandler {
 function Remove-KrLookupHandler {
     if ($null -eq $script:Hooks.LookupInstalled) { return }
     $script:Hooks.LookupLive = $false
-    if ([object]::ReferenceEquals($ExecutionContext.InvokeCommand.PreCommandLookupAction, $script:Hooks.LookupInstalled)) {
-        $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:Hooks.LookupPrior
+    if ([object]::ReferenceEquals($ExecutionContext.InvokeCommand.PostCommandLookupAction, $script:Hooks.LookupInstalled)) {
+        $ExecutionContext.InvokeCommand.PostCommandLookupAction = $script:Hooks.LookupPrior
         $script:Hooks.LookupInstalled = $null
         $script:Hooks.LookupPrior = $null
     }
