@@ -30,6 +30,7 @@ use crate::ceiling::InstallationGrant;
 use crate::error::{CatalogueError, CatalogueResult};
 use crate::install::Installation;
 use crate::repository::{CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind};
+use crate::trust::Met;
 use crate::{Catalogue, Change, Transition, Via, committing, extract};
 
 /// What the host calls the repository the seed enrols.
@@ -186,7 +187,7 @@ impl SeedTrust {
     /// Returns [`CatalogueError::Untrusted`] when the root cannot be read.
     #[cfg(any(test, feature = "testing"))]
     pub fn trusting_root_of(root: &[u8]) -> CatalogueResult<Self> {
-        let (keys, _) = root_role(root)?;
+        let (keys, _) = root_role(root, Met::Bundle)?;
         Ok(Self::named(Vec::new(), 1, Some(keys)))
     }
 
@@ -196,7 +197,13 @@ impl SeedTrust {
     ///
     /// Returns [`CatalogueError::Untrusted`] when the root cannot be read or is not trusted.
     pub fn permit(&self, root: &[u8]) -> CatalogueResult<Permitted> {
-        let (keys, threshold) = root_role(root)?;
+        self.permit_met(root, Met::Bundle)
+    }
+
+    /// [`Self::permit`], for a root met where `met` says, which decides what a refusal tells a
+    /// person to do.
+    fn permit_met(&self, root: &[u8], met: Met) -> CatalogueResult<Permitted> {
+        let (keys, threshold) = root_role(root, met)?;
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
         let production: Vec<&str> = self.production.iter().map(String::as_str).collect();
         let development: Option<Vec<&str>> = self
@@ -217,12 +224,12 @@ impl SeedTrust {
 }
 
 /// The key identifiers of a root's own role and the signatures it needs, as the client reads them.
-pub(crate) fn root_role(root: &[u8]) -> CatalogueResult<(Vec<String>, u64)> {
+pub(crate) fn root_role(root: &[u8], met: Met) -> CatalogueResult<(Vec<String>, u64)> {
     let signed: Signed<Root> =
         serde_json::from_slice(root).map_err(|source| CatalogueError::Untrusted {
             detail: format!("a bundled root could not be read: {source}"),
         })?;
-    crate::trust::check_role_keys(&signed.signed, crate::trust::Met::Bundle)?;
+    crate::trust::check_role_keys(&signed.signed, met)?;
     let role =
         signed
             .signed
@@ -843,7 +850,7 @@ impl Catalogue {
             outcome.notes.push(format!("did not seed: {error}"));
             return Ok(());
         }
-        let (bundle_keys, _) = root_role(bundle.highest_root())?;
+        let (bundle_keys, _) = root_role(bundle.highest_root(), Met::Bundle)?;
         let seeded = self
             .db
             .read(|records| records.settings_with_prefix(SEEDED))?;
@@ -859,7 +866,10 @@ impl Catalogue {
             // The root the enrolment trusts now has to be one this build trusts too, or the seed
             // does nothing to it: a build never moves a seeded enrolment under a root it does not
             // name.
-            if let Err(error) = bundle.trust.permit(&enrolled.enrolment.root) {
+            if let Err(error) = bundle
+                .trust
+                .permit_met(&enrolled.enrolment.root, Met::Rotation)
+            {
                 outcome.notes.push(format!(
                     "did not resume the seeded repository: its current root is not one this \
                      build trusts: {error}"
@@ -1009,7 +1019,7 @@ impl Catalogue {
     fn owners_enrolment(&self, bundle: &SeedBundle) -> CatalogueResult<Option<String>> {
         let bundled: Vec<Vec<String>> = bundle
             .roots()
-            .map(|(_, root)| root_role(root).map(|(keys, _)| keys))
+            .map(|(_, root)| root_role(root, Met::Bundle).map(|(keys, _)| keys))
             .collect::<CatalogueResult<_>>()?;
         for held in self.repositories()? {
             if let Ok(keys) = held.root_key_ids().map(|mut keys| {

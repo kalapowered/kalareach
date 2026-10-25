@@ -124,12 +124,12 @@ impl Met {
                  own, and enrol the repository with that root"
             }
             Self::Bundle => {
-                "the bundled catalogue is not seeded by this build, and a later release of the \
-                 product carries a root that gives each role a key of its own"
+                "this build does not seed the bundled catalogue, and a release whose bundled \
+                 root gives each role a key of its own seeds it"
             }
             Self::Rotation => {
-                "the repository stays on the root it holds until its publisher signs a next \
-                 root over it that gives each role a key of its own"
+                "the repository stays on the root it holds until its publisher signs a root \
+                 over this one that gives each role a key of its own"
             }
         }
     }
