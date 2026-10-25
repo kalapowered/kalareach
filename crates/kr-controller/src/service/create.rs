@@ -831,15 +831,19 @@ impl Controller {
                 );
                 self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 // A refusal of the authority the create stood on is that, and not a launch that
-                // failed: the caller pauses on the one and fails on the other.
-                return Err(if error.code == ErrorCode::PermissionDenied {
-                    ControllerError::PermissionDenied {
+                // failed: the caller pauses on the one and fails on the other. A shell that cannot
+                // be managed is not a launch that failed either: the caller is told to mend the
+                // shell or to choose another, not to wait and ask again.
+                return Err(match error.code {
+                    ErrorCode::PermissionDenied => ControllerError::PermissionDenied {
                         detail: error.message,
+                    },
+                    ErrorCode::ShellIntegrationUnsupported => {
+                        ControllerError::ShellIntegrationUnsupported(error.message)
                     }
-                } else {
-                    ControllerError::Supervision {
+                    _ => ControllerError::Supervision {
                         detail: error.to_string(),
-                    }
+                    },
                 });
             }
             Ok(Err(_)) | Err(_) => {
