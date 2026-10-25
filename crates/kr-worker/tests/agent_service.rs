@@ -2268,9 +2268,14 @@ async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_ma
         .refuse_ledger_writes(true)
         .expect("the ledger's store is put in query-only mode");
     let failed = broker
-        .checkpoint(
+        .bind_descriptor(
+            BrokerBindingId::new(Uuid::from_bytes([77; 16])),
             instance(),
-            kr_protocol::ids::StreamCursor::new(1),
+            PluginId::new("kalareach.other").expect("valid"),
+            PublisherId::new("kalareach").expect("valid"),
+            Digest256::from_bytes([6; 32]),
+            BrokerGrants::granted([BrokerGrant::Observation]),
+            None,
             TimestampMs::new(40),
         )
         .expect_err("the ledger's store refuses the write");

@@ -26,7 +26,8 @@
 //! * **Launch profiles** record what was actually resolved and run.
 //! * **Evidence gaps** record each spell of volatile operation, so the gap is committed when
 //!   storage returns rather than quietly forgotten.
-//! * **Adapter checkpoints** are the consumed semantic cursor a restart replays from.
+//! * **The checkpoint table** has no writer and no reader. It stays so that a ledger reads as the
+//!   retained release writes it, and goes with the ledger's next schema version.
 //! * **Client intents** are the requests the native terminal made of its own upstream, recorded
 //!   with their classification before their bytes go. A restart that found one of them unsettled
 //!   knows an operation it did not classify may already have changed upstream state.
@@ -2065,7 +2066,7 @@ impl Ledger {
         rows.iter().map(|bytes| decode(bytes)).collect()
     }
 
-    // -- adapter checkpoints ------------------------------------------------------------------
+    // -- the stream's generation --------------------------------------------------------------
 
     /// Advances and returns the generation of this broker's stream of transitions.
     ///
@@ -2105,56 +2106,6 @@ impl Ledger {
             )
             .map_err(|error| self.fault(error))?;
         Ok(u64::try_from(next).unwrap_or(1))
-    }
-
-    /// Records the last semantic cursor one adapter consumed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn put_checkpoint(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-        cursor: StreamCursor,
-        now: TimestampMs,
-    ) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO broker_checkpoints
-                     (application_instance_id, consumed_cursor, updated_at_ms)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (application_instance_id) DO UPDATE SET
-                     consumed_cursor = MAX(consumed_cursor, excluded.consumed_cursor),
-                     updated_at_ms = excluded.updated_at_ms",
-                params![
-                    application_instance_id.get().as_bytes().as_slice(),
-                    i64::try_from(cursor.get()).unwrap_or(i64::MAX),
-                    i64::try_from(now.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(|error| self.fault(error))?;
-        Ok(())
-    }
-
-    /// Reads one adapter's consumed cursor.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
-    pub fn checkpoint(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Result<Option<StreamCursor>> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT consumed_cursor FROM broker_checkpoints WHERE application_instance_id = ?1",
-                params![application_instance_id.get().as_bytes().as_slice()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|error| self.fault(error))?
-            .map(|cursor| StreamCursor::new(u64::try_from(cursor).unwrap_or(0))))
     }
 }
 
@@ -3093,21 +3044,6 @@ mod tests {
                 .expect("the read succeeds")
                 .is_none(),
             "the row the commit returned is the row the completion marks"
-        );
-    }
-
-    #[test]
-    fn a_checkpoint_never_moves_backwards() {
-        let ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
-        ledger
-            .put_checkpoint(instance(), StreamCursor::new(40), TimestampMs::new(1))
-            .expect("the checkpoint is written");
-        ledger
-            .put_checkpoint(instance(), StreamCursor::new(20), TimestampMs::new(2))
-            .expect("the older checkpoint is written");
-        assert_eq!(
-            ledger.checkpoint(instance()).expect("the read succeeds"),
-            Some(StreamCursor::new(40))
         );
     }
 }

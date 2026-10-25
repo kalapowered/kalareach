@@ -1124,9 +1124,9 @@ impl Broker {
 
     /// Registers one application instance no launch of this broker made.
     ///
-    /// Its semantic numbering resumes after whatever cursor an adapter last checkpointed, so a
-    /// restarted worker never issues a cursor an adapter has already passed, and a replay from
-    /// before the restart is a visible gap rather than a silently empty answer.
+    /// Its history starts empty and numbers its entries from one: an instance's identifier is its
+    /// own for good, so no cursor of another life of the host can be read as one of this
+    /// instance's.
     ///
     /// An identifier another path holds is refused: one already registered, and one a launch holds
     /// or an adoption has recorded. A launch registers its own instance through
@@ -1134,8 +1134,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read, and
-    /// [`BrokerError::InvalidArgument`] when the identifier is already held.
+    /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held.
     pub fn register_instance(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -1143,7 +1142,7 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
-        let semantic = self.resumed_semantics(application_instance_id)?;
+        let semantic = crate::broker::semantic::SemanticLog::new();
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
         state.insert_instance(application_instance_id, mode, profile_id, process, semantic);
@@ -1163,7 +1162,7 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
-        let semantic = self.resumed_semantics(application_instance_id)?;
+        let semantic = crate::broker::semantic::SemanticLog::new();
         let mut state = self.state();
         if state.launches.get(&application_instance_id) != Some(&token) {
             return Err(BrokerError::invalid(format!(
@@ -1204,8 +1203,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held, and
-    /// [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read or the profile cannot
-    /// be recorded.
+    /// [`BrokerError::LedgerUnavailable`] when the profile cannot be recorded.
     pub fn adopt_instance(
         &self,
         profile: LaunchProfile,
@@ -1213,7 +1211,7 @@ impl Broker {
         process: ProcessStartIdentity,
         saved_conversation: Option<String>,
     ) -> Result<()> {
-        let semantic = self.resumed_semantics(application_instance_id)?;
+        let semantic = crate::broker::semantic::SemanticLog::new();
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
@@ -1235,19 +1233,6 @@ impl Broker {
             instance.observed = Some(process);
         }
         Ok(())
-    }
-
-    /// Reads where one instance's semantic numbering resumes.
-    fn resumed_semantics(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Result<crate::broker::semantic::SemanticLog> {
-        let consumed = self.state().ledger.checkpoint(application_instance_id)?;
-        let mut semantic = crate::broker::semantic::SemanticLog::new();
-        if let Some(consumed) = consumed {
-            semantic.resume_after(consumed);
-        }
-        Ok(semantic)
     }
 
     /// Returns one instance's binding state.
@@ -3194,36 +3179,6 @@ impl Broker {
         self.state().ledger.refuse_writes(refuse)
     }
 
-    // -- adapter checkpoints ------------------------------------------------------------------
-
-    /// Records the last semantic cursor one adapter consumed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn checkpoint(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-        cursor: StreamCursor,
-        now: TimestampMs,
-    ) -> Result<()> {
-        self.state().stored(now, "an adapter checkpoint", |ledger| {
-            ledger.put_checkpoint(application_instance_id, cursor, now)
-        })
-    }
-
-    /// Returns the cursor an adapter replays from after a restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
-    pub fn consumed_cursor(
-        &self,
-        application_instance_id: ApplicationInstanceId,
-    ) -> Result<Option<StreamCursor>> {
-        self.state().ledger.checkpoint(application_instance_id)
-    }
-
     // -- the gateway --------------------------------------------------------------------------
 
     /// Pins one connector's qualified tables for one installation.
@@ -3975,11 +3930,6 @@ impl Broker {
         Ok(binding.actions.get(action).cloned())
     }
 
-        // A turn still running belonged to the owner the binding is leaving, so it is recorded as
-        // dropped under the revision it ran in, before that revision is left.
-        if let Some(turn) = instance.turn_id.clone() {
-            instance.note("turn.dropped", turn.as_str(), now);
-        }
     /// Mints the next gateway connection identifier.
     ///
     /// Downstream request identifiers are namespaced by it, so two connections that both start at
@@ -4025,6 +3975,11 @@ impl BrokerState {
             .instances
             .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
+        // A turn still running belonged to the owner the binding is leaving, so it is recorded as
+        // dropped under the revision it ran in, before that revision is left.
+        if let Some(turn) = instance.turn_id.clone() {
+            instance.note("turn.dropped", turn.as_str(), now);
+        }
         instance.binding_revision =
             AgentBindingRevision::new(instance.binding_revision.get().saturating_add(1));
         instance.thread_id = thread_id;

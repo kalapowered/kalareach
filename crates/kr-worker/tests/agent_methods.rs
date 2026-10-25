@@ -1285,92 +1285,31 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
         .expect("the observation beside it still answers");
 }
 
-/// KR-REQ-24.24: an adapter replays from the cursor it consumed, and an evicted range rebuilds
-/// with a visible history gap.
+/// KR-REQ-24.24: a reader replays from the cursor it consumed and is given what came after it, and
+/// an evicted range rebuilds from what is retained with a visible history gap. The cursor is the
+/// reader's own: it asks for the node after the last it read.
 #[test]
 fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_a_gap() {
-    let directory = std::env::temp_dir().join(format!("kr-methods-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    let path = directory.join("session.sqlite");
-
-    let consumed = {
-        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
-            .expect("the broker opens");
-        broker
-            .register_instance(instance(), IntegrationMode::Gateway, None, None)
-            .expect("the instance is registered");
-        for index in 1..=5 {
-            broker
-                .observe(
-                    instance(),
-                    "message",
-                    &format!("entry {index}"),
-                    TimestampMs::new(index),
-                )
-                .expect("observed");
-        }
-        let replay = broker
-            .replay(
-                instance(),
-                None,
-                &GrantLowerBound {
-                    from: StreamCursor::new(1),
-                },
-                MAX_SEMANTIC_SNAPSHOT_BYTES,
-            )
-            .expect("the replay succeeds");
-        assert_eq!(replay.entries.len(), 5);
-        assert!(!replay.history_gap);
-        broker
-            .checkpoint(instance(), replay.consumed, TimestampMs::new(6))
-            .expect("the cursor is recorded");
-        replay.consumed
-    };
-
-    // A restart replays from the cursor that was consumed, and nothing before it.
-    let restarted =
-        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
-    assert_eq!(
-        restarted
-            .consumed_cursor(instance())
-            .expect("the read succeeds"),
-        Some(consumed)
-    );
-    restarted
-        .register_instance(instance(), IntegrationMode::Gateway, None, None)
-        .expect("the instance is registered");
-    for index in 6..=8 {
-        restarted
-            .observe(
-                instance(),
-                "message",
-                &format!("entry {index}"),
-                TimestampMs::new(index),
-            )
-            .expect("observed");
-    }
-    let replay = restarted
-        .replay(
-            instance(),
-            Some(consumed),
-            &GrantLowerBound {
-                from: StreamCursor::new(1),
-            },
-            MAX_SEMANTIC_SNAPSHOT_BYTES,
-        )
-        .expect("the replay succeeds");
-    assert!(
-        replay.entries.is_empty() || replay.entries[0].text.starts_with("entry"),
-        "the replay starts after what was consumed"
-    );
-    assert!(!replay.history_gap);
-
-    // An evicted range rebuilds from what is verifiably retained, and says there is a gap.
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(instance(), IntegrationMode::Gateway, None, None)
         .expect("the instance is registered");
-    for index in 1..=(kr_worker::broker::semantic::MAX_RETAINED_ENTRIES as u64 + 10) {
+    let read = |from_node: Option<u64>| {
+        broker
+            .agent_snapshot(
+                &AgentSnapshotParams {
+                    subject: subject(session(), instance()),
+                    from_node: from_node
+                        .map_or_else(Nullable::null, |node| Nullable::some(U64::new(node))),
+                },
+                &GrantLowerBound {
+                    from: StreamCursor::new(1),
+                },
+                1 << 20,
+            )
+            .expect("the snapshot is read")
+    };
+    for index in 1..=5 {
         broker
             .observe(
                 instance(),
@@ -1380,21 +1319,49 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
             )
             .expect("observed");
     }
-    let rebuilt = broker
-        .replay(
-            instance(),
-            Some(StreamCursor::new(1)),
-            &GrantLowerBound {
-                from: StreamCursor::new(1),
-            },
-            MAX_SEMANTIC_SNAPSHOT_BYTES,
-        )
-        .expect("the replay succeeds");
+    let first = read(None);
+    assert_eq!(first.entries.len(), 5);
+    assert!(!first.history_gap);
+    let consumed = first.entries.last().expect("an entry").node.get();
+
+    // More is observed, and a reader that holds the cursor it consumed is given what came after it
+    // and nothing before it.
+    for index in 6..=8 {
+        broker
+            .observe(
+                instance(),
+                "message",
+                &format!("entry {index}"),
+                TimestampMs::new(index),
+            )
+            .expect("observed");
+    }
+    let next = read(Some(consumed + 1));
+    let texts: Vec<&str> = next
+        .entries
+        .iter()
+        .map(|entry| entry.text.as_str())
+        .collect();
+    assert_eq!(texts, ["entry 6", "entry 7", "entry 8"]);
+    assert!(!next.history_gap);
+
+    // An evicted range rebuilds from what is verifiably retained, and says there is a gap.
+    for index in 9..=(kr_worker::broker::semantic::MAX_RETAINED_ENTRIES as u64 + 10) {
+        broker
+            .observe(
+                instance(),
+                "message",
+                &format!("entry {index}"),
+                TimestampMs::new(index),
+            )
+            .expect("observed");
+    }
+    let rebuilt = read(Some(consumed + 1));
     assert!(
         rebuilt.history_gap,
         "a range that was evicted is a visible gap, not a shorter answer"
     );
-    let _ = std::fs::remove_dir_all(&directory);
+    assert!(!rebuilt.entries.is_empty());
 }
 
 /// KR-REQ-24.24: the history keeps a bounded text for each entry, so the entries it retains are

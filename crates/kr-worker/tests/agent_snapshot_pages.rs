@@ -487,12 +487,19 @@ async fn a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it() {
 /// What a connection that declared the usual limits receives in one control frame.
 const USUAL_FRAME: usize = kr_protocol::limits::MAX_CONTROL_FRAME_LEN;
 
-/// A text of exactly a million bytes, numbered: one of these fills most of a usual frame, so each
-/// part carries one, and sixteen fit section 8's 16 MiB while seventeen do not.
-fn million(number: usize) -> String {
-    let label = format!("entry {number:>2}: ");
-    format!("{label}{}", "x".repeat(1_000_000 - label.len()))
+/// A text of exactly the longest an entry keeps, numbered: a usual frame carries about fifteen of
+/// these, and section 8's 16 MiB holds a little over two hundred and fifty.
+fn big(number: usize) -> String {
+    let label = format!("entry {number:>3}: ");
+    format!(
+        "{label}{}",
+        "x".repeat(kr_worker::broker::semantic::MAX_ENTRY_TEXT_BYTES - label.len())
+    )
 }
+
+/// How many of the entries of `big` the first snapshot of a history longer than section 8's total
+/// carries: the total over what one entry costs, give or take the few bytes of its own members.
+const FIRST_SNAPSHOT_HOLDS: std::ops::RangeInclusive<usize> = 250..=256;
 
 /// Reads one part on the owner's own connection, and holds it to the usual frame.
 async fn usual_part(
@@ -511,9 +518,9 @@ async fn usual_part(
     answer.to_typed().expect("the snapshot decodes")
 }
 
-/// Records `count` entries of a million bytes each.
-fn converse_millions(host: &Host, count: usize) -> Vec<String> {
-    let said: Vec<String> = (1..=count).map(million).collect();
+/// Records `count` entries of `big`.
+fn converse_big(host: &Host, count: usize) -> Vec<String> {
+    let said: Vec<String> = (1..=count).map(big).collect();
     let timed: Vec<(&str, u64)> = said
         .iter()
         .zip(1_000_u64..)
@@ -525,15 +532,16 @@ fn converse_millions(host: &Host, count: usize) -> Vec<String> {
 
 /// KR-REQ-08.72: one snapshot's parts together carry at most section 8's 16 MiB, not 16 MiB each.
 ///
-/// Twenty entries of a million bytes are read on a connection whose frame carries one of them at
-/// a time. The parts of the first snapshot carry sixteen, and the part that would have passed the
-/// total ends with a continuation that names it, which is what section 8 asks of a limit that is
-/// passed. Asked from there, the rest is a snapshot of its own, and a reader that follows both
-/// reads every entry once, in the order it was said.
+/// Three hundred entries of the longest text an entry keeps are read on a connection whose frame
+/// carries about fifteen of them at a time. The parts of the first snapshot carry as many as the
+/// total holds, and the part that would have passed the total ends with a continuation that names
+/// it, which is what section 8 asks of a limit that is passed. Asked from there, the rest is a
+/// snapshot of its own, and a reader that follows both reads every entry once, in the order it
+/// was said.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_whose_parts_pass_the_total_is_cut_at_it() {
     let host = host().await;
-    let said = converse_millions(&host, 20);
+    let said = converse_big(&host, 300);
     let total = kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
 
     let mut reader = owner(&host, ReceiveLimits::default()).await;
@@ -557,11 +565,17 @@ async fn a_snapshot_whose_parts_pass_the_total_is_cut_at_it() {
         }
         from = Some(continuation.from_node.get());
     };
+    assert!(
+        FIRST_SNAPSHOT_HOLDS.contains(&first.len()),
+        "the first snapshot carries {} entries",
+        first.len()
+    );
     assert_eq!(
         first,
-        said[..16],
-        "the first snapshot carries the first sixteen, whole"
+        said[..first.len()],
+        "the first snapshot carries the first of them, whole"
     );
+    let carried = first.len();
 
     let mut rest = Vec::new();
     let mut from = Some(resume_at);
@@ -577,7 +591,11 @@ async fn a_snapshot_whose_parts_pass_the_total_is_cut_at_it() {
             "the part that started at {node} continues at {from:?}, which is no further on"
         );
     }
-    assert_eq!(rest, said[16..], "and asked from there, the rest, whole");
+    assert_eq!(
+        rest,
+        said[carried..],
+        "and asked from there, the rest, whole"
+    );
 }
 
 /// KR-REQ-23.39, the control: a snapshot whose parts together stay under the total is read as it
@@ -585,7 +603,7 @@ async fn a_snapshot_whose_parts_pass_the_total_is_cut_at_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_under_the_total_is_read_in_parts_that_never_name_it() {
     let host = host().await;
-    let said = converse_millions(&host, 15);
+    let said = converse_big(&host, 200);
     let total = kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
 
     let mut reader = owner(&host, ReceiveLimits::default()).await;
@@ -658,13 +676,13 @@ async fn forwarded_part(
 
 /// KR-REQ-08.72: the daemon's one connection carries many readers' reads, and each reader's
 /// snapshot spends a total of its own. Two devices read the same history part by part, in turns,
-/// on that connection, and each one's first snapshot carries sixteen entries and ends at the
-/// total, as one reader's alone does: neither reader's parts are paid for out of the other's
+/// on that connection, and each one's first snapshot carries as many entries as the total holds
+/// and ends at it, as one reader's alone does: neither reader's parts are paid for out of the other's
 /// total, and neither begins its snapshot again because the other read in between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_readers_on_one_connection_each_spend_a_total_of_their_own() {
     let host = host().await;
-    let said = converse_millions(&host, 20);
+    let said = converse_big(&host, 300);
     let total = kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES;
     let readers = [device(), second_device()];
 
@@ -691,17 +709,22 @@ async fn two_readers_on_one_connection_each_spend_a_total_of_their_own() {
                 from[index] = Some(continuation.from_node.get());
             }
             assert!(
-                read[index].len() <= 16,
+                read[index].len() <= *FIRST_SNAPSHOT_HOLDS.end(),
                 "reader {index} read {} entries in one snapshot",
                 read[index].len()
             );
         }
     }
     for (index, entries) in read.iter().enumerate() {
+        assert!(
+            FIRST_SNAPSHOT_HOLDS.contains(&entries.len()),
+            "reader {index}'s first snapshot carries {} entries",
+            entries.len()
+        );
         assert_eq!(
             entries,
-            &said[..16],
-            "reader {index}'s first snapshot carries the first sixteen"
+            &said[..entries.len()],
+            "reader {index}'s first snapshot carries the first of them"
         );
     }
 }

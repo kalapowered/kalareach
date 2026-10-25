@@ -556,7 +556,9 @@ pub static STORES: &[StoreDescriptor] = &[
     },
     StoreDescriptor {
         name: "broker_checkpoints",
-        holds: "stream cursor checkpoints for observer replay",
+        // Nothing writes or reads it. A ledger created by the retained release has it, so a ledger
+        // this release creates has it too; both go with the ledger's next schema version.
+        holds: "nothing: kept so the ledger reads as the retained release writes it",
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,

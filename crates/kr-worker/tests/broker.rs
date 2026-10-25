@@ -2995,44 +2995,6 @@ fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
     assert!(grants.is_display_only(), "and it did not change on the way");
 }
 
-/// KR-REQ-24.24: an adapter's consumed cursor survives a restart, which is what a replay starts
-/// from.
-///
-/// The replay itself, and the visible history gap an evicted range produces, are the gateway's
-/// and are established by its own suite.
-#[test]
-fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
-    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    let path = directory.join("session.sqlite");
-    {
-        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
-            .expect("the broker opens");
-        broker
-            .register_instance(instance(2), IntegrationMode::Gateway, None, None)
-            .expect("the instance is registered");
-        assert_eq!(
-            broker
-                .consumed_cursor(instance(2))
-                .expect("the read succeeds"),
-            None,
-            "an adapter that has consumed nothing replays from the beginning"
-        );
-        broker
-            .checkpoint(instance(2), StreamCursor::new(40), TimestampMs::new(2))
-            .expect("the checkpoint is written");
-    }
-    let restarted =
-        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
-    assert_eq!(
-        restarted
-            .consumed_cursor(instance(2))
-            .expect("the read succeeds"),
-        Some(StreamCursor::new(40))
-    );
-    let _ = std::fs::remove_dir_all(&directory);
-}
-
 /// KR-REQ-11.37: a gap commits everything that happened inside it, including endings, and normal
 /// operation afterwards writes every later transition down.
 ///
