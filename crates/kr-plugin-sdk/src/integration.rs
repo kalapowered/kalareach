@@ -141,8 +141,8 @@ pub struct IntegrationBackend {
     ///
     /// Listing a word also says that the first bare word after it names a saved conversation the
     /// launch works on (see [`IntegrationBackend::saved_conversation`]), whatever the word means
-    /// to the application: the host keeps a second launch of that conversation from running as a
-    /// second execution of it.
+    /// to the application. A second launch of that conversation in the same session gets no second
+    /// server and runs as typed.
     pub launching_words: Vec<String>,
 }
 
