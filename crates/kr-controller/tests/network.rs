@@ -995,13 +995,17 @@ async fn type_and_wait_for(
 }
 
 /// Types `text` into the session as the person at this machine does, on the worker's own socket,
-/// and returns once the worker has taken it.
-async fn the_owner_types(
+/// and returns the cursor after the output that carries `wanted`, as the owner reads it.
+///
+/// The connection that typed stays open until the output has come back: a worker discards the
+/// input a closed connection has not delivered.
+async fn the_owner_types_until(
     endpoint: &kr_ipc::paths::Endpoint,
     environment_id: EnvironmentId,
     session_id: SessionId,
     text: &str,
-) {
+    wanted: &str,
+) -> u64 {
     let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
         .await
         .expect("the local client reaches the worker");
@@ -1070,37 +1074,41 @@ async fn the_owner_types(
         .await
         .expect("the call reaches the worker")
         .expect("the owner's input reaches the terminal");
-}
-
-/// Reads the session's retained output as the owner does, on the worker's own socket, until it
-/// carries `wanted`, and returns the cursor after what it read.
-async fn the_owner_reads_until(
-    client: &mut LocalClient,
-    session_id: SessionId,
-    wanted: &str,
-) -> u64 {
+    // Each read is a round trip to the worker, which is what spaces them: the loop waits for the
+    // output and for nothing else, and ends at a deadline if it never comes.
     let deadline = tokio::time::Instant::now() + PATIENCE;
-    while tokio::time::Instant::now() < deadline {
-        let page: kr_protocol::recovery::HistoryPageResult = client
-            .request(
-                Method::HistoryPage,
-                &kr_protocol::recovery::HistoryPageParams {
-                    session_id,
-                    from_cursor: U64::ZERO,
-                    max_bytes: U64::new(64 * 1024),
-                },
-            )
-            .await
-            .expect("the call reaches the worker")
-            .expect("the owner is served the page")
-            .to_typed()
-            .expect("decodes");
+    loop {
+        let page = the_owners_page(&mut client, session_id).await;
         if String::from_utf8_lossy(page.bytes.as_slice()).contains(wanted) {
             return page.next_cursor.get();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session's retained output never carried {wanted:?}"
+        );
+        tokio::task::yield_now().await;
     }
-    panic!("the session's retained output never carried {wanted:?}");
+}
+
+/// The session's retained output from the start, as the owner reads it on the worker's own socket.
+async fn the_owners_page(
+    client: &mut LocalClient,
+    session_id: SessionId,
+) -> kr_protocol::recovery::HistoryPageResult {
+    client
+        .request(
+            Method::HistoryPage,
+            &kr_protocol::recovery::HistoryPageParams {
+                session_id,
+                from_cursor: U64::ZERO,
+                max_bytes: U64::new(64 * 1024),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner is served the page")
+        .to_typed()
+        .expect("decodes")
 }
 
 /// Closes a session and waits for the daemon to record that its worker has gone.
@@ -3751,14 +3759,14 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
         .expect("an attachment");
 
     // The session writes before the device is paired, and the owner reads that.
-    the_owner_types(
+    let before_ends = the_owner_types_until(
         &worker_endpoint,
         host.environment_id,
         session_id,
         BEFORE_COMMAND,
+        BEFORE_MARKER,
     )
     .await;
-    let before_ends = the_owner_reads_until(&mut attached_locally, session_id, BEFORE_MARKER).await;
 
     let device = Device::create(&loopback()).await;
     let record = pair_with(
@@ -3810,16 +3818,18 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
     // at its pairing. What the session wrote before then is not in the page, whatever the page
     // begins at; and where the page begins at or before the output written after the pairing, it
     // carries it.
-    let after_starts =
-        the_owner_reads_until(&mut attached_locally, session_id, BEFORE_MARKER).await;
-    the_owner_types(
+    let after_starts = the_owners_page(&mut attached_locally, session_id)
+        .await
+        .next_cursor
+        .get();
+    the_owner_types_until(
         &worker_endpoint,
         host.environment_id,
         session_id,
         AFTER_COMMAND,
+        AFTER_MARKER,
     )
     .await;
-    the_owner_reads_until(&mut attached_locally, session_id, AFTER_MARKER).await;
     let history = session
         .history_page(&kr_protocol::recovery::HistoryPageParams {
             session_id,
