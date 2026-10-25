@@ -18,11 +18,14 @@
 //! is whenever the sequences are equal.
 //!
 //! The limits. A registry and a mirror put back together are one earlier state, and nothing in
-//! this host can tell it from the host's own. A mirror that cannot be read protects nothing: a
-//! registry put back to an earlier state while the mirror is damaged keeps the older row, and the
-//! next write replaces the mirror with a copy of it. A registry put back to an earlier state that
-//! an earlier release then writes keeps the sequence it had, so the mirror still stands above it
-//! when this build starts again, and the mirror's policy replaces what that release wrote.
+//! this host can tell it from the host's own; only its comparison with its authority feed can, and
+//! then the policy waits for the person at this machine ([`super::restored`]). A mirror that is
+//! missing protects nothing. One that is there and cannot be read makes the host wait for the
+//! person at this machine too, since a registry put back to an earlier state could not be noticed:
+//! the start writes that record before the next write replaces the mirror with a copy of the row.
+//! A registry put back to an earlier state that a release from before the mirror then writes
+//! keeps the sequence it had, so the mirror still stands above it when this build starts again,
+//! and the mirror's policy replaces what that release wrote.
 
 use std::path::{Path, PathBuf};
 
