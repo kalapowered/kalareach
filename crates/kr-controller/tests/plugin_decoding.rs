@@ -673,8 +673,8 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
 }
 
 /// KR-REQ-11.21 and KR-ACC-016: a component that traps, declines or never returns writes no
-/// answer. Nothing is sent, the receipt does not say the answer was refused, the terminal answers
-/// the request, and the third fault within a minute disables the binding.
+/// answer. Nothing is sent, the terminal answers the request, and the third fault within a minute
+/// disables the binding. A fault the component declares itself is not one of the three.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_acc_016_a_component_that_faults_while_it_encodes_writes_no_answer_and_is_disabled_at_the_third()
  {
@@ -685,7 +685,12 @@ async fn kr_acc_016_a_component_that_faults_while_it_encodes_writes_no_answer_an
     };
     world.until_ready(1).await;
     let mut owner = world.owner().await;
-    for (number, marker) in (70_u64..).zip(["!encode-trap", "!encode-decline", "!encode-spin"]) {
+    for (number, marker) in (70_u64..).zip([
+        "!encode-decline",
+        "!encode-trap",
+        "!encode-spin",
+        "!encode-trap",
+    ]) {
         world.send(&request_noting(number, marker));
         let approval = approved(&world, &number.to_string()).await;
         let outcome = world
