@@ -3880,7 +3880,13 @@ transaction, while the environment's daemon is stopped and no worker can hold it
 registry's worker rows and closures, with the registry read as it is (`Registry::open_to_read`,
 which reads the file alone as immutable, writes nothing, not even beside it, and refuses a registry
 whose write-ahead log still holds writes or that is reached through a link), and from the
-descriptor; a source it cannot read, the registry included, refuses the journal. It checks the
+descriptor; a source it cannot read, the registry included, refuses the journal. A closure that
+lists a worker whose end was never confirmed refuses it too, unless the registry's reservation for
+the session records the process its launch ran and the kernel says that process has ended: the
+reservation is read only to lift that refusal, and a reservation that is missing, records no
+launch, names a process that runs or cannot be established, or cannot be read keeps it. The daemon
+asks the same question of the same proof before it collects or migrates a closed session's stores.
+It checks the
 version and every object against the statement one of those builds ran to make it, reads every row
 as the running host reads it, names anything it cannot read, and leaves a refused journal exactly as
 it was; a failure after it has begun changing the journal goes back with its transaction.
