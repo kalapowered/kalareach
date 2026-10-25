@@ -546,6 +546,11 @@ fn tell_the_page_the_records_are_open(app: &tauri::AppHandle) {
     if let Ok(owner) = state.owner() {
         let _ = app.emit(pairing::CONFIRMATIONS_EVENT, owner.view());
     }
+    // The notifications desk opens with the records, after the page asked for it and was told
+    // there was none.
+    if let Some(desk) = state.push() {
+        let _ = app.emit(push::PUSH_EVENT, desk.view());
+    }
 }
 
 /// Starts what needs the pairing records: on a phone the host its commands last went to, and
