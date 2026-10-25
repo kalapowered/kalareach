@@ -77,6 +77,7 @@ pub mod trust;
 /// The generation compiled into the host.
 #[rustfmt::skip]
 mod bundled_files;
+mod publisher;
 /// The trust a build commits.
 #[rustfmt::skip]
 mod seed_trust;
@@ -1387,6 +1388,25 @@ impl Catalogue {
         // which is what stays if it goes no further; generations it is not on make room for the
         // second first. A sync that cannot fit either way is refused here, with the accepted
         // checkpoint and the generation in use as they were.
+        // A publisher's name is held by one root. What this generation lists is held to that
+        // before anything of it is kept, against the root the repository was on and the one the
+        // load ended on, which the client verified a chain between.
+        let publishers: BTreeSet<String> = verified
+            .index
+            .entries
+            .iter()
+            .map(|entry| entry.publisher_id.to_string())
+            .collect();
+        self.db.read(|records| {
+            publisher::check(
+                records,
+                &self.root,
+                &enrolled.key,
+                &[&enrolled.enrolment.root, &verified.root],
+                &publishers,
+            )
+        })?;
+
         let checkpoint = store.publication_peak(&working)?;
         self.retain_before_publication(&store, &enrolled.key, id, checkpoint, arriving, authority)?;
 
@@ -1463,6 +1483,8 @@ impl Catalogue {
         let entries = verified.index.entries.len() as u64;
         let versions = verified.versions;
         let key = enrolled.key.clone();
+        let home = self.root.clone();
+        let began_on = enrolled.enrolment.root.clone();
         let accepted_targets = verified.accepted_targets(&enrolled.enrolment.targets_url)?;
         // The index is written whole and flushed before the row that names it commits, in a
         // commit of its own: a document nothing names yet is what a later failure leaves behind,
@@ -1486,6 +1508,15 @@ impl Catalogue {
                 digest,
                 accepted_of(current.active),
                 current.enrolment.pinned_generation,
+            )?;
+            // Decided again where the generation becomes the active one: another process can
+            // have synchronised a repository under another root since the check above.
+            publisher::check(
+                changes,
+                &home,
+                &key,
+                &[&began_on, &current.enrolment.root, &verified.root],
+                &publishers,
             )?;
             let active = ActiveGeneration {
                 generation: verified.generation.get(),
@@ -2463,6 +2494,18 @@ impl Catalogue {
                 ),
             });
         }
+        // The name this package lists is held by one root, and nothing is fetched for a package
+        // under a name another root holds.
+        let publishers = BTreeSet::from([entry.publisher_id.to_string()]);
+        self.db.read(|records| {
+            publisher::check(
+                records,
+                &self.root,
+                &enrolled.key,
+                &[&enrolled.enrolment.root],
+                &publishers,
+            )
+        })?;
         let previous = self.installation(environment_id, plugin_id)?;
         let confirmed = authority.owner_confirmed();
         check_installation(
@@ -2506,6 +2549,13 @@ impl Catalogue {
                         detail: format!("{id} was removed while {plugin_id} was installed"),
                     })?;
             check_decided_under(id, &current.enrolment.ceiling, decided_under)?;
+            publisher::check(
+                changes,
+                &root,
+                &key,
+                &[&current.enrolment.root],
+                &publishers,
+            )?;
             let previous = changes.installation(environment_id, plugin_id)?;
             check_installation(
                 &entry,

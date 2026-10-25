@@ -133,6 +133,23 @@ fn key_material(key: &tough::schema::key::Key) -> (&'static str, Vec<u8>) {
     }
 }
 
+/// The keys a root names for its own role, which are what a repository's trust is anchored in: the
+/// same set is the same root whatever its version, its expiry or the other roles' keys, and a
+/// rotation that replaces one of them is another set. `None` when the root cannot be read.
+pub(crate) fn root_role_keys(root: &[u8]) -> Option<BTreeSet<(&'static str, Vec<u8>)>> {
+    let signed: tough::schema::Signed<tough::schema::Root> = serde_json::from_slice(root).ok()?;
+    let role = signed.signed.roles.get(&tough::schema::RoleType::Root)?;
+    Some(
+        role.keyids
+            .iter()
+            .map(|identifier| match signed.signed.keys.get(identifier) {
+                Some(key) => key_material(key),
+                None => ("identifier", identifier.to_vec()),
+            })
+            .collect(),
+    )
+}
+
 /// Checks that no role of `root` names one key under two identifiers and that no two roles name
 /// the same key.
 ///

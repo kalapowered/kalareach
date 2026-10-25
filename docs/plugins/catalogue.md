@@ -39,6 +39,25 @@ before anything is fetched, with `QUOTA_EXCEEDED` and the name of the budget it 
 Each repository keeps its own root. An enterprise or vendor repository that adopted a root out of
 band is not verified against the official one, and adopting a second root never widens the first.
 
+A publisher's name is held by one root. A plugin identifier is `publisher/name` and an
+installation, an admission, a grant and a binding are all found by it, so two repositories under
+different roots that list one publisher would be two authorities for one name. A repository is
+refused a publisher that the root of another repository holds, with the publisher and that
+repository named: when it synchronises, before anything of its generation is kept, and when a
+package of it is installed, before anything is fetched. A root holds the publishers its repository's
+active generation lists and the publishers of what was installed from the repository, and what was
+installed from a repository that has since been removed still holds its publisher, by the root in
+the checkpoint the repository left. "The same root" is the same set of keys the root names for its
+own role, so a mirror and a vendor repository beneath the official root share their publishers,
+and a renewed root keeps them; a sync accepts a holder under the root the repository was on or the
+root the load ended on, since the client verified the chain between them. The repository the seed
+enrols is never refused, so a shipped publisher's name is the build's whichever repository was
+enrolled first. Nothing about the binding is stored: it is read from the records above. It does
+not cover a delegation that lists no package, and a mirror that has not followed a root-key
+rotation counts as another root for an installation until it synchronises. A third party that
+already holds a shipped name keeps its generation, and what it installed, until its next sync is
+refused.
+
 A root gives each of its four roles a key of its own. A root that names one key for two roles, or
 one key twice for a role, is refused with the roles named: when the owner is asked to adopt it,
 when the build is asked to trust the bundled generation's, and for the root a sync ends on, before
