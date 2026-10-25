@@ -290,6 +290,11 @@ pub struct PushView {
     pub available: bool,
     /// Each paired host.
     pub hosts: Vec<HostPushView>,
+    /// The place of this view among the views the desk has read, counted from one: a view read
+    /// later has a higher number. The page may be handed views by several routes (an event, an
+    /// answer to a command) and they do not arrive in the order they were read, so it keeps the
+    /// view with the highest number it has seen and drops any older one.
+    pub revision: u64,
 }
 
 /// Why a sequence stopped, in words for the person.
@@ -531,6 +536,8 @@ struct State {
     /// to any registration: a host that is on stays registered, and the next filing that succeeds
     /// takes the mark away. Kept in memory only, since a start files again.
     keys_unfiled: Option<String>,
+    /// How many views have been read: the number of the newest.
+    views: u64,
     /// The number the next claim is given.
     next_run: u64,
 }
@@ -683,6 +690,7 @@ impl PushDesk {
                 observed: BTreeMap::new(),
                 unconfirmed: BTreeMap::new(),
                 keys_unfiled: None,
+                views: 0,
                 next_run: 0,
             }),
             registering: tokio::sync::Mutex::new(()),
@@ -704,7 +712,10 @@ impl PushDesk {
     /// What the page is shown: each paired host and where its notifications stand.
     #[must_use]
     pub fn view(&self) -> PushView {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
+        // Numbered under the hold that reads the state, so a higher number is a later reading.
+        state.views += 1;
+        let revision = state.views;
         let hosts = self
             .device
             .pairing()
@@ -753,6 +764,7 @@ impl PushDesk {
         PushView {
             available: cfg!(mobile),
             hosts,
+            revision,
         }
     }
 

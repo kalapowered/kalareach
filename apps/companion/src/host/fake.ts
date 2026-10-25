@@ -667,7 +667,7 @@ export interface FakeHostControls {
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
   /** Changes where notifications stand, as native code would publish it. */
-  setPush(view: PushView): void
+  setPush(view: Omit<PushView, 'revision'>): void
   /** The references the person turned notifications on for, in order. */
   readonly pushEnabled: string[]
   /** The choices the person made about the text of the notifications, in order. */
@@ -984,7 +984,8 @@ export function fakeHost(
       typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('push')
     const row = (state: PushHostView['state'], words: string, settings = false): PushView => ({
       available: true,
-      hosts: [{ reference: 'studio-reference', state, words, settings, previews: true }]
+      hosts: [{ reference: 'studio-reference', state, words, settings, previews: true }],
+      revision: 1
     })
     switch (asked) {
       case 'on':
@@ -1003,7 +1004,7 @@ export function fakeHost(
           'The notification service could not be reached. Try again in a moment.'
         )
       default:
-        return { available: true, hosts: [] }
+        return { available: true, hosts: [], revision: 1 }
     }
   })()
   const pushEnabled: string[] = []
@@ -1012,8 +1013,9 @@ export function fakeHost(
   const pushListeners = new Set<(view: PushView) => void>()
   let routeNext: string | null = null
   const routeAsks = { count: 0 }
-  const publishPush = (view: PushView) => {
-    push = view
+  /** Publishes where notifications stand, numbered as native code numbers the views it reads. */
+  const publishPush = (view: Omit<PushView, 'revision'>) => {
+    push = { ...view, revision: push.revision + 1 }
     for (const listener of pushListeners) listener(push)
   }
   /** While set, the pairing view's answers wait for it. */

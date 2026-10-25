@@ -3622,8 +3622,13 @@ async fn a_choice_whose_key_cannot_be_filed_is_not_made() {
     );
     assert!(phone.view().hosts[0].previews, "the choice was let go");
     assert_eq!(
-        phone.views.lock().expect("the views").last(),
-        Some(&phone.view()),
+        phone
+            .views
+            .lock()
+            .expect("the views")
+            .last()
+            .map(|told| &told.hosts),
+        Some(&phone.view().hosts),
         "and the page was left with the view that stands, not the one the choice had made"
     );
     assert_eq!(
@@ -4060,8 +4065,31 @@ async fn a_view_read_earlier_never_reaches_the_page_after_one_read_later() {
     quick.join().expect("the second call returned");
 
     assert_eq!(
-        phone.views.lock().expect("the views").last(),
-        Some(&phone.view()),
+        phone
+            .views
+            .lock()
+            .expect("the views")
+            .last()
+            .map(|told| &told.hosts),
+        Some(&phone.view().hosts),
         "the page was left with the view the desk has now"
+    );
+    // The views are numbered in the order they were read, so a page handed them by two routes can
+    // tell which is older: what the page was told rises, and a view read after it is higher still.
+    let told: Vec<u64> = phone
+        .views
+        .lock()
+        .expect("the views")
+        .iter()
+        .map(|view| view.revision)
+        .collect();
+    assert!(
+        told.windows(2).all(|pair| pair[0] < pair[1]),
+        "the page was told in the order the views were read: {told:?}"
+    );
+    assert!(
+        told.last()
+            .is_some_and(|last| *last < phone.view().revision),
+        "a view read after them is numbered after them"
     );
 }

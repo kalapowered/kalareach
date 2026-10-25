@@ -28,13 +28,18 @@ export interface Notifications {
 export function useNotifications(): Notifications {
   const { port } = useApp()
   const [view, setView] = useState<PushView | null>(null)
+  // A view reaches the page by an event or as the answer to a command, and an answer read earlier
+  // can arrive after an event read later. The page keeps the view read last, whichever way it came.
+  const take = useCallback((next: PushView) => {
+    setView((held) => (held !== null && next.revision < held.revision ? held : next))
+  }, [])
 
   useEffect(() => {
     let watching = true
     let stop: (() => void) | null = null
     // The state is read once the listener is registered, so no change can fall between the two.
     void port.onPush((next) => {
-      if (watching) setView(next)
+      if (watching) take(next)
     }).then((unlisten) => {
       if (!watching) {
         unlisten()
@@ -42,26 +47,26 @@ export function useNotifications(): Notifications {
       }
       stop = unlisten
       void port.pushView().then((first) => {
-        if (watching) setView((held) => held ?? first)
+        if (watching) take(first)
       }).catch(() => undefined)
     }).catch(() => undefined)
     return () => {
       watching = false
       stop?.()
     }
-  }, [port])
+  }, [port, take])
 
   const enable = useCallback(
     async (reference: string) => {
-      setView(await port.pushEnable(reference))
+      take(await port.pushEnable(reference))
     },
-    [port]
+    [port, take]
   )
   const setPreviews = useCallback(
     async (reference: string, on: boolean) => {
-      setView(await port.pushPreviews(reference, on))
+      take(await port.pushPreviews(reference, on))
     },
-    [port]
+    [port, take]
   )
   const openSettings = useCallback(() => port.openAppSettings(), [port])
   return { view, enable, setPreviews, openSettings }
