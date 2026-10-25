@@ -6,7 +6,7 @@
 //! two names that differ only in case. The rules are plain functions of text so that the host's
 //! archive reading, its tree copy and its tests apply the same ones on every platform.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// The longest a single name may be: the file systems' limit, in UTF-16 code units.
 pub const MAX_COMPONENT_UNITS: usize = 255;
@@ -157,11 +157,39 @@ impl std::fmt::Display for PathFault {
 /// Every path of a release, by the rules above: no component is refused, no two paths fold to one,
 /// and no path is both a file and the parent of another. Checked as paths arrive, so that an
 /// archive is refused at the first entry that breaks them.
-#[derive(Debug, Default)]
+///
+/// The paths are kept as a tree of their components, so that what is kept grows with the bytes of
+/// the names and not with the square of the parts a name has.
+#[derive(Debug)]
 pub struct PathRules {
-    /// The folded form of every path seen, with the spelling it first came in and whether it is a
-    /// directory.
-    seen: BTreeMap<String, (String, bool)>,
+    /// The root, which is a directory with no component, and then every component seen below it.
+    nodes: Vec<Node>,
+}
+
+/// One component of a path seen, below its parent.
+#[derive(Debug)]
+struct Node {
+    /// The spelling it first came in.
+    component: String,
+    /// The node of the path above it.
+    parent: usize,
+    /// Whether it is a directory.
+    directory: bool,
+    /// The folded form of each component below it, with its node.
+    children: HashMap<String, usize>,
+}
+
+impl Default for PathRules {
+    fn default() -> Self {
+        Self {
+            nodes: vec![Node {
+                component: String::new(),
+                parent: 0,
+                directory: true,
+                children: HashMap::new(),
+            }],
+        }
+    }
 }
 
 impl PathRules {
@@ -169,6 +197,17 @@ impl PathRules {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The path a node stands for, in the spelling it first came in.
+    fn spelled(&self, mut at: usize) -> String {
+        let mut parts = Vec::new();
+        while at != 0 {
+            parts.push(self.nodes[at].component.as_str());
+            at = self.nodes[at].parent;
+        }
+        parts.reverse();
+        parts.join("/")
     }
 
     /// Takes in a path of `/`-separated components that is a file, or a directory when
@@ -188,24 +227,34 @@ impl PathRules {
                 });
             }
         }
-        for depth in 1..=parts.len() {
-            let own = parts[..depth].join("/");
-            let is_directory = directory || depth < parts.len();
-            match self.seen.get(&folded(&own)) {
-                Some((first, was_directory)) => {
-                    if *first != own {
-                        return Err(PathFault::Collides {
-                            path: own,
-                            with: first.clone(),
-                        });
-                    }
-                    if *was_directory != is_directory {
-                        return Err(PathFault::FileAndDirectory { path: own });
-                    }
+        let mut at = 0;
+        for (depth, part) in parts.iter().enumerate() {
+            let is_directory = directory || depth + 1 < parts.len();
+            let key = folded(part);
+            if let Some(&child) = self.nodes[at].children.get(&key) {
+                let first = &self.nodes[child];
+                if first.component != *part {
+                    return Err(PathFault::Collides {
+                        path: parts[..=depth].join("/"),
+                        with: self.spelled(child),
+                    });
                 }
-                None => {
-                    self.seen.insert(folded(&own), (own, is_directory));
+                if first.directory != is_directory {
+                    return Err(PathFault::FileAndDirectory {
+                        path: parts[..=depth].join("/"),
+                    });
                 }
+                at = child;
+            } else {
+                let child = self.nodes.len();
+                self.nodes.push(Node {
+                    component: (*part).to_owned(),
+                    parent: at,
+                    directory: is_directory,
+                    children: HashMap::new(),
+                });
+                self.nodes[at].children.insert(key, child);
+                at = child;
             }
         }
         Ok(())

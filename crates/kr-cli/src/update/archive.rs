@@ -13,8 +13,10 @@
 //! files of a `.tar.gz` are.
 
 use std::collections::HashSet;
-use std::io::Read as _;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_ipc::install::names::{NameFault, PathFault, PathRules};
 use zip::{CompressionMethod, ZipArchive};
@@ -105,29 +107,25 @@ pub fn unpack(
     if !file.metadata().is_ok_and(|about| about.is_file()) {
         return Err(unreadable("is not a regular file"));
     }
-    // What the archive's directory says of itself is judged before it is parsed, since the parser
-    // reads all of it into memory.
-    let Some(declared) = file
-        .try_clone()
-        .and_then(|mut copy| declared_directory(&mut copy))
-        .map_err(|_| unreadable("is not a zip archive this host reads"))?
-    else {
-        return Err(unreadable("is not a zip archive this host reads"));
+    // The archive's end and its directory are read and judged here, before the parser is given
+    // anything: the parser keeps every entry of the directory in memory and follows whatever end
+    // record it finds, and the record is the last 22 bytes of the file or the archive is refused.
+    let mut file = file;
+    let tail = match read_tail(&mut file, limits).map_err(|_| unreadable(NOT_A_ZIP))? {
+        Ok(tail) => tail,
+        Err(reason) => return Err(unreadable(reason)),
     };
-    if declared.entries == 0 {
-        return Err(unreadable("is empty"));
-    }
-    if declared.entries > limits.entries as u64 {
-        return Err(unreadable("holds more entries than a release does"));
-    }
-    if declared.bytes > limits.directory_bytes {
-        return Err(unreadable("has a directory larger than any a release has"));
-    }
-    let mut zipped = ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|_| unreadable("is not a zip archive this host reads"))?;
+    // The parser sees the directory and the end record as they were judged and zeros everywhere
+    // else, so that no other record can be found for it to follow; once it has its list of entries
+    // it reads the file itself.
+    let building = Arc::new(AtomicBool::new(true));
+    let entries = tail.entries;
+    let mut zipped = ZipArchive::new(Shown::new(file, tail, Arc::clone(&building)))
+        .map_err(|_| unreadable(NOT_A_ZIP))?;
+    building.store(false, Ordering::Release);
     // The reader keeps one entry for each name, the last of two that share one, so an archive that
     // names a file twice shows fewer entries than its directory declares.
-    if zipped.len() as u64 != declared.entries {
+    if zipped.len() as u64 != entries {
         return Err(unreadable("has the same name twice"));
     }
 
@@ -251,67 +249,248 @@ pub fn unpack(
     Ok((directory, written))
 }
 
-/// What an archive's end-of-central-directory record declares of its directory of entries.
-struct Declared {
+/// What a release archive's end looks like, which the parser is shown and nothing else of the file
+/// until it has its list of entries.
+struct Tail {
+    /// How long the file is.
+    length: u64,
+    /// Where the directory of entries starts.
+    start: u64,
+    /// The directory of entries and then the end record, which reach the end of the file.
+    bytes: Vec<u8>,
     /// How many entries the directory holds.
     entries: u64,
-    /// How many bytes the directory takes.
-    bytes: u64,
 }
 
-/// Reads what an archive declares of its directory from the tail of the file: the last end record
-/// whose comment ends the file, and the 64-bit record its locator points at where a count or a size
-/// does not fit the end record. `None` where there is no such record.
-fn declared_directory(file: &mut std::fs::File) -> std::io::Result<Option<Declared>> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
+/// What a refusal of the archive's shape says.
+const NOT_A_ZIP: &str = "is not a zip archive this host reads";
 
-    const END: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
-    const LOCATOR: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
-    const END64: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
+/// The signatures of the end record, of its 64-bit form and of that form's locator.
+const END_RECORDS: [[u8; 4]; 3] = [*b"PK\x05\x06", *b"PK\x06\x06", *b"PK\x06\x07"];
+
+/// The most extra data an entry of the directory may carry. The packer writes none.
+const EXTRA_BYTES: usize = 1024;
+
+/// Reads the directory of entries and the end record from the tail of the file, and judges them
+/// whole: the end record is the last 22 bytes of the file with no comment, names one disk and
+/// counts and sizes that fit it (so no 64-bit record), and the directory is exactly the bytes
+/// before it, which hold that many entries one after another, with a name and extra data within
+/// bounds, no comment, and no end record or locator among them. The archive a release is packed
+/// into has this shape; any other is refused, so the parser has one end record to follow and the
+/// bytes it will read are the bytes judged here.
+///
+/// Returns the refusal where the archive is not of this shape, or beyond the limits.
+fn read_tail(
+    file: &mut std::fs::File,
+    limits: &Limits,
+) -> std::io::Result<std::result::Result<Tail, &'static str>> {
     let length = file.seek(SeekFrom::End(0))?;
-    // The record is 22 bytes and a comment of at most 65,535 bytes, with the locator before it.
-    let window = length.min(22 + 65_535 + 20);
-    file.seek(SeekFrom::Start(length - window))?;
-    let mut tail = vec![0_u8; usize::try_from(window).unwrap_or(0)];
-    file.read_exact(&mut tail)?;
-    let Some(at) = (0..tail.len().saturating_sub(21)).rev().find(|&at| {
-        tail[at..at + 4] == END
-            && usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]))
-                == tail.len() - (at + 22)
-    }) else {
-        return Ok(None);
-    };
-    let entries = u16::from_le_bytes([tail[at + 10], tail[at + 11]]);
-    let bytes = u32::from_le_bytes([tail[at + 12], tail[at + 13], tail[at + 14], tail[at + 15]]);
-    if entries != u16::MAX && bytes != u32::MAX {
-        return Ok(Some(Declared {
-            entries: u64::from(entries),
-            bytes: u64::from(bytes),
-        }));
+    if length < 22 {
+        return Ok(Err(NOT_A_ZIP));
     }
-    let Some(locator) = at
-        .checked_sub(20)
-        .filter(|&locator| tail[locator..locator + 4] == LOCATOR)
-    else {
-        return Ok(Some(Declared {
-            entries: u64::from(entries),
-            bytes: u64::from(bytes),
-        }));
-    };
-    let mut offset = [0_u8; 8];
-    offset.copy_from_slice(&tail[locator + 8..locator + 16]);
-    file.seek(SeekFrom::Start(u64::from_le_bytes(offset)))?;
-    let mut record = [0_u8; 56];
-    file.read_exact(&mut record)?;
-    if record[..4] != END64 {
-        return Ok(None);
+    let mut end = [0_u8; 22];
+    file.seek(SeekFrom::Start(length - 22))?;
+    file.read_exact(&mut end)?;
+    let sixteen = |at: usize| u16::from_le_bytes([end[at], end[at + 1]]);
+    let thirty_two =
+        |at: usize| u32::from_le_bytes([end[at], end[at + 1], end[at + 2], end[at + 3]]);
+    let (entries, size, start) = (sixteen(10), thirty_two(12), thirty_two(16));
+    if end[..4] != END_RECORDS[0]
+        || sixteen(4) != 0
+        || sixteen(6) != 0
+        || sixteen(8) != entries
+        || sixteen(20) != 0
+        || entries == u16::MAX
+        || size == u32::MAX
+        || start == u32::MAX
+        || u64::from(start) + u64::from(size) != length - 22
+    {
+        return Ok(Err(NOT_A_ZIP));
     }
-    let mut total = [0_u8; 8];
-    total.copy_from_slice(&record[32..40]);
-    let mut size = [0_u8; 8];
-    size.copy_from_slice(&record[40..48]);
-    Ok(Some(Declared {
-        entries: u64::from_le_bytes(total),
-        bytes: u64::from_le_bytes(size),
+    if entries == 0 {
+        return Ok(Err("is empty"));
+    }
+    if usize::from(entries) > limits.entries {
+        return Ok(Err("holds more entries than a release does"));
+    }
+    if u64::from(size) > limits.directory_bytes {
+        return Ok(Err("has a directory larger than any a release has"));
+    }
+    let mut bytes = vec![0_u8; usize::try_from(size).unwrap_or(0) + 22];
+    file.seek(SeekFrom::Start(u64::from(start)))?;
+    file.read_exact(&mut bytes[..usize::try_from(size).unwrap_or(0)])?;
+    let directory = bytes.len() - 22;
+    bytes[directory..].copy_from_slice(&end);
+    let judged = &bytes[..directory];
+    let mut at = 0_usize;
+    for _ in 0..entries {
+        let Some(header) = judged.get(at..at + 46) else {
+            return Ok(Err(NOT_A_ZIP));
+        };
+        let field = |from: usize| usize::from(u16::from_le_bytes([header[from], header[from + 1]]));
+        let (name, extra, comment, disk) = (field(28), field(30), field(32), field(34));
+        if header[..4] != *b"PK\x01\x02" || comment != 0 || disk != 0 || extra > EXTRA_BYTES {
+            return Ok(Err(NOT_A_ZIP));
+        }
+        if name > limits.name_bytes {
+            return Ok(Err("has an entry name longer than any a release has"));
+        }
+        at += 46 + name + extra;
+    }
+    // The entries tile the directory, and nothing in it is an end record: the parser looks for one
+    // by its signature and falls back to an earlier one when the last does not serve. The end
+    // record after it cannot make one with the directory's last bytes, which it begins with `P`.
+    if at != directory
+        || judged
+            .windows(4)
+            .any(|window| END_RECORDS.iter().any(|record| record == window))
+    {
+        return Ok(Err(NOT_A_ZIP));
+    }
+    Ok(Ok(Tail {
+        length,
+        start: u64::from(start),
+        bytes,
+        entries: u64::from(entries),
     }))
+}
+
+/// The archive as the parser is shown it while it builds its list of entries: the directory and the
+/// end record where they are, zeros before them, and the end of the file where it is. When the
+/// list is built the file itself is read.
+struct Shown {
+    file: std::io::BufReader<std::fs::File>,
+    tail: Tail,
+    /// Whether the list of entries is still being built.
+    building: Arc<AtomicBool>,
+    /// Where a read is, in the archive as it is shown.
+    at: u64,
+    /// Whether the file has been moved to `at` since the list was built.
+    synced: bool,
+}
+
+impl Shown {
+    fn new(file: std::fs::File, tail: Tail, building: Arc<AtomicBool>) -> Self {
+        Self {
+            file: std::io::BufReader::new(file),
+            tail,
+            building,
+            at: 0,
+            synced: false,
+        }
+    }
+}
+
+impl Read for Shown {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.building.load(Ordering::Acquire) {
+            if !self.synced {
+                self.file.seek(SeekFrom::Start(self.at))?;
+                self.synced = true;
+            }
+            let read = self.file.read(buffer)?;
+            self.at += read as u64;
+            return Ok(read);
+        }
+        let left = self.tail.length.saturating_sub(self.at);
+        let wanted = buffer
+            .len()
+            .min(usize::try_from(left).unwrap_or(usize::MAX));
+        if self.at < self.tail.start {
+            let zeros =
+                wanted.min(usize::try_from(self.tail.start - self.at).unwrap_or(usize::MAX));
+            buffer[..zeros].fill(0);
+            self.at += zeros as u64;
+            return Ok(zeros);
+        }
+        let from = usize::try_from(self.at - self.tail.start).unwrap_or(usize::MAX);
+        let shown = self.tail.bytes.get(from..).unwrap_or_default();
+        let copied = wanted.min(shown.len());
+        buffer[..copied].copy_from_slice(&shown[..copied]);
+        self.at += copied as u64;
+        Ok(copied)
+    }
+}
+
+impl Seek for Shown {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        if !self.building.load(Ordering::Acquire) {
+            let at = self.file.seek(position)?;
+            self.at = at;
+            self.synced = true;
+            return Ok(at);
+        }
+        let target = match position {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(by) => self.tail.length.checked_add_signed(by),
+            SeekFrom::Current(by) => self.at.checked_add_signed(by),
+        };
+        let Some(target) = target else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a seek before the start of the archive",
+            ));
+        };
+        self.at = target;
+        Ok(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A directory of one entry named `a` with `extra` after the name, and the end record after it.
+    fn archive_ending(extra: &[u8]) -> Vec<u8> {
+        let mut bytes = b"PK\x01\x02".to_vec();
+        bytes.extend_from_slice(&[0; 24]);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(extra.len()).expect("short").to_le_bytes());
+        bytes.extend_from_slice(&[0; 14]);
+        bytes.push(b'a');
+        bytes.extend_from_slice(extra);
+        let size = u32::try_from(bytes.len()).expect("small");
+        bytes.extend_from_slice(b"PK\x05\x06");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    fn judged(bytes: &[u8]) -> bool {
+        let mut file = tempfile::tempfile().expect("a file");
+        file.write_all(bytes).expect("written");
+        read_tail(&mut file, &Limits::DEFAULT)
+            .expect("reads")
+            .is_ok()
+    }
+
+    /// KR-REQ-26.06: the parser falls back to an earlier end record when the last does not serve,
+    /// so a directory that holds the signature of an end record, of its 64-bit form or of that
+    /// form's locator, anywhere among its entries is refused before the parser sees it; the same
+    /// directory without it is judged whole.
+    #[test]
+    fn a_directory_that_holds_the_signature_of_an_end_record_is_refused() {
+        assert!(judged(&archive_ending(b"")), "the control is judged whole");
+        assert!(
+            judged(&archive_ending(b"PK\x05")),
+            "a part of a signature is not one"
+        );
+        for record in END_RECORDS {
+            assert!(
+                !judged(&archive_ending(&record)),
+                "{record:?} among the entries is refused"
+            );
+            let mut later = b"zz".to_vec();
+            later.extend_from_slice(&record);
+            assert!(
+                !judged(&archive_ending(&later)),
+                "{record:?} after other extra data is refused"
+            );
+        }
+    }
 }
