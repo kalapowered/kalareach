@@ -321,8 +321,9 @@ fn decode<T: serde::de::DeserializeOwned + Serialize>(path: &Path, bytes: &[u8])
 #[cfg(windows)]
 pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, LogAccess, MAX_LAUNCH_FRAME,
-    NamedLock, PeerProcess, Reached, StartedChild, account_sid, connect, current_session,
-    current_user_sid, in_any_job, open_log, pipe_client_is_this_user, process_facts, start_child,
+    NamedLock, PeerProcess, Reached, StartedChild, account_environment, account_sid, connect,
+    current_session, current_user_sid, in_any_job, open_log, pipe_client_is_this_user,
+    process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -363,7 +364,7 @@ mod windows {
     };
     use windows_sys::Win32::Security::{
         EqualSid, GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
-        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenSessionId, TokenUser,
+        SECURITY_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenSessionId, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
@@ -857,6 +858,76 @@ mod windows {
     /// Returns the operating system's error when this process's token cannot be read.
     pub fn current_session() -> io::Result<u32> {
         Token::of(current_process())?.session()
+    }
+
+    /// The environment the system gives this account when it starts a process for it: the system's
+    /// variables and the account's own, as a fresh sign-in has them, and nothing this process or its
+    /// parents added. It is what a scheduled task of the account starts a program with. Names are
+    /// upper-cased, because the system does not tell them apart by case.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the token cannot be opened or the block cannot be
+    /// made.
+    pub fn account_environment() -> io::Result<std::collections::BTreeMap<String, String>> {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        use windows_sys::Win32::System::Environment::{
+            CreateEnvironmentBlock, DestroyEnvironmentBlock,
+        };
+
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the process pseudo-handle is always valid and `token` is a live out parameter.
+        let opened = unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &raw mut token,
+            )
+        };
+        if opened == 0 || token.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call above returned a new handle that nothing else owns.
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut block: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the token is open with the rights the call asks for, and `block` is a live out
+        // parameter; the block is freed below.
+        let made = unsafe { CreateEnvironmentBlock(&raw mut block, token.as_raw_handle(), 0) };
+        if made == 0 || block.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut variables = std::collections::BTreeMap::new();
+        let mut at = block.cast::<u16>().cast_const();
+        loop {
+            let mut length = 0_usize;
+            // SAFETY: the block is a run of NUL-terminated strings ended by an empty one, so every
+            // read stays inside it up to and including the terminator of the string being measured.
+            while unsafe { *at.add(length) } != 0 {
+                length += 1;
+            }
+            if length == 0 {
+                break;
+            }
+            // SAFETY: `length` code units from `at` were just measured inside the block.
+            let entry =
+                std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(at, length) });
+            // SAFETY: the terminator after the string lies inside the block.
+            at = unsafe { at.add(length + 1) };
+            let Some(entry) = entry.to_str() else {
+                continue;
+            };
+            // A name that starts with `=` is a per-drive directory, not a variable.
+            if let Some((name, value)) = entry.split_once('=').filter(|(name, _)| !name.is_empty())
+            {
+                variables.insert(name.to_uppercase(), value.to_owned());
+            }
+        }
+        // SAFETY: `block` was made by the call above and is freed exactly once.
+        unsafe {
+            DestroyEnvironmentBlock(block);
+        }
+        Ok(variables)
     }
 
     /// Returns the account this process runs as, as its security identifier's text, `S-1-5-...`.
