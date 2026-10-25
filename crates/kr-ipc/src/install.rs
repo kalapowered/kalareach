@@ -98,7 +98,7 @@ pub mod names;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{seal_directory, seal_file, unseal_directory};
+pub use windows::{free_space, seal_directory, seal_file, unseal_directory, windows_version};
 
 /// The store's record, whose presence is what makes a directory a store.
 pub const STORE_RECORD: &str = "install.json";

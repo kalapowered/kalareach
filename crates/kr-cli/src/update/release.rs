@@ -12,9 +12,12 @@
 //! An archive is refused at the first entry that could put something outside the release or be
 //! something other than a file: a link, a device, a path that is absolute or climbs out of the
 //! archive's one top directory. What the archive says about a file's mode or owner is not read:
-//! a file is a program when the manifest says it is.
+//! a file is a program when the manifest says it is. A release is a `.tar.gz` where the system
+//! has symbolic links, and a `.zip` on Windows, where the archive is read by [`super::archive`]
+//! under bounds of its own, since it is parsed before any signature is checked.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -278,10 +281,12 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 }
 
 /// How long the system's own tool that says its version is given.
+#[cfg(unix)]
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many bytes a tool may print: the tool that says a version prints a short line, and one that
 /// prints more than this is given up on.
+#[cfg(unix)]
 const TOOL_OUTPUT: usize = 4096;
 
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
@@ -290,6 +295,7 @@ const TOOL_OUTPUT: usize = 4096;
 /// without blocking, in the loop that waits for it to end, so that a descendant that keeps the pipe
 /// open after the tool has exited holds the run for the bound and no longer, and one that writes
 /// without end is given up on at once. The pipe is closed with the run.
+#[cfg(unix)]
 fn run_bounded(
     program: &str,
     arguments: &[&str],
@@ -372,7 +378,22 @@ fn run_bounded(
     }
 }
 
+/// This host's version of what a floor is a version of, where it can be read: the system's own
+/// record of its version, which no compatibility setting of a program changes.
+#[cfg(windows)]
+fn host_version(system: FloorSystem) -> Option<FloorVersion> {
+    if system != FloorSystem::Windows {
+        return None;
+    }
+    let (major, minor) = kr_ipc::install::windows_version().ok()?;
+    Some(FloorVersion {
+        major: u16::try_from(major).ok()?,
+        minor: u16::try_from(minor).ok()?,
+    })
+}
+
 /// This host's version of what a floor is a version of, where it can be read.
+#[cfg(unix)]
 fn host_version(system: FloorSystem) -> Option<FloorVersion> {
     let (program, arguments): (&str, &[&str]) = match system {
         FloorSystem::Macos if cfg!(target_os = "macos") => {
@@ -398,6 +419,7 @@ pub type Written = BTreeMap<String, (u64, Digest256)>;
 /// Opens an archive for reading without waiting for a writer: a pipe named as an archive would
 /// otherwise hold the run for ever, under the update lock. A link is followed, since a person may
 /// name an archive by one; what it leads to is checked to be a regular file.
+#[cfg(unix)]
 fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
 
@@ -410,6 +432,31 @@ fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
     .map_err(std::io::Error::from)
 }
 
+/// Opens an archive for reading. What it is is checked on the open file before a byte is read: a
+/// pipe is not a regular file.
+#[cfg(windows)]
+fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Unpacks a release archive, `.zip` on Windows, into `staging`, an owner-only directory, and
+/// returns the release's directory in it and what was written.
+///
+/// # Errors
+///
+/// Returns a refusal naming what is wrong with the archive, or the failure to read or write it.
+#[cfg(windows)]
+pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
+    let file = open_archive(archive).map_err(|error| {
+        CliError::Other(shown!(
+            "the archive {} could not be read: {}",
+            Shown::root(archive),
+            Shown::io(&error)
+        ))
+    })?;
+    super::archive::unpack(file, archive, staging, &super::archive::Limits::DEFAULT)
+}
+
 /// Unpacks a release archive, `.tar.gz`, into `staging`, an owner-only directory, and returns the
 /// release's directory in it and what was written.
 ///
@@ -420,6 +467,7 @@ fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
 /// # Errors
 ///
 /// Returns a refusal naming what is wrong with the archive, or the failure to read or write it.
+#[cfg(unix)]
 pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
     let unreadable = |error: &std::io::Error| {
         CliError::Other(shown!(
@@ -522,6 +570,7 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
 /// # Errors
 ///
 /// Returns a refusal naming the failure to read the tree or write the archive.
+#[cfg(unix)]
 pub fn pack_tree(tree: &Path, top: &str, archive: &Path) -> Result<()> {
     let failed = |error: &std::io::Error| {
         CliError::Other(shown!(
@@ -650,17 +699,23 @@ fn create_directories(staging: &Path, directory: &Path) -> Result<()> {
 }
 
 /// Writes a new file from `source`, owner-only, and returns its length and digest.
-fn write_new(
+pub(super) fn write_new(
     destination: &Path,
     source: &mut impl std::io::Read,
 ) -> std::io::Result<(u64, Digest256)> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::io::Write as _;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(kr_ipc::paths::OWNER_ONLY_FILE_MODE)
-        .open(destination)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Owner-only by mode here, and on Windows by the list the staging directory gives every file
+    // made in it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(kr_ipc::paths::OWNER_ONLY_FILE_MODE);
+    }
+    let mut file = options.open(destination)?;
     let mut hasher = sha2::Sha256::new();
     let mut length = 0_u64;
     let mut buffer = vec![0_u8; 256 * 1024];
@@ -679,16 +734,20 @@ fn write_new(
 }
 
 /// Refuses to write `length` more bytes where that would leave less than [`SPACE_MARGIN`] free.
-fn ensure_space(directory: &Path, length: u64) -> Result<()> {
+pub(super) fn ensure_space(directory: &Path, length: u64) -> Result<()> {
+    #[cfg(unix)]
     let free = rustix::fs::statvfs(directory)
         .map(|about| about.f_bavail.saturating_mul(about.f_frsize))
-        .map_err(|error| {
-            CliError::Other(shown!(
-                "the free space at {} could not be read: {}",
-                Shown::root(directory),
-                Shown::io(&std::io::Error::from(error))
-            ))
-        })?;
+        .map_err(std::io::Error::from);
+    #[cfg(windows)]
+    let free = kr_ipc::install::free_space(directory);
+    let free = free.map_err(|error| {
+        CliError::Other(shown!(
+            "the free space at {} could not be read: {}",
+            Shown::root(directory),
+            Shown::io(&error)
+        ))
+    })?;
     if free < length.saturating_add(SPACE_MARGIN) {
         return Err(CliError::Other(shown!(
             "the filesystem of {} has {} bytes free, and staging the release needs {} more and \

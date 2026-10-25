@@ -39,8 +39,10 @@ use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
     PSECURITY_DESCRIPTOR,
 };
+use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    GetDiskFreeSpaceExW, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_TYPE_DISK, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx, GetFileType,
     GetVolumeInformationW, GetVolumePathNameW, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
@@ -604,4 +606,50 @@ pub fn seal_directory(path: &Path) -> io::Result<()> {
 /// Returns the operating system's error when the directory cannot be changed.
 pub fn unseal_directory(path: &Path) -> io::Result<()> {
     set_list(path, OWNER_ONLY)
+}
+
+/// The version of Windows this host runs, as the major and minor numbers the system states: `10.0`
+/// for Windows 10 and 11. The system's own record is read, never a version a program compatibility
+/// setting reports.
+///
+/// # Errors
+///
+/// Returns the operating system's error when it does not say.
+pub fn windows_version() -> io::Result<(u32, u32)> {
+    let mut information = OSVERSIONINFOW {
+        dwOSVersionInfoSize: u32::try_from(size_of::<OSVERSIONINFOW>()).unwrap_or(0),
+        ..OSVERSIONINFOW::default()
+    };
+    // SAFETY: `information` is a live buffer whose size field holds its size, as the call asks.
+    let status = unsafe { RtlGetVersion(&raw mut information) };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "the system did not say its version: status {status:#x}"
+        )));
+    }
+    Ok((information.dwMajorVersion, information.dwMinorVersion))
+}
+
+/// The bytes free for this account on the volume `path` is on.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the volume cannot be asked.
+pub fn free_space(path: &Path) -> io::Result<u64> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut available = 0_u64;
+    // SAFETY: `wide` is null-terminated and outlives the call, `available` is a live out
+    // parameter, and the two totals are not asked for.
+    let asked = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if asked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
 }

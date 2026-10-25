@@ -51,19 +51,14 @@
 
 #[cfg(unix)]
 pub mod admit;
-#[cfg(unix)]
 mod formats;
-#[cfg(unix)]
 mod handover;
-#[cfg(unix)]
 mod inventory;
-#[cfg(unix)]
 pub mod release;
 
 use std::path::PathBuf;
 
 use kr_client::shown;
-#[cfg(unix)]
 use kr_client::shown::Said as _;
 use kr_client::shown::Shown;
 use kr_ipc::install::{InstallError, Store};
@@ -128,7 +123,6 @@ const RECORD_LIMIT: u64 = 8 * 1024 * 1024;
 /// What a run that stopped part way tells a person to run: either command settles what the one that
 /// stopped left, before anything else, and a rollback goes back from a release whose daemon does
 /// not start.
-#[cfg(unix)]
 const RUN_AGAIN: &str = "kr host update or kr host rollback";
 
 /// The store's record, `install.json`: what an update needs that the store's directories do not
@@ -212,7 +206,6 @@ kr_client::debug_as_name!(Abandoned);
 
 /// `newer` and then each of `older` for an environment `newer` has none for: a daemon recorded
 /// more recently is the one to start.
-#[cfg(unix)]
 fn merged(newer: Vec<Restart>, older: Vec<Restart>) -> Vec<Restart> {
     let mut restarts = newer;
     for restart in older {
@@ -227,7 +220,6 @@ fn merged(newer: Vec<Restart>, older: Vec<Restart>) -> Vec<Restart> {
 }
 
 /// Whichever of two roots is of the higher version, the first when they are of one.
-#[cfg(unix)]
 fn newer_root(
     first: Option<tough::schema::Signed<tough::schema::Root>>,
     second: Option<tough::schema::Signed<tough::schema::Root>>,
@@ -244,7 +236,6 @@ fn newer_root(
     }
 }
 
-#[cfg(unix)]
 impl Transaction {
     /// The release the chain of failed updates this one belongs to began from.
     fn chain_start(&self) -> &ReleaseName {
@@ -289,7 +280,6 @@ impl Transaction {
     }
 }
 
-#[cfg(unix)]
 impl Abandoned {
     /// The update again, in the state of one whose switch happened, owing its daemons and those in
     /// `newer`, which are the more recent record of any environment they share, in the chain that
@@ -344,7 +334,6 @@ pub struct Restart {
 
 kr_client::debug_as_name!(Restart);
 
-#[cfg(unix)]
 impl Restart {
     /// The environment this daemon served, as the survey of the store's environments gives it.
     fn environment(&self) -> Result<inventory::Environment> {
@@ -447,7 +436,6 @@ impl Record {
 }
 
 /// The file in the store that names the package manager that put its releases there.
-#[cfg(unix)]
 const INSTALLER_FILE: &str = "installer";
 
 /// The package manager that put this store's releases there, when one did. It only records who
@@ -457,7 +445,6 @@ const INSTALLER_FILE: &str = "installer";
 /// # Errors
 ///
 /// Returns the failure to read it.
-#[cfg(unix)]
 pub fn installer(store: &Store) -> Result<Option<String>> {
     match std::fs::read_to_string(store.root().join(INSTALLER_FILE)) {
         Ok(text) => Ok(Some(text.trim().to_owned()).filter(|name| !name.is_empty())),
@@ -470,7 +457,6 @@ pub fn installer(store: &Store) -> Result<Option<String>> {
 }
 
 /// Names `installer` as the package manager that admitted this store's releases.
-#[cfg(unix)]
 fn write_installer(store: &Store, installer: &str) -> Result<()> {
     if self::installer(store)?.as_deref() == Some(installer) {
         return Ok(());
@@ -631,7 +617,6 @@ impl CarriedRegistry {
     }
 
     /// What an update that did not finish says it had already done to this registry.
-    #[cfg(unix)]
     fn brought(&self) -> Shown {
         shown!(
             "the registry of environment {} from schema version {} to {}",
@@ -770,7 +755,6 @@ impl Updated {
 
 /// The store the running program is a release of, and which release that is, refusing a program
 /// outside a store.
-#[cfg(unix)]
 fn this_release_store() -> Result<(Store, ReleaseName)> {
     let running = kr_ipc::install::this_process().map_err(|error| CliError::Other(said(error)))?;
     let (Some(store), Some(release)) = (running.store(), running.release()) else {
@@ -787,7 +771,6 @@ fn this_release_store() -> Result<(Store, ReleaseName)> {
 /// Asked under the update lock: `current` changes only under it, so the answer holds until the
 /// lock is let go, and an update that another finished first is refused rather than checked
 /// against the release it replaced.
-#[cfg(unix)]
 fn ensure_current(store: &Store, release: &ReleaseName) -> Result<()> {
     let current = store
         .current()
@@ -827,7 +810,6 @@ fn ensure_current(store: &Store, release: &ReleaseName) -> Result<()> {
 /// Returns a refusal when the tree is not a release this host installs, the store already has a
 /// current release, or another install or update of the store is running, and the failure to
 /// write the store otherwise.
-#[cfg(unix)]
 pub async fn install(
     tree: Option<&std::path::Path>,
     root: Option<&std::path::Path>,
@@ -916,7 +898,6 @@ pub async fn install(
 ///
 /// The same release already in `versions/`, as an install stopped before its switch leaves it, is
 /// replaced by the copy checked here ([`replace_kept`]).
-#[cfg(unix)]
 async fn stage_tree(
     store: &Store,
     tree: &std::path::Path,
@@ -960,7 +941,6 @@ async fn stage_tree(
 /// place, whole by construction. Another release under the name is refused. A name that is not a
 /// directory is not a release, and is removed as a name only; a release that a running program
 /// holds is not removed.
-#[cfg(unix)]
 fn replace_kept(
     store: &Store,
     manifest: &kr_protocol::update::ReleaseManifest,
@@ -1006,7 +986,6 @@ fn replace_kept(
 }
 
 /// Removes a staging directory and whatever an interrupted run left in it.
-#[cfg(unix)]
 fn remove_staging(staging: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1035,7 +1014,6 @@ fn remove_staging(staging: &std::path::Path) -> std::io::Result<()> {
 /// # Errors
 ///
 /// Returns a failure when this kr is not of an installed release, or the store cannot be read.
-#[cfg(unix)]
 pub fn versions() -> Result<Vec<Kept>> {
     let running = kr_ipc::install::this_process().map_err(|error| CliError::Other(said(error)))?;
     let Some(store) = running.store() else {
@@ -1080,7 +1058,6 @@ pub fn versions() -> Result<Vec<Kept>> {
 /// Returns [`CliError::UpdateDeferred`] (exit 9) when something live holds the update, naming what
 /// and what to do, with every daemon it stopped started again from the release still current; and
 /// a refusal or a failure otherwise.
-#[cfg(unix)]
 pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Updated> {
     let (store, source) = this_release_store()?;
     let Some(archive) = archive else {
@@ -1190,7 +1167,6 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
 /// older, and what an update returns otherwise, [`CliError::UpdateDeferred`] (exit 9) when
 /// something live holds it, and a refusal naming every store the older release cannot read as it
 /// is, with nothing switched.
-#[cfg(unix)]
 pub async fn rollback(to: Option<&str>) -> Result<Updated> {
     let (store, source) = this_release_store()?;
     let update_lock = store
@@ -1280,7 +1256,6 @@ pub async fn rollback(to: Option<&str>) -> Result<Updated> {
 /// Everything a switch to `target` does once the release is in the store: the survey of the
 /// environments, the first look at the live workers, the handover and the switch, and the
 /// removal of the releases nothing needs.
-#[cfg(unix)]
 async fn carry_out(
     store: &Store,
     update_lock: &kr_ipc::install::StoreLock,
@@ -1347,7 +1322,6 @@ async fn carry_out(
 /// An error that leaves an update after its survey goes through [`Report::annotate`] once, in
 /// [`update`], so that no exit, a failed record write among them, can leave out what the update had
 /// already done.
-#[cfg(unix)]
 struct Report {
     carried: Vec<CarriedRegistry>,
     unreached: Vec<Unreached>,
@@ -1357,7 +1331,6 @@ struct Report {
     rolled_back: bool,
 }
 
-#[cfg(unix)]
 impl Report {
     /// The error with what the update had done and found said after it, of the same kind and with
     /// the same exit code: a local IPC failure becomes [`CliError::HostUnavailable`], which exits
@@ -1406,7 +1379,6 @@ impl Report {
 /// Everything an update does after it has surveyed the environments: the first look at the live
 /// workers, the end of a check there, and otherwise the record of the update under way and the
 /// handover. Returns the environments whose daemons it started again.
-#[cfg(unix)]
 async fn proceed(
     store: &Store,
     update_lock: &kr_ipc::install::StoreLock,
@@ -1465,7 +1437,6 @@ async fn proceed(
 
 /// The root an update to this host is checked against: the newest of the current release's and the
 /// one the store recorded when it switched to a release that carried a newer.
-#[cfg(unix)]
 fn trusted_root(
     store: &Store,
     record: &Record,
@@ -1481,7 +1452,6 @@ fn trusted_root(
 }
 
 /// The manifest of a release already in the store.
-#[cfg(unix)]
 fn installed_manifest(
     store: &Store,
     release: &ReleaseName,
@@ -1492,7 +1462,6 @@ fn installed_manifest(
 
 /// Stages the release in `archive` and checks it against the current release; with `check`, the
 /// staged copy goes with the staging directory and nothing is admitted.
-#[cfg(unix)]
 fn stage_archive(
     store: &Store,
     update_lock: &kr_ipc::install::StoreLock,
@@ -1542,7 +1511,6 @@ fn stage_archive(
 
 /// What an update that waits returns: [`CliError::UpdateDeferred`], exit 9, naming the target,
 /// what held it and what to do.
-#[cfg(unix)]
 fn deferred(
     target: &kr_protocol::update::ReleaseManifest,
     held: Shown,
@@ -1568,7 +1536,7 @@ fn deferred(
 /// When `KR_UPDATE_PAUSE_DIR` names a directory the update creates `<point>.reached` there and
 /// waits for `<point>.release` to appear; it goes on anyway after ten minutes, which exists so that
 /// a test that failed cannot hold a host. A release build has no such point.
-#[cfg(all(unix, debug_assertions))]
+#[cfg(debug_assertions)]
 async fn pause(point: &str) {
     const BOUND: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -1584,7 +1552,7 @@ async fn pause(point: &str) {
 }
 
 /// A release build has no pause points.
-#[cfg(all(unix, not(debug_assertions)))]
+#[cfg(not(debug_assertions))]
 #[allow(clippy::unused_async)]
 async fn pause(_point: &str) {}
 
@@ -1592,7 +1560,6 @@ async fn pause(_point: &str) {}
 /// environment's lock, the install lock and the writers' lock. They are let go together, and before
 /// anything is undone, so that the undo, which may start a service, takes none of the locks a
 /// command takes while this holds one.
-#[cfg(unix)]
 struct Holds {
     _environments: Vec<kr_controller::singleton::SingletonLock>,
     install: kr_ipc::install::ExclusiveInstall,
@@ -1603,7 +1570,6 @@ struct Holds {
 /// classes every registry, switches `current` and starts each daemon of the target; or, when
 /// anything holds the update, starts again what it stopped and waits. What it carries and finds
 /// unreachable is put in `report`, from where every outcome says it.
-#[cfg(unix)]
 async fn hand_over(
     store: &Store,
     update_lock: &kr_ipc::install::StoreLock,
@@ -1956,7 +1922,6 @@ async fn hand_over(
 /// through which an environment the update holds was found at either reading: such an environment
 /// is held and classed, and is no environment the update could not reach, whatever way one of its
 /// pairs of roots is spelled.
-#[cfg(unix)]
 fn still_unreached(
     unreached: Vec<Unreached>,
     reached: &[(PathBuf, EnvironmentId)],
@@ -1975,7 +1940,6 @@ fn still_unreached(
 /// Every environment an update holds and classes once no daemon can start: those read again under
 /// the install lock, and any the first look found that the second reading did not, in the order of
 /// their identities.
-#[cfg(unix)]
 fn every_environment<'a>(
     first: &'a [inventory::Environment],
     again: &'a [inventory::Environment],
@@ -2001,7 +1965,6 @@ fn every_environment<'a>(
 /// by what `current` names ([`recover`]): an update that went on past no failed one starts what
 /// did not start, before anything else; one that did is that failed update again, whose daemons are
 /// owed, and a run asks whether they answer.
-#[cfg(unix)]
 async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliError {
     // The daemons this update stopped, and not those of a failed update it went on past: they are
     // started by the switch this update makes, from the release it makes current.
@@ -2042,7 +2005,6 @@ async fn undo(store: &Store, record: &mut Record, ended_by: CliError) -> CliErro
 /// answer as a daemon of it. With `with_abandoned`, so are those of the failed update it went on
 /// past, for each environment `update` recorded no daemon of: that is when `current` names the
 /// release `update` made current, which is where they are owed their start.
-#[cfg(unix)]
 async fn start_recorded(
     store: &Store,
     update: &Transaction,
@@ -2083,7 +2045,6 @@ async fn start_recorded(
 /// resumes goes on serving, and no stop of the handover can end it after, so it is left as it is
 /// once it answers as a daemon of `current`; one that does not is named, with how to stop it. One
 /// told to stop is going: it is waited for, and then the daemon is started as recorded.
-#[cfg(unix)]
 async fn start_one(
     store: &Store,
     restart: &Restart,
@@ -2153,7 +2114,6 @@ async fn start_one(
 /// says that: it is no daemon of this update's to stop. Otherwise what failed comes first, and then
 /// what [`handover::still_running`] finds: the daemon that still holds the environment, named with
 /// how to stop it unless it now answers as `expected`, or said to have gone.
-#[cfg(unix)]
 async fn unanswered_by(
     store: &Store,
     environment: &inventory::Environment,
@@ -2175,7 +2135,6 @@ async fn unanswered_by(
 /// An update that went on past a failed one leaves that one recorded again, owing what it owed and
 /// the daemons this one stopped and has started again, which are the more recent record of any it
 /// shares with it; otherwise nothing is left recorded.
-#[cfg(unix)]
 fn forget_update(store: &Store, record: &mut Record) {
     record.update = record.update.take().and_then(|ended| {
         let began_from = ended.chain_start().clone();
@@ -2197,7 +2156,6 @@ fn forget_update(store: &Store, record: &mut Record) {
 /// Returns a refusal when the recorded root, or a root a release carries, cannot be read or does
 /// not verify against itself, and when two of them have one version and are not the same document:
 /// the trust this host holds is never settled on a root it cannot establish.
-#[cfg(unix)]
 fn trusted_after(
     store: &Store,
     record: &Record,
@@ -2257,7 +2215,6 @@ fn trusted_after(
 /// is not older than the one recorded. It reads no release, unless the transaction holds no root
 /// because an earlier build began it: the roots of its two releases that can be read are then
 /// taken, and the newest of them.
-#[cfg(unix)]
 fn settle(store: &Store, record: &mut Record) -> Result<()> {
     if let Some(update) = record.update.take() {
         let newer = |root: &tough::schema::Signed<tough::schema::Root>| {
@@ -2297,7 +2254,6 @@ fn settle(store: &Store, record: &mut Record) -> Result<()> {
 /// Which it was is decided by the configuration document the daemon itself reads, at the directory
 /// it said, and not by the one this command reads: a daemon started with variables of its own may
 /// read another, and the document of this command's environment says nothing of how it was started.
-#[cfg(unix)]
 fn restart_of(
     environment: &inventory::Environment,
     started_as: &kr_protocol::update::HostUpdateHandoverResult,
@@ -2338,7 +2294,6 @@ fn restart_of(
 }
 
 /// What an update an earlier run left part way came to.
-#[cfg(unix)]
 enum Recovered {
     /// It is settled, or it never switched and has been ended: nothing is left recorded.
     Settled,
@@ -2366,7 +2321,6 @@ enum Recovered {
 ///
 /// Returns the failure to write the record, and, for an update that never switched, a daemon that
 /// does not start again from the release still current: nothing can be gone back to then.
-#[cfg(unix)]
 async fn recover(store: &Store, record: &mut Record) -> Result<Recovered> {
     let Some(mut update) = record.update.clone() else {
         return Ok(Recovered::Settled);
@@ -2405,7 +2359,6 @@ async fn recover(store: &Store, record: &mut Record) -> Result<Recovered> {
 /// Where the switch did not happen, either command starts the daemon again from the release still
 /// current, before anything else. Where it did, only `kr host update --archive` of the release now
 /// current starts it: any other run asks, and starts none.
-#[cfg(unix)]
 fn left_part_way(why: &Shown, switched: bool, back_to: Option<&ReleaseName>) -> CliError {
     let how = if switched {
         let back = match back_to {
@@ -2438,7 +2391,6 @@ fn left_part_way(why: &Shown, switched: bool, back_to: Option<&ReleaseName>) -> 
 ///
 /// Both releases are fixed facts of the record, the first carried unchanged along the chain and
 /// the second the update's own, so no later switch can change what this gives for an update.
-#[cfg(unix)]
 fn goes_back_to(update: &Transaction) -> ReleaseName {
     let start = update.chain_start();
     if *start == update.target {
@@ -2449,7 +2401,6 @@ fn goes_back_to(update: &Transaction) -> ReleaseName {
 }
 
 /// Whether the release `other` is older than the current release, whose manifest is `current`.
-#[cfg(unix)]
 fn older_than(
     store: &Store,
     current: &kr_protocol::update::ReleaseManifest,
@@ -2460,7 +2411,6 @@ fn older_than(
 
 /// Asks whether each daemon `update` recorded, and each of a failed update it went on past, answers
 /// as a daemon of `current`, and says which does not.
-#[cfg(unix)]
 async fn answering(store: &Store, update: &Transaction) -> std::result::Result<(), Shown> {
     let current = store
         .current()
@@ -2500,7 +2450,6 @@ async fn answering(store: &Store, update: &Transaction) -> std::result::Result<(
 
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
 /// for a later update, and not one a running program holds. Returns what it removed.
-#[cfg(unix)]
 fn collect(
     store: &Store,
     record: &Record,
@@ -2519,42 +2468,6 @@ fn collect(
         }
     }
     removed
-}
-
-/// `kr host install` on a platform that keeps no store.
-#[cfg(not(unix))]
-pub async fn install(
-    _tree: Option<&std::path::Path>,
-    _root: Option<&std::path::Path>,
-    _installer: Option<&str>,
-) -> Result<Installed> {
-    Err(unsupported())
-}
-
-/// `kr host versions` on a platform that keeps no store.
-#[cfg(not(unix))]
-pub fn versions() -> Result<Vec<Kept>> {
-    Err(unsupported())
-}
-
-/// `kr host update` on a platform that keeps no store.
-#[cfg(not(unix))]
-pub async fn update(_archive: Option<&std::path::Path>, _check: bool) -> Result<Updated> {
-    Err(unsupported())
-}
-
-/// `kr host rollback` on a platform that keeps no store.
-#[cfg(not(unix))]
-pub async fn rollback(_to: Option<&str>) -> Result<Updated> {
-    Err(unsupported())
-}
-
-/// What a platform that keeps no store says.
-#[cfg(not(unix))]
-fn unsupported() -> CliError {
-    CliError::HostUnavailable(Shown::said(
-        "this host keeps no store of releases on Windows: its installer replaces the release",
-    ))
 }
 
 #[cfg(all(test, unix))]
