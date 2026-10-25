@@ -1448,23 +1448,33 @@ pub async fn action_read(
 /// A live session's output is its worker's, so the page is read on the session's own worker link;
 /// the control daemon serves the archive of a session whose worker has ended, and refuses a live
 /// one. Which it is follows from whether the session's worker has a descriptor on this machine.
+///
+/// Over a host this device is paired with, the page is read on the link of the opening the screen
+/// names, or the session's ambient link when it names none. That host narrows the page to the
+/// output the grant reaches: it begins at the first output the grant's history reaches, and says
+/// what it left out before that. A closed session's output is not served to a device.
 #[tauri::command]
 pub async fn history_page(
     state: State<'_, AppState>,
     links: State<'_, crate::agent::WorkerLinks>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: kr_protocol::recovery::HistoryPageParams = decode(params)?;
-    // A host does not serve retained output to a paired device: a byte range cannot be narrowed to
-    // the time a grant reaches back to. The page is told so and nothing is asked.
-    not_on_a_paired_host(&state, "a session's retained output")?;
-    let page: kr_protocol::recovery::HistoryPageResult = if links.serves(typed.session_id)? {
-        links
-            .read(&state, typed.session_id, None, Method::HistoryPage, &typed)
-            .await?
-    } else {
-        state.session()?.read(Method::HistoryPage, &typed).await?
-    };
+    let page: kr_protocol::recovery::HistoryPageResult =
+        if state.paired_context().is_some() || links.serves(typed.session_id)? {
+            links
+                .read(
+                    &state,
+                    typed.session_id,
+                    opening.as_deref(),
+                    Method::HistoryPage,
+                    &typed,
+                )
+                .await?
+        } else {
+            state.session()?.read(Method::HistoryPage, &typed).await?
+        };
     encode(&page)
 }
 read_command!(

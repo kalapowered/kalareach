@@ -338,6 +338,59 @@ describe('the retained output (KR-REQ-13.15)', () => {
     expect(screen.queryByText("This session's output could not be read")).toBeNull()
   })
 
+  it('begins where a paired device’s grant reaches, and says the output before it is not shown to the device', async () => {
+    const { port, asked, controls } = recording()
+    controls.reachAsPairedDevice()
+    const end = controls.records.outputEnd(SESSION_MAIN)
+    const reach = end - 5000n
+    controls.records.reachOutputFrom(SESSION_MAIN, reach)
+    openOutput(port, 3000, 9000)
+    await waitFor(() => {
+      expect(held()).toHaveLength(1)
+    })
+    // The first read back is asked from before the reach and answered from it, with the reach as
+    // the oldest output: the window starts there, and no output before it is shown.
+    act(() => {
+      scrollTo(10)
+    })
+    await waitFor(() => {
+      expect(held()).toEqual([String(reach), String(end - 3000n)])
+    })
+    expect(screen.getByTestId('output-gap')).toHaveTextContent('Output before this is not shown to this device.')
+    expect(screen.getByTestId('output-gap')).not.toHaveTextContent('not kept')
+    // The reach ends the read: scrolling to the top again asks the host nothing more.
+    const reads = asked.length
+    act(() => {
+      scrollTo(10)
+    })
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 60)
+      })
+    })
+    expect(asked).toHaveLength(reads)
+  })
+
+  it('says what a paired device is shown of a session that has written nothing it may see, and shows what comes after', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPairedDevice()
+    controls.records.reachOutputFrom(SESSION_MAIN, controls.records.outputEnd(SESSION_MAIN))
+    render(
+      <AppProvider port={port}>
+        <RetainedOutput sessionId={SESSION_MAIN} cadenceMs={20} />
+      </AppProvider>
+    )
+    expect(await screen.findByTestId('output-empty')).toHaveTextContent(
+      'This session has written nothing this device may see yet.'
+    )
+    controls.records.appendOutput(SESSION_MAIN, '$ echo after\r\nwritten after the grant\r\n')
+    await waitFor(() => {
+      expect(screen.getByTestId('output-scroll').textContent).toContain('written after the grant')
+    })
+    expect(screen.queryByTestId('output-empty')).toBeNull()
+    expect(screen.getByTestId('output-scroll').textContent).not.toContain('finished 900 tests')
+  })
+
   it('is one of the session views, beside the conversation and the terminal', async () => {
     const person = userEvent.setup()
     const { port } = fakeHost()

@@ -1944,12 +1944,18 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
     )
     .expect("the session is closed on the link of its opening");
 
+    // A page of retained output is read on the link of the opening, and the host narrows it to the
+    // share's history, which begins when the share was issued: the session has written nothing
+    // since, so the page is whole and holds none of it.
+    let page = about(
+        "history_page",
+        json!({ "session_id": session, "from_cursor": "0", "max_bytes": "4096" }),
+    )
+    .expect("the page is read on the link of the share's opening");
+    assert_eq!(page["bytes"], "", "{page}");
+
     // What a paired host does not serve a device is refused in words, before anything is sent.
     for (command, body) in [
-        (
-            "history_page",
-            json!({ "params": { "session_id": session, "from_cursor": "0", "max_bytes": "4096" } }),
-        ),
         ("shell_launch", json!({ "params": {}, "subject": {} })),
         ("draft_create", json!({ "params": {}, "subject": {} })),
         (

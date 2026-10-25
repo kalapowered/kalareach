@@ -467,6 +467,55 @@ test.describe("a session's retained output", () => {
   })
 })
 
+// KR-REQ-13.15: over a host this device is paired with, the output starts where the device's grant
+// reaches. The reader is told that what comes before is not shown to the device, and the read
+// back stops there.
+test.describe("a paired device's view of a session's retained output", () => {
+  const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  test('ends at the first output the grant reaches, and says the output before it is not shown', async ({
+    page
+  }) => {
+    await page.goto('/harness.html')
+    await page.waitForSelector('.app-shell')
+    await page.evaluate((session) => {
+      const lines: string[] = []
+      for (let index = 0; index < 4000; index += 1) {
+        lines.push(`line ${String(index).padStart(4, '0')} ${'of retained output '.repeat(2)}`)
+      }
+      const host = window.krTestHost
+      host?.reachAsPairedDevice()
+      // The grant reaches the last 100 KB: more than one page, and about half of what was written.
+      host?.records.appendOutput(session, `\r\n${lines.join('\r\n')}\r\n`)
+      const end = host?.records.outputEnd(session) ?? 0n
+      host?.records.reachOutputFrom(session, end - 100_000n)
+    }, MAIN)
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByRole('tab', { name: 'Output' }).click()
+    const scroll = page.getByTestId('output-scroll')
+    await expect(scroll).toContainText('line 3999')
+
+    // Back to the top, page by page, until the read stops at the grant's reach.
+    const gap = page.getByTestId('output-gap')
+    for (let step = 0; step < 40 && !(await gap.isVisible()); step += 1) {
+      await scroll.evaluate((element) => {
+        element.scrollTop = 0
+      })
+      await page.waitForTimeout(100)
+    }
+    await expect(gap).toHaveText('Output before this is not shown to this device.')
+    // What the grant does not reach is not on the page, and what it does is.
+    await expect(scroll).not.toContainText('line 1000')
+    await expect(scroll).toContainText('line 3999')
+    await scroll.evaluate((element) => {
+      element.scrollTop = 0
+    })
+    await expect(gap).toBeInViewport()
+    await page.screenshot({ path: shot(`output-paired-13.15-${test.info().project.name}`) })
+  })
+})
+
 test.describe('sessions', () => {
   test('a row carries the number, the directory, the attachments and the state', async ({
     page
