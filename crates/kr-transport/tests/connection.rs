@@ -1736,6 +1736,8 @@ enum HostScript {
     SelectUnofferedCapability,
     /// Selects an input frame limit above what the client offered to receive, and ends the stream.
     SelectLimitAboveOffer,
+    /// Selects naming an endpoint other than the one that answered, and ends the stream.
+    SelectOtherEndpoint,
     /// Selects, reads the connection proof, and ends the stream without a reply.
     NoProofReply,
     /// Selects, reads the connection proof, and refuses it with this error.
@@ -1798,6 +1800,9 @@ fn spawn_scripted(host: &Side, script: HostScript) -> JoinHandle<()> {
                     .into_iter()
                     .collect();
             }
+            HostScript::SelectOtherEndpoint => {
+                selection.endpoint_id = EndpointKey::from_bytes([9; 32]);
+            }
             HostScript::SelectLimitAboveOffer => {
                 selection.limits.max_input_frame_len =
                     kr_protocol::scalars::U64::new(offer.max_receive.max_input_frame_len.get() + 1);
@@ -1819,7 +1824,8 @@ fn spawn_scripted(host: &Side, script: HostScript) -> JoinHandle<()> {
             | HostScript::SelectUnofferedVersion
             | HostScript::SelectWrongNonce
             | HostScript::SelectUnofferedCapability
-            | HostScript::SelectLimitAboveOffer => {
+            | HostScript::SelectLimitAboveOffer
+            | HostScript::SelectOtherEndpoint => {
                 writer
                     .write_message(&HelloReply::Selected(Box::new(selection.clone())))
                     .await
@@ -2096,6 +2102,14 @@ async fn a_candidate_refuses_a_capability_it_did_not_offer() {
 async fn a_candidate_refuses_a_limit_above_its_offer() {
     let what = candidate_binding_failure(HostScript::SelectLimitAboveOffer).await;
     assert!(what.contains("limit"), "{what}");
+}
+
+/// KR-REQ-20.24: a candidate refuses a selection that names an endpoint other than the one that
+/// answered, which needs no paired record to see.
+#[tokio::test]
+async fn a_candidate_refuses_a_selection_naming_another_endpoint() {
+    let what = candidate_binding_failure(HostScript::SelectOtherEndpoint).await;
+    assert!(what.contains("endpoint"), "{what}");
 }
 
 /// KR-REQ-20.24: a candidate refuses negotiated limits below the floor a connection needs, as the
