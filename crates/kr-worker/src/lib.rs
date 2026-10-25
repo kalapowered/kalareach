@@ -57,6 +57,7 @@ pub mod history_filter;
 pub mod input;
 pub mod input_domain;
 pub mod journal;
+pub mod launch_surface;
 pub mod lifecycle;
 pub mod local_gate;
 pub mod metrics;

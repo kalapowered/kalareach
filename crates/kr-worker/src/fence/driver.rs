@@ -24,9 +24,10 @@ use kr_shell_integration::contract::events::{
 use kr_shell_integration::contract::fence::{
     Action, ContinuousMs, DetachRejection, DetachTarget, EditorEntered, FenceInvalidation,
     FenceMachine, InputArrived, InputRef, InputRefusal, InterruptRequested, LaunchRequested,
-    LeaseAcknowledgement, LeaseFault, LeaseView, ReaderIdled, StaleMessage, Stimulus,
+    LaunchStanding, LeaseAcknowledgement, LeaseFault, LeaseView, ReaderIdled, StaleMessage,
+    Stimulus,
 };
-use kr_shell_integration::contract::qualification::{IntegrationLoss, ShellKind};
+use kr_shell_integration::contract::qualification::{IntegrationLoss, IntegrationPhase, ShellKind};
 use kr_shell_integration::contract::requests::{
     BridgeAnswer, LaunchRejectionReason, LaunchTransactionId, WorkerRequest,
 };
@@ -459,6 +460,31 @@ impl FenceDriver {
     #[must_use]
     pub const fn fence(&self) -> Option<&EditorFence> {
         self.machine.fence()
+    }
+
+    /// Says what stands between a caller and a launch, or that nothing does.
+    ///
+    /// The first thing that holds: a session that is closing, an integration that has not
+    /// qualified or was refused or lost (the phase is the driver's), then the machine's own
+    /// account of the editor. A refusal the handshake recorded is a loss even before the phase
+    /// has moved, because the session will not qualify.
+    #[must_use]
+    pub fn launch_standing(&self) -> LaunchStanding {
+        if self.closing {
+            return LaunchStanding::Closing;
+        }
+        if self.refusal.is_some() {
+            return LaunchStanding::IntegrationLost;
+        }
+        match self.phase.phase() {
+            IntegrationPhase::Unauthenticated | IntegrationPhase::Authenticated => {
+                LaunchStanding::Starting
+            }
+            IntegrationPhase::Degraded | IntegrationPhase::TerminalOnly => {
+                LaunchStanding::IntegrationLost
+            }
+            IntegrationPhase::Qualified => self.machine.launch_standing(),
+        }
     }
 
     /// Returns the batches still held, in arrival order.
