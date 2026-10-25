@@ -169,7 +169,7 @@ pub(super) fn open_for_hold(path: &Path, within: Duration) -> io::Result<File> {
     let deadline = Instant::now() + within;
     loop {
         match open_reading(path, FILE_SHARE_READ) {
-            Err(error) if false && is_sharing_violation(&error) && Instant::now() < deadline => {
+            Err(error) if is_sharing_violation(&error) && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             answer => return answer,
