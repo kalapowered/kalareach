@@ -2492,14 +2492,28 @@ pub(crate) mod tests {
     /// tolerance is a rollback: on a loaded machine a restart takes that long. A wall clock that
     /// passes with the boot clock is never behind it, whatever the runner takes.
     pub(in crate::service) fn clocks_that_pass_with_the_boot() -> crate::service::Clocks {
+        clocks_that_pass_with_the_boot_and_a_step().1
+    }
+
+    /// As [`clocks_that_pass_with_the_boot`], with a wall clock the test also steps forward by
+    /// hand: the time the returned counter holds, in milliseconds, is added to it.
+    pub(in crate::service) fn clocks_that_pass_with_the_boot_and_a_step()
+    -> (Arc<std::sync::atomic::AtomicU64>, crate::service::Clocks) {
         let began = kr_ipc::clock::boot_elapsed_ms();
         let start = kr_ipc::now_ms().get();
-        crate::service::Clocks {
-            wall: crate::service::WallClock::from_fn(move || {
-                start + kr_ipc::clock::boot_elapsed_ms().saturating_sub(began)
+        let stepped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clocks = crate::service::Clocks {
+            wall: crate::service::WallClock::from_fn({
+                let stepped = Arc::clone(&stepped);
+                move || {
+                    start
+                        + kr_ipc::clock::boot_elapsed_ms().saturating_sub(began)
+                        + stepped.load(std::sync::atomic::Ordering::SeqCst)
+                }
             }),
             ..crate::service::Clocks::system()
-        }
+        };
+        (stepped, clocks)
     }
 
     /// What a test daemon is started with, in the boot `boot_identity` names.
