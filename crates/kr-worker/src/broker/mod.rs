@@ -71,6 +71,7 @@ pub mod error;
 pub mod framing;
 pub mod gateway;
 pub mod host;
+pub mod host_claims;
 pub mod image;
 pub mod ledger;
 pub mod listener;
@@ -369,6 +370,11 @@ pub struct Instance {
     /// The application server this host started for the process, where it started one: a process
     /// below it is placed under this instance, as one below the process is.
     pub backend: Option<ProcessStartIdentity>,
+    /// How the retirement of that server ended, once it has: true when nothing it started was
+    /// left running, false when something was.
+    ///
+    /// The conversations the instance held are not free for another session until then.
+    server_retired: Option<bool>,
     /// The process an adoption found running this instance, where one did.
     ///
     /// It places the questions that process and the ones it starts ask, and does nothing else: it
@@ -788,6 +794,16 @@ struct BrokerState {
     bindings: BTreeMap<BrokerBindingId, Binding>,
     tokens: TokenStore,
     profiles: ProfileStore,
+    /// The host's claims on the conversations of instances that have ended and whose servers are
+    /// still being retired, by instance.
+    ///
+    /// A conversation is free for another session when what runs against it is gone, and an
+    /// instance's end comes first: a server that ignores the end of its input runs on for the
+    /// whole of its retirement. The claims are dropped when the retirement is over.
+    retiring: BTreeMap<ApplicationInstanceId, Vec<crate::broker::host_claims::HostClaim>>,
+    /// The claims on conversations whose servers could not be ended. They are held until this
+    /// worker ends: a conversation held too long is the safe side.
+    stranded: Vec<crate::broker::host_claims::HostClaim>,
     /// The launches that hold an instance's identifier and have not finished, by their token.
     ///
     /// A launch holds its identifier from its execution until its guard commits or gives it back,
@@ -1039,6 +1055,8 @@ impl Broker {
                 bindings: BTreeMap::new(),
                 tokens: TokenStore::new(),
                 profiles,
+                retiring: BTreeMap::new(),
+                stranded: Vec::new(),
                 launches: BTreeMap::new(),
                 next_launch: 1,
                 arbitration,
@@ -1547,11 +1565,13 @@ impl Broker {
         let Some(ended) = state.instances.remove(&application_instance_id) else {
             return false;
         };
+        let (has_server, retirement) = (ended.backend.is_some(), ended.server_retired);
         if let Some(agent) = ended.process {
             release_agent_job(&state.instances, &agent.process);
         }
         state.tokens.withdraw(application_instance_id);
-        state.profiles.release(application_instance_id);
+        let claims = state.profiles.release(application_instance_id);
+        state.hold_until_retired(application_instance_id, has_server, retirement, claims);
         state.capabilities.forget(application_instance_id);
         state.forget_instance(application_instance_id, kr_ipc::now_ms());
         state.application_changed();
@@ -1580,11 +1600,15 @@ impl Broker {
         }
         state.launches.remove(&application_instance_id);
         let removed = state.instances.remove(&application_instance_id);
+        let (has_server, retirement) = removed.as_ref().map_or((false, None), |instance| {
+            (instance.backend.is_some(), instance.server_retired)
+        });
         if let Some(agent) = removed.and_then(|instance| instance.process) {
             release_agent_job(&state.instances, &agent.process);
         }
         state.tokens.withdraw(application_instance_id);
-        state.profiles.release(application_instance_id);
+        let claims = state.profiles.release(application_instance_id);
+        state.hold_until_retired(application_instance_id, has_server, retirement, claims);
         state.capabilities.forget(application_instance_id);
         // An instance given back must not stay bound: its bindings go from memory at once, and
         // their rows now or, where the store refuses, as soon as it takes writes again.
@@ -2667,12 +2691,16 @@ impl Broker {
         state
             .profiles
             .check_executable(intent, now, application_instance_id)?;
+        // The conversation is claimed on the host before anything is written, so a launch that
+        // another session's execution holds the conversation of leaves nothing behind, and a
+        // write that fails gives the claim back by dropping it.
+        let claim = state.profiles.claim(intent)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
             ledger.put_profile(&intent.profile, Some(application_instance_id))
         })?;
         let profile = state
             .profiles
-            .execute(intent, now, application_instance_id)?;
+            .execute(intent, now, application_instance_id, claim)?;
         let token = state.next_launch;
         state.next_launch = state.next_launch.saturating_add(1);
         state.launches.insert(application_instance_id, token);
@@ -2694,6 +2722,35 @@ impl Broker {
             .profiles
             .profile_of(application_instance_id)
             .cloned()
+    }
+
+    /// Has this broker claim the conversations its instances own on the host, so that no other
+    /// session of the user runs against one of them as well.
+    ///
+    /// A broker without them knows only its own session's instances. It applies to the
+    /// conversations claimed from here on, so the worker sets it before it serves anything.
+    pub fn set_host_claims(&self, claims: crate::broker::host_claims::HostClaims) {
+        self.state().profiles.set_host_claims(claims);
+    }
+
+    /// Records that the retirement of the server started for one instance is over, and whether
+    /// it ended everything it covered (`clean`).
+    ///
+    /// A conversation an instance owned is free for another session only when what ran against it
+    /// is gone, and that is the later of two things: the instance's end and this. Whichever comes
+    /// second lets go of the host's claims. When something survived the retirement the claims are
+    /// kept until this worker ends.
+    pub fn server_retired(&self, application_instance_id: ApplicationInstanceId, clean: bool) {
+        let mut state = self.state();
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.server_retired = Some(clean);
+        } else if let Some(claims) = state.retiring.remove(&application_instance_id) {
+            if clean {
+                drop(claims);
+            } else {
+                state.stranded.extend(claims);
+            }
+        }
     }
 
     /// Returns which instance owns the live execution of one saved conversation.
@@ -3951,6 +4008,30 @@ impl Broker {
 }
 
 impl BrokerState {
+    /// Settles the host's claims of an instance that has left this broker: dropped at once where
+    /// no server ran against its conversations or the server is gone, kept until the server's
+    /// retirement is over otherwise, and kept for good where it left something running.
+    fn hold_until_retired(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        has_server: bool,
+        retirement: Option<bool>,
+        claims: Vec<crate::broker::host_claims::HostClaim>,
+    ) {
+        if claims.is_empty() {
+            return;
+        }
+        match (has_server, retirement) {
+            (false, _) | (true, Some(true)) => drop(claims),
+            (true, Some(false)) => self.stranded.extend(claims),
+            (true, None) => self
+                .retiring
+                .entry(application_instance_id)
+                .or_default()
+                .extend(claims),
+        }
+    }
+
     /// Advances one instance's binding revision, under the lock the caller already holds.
     ///
     /// See [`Broker::advance_binding`]: this is its whole body, here so that a decision that reads
@@ -4428,6 +4509,7 @@ impl BrokerState {
                 application_instance_id,
                 process,
                 backend: None,
+                server_retired: None,
                 observed: None,
                 binding_revision: AgentBindingRevision::new(1),
                 source_generation: SourceGeneration::new(1),

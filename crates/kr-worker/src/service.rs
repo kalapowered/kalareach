@@ -774,6 +774,15 @@ impl WorkerService {
         self
     }
 
+    /// Has this worker claim the saved conversations its instances own on the host, so that no
+    /// other session of the user runs a second agent against one of them. Without it the worker
+    /// knows only the instances of its own session.
+    #[must_use]
+    pub fn with_conversation_claims(self, claims: crate::broker::host_claims::HostClaims) -> Self {
+        self.broker.set_host_claims(claims);
+        self
+    }
+
     /// Has this worker register the components of its bindings with the plugin runtime, asking the
     /// control daemon for it when a binding first wants one. Without this a binding's component
     /// is reported pending and nothing is asked for.

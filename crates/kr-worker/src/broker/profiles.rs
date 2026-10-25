@@ -11,7 +11,10 @@
 //!   host rejects the stale launch. It must never paste a launch command into that application's
 //!   input." A refusal is the whole answer, so there is no code path here that writes bytes.
 //! * **One live execution per saved conversation.** "An adapter must not start a second agent
-//!   process against the same saved conversation to obtain a remote interface."
+//!   process against the same saved conversation to obtain a remote interface." The store knows
+//!   the executions of its own session. Where it has been given the host's claims
+//!   ([`ProfileStore::set_host_claims`]) it also holds a lock on each conversation it owns, in a
+//!   file that every session of the user shares, so a second session cannot start one either.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +23,7 @@ use kr_protocol::ids::{ApplicationInstanceId, LaunchProfileId};
 use kr_protocol::scalars::TimestampMs;
 
 use crate::broker::error::{BrokerError, Result};
+use crate::broker::host_claims::{ClaimRefusal, HostClaim, HostClaims};
 
 /// What occupies the terminal at one moment.
 ///
@@ -75,12 +79,25 @@ struct LaunchClaim {
     named_by_the_stream: bool,
 }
 
+/// The instance that owns the live execution of one saved conversation, and the host's claim on
+/// it.
+#[derive(Debug)]
+struct Held {
+    owner: ApplicationInstanceId,
+    /// The lock on the conversation's file in the host's claims. Every entry of a store that has
+    /// been given the host's claims has one, and an entry of a store that has not has none, so
+    /// an absent claim never stands for "another session holds it".
+    claim: Option<HostClaim>,
+}
+
 /// The broker's launch profiles and the conversations they own.
 #[derive(Debug, Default)]
 pub struct ProfileStore {
     profiles: BTreeMap<LaunchProfileId, LaunchProfile>,
     /// Which instance owns the live execution of each saved conversation.
-    conversations: BTreeMap<String, ApplicationInstanceId>,
+    conversations: BTreeMap<String, Held>,
+    /// Where the claims on conversations are made across sessions, where this store has them.
+    host: Option<HostClaims>,
     /// The saved conversation each instance's launch named.
     ///
     /// A word the application resolves, a name, stays held for as long as the execution lives,
@@ -96,6 +113,58 @@ impl ProfileStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Has this store claim every conversation it owns on the host, so that no other session of
+    /// the user owns it as well. It applies to the conversations claimed from here on.
+    pub fn set_host_claims(&mut self, claims: HostClaims) {
+        self.host = Some(claims);
+    }
+
+    /// Makes the host's claim on the conversation known as `word`, where this store has the
+    /// host's claims, and none otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::ConversationHeldElsewhere`] when another session holds the
+    /// conversation, and [`BrokerError::ResourceUnavailable`] when the claim could not be made:
+    /// nothing then says that no one holds it, so it is not taken to be free.
+    fn claim_word(&self, word: &str) -> Result<Option<HostClaim>> {
+        let Some(host) = self.host.as_ref() else {
+            return Ok(None);
+        };
+        host.take(word).map(Some).map_err(|refusal| match refusal {
+            ClaimRefusal::Held => BrokerError::ConversationHeldElsewhere,
+            ClaimRefusal::Unavailable(detail) => {
+                eprintln!(
+                    "kr-worker: the claim on a saved conversation could not be made: {detail}"
+                );
+                BrokerError::ResourceUnavailable {
+                    detail: format!(
+                        "the claim on the saved conversation could not be made: {detail}"
+                    ),
+                }
+            }
+        })
+    }
+
+    /// Makes the host's claim on the conversation this launch works on, where it names one and
+    /// this store has the host's claims, and none otherwise.
+    ///
+    /// It runs after [`ProfileStore::check_executable`] has found the conversation free in this
+    /// session, and before the launch's record is written, so a launch that cannot be claimed
+    /// leaves nothing behind and one whose record cannot be written gives the claim back by
+    /// dropping it. [`ProfileStore::execute`] takes the claim.
+    ///
+    /// # Errors
+    ///
+    /// As [`ProfileStore::claim_word`]: the launch is refused when another session holds the
+    /// conversation, and when the claim cannot be made.
+    pub fn claim(&self, intent: &LaunchIntent) -> Result<Option<HostClaim>> {
+        match intent.saved_conversation.as_deref() {
+            Some(word) => self.claim_word(word),
+            None => Ok(None),
+        }
     }
 
     /// Returns the intent to execute a resolved profile, without recording anything.
@@ -136,6 +205,9 @@ impl ProfileStore {
     /// prompt says the shell has accepted something else since. A live conversation says another
     /// execution already owns what this launch would resume.
     ///
+    /// `claim` is the host's claim on the conversation the intent names, made by
+    /// [`ProfileStore::claim`]. It is held with the conversation from here on.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Launch`] with the refusal that applies.
@@ -144,11 +216,17 @@ impl ProfileStore {
         intent: &LaunchIntent,
         now: &ForegroundMark,
         application_instance_id: ApplicationInstanceId,
+        claim: Option<HostClaim>,
     ) -> Result<LaunchProfile> {
         self.check_executable(intent, now, application_instance_id)?;
         if let Some(conversation) = intent.saved_conversation.as_ref() {
-            self.conversations
-                .insert(conversation.clone(), application_instance_id);
+            self.conversations.insert(
+                conversation.clone(),
+                Held {
+                    owner: application_instance_id,
+                    claim,
+                },
+            );
             self.launch_claims.insert(
                 application_instance_id,
                 LaunchClaim {
@@ -194,11 +272,11 @@ impl ProfileStore {
             return Err(BrokerError::Launch(LaunchRefusal::PromptMoved));
         }
         if let Some(conversation) = intent.saved_conversation.as_ref()
-            && let Some(owner) = self.conversations.get(conversation)
+            && let Some(held) = self.conversations.get(conversation)
         {
             return Err(BrokerError::Launch(
                 LaunchRefusal::ConversationAlreadyLive {
-                    application_instance_id: *owner,
+                    application_instance_id: held.owner,
                 },
             ));
         }
@@ -218,10 +296,20 @@ impl ProfileStore {
     ) {
         self.profiles
             .insert(profile.profile_id.clone(), profile.clone());
-        if let Some(conversation) = saved_conversation {
-            self.conversations
-                .entry(conversation)
-                .or_insert(application_instance_id);
+        // A program that already runs cannot be refused. Where another session holds its
+        // conversation, or the claim cannot be made, it is left owning nothing, as it is when
+        // another instance of this session owns it: the first owner keeps the word.
+        if let Some(conversation) = saved_conversation
+            && !self.conversations.contains_key(&conversation)
+            && let Ok(claim) = self.claim_word(&conversation)
+        {
+            self.conversations.insert(
+                conversation,
+                Held {
+                    owner: application_instance_id,
+                    claim,
+                },
+            );
         }
         self.instances
             .insert(application_instance_id, profile.profile_id);
@@ -243,23 +331,40 @@ impl ProfileStore {
         application_instance_id: ApplicationInstanceId,
         conversation: &str,
     ) -> Result<()> {
-        if let Some(owner) = self.conversations.get(conversation)
-            && *owner != application_instance_id
+        if let Some(held) = self.conversations.get(conversation)
+            && held.owner != application_instance_id
         {
             return Err(BrokerError::Launch(
                 LaunchRefusal::ConversationAlreadyLive {
-                    application_instance_id: *owner,
+                    application_instance_id: held.owner,
                 },
             ));
         }
+        // The host's claim on the conversation is settled before anything is freed, so a refusal
+        // leaves the instance exactly where it was. A conversation the instance already holds
+        // keeps its claim without a gap: it is moved, not dropped and taken again, and no other
+        // session can take it in between.
+        let held = self
+            .conversations
+            .get_mut(conversation)
+            .and_then(|held| held.claim.take());
+        let claim = match held {
+            Some(claim) => Some(claim),
+            None => self.claim_word(conversation)?,
+        };
         if let Some(claim) = self.launch_claims.get_mut(&application_instance_id)
             && claim.word == conversation
         {
             claim.named_by_the_stream = true;
         }
         self.free_but_what_the_launch_named(application_instance_id, Some(conversation));
-        self.conversations
-            .insert(conversation.to_owned(), application_instance_id);
+        self.conversations.insert(
+            conversation.to_owned(),
+            Held {
+                owner: application_instance_id,
+                claim,
+            },
+        );
         Ok(())
     }
 
@@ -280,17 +385,33 @@ impl ProfileStore {
             .get(&application_instance_id)
             .filter(|claim| !claim.named_by_the_stream || Some(claim.word.as_str()) == selected)
             .map(|claim| claim.word.clone());
-        self.conversations.retain(|conversation, owner| {
-            *owner != application_instance_id || kept.as_ref() == Some(conversation)
+        self.conversations.retain(|conversation, held| {
+            held.owner != application_instance_id || kept.as_ref() == Some(conversation)
         });
     }
 
-    /// Releases the conversation an instance owned, because the instance ended.
-    pub fn release(&mut self, application_instance_id: ApplicationInstanceId) {
-        self.conversations
-            .retain(|_, owner| *owner != application_instance_id);
+    /// Releases the conversations an instance owned in this session, because the instance ended,
+    /// and hands back the host's claims on them.
+    ///
+    /// The claims are the caller's to let go of, because what an instance owned is not yet free
+    /// when the instance ends: its server may still be running, and another session that took
+    /// the conversation then would start a second process against it.
+    #[must_use]
+    pub fn release(&mut self, application_instance_id: ApplicationInstanceId) -> Vec<HostClaim> {
+        let owned: Vec<String> = self
+            .conversations
+            .iter()
+            .filter(|(_, held)| held.owner == application_instance_id)
+            .map(|(conversation, _)| conversation.clone())
+            .collect();
+        let claims = owned
+            .iter()
+            .filter_map(|conversation| self.conversations.remove(conversation))
+            .filter_map(|held| held.claim)
+            .collect();
         self.launch_claims.remove(&application_instance_id);
         self.instances.remove(&application_instance_id);
+        claims
     }
 
     /// Returns the profile one instance was launched under.
@@ -324,7 +445,9 @@ impl ProfileStore {
     /// Returns which instance owns the live execution of one saved conversation.
     #[must_use]
     pub fn owner_of(&self, saved_conversation: &str) -> Option<ApplicationInstanceId> {
-        self.conversations.get(saved_conversation).copied()
+        self.conversations
+            .get(saved_conversation)
+            .map(|held| held.owner)
     }
 
     /// Restores profiles read back from the ledger.
@@ -566,7 +689,7 @@ mod tests {
             prompt_revision: 4,
         };
         let refusal = store
-            .execute(&intent, &occupied, instance(2))
+            .execute(&intent, &occupied, instance(2), None)
             .expect_err("a stale launch is refused");
         assert!(matches!(
             refusal,
@@ -585,7 +708,7 @@ mod tests {
             )
             .expect("prepared");
         let refusal = store
-            .execute(&intent, &ForegroundMark::idle(5), instance(2))
+            .execute(&intent, &ForegroundMark::idle(5), instance(2), None)
             .expect_err("a moved prompt is refused");
         assert!(matches!(
             refusal,
@@ -618,7 +741,7 @@ mod tests {
             )
             .expect("prepared");
         store
-            .execute(&first, &ForegroundMark::idle(4), instance(2))
+            .execute(&first, &ForegroundMark::idle(4), instance(2), None)
             .expect("the first launch runs");
 
         let second = store
@@ -629,7 +752,7 @@ mod tests {
             )
             .expect("prepared");
         let refusal = store
-            .execute(&second, &ForegroundMark::idle(4), instance(3))
+            .execute(&second, &ForegroundMark::idle(4), instance(3), None)
             .expect_err("a second process against the same conversation is refused");
         assert!(matches!(
             refusal,
@@ -638,9 +761,9 @@ mod tests {
             }) if application_instance_id == instance(2)
         ));
 
-        store.release(instance(2));
+        drop(store.release(instance(2)));
         store
-            .execute(&second, &ForegroundMark::idle(4), instance(3))
+            .execute(&second, &ForegroundMark::idle(4), instance(3), None)
             .expect("the conversation is free once its execution has ended");
     }
 
@@ -655,7 +778,7 @@ mod tests {
             )
             .expect("prepared");
         store
-            .execute(&intent, &ForegroundMark::idle(4), instance(2))
+            .execute(&intent, &ForegroundMark::idle(4), instance(2), None)
             .expect("the launch runs");
         assert_eq!(store.owner_of("thread-7"), Some(instance(2)));
 
@@ -695,7 +818,7 @@ mod tests {
             )
             .expect("prepared");
         store
-            .execute(&intent, &ForegroundMark::idle(4), instance(2))
+            .execute(&intent, &ForegroundMark::idle(4), instance(2), None)
             .expect("the launch runs");
 
         // The application resolved the name to a conversation of its own. Which one a name stands
@@ -713,7 +836,7 @@ mod tests {
         );
         assert_eq!(store.owner_of("thread-8"), None);
 
-        store.release(instance(2));
+        drop(store.release(instance(2)));
         assert_eq!(store.owner_of("my-chat"), None);
     }
 

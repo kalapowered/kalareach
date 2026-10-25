@@ -177,6 +177,8 @@ impl Backend {
             .take();
         if let Some(server) = server {
             let owned = SessionOwned(self.views.as_ref().map(|(_, runtime)| Weak::clone(runtime)));
+            let broker = Arc::clone(&run.broker);
+            let instance = self.application_instance_id;
             let ending = run.handle.spawn(async move {
                 let retirement = server.retire(&owned, begun).await;
                 if !retirement.survivors.is_empty() {
@@ -187,6 +189,8 @@ impl Backend {
                         retirement.ended
                     );
                 }
+                // The conversations the instance held are free for another session only now.
+                broker.server_retired(instance, retirement.survivors.is_empty());
                 retirement
             });
             ladders.push(ending);

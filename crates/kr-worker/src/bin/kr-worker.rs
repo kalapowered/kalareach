@@ -382,6 +382,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             },
         )?
         .with_plugin_admissions(admissions, Arc::clone(&sources))
+        .with_conversation_claims(kr_worker::broker::host_claims::HostClaims::new(&paths))
         .with_plugin_runtime(kr_worker::plugin_runtime::RuntimeRequest {
             session_id,
             rendezvous: arguments.rendezvous.clone(),
