@@ -2718,9 +2718,12 @@ does not record when a worker was made, so a worker made after those revisions p
 same way while a fence is owed to another worker. Once the start is done, a task of its own asks
 each recorded worker for the first page of each of the eight revisions at or below the one the
 registry holds it as having acknowledged, and the pass that collects owed names asks for the pages
-that follow. That is one exchange for each revision and none asked again, so a worker takes eight at
-most. The daemon keeps a report for eight revisions of a worker in all, so a worker that was eight
-or more revisions behind has the older of these reports go first. A repeat of one of those
+that follow. That is one exchange for each revision. A worker that answers that its dispatch boundary
+is held for the moment is asked again, at most three times for its walk, after pauses of 20, 40
+and 80 milliseconds, so a worker takes eight answered exchanges at most and three retries of a
+refusal for now; its fourth refusal ends its own walk and no other. The daemon keeps a report for eight
+revisions of a worker in all, so a worker that was eight or more revisions behind has the older of
+these reports go first. A repeat of one of those
 revocations then names what the worker still holds. A revocation older than that answers as it was
 first given.
 
