@@ -2194,34 +2194,21 @@ fn sync_directory(directory: &Path) -> Result<()> {
         .map_err(|error| InstallError::io("flush", directory, error))
 }
 
-/// Deletes a release that was moved out of `versions/`, its directories given back to their owner
-/// first, since a release is sealed. Only directories are changed: a file inside is never touched
-/// by its path, because a hard link to a file outside the release would carry the change there.
-#[cfg(windows)]
-fn remove_tree(directory: &Path) -> Result<()> {
-    fn unsealed(directory: &Path) -> std::io::Result<()> {
-        windows::unseal_directory(directory)?;
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                unsealed(&entry.path())?;
-            }
-        }
-        Ok(())
-    }
+/// Deletes the sealed tree at `directory`, whether it is a release moved out of `versions/` or
+/// one that was staged: its directories are given back to their owner first, since a release is
+/// sealed.
+///
+/// Only directories are changed. A file is deleted by name and never touched by its path, because a
+/// hard link to a file outside the release would carry the change there.
+///
+/// # Errors
+///
+/// Returns the failure to change a directory or to delete.
+pub fn remove_sealed_tree(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fn open_to_removal(directory: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
 
-    unsealed(directory)
-        .and_then(|()| std::fs::remove_dir_all(directory))
-        .map_err(|error| InstallError::io("remove", directory, error))
-}
-
-/// Deletes a release that was moved out of `versions/`, its directories made writable first, since
-/// a release is installed read-only.
-#[cfg(unix)]
-fn remove_tree(directory: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    fn writable(directory: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(
             directory,
             std::fs::Permissions::from_mode(crate::paths::OWNER_ONLY_DIRECTORY_MODE),
@@ -2229,15 +2216,29 @@ fn remove_tree(directory: &Path) -> Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
-                writable(&entry.path())?;
+                open_to_removal(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    fn open_to_removal(directory: &Path) -> std::io::Result<()> {
+        windows::unseal_directory(directory)?;
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                open_to_removal(&entry.path())?;
             }
         }
         Ok(())
     }
 
-    writable(directory)
-        .and_then(|()| std::fs::remove_dir_all(directory))
-        .map_err(|error| InstallError::io("remove", directory, error))
+    open_to_removal(directory).and_then(|()| std::fs::remove_dir_all(directory))
+}
+
+/// Deletes a release that was moved out of `versions/`.
+fn remove_tree(directory: &Path) -> Result<()> {
+    remove_sealed_tree(directory).map_err(|error| InstallError::io("remove", directory, error))
 }
 
 #[cfg(all(test, unix))]

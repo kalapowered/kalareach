@@ -670,6 +670,7 @@ pub fn copy_tree(tree: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
 
 /// Splits an archive entry's path into its top directory and the parts below it, when it is a
 /// relative path of text parts that stays inside that directory.
+#[cfg(unix)]
 fn split_entry(path: &Path) -> Option<(String, Vec<String>)> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -688,7 +689,7 @@ fn split_entry(path: &Path) -> Option<(String, Vec<String>)> {
 }
 
 /// Creates `directory` and its parents below `staging`, owner-only.
-fn create_directories(staging: &Path, directory: &Path) -> Result<()> {
+pub(super) fn create_directories(staging: &Path, directory: &Path) -> Result<()> {
     kr_ipc::paths::create_private_tree(staging, directory).map_err(|error| {
         CliError::Other(shown!(
             "the staging directory {} could not be made: {}",
@@ -843,6 +844,7 @@ pub fn manifest_document(release: &Path) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// Returns the failure to change or flush a file.
+#[cfg(unix)]
 pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -893,6 +895,55 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
     Ok(())
 }
 
+/// Makes every file of the release at `release` read-only and unwritable by its owner, and every
+/// directory under it unable to take a new name or lose one, then flushes each.
+///
+/// A file is sealed by attribute and by a list that denies its owner every right that writes it. A
+/// directory is flushed before it is sealed, since a flush asks for the right to add a name, which
+/// sealing takes away; the release's own directory is flushed and left open: it is renamed into
+/// `versions/` next, and [`admit`] seals it there. A program's mode is not a thing here: a file is
+/// run when its name says it is a program.
+///
+/// # Errors
+///
+/// Returns the failure to change or flush a file.
+#[cfg(windows)]
+pub fn seal(release: &Path, _manifest: &ReleaseManifest) -> Result<()> {
+    let mut directories = Vec::new();
+    let mut pending: Vec<PathBuf> = vec![release.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        directories.push(directory.clone());
+        let entries = std::fs::read_dir(&directory).map_err(|error| sealing(&directory, &error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| sealing(&directory, &error))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| sealing(&entry.path(), &error))?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let file = entry.path();
+            kr_ipc::install::seal_file(&file)
+                .and_then(|()| std::fs::File::open(&file).and_then(|opened| opened.sync_all()))
+                .map_err(|error| sealing(&file, &error))?;
+        }
+    }
+    // Deepest first, so a directory is flushed after everything in it and sealed last.
+    for directory in directories.iter().rev() {
+        kr_flush::flush_directory(directory, kr_flush::NameKind::Directory)
+            .and_then(|()| {
+                if directory == release {
+                    Ok(())
+                } else {
+                    kr_ipc::install::seal_directory(directory)
+                }
+            })
+            .map_err(|error| sealing(directory, &error))?;
+    }
+    Ok(())
+}
+
 /// Moves a sealed release into the store's `versions/` in one rename, makes its directory
 /// read-only, and flushes both directories the rename changed.
 ///
@@ -900,6 +951,7 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
 ///
 /// Returns a refusal when a release of that name is already there, and the failure to move or
 /// flush otherwise.
+#[cfg(unix)]
 pub fn admit(
     staged: &Path,
     store: &kr_ipc::install::Store,
@@ -926,6 +978,38 @@ pub fn admit(
     Ok(destination)
 }
 
+/// Moves a sealed release into the store's `versions/` in one rename, seals its directory, and
+/// flushes both directories the rename changed.
+///
+/// # Errors
+///
+/// Returns a refusal when a release of that name is already there, and the failure to move or
+/// flush otherwise.
+#[cfg(windows)]
+pub fn admit(
+    staged: &Path,
+    store: &kr_ipc::install::Store,
+    release: &kr_protocol::update::ReleaseName,
+) -> Result<PathBuf> {
+    let destination = store.release_directory(release);
+    if destination.exists() {
+        return Err(CliError::Other(shown!(
+            "the store already holds release {}",
+            crate::shown::release(release)
+        )));
+    }
+    std::fs::rename(staged, &destination).map_err(|error| sealing(&destination, &error))?;
+    kr_ipc::install::seal_directory(&destination)
+        .and_then(|()| kr_flush::flush_directory(&store.versions(), kr_flush::NameKind::Directory))
+        .and_then(|()| {
+            staged.parent().map_or(Ok(()), |parent| {
+                kr_flush::flush_directory(parent, kr_flush::NameKind::Directory)
+            })
+        })
+        .map_err(|error| sealing(&destination, &error))?;
+    Ok(destination)
+}
+
 fn sealing(path: &Path, error: &std::io::Error) -> CliError {
     CliError::Other(shown!(
         "the staged release could not be made read-only at {}: {}",
@@ -934,7 +1018,7 @@ fn sealing(path: &Path, error: &std::io::Error) -> CliError {
     ))
 }
 
-fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
+pub(super) fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
     CliError::Other(shown!(
         "the archive {} is not a release this host installs: it {}",
         Shown::root(archive),
@@ -943,10 +1027,12 @@ fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
 }
 
 /// The characters tar's entry kinds are written with, from `!` to `~`.
+#[cfg(unix)]
 const GRAPHIC: &str = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
 /// The refusal of an entry that is neither a file nor a directory, saying which kind it is by the
 /// character tar gives it, with its usual name: `2` is a symbolic link, `1` a hard link.
+#[cfg(unix)]
 fn refused_kind(archive: &Path, kind: u8) -> CliError {
     let said = |kind: Shown| {
         shown!(
@@ -979,7 +1065,7 @@ fn refused_tree(tree: &Path, reason: &'static str) -> CliError {
     ))
 }
 
-fn write_failure(path: &Path, error: &std::io::Error) -> CliError {
+pub(super) fn write_failure(path: &Path, error: &std::io::Error) -> CliError {
     CliError::Other(shown!(
         "the release could not be staged at {}: {}",
         Shown::root(path),

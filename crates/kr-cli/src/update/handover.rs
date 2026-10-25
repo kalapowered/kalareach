@@ -751,10 +751,11 @@ pub async fn answers_as_or_gone(
             && let Ok(Some(status)) = child.try_wait()
         {
             if !held(store, environment, INSTALL_LOCK_WAIT).await? {
-                let how = match (
-                    status.code(),
-                    std::os::unix::process::ExitStatusExt::signal(&status),
-                ) {
+                #[cfg(unix)]
+                let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+                #[cfg(not(unix))]
+                let signal: Option<i32> = None;
+                let how = match (status.code(), signal) {
                     (Some(code), _) => shown!("with exit code {}", code),
                     (None, Some(signal)) => shown!("on signal {}", signal),
                     (None, None) => Shown::said("for a reason its status does not say"),

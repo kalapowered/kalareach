@@ -1030,6 +1030,21 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
         );
     };
     probe("before");
+    {
+        let moved = test.root.join("probe-moved");
+        std::fs::rename(test.store.release_directory(&two), &moved).expect("moved");
+        probe("after rename");
+        kr_ipc::install::unseal_directory(&moved).expect("unseal root");
+        probe("after unseal root");
+        kr_ipc::install::unseal_directory(&moved.join("bin")).expect("unseal bin");
+        probe("after unseal bin");
+        std::fs::remove_dir_all(&moved).expect("removed");
+        probe("after remove");
+        std::fs::create_dir_all(test.store.release_directory(&two).join("bin")).expect("again");
+        std::fs::hard_link(outside.join("shared"), test.store.release_directory(&two).join("bin/kr.exe")).expect("again");
+        std::fs::write(test.store.manifest(&two), manifest(&two)).expect("manifest");
+    }
+    probe("before real");
     assert!(test.store.retire(&two, &update).expect("removes"));
     probe("after");
     assert!(!test.store.release_directory(&two).exists());

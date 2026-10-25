@@ -51,6 +51,8 @@
 
 #[cfg(unix)]
 pub mod admit;
+#[cfg(windows)]
+pub mod archive;
 mod formats;
 mod handover;
 mod inventory;
@@ -987,26 +989,10 @@ fn replace_kept(
 
 /// Removes a staging directory and whatever an interrupted run left in it.
 fn remove_staging(staging: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     if !staging.exists() {
         return Ok(());
     }
-    // A sealed release is read-only, and its directories are opened to removal first.
-    let mut pending = vec![staging.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        std::fs::set_permissions(
-            &directory,
-            std::fs::Permissions::from_mode(kr_ipc::paths::OWNER_ONLY_DIRECTORY_MODE),
-        )?;
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
-            }
-        }
-    }
-    std::fs::remove_dir_all(staging)
+    kr_ipc::install::remove_sealed_tree(staging)
 }
 
 /// `kr host versions`: the releases the store keeps, and what each is to this host.
