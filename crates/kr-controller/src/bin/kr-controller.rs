@@ -253,6 +253,7 @@ async fn run(
     // Held until the daemon has taken its environment: an update that switches `current` from then
     // on hands the environment over first.
     let controller = {
+        #[cfg(unix)]
         let _starting = hold_the_start(running, &paths, &environment)?;
         kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
             paths: environment.clone(),
