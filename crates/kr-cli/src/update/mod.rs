@@ -99,9 +99,6 @@ pub fn said(error: &InstallError) -> Shown {
             Shown::root(path),
             Shown::io(source)
         ),
-        InstallError::Unsupported => {
-            Shown::said("this host keeps no store of releases on this platform")
-        }
     }
 }
 
@@ -353,7 +350,8 @@ impl Restart {
 #[serde(rename_all = "snake_case")]
 pub enum Start {
     /// By this user's service manager, from the definition `kr host startup` wrote, which names the
-    /// daemon through the store's `current`.
+    /// daemon through the store's `current`. On Windows the manager is the environment's scheduled
+    /// task, which `kr host startup --set standalone` registers and which runs `current`'s starter.
     Service,
     /// Through the store's `current`, with the arguments it was started with and in the directory
     /// it was started in.
@@ -958,10 +956,11 @@ fn replace_kept(
         let kept = release::manifest_document(&directory).map_err(|_| {
             CliError::Other(shown!(
                 "the store holds a directory for release {} whose manifest is not a file this host \
-                 reads, a link or a pipe among the possible causes: make {} writable with `chmod -R \
-                 u+w`, remove it, and run kr host {} again",
+                 reads, a link or a pipe among the possible causes: make {} writable with {}, \
+                 remove it, and run kr host {} again",
                 crate::shown::release(&manifest.release),
                 Shown::root(&directory),
+                MAKE_WRITABLE,
                 command
             ))
         })?;
@@ -2300,21 +2299,19 @@ fn restart_of(
 /// All of these hold, or the update is deferred before it stops anything and says why: the daemon's
 /// configuration document chooses the standalone start; the daemon was started with exactly the
 /// arguments and in the directory the task's starter gives a daemon, the environment's roots and its
-/// state directory, and no other (a key store named `file` or a worker program among them); and the
-/// task is this installation's own, as it registers it, so that the task, run after the switch,
-/// starts the daemon of the release `current` then names.
+/// state directory, and no other (a key store named `file` or a worker program among them); the
+/// variables it states as deciding where it keeps something (`HOME`, `USERPROFILE` and
+/// `LOCALAPPDATA` on Windows) are the ones the system gives the account, which is what the task
+/// starts its replacement with; and the task is this installation's own, as it registers it, so
+/// that the task, run after the switch, starts the daemon of the release `current` then names.
 ///
-/// The daemon the task starts has the account's own environment, whatever environment the daemon
-/// this replaces was started in, so a variable of the old daemon's is compared only where it moves
-/// something the daemon keeps. Of the variables a daemon reads, the roots are its arguments, and
-/// `KR_RUNTIME_DIR` and `KR_STATE_DIR` name nothing once both are given. The ones that decide where
-/// else it keeps something are the account's home (`HOME`, else `USERPROFILE`, where an agent's tool
-/// configuration is written) and `LOCALAPPDATA`: each must be what this command has, which is
-/// what the account has, and a home that `HOME` moves away from the profile defers. The proxy
-/// variables move only where a relay check goes, `PATH` only what a capability probe finds, and
-/// `SystemRoot` and the session variables only what a reading reports; none of them changes what
-/// the daemon serves or where it keeps it. A shell package root named by the environment makes a
-/// daemon of an installed release refuse to start, so it cannot be one the update replaces.
+/// The daemon states those variables and no others, so they are the only ones that can be held to
+/// the account's. The rest of its environment (`PATH`, `APPDATA`, the proxy variables, `SystemRoot`
+/// and the session variables) is the account's in a replacement, as it is the starting command's on
+/// the other platforms, and it moves what a capability probe finds, where a relay check goes and
+/// what a session starts with, not what the daemon serves or where it keeps it. A shell package
+/// root named in the environment makes a daemon of an installed release refuse to start, so a
+/// daemon an update replaces never has one.
 #[cfg(windows)]
 fn restart_by_task(
     environment: &inventory::Environment,
@@ -2337,17 +2334,8 @@ fn restart_by_task(
              hand",
         )));
     }
-    // Spelled as the starter spells them: the verbatim prefix is not part of a place's name.
     let same = |one: &str, other: &std::path::Path| {
-        let plain = |text: &str| {
-            text.strip_prefix(r"\\?\")
-                .unwrap_or(text)
-                .trim_end_matches('\\')
-                .to_lowercase()
-        };
-        other
-            .to_str()
-            .is_some_and(|other| plain(one) == plain(other))
+        other.to_str().is_some_and(|other| same_place(one, other))
     };
     let arguments_match = matches!(
         started_as.arguments.as_slice(),
@@ -2367,29 +2355,140 @@ fn restart_by_task(
             "it was started in another directory than the environment's state directory",
         )));
     }
-    let recorded = |name: &str| {
-        started_as
-            .environment
-            .iter()
-            .find(|variable| variable.name == name)
-            .and_then(|variable| variable.value.0.as_deref())
-    };
-    let own = |name: &str| std::env::var(name).ok();
-    let profile = own("USERPROFILE");
-    let home = recorded("HOME").or_else(|| recorded("USERPROFILE"));
-    let local = recorded("LOCALAPPDATA");
-    let place_is = |recorded: Option<&str>, own: Option<&str>| {
-        recorded
-            .zip(own)
-            .is_some_and(|(recorded, own)| same(recorded, std::path::Path::new(own)))
-    };
-    if !place_is(home, profile.as_deref()) || !place_is(local, own("LOCALAPPDATA").as_deref()) {
-        return Err(deferred(Shown::said(
-            "its home or local application data directory is not the account's, so it would keep \
-             what it keeps elsewhere when the task starts it again",
+    // The task starts the replacement with the account's environment, whatever the update was run
+    // from, so what the old daemon states of the variables that decide where it keeps something is
+    // held to that and not to this command's own.
+    let account = kr_ipc::starter::account_environment().map_err(|error| {
+        deferred(shown!(
+            "the account's environment could not be read: {}",
+            Shown::io(&error)
+        ))
+    })?;
+    if let Some(name) = variable_not_the_accounts(&started_as.environment, &account) {
+        return Err(deferred(shown!(
+            "its {} is not the one the account gives a daemon, so the task would start its \
+             replacement with another",
+            name
         )));
     }
     crate::startup::task_is_this_installation_s(&environment.paths).map_err(deferred)
+}
+
+/// Whether two spellings name one place, as the starter spells them: the verbatim prefix is not part
+/// of a place's name, `/` is `\\`, a trailing separator is nothing, and capitals are not told apart.
+#[cfg(windows)]
+fn same_place(one: &str, other: &str) -> bool {
+    let plain = |text: &str| {
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(text)
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    plain(one) == plain(other)
+}
+
+/// The first of the variables a daemon states as deciding where it keeps something, `HOME`,
+/// `USERPROFILE` and `LOCALAPPDATA`, that the account does not give as the daemon has it: absent in
+/// one and present in the other, or naming another place. `account` is the account's environment
+/// with its names in capitals.
+#[cfg(windows)]
+fn variable_not_the_accounts(
+    stated: &[kr_protocol::update::PathVariable],
+    account: &std::collections::BTreeMap<String, String>,
+) -> Option<&'static str> {
+    ["HOME", "USERPROFILE", "LOCALAPPDATA"]
+        .into_iter()
+        .find(|name| {
+            let stated = stated
+                .iter()
+                .find(|variable| variable.name == *name)
+                .and_then(|variable| variable.value.0.as_deref());
+            let given = account.get(*name).map(String::as_str);
+            match (stated, given) {
+                (None, None) => false,
+                (Some(stated), Some(given)) => !same_place(stated, given),
+                _ => true,
+            }
+        })
+}
+
+#[cfg(all(test, windows))]
+mod account_tests {
+    use super::*;
+    use kr_protocol::scalars::Nullable;
+    use kr_protocol::update::PathVariable;
+    use std::collections::BTreeMap;
+
+    fn stated(pairs: &[(&str, Option<&str>)]) -> Vec<PathVariable> {
+        pairs
+            .iter()
+            .map(|(name, value)| PathVariable {
+                name: (*name).to_owned(),
+                value: Nullable(value.map(str::to_owned)),
+            })
+            .collect()
+    }
+
+    fn account(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// KR-REQ-26.10: a replacement the task starts has the account's home and application data, so
+    /// the daemon it replaces must state those: the same place however it is spelled, absent where
+    /// the account has none, and present where the account has it. A `HOME` the account sets (in its
+    /// own environment, which the task gives every program) is held to as much as a profile.
+    #[test]
+    fn a_daemon_is_held_to_the_variables_the_account_gives() {
+        let given = account(&[
+            ("USERPROFILE", r"C:\Users\kr"),
+            ("LOCALAPPDATA", r"C:\Users\kr\AppData\Local"),
+            ("HOME", r"D:\home\kr"),
+        ]);
+        let like_the_account = stated(&[
+            ("HOME", Some("D:/home/kr/")),
+            ("USERPROFILE", Some(r"\\?\c:\users\KR")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+            ("TMPDIR", None),
+        ]);
+        assert_eq!(variable_not_the_accounts(&like_the_account, &given), None);
+
+        let without_home = stated(&[
+            ("USERPROFILE", Some(r"C:\Users\kr")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+        ]);
+        assert_eq!(
+            variable_not_the_accounts(&without_home, &given),
+            Some("HOME"),
+            "an account that sets a home gives it to the replacement"
+        );
+
+        let plain = account(&[
+            ("USERPROFILE", r"C:\Users\kr"),
+            ("LOCALAPPDATA", r"C:\Users\kr\AppData\Local"),
+        ]);
+        let with_home = stated(&[
+            ("HOME", Some(r"C:\elsewhere")),
+            ("USERPROFILE", Some(r"C:\Users\kr")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+        ]);
+        assert_eq!(
+            variable_not_the_accounts(&with_home, &plain),
+            Some("HOME"),
+            "a home the account does not give is not kept by the replacement"
+        );
+        let moved = stated(&[
+            ("USERPROFILE", Some(r"C:\Users\other")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+        ]);
+        assert_eq!(
+            variable_not_the_accounts(&moved, &plain),
+            Some("USERPROFILE")
+        );
+    }
 }
 
 /// What an update an earlier run left part way came to.
@@ -2547,6 +2646,13 @@ async fn answering(store: &Store, update: &Transaction) -> std::result::Result<(
     Ok(())
 }
 
+/// How a person makes a sealed release directory removable, in the words of the platform.
+const MAKE_WRITABLE: &str = if cfg!(windows) {
+    "`icacls /reset /T` run on it"
+} else {
+    "`chmod -R u+w`"
+};
+
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
 /// for a later update, and not one a running program holds. Returns what it removed.
 fn collect(
@@ -2566,6 +2672,9 @@ fn collect(
             removed.push(release);
         }
     }
+    // What an earlier removal left because a program that holds nothing ran from the release.
+    #[cfg(windows)]
+    let _ = store.sweep_trash(update);
     removed
 }
 
