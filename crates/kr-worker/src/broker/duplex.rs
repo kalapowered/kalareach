@@ -879,7 +879,8 @@ pub enum LateClaim {
     /// The upstream has not answered. If it does, its answer comes here; if the connection ends
     /// first, nothing does.
     Waiting(tokio::sync::oneshot::Receiver<LateVerdict>),
-    /// This connection already holds as many claims as it keeps. The operation stays unknown.
+    /// The operation stays unknown: this connection already holds as many claims as it keeps, or
+    /// it holds one for this identifier already, or it has ended and reads nothing more.
     Refused,
 }
 
@@ -896,7 +897,7 @@ pub struct LateHandle {
 
 impl LateHandle {
     /// Claims the answer to this operation: what the upstream said if it has said it, else a
-    /// receiver for what it says. Each operation claims once.
+    /// receiver for what it says, or a refusal ([`LateClaim::Refused`]). Each operation claims once.
     #[must_use]
     pub fn claim(&self) -> LateClaim {
         self.outstanding.claim(&self.id)
@@ -997,7 +998,8 @@ impl Outstanding {
     /// Claims the upstream's answer to an operation that was given up on.
     ///
     /// The answer the upstream already gave is returned. Otherwise the answer is sent to the claim
-    /// when it comes. Each operation claims once.
+    /// when it comes, and a claim is refused once the connection has ended. Each operation claims
+    /// once.
     fn claim(&self, id: &UpstreamRequestId) -> LateClaim {
         let mut held = self.held();
         if held.ended {

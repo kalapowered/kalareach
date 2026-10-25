@@ -7092,10 +7092,11 @@ after the command's launching word, whatever follows it: the identifier, or the 
 application resumes the conversation by. The rule is the same for every launching word, `fork`
 included, because the package declares which words launch and the host does not know what an
 application's word means. A launch that types no such word, or an option in its place, names none.
-A name the application resolves is held for as long as the execution lives, beside the identifier
-the stream names once the application has resolved it, since a name and the identifier it resolves
-to are one conversation that the host cannot tell apart. A word that is already an identifier is
-held while the execution is in that conversation, and is free once the execution selects another.
+The word is held for as long as the execution lives, beside the identifier the stream names once
+the application has resolved it, since a name and the identifier it resolves to are one
+conversation that the host cannot tell apart. The exception is a word that the stream itself names
+as the execution's conversation, as it does an identifier: that word is held only while the
+execution is in that conversation, and is free once the execution selects another or none.
 A second launch of a held conversation is not served a second server: its program runs as typed and
 nothing of the launch is left published. The launcher prints its own reason for the refusal, and the
 host keeps the one that names the execution that holds the conversation for its own diagnostics.
@@ -7956,8 +7957,9 @@ the reply was kept. A connection keeps the sixteen newest replies that no operat
 and that includes a reply an operation's wait took in time, since the wait can end in the moment
 the reply comes: sixteen later replies of any kind push an older one out before its operation
 claims it. A connection also holds at most sixteen claims, and a claim stays until its reply comes
-or the connection ends, so after sixteen operations that get no reply, the replies that come later
-on that connection settle nothing.
+or the connection ends, so after sixteen operations that get no reply, a further operation's claim
+is refused, and a reply that comes after that operation gave up settles nothing unless it was
+kept before the claim.
 
 A binding's actions are registered from its package's declarations and from nothing else. The
 grant, the effect, the capability, the operation and the rights of each follow from its declared
