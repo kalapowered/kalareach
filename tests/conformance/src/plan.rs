@@ -2149,6 +2149,14 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-ipc",
+        target: "--test install",
+        cases: &["a_store_on_a_volume_that_is_not_ntfs_is_refused"],
+        runs: Runs::ByHand {
+            why: "it needs a volume that is not NTFS, a virtual disk formatted FAT32 that a person attaches and names in the environment",
+        },
+    },
+    IgnoredRun {
         package: "kr-hook",
         target: "--test channel",
         cases: &["record_the_approval_the_channel_relays"],

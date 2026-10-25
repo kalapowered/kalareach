@@ -565,6 +565,7 @@ async fn an_update_waits_for_a_session_its_release_does_not_retain() {
     host.install(&one);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
+    let daemon = host.daemon_process().await;
     let (display, _) = host.new_session(&host.store.stable(Program::Kr));
     let another = if PACKAGE_VERSION.major == 0 {
         PackageVersion::new(0, PACKAGE_VERSION.minor + 1, 0)
@@ -613,10 +614,9 @@ async fn an_update_waits_for_a_session_its_release_does_not_retain() {
         format!("kr-controller/{}", one.name()),
         "nothing was stopped"
     );
-    assert!(
-        host.daemons
-            .iter_mut()
-            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+    assert_eq!(
+        host.daemon_process().await,
+        daemon,
         "the daemon this test started is still the one running"
     );
     assert_eq!(host.record()["staged"], elsewhere.name().as_str());
@@ -1534,6 +1534,7 @@ async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
     host.install(&one);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
+    let daemon = host.daemon_process().await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
     two.archive(&archive);
@@ -1607,10 +1608,9 @@ async fn an_update_finds_a_daemon_that_started_after_its_first_look() {
         format!("kr-controller/{}", one.name()),
         "the daemon it prepared serves from the release still current"
     );
-    assert!(
-        host.daemons
-            .iter_mut()
-            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+    assert_eq!(
+        host.daemon_process().await,
+        daemon,
         "the daemon this test started was never stopped: the holder was found before any stop"
     );
     let record = host.record();
@@ -1632,6 +1632,7 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     host.install(&one);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
+    let daemon = host.daemon_process().await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
     two.archive(&archive);
@@ -1667,9 +1668,9 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
             "the process that holds the environment nothing answers for is named: {said}"
         );
     }
-    let daemon = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
+    let daemon_pid = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
     assert!(
-        !message.contains(&stop_command(daemon)),
+        !message.contains(&stop_command(daemon_pid)),
         "and the daemon that made way is not: {said}"
     );
     drop(hanging);
@@ -1681,10 +1682,9 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
         host.daemon_build().await,
         format!("kr-controller/{}", one.name())
     );
-    assert!(
-        host.daemons
-            .iter_mut()
-            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+    assert_eq!(
+        host.daemon_process().await,
+        daemon,
         "the daemon this test started was never stopped"
     );
     let record = host.record();
@@ -1722,6 +1722,7 @@ async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
     host.install(&one);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
+    let daemon = host.daemon_process().await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
     two.archive(&archive);
@@ -1791,10 +1792,9 @@ async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
         format!("kr-controller/{}", one.name()),
         "the daemon goes on serving"
     );
-    assert!(
-        host.daemons
-            .iter_mut()
-            .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+    assert_eq!(
+        host.daemon_process().await,
+        daemon,
         "the daemon this test started was never stopped"
     );
     let record = host.record();
@@ -2083,7 +2083,7 @@ fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
 /// The command a message names to end the process `pid` on this platform.
 fn stop_command(pid: u32) -> String {
     if cfg!(windows) {
-        format!("taskkill /PID {pid}")
+        format!("taskkill /F /PID {pid}")
     } else {
         format!("kill {pid}")
     }
@@ -10411,6 +10411,81 @@ fn the_digest_follows_what_a_store_keeps_and_not_how_it_is_written() {
         "string",
         "a property that is called description is a property, not prose"
     );
+}
+
+/// KR-REQ-26.06: a release that a program without a hold still ran from when an update removed it
+/// (the plugin host, here a program that waits) is moved out of the store and deleted as far as the
+/// program allows, and the next update deletes what is left once the program has ended.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_removal_leaves_in_the_trash_is_deleted_by_the_next_update() {
+    let system = PathBuf::from(std::env::var_os("SystemRoot").expect("a system directory"));
+    let ping = std::fs::read(system.join("System32").join("ping.exe")).expect("a program");
+    let releases: Vec<Assembled> = (1..=4)
+        .map(|sequence| {
+            let one =
+                Assembled::at_this_level(&format!("0.{sequence}.0+{}", "abcd".repeat(3)), sequence);
+            if sequence == 1 {
+                one.with_program("kr-plugin-host", &ping)
+            } else {
+                one
+            }
+        })
+        .collect();
+    let host = Host::bare();
+    host.install(&releases[0]);
+    let mut waiting = Command::new(
+        host.store
+            .release_directory(releases[0].name())
+            .join("bin")
+            .join(exe("kr-plugin-host")),
+    )
+    .args(["-n", "300", "127.0.0.1"])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .expect("a program that holds nothing runs from the first release");
+    let scratch = host.scratch("archives");
+    let update = |release: &Assembled| {
+        let archive = scratch.join(format!("{}.zip", release.name()));
+        release.archive(&archive);
+        let (output, said) = host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "kr host update: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        said
+    };
+    let left = || {
+        std::fs::read_dir(host.store.trash())
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    };
+    update(&releases[1]);
+    let said = update(&releases[2]);
+    assert_eq!(
+        said["removed"],
+        serde_json::json!([releases[0].name().as_str()]),
+        "{said}"
+    );
+    assert!(!host.store.release_directory(releases[0].name()).exists());
+    assert_eq!(
+        left(),
+        1,
+        "the program that is still running keeps the first release in the trash"
+    );
+
+    waiting.kill().expect("the program is ended");
+    waiting.wait().expect("and gone");
+    update(&releases[3]);
+    assert_eq!(left(), 0, "the next update deletes what was left");
 }
 
 /* -------------------------------------------------------------------------------------------- */
