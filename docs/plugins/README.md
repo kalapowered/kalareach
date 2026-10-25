@@ -30,18 +30,18 @@ What holds for every package, the first-party ones included:
 
 The generation compiled into the host differs from a repository's in how it arrives and not in what its packages may do. At every start the daemon seeds the catalogue from it without any action of the owner. It enrols the official repository against a root that the build trusts by key identifiers it commits, activates the generation once with expiry waived, installs each bundled package enabled with an empty grant (so the one ordinary rule it skips is that every capability past the ceiling be granted before an install, because the seed grants nothing), and serves the bundle's payloads from its own bytes. A shipped build commits no production root key yet, so it seeds nothing; a build with debug assertions seeds only when it is started with `--seed` ([Seeding](runtime.md#seeding)).
 
-Core is not free of application names. These are the places that carry them.
+Core is not free of application names. These are the places in its product code that carry them; its tests and fixtures name applications too (`fixtures/bridges/`, which holds the hook tables and the Qoder CLI launch elements the plugins repository pins the official packages to, `fixtures/plugins/released/kalareach/`, and the Codex stand-in), and a running host reads none of that.
 
 | Where | Which applications | What it does |
 | --- | --- | --- |
-| The `kr-hook` forwarder | Claude Code, Gemini CLI, Qoder CLI | Accepts an invocation named for each application. Holds a compiled table of that application's hook events and turns each into an observation (a thread started, ended or continued, a tool finished or failed, a notification), including whether a `compact` source continues a thread, which Claude Code and Qoder CLI do and Gemini CLI does not. For Claude Code it is also the Channels server itself, passing only the notifications it names and a verdict of `allow` or `deny` only for a request it relayed. It also reports a finished call of the contact skill's tool as a request for contact. The host and the worker admit it for a package that installs a native bridge only for the application its recipe declares, whatever the package's publisher and name, and for a package with no native bridge, whose launch registers the hook, only when the package's plugin name is that application's, under any publisher |
+| The `kr-hook` forwarder | Claude Code, Gemini CLI, Qoder CLI | Accepts an invocation named for each application. Holds a compiled table of that application's hook events and turns each into an observation (a thread started, ended or continued, a tool finished or failed, a notification), including whether a `compact` source continues a thread, which Claude Code and Qoder CLI do and Gemini CLI does not. For Claude Code it is also the Channels server itself, passing only the notifications it names and a verdict of `allow` or `deny` only for a request it relayed. In the report of a finished call of the contact skill's `ask_user` tool (Claude Code and Qoder CLI) it also names the request that call asked, so that the worker learns which thread the question was asked in. The host and the worker admit it for a package that installs a native bridge only for the application its recipe declares, whatever the package's publisher and name, and for a package with no native bridge, whose launch registers the hook, only when the package's plugin name is that application's, under any publisher |
 | Native bridge recipes | Claude Code, Gemini CLI | Names the registration files a recipe may install and their shapes, the forwarder command form and, for Claude Code, the one setting it may add. It names an application directory for Claude Code only (`.claude` in the account's home), so a recipe for Gemini CLI, or for any other application, is refused before anything is written (the worker's `BRIDGE_APPLICATIONS` table, which the host reads too, maps a recipe's application to the name its forwarder reports); the host applies and removes a recipe on macOS and Linux only |
 | `kr skill` and `agent_tools.install` | Codex, Claude Code, OpenCode, Gemini CLI, Kimi Code CLI, Qoder CLI | Knows where each agent keeps its skills and where its tool server is registered, from a closed list of six |
 | Command integrations | Gemini CLI | Permits one environment variable, `GEMINI_CLI_NO_RELAUNCH` set to `true`, and no other |
-| The bundled generation | The nine packages it holds | Embeds a signed generation of the official repository as files compiled into the host (today the development generation, signed with development keys), so that a host with no network can recognise and present an application once it seeds. The packages are data, held to the same ceiling as any repository's |
+| The bundled generation | The nine packages it holds | Embeds a signed generation of the official repository as files compiled into the host (today the development generation, signed with development keys), so that a host with no network can recognise an application once it seeds. The packages are data, held to the same ceiling as any repository's |
 | The host's own metrics | The eight connectors the product bundles | Counts adapter failures under a closed list of eight names, matched on the `kalareach/` publisher prefix; the failure of any other package, a vendor's package for the same application included, is not counted |
 
-None of these is read when a host matches a program to a package or grants a capability to one, and none of them lists the applications the host supports: a host admits any application whose package a repository it trusts publishes. They do decide what a package can do without a core release: a command integration can set only the one variable the contract lists, a native bridge can be applied for Claude Code only, the forwarder accepts the three names in the first row (for a native bridge, only the application its recipe declares; otherwise only from packages of those names), and the contact skill and tool server cover the six agents in the third. The Claude Code recipe needs a qualified build of Claude Code's executable in the signed index to give it a version, and no index names one yet, so the recipe is refused for want of a version until one does. Of the nine packages in the bundled generation, Codex, Kimi CLI, Kimi Code CLI, OpenCode and OpenCode attach are a manifest, a presentation document and a connector table, with no bridge and no forwarder. Qoder CLI adds a command integration and uses the forwarder. Claude Code adds a command integration and a native bridge. Gemini CLI adds a command integration and declares a native bridge that this host refuses, as the second row says. The ninth, `example-declarative`, is a manifest and a presentation document that recognise an example agent and have no connector table, no bridge and no forwarder. Each package also carries a README and fixtures.
+None of these is read when a host matches a program to a package or grants a capability to one, and none of them lists the applications the host supports: a host admits any application whose package a repository it trusts publishes. They do decide what a package can do without a core release: a package cannot add an application to the forwarder or change what any hook is read as, since the hook tables are compiled in, a command integration can set only the one variable the contract lists, a native bridge can be applied for Claude Code only, the forwarder accepts the three names in the first row (for a native bridge, only the application its recipe declares; otherwise only from packages of those names), and the contact skill and tool server cover the six agents in the third. The Claude Code recipe needs a qualified build of Claude Code's executable in the signed index to give it a version, and no index names one yet, so the recipe is refused for want of a version until one does. Of the nine packages in the bundled generation, Codex, Kimi CLI, Kimi Code CLI, OpenCode and OpenCode attach are a manifest, a presentation document and a connector table, with no bridge and no forwarder. Qoder CLI adds a command integration and uses the forwarder. Claude Code adds a command integration and a native bridge. Gemini CLI adds a command integration and declares a native bridge that this host refuses, as the second row says. The ninth, `example-declarative`, is a manifest and a presentation document that recognise an example agent and have no connector table, no bridge and no forwarder. Each package also carries a README and fixtures.
 
 ## What a package is
 
@@ -462,7 +462,7 @@ owns:
 
 | Implementation | What the broker does | Effect classes it can produce |
 | --- | --- | --- |
-| `presentation` | Redraws the package's own document | `observe` |
+| `presentation` | Answers with its receipt and does nothing else, since this host presents no package document | `observe` |
 | `component` | Runs `prepare-action` and checks the plan it returns | any |
 | `upstream_method` | Sends one routed method with the bound parameters | `upstream.prompt`, `upstream.attachment` |
 | `decision_destination` | Answers the pending request the call names, through the connector table's decision destination | `approval.respond` |
@@ -563,6 +563,12 @@ the granted decoder.
 Voice receives a separate bounded projection: which nodes it announces as status, which controls it
 offers as choices, and which nodes it refers to without reading out.
 
+This host presents no package document yet. The worker reads and drops the documents a component
+draws, no host path sends `presentation.json` to a client, and no protocol event carries a node, so
+a package's buttons and its voice projection reach nobody. The contract above is what a client
+renders once a host sends it ([the plugin runtime](runtime.md#what-a-worker-observes) says what the
+worker does with the documents).
+
 ### Controls
 
 A control carries a stable identifier and revision, a label, a standard icon, an accessible
@@ -593,12 +599,14 @@ The grammar is `always`, `never`, `not`, `all`, `any`, `capability`, `grant`, `b
 matching and no expression form: `node_present` and `pending_approval_for` compare one identifier
 exactly. Nesting is bounded at 4 levels and 8 terms per combinator.
 
-There are two reasons for the bound. The host rechecks visibility when a control is invoked, so
-evaluation has to be cheap and total. And a reviewer reads a predicate to decide whether a package
-is honest about when it appears, which is only possible if the predicate is readable.
+There are two reasons for the bound. A client evaluates a predicate each time it draws a control,
+so evaluation has to be cheap and total. And a reviewer reads a predicate to decide whether a
+package is honest about when it appears, which is only possible if the predicate is readable.
 
-Hiding a control the actor could not use is a courtesy, not a check. The host checks the right
-again at dispatch, so a predicate that lies only produces a control that then fails.
+Hiding a control the actor could not use is a courtesy, not a check. The host evaluates no
+predicate when an action is invoked. It checks the action's registration, its class's rights, the
+grant, the revision the caller saw and the resource the action names, so a predicate that lies only
+produces a control that then fails.
 
 ## The connector table
 
