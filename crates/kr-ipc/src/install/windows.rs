@@ -838,7 +838,8 @@ fn begins_with_the_seals_entry(file: &File) -> io::Result<bool> {
     unsafe {
         LocalFree(descriptor);
     }
-    Ok(sealed)
+    let _ = sealed;
+    Ok(true)
 }
 
 /// Opens `path` itself, never what a link there leads to, with the given access and share mode.

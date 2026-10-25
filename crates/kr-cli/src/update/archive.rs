@@ -345,6 +345,7 @@ fn read_tail(
         .collect();
     let named = |window: &[u8]| END_RECORDS.iter().any(|record| record == window);
     if at != directory
+        || judged.windows(4).any(named)
         || edge.windows(4).take(directory.min(3)).any(named)
     {
         return Ok(Err(NOT_A_ZIP));
