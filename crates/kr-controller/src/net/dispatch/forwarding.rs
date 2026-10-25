@@ -177,7 +177,20 @@ impl RemoteConnection {
             Ok(session_id) => self
                 .proxy_for(session_id, &asked.acting)
                 .await
-                .map_err(|error| error.to_protocol_error()),
+                .map_err(|error| match error {
+                    // A closed session has no worker to narrow its output to a grant, and this
+                    // host serves a device nothing of it.
+                    ControllerError::SessionClosed { .. }
+                        if entry.method == Method::HistoryPage =>
+                    {
+                        ProtocolError::new(
+                            ErrorCode::SessionClosed,
+                            "this host does not serve a closed session's retained output to a \
+                             paired device",
+                        )
+                    }
+                    other => other.to_protocol_error(),
+                }),
             Err(_) if entry.method == Method::ActionRead => {
                 self.receipt_owner(request, entry, &asked.acting).await
             }

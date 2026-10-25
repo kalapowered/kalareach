@@ -782,14 +782,27 @@ impl RemoteConnection {
     ) -> std::result::Result<(), ProtocolError> {
         let scope = &acting.history;
         match entry.method {
-            // The only method that returns *retained* history. Its scope is the grant's lower
-            // bound, and nothing on this path can apply one: the bound is a moment in time and a
-            // history page is a byte range. A host that cannot narrow content to a grant refuses
-            // it rather than serving more than the grant allows.
-            Method::HistoryPage => Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this host does not serve retained history to a paired device",
-            )),
+            // The only method that returns *retained* history. A page is a byte range and the
+            // grant's scope is a moment in time, so the session's worker narrows the range to the
+            // moment through the record of when each part of the output was produced, from the
+            // scope this connection forwards with the read. What is decided here is whether the
+            // grant reaches retained output at all: one that reaches none, the live screen alone,
+            // is refused by name rather than answered with a page that is empty.
+            Method::HistoryPage => {
+                let reaches = kr_worker::history_filter::HistoryFilter::new(
+                    kr_worker::history_filter::ViewerScope::from_history(scope, true),
+                )
+                .first_moment(kr_worker::history_filter::Surface::EventPage)
+                .is_some();
+                if reaches {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this device's grant does not reach the session's retained output",
+                    ))
+                }
+            }
             // These return the session's current screen and the stream that follows it, which is
             // the live view the scope either includes or does not.
             Method::EventsSubscribe | Method::EventsSnapshot | Method::SessionAttach
