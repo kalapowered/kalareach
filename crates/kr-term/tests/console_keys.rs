@@ -102,6 +102,11 @@ fn up_arrow(repeat: u16) -> KeyRecord {
 /// terminal would have sent, with the arrows in the form DEC mode 1 asks for, and a write is
 /// refused, whole, while the application has negotiated an encoding that legacy input cannot
 /// express. No scan code is sent, because none is claimed.
+///
+/// KR-REQ-08.54, the part about the legacy VT input path: what a record becomes in it is its text
+/// and nothing else, so no scan code is sent. A repeat is that many characters, a key coming up
+/// says nothing, a dead key carries no character and a surrogate pair is put back together as its
+/// character. The cases are in the fixture, by name.
 #[test]
 fn records_are_spelled_as_the_legacy_input_a_terminal_would_have_sent() {
     let document = fixture("console-legacy-input.json");
@@ -275,12 +280,13 @@ fn the_halves_of_a_character_are_kept_in_one_write() {
         Ok("\u{FFFD}a".as_bytes())
     );
 
-    // A first half at the end of a read waits, and the text before it goes. Nothing is lost: it is
-    // given back when the producer has something else to deliver.
+    // A first half at the end of a read waits, and the text before it goes. Nothing is lost: it
+    // goes out with the keys that follow, and it stays waiting through a read that has none.
     let before = typed(u16::from(b'z'), 1);
     assert_eq!(hold.take(&[before, high()]), [before]);
-    assert_eq!(hold.release(), [high()]);
-    assert!(hold.release().is_empty());
+    assert!(hold.take(&[]).is_empty());
+    let after = typed(u16::from(b'y'), 1);
+    assert_eq!(hold.take(&[after]), [high(), after]);
 
     // A second high half in a row: the first has nothing to pair with and goes out; the second
     // waits.
@@ -315,9 +321,6 @@ fn a_run_cut_anywhere_is_sent_as_the_whole_run_would_be() {
         let mut spelled = legacy_within(&sent, &ordinary(), LIMIT).expect("the first part");
         sent = hold.take(&run[cut..]);
         spelled.extend(legacy_within(&sent, &ordinary(), LIMIT).expect("the second part"));
-        // The tail that still waits is given back at the end of the input.
-        spelled
-            .extend(legacy_within(&hold.release(), &ordinary(), LIMIT).expect("what was waiting"));
         assert_eq!(spelled, whole, "cut after {cut} records");
     }
 }

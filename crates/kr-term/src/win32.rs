@@ -238,6 +238,10 @@ pub fn records_within(records: &[KeyRecord], limit: usize) -> Result<Vec<u8>, To
 /// next batch, key-ups included so that their order is kept. The next batch completes the pair, or
 /// starts something else, and then the waiting records go out as they were: a high surrogate with
 /// no low one is replaced by the translation, as it would be without any of this.
+///
+/// Only key records pass through. A producer that also reads mouse, resize and focus records hands
+/// this the keys between them and sends the rest in its own order, so a half that waits stays
+/// waiting across such a record and goes out with the keys that follow it.
 #[derive(Debug, Default)]
 pub struct PairHold {
     waiting: Vec<KeyRecord>,
@@ -265,12 +269,6 @@ impl PairHold {
             self.waiting = records.split_off(last);
         }
         records
-    }
-
-    /// Returns everything that is waiting, as it is, for a producer that has something other than
-    /// a key to deliver and so will not see the low half in order.
-    pub fn release(&mut self) -> Vec<KeyRecord> {
-        std::mem::take(&mut self.waiting)
     }
 }
 
