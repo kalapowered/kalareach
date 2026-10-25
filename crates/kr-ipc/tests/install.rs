@@ -1014,43 +1014,7 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
     std::fs::set_permissions(outside.join("shared"), permissions).expect("read-only");
     std::fs::remove_file(&program).expect("the copy goes");
     std::fs::hard_link(outside.join("shared"), &program).expect("a hard link");
-    let probe = |label: &str| {
-        let shown = std::process::Command::new("icacls")
-            .arg(outside.join("shared"))
-            .output()
-            .expect("icacls runs");
-        eprintln!(
-            "PROBE {label}: {} {:?}\n{}",
-            outside.join("shared").display(),
-            std::fs::metadata(outside.join("shared")).map(|about| {
-                use std::os::windows::fs::MetadataExt as _;
-                about.file_attributes()
-            }),
-            String::from_utf8_lossy(&shown.stdout)
-        );
-    };
-    probe("before");
-    {
-        let moved = test.root.join("probe-moved");
-        std::fs::rename(test.store.release_directory(&two), &moved).expect("moved");
-        probe("after rename");
-        kr_ipc::install::unseal_directory(&moved).expect("unseal root");
-        probe("after unseal root");
-        kr_ipc::install::unseal_directory(&moved.join("bin")).expect("unseal bin");
-        probe("after unseal bin");
-        std::fs::remove_dir_all(&moved).expect("removed");
-        probe("after remove");
-        std::fs::create_dir_all(test.store.release_directory(&two).join("bin")).expect("again");
-        std::fs::hard_link(
-            outside.join("shared"),
-            test.store.release_directory(&two).join("bin/kr.exe"),
-        )
-        .expect("again");
-        std::fs::write(test.store.manifest(&two), manifest(&two)).expect("manifest");
-    }
-    probe("before real");
     assert!(test.store.retire(&two, &update).expect("removes"));
-    probe("after");
     assert!(!test.store.release_directory(&two).exists());
     assert_eq!(
         std::fs::read(outside.join("shared")).expect("still there"),

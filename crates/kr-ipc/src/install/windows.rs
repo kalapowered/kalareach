@@ -33,12 +33,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SetSecurityInfo,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR,
+    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -502,7 +501,12 @@ const OTHERS_MAY_READ: u32 =
 const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)";
 
 /// Sets an explicit, protected access-control list, written as SDDL, on the file or directory at
-/// `path` itself, never on what a link there leads to.
+/// `path` itself, never on what a link there leads to, and on nothing else.
+///
+/// The list is set on the object alone: `SetSecurityInfo` and `SetNamedSecurityInfo` pass a
+/// changed list down to the objects inside a directory and take the entries they inherited from
+/// those that carry them, and a file inside a release can be a hard link to a file elsewhere, whose
+/// own list would be emptied by it. The kernel's call changes the one object.
 fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
     let handle = OpenOptions::new()
         .access_mode(WRITE_DAC | READ_CONTROL)
@@ -524,39 +528,19 @@ fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
     if parsed == 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut present = 0_i32;
-    let mut defaulted = 0_i32;
-    let mut list = std::ptr::null_mut();
-    // SAFETY: `descriptor` was just built, and the three outputs are live.
-    let got = unsafe {
-        GetSecurityDescriptorDacl(
+    // SAFETY: the handle is the open object's own and was opened with the right to change its
+    // list, and `descriptor` is the self-relative descriptor just built, freed after the call.
+    let set = unsafe {
+        SetKernelObjectSecurity(
+            handle.as_raw_handle(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             descriptor,
-            &raw mut present,
-            &raw mut list,
-            &raw mut defaulted,
         )
     };
-    let result = if got == 0 || present == 0 {
+    let result = if set == 0 {
         Err(io::Error::last_os_error())
     } else {
-        // SAFETY: the handle is the open object's own, and `list` points into `descriptor`, which
-        // is freed after the call.
-        let code = unsafe {
-            SetSecurityInfo(
-                handle.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                list,
-                std::ptr::null_mut(),
-            )
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(code.cast_signed()))
-        }
+        Ok(())
     };
     // SAFETY: `descriptor` was allocated by the conversion above and is freed exactly once.
     unsafe {
