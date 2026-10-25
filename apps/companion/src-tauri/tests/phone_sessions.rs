@@ -1860,6 +1860,22 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
         "STALE_SESSION",
         "no pending resource",
     );
+    refused_by_the_worker(
+        "plugin_action_invoke",
+        about(
+            "plugin_action_invoke",
+            json!({
+                "target": target,
+                "plugin_id": "kalareach.codex",
+                "action": "turn.cancel",
+                "draft_id": null,
+                "resource_id": null,
+                "parameters": "e30",
+            }),
+        ),
+        "STALE_SESSION",
+        "is not bound to",
+    );
     // A receipt the worker does not hold is the worker's own answer: the read reached it on the
     // session's link and was not refused on the way.
     let unheld = ActionId::new(kr_ipc::new_uuid()).to_string();

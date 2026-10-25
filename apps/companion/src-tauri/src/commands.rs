@@ -118,6 +118,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("agent_turn_steer", Some(Method::AgentTurnSteer)),
     ("agent_turn_cancel", Some(Method::AgentTurnCancel)),
     ("agent_approval_respond", Some(Method::AgentApprovalRespond)),
+    ("plugin_action_invoke", Some(Method::PluginActionInvoke)),
     ("session_agents", None),
     // Attention and review.
     ("attention_read", Some(Method::AttentionRead)),
@@ -271,6 +272,7 @@ pub const SESSION_BOUND_COMMANDS: &[&str] = &[
     "agent_turn_steer",
     "agent_turn_cancel",
     "agent_approval_respond",
+    "plugin_action_invoke",
     "question_read",
     "question_answer",
     "question_settle",
@@ -589,6 +591,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         agent_turn_steer,
         agent_turn_cancel,
         agent_approval_respond,
+        plugin_action_invoke,
         session_agents,
         attention_read,
         attention_acknowledge,
@@ -1617,6 +1620,12 @@ agent_mutate_command!(
     /// Answers one approval request with one of the decisions its decoder offered.
     agent_approval_respond, Method::AgentApprovalRespond,
     kr_protocol::agent::AgentApprovalRespondParams, |_| Ok(())
+);
+agent_mutate_command!(
+    /// Invokes one action a package registered for the bound agent, on the session's own worker,
+    /// which checks the action's rights against this device's grant itself.
+    plugin_action_invoke, Method::PluginActionInvoke,
+    kr_protocol::agent::PluginActionInvokeParams, |_| Ok(())
 );
 
 /// Reads a session's live agent instances and every request its broker is still arbitrating.
@@ -4176,6 +4185,7 @@ mod tests {
             agent_turn_steer,
             agent_turn_cancel,
             agent_approval_respond,
+            plugin_action_invoke,
             attention_read,
             attention_acknowledge,
             review_read,
