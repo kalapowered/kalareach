@@ -427,13 +427,18 @@ consumer verifies against.
 The managed shell packages are upstream releases with KalaReach's own patch sets, so a security
 update to one of those upstream projects is a release of ours.
 
-Each is triaged within one working day of the advisory, an advisory published from 2026-09-20 against a crate, repository or PCRE2 that the fish build compiles included, and an earlier advisory whose affected range includes what a package pins. A daily workflow reads the upstreams' advisories and fails when one has no row in the register. The package it affects is rebuilt against
-the fixed upstream release, requalified against the whole corpus under `tests/shells/`, and
-published within fourteen days of that release. No binary is
-distributed before its requalification passes, and no package is swapped into a session that is
+Each is triaged within one working day of the advisory, an advisory published from 2026-09-20 against a crate, repository or PCRE2 that the fish build compiles included, and an earlier advisory whose affected range includes what a package pins. A daily workflow reads the upstreams' advisories and fails when one has no row in the register; it
+reads none for the three git repositories in fish's lock. The package it affects is rebuilt against
+the fixed upstream release, requalified, and published within fourteen days of that release, or of
+the advisory when that came later. A requalification runs the corpus under `tests/shells/`, and
+which part runs where is set out in the register. No shell binary goes into a macOS or Linux release tree
+before its contract suites pass on the bytes that were built, and no package is swapped into a session that is
 already running: a session keeps the package identity it started with until it ends. Each target
-of a release tree runs the contract suites of the Zsh, Bash and Fish packages it built before the
-tree is assembled; the core workflow runs the whole corpus on x86-64 Linux.
+of a macOS or Linux release tree runs the contract suites of the Zsh, Bash and Fish packages it
+built before the tree is assembled; the core workflow runs the whole corpus on x86-64 Linux. A
+Windows release tree carries the PowerShell package as plain files that `kr-release` holds to the
+repository's, and no step of its workflow requalifies it. No release workflow reads the core
+workflow's result for the commit it builds.
 
 A package whose fourteen days pass without a requalified build is flagged in the register, a row of
 `docs/shell-integration/upstream.md` that no code reads, and the flag names the choices rather than
