@@ -1145,12 +1145,27 @@ impl StandingIn<'_> {
 }
 
 /// A stand-in for an agent that a session's shell started: a process that runs until the test lets go
-/// of the pipe it reads.
+/// of the pipe it reads, or on Windows until the test removes the file it watches.
 struct Agent {
     /// The identity the kernel gives its process.
     identity: kr_protocol::identity::ProcessStartIdentity,
     /// The pipe it reads, held open for as long as it should run.
+    #[cfg(unix)]
     _life: std::fs::File,
+    /// The file it watches, removed when the test lets go of the agent.
+    #[cfg(windows)]
+    _life: WatchedFile,
+}
+
+/// A file a stand-in agent watches, which is removed when this is dropped.
+#[cfg(windows)]
+struct WatchedFile(PathBuf);
+
+#[cfg(windows)]
+impl Drop for WatchedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// A host tree with a store of releases in it, and the daemons this test started.
@@ -2120,6 +2135,94 @@ impl Host {
             std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
                 .expect("executable");
         }
+        let cwd = self.tree.root().display().to_string();
+        let output = self.run(
+            kr,
+            &[
+                "new",
+                "--shell-mode",
+                "native_compat",
+                "--invisible",
+                "--headless",
+                "--cwd",
+                &cwd,
+                "--shell",
+                &shell.display().to_string(),
+                "--startup",
+                "interactive",
+                "--json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "kr new: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let created: Value = serde_json::from_slice(&output.stdout).expect("kr printed JSON");
+        let session_id = created["session_id"]
+            .as_str()
+            .expect("a session identifier")
+            .parse()
+            .expect("parses");
+        let started = Instant::now();
+        let pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the session's shell did not start its agent"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let identity = kr_ipc::identity::started_process_identity(pid).expect("the agent runs");
+        (
+            created["display_number"].to_string(),
+            session_id,
+            Agent {
+                identity,
+                _life: hold,
+            },
+        )
+    }
+
+    /// Creates a session with a release's `kr` whose root shell starts a stand-in agent, a process
+    /// of its own that outlasts anything the shell does, and then goes on as the shell.
+    ///
+    /// The agent runs while a file this test made exists, and ends when the test lets go of it,
+    /// however the test ends. Returns the session's display number and identifier, and the agent.
+    #[cfg(windows)]
+    fn new_session_with_an_agent(&self, kr: &Path, name: &str) -> (String, SessionId, Agent) {
+        let directory = self.scratch(&format!("agent-{name}"));
+        let pid_file = directory.join("pid");
+        let life = directory.join("life");
+        std::fs::write(&life, b"").expect("the file the agent watches");
+        let hold = WatchedFile(life.clone());
+        let shell_program = default_shell();
+        // A batch file that starts the agent from the shell's own tree and goes on as the shell. The
+        // worker gives a shell it does not know the arguments of a Bourne shell, which the batch
+        // file ignores.
+        let shell = directory.join("agent-shell.cmd");
+        let agent = format!(
+            "$p = Start-Process -PassThru -WindowStyle Hidden -FilePath '{shell}' \
+             -ArgumentList '-NoProfile','-Command','while (Test-Path ''{life}'') {{ Start-Sleep -Milliseconds 200 }}'; \
+             Set-Content -Path '{pid}.partial' -Value $p.Id; \
+             Move-Item -Path '{pid}.partial' -Destination '{pid}'",
+            shell = shell_program,
+            life = life.display(),
+            pid = pid_file.display()
+        );
+        std::fs::write(
+            &shell,
+            format!(
+                "@echo off\r\n\"{shell_program}\" -NoProfile -Command \"{agent}\"\r\n\
+                 \"{shell_program}\" -NoLogo -NoExit\r\n"
+            ),
+        )
+        .expect("the stand-in agent's shell");
         let cwd = self.tree.root().display().to_string();
         let output = self.run(
             kr,
