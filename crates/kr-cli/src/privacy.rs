@@ -79,8 +79,9 @@ async fn delete(
     };
     if !copy.deletable {
         return Err(CliError::Usage(shown!(
-            "this host has no way to ask for the removal of that copy; kr privacy status says \
-             which it can"
+            "this host cannot ask for the removal of that copy ({}); kr privacy status says which \
+             it can",
+            Asked::text(Request::Privacy, &copy.kind)
         )));
     }
     let summary = delete_summary(copy);

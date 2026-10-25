@@ -562,7 +562,8 @@ impl Disk {
 /// not at each place that makes one: [`QuietStorage`] and [`QuietManifest`] refuse to send while a
 /// delay is owed, with a refusal that carries what is left of it, and record every delay an answer
 /// names as it arrives. Cleanup under a privacy fence is the one exception, because ending work in
-/// flight must not wait out a delay.
+/// flight must not wait out a delay. A deletion the person asked for is not cleanup, and waits out a
+/// delay under a fence as it does without one.
 #[derive(Clone)]
 struct Gate {
     quiet: Arc<Quiet>,
@@ -570,15 +571,17 @@ struct Gate {
 }
 
 impl Gate {
-    /// Whether a request may leave now.
-    async fn open(&self) -> kr_client::Result<()> {
+    /// Whether a request may leave now. A request that ends work in flight (`ending_work`) may
+    /// under a privacy fence, whatever the service asked; no other request does.
+    async fn open(&self, ending_work: bool) -> kr_client::Result<()> {
         let Some(left) = self.quiet.left() else {
             return Ok(());
         };
-        let fenced = self
-            .disk
-            .run(|backup| backup.privacy_status())
-            .is_ok_and(|privacy| privacy.inhibited_at().is_some());
+        let fenced = ending_work
+            && self
+                .disk
+                .run(|backup| backup.privacy_status())
+                .is_ok_and(|privacy| privacy.inhibited_at().is_some());
         if fenced {
             return Ok(());
         }
@@ -602,12 +605,30 @@ impl Gate {
         }
     }
 
-    /// Sends `request` if a request may leave, and remembers what the service answers.
+    /// Sends `request` if a request may leave, and remembers what the service answers. Under a
+    /// privacy fence it leaves whatever delay the service asked for.
     async fn through<'a, T>(
         &self,
         request: impl FnOnce() -> ServiceFuture<'a, T>,
     ) -> kr_client::Result<T> {
-        self.open().await?;
+        self.sent(true, request).await
+    }
+
+    /// As [`Self::through`], for a request that does not end work in flight: it waits out the
+    /// service's delay under a privacy fence too.
+    async fn through_waiting_out_the_delay<'a, T>(
+        &self,
+        request: impl FnOnce() -> ServiceFuture<'a, T>,
+    ) -> kr_client::Result<T> {
+        self.sent(false, request).await
+    }
+
+    async fn sent<'a, T>(
+        &self,
+        ending_work: bool,
+        request: impl FnOnce() -> ServiceFuture<'a, T>,
+    ) -> kr_client::Result<T> {
+        self.open(ending_work).await?;
         let answer = request().await;
         if let Err(error) = &answer {
             self.note(error);
@@ -699,8 +720,9 @@ impl StorageService for QuietStorage {
         object_id: BackupObjectId,
     ) -> ServiceFuture<'_, kr_client::services::ObjectDeleted> {
         Box::pin(
-            self.gate
-                .through(move || self.inner.delete_object(archive_id, object_id)),
+            self.gate.through_waiting_out_the_delay(move || {
+                self.inner.delete_object(archive_id, object_id)
+            }),
         )
     }
 }
@@ -734,7 +756,7 @@ impl BackupManifestService for QuietManifest {
         Box::pin(async move {
             // A request that was not sent is not a request that may have left: it is not a
             // publication to ask the service about afterwards.
-            if let Err(error) = self.gate.open().await {
+            if let Err(error) = self.gate.open(true).await {
                 return Ok(Dispatched::NotSent(error));
             }
             let answer = self.inner.publish_dispatched(publication).await;
@@ -2188,7 +2210,7 @@ impl Uploader {
                 object.object_id,
                 now,
             ),
-            Basis::Person => backup.store().confirm_asked_deletion(
+            Basis::Person => backup.confirm_asked_deletion(
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,

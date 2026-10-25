@@ -1056,18 +1056,28 @@ impl BackupService {
     /// request writes nothing new. Returns how many objects of the generation the service has not
     /// yet confirmed deleted.
     ///
+    /// `admitted` holds the caller's registration standing for the write. It is taken inside the
+    /// hold of the store, the order a privacy change takes the two in, so that neither can wait
+    /// for the other: a caller never holds the registration while it waits for the store.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::Refused`] when the store refuses the deletion, and
-    /// [`ControllerError::RegistryUnavailable`] when it cannot be read or written.
+    /// Returns [`ControllerError::Refused`] when the store refuses the deletion, `admitted`'s own
+    /// refusal when the registration does not stand, and [`ControllerError::RegistryUnavailable`]
+    /// when the store cannot be read or written.
     pub fn ask_deletion(
         &self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         now_ms: TimestampMs,
+        admitted: crate::privacy::Admitted<'_>,
     ) -> Result<u64> {
         let mut store = self.store();
-        let unconfirmed = store.ask_generation_deletion(archive_id, backup_generation, now_ms)?;
+        let mut unconfirmed = 0;
+        admitted(&mut || {
+            unconfirmed = store.ask_generation_deletion(archive_id, backup_generation, now_ms)?;
+            Ok(())
+        })?;
         let asked: Vec<BackupObjectId> = store
             .objects(archive_id, backup_generation)?
             .into_iter()
@@ -1084,6 +1094,58 @@ impl BackupService {
                     .map(|object_id| (archive_id, backup_generation, *object_id)),
             );
         Ok(unconfirmed)
+    }
+
+    /// Why the person may not ask the service to delete a generation now, or nothing when they may.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn deletion_refusal(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+    ) -> Result<Option<String>> {
+        self.store().deletion_refusal(archive_id, backup_generation)
+    }
+
+    /// Decides again, before its request leaves, a deletion written down for the person: the
+    /// standing it was asked under must still hold ([`BackupStore::confirm_asked_deletion`]), and
+    /// while privacy mode is on the object must be one the person has just asked for.
+    ///
+    /// The fence is read in the same hold of the store as the standing, so a request is not
+    /// confirmed after privacy mode came on unless the person is the one who asked: a deletion this
+    /// host decided on for itself and wrote down before is not the person's, and waits for privacy
+    /// mode to be off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the standing no longer holds or privacy mode is
+    /// on and the person did not just ask, [`ControllerError::InvalidArgument`] when no deletion of
+    /// that object is written down, and [`ControllerError::RegistryUnavailable`] when the store
+    /// cannot be read.
+    pub fn confirm_asked_deletion(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+    ) -> Result<()> {
+        let store = self.store();
+        if store.privacy_status()?.inhibited_at().is_some()
+            && !self
+                .authorised
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&(archive_id, backup_generation, object_id))
+        {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "privacy mode is on, and only a deletion the person has just asked for is \
+                         sent while it is"
+                    .to_owned(),
+            });
+        }
+        store.confirm_asked_deletion(archive_id, backup_generation, object_id)
     }
 
     /// The objects the person has just asked to have deleted, which the carrier sends under a
@@ -2273,5 +2335,38 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
             )
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(listed.into_iter().flatten().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// A deletion the person asks for is admitted inside the hold of the store, the order a change
+    /// of privacy mode takes the two in. The registration taken first and the store after would
+    /// let a change that holds the store wait for the registration the deletion holds, and the
+    /// deletion wait for the store.
+    #[test]
+    fn a_deletion_is_admitted_inside_the_hold_of_the_store() {
+        let root = tempfile::tempdir().expect("a disposable directory");
+        let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+        let admitted_with_the_store_held = Cell::new(None);
+        // A host with no setup refuses the deletion in the write; the admission is asked for first.
+        let _ = service.ask_deletion(
+            ArchiveId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            BackupGeneration::new(1),
+            TimestampMs::new(1),
+            &|write| {
+                admitted_with_the_store_held.set(Some(service.store.try_lock().is_err()));
+                write()
+            },
+        );
+        assert_eq!(
+            admitted_with_the_store_held.get(),
+            Some(true),
+            "the registration is taken while the store is held"
+        );
     }
 }

@@ -1963,40 +1963,63 @@ impl crate::service::Controller {
         let refused = |why: &str| ControllerError::PermissionDenied {
             detail: format!("this host cannot ask for the removal of that copy: {why}"),
         };
-        if !copy.deletable {
-            return Err(refused(&copy.kind));
-        }
         let Some((archive, generation)) = backup_generation_of(&copy.reference) else {
-            return Err(refused("it is not a backup generation"));
+            return Err(refused(if copy.deletable {
+                "it is not a backup generation"
+            } else {
+                &copy.kind
+            }));
         };
+        if !copy.deletable {
+            // The store's own reason, when it has one, and the copy's kind otherwise.
+            let controller = Arc::clone(self);
+            let why = tokio::task::spawn_blocking(move || {
+                controller.backup().deletion_refusal(archive, generation)
+            })
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .flatten();
+            return Err(refused(why.as_deref().unwrap_or(&copy.kind)));
+        }
         let Some(runtime) = self.backup_runtime() else {
             return Err(ControllerError::NotConfigured(format!(
-                "{} in this host's configuration document ({}) selects no storage service, so                  there is nothing to ask for a deletion",
+                "{} in this host's configuration document ({}) selects no storage service, so \
+                 there is nothing to ask for a deletion",
                 kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
                 kr_protocol::hostinfo::configuration::FILE_NAME,
             )));
         };
         let controller = Arc::clone(self);
         let now_ms = kr_ipc::now_ms();
+        // The registration is taken inside the hold of the backup store, as a privacy change takes
+        // the two: the other order would let this call and a change of privacy mode each wait for
+        // what the other holds.
         tokio::task::spawn_blocking(move || {
-            controller.under_registration(&carried, || {
-                controller
-                    .backup()
-                    .ask_deletion(archive, generation, now_ms)
-            })
+            controller
+                .backup()
+                .ask_deletion(archive, generation, now_ms, &|write| {
+                    controller.under_registration(&carried, write)?
+                })
         })
         .await
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the deletion stopped before it could say what it did".to_owned(),
-        })???;
+        })??;
         // A service that is slow to answer, or one that asked to be left alone, leaves the rest
         // asked and shown as such; the person is told so and the carrier goes on.
         let _ = tokio::time::timeout(RETAINED_DELETE_WAIT, runtime.carry_now()).await;
-        let confirmed = self
-            .backup()
-            .objects(archive, generation)?
-            .iter()
-            .all(|object| object.released_at_ms.is_some());
+        let controller = Arc::clone(self);
+        let confirmed = tokio::task::spawn_blocking(move || {
+            controller
+                .backup()
+                .objects(archive, generation)
+                .map(|objects| objects.iter().all(|object| object.released_at_ms.is_some()))
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the deletion stopped before it could say what it did".to_owned(),
+        })??;
         let report = self.current_privacy_report().await?;
         kr_protocol::envelope::ParamsValue::from_typed(
             &kr_protocol::privacy::PrivacyRetainedDeleteResult {
