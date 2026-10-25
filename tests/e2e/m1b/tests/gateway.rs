@@ -1222,8 +1222,8 @@ fn server_besides(
         if let Some(identity) = kr_e2e_m1b::run::processes_under(ctx.run.root())
             .unwrap_or_default()
             .into_iter()
-            .find_map(|(pid, _)| ctx.run.record_named(pid, what, &["app-server"]))
-            .filter(|identity| !known.contains(&identity))
+            .filter_map(|(pid, _)| ctx.run.record_named(pid, what, &["app-server"]))
+            .find(|identity| !known.contains(&identity))
         {
             return identity;
         }
