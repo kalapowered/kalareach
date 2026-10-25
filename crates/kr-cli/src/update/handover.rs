@@ -339,6 +339,14 @@ pub async fn writers_lock(
     }
 }
 
+/// The command that ends a process on this platform, for a message that tells a person how to stop
+/// a daemon that does not answer; the process identifier follows it.
+const STOP_COMMAND: &str = if cfg!(windows) {
+    "taskkill /PID"
+} else {
+    "kill"
+};
+
 /// The refusal `error`, a wait for the store's install lock that ran out, with the process that holds
 /// each of `environments`, which are those no daemon answered for, added where one does: a daemon
 /// that hangs in its start holds the install lock and its environment, and is the person's to stop.
@@ -353,10 +361,11 @@ pub fn naming_holders(error: CliError, environments: &[&Environment]) -> CliErro
             .flatten()
         {
             said = shown!(
-                "{}; the control daemon of environment {} is process {}, and `kill {}` stops it",
+                "{}; the control daemon of environment {} is process {}, and `{} {}` stops it",
                 said,
                 environment.environment_id,
                 pid,
+                STOP_COMMAND,
                 pid
             );
         }
@@ -515,7 +524,12 @@ pub async fn hold(
             }
             Err(kr_controller::ControllerError::AlreadyRunning { .. }) => {
                 let holder = match SingletonLock::holder(&path).ok().flatten() {
-                    Some(pid) => shown!("; it is process {}, and `kill {}` stops it", pid, pid),
+                    Some(pid) => shown!(
+                        "; it is process {}, and `{} {}` stops it",
+                        pid,
+                        STOP_COMMAND,
+                        pid
+                    ),
                     None => Shown::said(""),
                 };
                 return Err(CliError::UpdateDeferred(shown!(
@@ -631,11 +645,12 @@ pub(super) fn holder_said(
         ),
         Some((Some(pid), Some(answers_as))) => shown!(
             "the control daemon of environment {} (process {}) answers as {}, not as a daemon of \
-             {}; stop it with `kill {}` and run {} again",
+             {}; stop it with `{} {}` and run {} again",
             environment_id,
             pid,
             crate::shown::build_name(answers_as),
             crate::shown::release(expected),
+            STOP_COMMAND,
             pid,
             super::RUN_AGAIN
         ),
@@ -649,9 +664,10 @@ pub(super) fn holder_said(
         ),
         Some((Some(pid), None)) => shown!(
             "the control daemon of environment {} (process {}) is still running and does not \
-             answer; stop it with `kill {}` and run {} again",
+             answer; stop it with `{} {}` and run {} again",
             environment_id,
             pid,
+            STOP_COMMAND,
             pid,
             super::RUN_AGAIN
         ),
