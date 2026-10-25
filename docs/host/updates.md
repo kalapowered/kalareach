@@ -14,11 +14,12 @@ Each user has one store of releases:
 | --- | --- |
 | macOS | `~/Library/Application Support/KalaReach/host` |
 | Linux | `$XDG_DATA_HOME/kalareach/host`, `~/.local/share/kalareach/host` by default |
+| Windows | `%LOCALAPPDATA%\KalaReach\host`, on an NTFS volume (see "Windows") |
 
 | Path | What it is |
 | --- | --- |
 | `versions/<release>/` | One release: `bin/`, `shells/`, `share/` and `release.json`, read-only once it is there |
-| `current` | A relative symbolic link to the release new processes start from |
+| `current` | A relative symbolic link to the release new processes start from; on Windows a directory junction to its directory |
 | `staging/` | A release being unpacked and checked before it is renamed into `versions/` |
 | `trash/` | A release being removed, moved out of `versions/` before anything of it is deleted |
 | `roots/` | The runtime and state roots each control daemon of the store has served, those a command of the store has worked in, and the configuration documents either has read or written |
@@ -151,8 +152,9 @@ file, and the package manager's next release is admitted again by the first comm
 the same rules. Removing the prefix leaves `versions/` as it is. `kr --help`, `kr --version`
 and a mistake in the arguments read nothing of the host and admit nothing, and neither does a `kr`
 of the store, an unpacked release that no package manager keeps (which `kr host install` installs
-on request) or a build outside a release. The store keeps no release on Windows, so none of this
-applies there.
+on request) or a build outside a release. A Windows host admits nothing from a package manager's
+directory: the winget package's `kr` runs from the directory winget unpacked the release in, and
+`kr host install` puts a release into the store when a person asks for it.
 
 ## Updating
 
@@ -461,7 +463,7 @@ To move forward again, give `kr host update --archive` an archive of a newer rel
 
 When a host is rolled back, the control daemon of the release the host is rolled back to is started with the arguments of the control daemon it replaces and the variables that decided its paths, or, where its document chooses the service start, by the service manager from the definition that was created when `kr host startup` was run. If for some reason it cannot be started, the rollback is still recorded, and `kr host update --archive` of the release that is now current will check the archive and then try to start it. (`kr host rollback` after that, however, will not try; it asks. Where no earlier failed update is recorded, the release it would take by default is the one the rollback left, which is not older than the current one, so it needs `--to` to go further back. See "Rolling back from an update whose daemon did not start".) It can also be started manually, by running it with whatever arguments it needs. (The service definition that `kr host startup` created runs the control daemon through `current`, so it always runs the control daemon of the release to which the host is switched.)
 
-When `kr host update --check` is run, the stores will not be checked. But if a store is listed in a way this version of `kr` doesn’t know, the store will still be refused and a release without a store in its manifest cannot be rolled back to. Stores that are mentioned in the manifest of the release the host will be rolled back to but that are not present on the host, and environments that can’t be reached, will not be checked. A `kr` command that writes a stored record between the check and the switch is held off by the writers' lock (see "The writers' lock"). The registry stores session create requests, closure records and the configuration it accepted, and most changes to those raise the version of the registry, so a rollback across such a release is refused. On Windows, `kr host rollback` says what `kr host update` says: that the host keeps no store of releases.
+When `kr host update --check` is run, the stores will not be checked. But if a store is listed in a way this version of `kr` doesn’t know, the store will still be refused and a release without a store in its manifest cannot be rolled back to. Stores that are mentioned in the manifest of the release the host will be rolled back to but that are not present on the host, and environments that can’t be reached, will not be checked. A `kr` command that writes a stored record between the check and the switch is held off by the writers' lock (see "The writers' lock"). The registry stores session create requests, closure records and the configuration it accepted, and most changes to those raise the version of the registry, so a rollback across such a release is refused. On Windows the stores are checked as on every platform.
 
 ## Stored formats
 
@@ -515,9 +517,126 @@ Note that this does not check the lock against the one on the main branch, so if
 
 ## Windows
 
-A Windows host keeps no store: a directory link there cannot be replaced in one step by a user who
-does not administer the machine. Its installer replaces the release, and `kr host install`,
-`kr host update`, `kr host rollback` and `kr host versions` say so. With no store there is no
-writers' lock to take and no release to read it from, so the lock never holds a command off or
-refuses it there. A record's own format check still applies, and an older release installed again
-reads a record a newer one wrote as it does today.
+A Windows host keeps a store and installs, updates and rolls back as the rest of this page
+describes. These are the differences.
+
+### The store
+
+The store is `%LOCALAPPDATA%\KalaReach\host`, with backslashes for the slashes in the tables above.
+It has to be on an NTFS volume: `kr host install` and `kr host update` refuse a store anywhere
+else and name it. A release archive is a `.zip`, `kalareach-<target>-<release>.zip`, with the same
+top directory and the same `release.json` as the other platforms' archive.
+
+### The current link
+
+`current` is a directory junction, which any account can make. An update replaces it by renaming a
+new junction over it with `SetFileInformationByHandle`, the `FileRenameInfoEx` class, and the flags
+that replace an existing name and give the rename POSIX semantics. Microsoft documents
+`FileRenameInformationEx` from Windows 10, version 1709 (OS build 16299), which makes that the
+oldest Windows a store runs on. The swap is one step, so a program that reads `current` at any
+moment finds a whole release.
+
+A junction names an absolute path. A store that is moved or copied has a `current` that still
+names the place it was made for, and `kr` refuses it as naming something other than a release of
+this store. A Windows store is not moved: install again where it should be.
+
+### Which release a process runs
+
+A program finds its release from the system's record of its own image, never from the path it
+was started through. The hold is the open `release.json`. The file is opened for reading with a
+share mode that lets others read it and nothing more, and while it is open neither the file nor
+any directory above it can be renamed or deleted. Whether a release is held is asked by opening the
+file with no sharing at all, which a holder refuses; a program that starts at that moment waits out
+the question, for at most the thirty seconds a start waits for a removal.
+
+A running image does not hold its directory on Windows, so only the manifest does. A program whose
+release was renamed away reads its image under `trash\` and does not start. A program whose working
+directory is inside a release stops that release being renamed out of `versions\`: the update keeps
+the release, as it keeps a held one, and removes it at a later update. The plugin host and the
+description process take no hold. A release they run from is renamed into `trash\` and deleted as far
+as the running image allows; what is left stays in `trash\`, is never started, and is deleted by the
+next update.
+
+### Sealing a release
+
+Each file of a release is read-only by attribute. Each file and directory also carries an entry
+that denies its owner the rights that write it (adding a file or a subdirectory, writing,
+appending, deleting, deleting a child), because the read-only attribute of a directory does not stop
+new names. A release is removed by renaming it out of `versions\`, resetting those entries and
+deleting the tree. The deletion follows no junction and changes no file by its path: a file of the
+release that is a second name for a file outside it is deleted as a name, and the file outside
+keeps its attribute and its entries.
+
+### The archive
+
+The archive is read before any signature is checked, so it is held to bounds first and nothing is
+written until every entry has been looked at: at most 50,000 entries, 8 GiB in all and 2 GiB for one
+file. An archive is refused whole when it has an entry that is a link or a device, that is encrypted
+or compressed in a way a release is not, or that is named twice, or whose name Windows would read as
+another (an absolute, drive or UNC path, a `..`, a device name such as `CON`, an alternate data
+stream, a trailing dot or space, or two names that differ only in case). A file is read for no more
+than its entry says it holds. Every member is then held to the manifest, as for any archive.
+
+### Starting a daemon again
+
+A Windows control daemon is created by the environment's scheduled task and by nothing else. The
+task runs `current\bin\kr-controller.exe --starter`, so it finds the release `current` names, and
+`kr host startup --set standalone` registers it. An update never changes it.
+
+An update records every daemon as started again by the service, which on Windows means that task,
+and stops none until it has checked that the task starts each one again as it is. The update waits
+with exit 9, before it stops anything, and names the one that fails, unless all of these hold:
+
+- the configuration document the daemon read chooses the standalone start;
+- the daemon was started with the environment's two roots as its arguments and no other
+  (`--secret-store file`, `--worker` and `--own-session` each make it another daemon), in the
+  environment's state directory;
+- its home (`HOME`, else `USERPROFILE`) and its `LOCALAPPDATA` are the account's own, which is what
+  the task gives a daemon, so a daemon started by hand with another home is not replaced by one that
+  keeps an agent's tool configuration somewhere else;
+- the task is the one this installation registers and runs `current`'s daemon. A missing task, a
+  stale one and one that belongs to another environment each defer, and the message names
+  `kr host startup --set standalone`, which registers or repairs it.
+
+No other variable a daemon reads changes what it serves or where it keeps it. A proxy variable moves
+where a relay check goes, `PATH` what a capability probe finds, and `SystemRoot` and the session
+variables what a reading reports. `KR_SHELL_PACKAGES` makes a daemon of an installed release refuse
+to start, so a daemon the update replaces never has it.
+
+A task that does not start the new release's daemon leaves the update recorded as owing it, as on
+the other platforms, and `kr host rollback` or an update to a release without the fault goes on from
+there. For a daemon that does not answer, the message gives `taskkill /PID <pid>`.
+
+### The first install over a build run in place
+
+A host that ran as a build in some directory has a task that names that build's daemon, and may
+have that daemon running. `kr host install` leaves the task alone. The store's `kr` finds the task
+is not this installation's, says so and names `kr host startup --set standalone`. Once the task is
+repaired, a daemon of the old build refuses to launch workers for a task that is not its own, so
+the order is: stop the old daemon, install, repair the task.
+
+### A session that runs the release before
+
+`kr attach`, `kr detach` and `kr agent-tools --stdio` hand over to the `kr` of the worker's release.
+Windows cannot replace a process by another, so the first `kr` starts the other as a child, keeps
+that release held, and ignores console control events while the child runs, so that Ctrl+C reaches
+only the program the person sees. It exits with the child's status. The child takes a hold of its
+own on starting. If the first `kr` is ended before the child has done so and the release is then
+removed, the child finds its release gone and does not run. On the other platforms the hold passes
+to the replacing process unbroken.
+
+### The launch exchange
+
+A daemon asks the environment's task for each worker it needs, and the task's starter creates
+it. The exchange has a protocol number, and the daemon refuses a starter that speaks another,
+naming both numbers. The starter belongs to the release `current` names and the daemon to the
+release it started from. A daemon that outlives a switch, in an environment the update could not
+reach, therefore keeps working only while the exchange changes by additions. A change that is not an
+addition raises the number.
+
+### What a Windows host does not do yet
+
+The forwarder hand-off to the forwarder of an older release and the gateway are not there on a
+Windows daemon. A package manager's release is not
+admitted into the store from the package manager's directory; `kr host install` puts a release into
+the store when a person asks.
