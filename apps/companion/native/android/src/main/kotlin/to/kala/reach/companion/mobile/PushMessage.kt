@@ -78,3 +78,55 @@ fun planNotification(delivery: PushMessage.Delivery, decision: PreviewDecision):
         is PreviewDecision.Generic ->
             NotificationPlan(delivery.collapseId, delivery.alert, decision.reason.wireName)
     }
+
+/** The data key that carries the sealed preview. */
+const val PREVIEW_KEY = "preview"
+
+/** How a notification is posted. */
+enum class Posting {
+    /** The first post of a delivery: it may sound. */
+    NEW,
+
+    /** A post that an earlier try of the same delivery may have made already: it does not sound again. */
+    REPEAT,
+
+    /**
+     * The opened preview, over the alert already up: it does not sound, and it is not posted when
+     * that alert has gone, as the person tapped or dismissed it.
+     */
+    REPLACEMENT
+}
+
+/**
+ * Shows one delivery, with the alert the message carries up before anything is opened.
+ *
+ * Opening a sealed preview runs native code in a process the system may end in the middle of it (a
+ * library that aborts, the memory limit, a kill), and a notification posted only after that returns
+ * would then never be posted: the person would get nothing, not even the generic alert. So the
+ * alert goes up first, and a preview that opens replaces it in place, under the same tag and
+ * without a second sound. A message with no sealed preview has nothing to open and is shown once.
+ *
+ * `decide` is the decision about the preview. `show` posts a plan the way it is told. `repeated`
+ * says an earlier try of this delivery may already have posted its alert, so that this try's first
+ * post does not sound again. Returns the plan the delivery ended with.
+ */
+fun showDelivery(
+    delivery: PushMessage.Delivery,
+    repeated: Boolean = false,
+    decide: () -> PreviewDecision,
+    show: (plan: NotificationPlan, posting: Posting) -> Unit
+): NotificationPlan {
+    val first = if (repeated) Posting.REPEAT else Posting.NEW
+    val opens = PREVIEW_KEY in delivery.data
+    if (opens) {
+        show(NotificationPlan(delivery.collapseId, delivery.alert, reason = "opening"), first)
+    }
+    val decision = decide()
+    val plan = planNotification(delivery, decision)
+    when {
+        !opens -> show(plan, first)
+        // The alert is already up, and a preview that stayed closed says nothing more.
+        decision is PreviewDecision.Reveal -> show(plan, Posting.REPLACEMENT)
+    }
+    return plan
+}
