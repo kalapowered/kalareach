@@ -125,8 +125,13 @@ session that boot made as one of an earlier boot. A session whose worker the ker
 is never closed as the host's restart. A session of an earlier boot that another recovery holds, or
 whose stores could not be taken safely, is left as it is; the daemon remembers it for as long as it
 runs and closes it as the host's restart when its dead worker is next found gone. A daemon that
-starts again first finds the worker gone like any other, and the closure gives the reason for that
-(`worker_crash`, or `desktop_lost` for a desktop-bound worker whose desktop has ended).
+starts again has forgotten the session and finds the worker gone like any other, but the worker's
+own record of its processes names the boot it ran in, and a record of an earlier boot gives the same
+closure: the host's restart, with nothing listed as surviving. Where that record cannot be read (the
+worker's endpoint could not be removed, so its stores are not opened; the worker recorded no
+processes; its journal cannot be read; the record names no boot or one this host cannot compare with
+its own), the closure gives the reason for a worker found gone (`worker_crash`, or `desktop_lost`
+for a desktop-bound worker whose desktop has ended).
 
 ## Containers and Windows Subsystem for Linux
 
