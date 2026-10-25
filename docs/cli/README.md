@@ -32,6 +32,7 @@ worker directly for what a session owns.
 | `kr host versions` | — | The releases this host keeps, and which one is current |
 | `kr host machine [join/merge/split/plan/finish/undo]` | — | Show the machine group an environment records for itself, take one owner-approved step that changes it, or keep a merge over several environments as a plan |
 | `kr host clock --establish` | — | Trust this host's clock again, as its owner |
+| `kr host policy --confirm` | — | Confirm, as the person at this machine, the policy this host holds after it found that policy restored from an earlier state |
 | `kr bridge --stdio` | — | Serve this environment to a local process bridge on standard input and output |
 | `kr bridge [list/enrol/forget/refresh]` | — | The environments this host has enrolled, and what it last saw of them |
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
@@ -1440,6 +1441,12 @@ is not isolation from other code running under the same account, which can do an
 If the host does not have an owner, the confirmation happens on the host's own terminal. The `kr` program will show the time, ask the user to type `clock`, and then use a newly-generated key to answer a challenge from the host on the `local_bootstrap_terminal` channel. In this case, the program will ensure that standard input and standard output are terminals, that the controlling terminal can be opened, and that the program is not running in a KalaReach session, as it does when taking a host's first owner. Otherwise, `kr` will wait for the confirmation to happen on one of the owner's devices, as it does for `kr pair invite`. If that host is not on the network, the command will refuse at once, because no owner device can reach it.
 
 This command spends a confirmation once, and it ends the distrust of the clock, the holds that follow from it and a lost clock continuity together or not at all, but it will not cause an object that has already expired to become unexpired. An owner's device refuses a challenge that has already expired by its own clock, so a host whose clock is more than two minutes behind the device's cannot be confirmed from it: correct the host's clock first, then confirm it. With the `--json` option, the command prints the ID of the confirmation that was spent.
+
+## `kr host policy`
+
+`kr host policy --confirm` ends the wait that a restored policy puts on every remote grant. A host that finds its authority feed holding a revision above its registry's knows the registry was put back to an earlier state. It carries out again what the feed shows completed, and then refuses every grant but the owner's at this machine, owner devices included, until the person at this machine confirms the policy it holds: the enrolments, the exclusive management and the bounds the restored state brought back. `kr doctor` shows the wait as `restored-policy`.
+
+The command prints what `kr organisation list` prints and then confirms the policy as it stands. It changes none of it, so end what you do not want in force first, with `kr organisation withdraw` and `kr device revoke`, which need no confirmation and work while the wait stands. Ending exclusive management takes an owner device's confirmation, which the wait refuses, so that comes after this command. It takes no owner device's confirmation, since the wait refuses every owner device. It is refused while the host is still catching up with its feed, and on a host that was waiting for nothing it says so and changes nothing. With `--json` it prints `lifted`, true when the call ended a wait. A record of the restore that cannot be read is removed by the confirmation.
 
 ## `kr project`
 
