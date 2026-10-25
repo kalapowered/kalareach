@@ -182,6 +182,23 @@ pub(crate) fn root_role_keys(root: &[u8]) -> Option<RoleKeys> {
     )
 }
 
+/// Whether `newer` is a root that `older`'s own keys signed over: a later version whose
+/// signatures carry a threshold of the keys `older` names for its root role.
+///
+/// That is how a client follows a rotation, so a root for which this holds belongs to the lineage
+/// of `older`, with no record of the rotation kept. It reaches one step only: a root two rotations
+/// on was signed by the root between, which is not held here. Either root that cannot be read is
+/// not in a lineage with anything.
+pub(crate) fn root_descends_from(older: &[u8], newer: &[u8]) -> bool {
+    let read = |bytes: &[u8]| {
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(bytes).ok()
+    };
+    let (Some(older), Some(newer)) = (read(older), read(newer)) else {
+        return false;
+    };
+    newer.signed.version > older.signed.version && older.signed.verify_role(&newer).is_ok()
+}
+
 /// Checks that no role of `root` names one key under two identifiers and that no two roles name
 /// the same key.
 ///
