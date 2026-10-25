@@ -21687,11 +21687,6 @@
           "type": "string"
         },
         {
-          "const": "signed_authority_object",
-          "description": "A payload that bears authority.\n\nNo reader of a mailbox takes authority from one: a host and a device take theirs from their\nown records and the authority feed, so an item of this kind is refused whoever sealed it.\nNothing produces one.\n\nThe variant stays while the release before reads the delivery store at a version that\nkeeps it: removing it changes what `SealedEnvelope` reaches, which moves the delivery\nstore's version, and that store is read through at version 11 and written at 10. It goes,\nwith [`Self::bears_authority`], in the release that writes version 11, once the release\nthat read it ahead is the one retained.",
-          "type": "string"
-        },
-        {
           "const": "notification_preview",
           "description": "An encrypted notification preview.",
           "type": "string"

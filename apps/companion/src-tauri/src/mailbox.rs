@@ -11,10 +11,10 @@
 //!
 //! The rules are the shared reader's ([`kr_client::mailbox_reader`]): an item opens only against
 //! the stored-envelope key of a host this computer is paired with, the routing record outside it
-//! is untrusted and must match the box, an identifier accepted before is refused, and a payload
-//! that bears authority is refused whoever sealed it. An item that opens is written down, and an
-//! announcement that a feed changed is counted; nothing else is done with it: the mailbox carries
-//! no keystroke, command, decision or closure, and nothing read from it executes anything.
+//! is untrusted and must match the box, and an identifier accepted before is refused. An item that
+//! opens is written down, and an announcement that a feed changed is counted; nothing else is done
+//! with it: the mailbox carries no keystroke, command, decision or closure, and nothing read from
+//! it executes anything.
 //!
 //! # What is kept, and where
 //!

@@ -302,9 +302,9 @@ device has no key for stops there, before anything is decrypted.
 The order is fixed. The keyless rules of the item's own shape run first, so a malformed item costs
 no key at all. An identifier the ledger already holds is refused next, on the record's own claim, so
 a redelivery costs no decryption; the claim is untrusted and that is only an early exit. Then the
-sender is selected, the box is opened, every binding is checked and a payload that bears authority
-is refused. The replay identifier is recorded **last**, after every check has passed, so an item that
-is refused is not recorded and one that was accepted is never accepted again.
+sender is selected, the box is opened and every binding is checked. The replay identifier is
+recorded **last**, after every check has passed, so an item that is refused is not recorded and one
+that was accepted is never accepted again.
 
 `open_envelope` stays public beneath it, for a caller that already knows which key it means. That
 caller takes on the two duties the delivery path discharges: selecting the sender from what it has
@@ -374,10 +374,9 @@ encryption, so pairwise message authentication never substitutes for an issuer's
 
 No reader of a mailbox in this product takes authority from one. A host takes its authority from its
 own records and its authority feed, and a device from its paired hosts' records, so a mailbox only
-tells a reader that something is there to read. `open_envelope` and `open_delivered_envelope`
-therefore refuse a payload that bears authority (`SignedAuthorityObject`) with
-`AuthorityNotAccepted`, after the box, the bindings and the expiry have passed, whatever the payload holds. The
-refusal does not record the replay identifier.
+tells a reader that something is there to read. The closed set of payload kinds has none that
+carries authority, so a plaintext that names another kind does not decode and `open_envelope` and
+`open_delivered_envelope` return it as an error, without recording the replay identifier.
 
 ## Recovery
 

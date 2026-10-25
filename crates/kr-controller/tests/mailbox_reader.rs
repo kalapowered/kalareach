@@ -768,7 +768,6 @@ async fn an_item_that_is_not_an_announcement_does_nothing_whoever_sent_it() {
     for (number, kind) in [
         (0xc1, MailboxPayloadType::StateReference),
         (0xc2, MailboxPayloadType::ActionReceipt),
-        (0xc3, MailboxPayloadType::SignedAuthorityObject),
     ] {
         rig.mailbox
             .deliver(
@@ -778,7 +777,7 @@ async fn an_item_that_is_not_an_announcement_does_nothing_whoever_sent_it() {
             .await
             .expect("the service takes the item");
     }
-    assert_eq!(rig.items_held(), 3);
+    assert_eq!(rig.items_held(), 2);
 
     rig.the_reader_reads().await;
 
@@ -788,8 +787,8 @@ async fn an_item_that_is_not_an_announcement_does_nothing_whoever_sent_it() {
     assert!(
         shown
             .detail()
-            .contains("0 announcement(s) taken, 2 ignored, 1 dropped"),
-        "two are ignored once they opened, and the one that claims authority is refused: {}",
+            .contains("0 announcement(s) taken, 2 ignored, 0 dropped"),
+        "both are ignored once they opened: {}",
         shown.detail()
     );
 }

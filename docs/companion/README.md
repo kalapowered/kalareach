@@ -674,14 +674,14 @@ revocations are still read from each feed.
 
 The rules for taking an item are the shared reader's (`kr_client::mailbox_reader`). It opens an item
 only against the stored-envelope key of a host this computer is paired with, holds the routing
-record outside the box to the fields inside it, refuses an identifier it has accepted, and refuses a
-payload that bears authority whoever sealed it. An item that opens is written down, and an
-announcement that a feed changed is counted; nothing else is done with it. The accepted identifiers
-are kept in `mailbox/replay.json` in the application's data directory, each until its item expired
-and a day more, up to 4,096 of them. At that limit the reader accepts nothing more, says so, and
-leaves the items on the service. A pass holds `mailbox/replay.lock` and does not wait for another
-window of the application that holds it. A record of a version this build does not read, or one that
-cannot be read, is left as found and nothing is acknowledged.
+record outside the box to the fields inside it, and refuses an identifier it has accepted. An item
+that opens is written down, and an announcement that a feed changed is counted; nothing else is done
+with it. The accepted identifiers are kept in `mailbox/replay.json` in the application's data
+directory, each until its item expired and a day more, up to 4,096 of them. At that limit the reader
+accepts nothing more, says so, and leaves the items on the service. A pass holds
+`mailbox/replay.lock` and does not wait for another window of the application that holds it. A
+record of a version this build does not read, or one that cannot be read, is left as found and
+nothing is acknowledged.
 
 No answer a host gives says which sync service it reads its revocations from, as the host chooses
 which to use with its own `authority.origin` setting. As the local computer doesn't know which sync

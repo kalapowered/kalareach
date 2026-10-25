@@ -1019,8 +1019,7 @@ the public key is refused rather than served.
 envelopes, and `services::mailbox` carries them. Everything outside the box stays untrusted on the
 way back. The routing record selects a sender's key out of the paired set rather than supplying
 one, the fields outside the box are held to the fields inside it, an identifier already accepted is
-refused by the reader's own replay ledger, a payload that bears authority is refused whoever sealed
-it, and the bytes a mailbox counts are the declared size bucket rather than the length of the
+refused by the reader's own replay ledger, and the bytes a mailbox counts are the declared size bucket rather than the length of the
 plaintext padded into it.
 
 `mailbox_reader` applies those rules in one place, for the host's reader and the companion's.

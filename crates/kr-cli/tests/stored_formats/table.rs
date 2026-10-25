@@ -55,18 +55,6 @@ fn entry(
     }
 }
 
-/// A store entry that reads through `version` above the one it writes.
-trait ReadsThrough {
-    fn reading_through(self, version: u32) -> Self;
-}
-
-impl ReadsThrough for ReleaseStore {
-    fn reading_through(mut self, version: u32) -> Self {
-        self.reads_through = Some(version);
-        self
-    }
-}
-
 /// The types a store keeps that the table does not declare yet, each with the store that keeps it and a
 /// digest of what it is today. Each store declares its own at its next raise, and deletes its lines.
 #[must_use]
@@ -212,89 +200,6 @@ pub fn known() -> Vec<Known> {
             "AccountSignedOut",
             "1c02b8aa44a0f9f364e09cf7cfcb8c9dad9ac89a63d9294a4bd7a4c019f97442",
         ),
-        // The delivery journal: what a notice holds, and the words it matches stored text against.
-        source(
-            "delivery",
-            "Audience",
-            "crates/kr-delivery/src/producer.rs",
-            "5e41c0cda7e2b49990ef41184e0013514dd1742cde3f951e1cd616ea07ac53cc",
-        ),
-        source(
-            "delivery",
-            "EventKey",
-            "crates/kr-delivery/src/journal.rs",
-            "3d28f50a04cc36f772c63a50afa83056c2da969d66b3322e61b2625376b058f6",
-        ),
-        source(
-            "delivery",
-            "EventSource",
-            "crates/kr-delivery/src/journal.rs",
-            "9d7ca85f394721ecbea1c7a09f08ffb90a68306181435b9ea570c418e9e7c06e",
-        ),
-        source(
-            "delivery",
-            "ContentLine",
-            "crates/kr-delivery/src/external.rs",
-            "18bd4f8548e3dc51740d1a715185a4c5ac710f8d2277a6b381ca2db85d17fa0f",
-        ),
-        known_protocol::<push::PushAlert>(
-            "delivery",
-            "PushAlert",
-            "bbc5b37ad31b754786dddec762e2119addf7419446d390380f60ca7ab1eae9b4",
-        ),
-        known_protocol::<push::PushUrgency>(
-            "delivery",
-            "PushUrgency",
-            "e299a0789eb8e4f4c26d886628cc8d967bfdb5bee1f82f3ef89e3c95d6a36bd0",
-        ),
-        words_of(
-            "delivery",
-            "push suppression reasons",
-            literal(&["burst", "sustained"]),
-            Some("crates/kr-delivery/src/journal.rs"),
-            &[("crates/kr-protocol/src/push.rs", "PushSuppressionReason")],
-            "a8bd4c6fd3dd8adbfd67f642f2122ec7c209d1e9bc4a7dff39b40cb492236ec1",
-        ),
-        words(
-            "delivery",
-            "event sources",
-            kr_delivery::journal::EventSource::ALL
-                .iter()
-                .map(|source| source.as_str().to_owned())
-                .collect(),
-            None,
-            "e59eb540e3a179fa14b6a3c0c3e55665967ad3a9d4a4be710fb096e3adf97ab2",
-        ),
-        words(
-            "delivery",
-            "delivery states",
-            kr_delivery::journal::DeliveryState::ALL
-                .iter()
-                .map(|state| state.as_str().to_owned())
-                .collect(),
-            None,
-            "e12dd6b5cb95d82e6e30bc54b206ad3fea8f00076b827fe76a64a5e7338d21b7",
-        ),
-        words(
-            "delivery",
-            "destination kinds",
-            kr_delivery::destination::DestinationKind::ALL
-                .iter()
-                .map(|kind| kind.as_str().to_owned())
-                .collect(),
-            None,
-            "3123a85b676f90000801236159af1bbc579cb2d26f772618f5a946dae158c050",
-        ),
-        words(
-            "delivery",
-            "next actions",
-            kr_delivery::push::NextAction::ALL
-                .iter()
-                .map(|next| next.as_str().to_owned())
-                .collect(),
-            None,
-            "dc39b51d2095b584734fb1a33503909b1bace98db1606d43d273163b64b52305",
-        ),
         // The attention store: the words it matches stored text against.
         words_of(
             "attention",
@@ -439,50 +344,6 @@ pub fn known() -> Vec<Known> {
             &[("crates/kr-transfer/src/store.rs", "SnapshotState")],
             "49e5f3b705b933016657462dba3bf9a0971954b08a67e97fd03f28385b0517af",
         ),
-        // The delivery journal's queued external message: the document and the words in it.
-        source(
-            "delivery",
-            "StoredMessage",
-            "crates/kr-controller/src/push/client.rs",
-            "c8bfa256400551e27e55fae73643fb75e1b0950986ba66af56ee12dea9094b97",
-        ),
-        source(
-            "delivery",
-            "StoredInterval",
-            "crates/kr-controller/src/push/client.rs",
-            "14747dd6a7c6ca6f67e5d2a1d29b6f41750cba354750ec6b57ecefc7b7a16fdf",
-        ),
-        words_of(
-            "delivery",
-            "queued message keys",
-            literal(&[
-                "alert",
-                "body",
-                "delivery_id",
-                "interval",
-                "from_ms",
-                "to_ms",
-                "resources",
-                "withheld",
-            ]),
-            Some("crates/kr-delivery/src/producer.rs"),
-            // The keys of a document, not the words of an enum: `StoredMessage` and
-            // `StoredInterval` above pin the document's shape.
-            &[],
-            "c8b1404c75a2d5a04b7d230e6ed9ec6725d7d4512fd5471f6a93760f8622a6f2",
-        ),
-        words_of(
-            "delivery",
-            "withheld reasons",
-            literal(&[
-                "outside_history_scope",
-                "resource_not_granted",
-                "no_production_time",
-            ]),
-            Some("crates/kr-delivery/src/external.rs"),
-            &[("crates/kr-delivery/src/external.rs", "Withheld")],
-            "1320677d9b402b374f5bff99e3252ee3dac5d7033c0b4400661b59d7fc002be4",
-        ),
         // The environment's presence record.
         known_protocol::<identity::EnvironmentPresence>(
             "environments",
@@ -510,7 +371,7 @@ pub fn known() -> Vec<Known> {
 /// holder.
 #[must_use]
 pub fn kept_without_a_holder() -> Vec<&'static str> {
-    vec!["PairingConsumedReason", "StoredMessage"]
+    vec!["PairingConsumedReason"]
 }
 
 /// The type of the answer the registry keeps for each method that has it kept, by the type's name:
@@ -784,17 +645,100 @@ pub fn table() -> Vec<Store> {
                 sqlite_table("delivery_schema"),
                 version(kr_delivery::journal::SCHEMA_VERSION),
                 version(kr_delivery::journal::OLDEST_SCHEMA_VERSION),
-            )
-            .reading_through(version(kr_delivery::journal::READS_THROUGH)),
+            ),
             owned: Vec::new(),
             kept: vec![
                 protocol::<push::PushDeliveryRequest>("PushDeliveryRequest"),
                 protocol::<mailbox::SealedEnvelope>("SealedEnvelope"),
+                protocol::<push::PushAlert>("PushAlert"),
+                protocol::<push::PushUrgency>("PushUrgency"),
                 Kept::Source(
                     "crates/kr-delivery/src/producer.rs",
-                    &["Production", "Notice"],
+                    &["Production", "Notice", "Audience"],
                 ),
                 Kept::Source("crates/kr-delivery/src/preview.rs", &["PreviewBody"]),
+                Kept::Source(
+                    "crates/kr-delivery/src/journal.rs",
+                    &["EventKey", "EventSource", "DeliveryState"],
+                ),
+                Kept::Source(
+                    "crates/kr-delivery/src/destination.rs",
+                    &["DestinationKind"],
+                ),
+                Kept::Source("crates/kr-delivery/src/push.rs", &["NextAction"]),
+                Kept::Source("crates/kr-delivery/src/external.rs", &["ContentLine"]),
+                // The document a queued external message is stored as, and its interval.
+                Kept::Source(
+                    "crates/kr-controller/src/push/client.rs",
+                    &["StoredMessage", "StoredInterval"],
+                ),
+                // The words the code matches stored text against. The enums that name them are kept
+                // beside them, so a variant added to one moves the digest even when its `ALL` is
+                // not changed; the count of how often each word is spelt in the file that writes
+                // it, which the pinned digest held, is not part of it.
+                Kept::Words(
+                    "push suppression reasons",
+                    vec!["burst".to_owned(), "sustained".to_owned()],
+                ),
+                protocol::<push::PushSuppressionReason>("PushSuppressionReason"),
+                Kept::Words(
+                    "event sources",
+                    kr_delivery::journal::EventSource::ALL
+                        .iter()
+                        .map(|source| source.as_str().to_owned())
+                        .collect(),
+                ),
+                Kept::Words(
+                    "delivery states",
+                    kr_delivery::journal::DeliveryState::ALL
+                        .iter()
+                        .map(|state| state.as_str().to_owned())
+                        .collect(),
+                ),
+                Kept::Words(
+                    "destination kinds",
+                    kr_delivery::destination::DestinationKind::ALL
+                        .iter()
+                        .map(|kind| kind.as_str().to_owned())
+                        .collect(),
+                ),
+                Kept::Words(
+                    "next actions",
+                    kr_delivery::push::NextAction::ALL
+                        .iter()
+                        .map(|next| next.as_str().to_owned())
+                        .collect(),
+                ),
+                // The keys of a queued message's document, not the words of an enum: the two
+                // `Stored` items above pin the document's shape.
+                Kept::Words(
+                    "queued message keys",
+                    [
+                        "alert",
+                        "body",
+                        "delivery_id",
+                        "interval",
+                        "from_ms",
+                        "to_ms",
+                        "resources",
+                        "withheld",
+                    ]
+                    .iter()
+                    .map(|key| (*key).to_owned())
+                    .collect(),
+                ),
+                Kept::Words(
+                    "withheld reasons",
+                    [
+                        "outside_history_scope",
+                        "resource_not_granted",
+                        "no_production_time",
+                    ]
+                    .iter()
+                    .map(|reason| (*reason).to_owned())
+                    .collect(),
+                ),
+                Kept::Source("crates/kr-delivery/src/external.rs", &["Withheld"]),
             ],
         },
         Store {
