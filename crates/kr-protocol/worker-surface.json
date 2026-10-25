@@ -226,6 +226,11 @@
       "result": "ShellLaunchResult"
     },
     {
+      "name": "shell.launch.surface",
+      "params": "ShellLaunchSurfaceParams",
+      "result": "ShellLaunchSurfaceResult"
+    },
+    {
       "name": "terminal.geometry.transfer",
       "params": "TerminalGeometryTransferParams",
       "result": "GeometryResult"
@@ -314,6 +319,8 @@
     "SessionScreenPreviewResult",
     "ShellLaunchParams",
     "ShellLaunchResult",
+    "ShellLaunchSurfaceParams",
+    "ShellLaunchSurfaceResult",
     "TerminalGeometryTransferParams",
     "TerminalResizeParams"
   ],

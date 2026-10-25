@@ -274,6 +274,13 @@ pub const AUTHORITY_REVISION_REACH: &str = "authority.revision-reach/1";
 /// A control daemon of an earlier release sends the read only to a worker that states this.
 pub const AGENT_INSTANCES_READ: &str = "agent.instances/1";
 
+/// The capability a worker states when it serves `shell.launch.surface`.
+///
+/// A control daemon and a client on the same machine ask the read only of a worker that states
+/// this: a worker of an earlier release has no row for the method and would refuse it as it
+/// refuses a method it does not serve, which reads as a missing right.
+pub const SHELL_LAUNCH_SURFACE_READ: &str = "shell.launch.surface/1";
+
 /// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
 /// session's screen the attachment is drawn.
 ///

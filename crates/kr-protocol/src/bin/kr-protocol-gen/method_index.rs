@@ -218,7 +218,8 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::RootEditorFence
         | Method::RootEofDetach
         | Method::RootCommandAccepted
-        | Method::ShellLaunch => at(PROTOCOL, "The root integration"),
+        | Method::ShellLaunch
+        | Method::ShellLaunchSurface => at(PROTOCOL, "The root integration"),
 
         Method::AgentCapabilities
         | Method::AgentSnapshot

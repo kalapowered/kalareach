@@ -221,7 +221,7 @@ use crate::root::{
     RootCommandResolveParams, RootCommandResolveResult, RootEditorEnterParams,
     RootEditorEnterResult, RootEditorFenceParams, RootEditorFenceResult, RootEditorLeaveParams,
     RootEditorLeaveResult, RootEofDetachParams, RootEofDetachResult, ShellLaunchParams,
-    ShellLaunchResult,
+    ShellLaunchResult, ShellLaunchSurfaceParams, ShellLaunchSurfaceResult,
 };
 use crate::semantic::SemanticContinuation;
 use crate::service::ServiceRequestSignature;
@@ -629,6 +629,8 @@ pub fn protocol_schema() -> Value {
         "session_summary" => SessionSummary,
         "shell_launch_params" => ShellLaunchParams,
         "shell_launch_result" => ShellLaunchResult,
+        "shell_launch_surface_params" => ShellLaunchSurfaceParams,
+        "shell_launch_surface_result" => ShellLaunchSurfaceResult,
         "signed_archive_manifest" => SignedArchiveManifest,
         "sleep_inhibition_state" => SleepInhibitionState,
         "signed_client_bundle" => SignedClientBundle,

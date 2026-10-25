@@ -27,7 +27,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::ProcessStartIdentity;
-use crate::ids::{AttachmentId, InputLeaseEpoch, SessionId};
+use crate::ids::{AttachmentId, InputLeaseEpoch, PluginId, SessionId};
 use crate::scalars::{Bytes, DurationMs, Nullable, TimestampMs, U64, Uuid};
 
 /// How long the worker holds new input while a reader transition resolves.
@@ -1157,6 +1157,156 @@ pub struct ShellLaunchResult {
     pub prompt_generation: PromptGeneration,
     /// The buffer revision after the command was installed.
     pub buffer_revision: EditorBufferRevision,
+}
+
+/// Parameters of `shell.launch.surface`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellLaunchSurfaceParams {
+    /// The session.
+    pub session_id: SessionId,
+}
+
+/// The result of `shell.launch.surface`: what a launch from this connection could do now.
+///
+/// It is advice, not a lease. A launch quotes the prompt generation and the buffer revision it
+/// names, and the worker and the reader refuse a quote that has gone stale before anything is
+/// typed.
+///
+/// Read-only metadata: a member added later is explicitly optional, and a reader whose schema
+/// predates it ignores it rather than refusing the answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
+pub struct ShellLaunchSurfaceResult {
+    /// The session.
+    pub session_id: SessionId,
+    /// Whether the root editor is at an empty prompt a launch can be installed in.
+    pub editor: LaunchEditor,
+    /// How the asking connection stands to the session's input.
+    pub input: LaunchInput,
+    /// The shell the session runs, where the host knows how to quote for it. Null otherwise.
+    pub shell: Nullable<LaunchShell>,
+    /// What the host has an agent package for, by command.
+    pub offers: Vec<LaunchOffer>,
+}
+
+/// Whether the root editor is at a prompt a launch can be installed in.
+///
+/// `verified` rests on the reader's last fence acknowledgement and on nothing the worker admitted
+/// since: the buffer was empty with no operation pending at a primary prompt, the fence still
+/// stands, and no launch is outstanding or installed here. The reader still checks the real buffer
+/// when a launch arrives.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LaunchEditor {
+    /// A launch quoting these values can be installed.
+    Verified {
+        /// The prompt the fence was proved at, which a launch quotes.
+        prompt_generation: PromptGeneration,
+        /// The buffer revision the reader acknowledged as empty, which a launch quotes.
+        buffer_revision: EditorBufferRevision,
+        /// The shell's working-directory revision. It shows where the shell is; a launch does not
+        /// quote it.
+        cwd_revision: CwdRevision,
+    },
+    /// The worker cannot vouch for the prompt.
+    Unverified {
+        /// The first reason that holds.
+        reason: LaunchUnverified,
+    },
+}
+
+/// Why the worker cannot vouch for the prompt, in the order it tests them.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchUnverified {
+    /// The session is closing.
+    Closing,
+    /// The session's root is a command the host started, so there is no shell to type into.
+    NotAShell,
+    /// The session runs a stock shell, whose editor the host does not see. A person is shown
+    /// instructions instead.
+    StockShell,
+    /// The session's launch profile does not allow a fenced launch.
+    ProfileForbids,
+    /// The caller's grant does not reach the live screen, so the editor is not told.
+    NotShown,
+    /// The root integration is not qualified yet: it has not connected, or the startup files still
+    /// run.
+    Starting,
+    /// The root integration was refused, or lost after it qualified.
+    IntegrationLost,
+    /// No root editor is registered: a command or an application holds the terminal, or the shell
+    /// is between prompts.
+    NotAtPrompt,
+    /// The reader is a continuation line or the `read` builtin, not the primary prompt.
+    NotPrimaryPrompt,
+    /// A launch is reserved, one the worker revoked still waits for the reader, or one was
+    /// installed at this prompt.
+    LaunchInProgress,
+    /// No fence stands: nobody holds the session's input, or a fence exchange is open or withheld.
+    NoFence,
+    /// The buffer the reader acknowledged held text.
+    BufferNotEmpty,
+    /// The reader acknowledged an operation in progress: a search, a numeric argument, a motion, a
+    /// quoted insertion, a macro, a key sequence or a paste.
+    ReaderPending,
+    /// Input, an interrupt, a refused launch or a reader report changed the worker's picture
+    /// after the fence was proved.
+    ChangedSinceFence,
+}
+
+/// How the asking connection stands to the session's input.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchInput {
+    /// An attachment of the asking connection holds the input lease.
+    HeldHere,
+    /// Another connection holds it.
+    HeldElsewhere,
+    /// Nobody holds it.
+    Free,
+    /// The caller's grant does not reach the live screen, which shows who holds the input.
+    Withheld,
+}
+
+/// The shell a session runs, where the host knows how to quote for it.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchShell {
+    /// A POSIX shell other than Bash and Zsh: `sh`, `dash` or `ash`.
+    Sh,
+    /// Zsh.
+    Zsh,
+    /// Bash.
+    Bash,
+    /// Fish.
+    Fish,
+    /// PowerShell.
+    Powershell,
+}
+
+/// One agent the host has a package for, and the command that starts it.
+///
+/// Whether the executable is on the shell's path is the shell's to say when the command runs.
+///
+/// Read-only metadata: a member added later is explicitly optional, and a reader whose schema
+/// predates it ignores it rather than refusing the answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(extend("x-kalareach-read-only-metadata" = true))]
+pub struct LaunchOffer {
+    /// The admitted package that gives the command.
+    pub plugin_id: PluginId,
+    /// The package's display name.
+    pub label: String,
+    /// What a launch sends to start the agent: the command alone, with no flags.
+    pub command: LaunchCommand,
 }
 
 /// Why the editor could not be fenced or reserved.

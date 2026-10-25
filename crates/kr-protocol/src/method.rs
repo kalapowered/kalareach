@@ -1118,6 +1118,15 @@ methods! {
     doc: "Install and submit an argument vector or correctly quoted command through the trusted \
           root editor. An intervening local edit returns DRAFT_CONFLICT.";
 
+    ShellLaunchSurface = "shell.launch.surface", ShellLaunch,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
+    selectors: [Session],
+    history: LiveViewOnly, capability: NO_CAPABILITY,
+    freshness: CurrentAuthority, confirmation: None, idempotency: READ,
+    doc: "Whether the root editor is at an empty prompt a launch can be installed in, how the \
+          asking connection stands to the session's input, the shell's name, and the agents the \
+          host has a package for.";
+
     // ----- Agent state ----------------------------------------------------------------------
     AgentCapabilities = "agent.capabilities", AgentState,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
