@@ -6397,9 +6397,9 @@ role the grant carries in full, and the role line of `kr share invite` says what
 rights line after it names the rest. The lists that show a share put each right its role does not
 cover beside the role: `kr share list` prints `viewer plus question.respond`, and the companion's
 "Who has access", "Invitations" and "Shared with you" lists say that the viewer also answers the
-agent's questions. A grant that carries no role in full, such as a voice call's, is listed as
-custom with its rights. The lists leave out the notices, which the invitation form and the
-recipient's invitation card show.
+agent's questions. A grant that carries no role in full, because it has no `session.view`, is
+listed as custom with its rights. The lists leave out the notices, which the invitation form and
+the recipient's invitation card show.
 
 Restricted typed collaboration would be offered only where the upstream and the broker both enforce
 the boundary it states, and this host offers none today. A question always keeps its free-text

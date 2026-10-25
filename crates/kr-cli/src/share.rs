@@ -1332,8 +1332,9 @@ const fn state_words(state: GrantState) -> &'static str {
 /// What a share allows, as a list prints it: the widest role whose rights the share carries in
 /// full, and every right the role does not cover named beside it. A viewer who may answer the
 /// agent's questions is `viewer plus question.respond`, never a plain viewer; a share that carries
-/// no role in full (a voice call's grant has no view of the session) is `custom` with each right
-/// named. The role is a label for the person reading the line: the host decides from the rights.
+/// no role in full, because every role includes `session.view` and it has none, is `custom` with
+/// each right named. The role is a label for the person reading the line: the host decides from
+/// the rights.
 fn access_words(actions: &CanonicalSet<ActionRight>) -> Shown {
     let role = kr_controller::sharing::roles::describes(actions);
     let beyond: Vec<Shown> = actions
@@ -2134,34 +2135,53 @@ mod tests {
             .to_owned()
     }
 
-    /// KR-REQ-10.42: a share is listed by what it allows. A viewer who may answer the agent's
-    /// questions, and a grant a voice call holds, are not listed as a plain viewer: the role is the
-    /// widest one whose rights the share carries in full, and each right beyond it is named beside
-    /// it. A share that carries exactly a role's rights says only the role.
+    /// KR-REQ-10.42: a viewer who may answer the agent's questions is not listed as a plain
+    /// viewer. The role is the widest one whose rights the share carries in full, and each right
+    /// beyond it is named beside it.
     #[test]
-    fn a_share_is_listed_by_what_it_allows() {
-        let plain = listed(&[ActionRight::SessionView]);
-        assert!(plain.contains("viewer"), "{plain}");
-        assert!(!plain.contains("session.view"), "{plain}");
-
+    fn a_viewer_who_may_answer_is_listed_with_the_answer() {
         let answering = listed(&[ActionRight::SessionView, ActionRight::QuestionRespond]);
         assert!(answering.contains("viewer"), "{answering}");
         assert!(answering.contains("question.respond"), "{answering}");
+    }
 
-        let voice = listed(&[
-            ActionRight::AgentApprovalRespond,
+    /// KR-REQ-10.42: the grant a voice call runs under carries `voice.use` and the rights of the
+    /// actions it permits beside the view of the session, so it is a viewer with those rights
+    /// named, not a plain viewer.
+    #[test]
+    fn a_voice_calls_grant_is_listed_with_its_rights() {
+        let call = listed(&[
+            ActionRight::SessionView,
             ActionRight::AgentPrompt,
             ActionRight::VoiceUse,
         ]);
-        assert!(!voice.contains("viewer"), "{voice}");
-        for right in ["agent.approval.respond", "agent.prompt", "voice.use"] {
-            assert!(voice.contains(right), "{voice}");
+        assert!(call.contains("viewer"), "{call}");
+        for right in ["agent.prompt", "voice.use"] {
+            assert!(call.contains(right), "{call}");
         }
+    }
 
-        let controller = listed(SessionRole::Controller.default_actions());
-        assert!(controller.contains("controller"), "{controller}");
-        for right in SessionRole::Controller.default_actions() {
-            assert!(!controller.contains(right.as_str()), "{controller}");
+    /// KR-REQ-10.42: every role includes the view of the session, so a share without it has no
+    /// role. It is not called a viewer; each right it carries is named.
+    #[test]
+    fn a_share_with_no_view_of_the_session_is_listed_with_its_rights() {
+        let blind = listed(&[ActionRight::AgentApprovalRespond, ActionRight::AgentPrompt]);
+        assert!(!blind.contains("viewer"), "{blind}");
+        for right in ["agent.approval.respond", "agent.prompt"] {
+            assert!(blind.contains(right), "{blind}");
+        }
+    }
+
+    /// A share that carries exactly a role's rights says the role and no right: nothing is left
+    /// unnamed, and nothing is said twice.
+    #[test]
+    fn a_share_that_carries_exactly_a_role_is_listed_by_the_role_alone() {
+        for role in SessionRole::ALL {
+            let line = listed(role.default_actions());
+            assert!(line.contains(role.as_str()), "{line}");
+            for right in role.default_actions() {
+                assert!(!line.contains(right.as_str()), "{role}: {line}");
+            }
         }
     }
 

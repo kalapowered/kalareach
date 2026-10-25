@@ -575,21 +575,17 @@ describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
     expect(within(shared).getByRole('heading', { name: 'Shared with you' })).toBeInTheDocument()
     expect(within(shared).getByText('Session 3 · Studio')).toBeInTheDocument()
     expect(within(shared).getByText('Controller')).toBeInTheDocument()
+    // A controller carries every right its role names: nothing is said beside the role.
+    expect(shared).not.toHaveTextContent(/also/i)
     expect(within(shared).getByText(/^Until /)).toBeInTheDocument()
   })
 
   // KR-REQ-10.42, the part about labels: a share is shown by what it allows, so a viewer who may
-  // answer the agent is named with the answer, and a grant that holds no whole role is custom access
-  // with each of its rights named, never a viewer.
-  it('names beside the role what a share allows beyond it, and never calls a voice grant a viewer', async () => {
+  // answer the agent is named with the answer, and a plain role says nothing more.
+  it('names beside the role what a share allows beyond it', async () => {
     start({
       before: (c) => {
         c.sharing.hold({ role: 'viewer', actions: ['question.respond', 'session.view'], session: '3' })
-        c.sharing.hold({
-          role: 'viewer',
-          actions: ['agent.approval.respond', 'agent.prompt', 'voice.use'],
-          session: '4'
-        })
       }
     })
     await openTab('Sessions')
@@ -597,11 +593,23 @@ describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
     const viewer = within(shared).getByRole('button', { name: /Session 3 · Studio/ })
     expect(viewer).toHaveTextContent('Viewer')
     expect(viewer).toHaveTextContent('answers the agent’s questions')
-    const voice = within(shared).getByRole('button', { name: /Session 4 · Studio/ })
-    expect(voice).toHaveTextContent('Custom access')
-    expect(voice).not.toHaveTextContent('Viewer')
-    expect(voice).toHaveTextContent(/sends the agent prompts/)
-    expect(voice).toHaveTextContent(/answers the agent’s approval requests/i)
+  })
+
+  // KR-REQ-10.42, the part about labels: a share with no view of the session is no viewer. It is
+  // custom access, and each right it carries is named.
+  it('calls a share with no view of the session custom access and names its rights', async () => {
+    start({
+      before: (c) => {
+        c.sharing.hold({ role: 'viewer', actions: ['agent.approval.respond', 'agent.prompt'], session: '4' })
+      }
+    })
+    await openTab('Sessions')
+    const shared = await screen.findByTestId('shared-with-you')
+    const custom = within(shared).getByRole('button', { name: /Session 4 · Studio/ })
+    expect(custom).toHaveTextContent('Custom access')
+    expect(custom).not.toHaveTextContent('Viewer')
+    expect(custom).toHaveTextContent(/sends the agent prompts/)
+    expect(custom).toHaveTextContent(/answers the agent’s approval requests/i)
   })
 
   it('opens the session under the share when the row is pressed', async () => {

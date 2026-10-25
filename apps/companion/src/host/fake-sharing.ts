@@ -76,7 +76,7 @@ export interface OfferSpec {
   readonly role?: RoleSelection['role']
   /**
    * The actions the share carries, where a test needs a set no role compiles to: a viewer who
-   * answers the agent's questions, or a grant a voice call holds. They replace the role's.
+   * answers the agent's questions, or a share with no view of the session. They replace the role's.
    */
   readonly actions?: readonly ActionRight[]
   /** Whether the live view of the screen is included. */

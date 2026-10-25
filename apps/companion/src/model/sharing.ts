@@ -332,8 +332,8 @@ const WIDEST_FIRST: readonly SessionRole[] = ['owner', 'controller', 'reviewer',
 /**
  * The widest role whose rights a share carries in full, or null when it carries none in full.
  *
- * It is the role the host names beside a grant, and the same one `kr share list` prints. A grant
- * with no view of the session, such as the one a voice call holds, is no viewer.
+ * It is the role the host names beside a grant, and the same one `kr share list` prints. Every
+ * role includes `session.view`, so a grant with no view of the session has no role.
  */
 export function roleOfRights(actions: readonly ActionRight[]): SessionRole | null {
   return (
