@@ -1992,54 +1992,6 @@ mod tests {
         .expect("another environment is unaffected");
     }
 
-    #[test]
-    fn a_publication_of_one_protocol_is_not_made_stale_by_one_of_another() {
-        let host = kr_ipc::testing::TempHost::create();
-        let environment = host.environment();
-        let identity =
-            HostIdentity::generate(host.environment_id()).expect("this host can describe itself");
-        let this = HostProtocol::THIS;
-        let second = HostProtocol::SECOND;
-        let mut for_this = descriptor_of(&identity, "/run/kr/p3.sock");
-        for_this.protocol = this.name.to_owned();
-        let mut for_second = descriptor_of(&identity, "/run/kr/p.sock");
-        for_second.protocol = second.name.to_owned();
-
-        // The first protocol's launch takes its number, the second protocol's launch takes a later
-        // one and publishes first. When the first reaches its turn its number is older than the
-        // second's, and it must still publish: they write different files.
-        let first_turn = publication_turn(host.environment_id(), &this);
-        let second_turn = publication_turn(host.environment_id(), &second);
-        let older = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let newer = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let waiting = core::sync::atomic::AtomicBool::new(false);
-        publish_numbered(
-            &second_turn,
-            newer,
-            &waiting,
-            &environment,
-            &second,
-            &for_second,
-        )
-        .expect("the second protocol publishes");
-        publish_numbered(&first_turn, older, &waiting, &environment, &this, &for_this)
-            .expect("the first protocol publishes although its number is the older");
-        assert_eq!(
-            read_descriptor(&environment, &this)
-                .expect("a read")
-                .expect("a descriptor")
-                .endpoint,
-            "/run/kr/p3.sock"
-        );
-        assert_eq!(
-            read_descriptor(&environment, &second)
-                .expect("a read")
-                .expect("a descriptor")
-                .endpoint,
-            "/run/kr/p.sock"
-        );
-    }
-
     #[tokio::test]
     async fn one_reservation_is_one_host_and_a_second_claim_is_refused_and_counted() {
         let host = kr_ipc::testing::TempHost::create();

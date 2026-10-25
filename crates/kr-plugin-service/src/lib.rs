@@ -1,6 +1,6 @@
 //! Reaching the plugin host, with no component engine.
 //!
-//! The engine lives in `kr-plugin-host`, one process for each protocol and environment, and a
+//! The engine lives in `kr-plugin-host`, one process for each environment, and a
 //! process that serves a shell may not link it. This crate is what such a process may link to
 //! reach the host instead: the protocol the two ends speak, the descriptor a worker finds the host
 //! through, the client a worker uses, the launcher that starts the host and takes its identity
@@ -31,7 +31,6 @@
 //! | [`protocol`] | The frames, the two proof transcripts and the published descriptor |
 //! | [`client`] | What a worker uses: connect, verify, register, deliver, call, unbind |
 //! | [`launcher`] | Starting the host as its own job, taking its rendezvous, publishing its descriptor |
-//! | [`retained_host`] | The look the control daemon takes at a host of a retained protocol |
 //! | [`notices`] | The bounded queue a connection's unasked-for news waits in |
 //! | [`vocabulary`] | The records a call carries, the bounds both ends share, and their wire forms |
 //! | [`error`] | What the client reports when the host does not answer |
@@ -43,5 +42,4 @@ pub mod hold;
 pub mod launcher;
 pub mod notices;
 pub mod protocol;
-pub mod retained_host;
 pub mod vocabulary;
