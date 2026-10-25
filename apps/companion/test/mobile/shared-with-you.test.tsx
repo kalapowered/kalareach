@@ -581,7 +581,7 @@ describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
   })
 
   // KR-REQ-10.42, the part about labels: a share is shown by what it allows, so a viewer who may
-  // answer the agent is named with the answer, and a plain role says nothing more.
+  // answer the agent is named with the answer.
   it('names beside the role what a share allows beyond it', async () => {
     start({
       before: (c) => {
@@ -600,7 +600,7 @@ describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
   it('calls a share with no view of the session custom access and names its rights', async () => {
     start({
       before: (c) => {
-        c.sharing.hold({ role: 'viewer', actions: ['agent.approval.respond', 'agent.prompt'], session: '4' })
+        c.sharing.hold({ actions: ['agent.approval.respond', 'agent.prompt'], session: '4' })
       }
     })
     await openTab('Sessions')

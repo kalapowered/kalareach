@@ -76,7 +76,8 @@ export interface OfferSpec {
   readonly role?: RoleSelection['role']
   /**
    * The actions the share carries, where a test needs a set no role compiles to: a viewer who
-   * answers the agent's questions, or a share with no view of the session. They replace the role's.
+   * answers the agent's questions, or a share with no view of the session. They replace the role's,
+   * and the offer names the role only when `role` is given beside them.
    */
   readonly actions?: readonly ActionRight[]
   /** Whether the live view of the screen is included. */
@@ -392,7 +393,8 @@ export class ScriptedSharing implements FakeSharing {
       invitation_id: idOf('e9e9e9e9', 2000 + this.#offered),
       issued_at_ms: String(this.#ids.nowMs + this.#offered),
       notices: noticesFor(actions),
-      role: selection.role,
+      // The host names the widest role the actions cover, and none when they cover no role.
+      role: spec.actions === undefined ? selection.role : (spec.role ?? null),
       session_id: this.#ids.session
     }
     this.#offers.push(offer)

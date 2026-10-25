@@ -2145,9 +2145,9 @@ mod tests {
         assert!(answering.contains("question.respond"), "{answering}");
     }
 
-    /// KR-REQ-10.42: the grant a voice call runs under carries `voice.use` and the rights of the
-    /// actions it permits beside the view of the session, so it is a viewer with those rights
-    /// named, not a plain viewer.
+    /// KR-REQ-10.42: the grant of a voice call in the default scope, with prompt submission added,
+    /// carries `session.view`, `agent.prompt` and `voice.use`, so it is a viewer with the other two
+    /// rights named, not a plain viewer.
     #[test]
     fn a_voice_calls_grant_is_listed_with_its_rights() {
         let call = listed(&[
