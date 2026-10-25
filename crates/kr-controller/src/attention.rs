@@ -735,6 +735,10 @@ pub struct AttentionModule {
     change_sets: std::sync::Mutex<change_sets::ChangeSetPass>,
     /// Set once the change-set store is being read, so it is read by one loop.
     change_sets_started: std::sync::OnceLock<()>,
+    /// Held for the whole of one pass over the change-set store, so passes do not overlap.
+    change_sets_pass: tokio::sync::Mutex<()>,
+    /// Whether a version waits for a session this daemon does not hold yet.
+    change_sets_waiting: AtomicBool,
     /// Woken when the change-set service records a version.
     change_sets_wake: Arc<tokio::sync::Notify>,
     /// Whether the last pass over the change-set store stopped short, so a failure that persists is
@@ -883,6 +887,8 @@ impl AttentionModule {
             automation_task: std::sync::Mutex::new(None),
             change_sets: std::sync::Mutex::new(change_sets::ChangeSetPass::default()),
             change_sets_started: std::sync::OnceLock::new(),
+            change_sets_pass: tokio::sync::Mutex::new(()),
+            change_sets_waiting: AtomicBool::new(false),
             change_sets_wake: Arc::new(tokio::sync::Notify::new()),
             change_sets_failing: AtomicBool::new(false),
             change_sets_task: std::sync::Mutex::new(None),

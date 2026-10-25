@@ -142,7 +142,7 @@ impl AttentionModule {
         let task = tokio::spawn(async move {
             loop {
                 let waiting = match module.upgrade() {
-                    Some(held) => !held.pass_state().waiting.is_empty(),
+                    Some(held) => held.change_sets_waiting.load(Ordering::Relaxed),
                     None => return,
                 };
                 let pause = if !clean {
@@ -189,6 +189,9 @@ impl AttentionModule {
         service: &Arc<ChangeSetService>,
         sessions: &dyn HeldSessions,
     ) -> Answer<()> {
+        // One pass at a time, from the read of the newest versions to the write of what they owe:
+        // a pass that read older versions cannot settle them after a newer pass settled newer ones.
+        let _one = self.change_sets_pass.lock().await;
         let module = Arc::clone(self);
         let reader = Arc::clone(service);
         let fresh = blocking(move || {
@@ -255,12 +258,39 @@ impl AttentionModule {
         // The order the versions were recorded in, so a visit sees them in it.
         let mut offered = offered;
         offered.sort_by_key(|offer| (offer.captured_at_ms, offer.change_set_id));
+        if !offered.is_empty() {
+            self.record_offers(&offered)?;
+        }
+        for head in fresh {
+            state.seen.insert(head.change_set_id, head.version);
+            state.waiting.remove(&head.change_set_id);
+        }
+        for offer in &offered {
+            state.waiting.remove(&offer.change_set_id);
+        }
+        for offer in unheld {
+            state.waiting.insert(
+                offer.change_set_id,
+                Waiting {
+                    version: offer.version,
+                    session_id: offer.session_id,
+                    captured_at_ms: offer.captured_at_ms,
+                },
+            );
+        }
+        self.change_sets_waiting
+            .store(!state.waiting.is_empty(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Writes what `offered` owes the review state, in one transaction for each page.
+    fn record_offers(&self, offered: &[Offer]) -> Answer<()> {
         self.deciding(|reading| -> Answer<()> {
             let mut store = self.store()?;
             let mut owed = Vec::with_capacity(offered.len());
             {
                 let reviews = store.reviews().map_err(refusal)?;
-                for offer in &offered {
+                for offer in offered {
                     // The review state only goes forward: a version it has reached is review work
                     // already, and offering it again changes nothing.
                     if reviews
@@ -302,25 +332,7 @@ impl AttentionModule {
                 store.rebuild(&events, reading).map_err(refusal)?;
             }
             Ok(())
-        })?;
-        for head in fresh {
-            state.seen.insert(head.change_set_id, head.version);
-            state.waiting.remove(&head.change_set_id);
-        }
-        for offer in &offered {
-            state.waiting.remove(&offer.change_set_id);
-        }
-        for offer in unheld {
-            state.waiting.insert(
-                offer.change_set_id,
-                Waiting {
-                    version: offer.version,
-                    session_id: offer.session_id,
-                    captured_at_ms: offer.captured_at_ms,
-                },
-            );
-        }
-        Ok(())
+        })
     }
 
     /// Reports a pass that stopped short, once for as long as passes keep stopping.

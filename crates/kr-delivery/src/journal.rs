@@ -49,8 +49,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use kr_protocol::ids::{
-    EnvelopeId, GrantId, InstallationId, InvitationId, NotificationId, PushSenderRecordId,
-    SessionId,
+    DeviceId, EnvelopeId, GrantId, InstallationId, InvitationId, NotificationId,
+    PushSenderRecordId, SessionId,
 };
 use kr_protocol::push::{PushSuppression, PushSuppressionReason};
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
@@ -210,15 +210,30 @@ impl EventKey {
         }
     }
 
-    /// Names one completed pairing, by the invitation the device paired through.
+    /// Names one completed pairing, by the invitation the device paired through and the device it
+    /// created.
     ///
-    /// The identity cannot be an announcement's: it holds a separator no announcement's does.
+    /// The identity cannot be an announcement's: it holds a separator no announcement's does. It
+    /// names the device so that the one device a pairing does not tell of itself stays left out
+    /// whenever the notification is produced, including by a pass that finishes what a stopped
+    /// host took.
     #[must_use]
-    pub fn pairing(invitation: InvitationId) -> Self {
+    pub fn pairing(invitation: InvitationId, device: DeviceId) -> Self {
         Self {
             source: EventSource::Attention,
-            identity: format!("pairing|{invitation}"),
+            identity: format!("pairing|{invitation}|{device}"),
         }
+    }
+
+    /// The device a pairing created, when this event names a pairing.
+    #[must_use]
+    pub fn paired_device(&self) -> Option<DeviceId> {
+        self.identity
+            .strip_prefix("pairing|")?
+            .split_once('|')?
+            .1
+            .parse()
+            .ok()
     }
 
     /// Which source this event came from.

@@ -726,6 +726,14 @@ fn refused_record(
     }
 }
 
+/// Whether `destination` is the device a pairing's event names: the one device a pairing does not
+/// tell of itself.
+fn is_the_paired_device(event: &EventKey, destination: &DestinationRecord) -> bool {
+    event
+        .paired_device()
+        .is_some_and(|device| destination.id.as_str().parse::<DeviceId>().ok() == Some(device))
+}
+
 /// The rule a notice about a completed pairing is raised under.
 pub const PAIRING_RULE: &str = "pairing.completed";
 
@@ -757,7 +765,7 @@ impl PairingEvent {
     #[must_use]
     fn notice(&self) -> Notice {
         Notice {
-            event: EventKey::pairing(self.invitation_id),
+            event: EventKey::pairing(self.invitation_id, self.device_id),
             // The closed vocabulary has no sentence for a pairing, and the authority feed's notice
             // is shown in these words too.
             alert: PushAlert::SessionNeedsAttention,
@@ -797,11 +805,6 @@ impl PairingEvent {
             produced_at_ms: Some(self.committed_at_ms),
             text: "A device was paired with this host.".to_owned(),
         }]
-    }
-
-    /// Whether `destination` is the device that paired.
-    fn is_the_device(&self, destination: &DestinationRecord) -> bool {
-        destination.id.as_str().parse::<DeviceId>().ok() == Some(self.device_id)
     }
 }
 
@@ -936,7 +939,7 @@ impl Producer {
                 let across_privacy = matches!(fate, Fate::Drop(why) if why.across_privacy());
                 let entry = match fate {
                     Fate::Alert(notice) => {
-                        self.alert(&notice, announcement.number, authority, now_ms, &|_| true)?
+                        self.alert(&notice, announcement.number, authority, now_ms)?
                     }
                     Fate::Drop(_) | Fate::Produce(_) => PrivateEntry {
                         event: observed_announcement(announcement, now_ms),
@@ -1012,13 +1015,15 @@ impl Producer {
         number: u64,
         authority: &dyn RecipientAuthority,
         now_ms: u64,
-        told: &dyn Fn(&DestinationRecord) -> bool,
     ) -> Result<PrivateEntry> {
         let generation = self.journal.generation()?;
         let mut records = Vec::new();
         let mut spent = Vec::new();
         for destination in self.journal.destinations()? {
-            if !destination.enabled || destination.as_push().is_none() || !told(&destination) {
+            if !destination.enabled
+                || destination.as_push().is_none()
+                || is_the_paired_device(&notice.event, &destination)
+            {
                 continue;
             }
             match self.build_push(
@@ -1060,14 +1065,13 @@ impl Producer {
     }
 
     /// Takes the completed pairings one outbox offers, and produces a notification of each for
-    /// the owner's devices that existed before it.
+    /// the owner's devices whose grant reaches the moment it committed.
     ///
     /// The cursor is the outbox row's sequence, kept in this journal under a consumer of its own
     /// (`scope`) and committed with the events, so the outbox needs to keep nothing for it and a
     /// host that stops anywhere is handed the same pairings again, which the event keys absorb.
-    /// The device that paired is left out of what is produced at once; a pairing this host took
-    /// and stopped before it produced from is finished by [`Producer::finish_pending`] for every
-    /// destination its audience admits.
+    /// The device that paired is left out of what is produced, whether it is produced here or by
+    /// [`Producer::finish_pending`] after a stop, because the event's key names it.
     ///
     /// While privacy mode is on, the notification is the generic alert and nothing sealed, to push
     /// destinations only, admitted in the transaction that takes the event. A pairing whose
@@ -1097,9 +1101,7 @@ impl Producer {
             for event in events {
                 let notice = event.alert_only(privacy.generation);
                 let entry = if now_ms < notice.expires_at_ms.get() {
-                    self.alert(&notice, event.sequence, authority, now_ms, &|destination| {
-                        !event.is_the_device(destination)
-                    })?
+                    self.alert(&notice, event.sequence, authority, now_ms)?
                 } else {
                     PrivateEntry {
                         event: observed(
@@ -1156,12 +1158,7 @@ impl Producer {
             if now_ms >= notice.expires_at_ms.get() {
                 continue;
             }
-            let told: Vec<DestinationRecord> = destinations
-                .iter()
-                .filter(|destination| !event.is_the_device(destination))
-                .cloned()
-                .collect();
-            match self.produce(&notice, &told, authority, &event.lines(), now_ms) {
+            match self.produce(&notice, &destinations, authority, &event.lines(), now_ms) {
                 Ok(_)
                 // Left to the pass that finishes what was taken: it decides each of these.
                 | Err(
@@ -1246,7 +1243,7 @@ impl Producer {
         let mut spent = Vec::new();
         let mut staged_objects = Vec::new();
         for destination in destinations {
-            if !destination.enabled {
+            if !destination.enabled || is_the_paired_device(&notice.event, destination) {
                 continue;
             }
             let outcome = match &destination.destination {
@@ -4527,7 +4524,13 @@ mod tests {
         let event = a_pairing(5, new_device, 1_000);
 
         let taken = producer
-            .take_from_pairings(&[event.clone()], &authority, PAIRINGS, NO_PRIVACY, 1_500)
+            .take_from_pairings(
+                std::slice::from_ref(&event),
+                &authority,
+                PAIRINGS,
+                NO_PRIVACY,
+                1_500,
+            )
             .expect("a take");
         assert_eq!(taken.taken, 1);
         let told = |destination: &str| {
@@ -4699,5 +4702,43 @@ mod tests {
         assert_eq!(finished.admitted, 0);
         assert!(producer.journal().deliveries().expect("a read").is_empty());
         assert_eq!(producer.journal().pending_count().expect("a count"), 0);
+    }
+
+    /// KR-REQ-10.08: a pairing the host took and stopped before it produced from is finished by the
+    /// pass that finishes what was taken, and that pass leaves out the device that paired too.
+    #[test]
+    fn a_pairing_finished_after_a_stop_still_leaves_out_the_device_that_paired() {
+        let mut producer = producer();
+        let owner = device(20);
+        let new_device = device(22);
+        for id in [owner, new_device] {
+            let (record, _) = phone_of(id);
+            producer
+                .journal_mut()
+                .configure_destination(&record)
+                .expect("a destination");
+        }
+        let authority = OwnerDevices(
+            [owner.to_string(), new_device.to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let event = a_pairing(5, new_device, 1_000);
+        let taken = event
+            .notice()
+            .taken_with(event.sequence, event.lines())
+            .expect("an event record");
+        producer
+            .take(EventSource::Attention, PAIRINGS, &[taken], 5, 1_000)
+            .expect("a page");
+
+        let destinations = producer.journal().destinations().expect("a read");
+        let finished = producer
+            .finish_pending(&destinations, &authority, 1_500)
+            .expect("the pass that finishes what was taken");
+        assert_eq!(finished.admitted, 1);
+        let deliveries = producer.journal().deliveries().expect("a read");
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].destination_id.as_str(), owner.to_string());
     }
 }

@@ -357,6 +357,46 @@ impl Rig {
         read.reviews
     }
 
+    /// Every session's review state, as the owner reads it.
+    async fn every_review(&mut self) -> Vec<ReviewState> {
+        let read: ReviewReadResult = typed(
+            &self
+                .control
+                .request(
+                    Method::ReviewRead,
+                    &ReviewReadParams {
+                        session_id: Nullable::null(),
+                        subject: Nullable::null(),
+                        max_reviews: U64::new(50),
+                        after: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("review state reads"),
+        );
+        read.reviews
+    }
+
+    /// What changed in one session since the owner's last visit.
+    async fn changes_of(&mut self, session_id: SessionId) -> VisitChangedResult {
+        typed(
+            &self
+                .control
+                .request(
+                    Method::VisitChanged,
+                    &VisitChangedParams {
+                        session_id,
+                        max_changes: U64::new(50),
+                        summarise: false,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("the changed view is served"),
+        )
+    }
+
     /// Reads the review state until `done` says it is what the test waits for, each time a pass
     /// over the change-set store has finished.
     async fn reviews_when(&mut self, done: impl Fn(&[ReviewState]) -> bool) -> Vec<ReviewState> {
@@ -375,21 +415,8 @@ impl Rig {
     }
 
     async fn changes(&mut self) -> VisitChangedResult {
-        typed(
-            &self
-                .control
-                .request(
-                    Method::VisitChanged,
-                    &VisitChangedParams {
-                        session_id: self.session(),
-                        max_changes: U64::new(50),
-                        summarise: false,
-                    },
-                )
-                .await
-                .expect("the call reaches the daemon")
-                .expect("the changed view is served"),
-        )
+        let session_id = self.session();
+        self.changes_of(session_id).await
     }
 
     async fn acknowledge_review(&mut self, subject: &ReviewSubject, version: u64) {
@@ -462,21 +489,21 @@ async fn a_change_set_captured_for_a_held_session_is_review_work() {
     assert_eq!(state.acknowledged_version, Nullable::null());
 
     // The controls: a session the daemon does not hold and a capture for none. The pass is made
-    // after each capture has been recorded, so a subject that was going to appear has.
+    // after each capture has been recorded, so a subject that was going to appear has. The owner
+    // reads every session's review state, and the invented session's log of changes.
     let unheld = SessionId::new(kr_ipc::new_uuid());
     let _ = rig.capture(None, Some(unheld)).await;
     let _ = rig.capture(None, None).await;
     rig.settle().await.expect("the pass runs");
     assert_eq!(
-        rig.reviews().await.len(),
+        rig.every_review().await.len(),
         1,
         "a session this daemon does not hold, and no session, raise nothing"
     );
-    let unheld_subject = ReviewSubject::ChangeSet {
-        session_id: unheld,
-        change_set_id: captured.version.change_set_id,
-    };
-    assert!(state_of(&rig.reviews().await, &unheld_subject).is_none());
+    assert!(
+        rig.changes_of(unheld).await.changes.is_empty(),
+        "and the session this daemon does not hold has no change to visit"
+    );
     rig.host.stop().await;
 }
 
@@ -708,7 +735,7 @@ async fn a_derived_version_is_new_review_work() {
 }
 
 /// Refuses the attention store's writes of the environment's own semantic source, as a store whose
-/// disk is full does, and returns the connection that holds the fault.
+/// disk is full does.
 fn the_attention_store_refuses_the_semantic_source(host: &Host) {
     let store =
         rusqlite::Connection::open(host.attention_database()).expect("opens the attention store");
