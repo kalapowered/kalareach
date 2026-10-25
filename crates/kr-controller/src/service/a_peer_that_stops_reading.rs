@@ -57,7 +57,7 @@ async fn connected(controller: &Controller, endpoint: &kr_ipc::paths::Endpoint) 
     .await
     .expect("connects");
     until("the connection is registered", || {
-        !controller.admitted_table().is_empty()
+        !controller.admitted_read().is_empty()
     })
     .await;
     client
@@ -92,7 +92,7 @@ async fn a_peer_that_never_reads(which: &str) {
     })
     .await;
     until("the connection ended", || {
-        controller.admitted_table().is_empty()
+        controller.admitted_read().is_empty()
     })
     .await;
 }
@@ -133,7 +133,7 @@ async fn a_peer_that_reads_keeps_its_connection() {
         }
     }
     assert!(
-        !controller.admitted_table().is_empty(),
+        !controller.admitted_read().is_empty(),
         "the connection is still registered"
     );
 }

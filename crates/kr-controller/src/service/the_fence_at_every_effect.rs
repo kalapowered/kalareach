@@ -201,7 +201,7 @@ async fn a_registration_replaced_while_a_retry_waits_stops_its_retained_answer()
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
-        let mut registrations = controller.admitted_table();
+        let mut registrations = controller.admitted_write();
         for connection in registrations.values_mut() {
             connection.admitted_revision = revision;
         }
@@ -247,7 +247,7 @@ async fn another_devices_revocation_lands(controller: &Controller) {
     let revision = registry
         .authority_revision()
         .expect("the revision in force");
-    let mut registrations = controller.admitted_table();
+    let mut registrations = controller.admitted_write();
     for connection in registrations.values_mut() {
         connection.admitted_revision = revision;
     }
@@ -580,7 +580,7 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
         );
     }
 
-    controller.admitted_table().remove(&connection_id);
+    controller.admitted_write().remove(&connection_id);
     for method in methods {
         let answered = controller
             .write_method(
@@ -628,7 +628,7 @@ pub(super) fn a_paired_device(controller: &Controller) -> kr_protocol::actor::Ac
     let revision = controller.leases.authority_revision();
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor_id = ActorId::new("device:test").expect("a principal");
-    controller.admitted_table().insert(
+    controller.admitted_write().insert(
         connection_id,
         super::AdmittedConnection::new(actor_id.clone(), revision),
     );
@@ -985,7 +985,7 @@ async fn a_transfer_action_recorded_before_a_late_attempt_is_not_given_back_whil
         .await
         .expect("once the fence is gone it is answered again");
 
-    controller.admitted_table().remove(&connection_id);
+    controller.admitted_write().remove(&connection_id);
     let refused = late()
         .await
         .expect_err("a registration that is gone stops the retained answer");
@@ -1575,7 +1575,7 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
         "once the fence is gone it is answered again: {answered:?}"
     );
 
-    controller.admitted_table().remove(&connection_id);
+    controller.admitted_write().remove(&connection_id);
     let refused = attempt().await;
     assert_eq!(
         refusal(&refused)

@@ -1185,7 +1185,7 @@ impl Controller {
             if flag(&policy) == raised {
                 return false;
             }
-            let _table = raised.then(|| self.admitted_table());
+            let _table = raised.then(|| self.admitted_write());
             set(&mut policy, raised);
             if raised {
                 self.feed_refusal.raise(bit);
@@ -1334,7 +1334,7 @@ impl Controller {
         &self,
         connection: ConnectionId,
     ) -> Option<crate::grants::Refusal> {
-        self.feed_refusal_of(self.admitted_table().get(&connection))
+        self.feed_refusal_of(self.admitted_read().get(&connection))
     }
 
     /// Refuses with the feed's refusal for `standing` when one stands, for a remote path that

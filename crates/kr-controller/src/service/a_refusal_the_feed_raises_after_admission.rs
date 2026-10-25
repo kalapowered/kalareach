@@ -20,7 +20,7 @@ fn registered(controller: &Arc<Controller>) -> (AdmittedMutation, AdmittedMutati
     let remote = ConnectionId::new(kr_ipc::new_uuid());
     let local = ConnectionId::new(kr_ipc::new_uuid());
     let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
-    let mut table = controller.admitted_table();
+    let mut table = controller.admitted_write();
     table.insert(remote, AdmittedConnection::new(actor.clone(), revision));
     table.insert(
         local,
@@ -108,7 +108,7 @@ fn registered_under(controller: &Arc<Controller>, grant: Grant) -> AdmittedMutat
     let revision = controller.policy().authority_revision();
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
     let actor = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
-    controller.admitted_table().insert(
+    controller.admitted_write().insert(
         connection_id,
         AdmittedConnection::new(actor, revision).under(grant),
     );

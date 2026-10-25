@@ -122,7 +122,7 @@ impl Controller {
         // registration takes the same lock. The answer is the check every service asks from
         // inside its work: a fence this host owes and could not raise, the connection's
         // registration under the revision it was admitted at, then the deadline.
-        let registrations = self.admitted_table();
+        let registrations = self.admitted_read();
         self.check_registration_in(&registrations, &carried)?;
         installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
         drop(registrations);

@@ -654,8 +654,11 @@ impl CatalogueModule {
     /// The future is driven to its end on that one thread, a synchronisation's waits for the
     /// network included, so a change holds one thread for as long as it runs. It cannot be
     /// abandoned part way: a task that holds it is stopped only by the runtime ending, which waits
-    /// for it. Both routes that reach a change run it in a task of its own and wait for that task
-    /// with a bound, which leaves it running past the bound, so nothing aborts it.
+    /// for it. The network route runs a change in a task of its own and waits for that task with a
+    /// bound, and the local route runs it in a task of its own and waits for it without one; either
+    /// way nothing aborts a change that has begun. The plan of an installation a person confirms
+    /// is no change and is not run so: it is reached in the handler of the connection that asked,
+    /// and the connection's end is not seen until the plan's fetch of the manifest is over.
     async fn off_the_executor_async<W: std::future::Future>(&self, work: W) -> W::Output {
         #[cfg(feature = "testing")]
         let hook = self.testing_hook();
