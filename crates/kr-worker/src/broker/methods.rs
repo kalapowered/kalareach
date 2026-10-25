@@ -1383,7 +1383,8 @@ impl Broker {
     /// Everything [`Self::admit_approval`] checks is checked again here, under the one lock, now:
     /// the encoding took time, and a native answer that arrived meanwhile has resolved the request,
     /// the thread may have changed and the grant or the decoder's trust may be gone. The bytes are
-    /// adopted only if they pass the connection's checks of any response ([`Gateway::adopt_encoded`]).
+    /// adopted only if they pass the connection's checks of any response
+    /// ([`Gateway::adopt_encoded`](crate::broker::gateway::Gateway::adopt_encoded)).
     ///
     /// # Errors
     ///
