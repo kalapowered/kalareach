@@ -731,6 +731,24 @@ pub enum PrivacyCommand {
     /// Show where privacy mode stands: its generation, what is still owed, what is kept and what
     /// had already left this host.
     Status(PrivacyArguments),
+    /// Ask the service that holds a copy `status` lists under what had already left this host to
+    /// delete it. Typed at a terminal outside every session; privacy mode does not stop it.
+    Delete(PrivacyDeleteArguments),
+}
+
+/// `kr privacy delete`.
+#[derive(Args)]
+pub struct PrivacyDeleteArguments {
+    /// The copy, by the reference `kr privacy status` shows for it, such as
+    /// `<archive> generation 3`.
+    #[arg(required = true, num_args = 1..)]
+    pub reference: Vec<String>,
+    /// Do not ask for `delete` at the terminal. Refused inside a session.
+    #[arg(long)]
+    pub yes: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr privacy on`, `off` and `status`.

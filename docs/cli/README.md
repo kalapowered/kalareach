@@ -44,7 +44,7 @@ worker directly for what a session owns.
 | `kr share [invite/list/revoke/transfer]` | — | Share a session with a paired device, see who holds a share, take one back, or hand a session's control to another device |
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
-| `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
+| `kr privacy [on/off/status/delete]` | — | Turn this environment's privacy mode on or off, show where it stands, or ask the service to delete a copy that left this host |
 | `kr destination [list/configure/remove]` | — | The places this host sends notifications besides paired devices: a webhook, Slack, Discord, Telegram or email |
 | `kr account [sign-in/sign-out/show]` | — | Sign this host in to the managed account service, in a browser, sign it out, or show where the sign-in stands |
 | `kr host paths` | — | Show where this installation keeps its runtime files and its state |
@@ -1899,6 +1899,7 @@ Privacy mode is one switch for the whole environment, and only this host turns i
 kr privacy on        # stop retaining content, and clean up what this host kept
 kr privacy status    # where it stands, and what is still owed
 kr privacy off       # retention starts again, once the cleanup is complete
+kr privacy delete <reference>   # ask the service to delete a copy that left this host
 ```
 
 Turning privacy mode on records a new privacy generation before anything else happens, and then
@@ -1915,12 +1916,28 @@ removed comes back when it is turned off.
 
 Use `kr privacy status` to also show what data will be retained on this host while in privacy mode
 (and why), and what has left this host (backup archives and notifications, each with whether this
-host holds any way to ask for its removal). This command does not change anything. Other devices
+host holds any way to ask for its removal, and for a copy it can, the command that asks). This
+command does not change anything. Other devices
 paired with this host that are granted `host.manage` can read the same report, but no device can
 enable or disable privacy mode. Other devices that are not granted `host.manage` will see only
 whether the host is in privacy mode, what generation it is at, and whether the host indicates it is
 changing privacy mode, as part of `host.info`. For more information on what each step does, and what
 privacy mode does not affect, see `docs/host/README.md`.
+
+`kr privacy delete <reference>` asks the storage service to delete one backup generation that
+`kr privacy status` lists as deletable. Write the reference as the status shows it, for example
+`kr privacy delete 7c1e2d90-0b0e-4f6e-9d6a-1f2b3c4d5e6f generation 3`. It runs outside every
+session, whose worker keeps its output and whose agent could read what it prints, and it is refused
+inside one, with or without `--yes`. It prints what is asked, including that nothing restores from
+the generation afterwards and that, if it was the newest, no restore works until this host makes its
+next backup (which it does once privacy mode is off), and then waits for you to type `delete` at the
+terminal. `--yes` skips that question and is the form for a script outside a session. The host
+reads its list again and refuses a reference that is not listed as deletable. Privacy mode does not
+stop the command. When the service confirms every object, the command prints that and exits with 0.
+When it has not, the command exits with 1 and `RESOURCE_UNAVAILABLE`: the request is written down,
+and running the same command again asks again, or this host sends it once privacy mode is off.
+`--json` prints `{ "ok": ..., "deleted": ..., "report": ... }`, the report in the shape
+`kr privacy status --json` prints.
 
 ## `kr destination`
 

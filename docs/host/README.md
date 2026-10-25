@@ -4889,27 +4889,50 @@ What has already left the host is shown rather than erased. An uploaded archive 
 archive and generation; so is one whose outcome this host could not establish, because a copy it
 cannot account for is still a copy; and so is object ciphertext a service acknowledged for a
 generation whose descriptor was never published, because those bytes are there whether or not an
-archive was ever completed from them. The backup service marks them **not** deletable, and that
-mark is the plain truth about what the host can do: it holds no route through which it could ask a
-service to remove a copy, so it offers no deletion action for one and says so instead of offering
-an action nothing here can perform. A person who wants such a copy removed asks the service that
-holds it. A notification or another artifact this host does hold a reference to is listed with an
-action; backup does not silently delete unrelated collections and does not claim a copy somebody
-else holds can be recalled. Local deletion is logical cleanup of this host's own records rather
-than a
-claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
-says the bytes are unrecoverable from the device they were on.
+archive was ever completed from them. The backup service marks an archive deletable when the
+person's own deletion of it would be accepted now (below), and not deletable when it would not. The
+ciphertext of a generation whose descriptor was never published is not deletable: its store records
+no deletion of such objects, the entry's kind says so, and a person who wants that copy removed asks
+the service that holds it. A notification a provider queued is listed and is not deletable, because
+this host holds no way to ask the provider to forget it. Backup does not silently delete unrelated
+collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical cleanup of this host's own
+records rather than a claim of physical secure erase: the files are unlinked and the rows are
+cleared, and nothing here says the bytes are unrecoverable from the device they were on.
 
-`privacy.retained.delete` is the separately authorised action that asks for one of those copies to be
-deleted. It is its own call, apart from turning privacy mode on, it is served on the owner's socket
-at the host only, no paired device can make it, and it needs `host.manage`. Privacy mode does not
-stop it: privacy mode is why the copy is listed. The call names the copy by the `reference` the
-`exported` list of `privacy.status` shows for it, and the host does not trust the text: it reads the
-list again and acts only when exactly one entry has that reference and the entry is marked
-deletable. Any other reference is refused. The answer is `deleted`, true once the service has said
-it no longer holds the copy and false while the request has been made and not answered, and the
-report as it stands. The call keeps no record of its action, so asking again for the same copy asks
-the service again, which is safe.
+`privacy.retained.delete` is the separately authorised action that asks the service to delete one of
+those copies. It is its own call, apart from turning privacy mode on. It is served on the owner's
+socket at the host only, so no paired device can make it, and it needs `host.manage`. Privacy mode
+does not stop it: privacy mode is why the copy is listed. The call names the copy by the `reference`
+the `exported` list of `privacy.status` shows for it, and the host does not trust the text. It reads
+the list again and acts only when exactly one entry has that reference and the entry is marked
+deletable. A reference the list does not hold is refused as `INVALID_ARGUMENT`, and a copy marked
+non-deletable as `PERMISSION_DENIED`.
+
+For a backup generation the host's store decides, in the write that records the request. The
+generation belongs to the archive of this host's setup, and the writer that signed it is still
+enrolled. It is published, or its production ended with the outcome unknown while a newer generation
+of the archive is published, because a publication of it landing later would otherwise name objects
+that are gone. No attempt or upload of it is open, and no other generation names one of its objects.
+The line privacy mode draws under a generation, and the fence while it stands, are not reasons to
+refuse. The store writes down a deletion of every object of the generation in one transaction before
+any request leaves, and the carrier then sends the requests, under a fence too. While a fence stands
+the carrier sends nothing else: a deletion the host decided on for itself before privacy mode came
+on waits until privacy mode is off.
+
+The answer is `deleted` and the report. `deleted` is true once the service has confirmed every
+object, and false while some are asked and not confirmed. The call waits for the first pass of the
+carrier that begins after the request is written down, and no longer than thirty seconds. A copy in
+the second state is listed as deletion asked and not yet confirmed, and stays deletable: asking
+again sends what is unanswered. Without a second ask the carrier sends it once privacy mode is off,
+also after a restart, because the written-down request is what survives. The call keeps no record of
+its action, so asking again for the same copy asks the service again, which is safe.
+
+A generation whose deletion is written down is no backup the host has. Retention keeps the newest
+generations that are not being deleted, so deleting the newest does not let the one before it go.
+When the newest generation is the one deleted, the producer makes the next one at its first pass
+after privacy mode is off, whatever has changed and however recently the deleted one was made, and
+until then no restore works: the restore takes the newest publication, and the service prunes
+nothing.
 
 Copies held by authorised viewers are listed with the rest of what has left the host, because a device
 that was let see a session may hold what it was shown, on a screen or in its own scrollback, and this
