@@ -40,6 +40,9 @@
 //! visits, presents again only when the lease the host holds is due to be replaced
 //! ([`LeaseKeeper::present_if_due`]): every presentation is an action the host records and never
 //! removes, so one a pass would write a row on each host for as long as the connection is kept.
+//! The lease the host took stays the keeper's until the host takes the next one, so a renewal that
+//! fails (the service does not answer, the chain of keys cannot be read, or the host refuses the
+//! new lease for a cause time mends) leaves the connection on the lease it has while that lasts.
 //!
 //! A keeper belongs to the account that was signed in when it was made. The service client checks
 //! which account is signed in before the keeper asks for a lease and again before it presents one,
@@ -389,8 +392,11 @@ struct Kept {
     /// The highest key revision a lease the host accepted was signed with. A lease signed by a
     /// higher one travels with the chain that brings the revision in.
     followed: u64,
-    /// The lease last got, and whether the host took it.
-    lease: Option<Held>,
+    /// The lease the host took last, which it holds until that lease ends. A lease the service
+    /// gives since waits beside it, not in its place, until the host takes the new one.
+    accepted: Option<Held>,
+    /// The lease last got from the service that the host has not taken yet.
+    pending: Option<Held>,
     /// Whether the host has taken a lease from this keeper that nothing has spoiled since.
     took_a_lease: bool,
     /// A stop that sends nothing until the moment it names, in UTC milliseconds.
@@ -398,6 +404,33 @@ struct Kept {
     /// No request goes to the service before this moment, in UTC milliseconds: the keeper is
     /// waiting out a failure or a delay the service named, and every connection waits with it.
     not_before_ms: u64,
+}
+
+impl Kept {
+    /// The lease to present again as it is at `now_ms`: one the host has not taken yet, and
+    /// otherwise the one it took, where `reuse` allows that.
+    fn reusable(&self, now_ms: u64, reuse: Reuse) -> Option<Held> {
+        self.pending
+            .iter()
+            .chain(&self.accepted)
+            .find(|held| held.usable(now_ms, reuse))
+            .cloned()
+    }
+
+    /// The lease last got, whether the host took it or not.
+    fn newest(&self) -> Option<&Held> {
+        self.pending.as_ref().or(self.accepted.as_ref())
+    }
+
+    /// Lets go of `held`, a lease the host refused in a way that asking for it again does not
+    /// mend, and of no other: the host may have taken a newer one meanwhile.
+    fn drop_lease(&mut self, held: &Held) {
+        for slot in [&mut self.pending, &mut self.accepted] {
+            if slot.as_ref().is_some_and(|kept| kept.lease == held.lease) {
+                *slot = None;
+            }
+        }
+    }
 }
 
 /// Keeps one organisation's lease for one device on one host.
@@ -503,9 +536,10 @@ impl LeaseKeeper {
     ///
     /// A presentation is an action the host records and keeps, so a connection that presented
     /// again at each use would write a row on the host for each. A new lease is asked for once, with
-    /// no waits; when it cannot be got while the lease the host holds still lasts, that is no
-    /// failure of the connection, and the service is not asked again until what was held against it
-    /// is over.
+    /// no waits. When it cannot be got, or the host will not take it for a cause time mends, that is
+    /// no failure of the connection while the lease the host holds still lasts: that lease stays in
+    /// place until the host takes the new one, and the service is not asked again until what was
+    /// held against it is over.
     ///
     /// # Errors
     ///
@@ -553,8 +587,7 @@ impl LeaseKeeper {
     fn due(&self) -> bool {
         let now = self.timer.now_ms();
         self.kept()
-            .lease
-            .as_ref()
+            .newest()
             .is_none_or(|held| held.due_at_ms.is_none_or(|due| due <= now))
     }
 
@@ -562,21 +595,20 @@ impl LeaseKeeper {
     fn until_due(&self) -> Duration {
         let now = self.timer.now_ms();
         self.kept()
-            .lease
-            .as_ref()
+            .newest()
             .and_then(|held| held.due_at_ms)
             .map_or(SHORTEST_REFRESH, |due| {
                 clamp(Duration::from_millis(due.saturating_sub(now)))
             })
     }
 
-    /// How long the lease the host holds has left, when it holds one this keeper presented.
+    /// How long the lease the host holds has left, when it holds one this keeper presented. A lease
+    /// the service gave since, which the host has not taken, is not it.
     fn left_on_the_lease(&self) -> Option<Duration> {
         let now = self.timer.now_ms();
         self.kept()
-            .lease
+            .accepted
             .as_ref()
-            .filter(|held| held.due_at_ms.is_some())
             .map(|held| Duration::from_millis(held.ends_at_ms.saturating_sub(now)))
     }
 
@@ -620,13 +652,6 @@ impl LeaseKeeper {
                 }
                 Err(next) => next,
             };
-            if matches!(
-                next,
-                Next::Now | Next::BackOffWithTheChain | Next::Mistrusted(_)
-            ) {
-                // The host will not take this lease again, with a chain or without.
-                self.kept().lease = None;
-            }
             let wait = match next {
                 Next::Now => None,
                 Next::WithTheChain => {
@@ -692,7 +717,8 @@ impl LeaseKeeper {
         {
             let mut kept = self.kept();
             if stop.spoils_the_lease() {
-                kept.lease = None;
+                kept.accepted = None;
+                kept.pending = None;
                 kept.took_a_lease = false;
             }
             let held = stop.holds_for();
@@ -795,11 +821,7 @@ impl LeaseKeeper {
         self.account_is_the_same()?;
         let reusable = {
             let now = self.timer.now_ms();
-            self.kept()
-                .lease
-                .as_ref()
-                .filter(|held| held.usable(now, reuse))
-                .cloned()
+            self.kept().reusable(now, reuse)
         };
         let fresh = reusable.is_none();
         let mut held = if let Some(held) = reusable {
@@ -820,7 +842,8 @@ impl LeaseKeeper {
                 advised: issued.refresh_after,
                 due_at_ms: None,
             };
-            self.kept().lease = Some(held.clone());
+            // The lease the host holds stays in its place until the host takes this one.
+            self.kept().pending = Some(held.clone());
             held
         };
         let revision = held.lease.payload.key_revision.get();
@@ -856,7 +879,18 @@ impl LeaseKeeper {
             )
             .await
             .and_then(|settled| settled.to_typed())
-            .map_err(|error| from_the_host(&error, presented))?;
+            .map_err(|error| {
+                let next = from_the_host(&error, presented);
+                if matches!(
+                    next,
+                    Next::Now | Next::BackOffWithTheChain | Next::Mistrusted(_)
+                ) {
+                    // The host will not take this lease again, with a chain or without; the lease
+                    // it holds, if this was another, is still its own.
+                    self.kept().drop_lease(&held);
+                }
+                next
+            })?;
         let now = self.timer.now_ms();
         let due = held
             .due_at_ms
@@ -865,7 +899,14 @@ impl LeaseKeeper {
         {
             let mut kept = self.kept();
             kept.followed = kept.followed.max(taken.key_revision.get()).max(revision);
-            kept.lease = Some(held.clone());
+            if kept
+                .pending
+                .as_ref()
+                .is_some_and(|waiting| waiting.lease == held.lease)
+            {
+                kept.pending = None;
+            }
+            kept.accepted = Some(held.clone());
             kept.took_a_lease = true;
         }
         (self.report)(LeaseEvent::Held {
