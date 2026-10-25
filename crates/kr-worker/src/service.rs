@@ -8056,8 +8056,8 @@ impl WorkerService {
             };
             return Err(WorkerError::PermissionDenied {
                 detail: format!(
-                    "this host does not serve retained history to {refused} that sent no history \
-                     scope"
+                    "this host does not serve retained history to {refused} whose read came with no \
+                     history scope"
                 ),
             });
         };

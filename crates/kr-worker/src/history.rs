@@ -1153,17 +1153,30 @@ impl OutputHistory {
         let mut page = self.page(from_cursor.max(floor), max_bytes)?;
         let oldest = page.oldest_retained_cursor.get();
         page.oldest_retained_cursor = U64::new(oldest.max(floor));
+        // What the page's own gap says about output before the reach is not the reader's to be
+        // told: it begins no earlier than the reach, and a gap wholly before it says nothing.
+        if let Some(gap) = page.gap.0.as_mut() {
+            gap.from_cursor = U64::new(gap.from_cursor.get().max(floor));
+        }
+        page.gap = Nullable(
+            page.gap
+                .0
+                .filter(|gap| gap.from_cursor.get() < gap.to_cursor.get()),
+        );
         if from_cursor < floor {
             // The reader began before its reach, so nothing of what it asked for first is served:
             // the page begins at the reach, or later where retention or a hole took more, and the
-            // gap runs from where the reader began to where the page does. It carries the cause
-            // this host recorded only when retention had taken the reach as well, which is the
-            // reader's gap as any reader would be told it.
-            let cause = page.gap.0.as_ref().and_then(|gap| gap.cause);
+            // gap runs from where the reader began to where the page does. It names a cause only
+            // when what this host recorded took some of what the reach covers.
+            let cause = page
+                .gap
+                .0
+                .as_ref()
+                .and_then(|gap| gap.cause.filter(|_| gap.to_cursor.get() > floor));
             page.gap = Nullable(Some(HistoryGap {
                 from_cursor: U64::new(from_cursor),
                 to_cursor: page.from_cursor,
-                cause: cause.filter(|_| floor < oldest),
+                cause,
             }));
         }
         Ok(page)
@@ -3288,6 +3301,34 @@ mod tests {
         let gap = page.gap.0.expect("a gap");
         assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, reach));
         assert_eq!(gap.cause, None, "nothing took what the reach leaves out");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_range_this_host_cannot_account_for_is_named_only_where_it_reaches_into_the_readers_reach()
+    {
+        let directory = spool_directory("reach-unaccounted");
+        let mut history =
+            OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        history.append(&[b'z'; 64]);
+        history.spool.as_mut().expect("a spool").unreadable_boundary = true;
+
+        // The host cannot say what lies before its oldest cursor, which is before the reach: the
+        // reader is told what its own reach leaves out and nothing of the range it could not read.
+        let page = history.page_within(0, 64, Reach::From(16)).expect("a page");
+        let gap = page
+            .gap
+            .0
+            .expect("the reader's reach begins after the start");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 16));
+        assert_eq!(gap.cause, None);
+        // Asked from inside its reach, the same host has nothing to say of what lies before it.
+        let page = history
+            .page_within(20, 64, Reach::From(16))
+            .expect("a page");
+        assert!(page.gap.0.is_none(), "{:?}", page.gap);
+        assert_eq!(page.from_cursor.get(), 20);
         std::fs::remove_dir_all(&directory).ok();
     }
 
