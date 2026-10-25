@@ -200,6 +200,9 @@ pub struct Framed {
     pub queries: usize,
     pub side_effects: usize,
     pub graphics: usize,
+    /// Sequences the class table approves and the grid library does not implement, which the
+    /// engine consumes. They break no invariant; the figure is how often a stream reaches one.
+    pub unrecognised: u64,
 }
 
 impl Framed {
@@ -207,6 +210,7 @@ impl Framed {
         self.queries += other.queries;
         self.side_effects += other.side_effects;
         self.graphics += other.graphics;
+        self.unrecognised += other.unrecognised;
     }
 }
 
@@ -513,7 +517,8 @@ pub fn check_stream(stream: &Stream, size: GridSize) -> (Vec<Violation>, Framed)
     let bytes = &stream.bytes;
     let events = observe::lex(bytes);
     let whole = observe::feed_whole(bytes, size);
-    let (mut found, framed) = forwarded_set_is_safe(stream, &events, &whole, size);
+    let (mut found, mut framed) = forwarded_set_is_safe(stream, &events, &whole, size);
+    framed.unrecognised = whole.unrecognised;
     found.extend(events_cover_the_stream(bytes, &events));
     found.extend(the_engine_is_in_its_bounds(&whole));
     for how in 1..crate::generator::SPLITS {
