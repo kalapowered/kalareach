@@ -18,7 +18,24 @@
 //!   the `worker-surface.json` each release committed: a renamed event or a method no longer
 //!   served changes no definition. A release before that file has no tables to compare, so they
 //!   are left out for it and the run says so;
-//! * the protocol the plugin host speaks and the table of public majors.
+//! * the protocol the plugin host speaks and the table of public majors;
+//! * the whole protocol schema, every definition a root, which is what a client built from the
+//!   protocol package reads: a member or a variant added to an existing definition, and anything
+//!   removed or changed, is a difference. A definition that is new, a variant added to `Method`
+//!   (a host of the same level answers a method it does not list with `PERMISSION_DENIED`, and a
+//!   client that meets that refusal for a method that is new asks the host a method its level has
+//!   before it takes the refusal for a lack of rights) and an optional member added to an object
+//!   the earlier release marked read-only metadata are not;
+//! * the plugin SDK schema, from the committed file of each release and of this commit, held to
+//!   the same rule. The file is generated, and `kr-plugin-sdk-gen --check` holds the committed
+//!   one equal to the generated one. A release of the level without the file, or a file that does
+//!   not read, fails the check.
+//!
+//! What it does not see: the `kr-plugin-host/3` frames, which have no schema; the types a
+//! daemon-served method names only in its description; rules that live in code; the hand-written
+//! TypeScript exports; `package-contract.json` and the component interface. A difference it
+//! fails on that is harmless takes a cut or a reviewed change of the comparison in
+//! `public_contract.rs`.
 //!
 //! It fails closed. It cannot list origin's tags, this checkout's tags are not origin's, a release's
 //! tree cannot be read, or a source is in a form it does not read: each is a failure with its own
@@ -34,6 +51,7 @@ use kr_protocol::update::CompatibilityLevel;
 use kr_protocol::worker_surface;
 use serde_json::Value;
 
+use crate::public_contract::compare_for_a_level;
 use crate::releases::{
     Release, agree_with_origin, file_at, git_in, inventory, kept, package_version_at,
     surface_roots_at,
@@ -45,6 +63,9 @@ pub const WORKER_SURFACE_PATH: &str = "crates/kr-protocol/worker-surface.json";
 
 /// Where a release keeps its generated schema.
 pub const SCHEMA_PATH: &str = "packages/protocol/schema/kalareach-protocol.schema.json";
+
+/// Where a release keeps the schema of the plugin SDK, from the root of the repository.
+pub const SDK_SCHEMA_PATH: &str = "packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json";
 
 /// The tables of what a worker serves, as a release committed them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +141,8 @@ pub struct Head {
     pub level: CompatibilityLevel,
     /// Its generated schema.
     pub schema: Value,
+    /// The plugin SDK schema it committed.
+    pub sdk_schema: Value,
     /// What it serves.
     pub worker: WorkerSurface,
     /// The protocol its plugin host speaks.
@@ -143,10 +166,18 @@ impl Head {
                  in a clean checkout of the commit to release"
             ));
         }
+        let sdk_schema = file_at(repository, commit, SDK_SCHEMA_PATH)
+            .map_err(|error| format!("{SDK_SCHEMA_PATH} at {commit} cannot be read: {error}"))?
+            .ok_or_else(|| format!("{commit} has no {SDK_SCHEMA_PATH}"))
+            .and_then(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|error| format!("{SDK_SCHEMA_PATH} at {commit}: {error}"))
+            })?;
         Ok(Self {
             commit: commit.to_owned(),
             level: CompatibilityLevel::of(PACKAGE_VERSION),
             schema: kr_protocol::schema::protocol_schema(),
+            sdk_schema,
             worker: WorkerSurface::parse(&worker_surface::document())?,
             plugin_host: PLUGIN_HOST_PROTOCOL.to_owned(),
             public_majors: expected_public_majors_in(repository, commit)?,
@@ -259,8 +290,10 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
         });
     }
     Err(format!(
-        "{}\na level is one surface: a change to it after the level's first release moves the level \
-         in the train that makes it, with its cut (docs/releases/support-window.md)",
+        "{}\na level is one surface and one public contract: a change to either after the level's \
+         first release moves the level in the train that makes it, with its cut \
+         (docs/releases/packages.md, \"A level is one surface\"); a difference that is harmless \
+         takes a cut or a reviewed change of the comparison",
         problems.join("\n")
     ))
 }
@@ -313,6 +346,28 @@ fn compare(
         .iter()
         .map(ToString::to_string)
         .collect();
+    // The whole schema, which a client of the protocol package reads, and the plugin SDK schema.
+    // A difference both comparisons report is one line.
+    for line in compare_for_a_level(&schema, &head.schema)
+        .map_err(|error| format!("the schema of {tag}: {error}"))?
+    {
+        if !found.contains(&line) {
+            found.push(line);
+        }
+    }
+    let sdk_text = file_at(repository, &release.commit, SDK_SCHEMA_PATH)
+        .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag} cannot be read: {error}"))?
+        .ok_or_else(|| {
+            format!("{tag} has no {SDK_SCHEMA_PATH}, so the plugin SDK schema cannot be compared with it")
+        })?;
+    let sdk: Value = serde_json::from_str(&sdk_text)
+        .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag}: {error}"))?;
+    found.extend(
+        compare_for_a_level(&sdk, &head.sdk_schema)
+            .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
+            .into_iter()
+            .map(|line| format!("the plugin SDK schema: {line}")),
+    );
     let host = plugin_host_in(repository, &release.commit)?;
     if host != head.plugin_host {
         found.push(format!(

@@ -149,15 +149,39 @@ The shell bridge's `root.*` methods are not in it, and neither are the hook's re
 a session launched, which have releases of their own. Nothing checks that a hook of one release
 works with a worker of another at the same level; the upgrade suite does not drive one yet.
 
+A level is also the public contract of the protocol package: a client built from the package meets
+a host of its own level, and the Rust types refuse a member or a value they do not know. Three
+statements say what moves the level:
+
+1. A new method with its own parameter and result types, served by the daemon, keeps the level. A
+   host of the same level answers a method it does not list with `PERMISSION_DENIED`. A client that
+   gets that refusal for a method that is new in its level therefore asks a method the host's level
+   has, under the same right, as `kr export` does for `history.times`. If that is answered, the
+   host is too old for the new method. Only if it is refused too does the client show the refusal
+   as a lack of rights. A new method that a worker serves is a row in the worker tables and moves
+   the level.
+2. A new member or value of an existing type moves the level, in a request as in an answer, and in a
+   closed enumeration an answer can carry. The exception is an optional member added to an object
+   that carries `x-kalareach-read-only-metadata`. A member, a variant or a definition that is
+   removed moves the level too.
+3. A store of its own at version 1, and a store that reads the next version without writing it,
+   move no level.
+
 `kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with `git
 ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares the
 commit with every release at its level, whether or not the commit's history reaches it. It fails
 naming the release and each difference, in the schema
 (cut over both revisions' roots, so that a root that was dropped cannot hide a change), in the
 tables of what the worker serves (renaming an event, or serving a method no longer, changes no
-definition of the schema), in the plugin host protocol and in the table of public majors. A release
-from before `worker-surface.json` has no table to compare, so its tables are left out and its schema, plugin
-host protocol and table of public majors are compared; the check says so. When no
+definition of the schema), in the plugin host protocol and in the table of public majors. It also
+compares the protocol schema as a whole, every definition a root, and the plugin SDK schema
+(`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
+commit and of each release) with the same rule as the public contract below, and fails on each
+difference except a variant added to `Method`, a definition that is new, and an optional member
+added to an object the earlier release marked read-only metadata. Descriptions and titles are
+ignored. A release from before `worker-surface.json` has no table to compare, so its tables are
+left out and its schema, plugin host protocol and table of public majors are compared; a release
+from before the SDK schema file is compared without it; the check says so. When no
 release is at the commit's level, the commit moves it, and the check runs
 `scripts/check-retained-release.sh` in the same run.
 
@@ -167,6 +191,14 @@ a release out. A tag that only one side has at the commit under test is left out
 because a release tags a commit after it lands. Fetch the tags first with the command in the
 procedure above, which also removes a tag that origin no longer has; delete a tag that only this
 checkout has with `git tag -d`.
+
+The check does not see the frames of `kr-plugin-host/3`, which have no schema, the types a
+daemon-served method names only in its description, rules that live in code, the hand-written
+TypeScript exports, `package-contract.json` and the component interface. A difference it fails on
+that is harmless, such as a tighter bound in an answer, a read-only marker added to an object, a
+renamed type or a new generated form of the schema, takes a cut, or a reviewed change of the
+comparison in `crates/kr-protocol/src/bin/kr-protocol-gen/public_contract.rs` in a commit of its
+own.
 
 core-ci runs the check in its `rust` job, and `package-release.yml` runs it before it packs and
 again, after a new fetch, just before it publishes. Run it before the tag too, as the procedure above
@@ -432,8 +464,11 @@ Bump the version when the generated output changes in a way a consumer cannot ta
 its own code. That includes a type or export that was removed or renamed, a field whose shape
 changed, an optional field that became required, and a new variant in a closed union, which breaks
 any consumer that handles the previous variants exhaustively. While the version is below `1.0.0`
-that is a minor bump. A change that only adds an independent type keeps the version; the commit in
-the tag and in each archive's name already tells two releases apart.
+that is a minor bump. A change that only adds an independent type keeps the version, and so does a
+new method that the daemon serves, with parameter and result types of its own: its variant in
+`Method` is the one new variant in a closed union that does not bump, because a client tells a host
+that does not know the method from a grant that lacks the right (statement 1 of "A level is one
+surface"). The commit in the tag and in each archive's name already tells two releases apart.
 
 A new member of an existing type takes that bump too, an optional member included. The Rust types
 refuse a member they do not know, those of a session's local path among them, so a build without

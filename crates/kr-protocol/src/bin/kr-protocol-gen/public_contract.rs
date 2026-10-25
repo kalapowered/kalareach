@@ -27,7 +27,7 @@
 //! It fails closed in both states when it cannot read what it compares: origin's tags, a release's
 //! schema, the record of the freeze.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use kr_protocol::retained::{Difference, DifferenceKind, differences};
@@ -82,13 +82,9 @@ fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
     marked && !required
 }
 
-/// Compares the head's schema with one release's: each difference an earlier reader could not
-/// read, as a line.
-///
-/// # Errors
-///
-/// When a schema cannot be cut.
-pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
+/// Every difference between one release's schema and the head's, with every definition a root,
+/// that an earlier reader could not read.
+fn rejected(old: &Value, new: &Value) -> Result<Vec<Difference>, String> {
     let names = |schema: &Value| -> BTreeSet<String> {
         schema["$defs"]
             .as_object()
@@ -99,8 +95,80 @@ pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
     let before = cut_over(old, &roots).map_err(|error| error.to_string())?;
     let after = cut_over(new, &roots).map_err(|error| error.to_string())?;
     Ok(differences(&before, &after)
-        .iter()
+        .into_iter()
         .filter(|difference| !accepted(old, new, difference))
+        .collect())
+}
+
+/// Compares the head's schema with one release's: each difference an earlier reader could not
+/// read, as a line.
+///
+/// # Errors
+///
+/// When a schema cannot be cut.
+pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
+    Ok(rejected(old, new)?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// The method names the `Method` definition of `schema` lists as plain string constants, each with
+/// how many branches name it.
+fn method_names(schema: &Value) -> BTreeMap<String, usize> {
+    let mut names = BTreeMap::new();
+    for branch in schema["$defs"]["Method"]["oneOf"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = branch.get("const").and_then(Value::as_str) {
+            *names.entry(name.to_owned()).or_insert(0) += 1;
+        }
+    }
+    names
+}
+
+/// Whether `difference` is one new method: a branch of `Method` that is only a string constant,
+/// whose name no branch of the earlier schema had and that no other branch of the new one has.
+/// Another addition under `Method`, a second branch with a name it already had, and a branch that
+/// says more than its name are not.
+fn is_an_added_method(old: &Value, new: &Value, difference: &Difference) -> bool {
+    if difference.kind != DifferenceKind::Added || difference.detail != "a variant" {
+        return false;
+    }
+    let Some(name) = difference.at.strip_prefix("Method#const:") else {
+        return false;
+    };
+    let plain = new["$defs"]["Method"]["oneOf"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|branch| branch.get("const").and_then(Value::as_str) == Some(name))
+        .all(|branch| {
+            branch.get("type").and_then(Value::as_str) == Some("string")
+                && branch.as_object().is_some_and(|members| {
+                    members.keys().all(|key| {
+                        ["const", "type", "description", "title"].contains(&key.as_str())
+                    })
+                })
+        });
+    plain && method_names(new).get(name) == Some(&1) && !method_names(old).contains_key(name)
+}
+
+/// As [`compare`], for the check of a level: the differences that fail a commit that stays at the
+/// level. A method a daemon serves keeps the level, because a host of the same level answers a
+/// method it does not list with `PERMISSION_DENIED` and a client that meets that refusal for a
+/// method that is new tells it from a lack of rights, so a new variant of `Method` is not a
+/// difference here. It is one for `--public-contract`, which reports it.
+///
+/// # Errors
+///
+/// When a schema cannot be cut.
+pub fn compare_for_a_level(old: &Value, new: &Value) -> Result<Vec<String>, String> {
+    Ok(rejected(old, new)?
+        .iter()
+        .filter(|difference| !is_an_added_method(old, new, difference))
         .map(ToString::to_string)
         .collect())
 }
