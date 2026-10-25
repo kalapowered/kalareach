@@ -685,8 +685,8 @@ async fn kr_req_11_33_a_trust_withdrawn_while_the_component_encodes_leaves_the_a
 /// of these is refused by the core with nothing sent: an answer to another request, to the right
 /// one with its identifier as another JSON type, one that is a request, one that is an error, one
 /// that is both a result and an error, one that names a member twice, at the top or inside the
-/// result, and one that holds a line break. The request stays the opaque one it was, the terminal answers it, and the binding's
-/// report says only that the bytes were not an answer.
+/// result, and one that holds a line break. The request stays the opaque one it was, the terminal
+/// answers it, and the binding's report says only that the bytes were not an answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_and_nothing_is_sent()
 {
@@ -711,21 +711,37 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
         world.send(&request_noting(number, marker));
         let approval = approved(&world, &number.to_string()).await;
         // Whatever the bytes spoil, nothing at all is written to the upstream: a line that names
-        // another request, or none, is not found by the request's own identifier.
+        // another request, or none, is not found by the request's own identifier. The upstream's
+        // lines are recorded in the order they were written, so once the terminal's own answer is
+        // recorded, anything the refused answer wrote would be recorded before it.
         let written = world.written.lock().expect("not poisoned").len();
         let outcome = world
             .respond(&mut owner, approval.resource_id, "allow")
             .await;
         failed_with(&outcome);
-        let lines = world.written.lock().expect("not poisoned").clone();
+        world.terminal.write(&answer(number)).await;
+        let expected = answer(number);
+        let lines = until(
+            "the terminal's answer to be written to the upstream",
+            || async {
+                let lines = world.written.lock().expect("not poisoned").clone();
+                lines
+                    .iter()
+                    .skip(written)
+                    .any(|line| {
+                        serde_json::from_str::<serde_json::Value>(line)
+                            .is_ok_and(|seen| seen == expected)
+                    })
+                    .then_some(lines)
+            },
+        )
+        .await;
         assert_eq!(
             lines.len(),
-            written,
-            "{marker} was sent: {:?}",
+            written + 1,
+            "{marker} was sent before the terminal's answer: {:?}",
             &lines[written..]
         );
-        world.terminal.write(&answer(number)).await;
-        until_answered(&world, number).await;
     }
     let reason = world.reason(1);
     assert!(

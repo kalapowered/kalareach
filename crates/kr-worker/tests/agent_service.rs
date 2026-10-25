@@ -2562,6 +2562,8 @@ async fn kr_req_09_05_a_reply_after_the_deadline_to_a_package_action_is_kept_as_
         receipt(&mut client, action_id).await.state,
         ReceiptState::Unknown
     );
+    // Waits until the upstream has read the request, whose record the reader task keeps.
+    let id = transport.identifier_of(1).await;
     assert!(
         transport
             .read
@@ -2570,7 +2572,6 @@ async fn kr_req_09_05_a_reply_after_the_deadline_to_a_package_action_is_kept_as_
             .contains("turn/interrupt"),
         "the cancellation reached the upstream"
     );
-    let id = transport.identifier_of(1).await;
     transport
         .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
         .await
