@@ -19,19 +19,15 @@
 //! yet locked it would give two claimants two files. A sweep needs the claimant to check, once it
 //! holds the lock, that the path still names the file it locked.
 
-use std::fs::{File, TryLockError};
-use std::path::PathBuf;
-
 use kr_ipc::paths::HostPaths;
 use sha2::{Digest, Sha256};
+use std::fs::{File, TryLockError};
 
 /// Where the claims on saved conversations are made.
 #[derive(Clone, Debug)]
 pub struct HostClaims {
-    /// The state root, which the claims directory is made below and checked against.
-    root: PathBuf,
-    /// The directory the lock files are in.
-    directory: PathBuf,
+    /// The roots the claims directory is made below and checked against, and its path.
+    paths: HostPaths,
 }
 
 /// Why a claim was not made.
@@ -66,8 +62,7 @@ impl HostClaims {
     #[must_use]
     pub fn new(paths: &HostPaths) -> Self {
         Self {
-            root: paths.state_root().to_path_buf(),
-            directory: paths.conversation_claims_dir(),
+            paths: paths.clone(),
         }
     }
 
@@ -98,9 +93,12 @@ impl HostClaims {
     /// the lock cannot be taken.
     pub fn take(&self, word: &str) -> Result<HostClaim, ClaimRefusal> {
         let unavailable = |detail: String| ClaimRefusal::Unavailable(detail);
-        kr_ipc::paths::create_private_tree(&self.root, &self.directory)
-            .map_err(|error| unavailable(error.to_string()))?;
-        let path = self.directory.join(Self::file_name(word));
+        kr_ipc::paths::create_private_tree(
+            self.paths.state_root(),
+            &self.paths.conversation_claims_dir(),
+        )
+        .map_err(|error| unavailable(error.to_string()))?;
+        let path = self.paths.conversation_claim_path(&Self::file_name(word));
         let file = kr_ipc::paths::open_lock_file(&path)
             .map_err(|error| unavailable(format!("{}: {error}", path.display())))?;
         match kr_flush::lock::try_exclusive(&file) {
@@ -195,9 +193,11 @@ mod tests {
     fn a_directory_that_cannot_be_made_is_unavailable_and_not_held() {
         let temp = tempfile::tempdir().expect("a directory");
         let claims = claims_in(&temp);
-        // A file where the claims directory is to be.
-        std::fs::create_dir_all(temp.path().join("state")).expect("the state root");
-        std::fs::write(&claims.directory, b"").expect("a file in the directory's place");
+        // A file where the claims directory is to be, in a state root that is as it should be.
+        let state = temp.path().join("state");
+        kr_ipc::paths::create_private_tree(&state, &state).expect("the state root");
+        std::fs::write(state.join("conversation-claims-1"), b"")
+            .expect("a file in the directory's place");
         assert!(matches!(
             claims.take("thread-7"),
             Err(ClaimRefusal::Unavailable(_))

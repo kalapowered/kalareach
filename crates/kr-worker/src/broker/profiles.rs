@@ -126,8 +126,8 @@ impl ProfileStore {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::ConversationHeldElsewhere`] when another session holds the
-    /// conversation, and [`BrokerError::ResourceUnavailable`] when the claim could not be made:
+    /// Returns [`BrokerError::ConversationHeldElsewhere`] when a claim on the conversation is held
+    /// on the host, and [`BrokerError::ResourceUnavailable`] when the claim could not be made:
     /// nothing then says that no one holds it, so it is not taken to be free.
     fn claim_word(&self, word: &str) -> Result<Option<HostClaim>> {
         let Some(host) = self.host.as_ref() else {

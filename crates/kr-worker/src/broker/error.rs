@@ -138,12 +138,16 @@ pub enum BrokerError {
     /// A launch intent was refused.
     #[error("{0}")]
     Launch(#[from] kr_protocol::broker::LaunchRefusal),
-    /// Another session of this user holds the saved conversation.
+    /// A claim on the saved conversation is held on this host.
     ///
     /// Section 12: an adapter must not start a second agent process against the same saved
-    /// conversation. This worker cannot say which instance of which session holds it, only that a
+    /// conversation. An execution of this session or of another session of the user, or the server
+    /// one of them started, is still running against it. This worker cannot say which, only that a
     /// worker's claim on it is held.
-    #[error("another session on this host is running against this saved conversation")]
+    #[error(
+        "this saved conversation is still held on this host by an execution of this session or \
+         another, or by the server it started"
+    )]
     ConversationHeldElsewhere,
     /// Something this broker counts has run out, and it refuses rather than count round.
     #[error("{detail}")]

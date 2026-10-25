@@ -179,6 +179,7 @@ impl Backend {
             let owned = SessionOwned(self.views.as_ref().map(|(_, runtime)| Weak::clone(runtime)));
             let broker = Arc::clone(&run.broker);
             let instance = self.application_instance_id;
+            let identity = server.identity().clone();
             let ending = run.handle.spawn(async move {
                 let retirement = server.retire(&owned, begun).await;
                 if !retirement.survivors.is_empty() {
@@ -190,7 +191,7 @@ impl Backend {
                     );
                 }
                 // The conversations the instance held are free for another session only now.
-                broker.server_retired(instance, retirement.survivors.is_empty());
+                broker.server_retired(instance, &identity, retirement.survivors.is_empty());
                 retirement
             });
             ladders.push(ending);
@@ -282,6 +283,11 @@ pub(super) async fn start(
     let attempt = async {
         let presented = environment.pairs();
         drop(environment);
+        // The conversations the instance holds stay held from here, whether or not the instance
+        // ends before the server is recorded, and no server is started for an instance that has
+        // ended.
+        run.broker
+            .server_starting(backend.application_instance_id)?;
         let (server, unshown) = Server::spawn(
             &ServerSpec {
                 executable: std::path::Path::new(&backend.invocation.executable),
@@ -340,7 +346,18 @@ pub(super) async fn start(
             })
         });
     if started.is_err() {
+        // A server that was recorded is retired by the ending, which settles the hold on the
+        // conversations. One that never existed is given up here.
+        let recorded = run
+            .server
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
         backend.end_gateway();
+        if !recorded {
+            run.broker
+                .server_not_started(backend.application_instance_id);
+        }
     }
     started
 }

@@ -370,8 +370,14 @@ pub struct Instance {
     /// The application server this host started for the process, where it started one: a process
     /// below it is placed under this instance, as one below the process is.
     pub backend: Option<ProcessStartIdentity>,
-    /// How the retirement of that server ended, once it has: true when nothing it started was
-    /// left running, false when something was.
+    /// Set from the moment a server is to be started for the instance until it is recorded as
+    /// [`Instance::backend`], or the start is given up.
+    ///
+    /// The conversations the instance holds are not free for another session while a server it
+    /// started may be running, so an instance that ends in this interval keeps them.
+    server_starting: bool,
+    /// How the retirement of the server named by [`Instance::backend`] ended, once it has: true
+    /// when nothing it started was left running, false when something was.
     ///
     /// The conversations the instance held are not free for another session until then.
     server_retired: Option<bool>,
@@ -429,6 +435,50 @@ pub struct Instance {
     /// Absent is the default and the safe one: every reverse file operation is then refused with a
     /// reason, and nothing is opened.
     host_files: Option<std::sync::Arc<HostFiles>>,
+}
+
+/// The host's claims of an instance that has ended while a server started for it was still to be
+/// retired.
+#[derive(Debug)]
+struct RetiringServer {
+    instance: ApplicationInstanceId,
+    /// The server, or none while it was being started and is not recorded yet.
+    server: Option<ProcessStartIdentity>,
+    claims: Vec<crate::broker::host_claims::HostClaim>,
+}
+
+impl RetiringServer {
+    fn is(&self, instance: ApplicationInstanceId, server: Option<&ProcessStartIdentity>) -> bool {
+        self.instance == instance && self.server.as_ref() == server
+    }
+}
+
+/// What an instance that is leaving has of a server that ran against its conversations.
+#[derive(Debug)]
+enum ServerOf {
+    /// None was started.
+    None,
+    /// One is being started, and is not recorded yet.
+    Starting,
+    /// One is recorded, and its retirement is not over.
+    Running(ProcessStartIdentity),
+    /// Its retirement is over: true when nothing was left running.
+    Retired(bool),
+}
+
+impl ServerOf {
+    fn of(instance: &Instance) -> Self {
+        match (
+            &instance.backend,
+            instance.server_starting,
+            instance.server_retired,
+        ) {
+            (Some(_), _, Some(clean)) => Self::Retired(clean),
+            (Some(server), _, None) => Self::Running(server.clone()),
+            (None, true, _) => Self::Starting,
+            (None, false, _) => Self::None,
+        }
+    }
 }
 
 /// One source frame the broker holds, with the package whose table recorded it.
@@ -800,7 +850,7 @@ struct BrokerState {
     /// A conversation is free for another session when what runs against it is gone, and an
     /// instance's end comes first: a server that ignores the end of its input runs on for the
     /// whole of its retirement. The claims are dropped when the retirement is over.
-    retiring: BTreeMap<ApplicationInstanceId, Vec<crate::broker::host_claims::HostClaim>>,
+    retiring: Vec<RetiringServer>,
     /// The claims on conversations whose servers could not be ended. They are held until this
     /// worker ends: a conversation held too long is the safe side.
     stranded: Vec<crate::broker::host_claims::HostClaim>,
@@ -1055,7 +1105,7 @@ impl Broker {
                 bindings: BTreeMap::new(),
                 tokens: TokenStore::new(),
                 profiles,
-                retiring: BTreeMap::new(),
+                retiring: Vec::new(),
                 stranded: Vec::new(),
                 launches: BTreeMap::new(),
                 next_launch: 1,
@@ -1541,11 +1591,19 @@ impl Broker {
         server: ProcessStartIdentity,
     ) -> Result<()> {
         let mut state = self.state();
-        let instance = state
-            .instances
-            .get_mut(&application_instance_id)
-            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let Some(instance) = state.instances.get_mut(&application_instance_id) else {
+            // The instance ended while its server was being started. Its claims wait for the
+            // server named from here, which the caller retires.
+            for waiting in &mut state.retiring {
+                if waiting.is(application_instance_id, None) {
+                    waiting.server = Some(server.clone());
+                }
+            }
+            return Err(unknown_instance(application_instance_id));
+        };
         instance.backend = Some(server);
+        instance.server_starting = false;
+        instance.server_retired = None;
         Ok(())
     }
 
@@ -1565,13 +1623,13 @@ impl Broker {
         let Some(ended) = state.instances.remove(&application_instance_id) else {
             return false;
         };
-        let (has_server, retirement) = (ended.backend.is_some(), ended.server_retired);
+        let server = ServerOf::of(&ended);
         if let Some(agent) = ended.process {
             release_agent_job(&state.instances, &agent.process);
         }
         state.tokens.withdraw(application_instance_id);
         let claims = state.profiles.release(application_instance_id);
-        state.hold_until_retired(application_instance_id, has_server, retirement, claims);
+        state.hold_until_retired(application_instance_id, server, claims);
         state.capabilities.forget(application_instance_id);
         state.forget_instance(application_instance_id, kr_ipc::now_ms());
         state.application_changed();
@@ -1600,15 +1658,13 @@ impl Broker {
         }
         state.launches.remove(&application_instance_id);
         let removed = state.instances.remove(&application_instance_id);
-        let (has_server, retirement) = removed.as_ref().map_or((false, None), |instance| {
-            (instance.backend.is_some(), instance.server_retired)
-        });
+        let server = removed.as_ref().map_or(ServerOf::None, ServerOf::of);
         if let Some(agent) = removed.and_then(|instance| instance.process) {
             release_agent_job(&state.instances, &agent.process);
         }
         state.tokens.withdraw(application_instance_id);
         let claims = state.profiles.release(application_instance_id);
-        state.hold_until_retired(application_instance_id, has_server, retirement, claims);
+        state.hold_until_retired(application_instance_id, server, claims);
         state.capabilities.forget(application_instance_id);
         // An instance given back must not stay bound: its bindings go from memory at once, and
         // their rows now or, where the store refuses, as soon as it takes writes again.
@@ -2733,22 +2789,67 @@ impl Broker {
         self.state().profiles.set_host_claims(claims);
     }
 
-    /// Records that the retirement of the server started for one instance is over, and whether
-    /// it ended everything it covered (`clean`).
+    /// Records that a server is about to be started for one instance.
+    ///
+    /// From here until the server is recorded ([`Broker::set_instance_backend`]) or given up
+    /// ([`Broker::server_not_started`]), an instance that ends keeps the host's claims on its
+    /// conversations, since a process may be running against them that the broker has no record
+    /// of yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal for an identifier no instance has: the instance ended, and no server
+    /// is started for it.
+    pub fn server_starting(&self, application_instance_id: ApplicationInstanceId) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.server_starting = true;
+        Ok(())
+    }
+
+    /// Records that no server was started after all: the start failed before a process existed.
+    pub fn server_not_started(&self, application_instance_id: ApplicationInstanceId) {
+        let mut state = self.state();
+        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+            instance.server_starting = false;
+        } else {
+            state
+                .retiring
+                .retain(|waiting| !waiting.is(application_instance_id, None));
+        }
+    }
+
+    /// Records that the retirement of `server`, which was started for one instance, is over, and
+    /// whether it ended everything it covered (`clean`).
     ///
     /// A conversation an instance owned is free for another session only when what ran against it
     /// is gone, and that is the later of two things: the instance's end and this. Whichever comes
     /// second lets go of the host's claims. When something survived the retirement the claims are
-    /// kept until this worker ends.
-    pub fn server_retired(&self, application_instance_id: ApplicationInstanceId, clean: bool) {
+    /// kept until this worker ends. A retirement is of one server: the retirement of an earlier
+    /// server of an instance that was launched again under the same identifier settles nothing
+    /// of the later one's.
+    pub fn server_retired(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        server: &ProcessStartIdentity,
+        clean: bool,
+    ) {
         let mut state = self.state();
-        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
+        if let Some(instance) = state.instances.get_mut(&application_instance_id)
+            && instance.backend.as_ref() == Some(server)
+        {
             instance.server_retired = Some(clean);
-        } else if let Some(claims) = state.retiring.remove(&application_instance_id) {
-            if clean {
-                drop(claims);
-            } else {
-                state.stranded.extend(claims);
+        }
+        let (done, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.retiring)
+            .into_iter()
+            .partition(|waiting| waiting.is(application_instance_id, Some(server)));
+        state.retiring = waiting;
+        if !clean {
+            for done in done {
+                state.stranded.extend(done.claims);
             }
         }
     }
@@ -4014,21 +4115,25 @@ impl BrokerState {
     fn hold_until_retired(
         &mut self,
         application_instance_id: ApplicationInstanceId,
-        has_server: bool,
-        retirement: Option<bool>,
+        server: ServerOf,
         claims: Vec<crate::broker::host_claims::HostClaim>,
     ) {
         if claims.is_empty() {
             return;
         }
-        match (has_server, retirement) {
-            (false, _) | (true, Some(true)) => drop(claims),
-            (true, Some(false)) => self.stranded.extend(claims),
-            (true, None) => self
-                .retiring
-                .entry(application_instance_id)
-                .or_default()
-                .extend(claims),
+        match server {
+            ServerOf::None | ServerOf::Retired(true) => drop(claims),
+            ServerOf::Retired(false) => self.stranded.extend(claims),
+            ServerOf::Running(server) => self.retiring.push(RetiringServer {
+                instance: application_instance_id,
+                server: Some(server),
+                claims,
+            }),
+            ServerOf::Starting => self.retiring.push(RetiringServer {
+                instance: application_instance_id,
+                server: None,
+                claims,
+            }),
         }
     }
 
@@ -4509,6 +4614,7 @@ impl BrokerState {
                 application_instance_id,
                 process,
                 backend: None,
+                server_starting: false,
                 server_retired: None,
                 observed: None,
                 binding_revision: AgentBindingRevision::new(1),
