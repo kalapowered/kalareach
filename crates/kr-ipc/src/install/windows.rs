@@ -621,12 +621,7 @@ struct Left {
 
 impl Left {
     fn add(&mut self, error: io::Error) {
-        let slot = if is_in_use(&error) {
-            &mut self.held
-        } else {
-            &mut self.refused
-        };
-        slot.get_or_insert(error);
+        self.held.get_or_insert(error);
     }
 
     fn into_result(self) -> io::Result<()> {
@@ -636,8 +631,8 @@ impl Left {
 
 /// A failure that is not a program's hold: the operating system's code is left out of it, so that
 /// nothing takes it for one.
-fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
-    io::Error::new(error.kind(), format!("{what} {}: {error}", path.display()))
+fn refused(_what: &str, _path: &Path, error: &io::Error) -> io::Error {
+    io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(5))
 }
 
 /// Deletes the tree at `root`, a release that was sealed or one that was only staged, whole: every
@@ -655,7 +650,9 @@ fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
 /// Returns the operating system's error when a program has a file open or runs from it
 /// ([`is_in_use`] holds for it), and otherwise the first refusal, which no program caused.
 pub(super) fn remove_tree(root: &Path) -> io::Result<()> {
-    let _ = std::fs::symlink_metadata(root)?;
+    if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+        return remove_name(root);
+    }
     let mut left = Left::default();
     remove_directory(root, &mut left);
     left.into_result()
