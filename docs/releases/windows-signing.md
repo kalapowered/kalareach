@@ -35,8 +35,9 @@ and knowing all of them gets nobody a signature: the trust is in the federated s
 the numbers.
 
 The profile issues a fresh certificate every three days, valid for those three days and no longer.
-A signature made under it keeps verifying indefinitely because it carries an RFC 3161 timestamp
-proving the certificate was valid when the signature was made. Which is why an executable or
+A signature made under it keeps verifying after that certificate has expired because it carries an RFC 3161
+timestamp proving the certificate was valid when the signature was made; a timestamp is no promise that a
+verifier accepts the signature after a later revocation or a later change of what it trusts. Which is why an executable or
 PowerShell script here is never signed without a timestamp, and why the gate refuses one that is.
 
 The certificates chain to the `Microsoft Identity Verification Root Certificate Authority 2020`,
@@ -53,7 +54,8 @@ A Windows release is one archive for each Windows target, `kalareach-x86_64-pc-w
 and `kalareach-aarch64-pc-windows-msvc-<release>.zip`, and one `SHA256SUMS` that names both. An archive
 holds one directory, named as the archive is, and that directory is the release tree: `bin/` with the
 host's programs, `shells/psreadline/` with the PowerShell package, `share/` with the update channel's
-root, the release record, `signatures.txt` and the licence, and `release.json`, the manifest.
+root, the release record, the terminal's capability manifest and terminfo database, `signatures.txt` and
+the licence, and `release.json`, the manifest.
 [manifest.md](manifest.md) says what the manifest and the record state.
 
 Two kinds of signature hold it. Authenticode signs the executables, `bin\kr.exe`, `kr-attach-guard.exe`,
@@ -168,8 +170,9 @@ signs the files of each tree and stops at the channel keys as any run does, so i
 once the keys exist it keeps the archives as a workflow artefact and creates no release, because
 the step that publishes one runs on a tag push and on nothing else.
 
-One tag is one run at a time. A second run for a tag already being released waits for the first
-rather than running beside it, and the run under way is never cancelled for the one waiting. When the
+One tag is one `release` job at a time. A second run for a tag already being released waits at that job
+for the first rather than running beside it, and the run under way is never cancelled for the one
+waiting; the gate and build jobs of the second run are not held back. When the
 waiting run's turn comes it finds whatever the run before it made, and refuses to go on if that is a
 release or a draft. `docs/releases/packages.md` describes the same arrangement at more length; this
 workflow follows it.
@@ -281,7 +284,7 @@ reference describes the format.
 ## Rotation and recovery
 
 The leaf certificates rotate themselves, every three days, with no human involved and nothing to do
-in this repository. Artefacts already signed keep verifying because they are timestamped.
+in this repository. Artefacts already signed keep verifying after the certificates expire because they are timestamped.
 
 Responsibility is divided across three roles:
 - The Azure subscription owner or User Access Administrator / Role Based Access Control Administrator
@@ -297,7 +300,9 @@ What a person rotates is the profile and the identity behind it, in three separa
 
 **The certificate profile.** The Azure subscription owner creates a new profile on the `kalareach`
 account, grants the signing application the Certificate Profile Signer role on it, and updates
-`certificate-profile-name` in the workflow. Artefacts signed under the old profile keep verifying;
+`certificate-profile-name` in the workflow. If the new profile's certificate subject differs,
+`KR_SIGNING_SUBJECT` in the workflow and `$releasePublisher` in `scripts/check-windows-signature-gate.ps1`
+change with it. Artefacts signed under the old profile keep verifying;
 their timestamps say when they were signed and the chain is unchanged. Retire the old profile after
 the change has shipped, not before.
 
@@ -347,8 +352,11 @@ run is suspected, or signing access must be revoked immediately:
    - Therefore, safe restoration requires rotating both the GitHub environment subject and the Azure
      application identity:
      1. The GitHub repository administrator creates a new, distinct GitHub environment (for example
-        `release-signing-v2`) with fresh required reviewers and deployment branch/tag policies, and
-        deletes or archives the compromised environment `release-signing`.
+        `release-signing-v2`) with fresh required reviewers and deployment branch/tag policies. The
+        environment `release-signing` is named by both `release-windows.yml` and the macOS `sign` job of
+        `release-tree.yml`, and it holds the Apple signing and notarisation secrets and variables, so the
+        new environment takes over those too, and the compromised environment is deleted or archived only
+        once both workflows name the new one.
      2. The Entra application administrator creates a new application registration and service principal,
         configured with a federated credential scoped strictly to the new environment subject
         (`repo:kalapowered@290383971/kalareach@1371146076:environment:release-signing-v2`). The old
@@ -358,7 +366,7 @@ run is suspected, or signing access must be revoked immediately:
      3. The Azure subscription owner or User Access Administrator grants `Artifact Signing Certificate
         Profile Signer` to the *new* service principal at the certificate profile scope.
      4. The GitHub repository administrator updates the `AZURE_CLIENT_ID` repository variable to the new
-        application ID, and updates the workflow `environment` name to the new environment.
+        application ID, and updates the `environment` name in both workflows to the new environment.
      5. The operator completes explicit denial verification before initiating production releases under
         the new environment:
         - Verify that OIDC token exchange requests using the old environment subject are rejected by
