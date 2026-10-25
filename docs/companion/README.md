@@ -75,11 +75,13 @@ event stream, and a node already held is replaced only by a newer revision of it
 A button that a package shows runs that package's action on the session's own worker. The call
 names the package that recognised the agent, the action, the agent's instance and the binding
 revision the person saw, and it carries no arguments. The worker checks the action against the
-rights this device holds. The button sends nothing, and says why, in these cases: the agent has not
-been read, or no package recognised it; the agent has moved to another conversation since the
-button was drawn, in which case it works again when the package draws it again; the button's
-control declares a parameter, or sits in a form with fields, because the conversation cannot take
-that input yet; or the document does not say what the action takes.
+rights this device holds. The conversation records which instance and binding revision each node
+revision was drawn under, and keeps the record with the revision, so it survives a visit to the
+terminal and back. The button sends nothing, and says why, in these cases: no live agent has been
+read; the node arrived before the agent was read, or the agent has moved to another conversation
+since it was drawn, in which case the button works again when the package draws it again; the
+control declares a parameter, or sits in a form with fields or an entry that takes a file, because
+the conversation cannot take that input yet; or the document does not say what the action takes.
 
 A session has three views: the conversation, the raw terminal and its output. The output view reads
 what the session wrote, as the host keeps it, with `history.page`: from the live end, a page at a

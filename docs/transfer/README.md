@@ -820,7 +820,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `SOURCE_CHANGED` | a declaration changed, a source moved under a snapshot, or a snapshot is gone |
 | `QUOTA_EXCEEDED` | a per-file or per-environment byte limit |
 | `RESOURCE_UNAVAILABLE` | the device's concurrency ceiling, or a transfer in a state that admits no more |
-| `DRAFT_CONFLICT` | the draft's revision is not the one the caller expected, an attachment of the draft is being offered to the agent so a prompt cannot send it, or a prompt names a draft written for another application |
+| `DRAFT_CONFLICT` | the draft is not as the call needs it: its revision is not the one the caller expected, an attachment of it is being offered to the agent or was accepted, a claim or a report does not match the binding it names, or a prompt names a draft written for another application |
 | `PERMISSION_DENIED` | a name that leaves an authorised directory, or a revoked scope or grant |
 | `ENVIRONMENT_UNAVAILABLE` | the request names an environment this service does not own |
 | `ID_CONFLICT` | one action identifier used for two different payloads |
