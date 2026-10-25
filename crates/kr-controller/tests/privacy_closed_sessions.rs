@@ -351,7 +351,9 @@ async fn a_removal_the_archive_cannot_finish_is_owed_and_not_served_until_it_has
         );
     }
 
-    // The daemon goes and another starts on the same tree: the obligation is on the disk.
+    // The daemon goes and another starts on the same tree: the obligation is on the disk. The
+    // client is closed first, since the daemon is held by each connection it serves.
+    drop(client);
     let host = host.restart().await;
     let mut client = host.client().await;
     let report = status(&mut client).await;
