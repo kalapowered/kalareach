@@ -1562,9 +1562,9 @@ async fn a_kept_visit_is_given_the_lease_again_when_the_one_it_holds_has_ended()
 }
 
 /// A member host the inbox keeps a visit to, read once. Five minutes have passed by the device's
-/// clock, so the lease the host holds is due to be replaced, and the host holds it for ten minutes
-/// more. The host in use, which the application was told to use so that the member host is only
-/// visited, is returned to be kept running.
+/// clock, which is when the lease the host holds is due to be replaced, and by that clock the lease
+/// has ten minutes left; the host's clock has not moved. The host in use, which the application was
+/// told to use so that the member host is only visited, is returned to be kept running.
 async fn visit_kept_with_its_lease_due() -> (Rig, Host, Arc<InboxDesk>) {
     let rig = Rig::start().await;
     rig.connection(true).await;

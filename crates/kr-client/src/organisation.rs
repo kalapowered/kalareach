@@ -32,18 +32,20 @@
 //! same stop and sends nothing until the stop has been held for the time [`LeaseStop::holds_for`]
 //! names. A hold is against the service: it stops every request to it, the chain of keys asked
 //! for by a presentation already under way as much as a lease asked for by one that begins later,
-//! and it stops a presentation only when no lease is held that the host would take. A token the
-//! service rejects is replaced once, by the keeper, which asks again under the renewed token after
-//! looking at the hold once more; a second rejection ends in `TokenRefused`.
+//! and it stops a presentation only when no lease is held that the host would take, except that a
+//! kept connection whose renewal did not come off sends the host nothing either while the hold
+//! lasts and the lease the host holds does. A token the service rejects is replaced once, by the
+//! keeper, which asks again under the renewed token after looking at the hold once more; a second
+//! rejection ends in `TokenRefused`.
 //!
 //! A connection that is kept beside the one that keeps the lease fresh, as the inbox keeps its
 //! visits, presents again only when the lease the host holds is due to be replaced
 //! ([`LeaseKeeper::present_if_due`]): every presentation is an action the host records and never
 //! removes, so one a pass would write a row on each host for as long as the connection is kept.
 //! The lease the host took stays the keeper's until the host takes the next one, so a renewal that
-//! fails (the service does not answer, the chain of keys cannot be read, or the host refuses the
-//! new lease for a cause the keeper waits out) leaves the connection on the lease it has while that
-//! lasts.
+//! fails (the service does not answer or names a delay, the chain of keys cannot be read, or the
+//! host refuses the new lease for a cause the keeper waits out, as when its clock and the service's
+//! differ) leaves the connection on the lease it has while that lasts.
 //!
 //! A keeper belongs to the account that was signed in when it was made. The service client checks
 //! which account is signed in before the keeper asks for a lease and again before it presents one,
@@ -538,9 +540,9 @@ impl LeaseKeeper {
     /// A presentation is an action the host records and keeps, so a connection that presented
     /// again at each use would write a row on the host for each. A new lease is asked for once, with
     /// no waits. When it cannot be got, or the host will not take it for a cause the keeper waits
-    /// out, that is no failure of the connection while the lease the host holds still lasts: that lease stays in
-    /// place until the host takes the new one, and the service is not asked again until what was
-    /// held against it is over.
+    /// out, that is no failure of the connection while the lease the host holds still lasts: that
+    /// lease stays in place until the host takes the new one, and neither the service nor the host
+    /// is sent anything until what was held against the service is over.
     ///
     /// # Errors
     ///

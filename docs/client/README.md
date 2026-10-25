@@ -1388,11 +1388,11 @@ replaced and then asks the service for a new one, because nothing refreshes the 
 is not in use and the host refuses a connection once the lease it holds has ended; a presentation is
 an action the host records and never removes, so one at each use would write a row on the host for
 each. A renewal that does not come off is no failure of the connection while the lease the host
-holds still lasts: the service did not answer, the chain of keys could not be read, or the host
-refused the new lease for a cause the keeper waits out (`not_yet_valid`, `clock_untrusted`,
-`issued_before_activation`). The keeper keeps the lease the host took until the host takes the new
-one, and sends nothing, to the service or to the host, until what the failure held against the
-service is over. A host that refuses a read on such a connection as not permitted may have lost the lease
+holds still lasts: the service did not answer or named a delay, the chain of keys could not be
+read, or the host refused the new lease for a cause the keeper waits out (for example
+`not_yet_valid`, `clock_untrusted` or `issued_before_activation`). The keeper keeps the lease the
+host took until the host takes the new one, and sends nothing, to the service or to the host, until
+what the failure held against the service is over. A host that refuses a read on such a connection as not permitted may have lost the lease
 before this device's clock said it was due, and the inbox presents the lease the device holds
 (`Presentation::First`, which asks for a new one if the host refuses it) and reads once more, when
 the refusal says the host holds no lease it will answer under (`organisation::lease_is_refused`), and
@@ -1462,8 +1462,10 @@ request that replaces a token the service turned back, which the keeper makes af
 the hold again. A request already sent is not recalled, so the hold covers what is asked after the
 caller gave up, and not the answer to a request that was already on its way or one whose token was
 being refreshed when the hold began. The hold is against the service only: a connection
-presents the lease the keeper holds whatever is held, and one that has none is told the stop. A chain the host does not accept is tried
-three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
+presents the lease the keeper holds whatever is held, and one that has none is told the stop, except
+that a kept connection whose renewal did not come off (`Presentation::IfDue`) sends the host nothing
+either while the hold lasts and the lease the host holds does. A chain the host does not accept is
+tried three times before the keeper stops, because nothing says whether time mends it. The keeper stops,
 and says why (`LeaseStop`), when no account is signed in (`SignIn`), when the service no longer takes
 the sign-in (`TokenRefused`), when the account is not a member, or when the host refuses the lease
 for a reason only an administrator can change. A visit that stops this way shows the reason in the
