@@ -1498,3 +1498,55 @@ fn a_draft_action_reused_with_another_payload_is_an_id_conflict() {
         .expect("a repeat is answered");
     assert_eq!(repeated.draft.revision, bound.draft.revision);
 }
+
+/// KR-REQ-12.06 and KR-REQ-14.11: a prompt for another application than the one a draft was
+/// written for is a conflict, and a draft that is wrong in its session is refused as that whichever
+/// application the prompt is for. A draft that names no application is sent to any.
+#[test]
+fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_own_refusal() {
+    let harness = Harness::create();
+    let create = |application_instance_id: Nullable<ApplicationInstanceId>| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable::null(),
+                    application_instance_id,
+                    text: "have a look at this".to_owned(),
+                },
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let session = SessionId::new(Uuid::from_bytes([9; 16]));
+    let other_session = SessionId::new(Uuid::from_bytes([11; 16]));
+    let elsewhere = ApplicationInstanceId::new(Uuid::from_bytes([12; 16]));
+    let written = create(Nullable::some(support::an_application()));
+    let record = |draft: &kr_protocol::transfer::DraftRecord, session, application| {
+        harness.service.record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            session,
+            application,
+            &Admission::none(),
+        )
+    };
+
+    let conflict =
+        record(&written, session, elsewhere).expect_err("written for another application");
+    assert_eq!(conflict.code(), ErrorCode::DraftConflict);
+    // Nothing was recorded, so the prompt for what the draft was written for is the first record.
+    record(&written, session, support::an_application()).expect("records the prompt");
+    // A draft sent to a session is wrong for another whatever application the prompt is for, and
+    // keeps that refusal.
+    let wrong = record(&written, other_session, elsewhere).expect_err("sent to another session");
+    assert_eq!(wrong.code(), ErrorCode::InvalidArgument);
+
+    // A draft that names no application is sent by a prompt for any.
+    let open = create(Nullable::null());
+    record(&open, session, elsewhere).expect("a draft that names no application goes to any");
+}
