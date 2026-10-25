@@ -73,6 +73,8 @@
 pub mod adapter;
 pub mod broker;
 pub mod budget;
+#[cfg(feature = "conformance")]
+pub mod capability;
 pub mod class;
 pub mod classify;
 #[cfg(feature = "conformance")]

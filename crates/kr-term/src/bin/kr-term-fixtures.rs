@@ -2,17 +2,23 @@
 //!
 //! Run with no arguments to write `fixtures/terminal/`, and with `--check` to fail when a committed
 //! file differs from what the engine produces now, so a change in behaviour has to arrive together
-//! with the fixture that records it.
+//! with the fixture that records it. `--root <directory>` names the directory of fixtures to write
+//! or check instead of the workspace's.
 //!
-//! With `--terminfo <directory>` it writes the compiled terminfo database into that directory
-//! instead, in the layout a terminfo library reads, for a release tree that carries one.
+//! The directory also holds fixtures the engine does not generate: the client renderer's, the
+//! physical terminals' measurements and the client encoder's vectors, which are written by hand.
+//! `capabilities.json` is the manifest that lists every fixture under the six things the
+//! specification gives it, by digest. It is written last, and the check fails when it differs from
+//! the fixtures as they are, and when a fixture belongs to no category.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use kr_term::capability;
 use kr_term::conformance::{
     ADMISSION_CASES, AdmissionCase, BROKER_CASES, BYTE_POLICY_CASES, CLASS_CASES, Case, GridCase,
-    SNAPSHOT_CASES, WIDTH_CASES, hex, summarise, summarise_admission, summarise_grid,
+    InputCase, SNAPSHOT_CASES, WIDTH_CASES, WIN32_INPUT_CASES, hex, summarise, summarise_admission,
+    summarise_grid,
 };
 use kr_term::profile::{CAPABILITIES, DA1_PARAMS, DA2_PARAMS, WITHHELD};
 use kr_term::terminfo;
@@ -21,21 +27,17 @@ use serde_json::{Value, json};
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(at) = arguments.iter().position(|arg| arg == "--terminfo") {
-        let Some(directory) = arguments.get(at + 1) else {
-            eprintln!("--terminfo needs a directory");
-            return ExitCode::FAILURE;
-        };
-        return match terminfo::write_database(Path::new(directory)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("{directory}: {error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
     let check = arguments.iter().any(|arg| arg == "--check");
-    let root = fixtures_root();
+    let root = match arguments.iter().position(|arg| arg == "--root") {
+        Some(at) => match arguments.get(at + 1) {
+            Some(directory) => PathBuf::from(directory),
+            None => {
+                eprintln!("--root needs a directory");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => fixtures_root(),
+    };
     let files = [
         ("classes.json", classes()),
         ("byte-policy.json", byte_policy()),
@@ -45,6 +47,7 @@ fn main() -> ExitCode {
         ("admission.json", admission()),
         ("profile.json", profile()),
         ("terminfo-xterm-256color.json", terminfo_database()),
+        ("input-encodings.json", input_encodings()),
     ];
     let mut stale = Vec::new();
     for (name, value) in files {
@@ -60,6 +63,33 @@ fn main() -> ExitCode {
             eprintln!("{}: {error}", path.display());
             return ExitCode::FAILURE;
         }
+    }
+    // The manifest names every fixture as it is on disk, so it is made after they are written.
+    let manifest = match capability::manifest(&root) {
+        Ok(manifest) => capability::render(&manifest),
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = root.join(capability::FILE);
+    if check {
+        match std::fs::read_to_string(&path) {
+            Ok(current) if current == manifest => {}
+            Ok(_) => stale.push(format!("{} differs", path.display())),
+            Err(error) => stale.push(format!("{}: {error}", path.display())),
+        }
+        match capability::unowned(&root) {
+            Ok(unowned) => {
+                stale.extend(unowned.into_iter().map(|file| {
+                    format!("{file} is owned by no category of the capability manifest")
+                }))
+            }
+            Err(error) => stale.push(error),
+        }
+    } else if let Err(error) = std::fs::write(&path, &manifest) {
+        eprintln!("{}: {error}", path.display());
+        return ExitCode::FAILURE;
     }
     if stale.is_empty() {
         if check {
@@ -205,6 +235,35 @@ fn admission() -> Value {
         },
         "boundary": kr_term::conformance::admission_boundary(),
         "cases": ADMISSION_CASES.iter().map(admission_entry).collect::<Vec<_>>(),
+    })
+}
+
+fn input_entry(case: &InputCase) -> Value {
+    json!({
+        "id": case.id,
+        "covers": case.covers,
+        "records": case.records.iter().map(|record| json!({
+            "virtual_key": record.virtual_key,
+            "scan_code": record.scan_code,
+            "unicode": record.unicode,
+            "key_down": record.key_down,
+            "control_keys": record.control_keys,
+            "repeat": record.repeat,
+        })).collect::<Vec<_>>(),
+        "bytes": hex(case.bytes),
+    })
+}
+
+fn input_encodings() -> Value {
+    json!({
+        "name": "input-encodings",
+        "profile": "kr-vt/1",
+        "description": "KR-REQ-08.52. The console's key records and the bytes the win32 input \
+                        mode encodes each as, `CSI Vk;Sc;Uc;Kd;Cs;Rc _` with every field written. \
+                        The bytes are written by hand and the encoder is checked against them. \
+                        The client's ordinary, modifyOtherKeys and Kitty encodings are in \
+                        `client-encodings.json`.",
+        "cases": WIN32_INPUT_CASES.iter().map(input_entry).collect::<Vec<_>>(),
     })
 }
 

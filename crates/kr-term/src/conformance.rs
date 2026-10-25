@@ -1130,6 +1130,90 @@ fn side_effect_name(kind: &SideEffectKind) -> &'static str {
     }
 }
 
+/// One case of the console key records and the bytes they are encoded as.
+///
+/// The bytes are written by hand. The fixture states them and the tests check the encoder against
+/// them, so they are never the encoder's own output.
+#[derive(Debug, Clone, Copy)]
+pub struct InputCase {
+    /// Stable identifier.
+    pub id: &'static str,
+    /// The requirements the case pins.
+    pub covers: &'static str,
+    /// The records, in the order the console read them.
+    pub records: &'static [crate::win32::KeyRecord],
+    /// The bytes the records are encoded as, `CSI Vk;Sc;Uc;Kd;Cs;Rc _` for each.
+    pub bytes: &'static [u8],
+}
+
+const fn record(
+    virtual_key: u16,
+    scan_code: u16,
+    unicode: u16,
+    key_down: bool,
+    control_keys: u32,
+    repeat: u16,
+) -> crate::win32::KeyRecord {
+    crate::win32::KeyRecord {
+        virtual_key,
+        scan_code,
+        unicode,
+        key_down,
+        control_keys,
+        repeat,
+    }
+}
+
+/// The win32 input mode's cases: a composed character, one outside the basic plane, a dead key and
+/// what it composes, AltGr, a held key and its release, and a record of nothing but defaults.
+pub const WIN32_INPUT_CASES: &[InputCase] = &[
+    InputCase {
+        id: "composed-character",
+        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        records: &[record(0, 0, 0x3042, true, 0, 1)],
+        bytes: b"\x1b[0;0;12354;1;0;1_",
+    },
+    InputCase {
+        id: "character-outside-the-basic-plane",
+        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        records: &[
+            record(0, 0, 0xD867, true, 0, 1),
+            record(0, 0, 0xDE3D, true, 0, 1),
+        ],
+        bytes: b"\x1b[0;0;55399;1;0;1_\x1b[0;0;56893;1;0;1_",
+    },
+    InputCase {
+        id: "dead-key-then-the-character-it-composes",
+        covers: "KR-REQ-08.56",
+        records: &[
+            record(0xDD, 0x1A, 0, true, 0, 1),
+            record(0x45, 0x12, 0x00EA, true, 0, 1),
+        ],
+        bytes: b"\x1b[221;26;0;1;0;1_\x1b[69;18;234;1;0;1_",
+    },
+    InputCase {
+        id: "alt-graph",
+        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        records: &[record(0x32, 0x03, 0x40, true, 0x0001 | 0x0008, 1)],
+        bytes: b"\x1b[50;3;64;1;9;1_",
+    },
+    InputCase {
+        id: "repeat-and-key-up",
+        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        records: &[
+            record(0x41, 0x1E, 0x61, true, 0, 4),
+            record(0x41, 0x1E, 0x61, false, 0, 1),
+        ],
+        bytes: b"\x1b[65;30;97;1;0;4_\x1b[65;30;97;0;0;1_",
+    },
+    InputCase {
+        id: "every-field-spelled-out",
+        covers: "KR-REQ-08.52",
+        records: &[crate::win32::KeyRecord::DEFAULT],
+        bytes: b"\x1b[0;0;0;0;0;1_",
+    },
+];
+
 /// Lowercase hex, the form every fixture uses for bytes.
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {
