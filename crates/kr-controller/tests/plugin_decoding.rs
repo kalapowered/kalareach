@@ -15,6 +15,7 @@
 //! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words; a request that waits for its decode is not given to a component whose binding loses the trust to decode it meanwhile |
 //! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
 //! | KR-REQ-11.21 and KR-REQ-11.33 | the answer to an approval a component read is the bytes that component encoded, written to the upstream once; an approval the connector's table read is answered with the table's bytes, and no component is asked to encode it |
+//! | KR-REQ-24.27 | the component that writes the answer to an approval made in privacy mode is marked as handed something made in it, on a replacement runtime and after privacy mode ended |
 //! | KR-REQ-11.33 | a native answer that comes while the component encodes wins, and the component's answer is not sent; the thread changing, the grant or the decoder's trust being withdrawn while it encodes each refuse the answer before the marker, and nothing is sent |
 //! | KR-REQ-11.21 and KR-ACC-016 | bytes that name another request, the right one as another JSON type, a method, an error in place of a result or beside one, a member twice or a line break are refused by the core and nothing is sent; a component that traps, declines or never returns makes no answer, the terminal answers, and the third fault disables the binding |
 
@@ -361,6 +362,69 @@ async fn kr_req_24_27_a_request_made_in_privacy_mode_marks_the_component_wheneve
     assert!(
         lane.is_marked(binding(1)),
         "the component was handed a request made in privacy mode and is not marked"
+    );
+}
+
+/// KR-REQ-24.27 and KR-REQ-11.33: the component that writes the answer to an approval made in
+/// privacy mode is marked as handed something made in it, on the connection that writes the answer.
+///
+/// The request is made and decoded in privacy mode, which marks the component. The plugin runtime
+/// is then replaced, which takes that mark with the connection it described, and privacy mode ends.
+/// The answer is written by the component on the replacement, which is handed the request's bytes
+/// again, and the request is still one made in privacy mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_24_27_an_answer_written_for_a_request_made_in_privacy_mode_marks_the_component_that_writes_it()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let lane = world.broker().observation();
+    let mut authority = world
+        .hosted
+        .daemon_connection(ControllerConnectionRole::Authority)
+        .await;
+    world.tell_privacy(&mut authority, 1, true).await;
+    world.send(&request_noting(51, "!answer"));
+    let approval = approved(&world, "51").await;
+    assert!(
+        lane.is_marked(binding(1)),
+        "the component decoded a request made in privacy mode and is not marked"
+    );
+
+    // The runtime that decoded it is killed, and the link connects to another. A component
+    // registered afresh holds nothing it was handed before.
+    let before = lane.connection();
+    let host = world.hosted.published().expect("the runtime is published");
+    plugin_world::kill(&host);
+    until("the link to connect to a replacement runtime", || async {
+        (lane.connection() > before).then_some(())
+    })
+    .await;
+    world.until_ready(1).await;
+    assert!(
+        !lane.is_marked(binding(1)),
+        "the mark described a connection that has ended"
+    );
+
+    world.tell_privacy(&mut authority, 2, false).await;
+    assert!(!lane.is_private());
+    let mut owner = world.owner().await;
+    let outcome = world
+        .respond(&mut owner, approval.resource_id, "allow")
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    until_answered(&world, 51).await;
+    let answers = answers_to(&world, 51);
+    assert!(
+        answers.len() == 1 && answers[0].contains(r#""via":"component""#),
+        "the replacement component wrote the answer: {answers:?}"
+    );
+    assert!(
+        lane.is_marked(binding(1)),
+        "the component wrote the answer to a request made in privacy mode and is not marked"
     );
 }
 
