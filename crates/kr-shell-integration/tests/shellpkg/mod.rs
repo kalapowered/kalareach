@@ -203,6 +203,28 @@ impl Package {
         command
     }
 
+    /// Runs `script` in the package's host with no profile and no terminal, started the way a
+    /// session starts it, and returns what the host did.
+    ///
+    /// No bridge is in the host's environment, so a module imported by the script finds none to
+    /// open. This is the one way a case asks the package's host something outside a session: a host
+    /// started by its path alone loses the runtime location the record holds, and a framework-dependent
+    /// one then does not start.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host cannot be started.
+    #[must_use]
+    pub fn ask(&self, script: &str) -> std::process::Output {
+        self.command()
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env_remove("KR_SHELL_BRIDGE")
+            .env_remove("KR_SHELL_BRIDGE_SECRET")
+            .env_remove("KR_SESSION")
+            .output()
+            .expect("the package's host runs")
+    }
+
     /// Finds this tree's own built package, or says why it is not there.
     ///
     /// The installation's `current` names a build, and a build is named by a digest of what it was
