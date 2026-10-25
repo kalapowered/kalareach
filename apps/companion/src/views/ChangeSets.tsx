@@ -120,6 +120,8 @@ export function ChangeSets(): ReactNode {
   // The copies this computer's own sync kept, which are read from its own records and listed
   // whether or not the host answers.
   const [syncCopies, setSyncCopies] = useState<readonly PrivacyExported[]>([])
+  // Why those records could not be read: an empty list is then not an answer.
+  const [syncFailure, setSyncFailure] = useState<string | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   // Every read, on opening, after an action and on a retry, is made under one watch with no
@@ -173,10 +175,12 @@ export function ChangeSets(): ReactNode {
       .then((copies) => {
         if (!current()) return
         setSyncCopies(copies)
+        setSyncFailure(null)
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!current()) return
         setSyncCopies([])
+        setSyncFailure(failureMessage(error))
       })
   }, [port])
 
@@ -343,7 +347,12 @@ export function ChangeSets(): ReactNode {
         </div>
       )}
 
-      <LeftTheHost privacy={privacy} syncCopies={syncCopies} reload={load} />
+      <LeftTheHost
+        privacy={privacy}
+        syncCopies={syncCopies}
+        syncFailure={syncFailure}
+        reload={load}
+      />
     </>
   )
 }

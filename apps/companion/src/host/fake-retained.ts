@@ -37,6 +37,10 @@ export interface FakeRetained {
   holdNextFinish(): { release(): void }
   /** Lists a copy the sync service kept, as this computer's own sync would. */
   keepSyncCopy(copy: PrivacyExported): void
+  /** Makes this computer's own sync list fail with these words, as unreadable records do, or stops that. */
+  syncListFails(message: string | null): void
+  /** Lists the host's copy as deleted and awaiting removal at the service, as it is once the service confirms. */
+  serviceHasDeleted(reference: string): void
 }
 
 /** The entries the scripted host lists before a test changes any. */
@@ -67,6 +71,7 @@ export class ScriptedRetained implements FakeRetained {
   private tokenCount = 0
   private confirming = true
   private refusal: string | null = null
+  private listFailure: string | null = null
   private heldFinish: { release: () => void } | null = null
   private holdingFinish: Promise<void> | null = null
 
@@ -146,6 +151,24 @@ export class ScriptedRetained implements FakeRetained {
     this.entries.push({ sync: true, copy })
   }
 
+  syncListFails(message: string | null): void {
+    this.listFailure = message
+  }
+
+  serviceHasDeleted(reference: string): void {
+    const at = this.entries.findIndex((each) => each.copy.reference === reference)
+    const entry = this.entries[at]
+    if (entry === undefined) throw new Error(`no entry lists ${reference}`)
+    this.entries[at] = {
+      ...entry,
+      copy: {
+        ...entry.copy,
+        kind: 'backup archive, deleted and awaiting removal at the service',
+        deletable: false
+      }
+    }
+  }
+
   /** What privacy mode reports: the host's own entries. */
   report(): PrivacyReport {
     return {
@@ -165,6 +188,7 @@ export class ScriptedRetained implements FakeRetained {
 
   /** What this computer's own sync lists. */
   syncCopies(): readonly PrivacyExported[] {
+    if (this.listFailure !== null) refuse('LOCAL_FAILURE', this.listFailure)
     return this.entries.filter((entry) => entry.sync).map((entry) => ({ ...entry.copy }))
   }
 

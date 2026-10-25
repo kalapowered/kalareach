@@ -21,7 +21,7 @@ const ARCHIVE = 'archive 4c1f0b5e generation 12'
 const SYNC_COPY = 'drafts, which the service holds as copy 2f6d0c1e-8a3b-4c57-9d10-6b1e5a7c9f42'
 
 /** Opens the screen that lists what has left the host, over a scripted host. */
-async function open(host = fakeHost()) {
+async function open(host = fakeHost(), rows = 4) {
   const { port, controls } = host
   const view = render(
     <AppProvider port={port} initialPlace={{ view: 'changesets' }}>
@@ -30,7 +30,7 @@ async function open(host = fakeHost()) {
   )
   const retained = await screen.findByTestId('retained-artefacts')
   await waitFor(() => {
-    expect(within(retained).getAllByTestId('left-copy')).toHaveLength(4)
+    expect(within(retained).getAllByTestId('left-copy')).toHaveLength(rows)
   })
   return { controls, retained, person: userEvent.setup(), unmount: view.unmount }
 }
@@ -194,5 +194,57 @@ describe('a host this device is paired with', () => {
       expect(within(retained).queryByText(SYNC_COPY, { exact: false })).toBeNull()
     })
     expect(controls.retained.finished).toEqual([SYNC_COPY])
+  })
+})
+
+describe('the copies this computer’s own sync kept', () => {
+  it('are not shown as an empty list when its records cannot be read', async () => {
+    const host = fakeHost()
+    host.controls.retained.syncListFails('a record of the sync could not be read')
+    const { controls, retained, person } = await open(host, 3)
+
+    const unread = within(retained).getByTestId('sync-copies-unread')
+    expect(within(unread).getByRole('alert')).toHaveTextContent(
+      'could not be read, so this list may be missing some: a record of the sync could not be read'
+    )
+    expect(within(retained).queryByText(SYNC_COPY, { exact: false })).toBeNull()
+
+    // The records are readable again: asking again lists the copy and the warning goes.
+    controls.retained.syncListFails(null)
+    await person.click(within(unread).getByRole('button', { name: 'Try again' }))
+    await waitFor(() => {
+      expect(within(retained).getAllByTestId('left-copy')).toHaveLength(4)
+    })
+    expect(within(retained).queryByTestId('sync-copies-unread')).toBeNull()
+  })
+})
+
+describe('a deletion the service did not confirm', () => {
+  it('says nothing more once the list shows the service has deleted the copy', async () => {
+    const { controls, retained, person } = await open()
+    controls.retained.serviceDoesNotConfirm(true)
+    await person.click(
+      within(rowOf(retained, ARCHIVE)).getByRole('button', { name: /Delete backup archive/ })
+    )
+    await answerDialog(controls, true)
+    await waitFor(() => {
+      expect(within(rowOf(retained, ARCHIVE)).getByRole('button')).toHaveTextContent('Ask again…')
+    })
+    // The button's name begins with what it shows.
+    expect(
+      within(rowOf(retained, ARCHIVE)).getByRole('button', { name: /^Ask again to delete/ })
+    ).toBeInTheDocument()
+
+    // The service deletes it, and the list is read again when the person deletes another copy.
+    controls.retained.serviceHasDeleted(ARCHIVE)
+    await person.click(within(rowOf(retained, SYNC_COPY)).getByRole('button'))
+    await answerDialog(controls, true)
+
+    await waitFor(() => {
+      expect(within(rowOf(retained, ARCHIVE)).getByTestId('removal')).toHaveTextContent(
+        'This host has no way to ask for its removal.'
+      )
+    })
+    expect(within(rowOf(retained, ARCHIVE)).queryByRole('button')).toBeNull()
   })
 })

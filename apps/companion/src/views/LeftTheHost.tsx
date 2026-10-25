@@ -72,12 +72,15 @@ function removalNote(row: Row, step: Step, here: boolean): string {
 export function LeftTheHost({
   privacy,
   syncCopies,
+  syncFailure,
   reload
 }: {
   /** The host's report, or null when the host could not be asked. */
   readonly privacy: PrivacyReport | null
   /** The copies this computer's own sync kept. */
   readonly syncCopies: readonly PrivacyExported[]
+  /** Why this computer's own sync records could not be read, when they could not: the list is then incomplete. */
+  readonly syncFailure: string | null
   /** Reads both lists again. */
   readonly reload: () => void
 }): ReactNode {
@@ -101,7 +104,12 @@ export function LeftTheHost({
     ...syncCopies.map((copy) => ({ copy, sync: true }))
   ]
 
-  const stepOf = (reference: string): Step => steps.get(reference) ?? 'idle'
+  // A deletion that was asked for and not confirmed is a note about a copy that is still listed as
+  // one to ask again: once the list says the service has deleted it, the note has nothing to say.
+  const stepOf = (row: Row): Step => {
+    const step = steps.get(row.copy.reference) ?? 'idle'
+    return step === 'unconfirmed' && !row.copy.deletable ? 'idle' : step
+  }
   const setStep = (reference: string, step: Step) => {
     setSteps((held) => new Map(held).set(reference, step))
   }
@@ -154,7 +162,7 @@ export function LeftTheHost({
     })()
   }
 
-  if (privacy === null && syncCopies.length === 0) return null
+  if (privacy === null && syncCopies.length === 0 && syncFailure === null) return null
 
   return (
     <section className="stack" data-testid="retained-artefacts">
@@ -173,12 +181,21 @@ export function LeftTheHost({
       </header>
       <Card>
         <div className="card-body">
-          {rows.length === 0 ? (
+          {rows.length === 0 && syncFailure === null ? (
             <p className="muted small">Nothing this host knows of has left it.</p>
           ) : null}
+          {syncFailure === null ? null : (
+            <div className="divided-row" data-testid="sync-copies-unread">
+              <p className="small warning-text spacer" role="alert">
+                The copies this computer’s own sync kept could not be read, so this list may be
+                missing some: {syncFailure}
+              </p>
+              <Button onClick={reload}>Try again</Button>
+            </div>
+          )}
           {rows.map((row) => {
             const reference = row.copy.reference
-            const step = stepOf(reference)
+            const step = stepOf(row)
             const refusal = refusals.get(reference)
             const offered = row.copy.deletable && (row.sync || here)
             return (
@@ -204,7 +221,7 @@ export function LeftTheHost({
                 {offered ? (
                   <Button
                     data-testid="delete-copy"
-                    aria-label={`Delete ${row.copy.kind}, ${reference}`}
+                    aria-label={`${step === 'unconfirmed' ? 'Ask again to delete' : 'Delete'} ${row.copy.kind}, ${reference}`}
                     aria-busy={step === 'waiting' || step === 'deleting'}
                     disabled={step === 'waiting' || step === 'deleting'}
                     onClick={() => {
