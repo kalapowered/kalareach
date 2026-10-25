@@ -226,9 +226,10 @@ The secret is in the exported environment only until the handshake succeeds. The
 removes both bootstrap variables from the exported environment and wipes its own copy: the compiled
 bridges clear the buffer the secret was decoded into, and the PowerShell module clears its array.
 Nothing reads the secret again, because activation is its only reader and a bridge that is lost
-finds the variables gone. A copy the shell itself made cannot be cleared: the base64url text of the
-secret stays in the memory the process was started with after the variable is unset, and the
-PowerShell runtime keeps managed copies.
+finds the variables gone. Copies that no bridge code can clear remain: the base64url text of the
+secret stays in the memory the process was started with after the variable is unset and in the
+blocks the shell freed when it copied or dropped the variable, and the PowerShell runtime keeps
+managed copies of the text and of the key its HMAC object held.
 
 A child shell therefore inherits neither an active root token nor automatic activation, and two
 independent rules keep it that way:
