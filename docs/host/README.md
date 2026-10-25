@@ -6114,6 +6114,16 @@ A grant is the authority a request is decided against. It names its issuer and i
 authority revision it was issued under, the environments and sessions it covers, the actions it
 permits, how far back it may see, when it stops and which organisation membership it requires.
 
+How far back a grant sees is a reading of the host's wall clock, and unlike expiry it is not held
+against a clock that cannot go backwards. A grant with no history cursor reaches from its own
+start, the moment the host committed a pairing or issued a share, and each reader compares that
+number with the moments it holds for its own content: the times recorded for a session's output,
+when an attention item was first seen, when a session's last command ran. If the wall clock is
+stepped backwards after content was recorded, a grant begun after the step has a start earlier
+than the readings of that content, and reaches what was recorded before the grant began. The host
+marks no row as written before such a step, so nothing withholds that content. Every reader that
+decides by the grant's first moment has this limit.
+
 Two stores hold grants. A pairing writes its grant into the device record.
 `crates/kr-controller/src/grants/` holds the grants this daemon issues through the sharing method
 group, among them the session shares a device redeems. `grants::decide` is the intersection both are
