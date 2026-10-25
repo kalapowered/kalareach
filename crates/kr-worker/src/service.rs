@@ -5211,9 +5211,10 @@ impl WorkerService {
         let deadline = tokio::time::Instant::now() + self.upstream_deadline();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
-        let (revision, operation) = (
+        let (revision, operation, action) = (
             handoff.admitted.binding_revision(),
             handoff.admitted.operation(),
+            handoff.admitted.action().cloned(),
         );
         let (outcome, late) = handoff.carry(deadline).await;
         let settled = off_the_executor(|| {
@@ -5230,6 +5231,7 @@ impl WorkerService {
                 actor_id: pending.actor_id.clone(),
                 action_id: pending.action_id,
                 name: operation.as_str().to_owned(),
+                action,
                 revision,
                 request: late.upstream_request_id().clone(),
             };
@@ -5375,12 +5377,19 @@ impl WorkerService {
         // identifier it was sent under, and the provenance. A late answer is not read for a turn.
         let result = matches!(verdict, LateVerdict::Applied)
             .then(|| {
-                encode(&kr_protocol::agent::AgentMutationResult {
+                let mutation = kr_protocol::agent::AgentMutationResult {
                     binding_revision: operation.revision,
                     provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
                     upstream_request_id: Nullable::some(operation.request.clone()),
                     turn_id: Nullable::null(),
-                })
+                };
+                match operation.action.clone() {
+                    Some(action) => encode(&kr_protocol::agent::PluginActionInvokeResult {
+                        mutation: Nullable::some(mutation),
+                        action,
+                    }),
+                    None => encode(&mutation),
+                }
                 .ok()
                 .map(|value| kr_cbor::encode(value.as_value()))
             })
@@ -10948,6 +10957,9 @@ struct LateOperation {
     action_id: kr_protocol::ids::ActionId,
     /// The operation's name, which the observation's subject begins with.
     name: String,
+    /// The action of a package the operation carried out, where it carried one: its result names
+    /// the action, as the result of an action that was answered on time does.
+    action: Option<kr_protocol::broker::ActionName>,
     /// The binding revision the operation was admitted at.
     revision: kr_protocol::ids::AgentBindingRevision,
     /// The identifier the operation was sent to the upstream under.
