@@ -1734,10 +1734,74 @@ async fn a_devices_close_whose_connection_ends_while_it_waits_for_the_workers_li
     }
 }
 
+/// KR-REQ-24.15: the lookup of a receipt that a retried close may have kept, which waits for the
+/// link to the session's worker, is refused when the link opens if the authority feed has raised a
+/// refusal on remote grants meanwhile, also when the device's connection has ended in between, and
+/// no worker is asked for the receipt. The close's route is on record, so the lookup is what waits
+/// at the link. The control: with no refusal raised, the lookup reaches the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_lookup_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
+    use std::sync::Arc;
+
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for (refused, ended) in [(false, false), (true, false), (true, true)] {
+        let recorded: fake::Recorded = Arc::default();
+        let world = answering_worker(
+            Arc::new(|_: &kr_protocol::envelope::Request| None),
+            Arc::clone(&recorded),
+            reads_scopes(),
+        )
+        .await;
+        let controller = &world.controller;
+        let connection =
+            super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 31));
+        let close = fake::close_request(world.environment_id, world.session_id);
+        assert!(
+            connection
+                .claim_route(&close, Some(world.session_id))
+                .is_ok(),
+            "the route of the close is on record"
+        );
+        let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+
+        let (_answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(close))),
+            async {
+                arrived.await.expect("the lookup reaches the worker's door");
+                if ended {
+                    // As a revocation does: the registration goes before the connection is fenced.
+                    controller.deregister(connection.connection_id);
+                }
+                if refused {
+                    controller.raise_the_unverified_withdrawal_refusal().await;
+                }
+                go.send(()).expect("the lookup is waiting");
+            }
+        );
+        if refused {
+            assert!(
+                forwarded_reads(&recorded).is_empty(),
+                "a lookup refused at the link reaches no worker"
+            );
+        } else {
+            assert_eq!(
+                forwarded_reads(&recorded).len(),
+                1,
+                "the control: the lookup reaches the worker"
+            );
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-24.15: a device's read, and with it raw input, that had been admitted and waits for the
 /// link to the session's worker is refused when the link opens if the authority feed has raised a
-/// refusal on remote grants meanwhile, and no worker is asked. The control: with no refusal raised,
-/// the read reaches the worker.
+/// refusal on remote grants meanwhile, also when the device's connection has ended in between, as
+/// a revocation ends it: it takes the standing it was admitted under with it, and no worker is
+/// asked. The control: with no refusal raised, the read reaches the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refusal_rises() {
     use std::sync::Arc;
@@ -1747,7 +1811,7 @@ async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refu
 
     use crate::service::a_close_a_worker_never_answers as fake;
 
-    for refused in [false, true] {
+    for (refused, ended) in [(false, false), (true, false), (true, true)] {
         let recorded: fake::Recorded = Arc::default();
         let world = answering_worker(
             Arc::new(move |request: &kr_protocol::envelope::Request| {
@@ -1778,6 +1842,10 @@ async fn a_devices_read_waiting_for_the_workers_link_is_refused_once_a_feed_refu
 
         let (answer, ()) = tokio::join!(connection.read(&read), async {
             arrived.await.expect("the read reaches the worker's door");
+            if ended {
+                // As a revocation does: the registration goes before the connection is fenced.
+                controller.deregister(connection.connection_id);
+            }
             if refused {
                 controller.raise_the_unverified_withdrawal_refusal().await;
             }
