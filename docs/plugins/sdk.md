@@ -6,6 +6,10 @@ registers an action that answers through that place, and every call to the actio
 resource it answers. A document drawn for one request can also say that its controls are for that
 request alone.
 
+This guide is for a package that ships no component. A package that does, and is trusted to decode
+a request, has the request read and its answer written by its component, and the table's answer is
+not written for it (see the plugin runtime guide).
+
 The destination, the action and the visibility declarations are in version 0.1.1 of the package
 contract. A package that uses only those declares `"sdk_range": ">=0.1.1, <0.2.0"`. A host on 0.1.0
 cannot read the new members and refuses such a package. The `decision_response`, `observation` and

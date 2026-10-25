@@ -228,7 +228,13 @@ checks the declaration and runs each invocation as typed, and `kr doctor` says w
   declaration applies to. The launch has to type no option, and its first word has to be absent or
   listed; any other launch runs as typed, with the reason named. The list is closed because it is
   what the package qualified: an option would not reach the server, and a word that is another
-  subcommand's name (`login`, `exec`) is not a terminal at all.
+  subcommand's name (`login`, `exec`) is not a terminal at all. Listing a word also says that the
+  first bare word after it names the saved conversation the launch works on, whatever follows it:
+  an identifier, or a name the application resumes by. The rule is the same for every listed word,
+  one that copies a conversation as well as one that resumes it. The host holds that word for as
+  long as the execution lives, and a second launch of the same conversation in the session runs as
+  typed, with the execution that holds it named. A word that is an option, empty or longer than 256
+  bytes names none. SDK code reads the rule through `IntegrationBackend::saved_conversation`.
 - The package must provide a connector table the gateway can read, which the validator checks:
   `stdio`, line-delimited JSON, a matching identifier, the request identifier, the method and the
   response identifier each one top-level member, between one and 256 classified methods, a wire name

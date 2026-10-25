@@ -720,8 +720,9 @@ reach the runtime before a wait the daemon asked for or a backoff has passed, ho
 broker's set changes meanwhile, except that a link nothing wants the runtime of any more forgets
 the wait, and the next binding that wants a component asks at once; the daemon's bound on starts
 is what holds a runtime that keeps ending. The worker's report on its admissions says that this
-host never calls the component's encode-response export, because the connector's table writes every
-answer; it says so of every package that ships a component, whether or not the package decodes.
+host asks the component to write the answer to a request the component read, and that a request the
+connector's table read is answered from the table, so a package that ships a component and does not
+decode is never asked to encode.
 
 ### An action a component prepares
 
@@ -817,12 +818,29 @@ the order is what counts:
    decision against the ones the request actually offered, commits the dispatch marker, and only
    then may the answer go.
 
-What is not joined up yet is the encode step: no answer a person gives is encoded by a component. The
-connector's table writes every answer, inside the admission that claims the resource, and the plugin
-host's `encode` request returns what a component would write without anything calling it for an
-answer. Calling it there means asking the component outside the broker's lock and rechecking, claiming
-and dispatching after it returns, a native answer given meanwhile winning, as the preparation of an
-action does.
+The encode step is joined up for a request a component read. The answer a person gives to it, by
+`agent.approval.respond` or by the package's answering action, is in two passes, as the preparation
+of an action is. The first checks what can be checked before the component is asked (the resource,
+the caller's grant, the decoder's trust, the binding's revision, the decision against the ones the
+request offered and the deadline) and returns the broker's own record of the request. The component
+is then asked outside the broker's lock and outside the session's boundary, with the receipt still
+`accepted`. The second pass hands its bytes back, and the broker checks everything again under its
+lock, adopts the bytes only if they are an answer to the request, claims the resource and reserves
+its one transmission there. A native answer given while the component worked has resolved the
+request, and the caller is told `QUESTION_RESOLVED`.
+
+The bytes are data. They are adopted only if they are one JSON object within the frame bound that
+names no member twice and no method, carry the table's result member and not its error member, hold
+no line break where the connection's framing forbids one, and carry at the table's response
+identifier member the request's own identifier as a JSON value of the same type: `"11"` is not `11`.
+The bytes that pass are the bytes written. The table does not stand in for a component that fails,
+runs out its deadline, declines, or returns bytes the broker refuses: that answer is not written,
+the receipt is rejected and not refused, the terminal can still answer, and the binding's report
+counts the answers not written by kind and never in the component's words. The third fault within a
+minute disables the binding, as for any call, though a fault the component declares itself is not
+counted. The request's privacy mark is kept with it, so a
+component handed it again to encode it is marked whatever privacy mode is by then. A bridge
+channel's answer is the host's, written from the validated decision, whoever read the request.
 
 A component that is faulted, disabled or slow changes none of step 1. That is the whole of the
 separation: rich meaning is a thing the broker asks for, and the native path does not wait for the

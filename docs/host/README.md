@@ -2504,7 +2504,9 @@ page carries at most 1,000 rows and 1 MiB.
 
 Semantic snapshots are held to section 8's three limits, which `kr_protocol::semantic` states: 16
 MiB across the parts, sixteen levels of depth and twenty thousand nodes. `agent.snapshot` reads an
-agent's retained history, a flat list of at most 4,096 entries, so its depth is one. A part travels
+agent's retained history, a flat list of at most 4,096 entries, so its depth is one. An entry keeps
+at most 64 KiB of text, cut at a character boundary; what it left out is counted in the entry's
+`omitted_text_bytes`, so a cut text is not read as the whole of what was said. A part travels
 in one control frame, so it is cut to what the reader's connection said it receives once the rest
 of the answer is in it, and an entry larger than that on its own is carried with its text cut,
 saying how many bytes it left out. The 16 MiB and the node count are spent by one snapshot's parts
@@ -3701,7 +3703,8 @@ shortens that. A record from an earlier boot needs no such guard, because the wi
 live in its memory and a host that has restarted can admit nothing through them.
 
 An observation is evidence, not an execution state. Only an authoritative answer about an uncertain
-outcome moves a receipt, and an inferred screen never does: a screen is what the host parsed, not
+outcome moves a receipt, such as the upstream's reply to the request this host sent, matched by the
+identifier it was sent under, and an inferred screen never does: a screen is what the host parsed, not
 what the interface that owns the subject said. "Observed" in a user interface means evidence was
 observed.
 
@@ -4721,8 +4724,8 @@ host's own maintenance takes its content then.
 
 Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
 can still page through, and the worker keeps a bounded log of the semantic entries that a bound
-agent's bridge observed (up to 4,096 for each instance, the text of notifications and details
-included), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
+agent's bridge or gateway observed (up to 4,096 for each instance, the text of notifications and
+details included, at most 64 KiB for each entry), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
 described here as though it were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
@@ -7074,19 +7077,30 @@ terminal.
 
 Within a session, one live instance at a time holds a saved conversation. A launch intent that
 names a saved conversation is refused, and names the instance that owns it, while that live
-instance holds the conversation; an instance in another session is not seen. A native thread
-selection moves the reservation with it, so the conversation an instance left is free and the one it
-took is not. An instance holds a conversation when its bridge reports that it selected one, and a
-program the host adopted from the terminal holds none.
+instance holds the conversation. A native thread selection moves the reservation with it, so the
+conversation an instance left is free and the one it took is not. An instance holds a conversation
+when its bridge or its gateway's stream reports that it selected one, and when the command that
+launched it named one.
 
-Nothing in the host replaces a running agent with a second run of its saved conversation. An agent
-process starts only from the managed shell: from a command the person typed, or from one a client
-installed at the empty prompt with `shell.launch`. The broker records no saved conversation for
-either, even when the command resumes one, so the guard above covers a launch intent that names a
-conversation and a bridge's selection, and not a command line that resumes a conversation by
-itself. If a bridge reports that an instance selected a conversation another live instance of the
-same session holds, the host refuses the selection: the instance is left with no thread vouched for,
-and rich mutations stay suspended until the binding is verified again.
+An agent process starts only from the managed shell: from a command the person typed, or from one a
+client installed at the empty prompt with `shell.launch`. When the command is one a package's
+backend declaration applies to, the saved conversation the launch works on is the first bare word
+after the command's launching word, whatever follows it: the identifier, or the name the
+application resumes the conversation by. The rule is the same for every launching word, `fork`
+included, because the package declares which words launch and the host does not know what an
+application's word means. A launch that types no such word, or an option in its place, names none.
+The word is held for as long as the execution lives, beside the identifier the stream names once
+the application has resolved it, since a name and the identifier it resolves to are one
+conversation that the host cannot tell apart. A second launch of a held conversation is not served
+a second server: its program runs as typed, nothing of the launch is left published, and the
+reason names the execution that holds the conversation.
+
+This holds within one session only. A second session's worker cannot see the first's executions, so
+two sessions can run a second process against one saved conversation, and so can a program the host
+adopted from the terminal, which holds no conversation until its stream names one. If a bridge or
+a stream reports that an instance selected a conversation another live instance of the same session
+holds, the host refuses the selection: the instance is left with no thread vouched for, and rich
+mutations stay suspended until the binding is verified again.
 
 ### What a launch reads of its application's mode
 
@@ -7268,6 +7282,16 @@ notification that says a request was answered or cleared. Each names a routed me
 its message, from the root of the message, inside the member the table names for that kind of
 message. The core reads those places itself; nothing a component says is read, and a conversation is
 never taken from matching prompt text and timestamps.
+
+What the stream says of the conversation and the turn is also history of the instance, which
+`agent.snapshot` serves: a `thread.started` entry when the binding takes a thread, a `thread.ended`
+entry when it leaves one or when the server closes the thread it is in, a `turn.started` entry when
+a turn starts in the bound conversation, a `turn.ended` entry when that turn ends and a
+`turn.dropped` entry when the binding moves while a turn runs. The text of each is the identifier it
+names. Each entry names the binding revision and the turn it was observed under, so what one owner
+said is never read as the words of the owner that followed it. A message about a conversation the
+terminal is not in records nothing. When the instance's history has used every entry number it has,
+an entry is lost and the transition it describes still happens.
 
 A success reply to a selecting request names a thread, and the binding takes it. The revision
 advances only when the thread changed, and the unread thread's reason ends. A conversation another
@@ -7904,7 +7928,20 @@ transport's own call that takes the operation runs on a thread of its own, and t
 it and for the upstream's answer for ten seconds at most, so a transport that blocks cannot hold the
 caller past them. At that bound an answer's resource is settled as uncertain first, the receipt then
 records an outcome nobody can establish, and only then is the caller told `UPSTREAM_UNAVAILABLE`.
-What the transport does afterwards settles nothing.
+What the transport does afterwards settles nothing for an answer.
+
+An operation this host sent as its own request is different, because the host minted the identifier
+it was sent under and the upstream's reply names it. When the receipt says unknown and a reply to
+that identifier comes later, the reply is correlation evidence: a result makes the receipt applied
+and clears the failure of the wait, an error that says the frame was never a call the upstream could
+make (the reserved parse, request, method and parameter codes) makes it refused with that error,
+and any other error is recorded and settles nothing. The evidence is an observation with the
+upstream-correlation provenance, written in the same commit as the new state. It never moves a
+receipt that is not unknown, a second reply to one identifier is recorded once, and a connection
+that ended before the reply keeps nothing, so a reply that reaches a later connection under the
+same text of identifier is not read. A connection holds at most sixteen replies that came before
+their operation claimed them and sixteen operations waiting for a reply; past that the oldest reply
+goes and a further operation stays unknown, as it did before the reply was kept.
 
 A binding's actions are registered from its package's declarations and from nothing else. The
 grant, the effect, the capability, the operation and the rights of each follow from its declared
@@ -7962,10 +7999,13 @@ name the resource it answers. The action must be registered for this binding wit
 `approval.respond` effect, and the binding must still hold that action's grant. This binding must be
 the resource's decoder, because the answer carries the decoder's meaning, and the decision, read
 from the parameter the action names for it, must be one the interpretation offered. No action token
-is issued and no component is asked: the answer is written from the connection's own table under
-the approval's claim, and the method answers with its own result, the mutation and the action.
+is issued. Who writes the answer depends on who read the request: a request the connector's table
+read is answered from the connection's own table under the approval's claim, and a request a
+component read is answered by that component, as `agent.approval.respond` does. The method answers
+with its own result, the mutation and the action.
 
-An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
-the numbering after it, so a new entry never takes a cursor an adapter has already passed and a
-replay from before the restart is a visible gap rather than a silently empty answer. A range that
-was evicted rebuilds from what is verifiably retained and says there is a gap.
+A history belongs to one instance and ends with it. An instance's identifier is its own for good, so
+no cursor of another life of the host is read as one of this instance's, and no number is given
+twice within it. A cursor is the reader's: `agent.snapshot` takes the node a reader has consumed
+and serves what follows, and the host keeps no cursor for a reader. A range that was evicted
+rebuilds from what is verifiably retained and says there is a gap.
