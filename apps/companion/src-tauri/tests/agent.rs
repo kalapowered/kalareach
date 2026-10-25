@@ -17,10 +17,10 @@ use kr_protocol::agent::{
     AgentApprovalInspectParams, AgentApprovalRespondParams, AgentBindingState, AgentCancelParams,
     AgentCapabilitiesParams, AgentCommand, AgentCommandsParams, AgentCommandsResult,
     AgentMutationResult, AgentPromptParams, AgentSnapshotEntry, AgentSnapshotParams,
-    AgentSnapshotResult, AgentSteerParams,
+    AgentSnapshotResult, AgentSteerParams, PluginActionInvokeParams, PluginActionInvokeResult,
 };
 use kr_protocol::attachment::GeometryState;
-use kr_protocol::broker::{ActionProvenance, IntegrationMode};
+use kr_protocol::broker::{ActionName, ActionProvenance, IntegrationMode};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
     DownstreamRequestId, NativeClassification, NativeMethodClass, PendingKind, PendingResource,
@@ -28,8 +28,8 @@ use kr_protocol::gateway::{
 };
 use kr_protocol::ids::{
     AgentBindingRevision, AgentTurnId, ApplicationInstanceId, GatewayConnectionId, GeometryEpoch,
-    InputLeaseEpoch, InputSequence, PendingResourceId, SessionId, SourceGeneration, UpstreamMethod,
-    UpstreamRequestId,
+    InputLeaseEpoch, InputSequence, PendingResourceId, PluginId, SessionId, SourceGeneration,
+    UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::input::InputLeaseState;
 use kr_protocol::method::Method;
@@ -372,6 +372,58 @@ async fn each_agent_mutation_names_the_workers_session_the_instance_and_the_revi
         );
     }
     assert!(!worker.connected(), "every action went on the one link");
+}
+
+/// KR-REQ-13.14: a package's action is invoked on the session's own worker, in the method's own
+/// parameters and under the envelope every agent mutation carries, and the page is given the
+/// method's own result.
+///
+/// The page names the package, the action and the binding revision it read; the action's
+/// arguments travel as the encoded object the worker hashes into the action's token, so an action
+/// that takes none sends the empty object and not empty bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_package_action_is_invoked_on_the_sessions_worker_and_answered_in_the_methods_own_result()
+{
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let plugin_id = PluginId::new("kalareach.codex").expect("a package");
+    let action = ActionName::new("turn.cancel").expect("an action");
+    let asked = page.call(
+        "plugin_action_invoke",
+        json!({ "params": {
+            "target": target(&worker),
+            "plugin_id": plugin_id.to_string(),
+            "action": action.to_string(),
+            "draft_id": null,
+            "resource_id": null,
+            "parameters": "e30",
+        } }),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::PluginActionInvoke).await;
+    assert_eq!(call.kind, CallKind::Mutation);
+    let envelope = call.target.clone().expect("a mutation's envelope");
+    assert_eq!(envelope.environment_id, worker.descriptor.environment_id);
+    assert_eq!(envelope.session_id.as_ref(), Some(&worker.session_id));
+    assert_eq!(envelope.application_instance_id.as_ref(), Some(&instance()));
+    assert_eq!(envelope.agent_binding_revision.as_ref(), Some(&revision()));
+    let sent: PluginActionInvokeParams = call.params();
+    assert_eq!(sent.plugin_id, plugin_id);
+    assert_eq!(sent.action, action);
+    assert!(!sent.draft_id.is_present() && !sent.resource_id.is_present());
+    assert_eq!(sent.parameters.as_slice(), b"{}");
+    let result = PluginActionInvokeResult {
+        mutation: Nullable::some(mutated()),
+        action,
+    };
+    link.answer(&call, &result).await;
+    let settled = answered(asked).await.expect("the worker's answer");
+    assert_eq!(settled["receipt"], Value::Null);
+    assert_eq!(
+        settled["value"],
+        serde_json::to_value(&result).expect("JSON"),
+        "the page is given the method's own result"
+    );
 }
 
 /// KR-REQ-10.01: a prompt that names both a draft and text, or neither, is refused before anything
