@@ -28,7 +28,7 @@
 //! Terminating-role semantics and the delegation traversal itself are the client's, and the suite
 //! qualifies the selected release's actual behaviour rather than trusting a crate overview.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use kr_plugin_sdk::catalogue::CatalogueIndex;
@@ -102,6 +102,91 @@ pub(crate) fn resets_floors(old: &[u8], new: &[u8]) -> CatalogueResult<bool> {
     ]
     .into_iter()
     .any(|role| old.signed.keys(role).ne(new.signed.keys(role))))
+}
+
+/// What the remedy for a root that cannot be trusted is, said wherever one is refused.
+const ROLE_KEY_REMEDY: &str = "ask the repository's publisher for a root that gives each role a \
+                               key of its own, and enrol the repository with it (a repository \
+                               this host already holds is removed first)";
+
+/// The name of a top-level role, as a refusal says it.
+const fn role_name(role: tough::schema::RoleType) -> &'static str {
+    match role {
+        tough::schema::RoleType::Root => "root",
+        tough::schema::RoleType::Targets => "targets",
+        tough::schema::RoleType::Snapshot => "snapshot",
+        tough::schema::RoleType::Timestamp => "timestamp",
+        tough::schema::RoleType::DelegatedTargets => "delegated targets",
+    }
+}
+
+/// A key as the client parsed it: its family and its public bytes. Two names for one key differ in
+/// the identifier, the member order or the description's spelling, and share these.
+fn key_material(key: &tough::schema::key::Key) -> (&'static str, Vec<u8>) {
+    use tough::schema::key::Key;
+    match key {
+        Key::Ed25519 { keyval, .. } => ("ed25519", keyval.public.to_vec()),
+        Key::Rsa { keyval, .. } => ("rsa", keyval.public.to_vec()),
+        Key::Ecdsa { keyval, .. } | Key::EcdsaOld { keyval, .. } => {
+            ("ecdsa", keyval.public.to_vec())
+        }
+    }
+}
+
+/// Checks that no role of `root` names one key under two identifiers and that no two roles name
+/// the same key.
+///
+/// A role holds the authority of its keys, so a key that two roles share lets whoever holds it
+/// act for both, and a root cannot say afterwards which of the two the key was meant for. A key
+/// the root does not describe stands for its identifier.
+///
+/// The comparison is by the bytes the client parsed for each key, within a family of keys. It does
+/// not find one key written two ways (an Ed25519 key as its raw bytes and as a
+/// `SubjectPublicKeyInfo`, an RSA key in two encodings, a point compressed and uncompressed), an
+/// Ed25519 key and its negation or its sum with a small-order point, or two RSA keys of one
+/// modulus: reducing those is the key ceremony's, and a root that passes this check has not been
+/// shown to hold independent keys beyond it.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::Untrusted`] naming the roles, and what to do about it.
+pub(crate) fn check_role_keys(root: &tough::schema::Root) -> CatalogueResult<()> {
+    let mut roles: Vec<_> = root.roles.iter().collect();
+    roles.sort_by_key(|(role, _)| role_name(**role));
+    let mut named: Vec<(&'static str, BTreeSet<(&'static str, Vec<u8>)>)> = Vec::new();
+    for (role, keys) in roles {
+        let identifiers: HashSet<_> = keys.keyids.iter().collect();
+        let material: BTreeSet<_> = identifiers
+            .iter()
+            .map(|identifier| match root.keys.get(*identifier) {
+                Some(key) => key_material(key),
+                None => ("identifier", identifier.to_vec()),
+            })
+            .collect();
+        if material.len() != identifiers.len() {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "the root names one key under two identifiers for its {} role, which counts \
+                     it twice toward the role's threshold; {ROLE_KEY_REMEDY}",
+                    role_name(*role)
+                ),
+            });
+        }
+        named.push((role_name(*role), material));
+    }
+    for (at, (first, keys)) in named.iter().enumerate() {
+        for (second, others) in &named[at + 1..] {
+            if !keys.is_disjoint(others) {
+                return Err(CatalogueError::Untrusted {
+                    detail: format!(
+                        "the root names one key for its {first} role and for its {second} role, \
+                         so whoever holds that key acts for both; {ROLE_KEY_REMEDY}"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the version a trusted root declares.
@@ -486,6 +571,9 @@ pub async fn verify(
                 >(&enrolment.root)
                 && new_signed.signed.version > old_signed.signed.version
             {
+                // The root a load moved to before it failed is kept so that old trust is not
+                // restored; one that gives two roles a key is not kept, and says why.
+                check_role_keys(&new_signed.signed)?;
                 on_root_rotated(bytes)?;
             }
             return Err(classify(&source));
@@ -500,6 +588,11 @@ pub async fn verify(
                 .to_owned(),
         });
     }
+    // The root this load ended on is the one that is kept, whether or not it moved: it is held to
+    // the rule before anything that follows can use it. The root the host held before the load is
+    // not refused first, because the publisher's way out of a root that fails is a root signed
+    // over it, which a host that refused it first could never read.
+    check_role_keys(&repository.root().signed)?;
     let versions = MetadataVersions {
         root: repository.root().signed.version.get(),
         timestamp: repository.timestamp().signed.version.get(),

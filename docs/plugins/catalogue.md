@@ -39,6 +39,16 @@ before anything is fetched, with `QUOTA_EXCEEDED` and the name of the budget it 
 Each repository keeps its own root. An enterprise or vendor repository that adopted a root out of
 band is not verified against the official one, and adopting a second root never widens the first.
 
+A root gives each of its four roles a key of its own. A root that names one key for two roles, or
+one key twice for a role, is refused with the roles named: when the owner is asked to adopt it,
+when the build is asked to trust the bundled generation's, and for the root a sync ends on, before
+that root is kept (a root a sync rotates to is not kept, and the repository stays on the root and
+the generation it was on). The check compares the keys as the client parsed them, within a family
+of keys (Ed25519, RSA, ECDSA). It does not find one key written two ways, an Ed25519 key and its
+negation or its sum with a small-order point, or two RSA keys of one modulus; those are the key
+ceremony's. A root this host already holds is refused when a sync ends on it, not before the
+load, so a publisher replaces a root that fails with a root signed over it, which the host follows.
+
 Adopting a root is the owner's decision, and so is enlarging what a repository's packages may do
 without a further grant. The one root a host adopts without the owner is the bundled generation's:
 the build trusts it by committed key identifiers and enrols the official repository at start, and

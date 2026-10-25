@@ -9858,3 +9858,189 @@ async fn a_next_root_that_cannot_be_read_fails_the_synchronisation() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-26.40: a catalogue root gives each role a key of its own
+// ---------------------------------------------------------------------------------------------
+
+/// A set of role keys whose snapshot and timestamp roles use one key.
+fn keys_that_share_one() -> KeySet {
+    let keys = KeySet::generate();
+    KeySet {
+        timestamp: keys.snapshot.clone(),
+        ..keys
+    }
+}
+
+fn enrolment_over(root: Vec<u8>, generation: &Generation) -> CatalogueResult<Enrolment> {
+    Enrolment::new(
+        repository(),
+        RepositoryKind::Official,
+        generation.metadata_url(),
+        generation.targets_url(),
+        root,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+}
+
+/// A root that gives two roles one key lets whoever holds it act for both, so the host does not
+/// adopt it, and says which roles and what to do. A root that gives each role a key of its own is
+/// adopted. The same holds for a role that names one key under two identifiers, which counts it
+/// twice toward its threshold.
+#[tokio::test]
+async fn kr_req_26_40_a_root_that_gives_two_roles_one_key_is_not_adopted() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let sound = Generation::build(&home.path().join("sound"), GenerationSpec::default()).await;
+    enrolment_over(sound.root_bytes(), &sound).expect("a key for each role is adopted");
+
+    let shared = Generation::build(
+        &home.path().join("shared"),
+        GenerationSpec {
+            keys: Some(keys_that_share_one()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let refusal = enrolment_over(shared.root_bytes(), &shared)
+        .expect_err("a root that shares a key between two roles");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted);
+    let text = refusal.to_string();
+    assert!(
+        text.contains("snapshot") && text.contains("timestamp") && text.contains("key of its own"),
+        "{text}"
+    );
+
+    // The targets role names its key a second time under another identifier.
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&sound.root_bytes()).expect("a readable root");
+    let targets_id = document["signed"]["roles"]["targets"]["keyids"][0]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    // A second description of the same key: a member added to it gives it another identifier, which
+    // the client accepts, and leaves the key as it was.
+    let mut key = document["signed"]["keys"][&targets_id].clone();
+    key["note"] = serde_json::json!("a second description of the same key");
+    let alias: String = serde_json::from_value::<tough::schema::key::Key>(key.clone())
+        .expect("a key")
+        .key_id()
+        .expect("an identifier")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    document["signed"]["keys"][&alias] = key;
+    document["signed"]["roles"]["targets"]["keyids"]
+        .as_array_mut()
+        .expect("identifiers")
+        .push(serde_json::json!(alias));
+    let refusal = enrolment_over(serde_json::to_vec(&document).expect("a root"), &sound)
+        .expect_err("one key under two identifiers");
+    let text = refusal.to_string();
+    assert!(
+        text.contains("two identifiers") && text.contains("targets"),
+        "{text}"
+    );
+}
+
+/// A rotation to a root that gives two roles one key is refused before the root is kept: the
+/// client verified the chain, the host does not keep the result, and the repository stays on the
+/// root and the generation it was on.
+#[tokio::test]
+async fn kr_req_26_40_a_rotation_to_a_root_that_shares_a_key_is_refused_before_it_is_kept() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    let before = catalogue
+        .repository(&repository())
+        .expect("readable")
+        .expect("enrolled")
+        .root;
+
+    generation
+        .rotate_to(GenerationSpec {
+            generation: 2,
+            root_version: 2,
+            keys: Some(keys_that_share_one()),
+            ..GenerationSpec::default()
+        })
+        .await;
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("a rotation to a root that shares a key");
+    assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted);
+    let text = refusal.to_string();
+    assert!(
+        text.contains("snapshot") && text.contains("timestamp"),
+        "{text}"
+    );
+    assert_eq!(
+        catalogue
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
+        before,
+        "the root the repository was on is the one it is still on"
+    );
+    assert_eq!(
+        catalogue
+            .active(&repository())
+            .expect("enrolled")
+            .map(|active| active.generation),
+        Some(1),
+        "and so is its generation"
+    );
+}
+
+/// A bundle whose root gives two roles one key is not a root the build trusts, whatever key
+/// identifiers the build names, so the seed enrols nothing from it.
+#[test]
+fn kr_req_26_40_a_bundled_root_that_shares_a_key_is_not_trusted() {
+    let keys = KeySet::generate();
+    let root_of = |keys: &KeySet| {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        runtime
+            .block_on(Generation::build(
+                home.path(),
+                GenerationSpec {
+                    keys: Some(keys.clone()),
+                    ..GenerationSpec::default()
+                },
+            ))
+            .root_bytes()
+    };
+    let trusting = |root: &[u8]| {
+        let document: serde_json::Value = serde_json::from_slice(root).expect("a readable root");
+        let ids: Vec<String> = document["signed"]["roles"]["root"]["keyids"]
+            .as_array()
+            .expect("identifiers")
+            .iter()
+            .map(|id| id.as_str().expect("an identifier").to_owned())
+            .collect();
+        kr_plugin_catalogue::SeedTrust::named(Vec::new(), 1, Some(ids))
+    };
+    let sound = root_of(&keys);
+    trusting(&sound)
+        .permit(&sound)
+        .expect("a root with a key for each role is trusted");
+    let shared = root_of(&KeySet {
+        timestamp: keys.snapshot.clone(),
+        ..keys
+    });
+    let refusal = trusting(&shared)
+        .permit(&shared)
+        .expect_err("a root that shares a key");
+    assert!(refusal.to_string().contains("snapshot"), "{refusal}");
+}

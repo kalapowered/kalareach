@@ -25,8 +25,12 @@ checks an update only against the channel root it trusts, which is the newer of 
 root it adopted; a relay checks a lease only against the issuer keys it pins; and an organisation's
 lease or policy only against the chain the host enrolled for that organisation. A root that names
 one key for two of its roles is refused where each is read: an update channel root by the release
-tool and by a host; a catalogue root only by the pipeline that builds a generation (it checks every
-root the generation ships), since a host's check of a catalogue root does not compare roles. The channel root names a key of its own for each of its four roles, the
+tool and by a host; a catalogue root by the pipeline that builds a generation (it checks every
+root the generation ships) and by a host, when the owner is asked to adopt it, when the bundled
+generation's root is trusted, and for the root a sync ends on before that root is kept. The
+pipeline refuses a key in a spelling it cannot reduce to its bytes; a host compares the keys as the
+TUF client parsed them, so in a root the pipeline did not build, one key written two ways is not
+found as one, and the key ceremony reduces those. The channel root names a key of its own for each of its four roles, the
 snapshot and timestamp roles included, though a host checks neither of them. A host that holds an
 update channel root made by an older `kr-release dev-keys`, which gave the root key to three roles,
 is installed again in a new store.
