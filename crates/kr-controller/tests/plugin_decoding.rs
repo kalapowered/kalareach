@@ -710,14 +710,19 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
     for (number, marker) in (50_u64..).zip(spoilt) {
         world.send(&request_noting(number, marker));
         let approval = approved(&world, &number.to_string()).await;
+        // Whatever the bytes spoil, nothing at all is written to the upstream: a line that names
+        // another request, or none, is not found by the request's own identifier.
+        let written = world.written.lock().expect("not poisoned").len();
         let outcome = world
             .respond(&mut owner, approval.resource_id, "allow")
             .await;
         failed_with(&outcome);
-        assert!(
-            answers_to(&world, number).is_empty(),
+        let lines = world.written.lock().expect("not poisoned").clone();
+        assert_eq!(
+            lines.len(),
+            written,
             "{marker} was sent: {:?}",
-            answers_to(&world, number)
+            &lines[written..]
         );
         world.terminal.write(&answer(number)).await;
         until_answered(&world, number).await;

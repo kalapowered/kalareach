@@ -2306,6 +2306,25 @@ fn observations_of(
         .expect("the observations are read")
 }
 
+/// Waits until the journal holds an observation about the action, and returns what it holds.
+async fn until_observed(
+    host: &Host,
+    receipt: &kr_protocol::receipt::Receipt,
+) -> Vec<kr_protocol::action::ActionObservation> {
+    let started = std::time::Instant::now();
+    loop {
+        let seen = observations_of(host, receipt);
+        if !seen.is_empty() {
+            return seen;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the journal holds no observation of the action by now"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Waits until the action's receipt says `state`.
 async fn until_receipt(
     client: &mut Client<impl Codec>,
@@ -2442,14 +2461,7 @@ async fn kr_req_09_05_a_reply_after_the_deadline_is_correlation_evidence_that_se
         ))
         .await
         .expect("the reply is carried");
-    let mut seen = Vec::new();
-    for _ in 0..200 {
-        seen = observations_of(&host, &unknown);
-        if !seen.is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    let seen = until_observed(&host, &unknown).await;
     assert_eq!(seen.len(), 1, "the evidence is recorded");
     assert_eq!(seen[0].claimed_result, ObservedResult::Indeterminate);
     assert_eq!(
@@ -2600,6 +2612,10 @@ async fn kr_req_09_05_a_reply_after_the_deadline_to_a_package_action_is_kept_as_
 
 /// KR-REQ-09.05: a connection that has ended carries no evidence: a reply the upstream wrote
 /// before the connection went is not read afterwards, and the receipt stays unknown.
+///
+/// The reply is refused where the connection reads, so it never reaches a claim. That the end of a
+/// connection lets go of the claims and the answers it kept is the connection's own unit case in
+/// the library.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_09_05_a_connection_that_ended_settles_nothing() {
     let host = host().await;
