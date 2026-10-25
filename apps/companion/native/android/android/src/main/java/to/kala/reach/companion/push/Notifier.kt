@@ -33,14 +33,14 @@ object Notifier {
     /**
      * Posts `plan` the way `posting` says: a repeat or a replacement takes the place of the
      * notification under its tag without sounding again, and a replacement is not posted when that
-     * notification is no longer up.
+     * notification is no longer up. Says whether it posted.
      */
-    fun show(context: Context, plan: NotificationPlan, posting: Posting) {
-        if (posting == Posting.REPLACEMENT && !stillUp(context, plan.tag)) return
+    fun show(context: Context, plan: NotificationPlan, posting: Posting): Boolean {
+        if (posting == Posting.REPLACEMENT && !stillUp(context, plan.tag)) return false
         // Channels arrived after this application's minimum, so the call is guarded rather than
         // assumed: on an older device the notification simply has no channel.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = context.getSystemService(NotificationManager::class.java) ?: return
+            val manager = context.getSystemService(NotificationManager::class.java) ?: return false
             manager.createNotificationChannel(
                 NotificationChannel(CHANNEL, CHANNEL_LABEL, NotificationManager.IMPORTANCE_HIGH)
             )
@@ -70,9 +70,9 @@ object Notifier {
                 .setContentIntent(tap)
                 .build()
         val manager = NotificationManagerCompat.from(context)
-        if (manager.areNotificationsEnabled()) {
-            manager.notify(plan.tag, NOTIFICATION_NUMBER, notification)
-        }
+        if (!manager.areNotificationsEnabled()) return false
+        manager.notify(plan.tag, NOTIFICATION_NUMBER, notification)
+        return true
     }
 
     /**
