@@ -4083,6 +4083,9 @@ whose registry row has no closure, or whose launch is still under way, is a reco
 collection's. A worker hands its closure over before it exits, and the closure erases its row and
 retires its descriptor, so the launch's process is what says the worker is still there: until the
 kernel says it has ended, the worker may still write what a collection or a migration would open.
+A closure the daemon wrote without confirming that the worker ended says so in its surviving list,
+and keeps the session shut for the same reason. The kernel's later word that the launch's process
+has ended clears that claim; a launch that names no process leaves it standing.
 
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
@@ -4690,7 +4693,9 @@ worker makes, which publishes where the output had reached, and the content of t
 have settled, which keep their identity, state and digests. Receipts that have not settled keep
 their intent. The obligation ends only when nothing is left. A removal that leaves something is
 reported as unavailable with the reason, and is tried again on a schedule that lengthens, across a
-restart. While the obligation stands, `history.page`, `history.times` and `action.read` of that
+restart. So is a removal that could not start: another recovery holds the session, or a worker may
+still own its stores. Removals run one at a time, so a change that answers while the tick is
+removing waits for it and reports what is left after it. While the obligation stands, `history.page`, `history.times` and `action.read` of that
 session are refused with `RESOURCE_UNAVAILABLE`. Once the output is removed they answer a gap with
 no bytes. A page that was read before privacy mode was turned on, and has not yet been written to
 the reader when it is, is written without its bytes, as a range that is gone. `privacy.set` runs the
