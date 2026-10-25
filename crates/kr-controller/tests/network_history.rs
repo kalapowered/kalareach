@@ -39,7 +39,9 @@ use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{ActionId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::ProposedGrant;
-use kr_protocol::privacy::PrivacySetParams;
+use kr_protocol::privacy::{
+    PrivacyCompletion, PrivacyReport, PrivacySetParams, PrivacyStatusParams,
+};
 use kr_protocol::recovery::{HistoryPageParams, HistoryPageResult};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
@@ -575,6 +577,21 @@ impl Rig {
             let session = self.worker.runtime().session();
             session.privacy().is_enabled() == enabled
                 && (!enabled || session.retained_output_bytes() == 0)
+        })
+        .await;
+        // The daemon turns the mode off only once the worker has said its cleanup is complete.
+        until("privacy mode's cleanup being complete", || async {
+            let report: PrivacyReport = self
+                .host
+                .client()
+                .await
+                .request(Method::PrivacyStatus, &PrivacyStatusParams {})
+                .await
+                .expect("the call reaches the daemon")
+                .expect("privacy mode's report")
+                .to_typed()
+                .expect("decodes");
+            matches!(report.completion, PrivacyCompletion::Complete)
         })
         .await;
     }
