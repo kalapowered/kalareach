@@ -122,6 +122,7 @@ impl Rig {
             clocks,
         )
         .await;
+        wait_for_the_passes(&host);
         let remote = client_for(served.origin(), owner.authorisation.clone());
         let rig = Self {
             host,
@@ -170,7 +171,11 @@ impl Rig {
     /// Waits until a pass that began after this call has finished: what a connection waits for, and
     /// what a request published before this call is read by. The carrier's waits stay held.
     async fn poll(&self) {
-        self.runtime().synchronised_before_serving().await;
+        within(
+            "the pass the case asked for ends",
+            self.runtime().synchronised_before_serving(),
+        )
+        .await;
     }
 
     /// Waits until a pass that began after this call has finished, twice over, which leaves no
@@ -179,11 +184,10 @@ impl Rig {
     /// the second call returns. What a connection waits for is exactly such a pass, and the pass
     /// it starts is then the only one that can read what is published afterwards. The wait for a
     /// synchronisation ends silently at its bound, so the bound is made longer than `within`
-    /// allows, and the wait can then end only with its pass or fail the case. The bound stays for
-    /// the connection's own wait, which `within` limits as well.
+    /// allows, and the wait can then end only with its pass or fail the case. The bound is the one
+    /// the start set (`wait_for_the_passes`), which stays for the connection's own wait, and which
+    /// `within` limits as well.
     async fn until_the_carrier_is_idle(&self) {
-        self.runtime()
-            .wait_for_a_synchronisation_at_most(Duration::from_secs(3600));
         within("the passes the setup asked for end", async {
             self.poll().await;
             self.poll().await;
@@ -278,6 +282,7 @@ impl Rig {
         edit(stopped.tree());
         let timer = HeldTimer::held();
         let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        wait_for_the_passes(&host);
         Self {
             host,
             served,
@@ -301,6 +306,7 @@ impl Rig {
         net_support::write_feed_document(stopped.tree(), Some(feed.origin()));
         let timer = HeldTimer::held();
         let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        wait_for_the_passes(&host);
         let remote = client_for(feed.origin(), owner.authorisation.clone());
         Self {
             host,
@@ -331,6 +337,7 @@ impl Rig {
         let stopped = host.shut_down().await;
         let timer = HeldTimer::held();
         let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        wait_for_the_passes(&host);
         (host, served)
     }
 
@@ -373,6 +380,19 @@ async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T 
     tokio::time::timeout(Duration::from_secs(180), work)
         .await
         .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
+}
+
+/// Lets a connection and a case wait for a pass of the carrier for as long as the pass takes, which
+/// `within` limits. The wait for a synchronisation ends silently at its bound, five seconds unless
+/// a case sets another, and a machine that is busy takes longer over a pass than that: the wait
+/// would then end with the pass unfinished, and what the case reads next would be what the pass had
+/// not yet made. Called for every daemon a case starts, before anything is asked of it (one that
+/// reads no feed has no carrier and nothing to wait for); a case that is about the bound sets its
+/// own afterwards.
+fn wait_for_the_passes(host: &Host) {
+    if let Some(carrier) = host.controller().feed_runtime() {
+        carrier.wait_for_a_synchronisation_at_most(Duration::from_secs(3600));
+    }
 }
 
 fn devices(id: DeviceId) -> RevocationTarget {
@@ -641,6 +661,7 @@ async fn a_host_that_stops_between_carrying_a_request_out_and_acknowledging_it_f
     let stopped = host.shut_down().await;
     let timer = HeldTimer::held();
     let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+    wait_for_the_passes(&host);
     // The pass it makes as it starts.
     within("the carrier waits between passes", timer.next_wait()).await;
 
@@ -3485,10 +3506,13 @@ async fn a_host_that_stops_after_a_request_took_effect_and_before_it_was_written
         let runtime = rig.runtime();
         let polled = runtime.synchronised_before_serving();
         tokio::pin!(polled);
-        tokio::select! {
-            () = &mut polled => panic!("the pass stopped where it was held"),
-            reached = arrived => reached.expect("the pass reached the point"),
-        }
+        within("the pass to reach the point", async {
+            tokio::select! {
+                () = &mut polled => panic!("the pass stopped where it was held"),
+                reached = arrived => reached.expect("the pass reached the point"),
+            }
+        })
+        .await;
     }
     rig.runtime().crash();
     let revision = rig
@@ -3509,6 +3533,7 @@ async fn a_host_that_stops_after_a_request_took_effect_and_before_it_was_written
     let stopped = host.shut_down().await;
     let timer = HeldTimer::held();
     let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+    wait_for_the_passes(&host);
     within("the carrier waits between passes", timer.next_wait()).await;
 
     let held = remote
@@ -3734,10 +3759,6 @@ async fn a_device_the_configuration_leaves_no_right_to_manage_the_host_has_no_au
 async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_read_through() {
     let rig = Rig::start().await;
     rig.runtime().read_at_most_pages(1);
-    // A connection waits for the first page to be read and the second to be held, which can take
-    // longer than the default bound on a loaded machine.
-    rig.runtime()
-        .wait_for_a_synchronisation_at_most(Duration::from_secs(120));
     let synchronised = rig.shown().await.list.feed_synchronised_at_ms.0;
     assert!(synchronised.is_some(), "the host has read the feed once");
 
@@ -3831,10 +3852,12 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_bound() {
     let rig = Rig::start().await;
-    rig.runtime()
-        .wait_for_a_synchronisation_at_most(Duration::from_millis(100));
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
     rig.poll().await;
+    // The bound is short only from here: the passes the setup asked for have ended, so what ends at
+    // the bound is the connection's wait for the pass that the held read keeps open.
+    rig.runtime()
+        .wait_for_a_synchronisation_at_most(Duration::from_millis(100));
 
     rig.served
         .web()
@@ -4141,10 +4164,13 @@ async fn a_host_that_stops_while_taking_a_request_that_withdrew_nothing_refuses_
     {
         let polled = rig.runtime().synchronised_before_serving();
         tokio::pin!(polled);
-        tokio::select! {
-            () = &mut polled => panic!("the pass stopped where it was held"),
-            reached = arrived => reached.expect("the pass reached the point"),
-        }
+        within("the pass to reach the point", async {
+            tokio::select! {
+                () = &mut polled => panic!("the pass stopped where it was held"),
+                reached = arrived => reached.expect("the pass reached the point"),
+            }
+        })
+        .await;
     }
     rig.runtime().crash();
 
@@ -4539,10 +4565,13 @@ async fn a_refusal_whose_first_write_failed_is_on_disk_before_it_is_sent() {
     {
         let polled = rig.runtime().synchronised_before_serving();
         tokio::pin!(polled);
-        tokio::select! {
-            () = &mut polled => panic!("the pass stopped where it was held"),
-            reached = arrived => reached.expect("the pass reached the point"),
-        }
+        within("the pass to reach the point", async {
+            tokio::select! {
+                () = &mut polled => panic!("the pass stopped where it was held"),
+                reached = arrived => reached.expect("the pass reached the point"),
+            }
+        })
+        .await;
         // The note is written. The refusal it is about to write is not.
         registry
             .execute_batch(
@@ -4552,7 +4581,7 @@ async fn a_refusal_whose_first_write_failed_is_on_disk_before_it_is_sent() {
             )
             .expect("the fault is in place");
         go.send(()).expect("the pass goes on");
-        polled.await;
+        within("the pass to end", polled).await;
     }
     assert_eq!(
         rig.held(&again).await.rejected.0,
@@ -4594,7 +4623,7 @@ async fn a_refusal_whose_first_write_failed_is_on_disk_before_it_is_sent() {
         "the refusal is on disk when the host sends it"
     );
     rig.served.web().release_held();
-    polled.await;
+    within("the pass to end", polled).await;
 }
 
 /// A removal is written down whether or not the attention store can be read when the feed answers:
