@@ -538,6 +538,121 @@ async fn kr_req_19_08_a_share_without_the_live_view_finds_its_agent_and_not_the_
     adopted.stop().await;
 }
 
+/// KR-REQ-13.11: a device reads a session's launch surface through the daemon, which forwards the
+/// read to the worker with the scope of the grant it acts under. The input lease is what the live
+/// screen shows, so a share without the screen is told nothing of who holds it and a share with the
+/// screen is. The session here runs a stock shell, which the read names for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_device_reads_the_launch_surface_as_its_grant_allows() {
+    use kr_protocol::root::{
+        LaunchEditor, LaunchInput, LaunchUnverified, ShellLaunchSurfaceParams,
+        ShellLaunchSurfaceResult,
+    };
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let (device, record) = recipient(&adopted.host, &adopted.owner).await;
+    let dark = share(
+        &adopted.host,
+        worker.session_id,
+        &device,
+        &record,
+        RoleSelection::plain(SessionRole::Viewer),
+    )
+    .await;
+    let lit = share(
+        &adopted.host,
+        worker.session_id,
+        &device,
+        &record,
+        RoleSelection {
+            include_live_screen: true,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        },
+    )
+    .await;
+    let params = ShellLaunchSurfaceParams {
+        session_id: worker.session_id,
+    };
+
+    for (grant, input) in [(&dark, LaunchInput::Withheld), (&lit, LaunchInput::Free)] {
+        let connection = RawDevice::connect(&adopted.host, &device, &record).await;
+        open(&connection, Some(worker.session_id), Some(grant.grant_id))
+            .await
+            .expect("the share opens");
+        let surface: ShellLaunchSurfaceResult = connection
+            .read(Method::ShellLaunchSurface, &params)
+            .await
+            .expect("the launch surface is read under session.view")
+            .to_typed()
+            .expect("decodes");
+        assert_eq!(
+            surface.editor,
+            LaunchEditor::Unverified {
+                reason: LaunchUnverified::StockShell
+            }
+        );
+        assert_eq!(surface.input, input);
+        connection.close();
+    }
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.11: a worker that does not state that it serves the launch surface is not asked for
+/// it. A worker of an earlier release has no row for the method and refuses it as it refuses any
+/// method it does not serve, which a device would read as a missing right; the daemon refuses the
+/// read itself, as an unsupported capability, and sends the worker nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_worker_that_does_not_state_the_launch_surface_is_not_asked_for_it() {
+    use kr_protocol::root::ShellLaunchSurfaceParams;
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    worker
+        .service
+        .withhold_capability(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ);
+    let (device, record) = recipient(&adopted.host, &adopted.owner).await;
+    let lit = share(
+        &adopted.host,
+        worker.session_id,
+        &device,
+        &record,
+        RoleSelection {
+            include_live_screen: true,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        },
+    )
+    .await;
+    let connection = RawDevice::connect(&adopted.host, &device, &record).await;
+    open(&connection, Some(worker.session_id), Some(lit.grant_id))
+        .await
+        .expect("the share opens");
+    assert_eq!(
+        code(
+            connection
+                .read(
+                    Method::ShellLaunchSurface,
+                    &ShellLaunchSurfaceParams {
+                        session_id: worker.session_id,
+                    },
+                )
+                .await
+        ),
+        ErrorCode::UnsupportedCapability,
+        "the daemon refuses a read the worker does not state, and the grant is not at fault"
+    );
+    // The same connection reads the session, which the worker serves: the grant is in force.
+    connection
+        .read(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams {
+                session_id: worker.session_id,
+            },
+        )
+        .await
+        .expect("the session is read");
+    connection.close();
+    adopted.stop().await;
+}
+
 /// A share's end ends its own connection and no other: two shares of one session on two
 /// connections, one revoked, the other still served, and the connection opened for the host
 /// untouched.

@@ -212,6 +212,9 @@ pub struct WorkerProxy {
     next_request: AtomicU64,
     /// The level the worker stated, which every frame on this link is read and written under.
     level: kr_protocol::retained::Level,
+    /// What the worker stated about itself in its answer to the hello: the reads and frames it
+    /// serves that a worker of an earlier release does not.
+    capabilities: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     /// How many calls have begun to wait for the write half.
     #[cfg(test)]
     calls_at_the_writer: AtomicU64,
@@ -304,7 +307,7 @@ impl WorkerProxy {
             .await?;
 
         let level = client.level();
-        let (reader, writer, _) = client.into_halves();
+        let (reader, writer, acknowledgement) = client.into_halves();
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -322,6 +325,7 @@ impl WorkerProxy {
             reader,
             next_request: AtomicU64::new(1),
             level,
+            capabilities: acknowledgement.capabilities,
             #[cfg(test)]
             calls_at_the_writer: AtomicU64::new(0),
         }))
@@ -399,6 +403,13 @@ impl WorkerProxy {
     #[must_use]
     pub const fn level(&self) -> kr_protocol::retained::Level {
         self.level
+    }
+
+    /// Whether the worker this link is to stated `capability` in its answer to the hello.
+    #[must_use]
+    pub fn states(&self, capability: &str) -> bool {
+        kr_protocol::ids::CapabilityId::new(capability)
+            .is_ok_and(|capability| self.capabilities.contains(&capability))
     }
 
     /// Forwards one admitted read and returns what the worker answered.
