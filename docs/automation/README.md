@@ -150,6 +150,12 @@ it dispatches and once more where the node's effect begins.
   its node and itself when dispatch reaches a node its grant does not authorise, with that refusal.
   A `create_session` node that names the shell its session runs is held to the same grant, because a
   named shell runs a program the definition chose.
+* **A capture node's session is one the grant selects.** A `capture_changeset` node that names a
+  session records its version for that session, and a version recorded for a session is review
+  work in it. If the definition's grant does not select that session, the definition is refused at
+  install, and the refusal names the session. A definition installed earlier, whose grant has been
+  issued again for fewer sessions, is refused when a run is admitted. A node that names no session
+  needs none.
 * **A device's workflow gets what its grant carries.** Because the grant is held inside the
   change-set service's own transactions, a workflow under a paired device's grant runs the
   change-set nodes that grant's rights allow, under the same hold, and nothing more.

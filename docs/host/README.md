@@ -5472,7 +5472,8 @@ reading of the host time contract from the daemon.
 
 ### Where its events come from
 
-Three sources in each session's journal reach it: the question ledger, whose events carry the moment
+Three sources in each session's journal reach it, and the environment has two of its own beside
+them, the workflow journal's alerts and the change-set store's versions, which come below: the question ledger, whose events carry the moment
 a request became pending; the transitions the session's broker records for the requests an
 application makes of a person, which is how an approval an application raises comes to be
 pending; and the journal's host events, which are the terminal side effects that had no
@@ -5589,6 +5590,35 @@ the owner's alone. A record announces nothing by itself: once a pass has read to
 journal's records, the timer pass decides what an item it raised is owed, as it does for a session
 after a page that reached the head of both its sources. `workflow.read` shows as alerts the
 attention records the journal does not yet record the store as having taken.
+
+### The change-set store's versions
+
+The change-set service is a source of review work. A change set's version numbers only go up, and
+each version's record names the session it was recorded for and the moment it was recorded. The
+daemon reads the newest version of each change set past what it has already read: at its start,
+before it serves anything; each time the service records a version; and two seconds after a pass
+that could not finish. A version a capture recorded, a version derived from a modified
+materialisation and a version whose pin then failed are read the same way, and nothing that
+captures has anything to announce.
+
+A version that is review work is recorded as a captured change set at that version, and as one
+change in its session's log. The change is dated by the moment the version was recorded and not
+the moment it was read, and its text is the host's own words: the identifiers of the version and
+of its change set, so a paired device is served it. Reading a version raises no inbox item; only a
+completed turn does. The records are numbered from the environment's own semantic source, in one
+transaction for each page, and the review state only goes forward, so a version read again after a
+restart is recorded once. A write the attention store refused is not counted as read, and the next
+pass offers the version again.
+
+After a pass, every change set whose newest version names a session this daemon holds has review
+work at that version. A session is held while a worker is known for it and after a closure is
+recorded for it. A version recorded for a session the daemon does not hold waits, and is read again
+at each pass and every minute, until the session is held. A version that names no session raises
+nothing, because a review subject belongs to a session: a capture that names none, and the
+versions a proposal apply derives into its destination's change set, are not review work. The pass
+cannot recover a version that was deleted, an older version of a change set that was captured into
+again afterwards, or the order the captures were made in. A workflow's capture node names a session
+only when its grant selects that session.
 
 ### The rule set
 
