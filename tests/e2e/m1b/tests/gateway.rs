@@ -1275,16 +1275,10 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
         "TUI: turn/completed",
         "the second session is served another conversation",
     );
-    assert_eq!(
-        first_instance(&ctx, &remote, second.session_id).mode,
-        IntegrationMode::Gateway
-    );
     let other = server_besides(&ctx, "the second session's server", &[&server]);
     second.window.type_text(b"\x03");
     assert!(ended_within(&other, LIVENESS), "the second server ends");
-    let _ = ctx.instances_until(&remote, second.session_id, "its instance ends", |read| {
-        read.agent_instances.instances.is_empty()
-    });
+    wait_until_the_claim_is_free(&host, "thread-10");
 
     // It asks for the first session's conversation, and the launcher says the backend refused it.
     // Nothing was started for it.
@@ -1312,14 +1306,6 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
         still.mode == IntegrationMode::Gateway && still.ended_at.0.is_none(),
         "the first session's instance is untouched: {still:?}"
     );
-    assert!(
-        ctx.instances(&remote, second.session_id)
-            .agent_instances
-            .instances
-            .iter()
-            .all(|instance| instance.mode != IntegrationMode::Gateway),
-        "the second session has no gateway's instance"
-    );
 
     // The first session's program ends and its server with it: the conversation is free once the
     // retirement has ended what the server started.
@@ -1337,9 +1323,15 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
         "TUI: turn/completed",
         "the second session's line is served once the first session's execution has ended",
     );
+    let served = server_besides(&ctx, "the second session's server", &[&server, &other]);
+    assert!(
+        kr_e2e_m1b::run::running(&served),
+        "behind a gateway of its own"
+    );
     assert_eq!(
-        first_instance(&ctx, &remote, second.session_id).mode,
-        IntegrationMode::Gateway
+        gateway_sockets(host.roots().runtime_root()).len(),
+        1,
+        "which is the one gateway socket"
     );
     ctx.close(&host);
 }

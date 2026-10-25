@@ -158,8 +158,8 @@ impl ProfileStore {
     ///
     /// # Errors
     ///
-    /// As [`ProfileStore::claim_word`]: the launch is refused when another session holds the
-    /// conversation, and when the claim cannot be made.
+    /// Returns [`BrokerError::ConversationHeldElsewhere`] when a claim on the conversation is
+    /// held on the host, and [`BrokerError::ResourceUnavailable`] when the claim cannot be made.
     pub fn claim(&self, intent: &LaunchIntent) -> Result<Option<HostClaim>> {
         match intent.saved_conversation.as_deref() {
             Some(word) => self.claim_word(word),
