@@ -842,3 +842,249 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
     });
     assert!(reads.load(Ordering::SeqCst) > 0, "the readers read");
 }
+
+/// Seals a release the way an install does: every file read-only and without a right to write it,
+/// then every directory, deepest first, without a right to add a name or take one away.
+#[cfg(windows)]
+fn seal_tree(directory: &Path) {
+    let mut directories = vec![directory.to_path_buf()];
+    let mut at = 0;
+    while at < directories.len() {
+        for entry in std::fs::read_dir(&directories[at]).expect("reads") {
+            let entry = entry.expect("an entry");
+            if entry.file_type().expect("a type").is_dir() {
+                directories.push(entry.path());
+            } else {
+                kr_ipc::install::seal_file(&entry.path()).expect("a file is sealed");
+            }
+        }
+        at += 1;
+    }
+    for directory in directories.iter().rev() {
+        kr_ipc::install::seal_directory(directory).expect("a directory is sealed");
+    }
+}
+
+/// KR-REQ-26.06: a release that was sealed is not changed by the account that owns it, by any of the
+/// ways a program changes a file: nothing is created beside its files or overwritten, appended to,
+/// renamed or removed, and its read-only attribute cannot be cleared. Its programs still read and run
+/// as they did. The control is the same release before it is sealed, where each change is made.
+#[cfg(windows)]
+#[test]
+fn a_sealed_release_refuses_to_create_or_overwrite_a_file_as_its_owner() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let program = test.install(&one);
+    let directory = test.store.release_directory(&one);
+    std::fs::create_dir_all(directory.join("share")).expect("a directory");
+    std::fs::write(directory.join("share/data"), b"data").expect("a file");
+
+    // The control: an unsealed release is changed in every way.
+    let changes = |program: &Path, directory: &Path| -> Vec<(&'static str, bool)> {
+        vec![
+            (
+                "create a file",
+                std::fs::File::create_new(directory.join("bin/new")).is_ok(),
+            ),
+            (
+                "overwrite a file",
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(program)
+                    .is_ok(),
+            ),
+            (
+                "append to a file",
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(directory.join("share/data"))
+                    .is_ok(),
+            ),
+            (
+                "make a directory",
+                std::fs::create_dir(directory.join("bin/sub")).is_ok(),
+            ),
+            (
+                "rename a file",
+                std::fs::rename(directory.join("share/data"), directory.join("share/moved"))
+                    .is_ok(),
+            ),
+            (
+                "remove a file",
+                std::fs::remove_file(directory.join("release.json")).is_ok(),
+            ),
+        ]
+    };
+    let before = changes(&program, &directory);
+    assert!(
+        before.iter().all(|(_, made)| *made),
+        "an unsealed release is changed in every way: {before:?}"
+    );
+
+    // Put the release back as it was, and seal it.
+    std::fs::remove_file(directory.join("bin/new")).expect("tidied");
+    std::fs::remove_dir(directory.join("bin/sub")).expect("tidied");
+    std::fs::rename(directory.join("share/moved"), directory.join("share/data")).expect("tidied");
+    std::fs::write(test.store.manifest(&one), manifest(&one)).expect("the manifest again");
+    seal_tree(&directory);
+
+    let after = changes(&program, &directory);
+    assert!(
+        after.iter().all(|(_, made)| !*made),
+        "a sealed release is changed in none: {after:?}"
+    );
+    let mut permissions = std::fs::metadata(&program).expect("there").permissions();
+    permissions.set_readonly(false);
+    assert!(
+        std::fs::set_permissions(&program, permissions).is_err(),
+        "the read-only attribute of a sealed file cannot be cleared"
+    );
+    assert!(std::fs::read(&program).is_ok(), "a sealed program reads");
+
+    // A program of the sealed release starts and holds it, and the release is then removed whole
+    // once nothing holds it: the owner can still take a sealed release away.
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(
+        test.store.retire(&one, &update).expect("removes"),
+        "a sealed release nobody holds goes"
+    );
+    assert!(!directory.exists());
+}
+
+/// KR-REQ-26.06: removing a release follows no link and changes nothing outside it. A name that is a
+/// junction is taken away and what it leads to is left as it was, and a release whose program is a
+/// hard link to a file elsewhere goes as names only: that file keeps its contents and its read-only
+/// attribute, which clearing by the release's path would have taken from it.
+#[cfg(windows)]
+#[test]
+fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
+    let test = TestStore::create();
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(outside.join("release/bin")).expect("a directory elsewhere");
+    let read_only = |path: &Path| {
+        std::fs::metadata(path)
+            .expect("there")
+            .permissions()
+            .readonly()
+    };
+
+    // A name that is a junction to a whole release elsewhere.
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    std::fs::write(outside.join("release/release.json"), manifest(&one)).expect("written");
+    std::fs::write(outside.join("release/bin/kr.exe"), b"program").expect("written");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(test.store.release_directory(&one))
+        .arg(outside.join("release"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("mklink runs");
+    assert!(made.success(), "a junction under the release's name");
+    assert!(
+        test.store.retire(&one, &update).expect("removes the name"),
+        "a junction is removed as a name"
+    );
+    assert!(
+        std::fs::symlink_metadata(test.store.release_directory(&one)).is_err(),
+        "the name is gone"
+    );
+    assert!(
+        outside.join("release/bin/kr.exe").is_file()
+            && outside.join("release/release.json").is_file(),
+        "what it led to is not followed or removed"
+    );
+
+    // A release whose program is a hard link to a read-only file elsewhere.
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    let program = test.install(&two);
+    std::fs::write(outside.join("shared"), b"shared contents").expect("written");
+    let mut permissions = std::fs::metadata(outside.join("shared"))
+        .expect("there")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(outside.join("shared"), permissions).expect("read-only");
+    std::fs::remove_file(&program).expect("the copy goes");
+    std::fs::hard_link(outside.join("shared"), &program).expect("a hard link");
+    assert!(test.store.retire(&two, &update).expect("removes"));
+    assert!(!test.store.release_directory(&two).exists());
+    assert_eq!(
+        std::fs::read(outside.join("shared")).expect("still there"),
+        b"shared contents"
+    );
+    assert!(read_only(&outside.join("shared")), "its attribute is kept");
+}
+
+/// KR-REQ-26.06: `current` is a junction to the release's own directory, `Store::current` reads the
+/// release it names, and it names a release of this store only: a store that was moved has a
+/// `current` that leads to the place it was made for, which is refused, and a junction a crash left
+/// beside `current` is taken away by the next switch.
+#[cfg(windows)]
+#[test]
+fn current_is_a_junction_that_names_a_release_of_this_store_only() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    assert_eq!(test.store.current().expect("reads"), Some(one.clone()));
+    assert_eq!(
+        std::fs::read_link(test.store.current_link()).expect("a junction"),
+        test.store.release_directory(&one),
+        "the junction names the release's own directory"
+    );
+
+    // A junction a crash left, as `mklink /J` makes one.
+    let stale = test.store.root().join(".current-crashed");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&stale)
+        .arg(test.store.release_directory(&one))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("mklink runs");
+    assert!(
+        made.success() && stale.exists(),
+        "a junction is left behind"
+    );
+    test.switch(&two);
+    assert!(!stale.exists(), "the next switch takes it away");
+    assert_eq!(test.store.current().expect("reads"), Some(two));
+
+    // The store is moved: its junction still leads where it was made.
+    let moved = test.root.join("moved");
+    std::fs::rename(test.store.root(), &moved).expect("the store is moved");
+    let refused = Store::at(&moved).current();
+    assert!(
+        matches!(refused, Err(kr_ipc::install::InstallError::Replaced { .. })),
+        "a store that was moved does not follow its junction: {refused:?}"
+    );
+}
+
+/// KR-REQ-26.06: a store is kept on an NTFS volume, and one named on another file system is refused
+/// before anything is made there. The volume is a virtual disk formatted FAT32 that the native run
+/// attaches and names by the variable; without it there is no other file system to ask, and the case
+/// has nothing to assert.
+#[cfg(windows)]
+#[test]
+fn a_store_on_a_volume_that_is_not_ntfs_is_refused() {
+    let Some(volume) = std::env::var_os("KR_INSTALL_TEST_FAT_VOLUME") else {
+        return;
+    };
+    let store = Store::at(PathBuf::from(volume).join("host"));
+    let refused = store.create_directories();
+    assert!(
+        matches!(refused, Err(kr_ipc::install::InstallError::Replaced { .. })),
+        "a store is not made on a volume that is not NTFS: {refused:?}"
+    );
+    assert!(!store.root().exists(), "and nothing is made there");
+}
