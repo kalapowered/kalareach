@@ -35,6 +35,7 @@ use kr_protocol::question::{Question, QuestionCreateParams, QuestionKind};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
+use kr_worker::action::time::TimeSources;
 use kr_worker::broker::{
     BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
     UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
@@ -73,6 +74,7 @@ impl HeldBoundary {
 pub struct Worker {
     pub service: Arc<WorkerService>,
     pub session_id: SessionId,
+    endpoint: kr_ipc::paths::Endpoint,
     _runtime: Arc<SessionRuntime>,
 }
 
@@ -101,11 +103,47 @@ impl Worker {
         Self::start_as(tree, display, true, "exec cat").await
     }
 
+    /// As [`Self::start_running`], for a worker whose time service keeps its clock, so that the
+    /// time each part of its output is written at is recorded as proven. A host with no such
+    /// service to read, as a runner may be, would record none of it as proven.
+    pub async fn start_running_on_a_kept_clock(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        script: &str,
+    ) -> Self {
+        let kept = kr_worker::action::adapter::classify_unix(
+            "macos",
+            "ntp_adjtime(2)",
+            kr_worker::action::adapter::UnixTimex {
+                time_state: kr_worker::action::adapter::unix_model::TIME_OK,
+                status: kr_worker::action::adapter::unix_model::STA_PLL,
+                maxerror_us: 62_192,
+                esterror_us: 500,
+            },
+            now(),
+        );
+        let time = TimeSources {
+            adapter: Arc::new(kr_worker::action::adapter::RecordedTimeAdapter::new(kept)),
+            ..TimeSources::system()
+        };
+        Self::start_with(tree, display, true, script, time).await
+    }
+
     async fn start_as(
         tree: &kr_ipc::testing::TempHost,
         display: u64,
         reserved: bool,
         script: &str,
+    ) -> Self {
+        Self::start_with(tree, display, reserved, script, TimeSources::system()).await
+    }
+
+    async fn start_with(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        reserved: bool,
+        script: &str,
+        time: TimeSources,
     ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
@@ -177,7 +215,7 @@ impl Worker {
             worker_endpoint: None,
             send_queue_bytes: 1024 * 1024,
             resident_bytes: 64 * 1024,
-            time: kr_worker::action::time::TimeSources::system(),
+            time,
             launch_profile: kr_protocol::session::LaunchProfile::default(),
         };
         let mut session = Session::open(config).expect("opens the session");
@@ -247,8 +285,20 @@ impl Worker {
         Self {
             service,
             session_id,
+            endpoint,
             _runtime: runtime,
         }
+    }
+
+    /// The owner's own client on this worker's socket, as a terminal on this machine reaches it.
+    pub async fn client(&self) -> kr_ipc::client::LocalClient {
+        kr_ipc::client::LocalClient::connect(
+            &self.endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("connects to the worker")
     }
 
     /// The session's runtime, for a suite that stops the journal's next commit.
