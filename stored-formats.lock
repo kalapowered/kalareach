@@ -225,7 +225,7 @@
         "version": 11,
         "migrates_from": 6
       },
-      "digest": "2d1070eab92fb73596716cce9384f7877ae3d9f6c64a07b99bd8f555d827736f",
+      "digest": "43f4a7424a4d46099716d218f15f800f6210548642af93eeb27efe6b6d4ed0e1",
       "kept": [
         "PushDeliveryRequest",
         "SealedEnvelope",
@@ -233,7 +233,9 @@
         "PushUrgency",
         "Production, Notice, Audience (crates/kr-delivery/src/producer.rs)",
         "PreviewBody (crates/kr-delivery/src/preview.rs)",
-        "EventKey, EventSource (crates/kr-delivery/src/journal.rs)",
+        "EventKey, EventSource, DeliveryState (crates/kr-delivery/src/journal.rs)",
+        "DestinationKind (crates/kr-delivery/src/destination.rs)",
+        "NextAction (crates/kr-delivery/src/push.rs)",
         "ContentLine (crates/kr-delivery/src/external.rs)",
         "StoredMessage, StoredInterval (crates/kr-controller/src/push/client.rs)",
         "words of push suppression reasons",
