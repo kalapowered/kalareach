@@ -81,6 +81,8 @@ use std::time::{Duration, Instant};
 
 use kr_protocol::update::{MANIFEST_FILE, ReleaseManifest, ReleaseName};
 
+pub mod names;
+
 /// The store's record, whose presence is what makes a directory a store.
 pub const STORE_RECORD: &str = "install.json";
 
