@@ -922,6 +922,8 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
 
     running.kill().expect("the program is ended");
     running.wait().expect("and gone");
+    let last = kr_ipc::install::remove_sealed_tree(&kept);
+    assert!(last.is_ok(), "removal after the program ended: {last:?}");
     test.store.sweep_trash(&update).expect("sweeps");
     let result = (
         left(),
