@@ -10493,6 +10493,65 @@ async fn what_a_removal_leaves_in_the_trash_is_deleted_by_the_next_update() {
     );
 }
 
+/// KR-REQ-26.06: an update says what it could not remove when no running program is the reason, in
+/// its words and in its `--json` document, and says nothing of it once it is put right. Here an
+/// entry in the store's trash refuses its owner the right to change its access list, which a removal
+/// asks for.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_says_what_it_could_not_remove_when_no_program_is_the_reason() {
+    let releases: Vec<Assembled> = (1..=3)
+        .map(|sequence| {
+            Assembled::at_this_level(&format!("0.{sequence}.0+{}", "abcd".repeat(3)), sequence)
+        })
+        .collect();
+    let host = Host::bare();
+    host.install(&releases[0]);
+    let stuck = host.store.trash().join("stuck");
+    std::fs::create_dir_all(&stuck).expect("an entry in the trash");
+    let denied = Command::new("icacls")
+        .arg(&stuck)
+        .args(["/deny", "*S-1-3-4:(WDAC)"])
+        .stdout(Stdio::null())
+        .status()
+        .expect("icacls runs");
+    assert!(denied.success(), "the right is denied");
+    let scratch = host.scratch("archives");
+    let update = |release: &Assembled| {
+        let archive = scratch.join(format!("{}.zip", release.name()));
+        release.archive(&archive);
+        let (output, said) = host.kr_json(&[
+            "host",
+            "update",
+            "--archive",
+            &archive.display().to_string(),
+            "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "kr host update: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        said
+    };
+
+    let said = update(&releases[1]);
+    let reported = said["not_removed"].as_array().cloned().unwrap_or_default();
+    assert_eq!(reported.len(), 1, "{said}");
+    assert!(reported[0]["release"].is_null(), "{said}");
+    assert!(
+        reported[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "{said}"
+    );
+
+    // Put right, the next update has nothing to say.
+    std::fs::remove_dir(&stuck).expect("an empty directory goes by the right its parent gives");
+    let said = update(&releases[2]);
+    assert_eq!(said["not_removed"], serde_json::json!([]), "{said}");
+}
+
 /* -------------------------------------------------------------------------------------------- */
 /* Windows: the environment's task starts a daemon again                                         */
 /* -------------------------------------------------------------------------------------------- */
