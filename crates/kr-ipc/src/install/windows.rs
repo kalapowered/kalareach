@@ -28,25 +28,27 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SetSecurityInfo,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR,
+    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_TYPE_DISK, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx, GetFileType,
-    GetVolumeInformationW, GetVolumePathNameW, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+    FILE_TYPE_DISK, FileIdInfo, FileRenameInfoEx, GetDiskFreeSpaceExW,
+    GetFileInformationByHandleEx, GetFileType, GetVolumeInformationW, GetVolumePathNameW,
+    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
 };
@@ -499,7 +501,12 @@ const OTHERS_MAY_READ: u32 =
 const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)";
 
 /// Sets an explicit, protected access-control list, written as SDDL, on the file or directory at
-/// `path` itself, never on what a link there leads to.
+/// `path` itself, never on what a link there leads to, and on nothing else.
+///
+/// The list is set on the object alone: `SetSecurityInfo` and `SetNamedSecurityInfo` pass a
+/// changed list down to the objects inside a directory and take the entries they inherited from
+/// those that carry them, and a file inside a release can be a hard link to a file elsewhere, whose
+/// own list would be emptied by it. The kernel's call changes the one object.
 fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
     let handle = OpenOptions::new()
         .access_mode(WRITE_DAC | READ_CONTROL)
@@ -521,39 +528,19 @@ fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
     if parsed == 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut present = 0_i32;
-    let mut defaulted = 0_i32;
-    let mut list = std::ptr::null_mut();
-    // SAFETY: `descriptor` was just built, and the three outputs are live.
-    let got = unsafe {
-        GetSecurityDescriptorDacl(
+    // SAFETY: the handle is the open object's own and was opened with the right to change its
+    // list, and `descriptor` is the self-relative descriptor just built, freed after the call.
+    let set = unsafe {
+        SetKernelObjectSecurity(
+            handle.as_raw_handle(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             descriptor,
-            &raw mut present,
-            &raw mut list,
-            &raw mut defaulted,
         )
     };
-    let result = if got == 0 || present == 0 {
+    let result = if set == 0 {
         Err(io::Error::last_os_error())
     } else {
-        // SAFETY: the handle is the open object's own, and `list` points into `descriptor`, which
-        // is freed after the call.
-        let code = unsafe {
-            SetSecurityInfo(
-                handle.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                list,
-                std::ptr::null_mut(),
-            )
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(code.cast_signed()))
-        }
+        Ok(())
     };
     // SAFETY: `descriptor` was allocated by the conversion above and is freed exactly once.
     unsafe {
@@ -604,4 +591,50 @@ pub fn seal_directory(path: &Path) -> io::Result<()> {
 /// Returns the operating system's error when the directory cannot be changed.
 pub fn unseal_directory(path: &Path) -> io::Result<()> {
     set_list(path, OWNER_ONLY)
+}
+
+/// The version of Windows this host runs, as the major and minor numbers the system states: `10.0`
+/// for Windows 10 and 11. The system's own record is read, never a version a program compatibility
+/// setting reports.
+///
+/// # Errors
+///
+/// Returns the operating system's error when it does not say.
+pub fn windows_version() -> io::Result<(u32, u32)> {
+    let mut information = OSVERSIONINFOW {
+        dwOSVersionInfoSize: u32::try_from(size_of::<OSVERSIONINFOW>()).unwrap_or(0),
+        ..OSVERSIONINFOW::default()
+    };
+    // SAFETY: `information` is a live buffer whose size field holds its size, as the call asks.
+    let status = unsafe { RtlGetVersion(&raw mut information) };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "the system did not say its version: status {status:#x}"
+        )));
+    }
+    Ok((information.dwMajorVersion, information.dwMinorVersion))
+}
+
+/// The bytes free for this account on the volume `path` is on.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the volume cannot be asked.
+pub fn free_space(path: &Path) -> io::Result<u64> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut available = 0_u64;
+    // SAFETY: `wide` is null-terminated and outlives the call, `available` is a live out
+    // parameter, and the two totals are not asked for.
+    let asked = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if asked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
 }
