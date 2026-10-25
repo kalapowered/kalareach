@@ -1372,7 +1372,12 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
     std::fs::write(outside.join("inner/kept"), b"kept").expect("written");
     let made = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(test.store.release_directory(&two).join("bin/linked"))
+        .arg(
+            test.store
+                .release_directory(&two)
+                .join("bin")
+                .join("linked"),
+        )
         .arg(outside.join("inner"))
         .stdout(std::process::Stdio::null())
         .status()
