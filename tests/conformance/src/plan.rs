@@ -1617,6 +1617,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the recovery bundle store and its write record",
+            &["test", "--locked", "-p", "kr-client", "--test", "recovery"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the real-worker host tests, through the environment's scheduled task",
             &["test", "--locked", "-p", "kr-worker", "--test", "host"],
         ),
