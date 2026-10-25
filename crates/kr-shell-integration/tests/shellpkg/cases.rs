@@ -3834,19 +3834,81 @@ pub fn the_powershell_secret_is_decoded_into_one_byte_array_that_is_cleared() {
            $left = @($decoded | Where-Object {{ $_ -ne 0 }}).Count; \
            Write-Output \"kr-decoded=[$type|$length|$left]\" }}"
     );
-    let asked = std::process::Command::new(&package.executable)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .env_remove("KR_SHELL_BRIDGE")
-        .env_remove("KR_SHELL_BRIDGE_SECRET")
-        .env_remove("KR_SESSION")
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     assert!(
         said.lines()
             .any(|line| line == "kr-decoded=[System.Byte[]|32|0]"),
         "the decoded secret is not one byte array of 32 bytes with none left after the clear:\n{said}\n{}",
         String::from_utf8_lossy(&asked.stderr)
+    );
+}
+
+/// KR-REQ-07.16: a case that asks the package's host something starts it as a session does, with
+/// the launch environment the package's record holds.
+///
+/// A package that builds no shell names the host the person has, and the record holds what that
+/// host needs in its environment: a host that is framework-dependent does not start without the
+/// location of its runtime. The host here is a stand-in outside the package that answers with the
+/// location it was started with, and the record gives it one that nothing else in the environment
+/// could.
+///
+/// # Panics
+///
+/// Panics when the stand-in is not started with the record's location.
+pub fn the_packages_host_is_started_with_the_launch_environment_its_record_holds() {
+    let root = tempfile::tempdir().expect("a directory");
+    let directory = root.path().join("powershell/identity-1");
+    let modules = directory.join("modules");
+    std::fs::create_dir_all(&modules).expect("the package's modules");
+    std::fs::create_dir_all(directory.join("startup")).expect("the package's startup entry");
+    std::fs::write(directory.join("startup/kr-profile.ps1"), b"# entry\n").expect("the entry");
+    let host = root.path().join("host/PowerShell/7/pwsh");
+    std::fs::create_dir_all(host.parent().expect("a directory")).expect("the host's directory");
+    let text = host.with_file_name("pwsh.text");
+    std::fs::write(
+        &text,
+        b"#!/bin/sh\nprintf 'kr-runtime=[%s]\\n' \"$DOTNET_ROOT\"\n",
+    )
+    .expect("the stand-in host");
+    kr_ipc::testing::place_program(&text, &host);
+    let record = serde_json::json!({
+        "identity": "identity-1",
+        "shell": {
+            "kind": "powershell",
+            "executable": host,
+            "upstream_version": "7.6.7",
+            "editor_abi": "psreadline-2.4",
+            "integration_version": "1",
+            "patches": [],
+            "modules": [{
+                "name": "KalaReach.ShellBridge",
+                "search_path": modules,
+                "editor_abi": "psreadline-2.4",
+            }],
+        },
+        "startup_entry": { "file": "startup/kr-profile.ps1" },
+        "launch": {
+            "environment": { "DOTNET_ROOT": "/opt/dotnet-the-record-holds" },
+            "search_paths": { "PSModulePath": [modules] },
+        },
+    });
+    std::fs::write(directory.join("kr-shell-identity.json"), record.to_string())
+        .expect("the record");
+    let package = Package {
+        kind: ShellKind::PowerShell,
+        identity: "identity-1".to_owned(),
+        executable: host,
+        startup_entry: directory.join("startup/kr-profile.ps1"),
+        module_directory: modules,
+        record,
+    };
+
+    let asked = package.ask("the stand-in answers whatever it is asked");
+    let said = String::from_utf8_lossy(&asked.stdout);
+    assert!(
+        said.contains("kr-runtime=[/opt/dotnet-the-record-holds]"),
+        "the host was not started with the location of the runtime its record holds: {said:?}"
     );
 }
 

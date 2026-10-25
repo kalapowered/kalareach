@@ -25,6 +25,13 @@ use kr_shell_integration::contract::qualification::ShellKind;
 
 const PWSH: ShellKind = ShellKind::PowerShell;
 
+/// KR-REQ-07.16: the cases that ask the package's host something start it with the launch
+/// environment its record holds, as a session does.
+#[test]
+fn a_case_that_asks_the_packages_host_starts_it_with_the_launch_environment_its_record_holds() {
+    shellpkg::the_packages_host_is_started_with_the_launch_environment_its_record_holds();
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -507,14 +514,7 @@ fn in_the_package_host(script: &str) -> String {
         "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
          $module = Get-Module KalaReach.ShellBridge; {script}"
     );
-    let asked = package
-        .command()
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .env_remove("KR_SHELL_BRIDGE")
-        .env_remove("KR_SHELL_BRIDGE_SECRET")
-        .env_remove("KR_SESSION")
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     let told = String::from_utf8_lossy(&asked.stderr);
     assert!(

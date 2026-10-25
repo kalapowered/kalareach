@@ -3583,11 +3583,7 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
            if ($r) {{ Write-Output \"kr-release=[$v|$($r.Id)|$($r.FirstFixed)]\" }} \
            else {{ Write-Output \"kr-release=[$v||]\" }} }} }}"
     );
-    let asked = package
-        .command()
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     for (version, expected) in table {
         let prefix = format!("kr-release=[{version}|");
@@ -3669,10 +3665,7 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
            foreach ($t in @({texts})) {{ \
              Write-Output \"kr-described=[$t|$(ConvertFrom-KrFrameworkDescription $t)]\" }} }}"
     );
-    let asked = std::process::Command::new(&package.executable)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .expect("the package's host runs");
+    let asked = package.ask(&script);
     let said = String::from_utf8_lossy(&asked.stdout).into_owned();
     for (runtime, platform, expected) in runtimes {
         let prefix = format!("kr-runtime=[{runtime}|{platform}|");
