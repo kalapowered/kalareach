@@ -1453,7 +1453,9 @@ impl WorkerService {
     /// The worker takes the boundary itself as that announcement arrives and keeps it until it has
     /// answered, so the announcement is refused as one is that meets a boundary someone else holds,
     /// and the next meets it free whenever the daemon makes it. Nothing waits on a thread of the
-    /// test: which announcement is refused is decided by how many came before it.
+    /// test: which announcement is refused is decided by how many came before it. Another holder
+    /// of the boundary at that moment makes the worker wait for it, which the product path never
+    /// does, until that holder lets go.
     #[cfg(feature = "testing")]
     pub fn hold_the_boundary_for_one_announcement_after(&self, others: usize) {
         *self
