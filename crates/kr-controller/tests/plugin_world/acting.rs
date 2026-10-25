@@ -263,11 +263,12 @@ impl Acting {
     /// runs, so the runtime's notice that it disabled a binding reaches the broker; the plugin
     /// host's epoch runs, so a call into the component is stopped when its deadline passes; and a
     /// native terminal is served on the transport, so traffic that does not wait for the component
-    /// can be shown going on.
+    /// can be shown going on. The worker's deadlines are measured on a clock that stays where it
+    /// is, so that an action held in its preparation does not run out its accepted deadline.
     pub async fn start_faulting() -> Option<Self> {
         Self::assemble(
             Registration::ByLink,
-            None,
+            Some(Arc::new(kr_transport::clock::ManualClock::new())),
             Options {
                 epoch: Epoch::Running,
                 native_terminal: true,
@@ -685,10 +686,12 @@ impl Acting {
     ///
     /// The action's receipt says `accepted` by then and its component has not been asked, so the
     /// action waits for its component for as long as the case holds it, however long the machine
-    /// takes to do what the case does meanwhile. The preparation's own bound starts at the
-    /// release, so a case that moves the worker's clock by hand (`Acting::start_on`) cannot run it
-    /// out. A case that needs a call outstanding in the component keeps the host's replies back
-    /// instead ([`Acting::gate`]).
+    /// takes to do what the case does meanwhile, on one condition: the action's accepted deadline
+    /// is measured on the worker's clock, and runs while the case holds the preparation unless the
+    /// world was started on a clock the case holds (`Acting::start_on`). The preparation's own
+    /// bound starts at the release. A case that needs a call outstanding in the component keeps
+    /// the host's replies back instead ([`Acting::gate`]); the preparation's bound, five seconds
+    /// of the runtime's time, then runs while the reply is kept back.
     pub fn hold_the_next_preparation(&self) -> HeldPreparation {
         let (arrived, release) = self.hosted._service.stall_next_preparation();
         HeldPreparation {
