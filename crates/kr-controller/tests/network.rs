@@ -14,11 +14,11 @@
 //! a test suite must never do that, so every create checks what the kernel actually gave the
 //! process it started.
 //!
-//! The session this drives is a POSIX shell in a Unix pseudo-terminal, signalled by process group
-//! and read from the process table, so the suite is a Unix suite. The Windows equivalents of the
-//! same paths are qualified against a Windows console in the worker's Windows module.
-
-#![cfg(unix)]
+//! The session this drives is a POSIX shell in a pseudo-terminal, signalled by process group and
+//! read from the process table on Unix. On Windows the daemon starts each worker through the
+//! environment's scheduled task, as the shipping daemon does, and the shell is the POSIX shell Git
+//! for Windows installs; the cases that read a process's working directory or signal a group are
+//! Unix cases.
 
 #[allow(dead_code)]
 #[path = "net_support/pairing.rs"]
@@ -38,6 +38,7 @@ use kr_controller::registry::Registry;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
+#[cfg(not(windows))]
 use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
@@ -128,6 +129,10 @@ struct Host {
     /// The host tree, which ends every worker its daemon started before it goes, and is kept
     /// instead when one of them cannot be established as ended.
     temp: teardown::Tree,
+    /// The environment's scheduled task, through which a Windows daemon here starts each worker.
+    /// Declared after the tree, so it is removed once the tree has ended what was started.
+    #[cfg(windows)]
+    task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
 }
@@ -146,10 +151,35 @@ impl Host {
         // Started once here, where nothing is timed, so the operating system's check of a new
         // executable is not paid inside a create's rendezvous.
         kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
+        #[cfg(windows)]
+        let task = kr_controller::supervision::windows::testing::TestTask::register(
+            &temp.environment(),
+            &kr_controller::supervision::windows::testing::built_binary("kr-controller")
+                .unwrap_or_else(|missing| panic!("{missing}")),
+        )
+        .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
         Self {
             temp,
+            #[cfg(windows)]
+            task,
             worker,
             environment_id,
+        }
+    }
+
+    /// The supervisor this host's daemon starts workers through.
+    ///
+    /// On Windows, the one the shipping daemon chooses: the environment's scheduled task, whose
+    /// starter creates each worker outside the jobs a test run holds its daemon in. Elsewhere, a
+    /// detached process of the daemon's own.
+    fn platform_supervisor(&self) -> Box<dyn kr_controller::supervision::WorkerSupervisor> {
+        #[cfg(windows)]
+        {
+            self.task.product_supervisor(&self.paths())
+        }
+        #[cfg(not(windows))]
+        {
+            Box::new(DetachedSupervisor::new())
         }
     }
 
@@ -199,7 +229,7 @@ impl Host {
             }),
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: self.temp.supervisor(Box::new(DetachedSupervisor::new())),
+            supervisor: self.temp.supervisor(self.platform_supervisor()),
             worker_program: self.worker.clone(),
             build_id: build(),
             release: "0".to_owned(),
@@ -337,7 +367,7 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
     SessionCreateParams {
         environment_id,
         presentation: Presentation::Attach,
-        shell: Nullable::some("/bin/sh".to_owned()),
+        shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some(cwd.display().to_string()),
         dimensions: Nullable::null(),
@@ -379,8 +409,9 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
 /// like one that was given the right one until the kernel is asked. Linux and macOS answer that for
-/// another process, and a refusal to answer fails here. So does a platform this suite knows no way
-/// to ask, because a comparison that could not be made is not one that passed.
+/// another process, and a refusal to answer fails here. Windows is not asked: the check is about a
+/// removable volume a worker must not hold open, which the Windows hosts do not have.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn working_directory_of(pid: u32) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -400,13 +431,6 @@ fn working_directory_of(pid: u32) -> PathBuf {
             .unwrap_or_else(|| {
                 panic!("the process table named no working directory for process {pid}")
             })
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        panic!(
-            "this suite knows no way to ask this platform for the working directory of process \
-             {pid}, so the check that the host put its worker there cannot run here"
-        )
     }
 }
 
@@ -442,12 +466,17 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         "and the binary it started is not inside it either: {}",
         host.worker.display()
     );
-    let actual = working_directory_of(pid);
-    assert_eq!(
-        std::fs::canonicalize(&actual).unwrap_or(actual),
-        expected,
-        "the worker runs in the directory the host configured"
-    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let actual = working_directory_of(pid);
+        assert_eq!(
+            std::fs::canonicalize(&actual).unwrap_or(actual),
+            expected,
+            "the worker runs in the directory the host configured"
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = pid;
 }
 
 /// Returns the workspace this test was built from.
@@ -2091,9 +2120,9 @@ impl Membership {
 /// Printed through format strings, so the echo of the command itself matches neither.
 fn flag_loop(flag: &Path) -> String {
     format!(
-        "while :; do printf 'kala%s-tick\\n' reach; if [ -f '{path}' ]; then \
-         printf 'kala%s-flag-%s\\n' reach \"$(cat '{path}')\"; fi; sleep 0.2; done\n",
-        path = flag.display()
+        "while :; do printf 'kala%s-tick\\n' reach; if [ -f {path} ]; then \
+         printf 'kala%s-flag-%s\\n' reach \"$(cat {path})\"; fi; sleep 0.2; done\n",
+        path = kr_worker::testing::shell_quoted(flag)
     )
 }
 
