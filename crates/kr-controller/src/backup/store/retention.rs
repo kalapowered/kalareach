@@ -383,7 +383,7 @@ impl BackupStore {
     }
 
     /// Why the person may not ask the service to delete a generation's objects, or nothing when they
-    /// may. Privacy mode is not a reason; see [`person_refusal`].
+    /// may. Privacy mode is not a reason; the store's own rules for a person's deletion are.
     ///
     /// # Errors
     ///
@@ -404,10 +404,10 @@ impl BackupStore {
     ///
     /// It is the person's own action, so it applies none of retention's rules and neither of
     /// privacy mode's: not the fence, and not the line privacy mode drew under a generation, whose
-    /// copies are what the action is for. It applies the store's own ([`person_refusal`]), so a
-    /// generation is refused whole, and every object is written down or none is. An object already
-    /// written down is left as it is: asking again after an unanswered request writes nothing new
-    /// and still finds the standing intact.
+    /// copies are what the action is for. It applies the store's own rules for a person's deletion,
+    /// so a generation is refused whole, and every object is written down or none is. An object
+    /// already written down is left as it is: asking again after an unanswered request writes
+    /// nothing new and still finds the standing intact.
     ///
     /// # Errors
     ///
