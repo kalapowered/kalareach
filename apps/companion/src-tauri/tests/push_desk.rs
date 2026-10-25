@@ -525,6 +525,8 @@ struct Desk {
     clock_ahead_ms: Arc<AtomicU64>,
     /// How many times the desk told the page that what it shows changed.
     changes: Arc<AtomicUsize>,
+    /// What the page would have been shown each time, in order.
+    views: Arc<Mutex<Vec<PushView>>>,
     /// Kept so the phone's records outlive the test.
     _phone: support::Phone,
 }
@@ -646,6 +648,7 @@ async fn desk_reaching(
         device,
         clock_ahead_ms: opened.clock_ahead_ms,
         changes: opened.changes,
+        views: opened.views,
         _phone: phone,
     }
 }
@@ -658,6 +661,8 @@ struct Opened {
     clock_ahead_ms: Arc<AtomicU64>,
     /// How many times the desk told the page that what it shows changed.
     changes: Arc<AtomicUsize>,
+    /// What the page would have been shown each time, in order.
+    views: Arc<Mutex<Vec<PushView>>>,
 }
 
 impl Opened {
@@ -694,6 +699,10 @@ fn open_with(
     let ahead = Arc::clone(&clock_ahead_ms);
     let changes = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&changes);
+    let views = Arc::new(Mutex::new(Vec::new()));
+    let shown = Arc::clone(&views);
+    let desk_told = Arc::new(Mutex::new(None::<std::sync::Weak<PushDesk>>));
+    let to_tell = Arc::clone(&desk_told);
     let desk = PushDesk::open(
         data,
         Arc::clone(device),
@@ -713,14 +722,22 @@ fn open_with(
                     .unwrap_or(false),
                 "the page's callback failed"
             );
+            // What the page would be shown now: read the way the page reads it, outside the desk's
+            // holds, which a call made under one would never return from.
+            let told = to_tell.lock().expect("the desk").clone();
+            if let Some(desk) = told.and_then(|desk| desk.upgrade()) {
+                shown.lock().expect("the views").push(desk.view());
+            }
         },
     )
     .expect("the desk opens");
+    *desk_told.lock().expect("the desk") = Some(Arc::downgrade(&desk));
     Opened {
         desk,
         gateway,
         clock_ahead_ms,
         changes,
+        views,
     }
 }
 
@@ -3543,7 +3560,20 @@ async fn a_choice_whose_key_cannot_be_filed_is_not_made() {
         refused.message
     );
     assert!(phone.view().hosts[0].previews, "the choice was let go");
-    assert_eq!(phone.view().hosts[0].state, PushState::On);
+    assert!(
+        phone
+            .views
+            .lock()
+            .expect("the views")
+            .last()
+            .is_some_and(|last| last.hosts[0].previews),
+        "and was left with the choice that stands, not the one let go"
+    );
+    assert_eq!(
+        phone.view().hosts[0].state,
+        PushState::NeedsAttention,
+        "the row says the receivers could not be handed the keys"
+    );
     assert_eq!(
         phone.registered.lock().expect("what was sent").reaches,
         [Reach::Asked],
@@ -3564,6 +3594,7 @@ async fn a_choice_whose_key_cannot_be_filed_is_not_made() {
     look(&phone.desk).await;
     assert!(asked(&phone) > before, "the look filed the set again");
     assert_eq!(held_keys(&phone).expect("keys").senders.len(), 1);
+    assert_eq!(phone.view().hosts[0].state, PushState::On);
 }
 
 /// KR-REQ-16.11: a filing that failed part way may have left the receivers holding some of the new
@@ -3638,6 +3669,103 @@ async fn previews_turned_off_reach_the_host_though_the_key_cannot_be_taken_out_i
         words.contains("could not file its preview key"),
         "{words:?}"
     );
+
+    // A look a minute later files the keys alone: it claims no host and tells the page nothing, the
+    // host that was told is not registered again, and the gateway is asked for nothing more.
+    let page = restarted.changes.load(Ordering::SeqCst);
+    restarted.let_time_pass();
+    look(&restarted.desk).await;
+    assert_eq!(restarted.changes.load(Ordering::SeqCst), page);
+    states_until(&restarted.desk, |states| states != [PushState::Working]).await;
+    assert_eq!(
+        proposed(&restarted.gateway),
+        [FIRST_TOKEN],
+        "the sequence was not run again"
+    );
+    assert_eq!(previews_asked(&phone), [true, false]);
+}
+
+/// KR-REQ-16.11: keys the receivers cannot be handed do not stop the host being registered, and no
+/// look runs the whole sequence again for them. The host is told, the row says what is wrong, each
+/// look tries the filing alone, and once the receivers take it the row is on again, the page is
+/// told, and nothing was registered a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_look_files_them_alone()
+{
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone.receiver.with(|state| state.keys_fail = true);
+
+    phone.desk.enable(&reference).expect("the person asks");
+
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("could not file its preview key"),
+        "{:?}",
+        phone.view().hosts[0].words
+    );
+    assert_eq!(
+        previews_asked(&phone),
+        [true],
+        "the host was told, though the receivers hold no key of it"
+    );
+    let asked = |phone: &Desk| {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_asked
+    };
+    let filings = asked(&phone);
+
+    // Looks a minute and more apart try the filing and nothing else.
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    let page = told(&phone);
+    phone.let_time_pass();
+    look(&phone.desk).await;
+    states_until(&phone.desk, |states| states != [PushState::Working]).await;
+    assert!(asked(&phone) >= filings + 2, "each look tried the filing");
+    assert_eq!(told(&phone), page, "the page has nothing new to be told");
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+    assert_eq!(phone.gateway.issue_requests(), 1);
+    assert_eq!(
+        phone.registered.lock().expect("what was sent").reaches,
+        [Reach::Asked],
+        "no run was started by a look"
+    );
+
+    // Try again on a row that needs the person only for the keys files them and nothing else.
+    phone.desk.enable(&reference).expect("Try again");
+    assert_eq!(
+        phone.view().hosts[0].state,
+        PushState::NeedsAttention,
+        "no sequence was started for the host"
+    );
+    eventually("Try again filed the keys", || asked(&phone) >= filings + 3).await;
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
+    assert_eq!(phone.gateway.issue_requests(), 1);
+
+    phone.receiver.with(|state| state.keys_fail = false);
+    phone.desk.enable(&reference).expect("Try again");
+    phone.until(|states| states == [PushState::On]).await;
+
+    assert_eq!(held_keys(&phone).expect("keys").senders.len(), 1);
+    eventually("the page was told it is on again", || told(&phone) > page).await;
+    assert_eq!(told(&phone), page + 1, "and once");
+    assert_eq!(
+        previews_asked(&phone),
+        [true],
+        "nothing was registered again"
+    );
+    assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
 }
 
 /// A choice the record cannot keep is not made: the record is what a restart reads, and an off that

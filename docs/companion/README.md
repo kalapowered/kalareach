@@ -508,9 +508,12 @@ cannot keep, or whose key cannot be filed for the receivers, is not made: the sw
 person is told, so that off is never off in name only. Choices are made one after another, so one
 that is let go never undoes a choice made after it began. The choice a run tells the host is the one
 recorded when the run begins to tell it, before the keys are filed, so the host is told off after the
-receivers were asked to let the key go, whether or not they did (a filing that failed is said at the
-end of the run, and the next look files again); a choice made after that is told by the run when it
-goes round again.
+receivers were asked to let the key go, whether or not they did; a choice made after that is told by
+the run when it goes round again. A filing of the keys that fails does not stop a run or start one:
+the host is still registered, the rows of hosts that are on say that the receivers could not be handed
+the keys until a filing succeeds, and each look files them again, alone, without the gateway or the
+host. "Try again" on such a row does the same and starts no sequence, since a sequence would spend the
+gateway's issues and retire the credential the host holds without changing what the store refuses.
 
 The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
 `push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. `push.rs`
