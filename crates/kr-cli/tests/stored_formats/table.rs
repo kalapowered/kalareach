@@ -1470,7 +1470,7 @@ pub fn named() -> Vec<Named> {
         leaf(
             StoreScope::Environment,
             "login-session",
-            "an earlier release wrote it on Windows, which keeps no store of releases; nothing reads it",
+            "an earlier release wrote it on Windows; nothing reads it",
         ),
         leaf(
             StoreScope::Environment,
