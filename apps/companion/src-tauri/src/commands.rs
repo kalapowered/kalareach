@@ -134,6 +134,13 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // What privacy mode reports: whether it is on, and the copies that have left the host and are
     // shown rather than erased. The page lists them and offers no action on them.
     ("privacy_status", Some(Method::PrivacyStatus)),
+    // Deleting a copy privacy mode lists as having left the host. The page names the copy by the
+    // reference the host lists it under and cannot confirm: this process asks in a native dialog,
+    // and sends the deletion once, with the token that answer minted.
+    ("retained_delete_ask", None),
+    ("retained_delete_finish", None),
+    ("retained_delete_cancel", None),
+    ("retained_sync_copies", None),
     ("grant_notices", None),
     ("session_screen_preview", Some(Method::SessionScreenPreview)),
     ("grant_create", Some(Method::GrantCreate)),
@@ -492,6 +499,13 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         "transfer_finish",
         &[Method::OwnerConfirmationPending, Method::GrantTransfer],
     ),
+    // Deleting a copy that left the host: the host's list is read before the person is asked and
+    // again before the deletion is sent, which only the command that holds the person's yes does.
+    ("retained_delete_ask", &[Method::PrivacyStatus]),
+    (
+        "retained_delete_finish",
+        &[Method::PrivacyStatus, Method::PrivacyRetainedDelete],
+    ),
     // What was left unfinished. Asking the host again is an exact repeat of the request that was
     // sent, and a state check reads what the host shows; neither is an action of its own.
     ("attempts_list", &[Method::GrantList, Method::GrantHeld]),
@@ -598,6 +612,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         device_list,
         privacy_status,
         grant_notices,
+        retained_delete_ask,
+        retained_delete_finish,
+        retained_delete_cancel,
+        retained_sync_copies,
         session_screen_preview,
         grant_create,
         grant_list,
@@ -1731,6 +1749,71 @@ pub async fn grant_redeem(
 #[tauri::command]
 pub async fn grant_held(state: State<'_, AppState>) -> Result<crate::sharing::Held> {
     crate::sharing::held(&state).await
+}
+
+/// Asks the person, in a native dialog, whether to delete a copy that left this computer: one the
+/// host lists, or one this application's own sync lists.
+///
+/// The page names the copy by the reference it is listed under and cannot answer for the person. A
+/// yes returns a token that finishes the deletion once.
+#[tauri::command]
+pub async fn retained_delete_ask<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::retained::Asked> {
+    let connection = state.connection().ok();
+    let settings = state.settings()?;
+    state
+        .retained()
+        .ask(
+            connection.as_ref(),
+            &settings,
+            &crate::retained::NativeConfirm::new(app),
+            &reference,
+        )
+        .await
+}
+
+/// Asks for the deletion of the copy the person said yes to, once, and says whether the service
+/// confirmed it.
+#[tauri::command]
+pub async fn retained_delete_finish(
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<crate::retained::Finished> {
+    let connection = state.connection().ok();
+    let settings = state.settings()?;
+    state
+        .retained()
+        .finish(connection.as_ref(), &settings, &token)
+        .await
+}
+
+/// Drops a confirmation without using it.
+#[tauri::command]
+pub fn retained_delete_cancel(state: State<'_, AppState>, token: String) -> Result<()> {
+    state.retained().cancel(&token);
+    Ok(())
+}
+
+/// The copies the sync service kept of writes it refused this computer, listed as the host lists
+/// what it sent. Nothing is sent.
+#[tauri::command]
+pub fn retained_sync_copies(
+    state: State<'_, AppState>,
+) -> Result<Vec<kr_protocol::privacy::PrivacyExported>> {
+    Ok(state
+        .settings()?
+        .sync_copies()?
+        .into_iter()
+        .map(|copy| kr_protocol::privacy::PrivacyExported {
+            kind: copy.kind,
+            reference: copy.reference,
+            left_at_ms: copy.left_at_ms,
+            deletable: copy.deletable,
+        })
+        .collect())
 }
 
 /// Asks the owner devices to confirm handing a session's control to another device. Nothing that
@@ -3663,6 +3746,10 @@ mod tests {
         "changeset_read",
         "device_list",
         "privacy_status",
+        "retained_delete_ask",
+        "retained_delete_finish",
+        "retained_delete_cancel",
+        "retained_sync_copies",
         "grant_notices",
         "grant_create",
         "grant_list",
@@ -3938,6 +4025,15 @@ mod tests {
                 // What an invitation would carry, from the protocol's own table. It reaches
                 // nothing.
                 "grant_notices",
+                // Deleting a copy that left the host: native code asks the person in a dialog and
+                // sends the deletion with the token their yes minted. The page names the copy by the
+                // reference the host lists it under, never a method.
+                "retained_delete_ask",
+                "retained_delete_finish",
+                "retained_delete_cancel",
+                // What the sync service kept of this computer's refused writes, read from this
+                // computer's own records.
+                "retained_sync_copies",
                 // A hand-over of control: the host describes the plan and asks the owner devices,
                 // native code reads whether one answered, and only then sends the transfer. The
                 // page names a session, a grant, a device and a reference, never a method.
@@ -4039,6 +4135,11 @@ mod tests {
         assert_eq!(
             performing(Method::PairRedeem),
             BTreeSet::from(["pairing_start_read"])
+        );
+        // A copy that left the host is deleted only by the command that holds the person's yes.
+        assert_eq!(
+            performing(Method::PrivacyRetainedDelete),
+            BTreeSet::from(["retained_delete_finish"])
         );
         // A terminal view's calls are the view's own, on its own link: no page method attaches,
         // subscribes, reports a window, resizes, configures, takes or gives back the input lease,

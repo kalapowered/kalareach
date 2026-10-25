@@ -50,7 +50,7 @@ pub(crate) fn locked_file(path: &Path) -> std::io::Result<std::fs::File> {
 pub use drafts::{DraftsView, Holds, HostLists, HostPrivacy, Hosts, KeptHere, Why};
 pub use sync::{
     Candidate, ConflictView, DeviceCandidate, DevicesView, Happened, Keep, Member, Offer, Other,
-    SettingsSync, SyncParts, SyncState, SyncView,
+    SettingsSync, SyncCopy, SyncParts, SyncState, SyncView,
 };
 
 /// The event the backend publishes the settings on, as a [`SettingsView`].
@@ -444,6 +444,30 @@ impl Settings {
     /// Returns a local failure when the records cannot be read.
     pub fn conflicts(&self) -> Result<Option<ConflictView>> {
         self.sync.get().map_or(Ok(None), SettingsSync::conflicts)
+    }
+
+    /// The copies the sync service kept of writes it refused this computer, which privacy mode
+    /// lists beside what the host sent. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records cannot be read.
+    pub fn sync_copies(&self) -> Result<Vec<SyncCopy>> {
+        self.sync
+            .get()
+            .map_or_else(|| Ok(Vec::new()), SettingsSync::kept_copies)
+    }
+
+    /// Asks the sync service to drop the one copy listed under `reference`, and says whether it has.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when no one copy is listed under the reference or its sync is off.
+    pub async fn drop_sync_copy(&self, reference: &str) -> Result<bool> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        sync.drop_kept_copy(reference).await
     }
 
     /// Records the person's choice between the versions, and sends it.

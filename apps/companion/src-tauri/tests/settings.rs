@@ -536,6 +536,7 @@ impl Computer {
                 companion_tauri::commands::settings_join,
                 companion_tauri::commands::device_drafts,
                 companion_tauri::commands::device_draft_discard,
+                companion_tauri::commands::retained_sync_copies,
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
@@ -1818,6 +1819,164 @@ async fn a_choice_that_names_nothing_waiting_is_refused() {
         json!({ "keep": { "choice": "mine" } }),
     )
     .expect_err("settings sync is not on");
+}
+
+/// What privacy mode lists of the copies the sync service kept, as the page reads it.
+fn kept_by_the_service(page: &Page) -> Vec<Value> {
+    page.call("retained_sync_copies", json!({}))
+        .expect("the copies are listed")
+        .as_array()
+        .expect("a list")
+        .clone()
+}
+
+/// KR-REQ-24.29: the copy the service kept of a settings write it refused is listed as one this
+/// computer can ask the service to drop, and asking drops that copy and no other. The control is
+/// the list before: the service holds the copy and the entry is deletable; afterwards the service
+/// holds none and the list is empty. A service that cannot be reached leaves the choice made and
+/// the copy listed as before, and the next step that reaches it finishes the drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_copy_the_service_kept_of_a_refused_settings_write_is_dropped_when_the_person_asks() {
+    let computer = Computer::new().await;
+    let (page, elsewhere) = waiting_for_a_choice(&computer).await;
+    assert_eq!(elsewhere.copies_kept().await, 1, "the service kept a copy");
+
+    let listed = kept_by_the_service(&page);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["deletable"], true);
+    assert!(
+        listed[0]["kind"]
+            .as_str()
+            .expect("a kind")
+            .contains("kept as a copy by the service"),
+        "{listed:?}"
+    );
+    let reference = listed[0]["reference"].as_str().expect("a reference");
+
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    settings
+        .drop_sync_copy("a reference nobody listed")
+        .await
+        .expect_err("a reference the list does not hold deletes nothing");
+    assert_eq!(elsewhere.copies_kept().await, 1);
+
+    // The service cannot be reached: the choice is made, nothing is dropped and nothing is claimed.
+    computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+    assert!(
+        !settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the choice is recorded"),
+        "the service has not said it dropped the copy"
+    );
+    assert_eq!(elsewhere.copies_kept().await, 1);
+    assert_eq!(kept_by_the_service(&page).len(), 1, "it is still listed");
+
+    // Asking again reaches the service, which drops that copy.
+    assert!(
+        settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the service is asked"),
+        "the service dropped it"
+    );
+    assert_eq!(elsewhere.copies_kept().await, 0, "the service holds none");
+    assert!(kept_by_the_service(&page).is_empty());
+}
+
+/// The person at the dialog, who says what they are made to say.
+struct Says(bool);
+
+impl companion_tauri::retained::Confirm for Says {
+    fn confirm(&self, _question: companion_tauri::retained::Question) -> BoxFuture<'_, bool> {
+        let yes = self.0;
+        Box::pin(async move { yes })
+    }
+}
+
+/// KR-REQ-24.29: a copy the service kept is dropped only after the person's yes, once, and with
+/// no host connected: a no leaves the copy, a token nobody minted drops nothing, and the token a
+/// yes minted drops that copy a single time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_copy_is_dropped_after_the_persons_yes_once_and_with_no_host_asked() {
+    let computer = Computer::new().await;
+    let (page, elsewhere) = waiting_for_a_choice(&computer).await;
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    let listed = kept_by_the_service(&page);
+    let reference = listed[0]["reference"].as_str().expect("a reference");
+    let deletions = companion_tauri::retained::Deletions::default();
+
+    let no = deletions
+        .ask(None, &settings, &Says(false), reference)
+        .await
+        .expect("the person is asked");
+    assert!(!no.confirmed && no.token.is_none(), "a no mints nothing");
+    assert_eq!(elsewhere.copies_kept().await, 1);
+
+    let yes = deletions
+        .ask(None, &settings, &Says(true), reference)
+        .await
+        .expect("the person is asked");
+    let token = yes.token.expect("a yes mints a token");
+    deletions
+        .finish(None, &settings, "a token nobody minted")
+        .await
+        .expect_err("nothing is dropped for a token nobody minted");
+    assert_eq!(elsewhere.copies_kept().await, 1);
+
+    let finished = deletions
+        .finish(None, &settings, &token)
+        .await
+        .expect("the copy is dropped");
+    assert!(finished.deleted, "the service dropped it");
+    assert!(finished.report.is_none(), "no host was asked");
+    assert_eq!(elsewhere.copies_kept().await, 0);
+    deletions
+        .finish(None, &settings, &token)
+        .await
+        .expect_err("a confirmation works once");
+}
+
+/// KR-REQ-24.29: the copy the service kept of a draft write it refused is listed, and dropping it
+/// records the choice in the store of the host the draft was for and asks the service in the pass
+/// that follows, which drops that copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_copy_the_service_kept_of_a_refused_draft_write_is_dropped_when_the_person_asks() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, _) = page.write_draft(Some(&studio), "written for the studio");
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    let elsewhere = computer.elsewhere();
+    elsewhere
+        .claim_draft(&held.load(draft).expect("the draft"))
+        .await;
+    page.drafts_on(true).expect("drafts sync is on");
+    assert_eq!(elsewhere.copies_kept().await, 1, "the service kept a copy");
+
+    let listed = kept_by_the_service(&page);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["deletable"], true);
+    let reference = listed[0]["reference"].as_str().expect("a reference");
+
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    assert!(
+        settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the service is asked"),
+        "the service dropped it"
+    );
+    assert_eq!(elsewhere.copies_kept().await, 0, "the service holds none");
+    assert!(kept_by_the_service(&page).is_empty());
 }
 
 /* -------------------------------------------------------------------------- */

@@ -66,12 +66,13 @@ use kr_client::services::{
 };
 use kr_client::sync::membership::CollectionRef;
 use kr_client::sync::{
-    CollectionKeys, RequestState, SharedCollectionService, SyncClient, SyncError, SyncStore,
+    CollectionKeys, KeptCopy, RequestState, SharedCollectionService, SyncClient, SyncError,
+    SyncStore,
 };
 use kr_ipc::paths::{
     create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
 };
-use kr_protocol::ids::{DraftId, EnvironmentId, SessionId, SyncObjectId};
+use kr_protocol::ids::{DraftId, EnvironmentId, SessionId, SyncConflictId, SyncObjectId};
 use kr_protocol::scalars::Uuid;
 use kr_protocol::sync::SyncObjectKind;
 use serde::{Deserialize, Serialize};
@@ -548,6 +549,53 @@ impl DraftsSync {
         }
     }
 
+    /// The copies the service kept of drafts it refused this computer, with the host whose store
+    /// records each. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when a store cannot be read.
+    pub fn kept_copies(&self) -> Result<Vec<(EnvironmentId, KeptCopy)>> {
+        let mut found = Vec::new();
+        for directory in self.host_stores() {
+            let Some(environment) = directory
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(environment_of)
+            else {
+                continue;
+            };
+            let store = SyncStore::open(&directory).map_err(super::sync::sync_failure)?;
+            for copy in kr_client::sync::kept_copies(&store).map_err(super::sync::sync_failure)? {
+                found.push((environment, copy));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Records, in the host's store, that the person chose to have the service drop a copy it kept.
+    /// The next pass that reaches the service asks it, and asks again until it has dropped it.
+    /// Returns whether the store holds the copy, whether the choice is new or was made before.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the store cannot be read or written.
+    pub fn choose_to_drop(&self, environment: EnvironmentId, copy: SyncConflictId) -> Result<bool> {
+        let directory = self.directory.join(environment.to_string()).join(STORE);
+        if !directory.is_dir() {
+            return Ok(false);
+        }
+        let store = SyncStore::open(&directory).map_err(super::sync::sync_failure)?;
+        store
+            .drop_kept_copy(copy)
+            .map_err(super::sync::sync_failure)?;
+        Ok(kr_client::sync::kept_copies(&store)
+            .map_err(super::sync::sync_failure)?
+            .iter()
+            .any(|kept| kept.copy == copy))
+    }
+
     /// Whether the person turned drafts sync on.
     ///
     /// # Errors
@@ -815,6 +863,13 @@ impl DraftsSync {
             .reconcile_unsettled(store, now())
             .await
             .map_err(super::sync::sync_failure)?;
+        // A copy the person chose to have the service drop is asked about again, for as long as the
+        // service has not said it has dropped it. Only identifiers leave, so a host's privacy mode
+        // does not stop it.
+        client
+            .finish_resolutions()
+            .await
+            .map_err(super::sync::sync_failure)?;
         Ok(HostStore {
             drafts,
             client,
@@ -1016,9 +1071,10 @@ impl DraftsSync {
         Ok(seen)
     }
 
-    /// The hosts whose store holds a publication that left without an answer, whatever draft it
-    /// was for and wherever that draft is for now: its answer is asked for, or it is waited for for
-    /// ever. A store that cannot be read is named too, so that opening it says why.
+    /// The hosts whose store holds a publication that left without an answer, or a copy the person
+    /// chose to have the service drop, whatever draft it was for and wherever that draft is for
+    /// now: the answer is asked for, or the service is asked again, or it is waited for for ever. A
+    /// store that cannot be read is named too, so that opening it says why.
     fn hosts_with_work_out(&self) -> Vec<EnvironmentId> {
         self.host_stores()
             .into_iter()
@@ -1026,7 +1082,10 @@ impl DraftsSync {
                 SyncStore::open(directory)
                     .and_then(|held| held.requests())
                     .map_or(true, |listing| {
-                        listing.items.iter().any(|request| request.dispatched())
+                        listing.items.iter().any(|request| {
+                            request.dispatched()
+                                || matches!(request.state, RequestState::Resolving { .. })
+                        })
                     })
             })
             .filter_map(|directory| environment_of(directory.parent()?.file_name()?.to_str()?))

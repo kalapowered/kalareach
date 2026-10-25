@@ -52,6 +52,7 @@ pub mod push;
 pub mod questions;
 pub mod recovery;
 pub mod remote;
+pub mod retained;
 pub mod revocation;
 pub mod settings;
 pub mod setup;
