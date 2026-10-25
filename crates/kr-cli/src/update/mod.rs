@@ -574,6 +574,8 @@ pub struct Updated {
     pub restarted: Vec<EnvironmentId>,
     /// The releases removed because nothing needs them.
     pub removed: Vec<ReleaseName>,
+    /// What could not be removed for a reason no running program gave.
+    pub not_removed: Vec<NotRemoved>,
     /// The environments no daemon served, whose registries the update brought forward.
     pub carried: Vec<CarriedRegistry>,
     /// The environments the store records that the update could not reach.
@@ -582,6 +584,40 @@ pub struct Updated {
     pub checked_only: bool,
     /// Whether this went back to an older release rather than forward to a newer one.
     pub rolled_back: bool,
+}
+
+/// A release, or what an earlier removal left of one, that the update could not remove for a reason
+/// no running program gave. A release a program still holds is not one of these: it stays and is
+/// tried again at the next update.
+pub struct NotRemoved {
+    /// The release, or nothing for what lies in the store's trash.
+    pub release: Option<ReleaseName>,
+    /// Why it could not be removed.
+    pub reason: Shown,
+}
+
+impl NotRemoved {
+    /// What `--json` says of it.
+    fn document(&self) -> Document {
+        Document::new()
+            .with("release", self.release.as_ref().map(crate::shown::release))
+            .with("reason", self.reason.clone())
+    }
+
+    /// What is said to a person.
+    fn said(&self) -> Shown {
+        match &self.release {
+            Some(release) => shown!(
+                "release {} could not be removed: {}",
+                crate::shown::release(release),
+                self.reason
+            ),
+            None => shown!(
+                "something an earlier removal left in the store's trash could not be removed: {}",
+                self.reason
+            ),
+        }
+    }
 }
 
 /// An environment's registry an update brought forward to the schema its release reads, because no
@@ -686,6 +722,13 @@ impl Updated {
                     .collect::<Vec<_>>(),
             )
             .with(
+                "not_removed",
+                self.not_removed
+                    .iter()
+                    .map(NotRemoved::document)
+                    .collect::<Vec<_>>(),
+            )
+            .with(
                 "carried",
                 self.carried
                     .iter()
@@ -749,6 +792,7 @@ impl Updated {
                 crate::shown::release(removed)
             ));
         }
+        lines.extend(self.not_removed.iter().map(NotRemoved::said));
         lines
     }
 }
@@ -1113,6 +1157,7 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
             source,
             restarted,
             removed: Vec::new(),
+            not_removed: Vec::new(),
             carried: Vec::new(),
             unreached: Vec::new(),
             checked_only: check,
@@ -1284,8 +1329,8 @@ async fn carry_out(
         Ok(restarted) => restarted,
         Err(error) => return Err(report.annotate(error)),
     };
-    let removed = if check {
-        Vec::new()
+    let (removed, not_removed) = if check {
+        (Vec::new(), Vec::new())
     } else {
         collect(store, record, update_lock)
     };
@@ -1294,6 +1339,7 @@ async fn carry_out(
         target: target.release,
         restarted,
         removed,
+        not_removed,
         carried: report.carried,
         unreached: report.unreached,
         checked_only: check,
@@ -2654,28 +2700,43 @@ const MAKE_WRITABLE: &str = if cfg!(windows) {
 };
 
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
-/// for a later update, and not one a running program holds. Returns what it removed.
+/// for a later update, and not one a running program holds. Returns what it removed, and what it
+/// could not remove for a reason no running program gave.
 fn collect(
     store: &Store,
     record: &Record,
     update: &kr_ipc::install::StoreLock,
-) -> Vec<ReleaseName> {
+) -> (Vec<ReleaseName>, Vec<NotRemoved>) {
     let Ok(current) = store.current() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut removed = Vec::new();
+    let mut not_removed = Vec::new();
     for release in store.releases().unwrap_or_default() {
         let needed = current.as_ref() == Some(&release)
             || record.previous.as_ref() == Some(&release)
             || record.staged.as_ref() == Some(&release);
-        if !needed && store.retire(&release, update).unwrap_or(false) {
-            removed.push(release);
+        if needed {
+            continue;
+        }
+        match store.retire(&release, update) {
+            Ok(true) => removed.push(release),
+            Ok(false) => {}
+            Err(error) => not_removed.push(NotRemoved {
+                release: Some(release),
+                reason: said(&error),
+            }),
         }
     }
     // What an earlier removal left because a program that holds nothing ran from the release.
     #[cfg(windows)]
-    let _ = store.sweep_trash(update);
-    removed
+    if let Err(error) = store.sweep_trash(update) {
+        not_removed.push(NotRemoved {
+            release: None,
+            reason: said(&error),
+        });
+    }
+    (removed, not_removed)
 }
 
 #[cfg(all(test, unix))]
@@ -3060,6 +3121,7 @@ mod tests {
             target: release("0.2.0+bbbbbbbbbbbb"),
             restarted: Vec::new(),
             removed: Vec::new(),
+            not_removed: Vec::new(),
             carried: vec![CarriedRegistry {
                 environment,
                 from: 4,

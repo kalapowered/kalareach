@@ -33,24 +33,26 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SetKernelObjectSecurity,
+    ACCESS_DENIED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
+    DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
     FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileIdInfo, FileRenameInfoEx,
-    GetDiskFreeSpaceExW, GetFileInformationByHandleEx, GetFileType, GetVolumeInformationW,
-    GetVolumePathNameW, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+    FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FileDispositionInfoEx, FileIdInfo,
+    FileRenameInfoEx, GetDiskFreeSpaceExW, GetFileInformationByHandleEx, GetFileType,
+    GetVolumeInformationW, GetVolumePathNameW, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
 };
@@ -525,11 +527,12 @@ const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)";
 /// those that carry them, and a file inside a release can be a hard link to a file elsewhere, whose
 /// own list would be emptied by it. The kernel's call changes the one object.
 fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
-    let handle = OpenOptions::new()
-        .access_mode(WRITE_DAC | READ_CONTROL)
-        .share_mode(SHARE_ALL)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
+    set_list_on(&open_name(path, WRITE_DAC | READ_CONTROL, SHARE_ALL)?, sddl)
+}
+
+/// Sets the list of the object `handle` is open on, as [`set_list`] does. The handle was opened with
+/// the right to change the list.
+fn set_list_on(handle: &File, sddl: &str) -> io::Result<()> {
     let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `wide` is null-terminated and outlives the call, and `descriptor` is a live out
@@ -664,8 +667,46 @@ pub(super) fn remove_tree(root: &Path) -> io::Result<()> {
 }
 
 /// Deletes what is in `directory` and then the directory. Returns whether the directory is gone.
+///
+/// The directory is pinned first: it is opened with a share mode that lets nobody rename or delete
+/// it, which holds the directory and every one above it where they are while the handle is open. A
+/// name below it then reaches what this handle is and nothing else, so a directory that another
+/// process swaps for a junction between the look at its type and the work in it cannot lead the
+/// removal anywhere: the swap is refused, or it happened before the open and the open finds the
+/// junction itself, which is then taken away as a name.
 fn remove_directory(directory: &Path, left: &mut Left) -> bool {
-    if let Err(error) = set_list(directory, OWNER_ONLY) {
+    let pin = match open_name(
+        directory,
+        FILE_LIST_DIRECTORY | READ_CONTROL | WRITE_DAC | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    ) {
+        Ok(pin) => pin,
+        Err(error) if is_sharing_violation(&error) => {
+            left.add(error);
+            return false;
+        }
+        Err(error) => {
+            left.add(refused("cannot open", directory, &error));
+            return false;
+        }
+    };
+    match pin.metadata() {
+        Ok(about)
+            if about.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && about.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 => {}
+        Ok(_) => {
+            // Not the directory the caller saw: a link now, which goes as a name.
+            return mark_for_deletion(&pin)
+                .map_err(|error| left.add(error))
+                .is_ok();
+        }
+        Err(error) => {
+            left.add(refused("cannot read", directory, &error));
+            return false;
+        }
+    }
+    // Given back to its owner before its names are read: a sealed directory refuses to lose one.
+    if let Err(error) = set_list_on(&pin, OWNER_ONLY) {
         left.add(refused("cannot give back", directory, &error));
         return false;
     }
@@ -699,13 +740,9 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
     if !emptied {
         return false;
     }
-    match std::fs::remove_dir(directory) {
-        Ok(()) => true,
-        Err(error) => {
-            left.add(error);
-            false
-        }
-    }
+    mark_for_deletion(&pin)
+        .map_err(|error| left.add(error))
+        .is_ok()
 }
 
 /// Deletes the name `path`: a file, or a link, whose target is neither followed nor changed. The
@@ -713,11 +750,12 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
 /// handle that asks for it, so that a name of a file that other names share leaves the file as it
 /// was.
 ///
-/// Deleting a read-only file asks for the right to change attributes, and a sealed file's access
-/// list denies its owner that right. A refusal is therefore either the seal or a program that runs
-/// from the file, and the right is asked for to tell which: when the list denies it, the file is
-/// given back to its owner, the one change to a file's access list a removal makes, and the delete
-/// is tried again.
+/// Deleting a read-only file asks for the right to change attributes, and the entries the seal puts
+/// on a file deny its owner that right. A refusal is therefore either the seal or a program that
+/// runs from the file, and the right is asked for to tell which. When the list denies it and begins
+/// with the seal's own entry, the file is given back to its owner, the one change to a file's
+/// access list a removal makes, and the delete is tried again. A list that denies the right and is
+/// not the seal's is somebody else's, and it is left as it is and reported.
 ///
 /// # Errors
 ///
@@ -728,12 +766,23 @@ fn remove_name(path: &Path) -> io::Result<()> {
         |error: &io::Error| error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed());
     match delete_name(path) {
         Err(error) if denied(&error) => {
-            match open_to_change_attributes(path) {
-                Ok(()) => return Err(error),
+            match open_name(path, FILE_WRITE_ATTRIBUTES, SHARE_ALL) {
+                Ok(_) => return Err(error),
                 Err(not_allowed) if denied(&not_allowed) => {}
                 Err(other) => return Err(refused("cannot reach", path, &other)),
             }
-            set_list(path, OWNER_ONLY)
+            let sealed = open_name(path, READ_CONTROL | WRITE_DAC, SHARE_ALL)
+                .map_err(|error| refused("cannot give back", path, &error))?;
+            if !begins_with_the_seals_entry(&sealed)
+                .map_err(|error| refused("cannot read the list of", path, &error))?
+            {
+                return Err(refused(
+                    "its list denies the right to delete and is not the seal's:",
+                    path,
+                    &error,
+                ));
+            }
+            set_list_on(&sealed, OWNER_ONLY)
                 .map_err(|error| refused("cannot give back", path, &error))?;
             delete_name(path)
         }
@@ -742,31 +791,82 @@ fn remove_name(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Opens `path` itself, never what a link there leads to, with the given access and every share.
-fn open_name(path: &Path, access: u32) -> io::Result<File> {
-    OpenOptions::new()
-        .access_mode(access)
-        .share_mode(SHARE_ALL)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
+/// The SID of the owner-rights principal, `S-1-3-4`, as the bytes an entry carries it in.
+const OWNER_RIGHTS_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+
+/// Whether the access list of the open file begins with the entry the seal puts first: one that
+/// denies the owner-rights principal the right to write attributes. The handle was opened with the
+/// right to read the list.
+fn begins_with_the_seals_entry(file: &File) -> io::Result<bool> {
+    let mut list: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the handle is the open file's own, and `list` and `descriptor` are live out
+    // parameters; the descriptor owns the list and is freed after its last use below.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut list,
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    let mut first: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `list` is the file's list, which `descriptor` keeps alive, and the entry is read
+    // only after the call says it exists and only as far as its own header says it reaches.
+    let sealed = !list.is_null()
+        && unsafe { GetAce(list, 0, &raw mut first) } != 0
+        && unsafe {
+            let header = first.cast::<ACE_HEADER>();
+            let entry = first.cast::<ACCESS_DENIED_ACE>();
+            let sid_at = std::mem::offset_of!(ACCESS_DENIED_ACE, SidStart);
+            u8::try_from(ACCESS_DENIED_ACE_TYPE).is_ok_and(|kind| (*header).AceType == kind)
+                && usize::from((*header).AceSize) >= sid_at + OWNER_RIGHTS_SID.len()
+                && (*entry).Mask & FILE_WRITE_ATTRIBUTES != 0
+                && std::slice::from_raw_parts(
+                    (&raw const (*entry).SidStart).cast::<u8>(),
+                    OWNER_RIGHTS_SID.len(),
+                ) == OWNER_RIGHTS_SID
+        };
+    // SAFETY: `descriptor` was allocated by the call above and is freed exactly once.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    Ok(sealed)
 }
 
-/// Asks whether the file's access list lets its owner change its attributes.
-fn open_to_change_attributes(path: &Path) -> io::Result<()> {
-    open_name(path, FILE_WRITE_ATTRIBUTES).map(drop)
+/// Opens `path` itself, never what a link there leads to, with the given access and share mode.
+fn open_name(path: &Path, access: u32, share: u32) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(access)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
 }
 
 /// Deletes the name `path` through a handle opened for the purpose, so that a file other names
 /// share is not changed in any way, and a name goes at once even while a program has the file
 /// open with its delete shared.
 fn delete_name(path: &Path) -> io::Result<()> {
-    let file = open_name(path, DELETE)?;
+    mark_for_deletion(&open_name(path, DELETE, SHARE_ALL)?)
+}
+
+/// Marks the object `file` is open on for deletion, with POSIX semantics and the system's rule for
+/// a read-only file, so that its name goes when the handle closes and the rest of the name's file
+/// is left as it was. The handle was opened with the right to delete.
+fn mark_for_deletion(file: &File) -> io::Result<()> {
     let information = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE
             | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
             | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
     };
-    // SAFETY: the handle is the open name's own, opened with the right to delete, and
+    // SAFETY: the handle is the open object's own, opened with the right to delete, and
     // `information` is the record the class asks for, with its size.
     let marked = unsafe {
         SetFileInformationByHandle(
