@@ -607,7 +607,10 @@ to start, so a daemon the update replaces never has it.
 
 A task that does not start the new release's daemon leaves the update recorded as owing it, as on
 the other platforms, and `kr host rollback` or an update to a release without the fault goes on from
-there. For a daemon that does not answer, the message gives `taskkill /PID <pid>`.
+there. A message that names a daemon's process gives `taskkill /PID <pid>`. A daemon that holds the
+environment and does not listen cannot be named: it holds its lock file with no sharing, so the
+message says to stop it and to run the command again, and `Get-Process kr-controller` lists the
+daemons.
 
 ### The first install over a build run in place
 
