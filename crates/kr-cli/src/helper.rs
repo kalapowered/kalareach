@@ -59,7 +59,6 @@ impl Other {
     /// states the worker's level and holds a `kr`.
     ///
     /// Nothing waits: a release an update is removing is not there to be reached.
-    #[cfg(unix)]
     #[must_use]
     pub fn stored_kr(&self) -> Option<Stored> {
         use kr_ipc::install::Program;
@@ -86,13 +85,6 @@ impl Other {
             pin,
         })
     }
-
-    /// No release is held by a command on this platform.
-    #[cfg(not(unix))]
-    #[must_use]
-    pub fn stored_kr(&self) -> Option<Stored> {
-        None
-    }
 }
 
 /// The `kr` of another release in this host's store, and the hold that keeps the release there.
@@ -101,14 +93,16 @@ pub struct Stored {
     pub release: ReleaseName,
     /// Its `kr`.
     pub program: std::path::PathBuf,
-    #[cfg(unix)]
     pin: kr_ipc::install::Pin,
 }
 
 impl Stored {
-    /// Replaces this process with that `kr`, run with `arguments`. Returns only when it could not
-    /// be started, and why.
-    #[cfg(unix)]
+    /// Hands the command to that `kr`, run with `arguments`, holding its release until it starts
+    /// holding it itself. Returns only when it could not be started, and why.
+    ///
+    /// Where a process can replace itself this process is replaced, and the release is held from the
+    /// new program's first instruction. Where it cannot, on Windows, this process runs the other `kr`
+    /// as its child, waits for it, and ends with its exit code.
     pub fn exec(self, arguments: &[OsString]) -> std::io::Error {
         let this = kr_ipc::install::this_process()
             .ok()
@@ -116,13 +110,14 @@ impl Stored {
             .unwrap_or_default();
         let mut command = std::process::Command::new(&self.program);
         command.args(arguments).env(MARKER, this);
-        self.pin.exec(&mut command)
-    }
-
-    /// Not started on this platform.
-    #[cfg(not(unix))]
-    pub fn exec(self, _arguments: &[OsString]) -> std::io::Error {
-        std::io::Error::other("a release of a store is not started on this platform")
+        #[cfg(unix)]
+        {
+            self.pin.exec(&mut command)
+        }
+        #[cfg(windows)]
+        {
+            self.pin.run(&mut command)
+        }
     }
 }
 

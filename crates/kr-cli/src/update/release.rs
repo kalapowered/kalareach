@@ -12,17 +12,24 @@
 //! An archive is refused at the first entry that could put something outside the release or be
 //! something other than a file: a link, a device, a path that is absolute or climbs out of the
 //! archive's one top directory. What the archive says about a file's mode or owner is not read:
-//! a file is a program when the manifest says it is.
+//! a file is a program when the manifest says it is. A release is a `.tar.gz` where the system
+//! has symbolic links, and a `.zip` on Windows, where the archive is read by [`super::archive`]
+//! under bounds of its own, since it is parsed before any signature is checked.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::Write as _;
-use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::scalars::Digest256;
+#[cfg(unix)]
+use kr_protocol::update::FileMode;
 use kr_protocol::update::{
-    FileMode, FloorSystem, FloorVersion, MANIFEST_FILE, MAX_MANIFEST_LEN, ReleaseManifest,
+    FloorSystem, FloorVersion, MANIFEST_FILE, MAX_MANIFEST_LEN, ReleaseManifest,
 };
 use sha2::Digest as _;
 
@@ -278,10 +285,12 @@ pub fn check_system(manifest: &ReleaseManifest) -> Result<()> {
 }
 
 /// How long the system's own tool that says its version is given.
+#[cfg(unix)]
 const TOOL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How many bytes a tool may print: the tool that says a version prints a short line, and one that
 /// prints more than this is given up on.
+#[cfg(unix)]
 const TOOL_OUTPUT: usize = 4096;
 
 /// Runs `program` and returns what it printed, or nothing when it does not end and say it within
@@ -290,6 +299,7 @@ const TOOL_OUTPUT: usize = 4096;
 /// without blocking, in the loop that waits for it to end, so that a descendant that keeps the pipe
 /// open after the tool has exited holds the run for the bound and no longer, and one that writes
 /// without end is given up on at once. The pipe is closed with the run.
+#[cfg(unix)]
 fn run_bounded(
     program: &str,
     arguments: &[&str],
@@ -372,7 +382,22 @@ fn run_bounded(
     }
 }
 
+/// This host's version of what a floor is a version of, where it can be read: the system's own
+/// record of its version, which no compatibility setting of a program changes.
+#[cfg(windows)]
+fn host_version(system: FloorSystem) -> Option<FloorVersion> {
+    if system != FloorSystem::Windows {
+        return None;
+    }
+    let (major, minor) = kr_ipc::install::windows_version().ok()?;
+    Some(FloorVersion {
+        major: u16::try_from(major).ok()?,
+        minor: u16::try_from(minor).ok()?,
+    })
+}
+
 /// This host's version of what a floor is a version of, where it can be read.
+#[cfg(unix)]
 fn host_version(system: FloorSystem) -> Option<FloorVersion> {
     let (program, arguments): (&str, &[&str]) = match system {
         FloorSystem::Macos if cfg!(target_os = "macos") => {
@@ -398,6 +423,7 @@ pub type Written = BTreeMap<String, (u64, Digest256)>;
 /// Opens an archive for reading without waiting for a writer: a pipe named as an archive would
 /// otherwise hold the run for ever, under the update lock. A link is followed, since a person may
 /// name an archive by one; what it leads to is checked to be a regular file.
+#[cfg(unix)]
 fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
 
@@ -410,6 +436,31 @@ fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
     .map_err(std::io::Error::from)
 }
 
+/// Opens an archive for reading. What it is is checked on the open file before a byte is read: a
+/// pipe is not a regular file.
+#[cfg(windows)]
+fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Unpacks a release archive, `.zip` on Windows, into `staging`, an owner-only directory, and
+/// returns the release's directory in it and what was written.
+///
+/// # Errors
+///
+/// Returns a refusal naming what is wrong with the archive, or the failure to read or write it.
+#[cfg(windows)]
+pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
+    let file = open_archive(archive).map_err(|error| {
+        CliError::Other(shown!(
+            "the archive {} could not be read: {}",
+            Shown::root(archive),
+            Shown::io(&error)
+        ))
+    })?;
+    super::archive::unpack(file, archive, staging, &super::archive::Limits::DEFAULT)
+}
+
 /// Unpacks a release archive, `.tar.gz`, into `staging`, an owner-only directory, and returns the
 /// release's directory in it and what was written.
 ///
@@ -420,6 +471,7 @@ fn open_archive(path: &Path) -> std::io::Result<std::fs::File> {
 /// # Errors
 ///
 /// Returns a refusal naming what is wrong with the archive, or the failure to read or write it.
+#[cfg(unix)]
 pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
     let unreadable = |error: &std::io::Error| {
         CliError::Other(shown!(
@@ -522,6 +574,7 @@ pub fn unpack(archive: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
 /// # Errors
 ///
 /// Returns a refusal naming the failure to read the tree or write the archive.
+#[cfg(unix)]
 pub fn pack_tree(tree: &Path, top: &str, archive: &Path) -> Result<()> {
     let failed = |error: &std::io::Error| {
         CliError::Other(shown!(
@@ -621,6 +674,7 @@ pub fn copy_tree(tree: &Path, staging: &Path) -> Result<(PathBuf, Written)> {
 
 /// Splits an archive entry's path into its top directory and the parts below it, when it is a
 /// relative path of text parts that stays inside that directory.
+#[cfg(unix)]
 fn split_entry(path: &Path) -> Option<(String, Vec<String>)> {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -639,7 +693,7 @@ fn split_entry(path: &Path) -> Option<(String, Vec<String>)> {
 }
 
 /// Creates `directory` and its parents below `staging`, owner-only.
-fn create_directories(staging: &Path, directory: &Path) -> Result<()> {
+pub(super) fn create_directories(staging: &Path, directory: &Path) -> Result<()> {
     kr_ipc::paths::create_private_tree(staging, directory).map_err(|error| {
         CliError::Other(shown!(
             "the staging directory {} could not be made: {}",
@@ -650,17 +704,23 @@ fn create_directories(staging: &Path, directory: &Path) -> Result<()> {
 }
 
 /// Writes a new file from `source`, owner-only, and returns its length and digest.
-fn write_new(
+pub(super) fn write_new(
     destination: &Path,
     source: &mut impl std::io::Read,
 ) -> std::io::Result<(u64, Digest256)> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::io::Write as _;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(kr_ipc::paths::OWNER_ONLY_FILE_MODE)
-        .open(destination)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Owner-only by mode here, and on Windows by the list the staging directory gives every file
+    // made in it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(kr_ipc::paths::OWNER_ONLY_FILE_MODE);
+    }
+    let mut file = options.open(destination)?;
     let mut hasher = sha2::Sha256::new();
     let mut length = 0_u64;
     let mut buffer = vec![0_u8; 256 * 1024];
@@ -679,16 +739,20 @@ fn write_new(
 }
 
 /// Refuses to write `length` more bytes where that would leave less than [`SPACE_MARGIN`] free.
-fn ensure_space(directory: &Path, length: u64) -> Result<()> {
+pub(super) fn ensure_space(directory: &Path, length: u64) -> Result<()> {
+    #[cfg(unix)]
     let free = rustix::fs::statvfs(directory)
         .map(|about| about.f_bavail.saturating_mul(about.f_frsize))
-        .map_err(|error| {
-            CliError::Other(shown!(
-                "the free space at {} could not be read: {}",
-                Shown::root(directory),
-                Shown::io(&std::io::Error::from(error))
-            ))
-        })?;
+        .map_err(std::io::Error::from);
+    #[cfg(windows)]
+    let free = kr_ipc::install::free_space(directory);
+    let free = free.map_err(|error| {
+        CliError::Other(shown!(
+            "the free space at {} could not be read: {}",
+            Shown::root(directory),
+            Shown::io(&error)
+        ))
+    })?;
     if free < length.saturating_add(SPACE_MARGIN) {
         return Err(CliError::Other(shown!(
             "the filesystem of {} has {} bytes free, and staging the release needs {} more and \
@@ -784,6 +848,7 @@ pub fn manifest_document(release: &Path) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// Returns the failure to change or flush a file.
+#[cfg(unix)]
 pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -834,6 +899,55 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
     Ok(())
 }
 
+/// Makes every file of the release at `release` read-only and unwritable by its owner, and every
+/// directory under it unable to take a new name or lose one, then flushes each.
+///
+/// A file is sealed by attribute and by a list that denies its owner every right that writes it. A
+/// directory is flushed before it is sealed, since a flush asks for the right to add a name, which
+/// sealing takes away; the release's own directory is flushed and left open: it is renamed into
+/// `versions/` next, and [`admit`] seals it there. A program's mode is not a thing here: a file is
+/// run when its name says it is a program.
+///
+/// # Errors
+///
+/// Returns the failure to change or flush a file.
+#[cfg(windows)]
+pub fn seal(release: &Path, _manifest: &ReleaseManifest) -> Result<()> {
+    let mut directories = Vec::new();
+    let mut pending: Vec<PathBuf> = vec![release.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        directories.push(directory.clone());
+        let entries = std::fs::read_dir(&directory).map_err(|error| sealing(&directory, &error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| sealing(&directory, &error))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| sealing(&entry.path(), &error))?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let file = entry.path();
+            kr_ipc::install::seal_file(&file)
+                .and_then(|()| std::fs::File::open(&file).and_then(|opened| opened.sync_all()))
+                .map_err(|error| sealing(&file, &error))?;
+        }
+    }
+    // Deepest first, so a directory is flushed after everything in it and sealed last.
+    for directory in directories.iter().rev() {
+        kr_flush::flush_directory(directory, kr_flush::NameKind::Directory)
+            .and_then(|()| {
+                if directory == release {
+                    Ok(())
+                } else {
+                    kr_ipc::install::seal_directory(directory)
+                }
+            })
+            .map_err(|error| sealing(directory, &error))?;
+    }
+    Ok(())
+}
+
 /// Moves a sealed release into the store's `versions/` in one rename, makes its directory
 /// read-only, and flushes both directories the rename changed.
 ///
@@ -841,6 +955,7 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
 ///
 /// Returns a refusal when a release of that name is already there, and the failure to move or
 /// flush otherwise.
+#[cfg(unix)]
 pub fn admit(
     staged: &Path,
     store: &kr_ipc::install::Store,
@@ -867,6 +982,38 @@ pub fn admit(
     Ok(destination)
 }
 
+/// Moves a sealed release into the store's `versions/` in one rename, seals its directory, and
+/// flushes both directories the rename changed.
+///
+/// # Errors
+///
+/// Returns a refusal when a release of that name is already there, and the failure to move or
+/// flush otherwise.
+#[cfg(windows)]
+pub fn admit(
+    staged: &Path,
+    store: &kr_ipc::install::Store,
+    release: &kr_protocol::update::ReleaseName,
+) -> Result<PathBuf> {
+    let destination = store.release_directory(release);
+    if destination.exists() {
+        return Err(CliError::Other(shown!(
+            "the store already holds release {}",
+            crate::shown::release(release)
+        )));
+    }
+    std::fs::rename(staged, &destination).map_err(|error| sealing(&destination, &error))?;
+    kr_ipc::install::seal_directory(&destination)
+        .and_then(|()| kr_flush::flush_directory(&store.versions(), kr_flush::NameKind::Directory))
+        .and_then(|()| {
+            staged.parent().map_or(Ok(()), |parent| {
+                kr_flush::flush_directory(parent, kr_flush::NameKind::Directory)
+            })
+        })
+        .map_err(|error| sealing(&destination, &error))?;
+    Ok(destination)
+}
+
 fn sealing(path: &Path, error: &std::io::Error) -> CliError {
     CliError::Other(shown!(
         "the staged release could not be made read-only at {}: {}",
@@ -875,7 +1022,7 @@ fn sealing(path: &Path, error: &std::io::Error) -> CliError {
     ))
 }
 
-fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
+pub(super) fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
     CliError::Other(shown!(
         "the archive {} is not a release this host installs: it {}",
         Shown::root(archive),
@@ -884,10 +1031,12 @@ fn refused_archive(archive: &Path, reason: &'static str) -> CliError {
 }
 
 /// The characters tar's entry kinds are written with, from `!` to `~`.
+#[cfg(unix)]
 const GRAPHIC: &str = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
 /// The refusal of an entry that is neither a file nor a directory, saying which kind it is by the
 /// character tar gives it, with its usual name: `2` is a symbolic link, `1` a hard link.
+#[cfg(unix)]
 fn refused_kind(archive: &Path, kind: u8) -> CliError {
     let said = |kind: Shown| {
         shown!(
@@ -920,7 +1069,7 @@ fn refused_tree(tree: &Path, reason: &'static str) -> CliError {
     ))
 }
 
-fn write_failure(path: &Path, error: &std::io::Error) -> CliError {
+pub(super) fn write_failure(path: &Path, error: &std::io::Error) -> CliError {
     CliError::Other(shown!(
         "the release could not be staged at {}: {}",
         Shown::root(path),
@@ -934,6 +1083,7 @@ mod tests {
 
     /// A path inside one top directory is split into it and the parts below; anything that could
     /// leave it, or is not text, is not.
+    #[cfg(unix)]
     #[test]
     fn an_archive_entry_stays_inside_its_top_directory() {
         assert_eq!(
@@ -965,6 +1115,7 @@ mod tests {
     }
 
     /// A tool that does not end is given a bound and ended, and one that ends is read.
+    #[cfg(unix)]
     #[test]
     fn the_system_s_tool_is_given_a_bound_and_no_more() {
         let began = std::time::Instant::now();
@@ -996,6 +1147,7 @@ mod tests {
 
     /// A tool that writes without end is given up on at once, not read for as long as it writes:
     /// with a bound far beyond the watchdog, only the limit on what it may print ends the run.
+    #[cfg(unix)]
     #[test]
     fn a_tool_that_never_stops_writing_is_given_up_on() {
         // On a thread of its own, so that a run that reads for ever fails the test and does not
@@ -1016,6 +1168,7 @@ mod tests {
     /// ends. The descendant says what it finds when it writes: the pipe closed, or, as the control,
     /// open while the run still reads it. It says so in a file, which is waited for, and writes
     /// ten seconds after a bound of one, so that only a stall of nine seconds could reorder them.
+    #[cfg(unix)]
     #[test]
     fn a_tool_s_pipe_is_closed_when_its_bound_ends() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -1076,6 +1229,7 @@ mod tests {
 
     /// A release's manifest that is a pipe is refused at once, and one that is a link is not
     /// followed, where the update reads it.
+    #[cfg(unix)]
     #[test]
     fn a_manifest_that_is_a_pipe_or_a_link_is_refused_at_once() {
         let directory = tempfile::tempdir().expect("a directory");
