@@ -42,7 +42,8 @@
 //! removes, so one a pass would write a row on each host for as long as the connection is kept.
 //! The lease the host took stays the keeper's until the host takes the next one, so a renewal that
 //! fails (the service does not answer, the chain of keys cannot be read, or the host refuses the
-//! new lease for a cause time mends) leaves the connection on the lease it has while that lasts.
+//! new lease for a cause the keeper waits out) leaves the connection on the lease it has while that
+//! lasts.
 //!
 //! A keeper belongs to the account that was signed in when it was made. The service client checks
 //! which account is signed in before the keeper asks for a lease and again before it presents one,
@@ -536,8 +537,8 @@ impl LeaseKeeper {
     ///
     /// A presentation is an action the host records and keeps, so a connection that presented
     /// again at each use would write a row on the host for each. A new lease is asked for once, with
-    /// no waits. When it cannot be got, or the host will not take it for a cause time mends, that is
-    /// no failure of the connection while the lease the host holds still lasts: that lease stays in
+    /// no waits. When it cannot be got, or the host will not take it for a cause the keeper waits
+    /// out, that is no failure of the connection while the lease the host holds still lasts: that lease stays in
     /// place until the host takes the new one, and the service is not asked again until what was
     /// held against it is over.
     ///
@@ -546,7 +547,7 @@ impl LeaseKeeper {
     /// Returns why the host holds no lease that lasts and will not without a person or a new
     /// connection.
     pub async fn present_if_due(&self, session: &Session) -> Result<(), LeaseStop> {
-        if !self.due() {
+        if !self.due() || self.waits_out_a_renewal() {
             return Ok(());
         }
         let stop = match tokio::time::timeout(
@@ -559,13 +560,28 @@ impl LeaseKeeper {
             Ok(Err(stop)) => stop,
             Err(_) => self.stopped(LeaseStop::Unreachable),
         };
-        let lasts = self
-            .left_on_the_lease()
-            .is_some_and(|left| left > LEASE_MARGIN);
-        if lasts && matches!(stop, LeaseStop::Unreachable | LeaseStop::Later(_)) {
+        if self.lasts() && matches!(stop, LeaseStop::Unreachable | LeaseStop::Later(_)) {
             return Ok(());
         }
         Err(stop)
+    }
+
+    /// Whether the lease the host holds lasts beyond the margin, so a renewal that does not come
+    /// off is no failure yet.
+    fn lasts(&self) -> bool {
+        self.left_on_the_lease()
+            .is_some_and(|left| left > LEASE_MARGIN)
+    }
+
+    /// Whether a renewal that did not come off is being waited out: what it left held against the
+    /// service is not over, and the lease the host holds lasts. Nothing goes to the service then,
+    /// and nothing to the host either, since the host records a refused presentation as it does a
+    /// taken one.
+    fn waits_out_a_renewal(&self) -> bool {
+        self.lasts()
+            && self.held_back().is_some_and(|(stop, _)| {
+                matches!(stop, LeaseStop::Unreachable | LeaseStop::Later(_))
+            })
     }
 
     /// Keeps the lease until something stops it. It begins with a wait until the lease the host
