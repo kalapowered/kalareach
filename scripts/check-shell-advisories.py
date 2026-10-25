@@ -1168,6 +1168,33 @@ def run_self_test():
         expect("a zsh tag past the pin", says(outcome, "zsh-5.9.3", "no triage row"), str(outcome))
         outcome = attempt(table, now="2026-10-02")
         expect("a zsh tag inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "zsh-5.9.3"), str(outcome))
+
+        # The assessment that stands for a package is the last row, by date and then by place in the
+        # table, that names the package and mentions the change's identifier; a row that names two
+        # packages stands for each apart. The qualification suite applies the same rule to a row that
+        # is still scheduled past its target.
+        def with_rows(*rows):
+            marker = "<!-- /kr:triage -->"
+            return register.replace(marker, "\n".join(rows) + "\n" + marker)
+        table = zsh_tag(routes(), "zsh-5.9.3", "2026-10-01T10:00:00Z")
+        both = "| 2026-10-24 | zsh-5.9.3, the release after 5.9.2; released 2026-10-01 | zsh, bash | A first reading of the release by both packages. | 2026-10-15 | scheduled |"
+        for_bash = "| 2026-10-25 | zsh-5.9.3, read again; released 2026-10-01 | bash | The release was read again for this package. | 2026-10-15 | not-affected |"
+        for_zsh = "| 2026-10-25 | The release after 5.9.2 (zsh-5.9.3), assessed again; released 2026-10-01 | zsh | The release was read again for this package. | 2026-10-15 | not-affected |"
+        same_day = "| 2026-10-24 | zsh-5.9.3, read again; released 2026-10-01 | zsh | The release was read again for this package. | 2026-10-15 | not-affected |"
+        for name, rows, stands in (
+            ("a scheduled row past its target and alone", (both,), True),
+            ("a later row for the other package only", (both, for_bash), True),
+            ("a later row for the package, worded otherwise", (both, for_zsh), False),
+            ("a later row of the same day below it", (both, same_day), False),
+            ("a row of a later day above it", (for_zsh, both), False),
+            ("a row of the same day above it", (same_day, both), True),
+        ):
+            outcome = attempt(table, now="2026-11-02", text=with_rows(*rows))
+            expect(
+                "the assessment that stands: " + name,
+                not isinstance(outcome, SourceError) and says(outcome, "zsh-5.9.3", "still scheduled") == stands,
+                str(outcome),
+            )
         five_three = "/gnu/bash/bash-5.3-patches/"
         row = lambda text: b'<tr><td><a href="%s">%s</a></td><td align="right">%s  </td></tr>\n' % tuple(
             part.encode() for part in text
