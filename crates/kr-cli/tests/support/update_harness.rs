@@ -1263,9 +1263,12 @@ impl Drop for Host {
             self.remove_the_standalone_start();
             forget_the_keys(self.tree.environment_id());
         }
-        // An installed release is read-only, and the tree goes whole: its directories are opened
-        // to removal first.
+        // An installed release is sealed, and the tree goes whole: on Unix its directories are
+        // opened to removal first, and on Windows the store is removed as a release is.
+        #[cfg(unix)]
         writable(self.store.root());
+        #[cfg(windows)]
+        let _ = kr_ipc::install::remove_sealed_tree(self.store.root());
     }
 }
 
@@ -1296,17 +1299,13 @@ fn forget_the_keys(environment: kr_protocol::ids::EnvironmentId) {
 }
 
 /// Makes every directory under `root` writable by its owner, so the tree can be removed.
+#[cfg(unix)]
 fn writable(root: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
-        }
-        #[cfg(windows)]
-        let _ = kr_ipc::install::unseal_directory(&directory);
+        let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
