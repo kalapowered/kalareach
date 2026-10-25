@@ -6,8 +6,6 @@
 //! nothing unless [`HELPER`] names a directory; then it waits there for word to go on, and writes
 //! down what it found about itself.
 
-#![cfg(unix)]
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -170,6 +168,25 @@ fn wait_for(path: &Path) {
     }
 }
 
+/// Waits for `path` to appear, and fails at once, saying how, if `child` ends first.
+fn wait_for_unless_ended(path: &Path, child: &mut std::process::Child) {
+    let deadline = Instant::now() + WAIT;
+    while !path.exists() {
+        if let Some(status) = child.try_wait().expect("asks the child") {
+            panic!(
+                "the program ended ({status}) before {} appeared",
+                path.display()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// KR-REQ-26.06: a program started through `current` runs the release it started from, and holds
 /// it, even after `current` names another release; the release goes only once it has exited.
 #[test]
@@ -221,9 +238,10 @@ fn a_program_started_through_current_keeps_its_release_after_the_switch() {
         one.as_str(),
         "it holds the release it started from"
     );
-    // The control, where it shows: macOS says the path the program was started as, and that path
-    // resolves to the other release once `current` has moved on, which is why no program asks it.
-    if cfg!(target_os = "macos") {
+    // The control, where it shows: macOS and Windows say the path the program was started as, and
+    // that path resolves to the other release once `current` has moved on, which is why no program
+    // asks it.
+    if cfg!(any(target_os = "macos", windows)) {
         assert_eq!(started_as, test.store.stable(Program::Kr));
         assert_ne!(
             std::fs::canonicalize(&started_as).expect("resolves"),
@@ -457,10 +475,12 @@ fn a_command_registers_what_it_works_in_before_it_writes() {
 
 /// The variable that makes the launcher test act: the store's root, the release to pin and the
 /// directory the program it becomes reports through, one to a line.
+#[cfg(unix)]
 const PINNING: &str = "KR_INSTALL_TEST_PINNING";
 
 /// What the launcher does when it is started to pin a release and replace itself with a program
 /// that takes no hold of its own: the pin passes to the program, or nothing holds the release.
+#[cfg(unix)]
 #[test]
 fn launcher() {
     let Some(text) = std::env::var_os(PINNING) else {
@@ -486,6 +506,7 @@ fn launcher() {
 /// KR-REQ-26.06: a program that replaces itself with another passes the hold on its release to it,
 /// so a release is held from the moment it is pinned to the moment the program that took over
 /// ends, with nothing in between that an update could retire it in.
+#[cfg(unix)]
 #[test]
 fn a_pinned_release_stays_held_by_the_program_that_takes_over() {
     let test = TestStore::create();
@@ -533,6 +554,134 @@ fn a_pinned_release_stays_held_by_the_program_that_takes_over() {
     );
 }
 
+/// The variable that makes the launcher test act on Windows: the store's root, the release to pin and
+/// the directory the program it runs reports through, one to a line.
+#[cfg(windows)]
+const PINNING: &str = "KR_INSTALL_TEST_PINNING";
+
+/// What the launcher does when it is started to pin a release and run a program of that release
+/// with the pin held: the program is the release's own `kr`, which is this test binary, and it
+/// reports through the directory it is given. The launcher waits for it, so its pin is the release's
+/// hold until it ends.
+#[cfg(windows)]
+#[test]
+fn launcher() {
+    let Some(text) = std::env::var_os(PINNING) else {
+        return;
+    };
+    let text = text.to_string_lossy().into_owned();
+    let mut lines = text.lines();
+    let store = Store::at(lines.next().expect("the store"));
+    let release = release(lines.next().expect("the release"));
+    let talk = lines.next().expect("the directory to talk through");
+    let pin = store
+        .pin(&release)
+        .expect("asks")
+        .expect("the release is pinned");
+    let mut command = std::process::Command::new(
+        store
+            .release_directory(&release)
+            .join("bin")
+            .join(Program::Kr.file_name()),
+    );
+    command
+        .args([
+            "--exact",
+            "stored_child",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(HELPER, talk);
+    let error = pin.run(&mut command);
+    panic!("the launcher could not run the program: {error}");
+}
+
+/// What the program a launcher runs does: it says it started, waits for `go` before it asks what it
+/// runs, and writes down whether it was let run, as every host executable asks first thing.
+#[cfg(windows)]
+#[test]
+fn stored_child() {
+    let Some(directory) = std::env::var_os(HELPER).map(PathBuf::from) else {
+        return;
+    };
+    std::fs::write(directory.join("started"), b"").expect("says it started");
+    wait_for(&directory.join("go"));
+    let said = match kr_ipc::install::this_process() {
+        Ok(running) => format!(
+            "ran {}",
+            running.release().map_or("outside", ReleaseName::as_str)
+        ),
+        Err(error) => format!("refused: {error}"),
+    };
+    std::fs::write(directory.join("said"), said).expect("says what it found");
+    wait_for(&directory.join("end"));
+}
+
+/// KR-REQ-26.06: a program that runs another of its release with the release pinned holds the
+/// release for as long as it runs it, and an update does not remove the release meanwhile. The
+/// pin cannot pass to the program as it does where a program replaces itself, so when the holder is
+/// ended first, the program that is left, which has not yet taken a hold of its own, is refused by
+/// the release's removal and does not start work in a release that is gone.
+#[cfg(windows)]
+#[test]
+fn a_pinned_release_stays_held_by_the_program_that_takes_over() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let talk = test.root.join("talk");
+    std::fs::create_dir(&talk).expect("a directory to talk through");
+    let mut launcher =
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "launcher", "--nocapture", "--test-threads", "1"])
+            .env(
+                PINNING,
+                format!(
+                    "{}\n{one}\n{}\n",
+                    test.store.root().display(),
+                    talk.display()
+                ),
+            )
+            .current_dir(&test.root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the launcher starts");
+    wait_for_unless_ended(&talk.join("started"), &mut launcher);
+
+    // The program has not asked what it runs, so nothing holds the release but the launcher's pin.
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(test.store.held(&one).expect("asks"), "the release is held");
+    assert!(
+        !test.store.retire(&one, &update).expect("asks"),
+        "an update does not remove a release a pin is held on"
+    );
+
+    // The launcher ends before the program has a hold of its own.
+    launcher.kill().expect("the launcher is ended");
+    launcher.wait().expect("the launcher has ended");
+    assert!(
+        !test.store.held(&one).expect("asks"),
+        "nothing holds it now"
+    );
+    assert!(
+        test.store.retire(&one, &update).expect("removes"),
+        "and it goes"
+    );
+    std::fs::write(talk.join("go"), b"").expect("go");
+    wait_for(&talk.join("said"));
+    let said = std::fs::read_to_string(talk.join("said")).expect("what it found");
+    assert!(
+        said.starts_with("refused:"),
+        "the program of a release that went does not run: {said}"
+    );
+    std::fs::write(talk.join("end"), b"").expect("end");
+}
+
 /// A release that is not there, or that an update is removing, is not pinned and is not waited
 /// for.
 #[test]
@@ -555,14 +704,141 @@ fn a_release_that_is_gone_or_being_removed_is_not_pinned() {
     // release is one this test never pinned: another test of this binary starting a program can
     // hold a copy of a pin's file for a moment after the pin is dropped, and its lock with it.
     let path = test.store.manifest(&removed);
-    let removing = std::fs::File::open(&path).expect("opens");
-    rustix::fs::flock(
-        &removing,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .expect("the removal's lock");
+    #[cfg(unix)]
+    let removing = {
+        let removing = std::fs::File::open(&path).expect("opens");
+        rustix::fs::flock(
+            &removing,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("the removal's lock");
+        removing
+    };
+    // On Windows the removal holds the manifest open with a share mode that allows nothing.
+    #[cfg(windows)]
+    let removing = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("the removal's hold")
+    };
     assert!(
         test.store.pin(&removed).expect("asks").is_none(),
         "a release being removed, without waiting for the removal"
     );
+    drop(removing);
+}
+
+/// The variable that makes the late helper act, naming the directory it talks through.
+const LATE: &str = "KR_INSTALL_TEST_LATE";
+
+/// What a program does that is started from a release and asks what it runs only when it is told
+/// to go: it says it started, waits, and then writes down whether it was let run.
+#[test]
+fn late_helper() {
+    let Some(directory) = std::env::var_os(LATE).map(PathBuf::from) else {
+        return;
+    };
+    std::fs::write(directory.join("started"), b"").expect("says it started");
+    wait_for(&directory.join("go"));
+    let said = match kr_ipc::install::this_process() {
+        Ok(running) => format!(
+            "ran {}",
+            running.release().map_or("outside", ReleaseName::as_str)
+        ),
+        Err(error) => format!("refused: {error}"),
+    };
+    std::fs::write(directory.join("said"), said).expect("says what it found");
+}
+
+/// KR-REQ-26.06: a release that was removed before a program of it took its hold is not run by that
+/// program, however late the program asks what it runs: the removal is judged by the program's own
+/// image at the moment it asks, and the release is gone or in the trash by then.
+#[test]
+fn a_program_that_asks_what_it_runs_after_its_release_was_removed_is_refused() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let program = test.install(&one);
+    let talk = test.root.join("talk");
+    std::fs::create_dir(&talk).expect("a directory to talk through");
+    let mut child = std::process::Command::new(&program)
+        .args([
+            "--exact",
+            "late_helper",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(LATE, &talk)
+        .current_dir(&test.root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the program starts");
+    wait_for_unless_ended(&talk.join("started"), &mut child);
+
+    // Nothing holds the release: the program has not asked what it runs.
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(
+        !test.store.held(&one).expect("asks"),
+        "nothing holds it yet"
+    );
+    assert!(
+        test.store.retire(&one, &update).expect("removes"),
+        "a release nothing holds is removed"
+    );
+    std::fs::write(talk.join("go"), b"").expect("go");
+    let status = child.wait().expect("the program ends");
+    assert!(status.success(), "the helper ran as asked: {status}");
+    let said = std::fs::read_to_string(talk.join("said")).expect("what it found");
+    assert!(
+        said.starts_with("refused:"),
+        "a program of a release that went does not run: {said}"
+    );
+}
+
+/// KR-REQ-26.06: `current` always names a release whole while it is switched, to a reader that never
+/// stops: a program started through it at any moment finds one release or the other and never
+/// neither. Judged by a count of switches, not by how long they take.
+#[test]
+fn current_names_a_whole_release_at_every_moment_of_a_switch() {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    let finished = AtomicBool::new(false);
+    let reads = AtomicU32::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..3 {
+            scope.spawn(|| {
+                while !finished.load(Ordering::SeqCst) {
+                    let named = test.store.current().expect("current is readable");
+                    assert!(named.is_some(), "current names a release");
+                    let program = test.store.stable(Program::Kr);
+                    assert!(
+                        program.is_file(),
+                        "the program through current is there: {}",
+                        program.display()
+                    );
+                    reads.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        for round in 0..200 {
+            test.switch(if round % 2 == 0 { &two } else { &one });
+        }
+        finished.store(true, Ordering::SeqCst);
+    });
+    assert!(reads.load(Ordering::SeqCst) > 0, "the readers read");
 }
