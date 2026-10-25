@@ -2021,7 +2021,7 @@ mod tests {
         assert_eq!(
             busy.released_input_bytes.get(),
             6,
-            "the six bytes a person typed, and none of the answer's eight"
+            "the six bytes a person typed, and none of the answer's"
         );
         let released: Vec<Vec<u8>> = effects
             .steps
