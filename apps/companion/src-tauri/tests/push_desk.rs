@@ -3053,6 +3053,20 @@ async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_
         "the row says what the host said: {:?}",
         phone.view().hosts[0].words
     );
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .starts_with("The host did not take this choice of previews"),
+        "and that it refused the choice, not the phone: {:?}",
+        phone.view().hosts[0].words
+    );
+    assert!(
+        phone.view().hosts[0]
+            .words
+            .contains("cannot notify this phone"),
+        "and that the credential it was issued first leaves it unable to notify: {:?}",
+        phone.view().hosts[0].words
+    );
     assert!(held_keys(&phone).expect("keys").senders.is_empty());
 
     // A host that needs the person is not told again by a second choice: the choice is recorded,
