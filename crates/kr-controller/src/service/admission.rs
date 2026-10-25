@@ -153,10 +153,10 @@ impl Controller {
     /// Returns the table of admitted connections to withdraw from or to move to another revision,
     /// once no commit stands on a registration.
     ///
-    /// It waits for every commit that holds a registration standing ([`Self::under_registration`])
-    /// and lets no new one begin behind it, so a withdrawal lands wholly before such a commit's
-    /// check or wholly after its end. The wait is as long as the commit, and holds the thread it
-    /// is made on.
+    /// It waits for every commit that holds a registration standing ([`Self::under_registration`]),
+    /// so a withdrawal lands wholly before such a commit's check or wholly after its end. The wait
+    /// is as long as the commit, and holds the thread it is made on. The lock does not say whether
+    /// a commit that begins while a withdrawal waits goes first or waits behind it.
     pub(super) fn admitted_withdraw(&self) -> Withdrawing<'_> {
         let hold = self
             .commit_hold
