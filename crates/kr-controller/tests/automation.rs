@@ -7130,19 +7130,37 @@ async fn a_command_a_stopped_daemon_left_running_is_closed_and_released_by_the_n
     host.clients.abort();
 }
 
+/// How long a grant that ends has left when the worker's claim reads it, in the case below.
+const GRANT_LEFT_MS: u64 = 100;
+
 /// KR-REQ-19.04 and KR-REQ-25.14: a session a workflow starts is held to its grant's own end where
 /// its process is created, whatever the node's wait still allows. The grant ends while the worker's
 /// rendezvous is held after its claim, which the grant still stood at, and the worker, going on,
 /// creates no process: a command leaves no mark, a shell a `create_session` node names starts none,
 /// and the reservation fails. The control is a grant with no end, whose command starts through the
 /// same hold.
+///
+/// The daemon's clocks stand still, the wall clock an hour ahead of the machine's so that no
+/// reading a worker takes from the machine's clock is later than it. A grant that ends has a tenth
+/// of a second left at every reading, the claim's included, however long the machine takes to get
+/// there. The moment the worker is given to start by is that time on the machine's boot clock,
+/// which the worker reads as well, and the daemon's clocks never reach it: the case lets the worker
+/// go on once the boot clock has passed that moment, so only the worker's own check can refuse the
+/// start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_left() {
-    let host = working_host().await;
+    let wall = kr_ipc::now_ms().get() + 60 * 60_000;
+    let host = working_host_through_on(
+        Clocks {
+            continuous: Arc::new(kr_transport::clock::ManualClock::new()),
+            wall: WallClock::from_fn(move || wall),
+        },
+        |supervisor| supervisor,
+    )
+    .await;
     let mut control = client(&host).await;
     let local = kr_protocol::ids::DeviceId::new(host.environment_id.get());
     for (number, ends, shell) in [(50_u8, true, false), (51, false, false), (55, true, true)] {
-        let ends_at = kr_ipc::now_ms().get() + 20_000;
         issue_grant(
             &host,
             grant_id(number),
@@ -7150,7 +7168,7 @@ async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_
             &COMMAND_RIGHTS,
             if ends {
                 GrantExpiry::At {
-                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(ends_at),
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(wall + GRANT_LEFT_MS),
                 }
             } else {
                 GrantExpiry::Never
@@ -7177,9 +7195,13 @@ async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_
             .expect("the worker claimed its launch")
             .expect("the worker's claim was committed");
         if ends {
-            until("the grant's end to pass", || {
-                kr_ipc::now_ms().get() > ends_at
-            })
+            // The claim read the boot clock before this reading, so the moment the worker was
+            // given is no later than this reading and the time the grant had left.
+            let claimed_at = kr_ipc::clock::boot_elapsed_ms();
+            until(
+                "the machine's boot clock to pass the moment the worker was given",
+                || kr_ipc::clock::boot_elapsed_ms() > claimed_at + GRANT_LEFT_MS,
+            )
             .await;
         }
         resume.send(()).expect("the rendezvous goes on");
