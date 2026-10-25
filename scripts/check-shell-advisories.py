@@ -157,18 +157,12 @@ def version_key(text):
     return release + (0, tuple((0, int(each)) if each.isdigit() else (1, each.lower()) for each in label.split(".")))
 
 
-def numeric_key(text):
-    """Where a version sorts when only its numbers count, as in a comparison of four-part versions
-    that has no pre-release: `2.3.4-beta1` is `2.3.4`."""
-    match = re.match(r"\s*v?(\d+(?:\.\d+)*)", text)
-    if not match:
-        return None
-    return padded(tuple(int(part) for part in match.group(1).split("."))) + (1, ())
-
-
 def after(key):
-    """The smallest key above `key`: what a bound of `>` or `<=` stands for."""
-    return key[:-1] + (key[-1] + ((2, 0),),)
+    """The smallest key above `key`: what a bound of `>` or `<=` stands for. Above a pre-release it
+    is the same pre-release with one more identifier, the smallest there is (`rc` and then `rc.0`);
+    above a release it is past anything that shares the release's numbers."""
+    marker = (0, 0) if key[-2] == 0 else (2, 0)
+    return key[:-1] + (key[-1] + (marker,),)
 
 
 def series_start(version):
@@ -202,17 +196,17 @@ def in_range(range_text, version):
     return True
 
 
-def range_intervals(range_text, key=version_key):
+def range_intervals(range_text):
     """The versions a range covers, as half-open intervals of version keys: `low` is inside, `high`
     is not, and None is no bound. Comparators separated by a comma all hold, alternatives separated
     by `||` are each their own interval, and `a-b` is the span from a to b. Versions are ordered as
-    `key` orders them. None when the range cannot be read in full."""
+    `version_key` orders them. None when the range cannot be read in full."""
     intervals = []
     for alternative in range_text.split("||"):
         low, high = None, None
         span = re.match(r"\s*([0-9][0-9A-Za-z.+]*)\s*-\s*([0-9][0-9A-Za-z.+]*)\s*$", alternative)
         if span:
-            first, last = key(span.group(1)), key(span.group(2))
+            first, last = version_key(span.group(1)), version_key(span.group(2))
             if first is None or last is None:
                 return None
             intervals.append((first, after(last)))
@@ -221,7 +215,7 @@ def range_intervals(range_text, key=version_key):
             match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9A-Za-z.\-+]*)\s*$", comparator)
             if not match:
                 return None
-            operator, version = match.group(1) or "=", key(match.group(2))
+            operator, version = match.group(1) or "=", version_key(match.group(2))
             if version is None:
                 return None
             if operator in (">=", "="):
@@ -243,11 +237,10 @@ def overlap(first, second):
 
 
 def reaches(range_text, accepted):
-    """Whether a range covers any version inside the accepted intervals, which are ordered by the
-    accepted set's own `key`. A range that cannot be read in full counts as reaching, because the
-    safe mistake is a row too many."""
-    intervals = range_intervals(range_text, accepted["key"])
-    return intervals is None or any(overlap(each, other) for each in intervals for other in accepted["intervals"])
+    """Whether a range covers any version inside the accepted intervals. A range that cannot be read
+    in full counts as reaching, because the safe mistake is a row too many."""
+    intervals = range_intervals(range_text)
+    return intervals is None or any(overlap(each, other) for each in intervals for other in accepted)
 
 
 def finding(source, package, identifier, aliases, published, updated=None, ranges=(), needs_row=True,
@@ -271,9 +264,9 @@ def finding(source, package, identifier, aliases, published, updated=None, range
 def repository_advisories(api, token, repository, package, pinned, may_be_empty=False, accepted=None):
     """The security advisories of one repository. `pinned` is the version of what the package
     pins from it, or None where only the date decides. `accepted` is, for a package that pins no
-    version, the intervals of the versions its module accepts and the order it compares versions
-    in: an advisory revised since the register started whose ranges now reach one of them needs a
-    row, whenever it was first published. A repository that has published none is the one case of a source that may answer
+    version, the intervals of the versions its module accepts: an advisory revised since the
+    register started whose ranges now reach one of them needs a row, whenever it was first
+    published. A repository that has published none is the one case of a source that may answer
     with nothing."""
     source = "%s security advisories" % repository
     items = fetch_pages(
@@ -667,8 +660,10 @@ def pinned_versions(root):
     # fixed release of each series that an advisory against PowerShell itself lists to the next
     # series, and every series above the newest. A pre-release of a fixed release is refused. What
     # it accepts of PSReadLine, which it compares as a four-part version that has no pre-release,
-    # is the range it was qualified against: the pre-releases of the lower bound are in it and
-    # those of the upper bound are not.
+    # is the range it was qualified against, and in the order advisories use that is the span from
+    # below the pre-releases of the lower bound to below those of the upper bound: a pre-release
+    # of the lower bound reads as the bound, and one of the upper bound reads as the bound, which
+    # is refused.
     newest = max(host_floors) if host_floors else (0, 0)
     powershell = [
         (floor, series_start((series[0], series[1] + 1))) for series, floor in sorted(host_floors.items())
@@ -676,13 +671,10 @@ def pinned_versions(root):
     powershell.append((series_start((newest[0], newest[1] + 1)), None))
     qualified = manifest("psreadline")["qualified"]
     psreadline = [
-        (numeric_key(qualified["psreadline_from"]), numeric_key(qualified["psreadline_before"]))
+        (series_start(numbers(qualified["psreadline_from"])), series_start(numbers(qualified["psreadline_before"])))
     ]
     return {
-        "accepted": {
-            "powershell": {"intervals": powershell, "key": version_key},
-            "psreadline": {"intervals": psreadline, "key": numeric_key},
-        },
+        "accepted": {"powershell": powershell, "psreadline": psreadline},
         "fish": manifest("fish")["upstream"]["version"],
         "zsh": manifest("zsh")["upstream"]["version"],
         "bash": manifest("bash")["upstream"]["version"],
@@ -1126,6 +1118,7 @@ def run_self_test():
             (">= 7.6.8-rc.1, < 7.6.8", "2026-10-20T10:00:00Z", True, "a revised range of release candidates of an accepted release"),
             (">= 7.7.0-preview.5, < 7.7.0-rc.1", "2026-10-20T10:00:00Z", True, "a revised range of previews between two labels"),
             (">= 7.7, <= 7.7.0", "2026-10-20T10:00:00Z", True, "a revised range written with two numbers"),
+            ("> 7.7.0-preview, < 7.7.0-preview.2", "2026-10-20T10:00:00Z", True, "a revised range that excludes a label and includes the previews numbered after it"),
             (">= 7.6.0-rc.1, < 7.6.6-rc.1", "2026-10-20T10:00:00Z", False, "a revised range that ends before the first fixed release"),
         ):
             outcome = attempt(
@@ -1141,7 +1134,7 @@ def run_self_test():
         table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", ">= 2.3.5, < 2.3.7", "2026-10-20T10:00:00Z")([])).encode()
         outcome = attempt(table, now="2026-11-10")
         expect("a revised PSReadLine range inside the qualified one", says(outcome, "GHSA-old2-aaaa-bbbb", "no triage row"), str(outcome))
-        table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", "< 2.3.4", "2026-10-20T10:00:00Z")([])).encode()
+        table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", "<= 2.3.3", "2026-10-20T10:00:00Z")([])).encode()
         outcome = attempt(table, now="2026-11-10")
         expect("a revised PSReadLine range below it", not isinstance(outcome, SourceError) and not says(outcome, "GHSA-old2"), str(outcome))
         # The module compares PSReadLine as a four-part version that has no pre-release, so a
@@ -1150,6 +1143,7 @@ def run_self_test():
         for text, needs, name in (
             ("= 2.3.4-beta1", True, "a revised range of a pre-release of the lowest PSReadLine version"),
             ("= 3.0.0-beta1", False, "a revised range of a pre-release of the version the range stops before"),
+            (">= 2.3.5-beta1, < 2.3.5", True, "a revised range of previews that ends at a version the module accepts"),
         ):
             table[reader_route] = json.dumps(old_advisory("GHSA-old2-aaaa-bbbb", text, "2026-10-20T10:00:00Z")([])).encode()
             outcome = attempt(table, now="2026-11-10")
