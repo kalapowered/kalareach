@@ -14,12 +14,14 @@
 //! | KR-REQ-06.07 | the component was given the request's own bytes under the provenance the broker recorded them with, and the identifier the upstream gave |
 //! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words; a request that waits for its decode is not given to a component whose binding loses the trust to decode it meanwhile |
 //! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
+//! | KR-REQ-11.21 and KR-REQ-11.33 | the answer to an approval a component read is the bytes that component encoded, written to the upstream once; an approval the connector's table read is answered with the table's bytes, and no component is asked to encode it |
 
 #![cfg(unix)]
 
 mod plugin_world;
 
 use kr_protocol::broker::BrokerGrant;
+use kr_protocol::envelope::Outcome;
 use kr_protocol::gateway::{PendingResource, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_worker::broker::decoding::NotDecoded;
@@ -376,5 +378,90 @@ async fn kr_req_11_26_a_binding_has_a_share_of_the_decode_queue_and_a_request_pa
         world.reason(1).contains("1 request was not decoded"),
         "{}",
         world.reason(1)
+    );
+}
+
+/// The lines the upstream was written that answer request `id`.
+fn answers_to(world: &Observing, id: u64) -> Vec<String> {
+    let wanted = format!("\"id\":{id},\"result\"");
+    world
+        .written
+        .lock()
+        .expect("not poisoned")
+        .iter()
+        .filter(|line| line.contains(&wanted))
+        .cloned()
+        .collect()
+}
+
+/// KR-REQ-11.21 and KR-REQ-11.33: the answer to an approval a component read is the bytes that
+/// component encoded, and the upstream is written them once.
+///
+/// The component marks what it writes, so the case tells its bytes from the connector table's. It is
+/// asked once to decode and once to encode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_33_an_approval_a_component_read_is_answered_with_the_bytes_that_component_encoded()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.send(&request_noting(7, "!answer"));
+    let approval = approved(&world, "7").await;
+    let mut owner = world.owner().await;
+    let outcome = world
+        .respond(&mut owner, approval.resource_id, "allow")
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+
+    until_answered(&world, 7).await;
+    let answers = answers_to(&world, 7);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert!(
+        answers[0].contains(r#""via":"component""#),
+        "the upstream was written the table's answer and not the component's: {}",
+        answers[0]
+    );
+    let account = world.raw_account(1).await.expect("the component answers");
+    assert!(
+        account.starts_with("decode=1;encode=1;"),
+        "the component was asked once to decode and once to encode: {account}"
+    );
+}
+
+/// KR-REQ-11.21: an approval the connector's table read is answered with the table's bytes, and the
+/// plugin host is not asked to encode it, though another package's binding on the instance ships a
+/// component that could.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_21_an_approval_the_table_read_is_answered_with_the_tables_bytes_and_no_encode_is_made()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::interpreter(1),
+        Spec::decoder(2, "hostile-decoder").of_another_package(),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(2).await;
+    world.send(&request_noting(8, "!answer"));
+    let approval = approved(&world, "8").await;
+    let mut owner = world.owner().await;
+    let outcome = world
+        .respond(&mut owner, approval.resource_id, "allow")
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+
+    until_answered(&world, 8).await;
+    assert_eq!(
+        answers_to(&world, 8),
+        [r#"{"id":8,"result":{"outcome":"allow"}}"#]
+    );
+    let account = world.raw_account(2).await.expect("the component answers");
+    assert!(
+        account.starts_with("decode=0;encode=0;"),
+        "no component was asked about a request the table read: {account}"
     );
 }
