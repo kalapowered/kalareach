@@ -1302,9 +1302,12 @@ fn untouched_files(host: &Host) -> BTreeMap<PathBuf, Kept> {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // The delivery journal is written by the host's own delivery pass as it tells devices
+            // of a completed pairing, whenever that pass runs, so its files are not the group's.
             name == RECORD_FILE
                 || name.starts_with(&registry_name)
                 || name.starts_with(".machine-group.")
+                || name.starts_with("delivery.sqlite3")
         },
         &mut take,
     );

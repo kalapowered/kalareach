@@ -1942,7 +1942,9 @@ async fn kr_req_18_08_an_external_destination_is_told_only_under_its_rule_and_it
     )
     .await;
 
-    // Every destination was decided in the transaction that admitted the message above.
+    // Every destination was decided in the transaction that admitted the message above. The
+    // devices that paired are told of their pairing to the destinations configured by then, which
+    // is not what this case asks about, so only what the question produced is read.
     let records = controller
         .delivery()
         .with(|producer| Ok(producer.journal().deliveries().expect("a read")))
@@ -1950,7 +1952,9 @@ async fn kr_req_18_08_an_external_destination_is_told_only_under_its_rule_and_it
     let state_of = |id: &str| {
         records
             .iter()
-            .filter(|record| record.destination_id.as_str() == id)
+            .filter(|record| {
+                record.destination_id.as_str() == id && record.event.paired_device().is_none()
+            })
             .map(|record| record.state)
             .collect::<Vec<_>>()
     };
