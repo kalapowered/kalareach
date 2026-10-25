@@ -819,10 +819,12 @@ impl Default for Outstanding {
     }
 }
 
-/// How many answers that came after their operation was given up on are kept for it to claim, and
-/// how many claims wait for an answer that has not come: each is bounded on its own, per
-/// connection. Past it the oldest kept answer goes, and a claim is refused, which leaves an
-/// operation's receipt unknown, as it was.
+/// How many answers to this host's own requests are kept for an operation that was given up on to
+/// claim, and how many claims wait for an answer that has not come: each is bounded on its own,
+/// per connection. The answers kept include one an operation's own wait took, because that wait can
+/// end in the moment the answer comes. Past the bound the oldest kept answer goes, and a claim is
+/// refused, which leaves an operation's receipt unknown, as it was. A claim stays until its answer
+/// comes or the connection ends.
 pub const MAX_LATE_ANSWERS: usize = 16;
 
 /// The longest detail of an upstream's refusal that is kept with a late answer, in bytes.

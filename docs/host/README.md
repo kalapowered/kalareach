@@ -2506,7 +2506,10 @@ Semantic snapshots are held to section 8's three limits, which `kr_protocol::sem
 MiB across the parts, sixteen levels of depth and twenty thousand nodes. `agent.snapshot` reads an
 agent's retained history, a flat list of at most 4,096 entries, so its depth is one. An entry keeps
 at most 64 KiB of text, cut at a character boundary; what it left out is counted in the entry's
-`omitted_text_bytes`, so a cut text is not read as the whole of what was said. A part travels
+`omitted_text_bytes`, so a cut text is not read as the whole of what was said. Together with the
+4,096 entries that makes 256 MiB of text for one instance at the most, which no producer of entries
+reaches: a gateway frame records an identifier, and a bridge report is cut at 4,096 bytes first.
+A part travels
 in one control frame, so it is cut to what the reader's connection said it receives once the rest
 of the answer is in it, and an entry larger than that on its own is carried with its text cut,
 saying how many bytes it left out. The 16 MiB and the node count are spent by one snapshot's parts
@@ -7939,12 +7942,22 @@ that identifier comes later, the reply is correlation evidence: a result makes t
 and clears the failure of the wait, an error that says the frame was never a call the upstream could
 make (the reserved parse, request, method and parameter codes) makes it refused with that error,
 and any other error is recorded and settles nothing. The evidence is an observation with the
-upstream-correlation provenance, written in the same commit as the new state. It never moves a
-receipt that is not unknown, a second reply to one identifier is recorded once, and a connection
-that ended before the reply keeps nothing, so a reply that reaches a later connection under the
-same text of identifier is not read. A connection holds at most sixteen replies that came before
-their operation claimed them and sixteen operations waiting for a reply; past that the oldest reply
-goes and a further operation stays unknown, as it did before the reply was kept.
+upstream-correlation provenance, written in the same commit as the new state. The result the
+receipt then keeps is the one the operation has when its reply comes in time. It names the
+identifier the operation was sent under and the turn it was admitted against (a prompt learns its
+turn from its reply, which is not read late, so a late prompt names none), and the result of a
+package's action names the action as well. The evidence never moves a receipt that is not unknown,
+a second reply to one identifier is recorded once, and a connection that ended before the reply
+keeps nothing, so a reply that reaches a later connection under the same text of identifier is not
+read, and an operation that gives up after the connection ended claims nothing.
+
+Two limits keep the evidence bounded, and past either an operation stays unknown, as it did before
+the reply was kept. A connection keeps the sixteen newest replies that no operation has claimed,
+and that includes a reply an operation's wait took in time, since the wait can end in the moment
+the reply comes: sixteen later replies of any kind push an older one out before its operation
+claims it. A connection also holds at most sixteen claims, and a claim stays until its reply comes
+or the connection ends, so after sixteen operations that get no reply, the replies that come later
+on that connection settle nothing.
 
 A binding's actions are registered from its package's declarations and from nothing else. The
 grant, the effect, the capability, the operation and the rights of each follow from its declared

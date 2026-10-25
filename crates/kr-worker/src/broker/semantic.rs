@@ -55,6 +55,13 @@ pub const MAX_RETAINED_ENTRIES: usize = 4096;
 /// bytes it left out. Nothing that observes a conversation needs to keep more than this of one
 /// event, and the retained history is bounded in bytes by this and by [`MAX_RETAINED_ENTRIES`]
 /// together, whatever a producer offers.
+///
+/// The two bounds together are 256 MiB of text for one instance at the most. Every producer that
+/// records an entry keeps far less: a gateway frame records an identifier, and a bridge
+/// report is cut at 4,096 bytes before it gets here, so only a producer that offers an entry
+/// through [`Broker::observe`] can reach this one. It is the ceiling for such a producer, set so
+/// that an entry is long enough to be worth reading and a snapshot still carries several of them
+/// in a part.
 pub const MAX_ENTRY_TEXT_BYTES: usize = 64 * 1024;
 
 /// What one actor may see of an instance's history.
