@@ -236,8 +236,8 @@ fn a_name_the_person_defined_runs_as_defined_and_the_worker_is_never_asked_about
 /// KR-REQ-12.07
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
-fn a_handler_the_person_runs_after_the_search_is_asked_once_about_a_command_left_alone() {
-    shellpkg::a_handler_the_person_runs_after_the_search_is_asked_once_about_a_command_left_alone(
+fn a_handler_the_person_runs_after_the_search_is_asked_once_and_chooses_the_command() {
+    shellpkg::a_handler_the_person_runs_after_the_search_is_asked_once_and_chooses_the_command(
         PWSH,
     );
 }
@@ -546,24 +546,24 @@ fn said(output: &str, name: &str) -> String {
         .to_owned()
 }
 
-/// KR-REQ-12.07: when the hooks go, the handler the person had in front of the module's still runs
+/// KR-REQ-12.07: when the hooks go, the handler the person had before the module's still runs
 /// through a handler of the person's set after the module's.
 ///
 /// The later handler calls the module's, as the person's chain of handlers does, and the module's
-/// calls the one that stood in front of it. Taking the hooks off cannot put the earlier handler
-/// back, since the later one holds the engine, so the module's goes on calling it and does nothing
-/// of its own. Each lookup is counted by the earlier handler: once before the hooks go, and once
-/// after.
+/// calls the one that stood before it. Taking the hooks off cannot put the earlier handler back,
+/// since the later one holds the engine, so the module's goes on calling it and does nothing of its
+/// own. Each lookup is counted by the earlier handler: once before the hooks go, and once after.
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_handler_the_person_set_before_the_hooks_is_still_called_through_a_later_one_after_they_go() {
     let output = in_the_package_host(
-        r#"$global:KrEarlier = 0;
-           $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
+        r#"function kr-chain { };
+           $global:KrEarlier = 0;
+           $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
                param($n, $e) if ($n -eq 'kr-chain') { $global:KrEarlier++ } };
            & $module { Install-KrLookupHandler };
-           $kr_ours = $ExecutionContext.InvokeCommand.PreCommandLookupAction;
-           $ExecutionContext.InvokeCommand.PreCommandLookupAction = {
+           $kr_ours = $ExecutionContext.InvokeCommand.PostCommandLookupAction;
+           $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
                param($n, $e) $kr_ours.Invoke($n, $e) }.GetNewClosure();
            $null = $ExecutionContext.InvokeCommand.GetCommand('kr-chain', 'All');
            Write-Output "kr-key[before]=[$global:KrEarlier]";
@@ -575,7 +575,7 @@ fn a_handler_the_person_set_before_the_hooks_is_still_called_through_a_later_one
     assert_eq!(
         said(&output, "after"),
         "2",
-        "the handler that stood in front of the module's was dropped from the chain: {output}"
+        "the handler that stood before the module's was dropped from the chain: {output}"
     );
 }
 
