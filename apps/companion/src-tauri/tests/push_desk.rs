@@ -30,6 +30,7 @@ use companion_tauri::push::{
     AskFuture, ConnectionRegistrar, HostLine, LineFuture, LineStop, Native, PushDesk, PushFuture,
     PushState, PushView, Reach, Registrar, Wiring,
 };
+use futures_util::FutureExt as _;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::ServiceFuture;
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
@@ -3732,4 +3733,71 @@ async fn a_choice_let_go_says_so_when_the_record_cannot_be_written_back() {
         refused.message
     );
     assert!(phone.view().hosts[0].previews, "and the choice was let go");
+}
+
+/// KR-REQ-16.11: choices made together are made one after another. On, then an Off whose filing the
+/// receivers hold up and then refuse, then On and Off made while it waits, ends with the last choice
+/// the person made: the switch reads Off, the host's key is out of the receivers' hands, and the host
+/// is told Off. The choice let go puts back what it found, and the ones made after it began are not
+/// undone by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_let_go_does_not_undo_a_choice_made_after_it_began() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    assert!(phone.view().hosts[0].previews);
+    let next = phone
+        .receiver
+        .state
+        .lock()
+        .expect("the receiver")
+        .keys_asked
+        + 1;
+    phone.receiver.with(|state| {
+        state.keys_hold = Some(next);
+        state.keys_released = false;
+        state.keys_fail_next = 1;
+    });
+
+    // Each is polled once, in the order the person made them: the first reaches the receivers and
+    // waits there, and the others stop wherever the desk makes a later choice wait.
+    let mut first = Box::pin(phone.desk.set_previews(&reference, false));
+    let mut second = Box::pin(phone.desk.set_previews(&reference, true));
+    let mut third = Box::pin(phone.desk.set_previews(&reference, false));
+    assert!((&mut first).now_or_never().is_none());
+    assert_eq!(
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_asked,
+        next,
+        "the first choice is with the receivers"
+    );
+    assert!((&mut second).now_or_never().is_none());
+    assert!((&mut third).now_or_never().is_none());
+
+    // The receivers answer the first, by refusing it.
+    phone.receiver.with(|state| state.keys_released = true);
+    let (first, second, third) =
+        tokio::time::timeout(WATCHDOG, async { tokio::join!(first, second, third) })
+            .await
+            .expect("the choices end");
+
+    assert!(first.is_err(), "the first choice is not made");
+    second.expect("the second choice is made");
+    let last = third.expect("the third choice is made");
+    assert!(
+        !last.hosts[0].previews,
+        "the switch the page was last given reads the last choice"
+    );
+    assert!(!phone.view().hosts[0].previews, "and so does the record");
+    assert!(
+        held_keys(&phone).expect("keys").senders.is_empty(),
+        "the receivers hold no key of the host"
+    );
+    eventually("the host was told the last choice", || {
+        previews_asked(&phone).last() == Some(&false)
+    })
+    .await;
+    phone.until(|states| states == [PushState::On]).await;
 }
