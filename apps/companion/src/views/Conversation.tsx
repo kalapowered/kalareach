@@ -53,11 +53,13 @@ import {
   attachOffer,
   bindingStateOf,
   composerOffers,
+  drawnUnder,
   invocationOf,
   subjectOf,
   targetOf,
   withheldTotal,
-  type ComposerOffers
+  type ComposerOffers,
+  type DrawnUnder
 } from '../model/agent'
 import {
   applyNodes,
@@ -186,6 +188,23 @@ export function Conversation({
   )
   const position = useRef<Anchor | null>(null)
   const agent = state.agent
+  // The instance the composer speaks to, as its summary.
+  const live = useMemo(
+    () => agent.instances?.find((each) => each.application_instance_id === agent.instance) ?? null,
+    [agent.instances, agent.instance]
+  )
+  // The conversation each package node was drawn under, as this view knew it when the node arrived.
+  // A node that arrived before the agent was read takes the first conversation this view learns.
+  const currentlyUnder = useRef<DrawnUnder | null>(null)
+  const drawnAt = useRef(new Map<string, DrawnUnder | null>())
+  useEffect(() => {
+    const now = drawnUnder(live, agent.binding)
+    currentlyUnder.current = now
+    if (now === null) return
+    for (const [id, under] of drawnAt.current) {
+      if (under === null) drawnAt.current.set(id, now)
+    }
+  }, [live, agent.binding])
 
   // A package's presentation arrives as nodes on the host's event stream. One batch per animation
   // frame: forty in one tick are one render, and the composer keeps taking keystrokes meanwhile.
@@ -239,6 +258,7 @@ export function Conversation({
           // An event belongs to the stream it names. A view showing one session ignores another's
           // rather than folding it into what the person is looking at.
           if (body.kind === 'node' && body.node && eventIsFor(event.stream_id, sessionId)) {
+            drawnAt.current.set(body.node.id, currentlyUnder.current)
             batcher.push(body.node)
           }
           if (body.kind === 'receipt' && body.receipt) {
@@ -671,10 +691,15 @@ export function Conversation({
   )
 
   const invoke = useCallback(
-    (control: Control) => {
-      const instance =
-        agent.instances?.find((each) => each.application_instance_id === agent.instance) ?? null
-      const call = invocationOf(control, sessionId, instance, agent.binding)
+    (control: Control, nodeId: string, collects: boolean) => {
+      const call = invocationOf(
+        control,
+        sessionId,
+        live,
+        agent.binding,
+        drawnAt.current.get(nodeId),
+        collects
+      )
       if (call.kind === 'cannot') {
         say(call.because, 'danger')
         return
@@ -688,7 +713,7 @@ export function Conversation({
           say(failureMessage(error), 'danger')
         })
     },
-    [port, sessionId, agent.instances, agent.instance, agent.binding, say]
+    [port, sessionId, live, agent.binding, say]
   )
 
   /**
@@ -1036,7 +1061,7 @@ const Document = memo(function Document({
   readonly images: ReadonlyMap<string, string>
   readonly onOpenLink: (url: string) => void
   readonly onImportImage: (url: string) => void
-  readonly onInvoke: (control: Control) => void
+  readonly onInvoke: (control: Control, nodeId: string, collects: boolean) => void
 }): ReactNode {
   return (
     <>
@@ -1151,10 +1176,17 @@ const NodeView = memo(function NodeView({
   readonly images: ReadonlyMap<string, string>
   readonly onOpenLink: (url: string) => void
   readonly onImportImage: (url: string) => void
-  readonly onInvoke: (control: Control) => void
+  readonly onInvoke: (control: Control, nodeId: string, collects: boolean) => void
 }): ReactNode {
   const body = node.body as Record<string, unknown>
   const kind = readNodeKind(body)
+  // A control is called with the node it is in, which says the conversation it was drawn under.
+  const invokeHere = (control: Control) => {
+    onInvoke(control, node.id, false)
+  }
+  const submitHere = (control: Control) => {
+    onInvoke(control, node.id, collectsInput(body.fields))
+  }
 
   if (!isRendered(kind)) {
     // An unknown node renders as itself and invokes nothing. There is no branch here that could
@@ -1263,7 +1295,7 @@ const NodeView = memo(function NodeView({
           <div className="card-body">
             <FormFields fields={body.fields} />
             {submit ? (
-              <ControlButton control={submit} state={controlState} onInvoke={onInvoke} />
+              <ControlButton control={submit} state={controlState} onInvoke={submitHere} />
             ) : null}
           </div>
         </Card>
@@ -1292,7 +1324,7 @@ const NodeView = memo(function NodeView({
                 key={control.id}
                 control={control}
                 state={controlState}
-                onInvoke={onInvoke}
+                onInvoke={invokeHere}
               />
             ))}
           </div>
@@ -1311,13 +1343,21 @@ const NodeView = memo(function NodeView({
  * Standard components, nothing the package supplied as markup. A field whose type this client does
  * not draw is named and left blank rather than guessed at.
  */
-function FormFields({ fields }: { readonly fields: unknown }): ReactNode {
-  const entries =
-    typeof fields === 'object' &&
+function fieldsOf(fields: unknown): Record<string, unknown>[] {
+  return typeof fields === 'object' &&
     fields !== null &&
     Array.isArray((fields as { parameters?: unknown }).parameters)
-      ? ((fields as { parameters: unknown[] }).parameters as Record<string, unknown>[])
-      : []
+    ? ((fields as { parameters: unknown[] }).parameters as Record<string, unknown>[])
+    : []
+}
+
+/** Whether a form asks the person for anything: its submit control may leave optional ones out. */
+function collectsInput(fields: unknown): boolean {
+  return fieldsOf(fields).length > 0
+}
+
+function FormFields({ fields }: { readonly fields: unknown }): ReactNode {
+  const entries = fieldsOf(fields)
   if (entries.length === 0) return null
   return (
     <div data-testid="form-fields">
