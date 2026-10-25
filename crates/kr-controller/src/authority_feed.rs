@@ -967,21 +967,37 @@ async fn pass(
                     // this machine has dealt with what it names.
                     contiguous = false;
                     found.extend(&these);
-                    controller
-                        .note_unverified_withdrawal(&found)
-                        .await
-                        .map_err(Stopped::local)?;
+                    let (wait_owed, keys) =
+                        controller.refuse_for_an_unverified_withdrawal(&found).await;
+                    if let Err(error) = keys {
+                        // The refusal stands, and a later scan owes no wait for it.
+                        if wait_owed {
+                            controller.wait_for_the_confirmations_being_spent().await;
+                        }
+                        return Err(Stopped::local(error));
+                    }
                     shared.observed().unverified = true;
                     // The feed takes a removal from the keys it lists, so the keys of the devices
                     // this names are taken out of the list now, not when the scan has read the
-                    // feed through: a scan that stops half way leaves the list as it is. A change
-                    // the feed turns back stops the pass like any other request it turns back,
-                    // with the delay it asked for.
-                    if withhold_from_the_feed(shared, controller, &mut now).await?
-                        == Delegation::Removed
-                    {
-                        return removed(shared, controller).await;
+                    // feed through, and before the wait for the registry: a write that is held
+                    // keeps the wait from ending, and the list must not wait with it. A scan that
+                    // stops half way leaves the list as it is. A change the feed turns back stops
+                    // the pass like any other request it turns back, with the delay it asked for.
+                    let delegation = withhold_from_the_feed(shared, controller, &mut now).await;
+                    if matches!(delegation, Ok(Delegation::Removed)) {
+                        // The removal is recorded first: a registry that cannot take a write must
+                        // not keep it from being recorded and shown. The wait this raise owes
+                        // follows.
+                        let ended = removed(shared, controller).await;
+                        if wait_owed {
+                            controller.wait_for_the_confirmations_being_spent().await;
+                        }
+                        return ended;
                     }
+                    if wait_owed {
+                        controller.wait_for_the_confirmations_being_spent().await;
+                    }
+                    delegation?;
                 }
                 Settled::Waiting => {
                     contiguous = false;

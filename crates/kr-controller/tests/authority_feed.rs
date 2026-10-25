@@ -1959,6 +1959,91 @@ async fn the_doctor_says_that_a_refusal_waits_for_a_write_to_the_pairing_records
     );
 }
 
+/// KR-REQ-24.15: a withdrawal the host cannot verify takes the keys of the devices it names off the
+/// list the feed takes a removal from while a write to the pairing records is held, and not only
+/// once the write has ended: the wait of the refusal for the registry does not hold the shorter list
+/// back, because the keys are known before the refusal rises. The registry stands at the feed's
+/// revision, so the unverified refusal is the first that the pass raises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_the_host_cannot_verify_takes_its_keys_off_the_feeds_list_while_a_write_is_held()
+ {
+    let rig = Rig::start().await;
+    let named = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let spare = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let key = named.0.keys().authorisation.key_id();
+    assert!(
+        rig.feed_as_the_owner_sees_it()
+            .await
+            .summary
+            .removal_keys
+            .contains(&key),
+        "the control: the feed lists the key of the device the withdrawal will name"
+    );
+    let stranger = AuthorisationKeyPair::generate().expect("a key");
+    let withdrawal = rig.request_of(
+        &stranger,
+        DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x0f; 16])),
+        0xd1,
+        devices(named.1.device_id),
+    );
+    rig.published_as(&stranger, &withdrawal).await;
+    rig.an_earlier_run_carried_out(&withdrawal, 0, 1).await;
+    // The pass that the local revocation wakes is held at its read until the write is taken, so
+    // that the pass meets the withdrawal with the write held and not before. The registry reaches
+    // the feed's revision by that revocation, so the host is not behind its feed.
+    rig.served
+        .web()
+        .fail_with_member(AUTHORITY, "read", 1, Moment::Gate);
+    let reads = rig.arrivals("read");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    rig.revokes_at_the_machine(spare.1.device_id).await;
+    rig.until_arrivals("read", reads + 1).await;
+
+    let writer = rusqlite::Connection::open(rig.host.registry_database()).expect("the registry");
+    writer
+        .busy_timeout(Duration::from_secs(5))
+        .expect("the writer waits for a write that is under way");
+    writer
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the write lock is taken");
+    rig.served.web().release_held();
+    within(
+        "the feed lists no key of the device the withdrawal names",
+        async {
+            while rig
+                .feed_as_the_owner_sees_it()
+                .await
+                .summary
+                .removal_keys
+                .contains(&key)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        },
+    )
+    .await;
+    assert!(
+        rig.host.controller().policy().withdrawal_unverified(),
+        "the refusal stands meanwhile"
+    );
+    assert!(
+        *passes.borrow() <= seen,
+        "and the pass has not ended while the write is held"
+    );
+
+    writer.execute_batch("ROLLBACK").expect("the write ends");
+    within("the pass ends once the write has", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+}
+
 /// A change to the list of keys that may remove the feed, turned back with a delay, ends the pass:
 /// the host asks the feed for nothing more until the delay is over, as it does for any request the
 /// feed turns back with one.

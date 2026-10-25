@@ -917,15 +917,35 @@ impl Controller {
     }
 
     /// Records that the feed shows complete a withdrawal this host cannot verify, which names
-    /// what `found` holds, and refuses every remote grant from this moment. What a scan found so
-    /// far is added to what the host holds, so a device is not given its standing back while the
-    /// scan goes on to the request that names it.
+    /// what `found` holds, and refuses every remote grant from this moment, then waits for the
+    /// writes to the pairing records that were under way. What a scan found so far is added to what
+    /// the host holds, so a device is not given its standing back while the scan goes on to the
+    /// request that names it.
     ///
     /// # Errors
     ///
     /// Returns an error when the device directory cannot be read. The refusal is raised all the
     /// same.
     pub(crate) async fn note_unverified_withdrawal(&self, found: &Unverified) -> Result<()> {
+        let (wait_owed, keys) = self.refuse_for_an_unverified_withdrawal(found).await;
+        if wait_owed {
+            self.wait_for_the_confirmations_being_spent().await;
+        }
+        keys
+    }
+
+    /// As [`Self::note_unverified_withdrawal`], without the wait, for a caller that has more to do
+    /// before it waits: the keys of the devices the withdrawal names are known here, and the
+    /// caller sends the feed the shorter list before it waits for the registry.
+    ///
+    /// Returns whether a refusal rose, which owes the wait
+    /// ([`Self::wait_for_the_confirmations_being_spent`]), and whether the device directory could
+    /// be read for the keys. A caller that goes on to anything else waits all the same: a refusal
+    /// that already stands owes no wait to a later scan.
+    pub(crate) async fn refuse_for_an_unverified_withdrawal(
+        &self,
+        found: &Unverified,
+    ) -> (bool, Result<()>) {
         let keys = self.keys_of_the_named(found);
         {
             let mut held = self.feed_withheld();
@@ -942,14 +962,14 @@ impl Controller {
                 Err(_) => held.keys_unresolved = true,
             }
         }
-        self.move_a_feed_refusal(
-            RemoteRefusal::WITHDRAWAL_UNVERIFIED,
-            true,
-            crate::grants::HostPolicy::withdrawal_unverified,
-            crate::grants::HostPolicy::set_withdrawal_unverified,
-        )
-        .await;
-        keys.map(|_| ())
+        let wait_owed = self
+            .raise_a_feed_refusal(
+                RemoteRefusal::WITHDRAWAL_UNVERIFIED,
+                crate::grants::HostPolicy::withdrawal_unverified,
+                crate::grants::HostPolicy::set_withdrawal_unverified,
+            )
+            .await;
+        (wait_owed, keys.map(|_| ()))
     }
 
     /// Records what a scan that has read the feed through found of withdrawals this host cannot
@@ -1067,8 +1087,9 @@ impl Controller {
 
     /// Raises or lifts one of the two refusals the feed puts on every remote grant, and when it
     /// raises one, ends the links of the connections it reaches and waits for the writes to the
-    /// pairing records that were under way ([`Self::put_a_feed_refusal`]). The removal of the host
-    /// is raised without that wait ([`Self::refuse_the_grants_that_rest_on_the_feed`]).
+    /// pairing records that were under way ([`Self::raise_a_feed_refusal`] and
+    /// [`Self::wait_for_the_confirmations_being_spent`]). The removal of the host is raised
+    /// without that wait ([`Self::refuse_the_grants_that_rest_on_the_feed`]).
     ///
     /// The callers are the carrier's one pass at a time.
     async fn move_a_feed_refusal(
@@ -1078,10 +1099,28 @@ impl Controller {
         flag: fn(&crate::grants::HostPolicy) -> bool,
         set: fn(&mut crate::grants::HostPolicy, bool),
     ) {
-        if self.put_a_feed_refusal(bit, raised, flag, set).await && raised {
-            self.release_the_links_the_feed_refuses();
+        if !raised {
+            self.put_a_feed_refusal(bit, false, flag, set).await;
+        } else if self.raise_a_feed_refusal(bit, flag, set).await {
             self.wait_for_the_confirmations_being_spent().await;
         }
+    }
+
+    /// Raises one of the two refusals the feed puts on every remote grant and ends the links of the
+    /// connections it reaches, without the wait for the writes to the pairing records that were
+    /// under way. Says whether it raised the refusal, which owes that wait; a refusal that already
+    /// stood owes none.
+    async fn raise_a_feed_refusal(
+        &self,
+        bit: u8,
+        flag: fn(&crate::grants::HostPolicy) -> bool,
+        set: fn(&mut crate::grants::HostPolicy, bool),
+    ) -> bool {
+        let raised = self.put_a_feed_refusal(bit, true, flag, set).await;
+        if raised {
+            self.release_the_links_the_feed_refuses();
+        }
+        raised
     }
 
     /// Raises or lifts one of the refusals the feed puts on remote grants: the policy's
@@ -1150,7 +1189,7 @@ impl Controller {
     ///
     /// The only caller is the carrier's one pass at a time, so two waits do not overlap. The
     /// removal of the host does not wait, whether the carrier raises it or a start restores it.
-    async fn wait_for_the_confirmations_being_spent(&self) {
+    pub(crate) async fn wait_for_the_confirmations_being_spent(&self) {
         loop {
             let devices = Arc::clone(&self.devices);
             let mut ask = tokio::task::spawn_blocking(move || devices.write_lock_is_free());
