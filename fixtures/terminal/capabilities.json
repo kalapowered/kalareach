@@ -64,11 +64,11 @@
         },
         {
           "path": "console-legacy-input.json",
-          "sha256": "b13b5d529b53f52c4a4889b9e7870e825f60ccd63f60b02b355a90718391d3f2"
+          "sha256": "a431fd83f10d79a2b51c0eeb7e00516be21cd96802abb2d9c2d9c67402a47109"
         },
         {
           "path": "client-encodings.json",
-          "sha256": "5dfacf27ffd8475d378ed47470c455d26ca9ea10d0e8dbd90e7125d6f2c77ab6"
+          "sha256": "56b0da644660b3fd4ea70ae957af1aab374e241d24ca35fe1a035b039854f19a"
         }
       ],
       "name": "input-encodings",
