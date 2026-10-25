@@ -446,6 +446,15 @@ impl Instance {
         }
     }
 
+    /// Records one entry about this instance's own binding, under what it is observed under now.
+    ///
+    /// A history that has given every entry number it has takes no more: the entry is lost, and
+    /// the transition it describes is not.
+    fn note(&mut self, kind: &str, text: &str, now: TimestampMs) {
+        let under = self.observed_under();
+        let _ = self.semantic.append(kind, text, now, under);
+    }
+
     /// Returns what an entry is observed under when the application reported it about `thread`
     /// from a hook the kernel says started at `started`.
     ///
@@ -3966,6 +3975,11 @@ impl Broker {
         Ok(binding.actions.get(action).cloned())
     }
 
+        // A turn still running belonged to the owner the binding is leaving, so it is recorded as
+        // dropped under the revision it ran in, before that revision is left.
+        if let Some(turn) = instance.turn_id.clone() {
+            instance.note("turn.dropped", turn.as_str(), now);
+        }
     /// Mints the next gateway connection identifier.
     ///
     /// Downstream request identifiers are namespaced by it, so two connections that both start at
