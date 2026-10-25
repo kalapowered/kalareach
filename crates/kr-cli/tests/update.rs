@@ -14,7 +14,9 @@
 //! a test ends is handed over and stopped through its own door, and the tree ends every worker it
 //! started before it goes.
 
-#![cfg(unix)]
+// The cases that start no daemon of their own on Windows, and the helpers they leave unused there,
+// are Unix's: this file holds the platform half of the suite for both.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 mod stored_formats;
 mod support;
@@ -34,6 +36,7 @@ include!("support/update_harness.rs");
 /// workspace test run made has no list of its own to judge it by, and is used as it is: the box and
 /// core-ci build every program first, and a package-scoped run builds them by the command the
 /// refusal names.
+#[cfg(unix)]
 #[test]
 fn a_program_not_built_from_this_tree_is_refused() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -148,6 +151,7 @@ fn a_program_not_built_from_this_tree_is_refused() {
 
 /// KR-REQ-26.06: every program of a release that is being removed refuses to start, and the same
 /// programs start from the release's place in the store.
+#[cfg(unix)]
 #[test]
 fn no_program_of_a_release_being_removed_starts() {
     let host = Host::create();
@@ -207,6 +211,7 @@ fn no_program_of_a_release_being_removed_starts() {
 /// KR-REQ-26.06: a daemon of a release states it, records the roots it serves, holds its release,
 /// and starts its own release's worker, which states the release too; the release stays for as
 /// long as either runs.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_of_a_release_starts_its_own_release_s_worker_and_holds_the_release() {
     let mut host = Host::create();
@@ -242,6 +247,7 @@ async fn a_daemon_of_a_release_starts_its_own_release_s_worker_and_holds_the_rel
 
 /// A daemon of a release starts its own release's worker with its own release's packages, and
 /// takes no other: a session it launched with another would run what the store does not hold.
+#[cfg(unix)]
 #[test]
 fn a_daemon_of_a_release_takes_no_other_worker_and_no_other_packages() {
     let host = Host::create();
@@ -402,6 +408,7 @@ fn kr_host_install_refuses_a_release_that_lacks_a_program_a_host_runs() {
 /// KR-REQ-26.10: `kr host install` refuses a tree whose signed manifest lists no store, because the
 /// stores a release reads are what a host checks before it switches to the release, and the same
 /// release with its stores is installed into the same store.
+#[cfg(unix)]
 #[test]
 fn kr_host_install_refuses_a_release_that_lists_no_store() {
     let host = Host::bare();
@@ -627,6 +634,7 @@ async fn an_update_waits_for_a_session_its_release_does_not_retain() {
 /// reads the levels a release retains and never its table of public majors, so the local window is
 /// independent of the public table. That the local window outlasts a public window that ended is
 /// shown against a daemon that states a later major, in the upgrade suite.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_keeps_or_waits_for_a_session_by_the_levels_it_retains_whatever_its_table_lists()
 {
@@ -760,6 +768,7 @@ async fn an_update_keeps_or_waits_for_a_session_by_the_levels_it_retains_whateve
 /// release it makes current lists major 2; the `kr` of release two, which states major 2, rolls the
 /// host back and sees release one's daemon answer in the same way. Each daemon states the major its
 /// release names however it is started, and a client of the other major is refused by it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_goes_from_one_public_major_to_the_next_and_back() {
     let mut host = Host::bare();
@@ -904,6 +913,7 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
 /// KR-REQ-26.10: a transaction an earlier build began holds no root, and settles on the roots of its
 /// two releases that can be read, each on its own: the root file of the release left is damaged,
 /// and the second root the release switched to carries is still the root the host trusts.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_transaction_with_no_root_settles_on_the_release_roots_that_can_be_read() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -960,6 +970,7 @@ async fn a_transaction_with_no_root_settles_on_the_release_roots_that_can_be_rea
 /// KR-REQ-26.09: an update an earlier run left after its switch finds the environment held by a
 /// daemon of the release before it, which resumes and goes on answering as that release: the update
 /// says what it answered as, and then names the daemon with how to stop it, and keeps the update.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_left_after_its_switch_names_a_daemon_that_answers_as_the_release_before() {
     let mut host = Host::bare();
@@ -1005,6 +1016,7 @@ async fn an_update_left_after_its_switch_names_a_daemon_that_answers_as_the_rele
 /// KR-REQ-26.09: an update an earlier run left after its switch finds the environment held by a
 /// daemon that does not listen, one on its way out: it waits for that daemon to have gone, and then
 /// starts the daemon it recorded, where it used to wait for an answer that could not come.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
     let mut host = Host::bare();
@@ -1140,6 +1152,7 @@ async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_
 /// then updates the host. What ends this update, after the stop, is a registry that is not a regular
 /// file, which is refused and never opened: a pipe there would hold the update for as long as
 /// nothing wrote to it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_for_the_next_run() {
     let mut host = Host::bare();
@@ -1210,6 +1223,7 @@ async fn a_daemon_that_does_not_start_again_before_the_switch_keeps_the_update_f
 /// environment's daemon only once it has resumed, so no stop of that attempt still on its way can
 /// end it afterwards, however the daemon is prepared again meanwhile: the stop names the attempt it
 /// belongs to, finds it over, and is refused, and the daemon goes on serving.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_end_it() {
     let mut host = Host::bare();
@@ -1326,6 +1340,7 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
 /// A `resume` and a `stop` are taken all the same, and are not refused, since what they answer is not
 /// what a daemon is started from: a step that answers an error is a step that was not taken. A daemon
 /// that takes a stop ends, and may end before its answer is written.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_that_cannot_say_how_it_was_started_is_refused_before_its_gate_closes() {
     use kr_protocol::error::ErrorCode;
@@ -1718,6 +1733,7 @@ async fn a_daemon_that_refuses_to_stop_goes_on_serving_and_the_update_waits() {
 /// stopped, the update waits for the one it stopped to have gone before it starts it again: nothing
 /// is met on its way out, nobody is told to kill anything, the update exits 9, and both daemons
 /// serve.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_stop_leaves_every_daemon_serving_and_the_update_waits() {
     let mut host = Host::bare();
@@ -1832,6 +1848,7 @@ async fn a_refused_stop_leaves_every_daemon_serving_and_the_update_waits() {
 /// current is finished by the next install of the same release, and no daemon of the release
 /// starts meanwhile; another release under the same name is refused, and an install waits while
 /// another install or update of the store runs.
+#[cfg(unix)]
 #[test]
 fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
     let host = Host::create();
@@ -1915,6 +1932,7 @@ fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
 /// store, and puts the release in and makes it current under the install lock: while a daemon of
 /// the store is part way through its start, the install has made the directory a store and has
 /// published nothing, and it finishes once the daemon's start has.
+#[cfg(unix)]
 #[test]
 fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
     let host = Host::bare();
@@ -2156,6 +2174,7 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
 /// KR-REQ-26.09: a release kept in the store whose manifest is a link or a pipe is not trusted and
 /// not read: the install refuses by naming its directory and says what to do, and once the directory
 /// has been removed the install goes through.
+#[cfg(unix)]
 #[test]
 fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
@@ -2359,6 +2378,7 @@ fn write_zsh_package(shells: &Path) {
 /// A kr of an installed release writes a startup entry that sources the current release's entry
 /// through the store's `current`, which every update leaves in place; a kr outside a store sources
 /// the package's own file.
+#[cfg(unix)]
 #[test]
 fn a_store_s_startup_entry_sources_the_current_release_s_entry() {
     let host = Host::create();
@@ -2497,6 +2517,7 @@ fn trusted() -> kr_cli::update::release::ChannelRoot {
 
 /// KR-REQ-26.09: a manifest is taken only when a threshold of the keys the trusted root names for
 /// its targets role signed it, over exactly what it says.
+#[cfg(unix)]
 #[test]
 fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
     let root = trusted();
@@ -2531,6 +2552,7 @@ fn a_manifest_is_taken_only_as_the_root_s_targets_keys_signed_it() {
 
 /// A release carries the host's root or the one that follows it, signed by the host's root keys and
 /// its own; any other root is refused.
+#[cfg(unix)]
 #[test]
 fn a_channel_root_is_followed_only_by_its_successor() {
     let trusted = trusted();
@@ -2569,6 +2591,7 @@ fn a_channel_root_is_followed_only_by_its_successor() {
 /// KR-REQ-26.40: a channel root gives each of its roles a key of its own. One that names a key for
 /// two roles is not root metadata a host reads, whether a release carries it or the host kept it,
 /// and what the host says names that cause and, for a root it kept, the new store that replaces it.
+#[cfg(unix)]
 #[test]
 fn a_channel_root_that_gives_one_key_to_two_roles_is_not_trusted() {
     let carried = |text: String| {
@@ -2624,6 +2647,7 @@ fn a_channel_root_that_gives_one_key_to_two_roles_is_not_trusted() {
 
 /// KR-REQ-26.09: an archive is refused at its first entry that is not a file or a directory of the
 /// one release under one top directory, and an archive that is only files unpacks.
+#[cfg(unix)]
 #[test]
 fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
     let scratch = tempfile::tempdir().expect("a directory");
@@ -2770,6 +2794,7 @@ fn an_archive_is_refused_at_its_first_entry_that_is_not_a_release_file() {
 /// KR-REQ-26.09: a sparse entry, a file written with its holes left out, which the tar crate's
 /// builder writes of a file that has some on the systems that report holes, is refused, and said to
 /// be a sparse entry, not taken for a link or a device; a file with holes written whole is taken.
+#[cfg(unix)]
 #[test]
 fn a_sparse_entry_is_refused_as_one() {
     use std::os::unix::fs::{DirBuilderExt as _, FileExt as _};
@@ -2875,6 +2900,7 @@ fn a_sparse_entry_is_refused_as_one() {
 
 /// KR-REQ-26.09: what was written is checked against the manifest: every listed file with its
 /// length and digest, and nothing unlisted.
+#[cfg(unix)]
 #[test]
 fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
     let (manifest, files, _) = small_release(&keys().targets);
@@ -2917,6 +2943,7 @@ fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
 /// runs, whichever program that is, and says which; so does a manifest that lists the file as data,
 /// whose bytes are all there. The same release with the program is taken, so the one program is
 /// the whole of the refusal.
+#[cfg(unix)]
 #[test]
 fn an_update_refuses_a_release_that_lacks_a_program_a_host_runs() {
     let host = Host::bare();
@@ -2985,6 +3012,7 @@ fn an_update_refuses_a_release_that_lacks_a_program_a_host_runs() {
 /// than a host now runs, stays: its programs start, `kr host versions` reads its manifest, and an
 /// update from it to a release that carries every program is taken. Only a release being taken in
 /// is held to the list of programs.
+#[cfg(unix)]
 #[test]
 fn a_release_in_the_store_that_lacks_a_program_is_kept_and_updated_from() {
     let host = Host::create();
@@ -3355,6 +3383,7 @@ async fn host_to_update() -> (Host, Assembled, Assembled, String) {
 /// release reads; the update, with every daemon stopped and every environment's lock held, brings
 /// it forward through the registry's own migration before it classes it, says so, and the rows it
 /// held are the rows it holds: nothing is left beside the file.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_carries_an_environment_whose_daemon_did_not_run_forward() {
     let (host, one, two, archive) = host_to_update().await;
@@ -3409,6 +3438,7 @@ async fn an_update_carries_an_environment_whose_daemon_did_not_run_forward() {
 /// steps behind comes through the step that removes the environment its creators sent from the
 /// recorded create requests as a daemon's start would take it, and the old bytes are gone from the
 /// file and from its log, and the request is what it was, with no environment.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_carry_takes_an_idle_registry_through_the_step_that_removes_recorded_environments() {
     let (host, _one, _two, archive) = host_to_update().await;
@@ -3465,6 +3495,7 @@ async fn the_carry_takes_an_idle_registry_through_the_step_that_removes_recorded
 /// its log in while another connection reads the registry: the update exits 1 with the registry at
 /// the version before that step, its requests already rewritten, nothing switched and the daemon it
 /// stopped serving; once the reader is gone, the next update carries from that version.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_that_cannot_finish_holds_the_update_and_the_next_run_goes_on_from_it() {
     let (host, one, two, archive) = host_to_update().await;
@@ -3522,6 +3553,7 @@ async fn a_step_that_cannot_finish_holds_the_update_and_the_next_run_goes_on_fro
 
 /// The control of the above: every environment ran, so every registry is at the schema this build
 /// reads, the update finishes, and it carries nothing.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_across_environments_that_all_ran_carries_nothing() {
     let (host, _one, two, archive) = host_to_update().await;
@@ -3560,6 +3592,7 @@ async fn an_update_across_environments_that_all_ran_carries_nothing() {
 
 /// KR-REQ-26.09: a check changes nothing, and so does not carry: an idle registry two steps behind
 /// is as it was after it, byte for byte and with nothing made beside it, and the check names none.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_check_leaves_an_idle_registry_as_it_was() {
     let (host, _one, _two, archive) = host_to_update().await;
@@ -3597,6 +3630,7 @@ async fn a_check_leaves_an_idle_registry_as_it_was() {
 /// carry happens and the registry is then classed and holds the update, exit 9, with nothing switched
 /// and the daemon the update stopped serving again. A recorded environment whose state is gone is
 /// named in that message too.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_that_waits_after_a_carry_says_what_it_carried_and_leaves_it_so() {
     let (host, one, _two, archive) = host_to_update().await;
@@ -3650,6 +3684,7 @@ async fn an_update_that_waits_after_a_carry_says_what_it_carried_and_leaves_it_s
 /// said. Labelled version 3 with every column of this build, its first step adds a column that is
 /// already there: the step fails whole, the registry stays at version 3 for the release that is
 /// current to continue from, nothing is switched, and the daemon the update stopped serves again.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registry_that_cannot_be_carried_holds_the_update_and_says_where_it_is() {
     let (host, one, _two, archive) = host_to_update().await;
@@ -3687,6 +3722,7 @@ async fn a_registry_that_cannot_be_carried_holds_the_update_and_says_where_it_is
 /// KR-REQ-24.30: the migration never makes a table again that a registry lost, which would read as
 /// a registry that recorded no worker: a registry two steps behind with no `reservations` table
 /// holds the update, names the table, and is left as it was.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registry_that_lost_a_table_is_not_carried_and_holds_the_update() {
     let (host, one, _two, archive) = host_to_update().await;
@@ -3724,6 +3760,7 @@ async fn a_registry_that_lost_a_table_is_not_carried_and_holds_the_update() {
 
 /// The control of the two above, for a registry of a later schema than this release reads: it is
 /// not carried back, and the update holds as it did.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registry_of_a_later_schema_holds_the_update_and_is_left() {
     let (host, one, _two, archive) = host_to_update().await;
@@ -3754,6 +3791,7 @@ async fn a_registry_of_a_later_schema_holds_the_update_and_is_left() {
 /// a state root that is a file where a directory was, or one that was removed, is named in the
 /// outcome, and every other environment goes ahead: the daemon the host's own environment has is
 /// handed over and started again from the new release.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_environment_that_cannot_be_reached_is_named_and_the_others_go_ahead() {
     let (host, _one, two, archive) = host_to_update().await;
@@ -3802,6 +3840,7 @@ async fn an_environment_that_cannot_be_reached_is_named_and_the_others_go_ahead(
 
 /// The control of the above: an identity that is there and cannot be trusted, a link, is not a
 /// reason to go on without the environment: the update stops before it stops anything.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_identity_that_is_there_and_not_trusted_still_stops_the_update() {
     let (host, one, _two, archive) = host_to_update().await;
@@ -4011,6 +4050,7 @@ async fn a_rollback_goes_back_to_the_release_before_and_moves_no_live_session() 
 /// a schema before this release's has a registry the older release can read as it is, and a rollback
 /// that migrated it to this release's schema would put it beyond that release. It is left as the file
 /// it was, with nothing made beside it, and the rollback says it carried nothing.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_a_registry_behind_this_release_s_schema_as_it_is() {
     let (host, one, two, archive) = host_to_update().await;
@@ -4049,6 +4089,7 @@ async fn a_rollback_leaves_a_registry_behind_this_release_s_schema_as_it_is() {
 /// KR-REQ-26.10: a rollback classes the records of a registry that is behind this release's schema
 /// all the same, from a copy it brings forward: a worker the registry names that does not answer and
 /// has not ended holds the rollback, as it holds an update, and the registry is left as it was.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_classes_a_registry_behind_this_release_s_schema_without_changing_it() {
     let (host, one, two, archive) = host_to_update().await;
@@ -4173,6 +4214,7 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
 /// version the older release does not read: the document this build writes is at version 3, and a release
 /// that reads versions 1 to 2 cannot take it. Nothing is switched, and the document is left as it was; a
 /// document at the older release's own version is no obstacle.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read() {
     let mut host = Host::bare();
@@ -4264,6 +4306,7 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
 /// KR-REQ-26.10: an update is held to the same rule, forward: a release that reads a version of the
 /// registry above the one a host's registry is at, and one that migrates from a version above it,
 /// are both refused naming the store, with nothing switched.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_is_refused_naming_a_store_the_new_release_cannot_read() {
     let (host, one, _two, _archive) = host_to_update().await;
@@ -4311,6 +4354,7 @@ async fn an_update_is_refused_naming_a_store_the_new_release_cannot_read() {
 /// this build does not know cannot be checked against, so the switch is refused naming the store
 /// before anything is surveyed or stopped: no update is recorded as begun and the daemon keeps
 /// serving.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before_anything_stops() {
     let (mut host, one, _two, _archive) = host_to_update().await;
@@ -4384,6 +4428,7 @@ async fn a_store_listed_in_a_way_this_kr_does_not_know_refuses_the_switch_before
 /// and so is a store whose version cannot be read: an environment whose transfer journal is at
 /// version 1 against a release that migrates from 2, and one whose record of enrolments is not
 /// JSON. The control, in the same environment, is the store that is in range, which is not named.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
     let (host, one, _two, _archive) = host_to_update().await;
@@ -4459,6 +4504,7 @@ async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
 /// does not retain does not start, and says which level. A manifest that names the levels the
 /// binary retains starts, and so does one that names fewer of them: that only holds more updates
 /// back.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_whose_manifest_names_a_level_it_does_not_retain_does_not_start() {
     let another = if PACKAGE_VERSION.major == 0 {
@@ -4586,6 +4632,7 @@ async fn a_rollback_waits_for_a_session_the_older_release_does_not_retain() {
 /// KR-REQ-26.10: a rollback needs a release to go back to, and it is refused, usage, when there is
 /// none recorded, when the one named is not in the store, when it is not older than the current
 /// release, and when it is the current release.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_needs_an_older_release_in_the_store() {
     let (host, one, two, archive) = host_to_update().await;
@@ -4631,6 +4678,7 @@ async fn a_rollback_needs_an_older_release_in_the_store() {
 /// root is the first, still trusts the second: an archive signed with the retired key is refused
 /// and one signed with the new key is taken. The archive release two came in, which only the retired
 /// key signed, is refused too.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
     let mut host = Host::bare();
@@ -4852,6 +4900,7 @@ async fn a_rollback_does_not_bring_back_a_key_the_channel_retired() {
 /// leaves holds the second root, and the root file of release two is gone when the next run settles
 /// it. A rollback then goes on, and the host still trusts the second root: going back did not give
 /// up the trust the switch earned, and the key the second root retired stays retired.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_switch_left_after_it_happened_settles_on_the_root_decided_before_it() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -4918,6 +4967,7 @@ async fn a_switch_left_after_it_happened_settles_on_the_root_decided_before_it()
 /// host trusts and is another document is refused: the host trusts neither, nothing is switched or
 /// recorded, and the root it recorded stays what it was. The control, in the same store, is the
 /// rollback to a release whose root is the first, which goes back.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_to_a_release_with_another_root_of_the_trusted_version_is_refused() {
     let mut host = Host::bare();
@@ -4995,6 +5045,7 @@ async fn a_rollback_to_a_release_with_another_root_of_the_trusted_version_is_ref
 /// daemon's stamping of its format does, and an environment that has no state directory yet has
 /// nothing to clear and needs none held: with the preference held by another change the command is
 /// refused and leaves the file; once it is let go the command clears it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn kr_host_terminal_clear_holds_the_preference_and_needs_no_directory_that_is_not_there() {
     use kr_shell_integration::host::terminal::{
@@ -5051,6 +5102,7 @@ async fn kr_host_terminal_clear_holds_the_preference_and_needs_no_directory_that
 /// A named pipe left at the saved terminal preference's name does not hold `kr host terminal`: the
 /// preference is read as a regular file only, and a pipe reads as no preference. A program that read
 /// it would wait for a writer for ever.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pipe_where_the_saved_terminal_preference_belongs_does_not_hold_kr() {
     let mut host = Host::bare();
@@ -5105,6 +5157,7 @@ fn starts_in(log: &Path) -> usize {
 /// start, which is the case a rollback exists for: it does not start the daemon of the release that
 /// failed again, it goes to the release the update began from and starts the daemon from there, and
 /// a registry the failed release never opened is not brought forward on the way.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_rescues_an_update_whose_daemon_did_not_start() {
     let mut host = Host::bare();
@@ -5167,6 +5220,7 @@ async fn a_rollback_rescues_an_update_whose_daemon_did_not_start() {
 /// KR-REQ-26.10: a rescue is held to the same rule as any switch: a store the older release cannot read
 /// as it is refuses it, naming the store, and the failed update stays recorded for an update to a
 /// release that fixes it, or for the rescue once the store has been put right.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_the_older_release_cannot_read_the_stores_for_is_refused_and_the_failed_update_stays()
  {
@@ -5245,6 +5299,7 @@ async fn a_rescue_the_older_release_cannot_read_the_stores_for_is_refused_and_th
 /// KR-REQ-26.10: an update goes on past a failed one, so that a person whose update left a daemon
 /// that does not start can update to a release that fixes it: the daemon is started from the new
 /// release, the release that failed is the previous one, and nothing is left recorded.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_goes_on_past_a_failed_one() {
     let mut host = Host::bare();
@@ -5301,6 +5356,7 @@ async fn an_update_goes_on_past_a_failed_one() {
 /// failed which holds its environment and answers nothing: the archive is staged and checked before
 /// any daemon is started, so the run names the process, starts nothing, and once the person has
 /// stopped it the same update goes on.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_failed() {
     let mut host = Host::bare();
@@ -5368,6 +5424,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
 /// release before the current one, and starts none of the daemons that failed: each was tried once by
 /// its own update, and the last once more by an archive of the release now current, which names that
 /// release too.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_that_ran() {
     let mut host = Host::bare();
@@ -5452,6 +5509,7 @@ async fn a_rollback_after_three_failed_updates_goes_back_to_the_last_release_tha
 /// KR-REQ-26.10: a failed update does not name a release a rollback would refuse. A rollback to
 /// release two whose daemon did not start, and then an update to release three that fails, leave a
 /// rollback without `--to` nowhere to go: the release it would take, four, is newer than three.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_update_does_not_name_a_release_a_rollback_would_refuse() {
     let mut host = Host::bare();
@@ -5503,6 +5561,7 @@ async fn a_failed_update_does_not_name_a_release_a_rollback_would_refuse() {
 /// that goes on past a chain does not change which that is. The update from one to two fails, a rollback
 /// to one fails, and the update to three switches and fails: the failure names one, which ran, and
 /// not two, whose daemon never did, and a rollback without `--to` goes there.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_after_a_chain_leaves_the_release_that_ran_as_the_one_to_go_back_to() {
     let mut host = Host::bare();
@@ -5562,6 +5621,7 @@ async fn an_update_after_a_chain_leaves_the_release_that_ran_as_the_one_to_go_ba
 /// was, with the release it began from to go back to. The updates to two and to three both fail to start a
 /// daemon; an update to four that the stores refuse after it has recorded itself ends without a switch; and a
 /// rollback without `--to` then goes to one, which ran, and not to two, whose daemon never did.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_that_stops_before_its_switch_leaves_the_start_of_the_chain_to_go_back_to() {
     let mut host = Host::bare();
@@ -5622,6 +5682,7 @@ async fn an_update_that_stops_before_its_switch_leaves_the_start_of_the_chain_to
 /// and an update from one to three both fail to start a daemon; an update to four that the stores
 /// refuse leaves them recorded; and a rollback without `--to` then goes to one, which ran, and not to
 /// three, which is already current.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chain_that_comes_back_to_its_start_still_goes_back_to_the_release_that_ran() {
     let mut host = Host::bare();
@@ -5689,6 +5750,7 @@ async fn a_chain_that_comes_back_to_its_start_still_goes_back_to_the_release_tha
 /// KR-REQ-26.10: a rollback goes on past a rescue whose own daemon did not start, to an older release,
 /// without starting the daemon of the release it leaves: the rescue is a switch that happened whose
 /// daemon is owed, like any other.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_goes_on_past_a_rescue_whose_own_daemon_did_not_start() {
     let mut host = Host::bare();
@@ -5751,6 +5813,7 @@ async fn a_rollback_goes_on_past_a_rescue_whose_own_daemon_did_not_start() {
 /// KR-REQ-26.10: an update that failed in one of two environments is rescued in both: the daemon
 /// that runs is handed over, as an update hands one over, and the one that does not is started from the
 /// older release, from what the failed update recorded of it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
     let mut host = Host::bare();
@@ -5847,6 +5910,7 @@ async fn a_failed_update_in_one_of_two_environments_is_rescued_in_both() {
 /// leaves the failed update recorded and nothing switched. The next rescue, once the stores are right,
 /// goes back to the older release and starts both daemons from it, while the daemon of the release
 /// that failed stays unable to start.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_whose_undo_cannot_start_the_daemon_again_is_finished_by_the_next_rescue() {
     let mut host = Host::bare();
@@ -5943,6 +6007,7 @@ async fn a_rescue_whose_undo_cannot_start_the_daemon_again_is_finished_by_the_ne
 /// KR-REQ-26.10: an update that goes on past a failed one and fails in its turn leaves both owing, as
 /// one record, and an update after them starts the daemon each owed from the release that fixes them:
 /// a chain of failed updates is never more than the daemons owed and the root that was recorded.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_goes_on_past_two_failed_ones() {
     let mut host = Host::bare();
@@ -6003,6 +6068,7 @@ async fn an_update_goes_on_past_two_failed_ones() {
 
 /// KR-REQ-26.10: a rescue that stopped after its switch is finished by the next run, which starts the
 /// daemons it and the update it went on past owed, from the older release, and settles it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_that_stopped_after_its_switch_is_finished_by_the_next_run() {
     let host = Host::bare();
@@ -6057,6 +6123,7 @@ async fn a_rescue_that_stopped_after_its_switch_is_finished_by_the_next_run() {
 /// rollback goes back to the release that update began from, which is not the release before it, and
 /// the daemon is started from there; of an environment both the rescue and that update recorded, the
 /// rescue's record, which is the newer, is the one that is started.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_that_stopped_before_its_switch_is_the_failed_update_again() {
     let host = Host::bare();
@@ -6105,6 +6172,7 @@ async fn a_rescue_that_stopped_before_its_switch_is_the_failed_update_again() {
 /// KR-REQ-26.10: the root a failed update recorded is kept by the rescue that goes back past it, even
 /// when the root file of the failed release is gone: the host never trusts an older root than the one
 /// it recorded.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_keeps_the_root_the_failed_update_recorded() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -6163,6 +6231,7 @@ async fn a_rescue_keeps_the_root_the_failed_update_recorded() {
 /// KR-REQ-26.10: a rescue the stores refuse starts again the daemon it stopped and leaves the failed
 /// update owing it as the rescue recorded it, which is the newer record of that daemon, and owing the
 /// daemon that did not run as the failed update recorded it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_the_stores_refuse_leaves_the_failed_update_owing_the_daemon_as_it_now_is() {
     let host = Host::bare();
@@ -6266,6 +6335,7 @@ async fn a_rescue_the_stores_refuse_leaves_the_failed_update_owing_the_daemon_as
 /// KR-REQ-26.10: the root a failed update recorded is held to the same rule as any root: a rescue to a
 /// release that carries another document of the version that update was to trust is refused, and the
 /// failed update stays recorded.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_to_a_release_with_another_root_of_the_version_the_failed_update_recorded_is_refused()
  {
@@ -6345,6 +6415,7 @@ async fn a_rescue_to_a_release_with_another_root_of_the_version_the_failed_updat
 /// release that failed: a daemon of it that holds the environment and answers nothing is the person's
 /// to stop, as every daemon the updater did not stop is, and once it is stopped the same command goes
 /// back.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_nothing() {
     let mut host = Host::bare();
@@ -6415,6 +6486,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
 /// update whose daemon did not start, is checked by the rescue where it read it: the failed update
 /// recorded the directory when the daemon made way, and nothing runs to say it now.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rescue_checks_the_document_the_abandoned_daemon_read() {
     let (host, one, document) =
@@ -6505,6 +6577,7 @@ fn variable_of(
 /// variables that decide its paths that the daemon it replaces had, and none that the command which
 /// starts it has and the daemon did not: it keeps what it keeps where its predecessor did. What it
 /// states of itself is what it has, so this asks the restarted daemon and compares.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_started_again_has_the_variables_that_decide_its_paths_the_one_before_had() {
     let mut host = Host::bare();
@@ -6632,6 +6705,7 @@ async fn a_daemon_started_again_has_the_variables_that_decide_its_paths_the_one_
 /// KR-REQ-26.10: a daemon that cannot say which values of the variables that decide its paths it
 /// has, because one is not text, is not prepared to make way: it cannot be started again like itself.
 /// Its gate is not closed by the attempt.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_with_a_path_variable_that_is_not_text_is_not_prepared() {
     use std::os::unix::ffi::OsStrExt as _;
@@ -6723,6 +6797,7 @@ async fn a_daemon_that_finds_its_document_under_its_own_configuration_home()
 /// daemon started later from there would read is not passed over because the daemon in front of
 /// the update read another.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_a_daemon_reads_under_its_own_configuration_home_is_checked() {
     let (host, one, document) =
@@ -6795,6 +6870,7 @@ async fn a_document_a_daemon_reads_under_its_own_configuration_home_is_checked()
 /// its own, is put at a version the release switched to cannot read; the update names it. With the
 /// document in range, the control, the update goes ahead.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_a_stopped_daemon_read_under_its_own_configuration_home_is_checked() {
     let (mut host, one, document) =
@@ -6842,6 +6918,7 @@ async fn a_document_a_stopped_daemon_read_under_its_own_configuration_home_is_ch
 /// and finds no service definition, and the daemon in front of the update was started by hand and reads
 /// a document of its own that chooses nothing, so it is started again as it was.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_is_started_again_as_its_own_document_chose() {
     let (host, _one, document) =
@@ -6950,6 +7027,7 @@ async fn waited_for_a_daemon_of(tree: &teardown::Tree) {
 /// that is current when it starts, in an update and in a rollback: the daemon that answers afterwards is
 /// the process the manager runs the unit as, and not one `kr` started beside it.
 #[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_the_service_manager_started_is_started_again_by_it() {
     let host = Host::bare();
@@ -7266,6 +7344,7 @@ impl Writing {
 /// and then writes. The writers' lock is held exclusively, as an update holds it between its check of
 /// the stores and its switch; the command says it waits, writes nothing while the lock is held, and
 /// writes once it is let go.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_waits_for_an_update_and_then_writes() {
     let host = Host::bare();
@@ -7292,6 +7371,7 @@ async fn a_command_waits_for_an_update_and_then_writes() {
 /// KR-REQ-26.10: a command that has waited for an update's switch for longer than the bound is
 /// refused with the code for an update that waits, exit 9, and writes nothing; the same command
 /// succeeds once the lock is let go.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_is_refused_while_an_update_holds_the_lock_past_the_bound() {
     let host = Host::bare();
@@ -7323,6 +7403,7 @@ async fn a_command_is_refused_while_an_update_holds_the_lock_past_the_bound() {
 /// lists for it. A current release that lists the configuration document at a version this `kr` does
 /// not write refuses the command, naming both versions, and the document is not written; a current
 /// release that lists no such store does not.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_refuses_to_write_a_version_current_does_not_write() {
     let host = Host::bare();
@@ -7365,6 +7446,7 @@ async fn a_command_refuses_to_write_a_version_current_does_not_write() {
 /// KR-REQ-26.10, KR-REQ-24.30: the service start's record is written only at the version the current
 /// release lists. Where it lists the record at another, `kr host startup --set service` is refused
 /// before anything is changed: no record, no document, and nothing the service manager would take.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_service_start_is_refused_a_record_version_current_does_not_write() {
     let host = Host::bare();
@@ -7413,6 +7495,7 @@ async fn the_service_start_is_refused_a_record_version_current_does_not_write() 
 /// KR-REQ-26.10: a command that cannot use the writers' lock writes nothing, and says why; and a
 /// current release whose manifest this build cannot read refuses the command of another release's
 /// `kr`, which says to run the current release's.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_cannot_use_the_lock_or_read_current_writes_nothing() {
     let host = Host::bare();
@@ -7500,6 +7583,7 @@ async fn a_command_that_cannot_use_the_lock_or_read_current_writes_nothing() {
 /// With a directory where the lock file belongs the update, after it has stopped the daemon, ends
 /// with exit 1 and starts the daemon again from the release still current, and the next update
 /// goes through once the directory is gone.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_whose_writers_lock_cannot_be_used_stops_nothing_for_good() {
     let (host, one, two, archive) = host_to_update().await;
@@ -7543,6 +7627,7 @@ async fn an_update_whose_writers_lock_cannot_be_used_stops_nothing_for_good() {
 /// switch made current. The release switched to reads the configuration document at version 1 only,
 /// this `kr` writes version 3, and the command that was waiting is refused: the document is never at
 /// a version the release switched to cannot read.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_waited_through_a_switch_is_judged_by_the_release_switched_to() {
     let host = Host::bare();
@@ -7574,6 +7659,7 @@ async fn a_command_that_waited_through_a_switch_is_judged_by_the_release_switche
 /// `current` names. Where it lists the record at another version than this `kr` writes, the command
 /// is refused naming the record, with nothing written; where it lists no such record the command is
 /// not stopped by that.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_does_not_write() {
     for (store, arguments) in [
@@ -7639,6 +7725,7 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
 /// the switch, which is a condition of the test and not a time. A command started then says it waits;
 /// the rollback is let go on, switches, and the command is refused: the document was never at version
 /// 3 while the rollback was under way. The pause points exist in a debug build only.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_tries_while_a_real_rollback_holds_the_locks_waits_and_is_refused() {
     if !cfg!(debug_assertions) {
@@ -7704,6 +7791,7 @@ async fn a_command_that_tries_while_a_real_rollback_holds_the_locks_waits_and_is
 /// A command holds it, shared, past the update's bound: the update exits 9 with every daemon it
 /// stopped started again from the release still current, and the next update goes through once the
 /// lock is let go.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_that_cannot_take_the_writers_lock_stops_nothing_for_good() {
     let (host, one, two, archive) = host_to_update().await;
@@ -7871,6 +7959,7 @@ impl Host {
 /// no new session, whatever execution context the request names, and says the document and how to
 /// put it right; a session it already serves is untouched, and a document put right lifts all of it
 /// at the next create. The control is a document it reads.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_again_when_it_is_rewritten()
  {
@@ -7978,6 +8067,7 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
 /// KR-REQ-26.13: a create the daemon already answered is answered again when the document breaks
 /// afterwards, and a new one is refused: a repeated token is a retry of an action that has an
 /// outcome, whatever the host's conditions are now.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_repeated_after_the_document_breaks_is_answered_and_a_new_one_is_refused() {
     let mut host = Host::bare();
@@ -8055,6 +8145,7 @@ async fn a_create_repeated_after_the_document_breaks_is_answered_and_a_new_one_i
 /// document before it reads what the session is started with, so the variable the owner added is
 /// the session's. A direct create is how an app or a paired device creates; `kr new` asks the host
 /// first and would not show it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_create_made_right_after_the_document_is_put_right_takes_what_it_now_says() {
     let mut host = Host::bare();
@@ -8124,6 +8215,7 @@ async fn a_create_made_right_after_the_document_is_put_right_takes_what_it_now_s
 
 /// KR-REQ-26.13: with no daemon running, `kr new` over a document that cannot be used names the
 /// document's way out, not "start the control daemon".
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn kr_new_with_no_daemon_over_an_unusable_document_names_the_way_out() {
     let host = Host::bare();
@@ -8193,6 +8285,7 @@ impl Host {
 /// the store recorded is found by the check, and the switch is refused while the document is out of
 /// range. The command registered the root and the document before it wrote; the control is the same
 /// rollback once the document is gone.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_writes_in_a_root_no_daemon_recorded_is_found_by_the_check() {
     let host = Host::bare();
@@ -8246,6 +8339,7 @@ async fn a_command_that_writes_in_a_root_no_daemon_recorded_is_found_by_the_chec
 /// KR-REQ-26.10: a command that writes a state-root record, here the startup entries `kr shell
 /// install` records, in a root no control daemon of the store served has it found by the check: the
 /// command registered the root before it wrote.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_writes_a_state_root_record_in_a_root_no_daemon_recorded_is_found() {
     let host = Host::create();
@@ -8303,6 +8397,7 @@ async fn a_command_that_writes_a_state_root_record_in_a_root_no_daemon_recorded_
 /// not the root can be listed, and is named, with the switch going ahead, when it cannot be
 /// searched. The records of a root are opened by name, so a root a person can search but not list
 /// still has its records checked.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registered_root_is_looked_at_when_it_can_be_searched_and_named_when_it_cannot() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8376,6 +8471,7 @@ async fn a_registered_root_is_looked_at_when_it_can_be_searched_and_named_when_i
 /// KR-REQ-26.10: a command that registers before an update takes the install lock is found by the
 /// update's survey under it. The rollback is held by the test at the step before the lock; the
 /// command runs to its end meanwhile; the rollback then finds the root and refuses.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_registers_before_the_update_takes_the_install_lock_is_checked() {
     if !cfg!(debug_assertions) {
@@ -8426,6 +8522,7 @@ async fn a_command_that_registers_before_the_update_takes_the_install_lock_is_ch
 /// KR-REQ-26.10: a command waits for an update from the moment the update holds the install lock,
 /// and registers and writes once it lets go. Only the install lock is held here, so a command that
 /// did not take it would write at once.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_waits_for_an_update_that_holds_the_install_lock() {
     let host = Host::bare();
@@ -8452,6 +8549,7 @@ async fn a_command_waits_for_an_update_that_holds_the_install_lock() {
 /// state of its own, leave a host an update can switch. The roots are only checked: a path too long
 /// for a socket, a state root nobody can read, and a terminal the host lacks stop nothing, and the
 /// root nobody could read is named.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_registered_and_was_refused_leaves_a_host_that_can_be_updated() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8511,6 +8609,7 @@ async fn a_command_that_registered_and_was_refused_leaves_a_host_that_can_be_upd
 /// KR-REQ-26.10: a registration of a command that cannot be read refuses the switch, whatever the
 /// others say, before anything is stopped: a record that is wider than owner-only, or that names no
 /// roots, hides a root the update must look at. Removing it lets the same rollback go ahead.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_removed() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8584,6 +8683,7 @@ async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_remov
 /// KR-REQ-26.10: a registration that cannot be read refuses the update before the daemon is
 /// stopped. The daemon the host was serving with is still the process that serves it afterwards, on
 /// the release it ran, and removing the record lets the same update go ahead.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registration_that_cannot_be_read_refuses_the_update_before_a_daemon_is_stopped() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8635,6 +8735,7 @@ async fn a_registration_that_cannot_be_read_refuses_the_update_before_a_daemon_i
 /// store's update checks what a command writes there and leaves the second store's daemon serving,
 /// and a record only that daemon writes, at a version the first store's target does not read, does
 /// not refuse the switch.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_store_does_not_hand_over_or_read_the_daemon_records_of_another_store() {
     let mut served = Host::bare();
@@ -8690,6 +8791,7 @@ async fn a_store_does_not_hand_over_or_read_the_daemon_records_of_another_store(
 /// KR-REQ-26.10: a command that works in the state root of a running daemon but with other runtime
 /// variables registers its roots without replacing the daemon's, so the update still reaches the
 /// daemon at the runtime root it was started with.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_run_with_other_runtime_variables_does_not_replace_the_daemons_runtime_root() {
     let (host, _one, two, archive) = host_to_update().await;
@@ -8722,6 +8824,7 @@ async fn a_command_run_with_other_runtime_variables_does_not_replace_the_daemons
 }
 
 /// KR-REQ-26.10: a root a command registered that is gone later, or is a file, stops no switch.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registered_root_that_is_gone_does_not_stop_a_switch() {
     let (host, _one, two, archive) = host_to_update().await;
@@ -8748,6 +8851,7 @@ async fn a_registered_root_that_is_gone_does_not_stop_a_switch() {
 /// KR-REQ-26.10: a document a command writes under a configuration home of its own, which no daemon
 /// read, is found by the check: the command recorded where it wrote.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_a_command_writes_under_another_configuration_home_is_checked() {
     let host = Host::bare_as_a_default_install();
@@ -8797,6 +8901,7 @@ async fn a_document_a_command_writes_under_another_configuration_home_is_checked
 }
 
 /// KR-REQ-26.10: a command that cannot register what it works in writes nothing and says so.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_whose_registration_cannot_be_written_writes_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8894,6 +8999,7 @@ fn observed_stores(host: &Host) -> Vec<stored_formats::Observed> {
 /// to the version the code writes and a digest of what the version stands for: the tables a real
 /// daemon made, the types it keeps and the words it matches by hand. A change to any of them moves
 /// the digest, and this fails until the version has been raised and the lock written.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     let host = a_host_whose_daemon_has_run().await;
@@ -8916,6 +9022,7 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
 /// type added to a stored item, or a listed method that keeps an answer, without a line in the table
 /// fails here until it has one. A method that reaches the registry's authority claim without being
 /// listed fails the first test that runs it; a path that claims elsewhere is not covered by that.
+#[cfg(unix)]
 #[test]
 fn no_type_a_store_keeps_is_undeclared() {
     let table = stored_formats::table::table();
@@ -8949,6 +9056,7 @@ fn no_type_a_store_keeps_is_undeclared() {
 /// KR-REQ-26.10: every record the grants store writes under a name of its own is in the lock. The
 /// registry lists the types it keeps from `grants/durable.rs`, and a record added there without a
 /// line is a stored format the lock would never see change.
+#[cfg(unix)]
 #[test]
 fn every_record_the_grants_store_writes_is_listed_in_the_lock() {
     let unlisted = stored_formats::records_unlisted(
@@ -8964,6 +9072,7 @@ fn every_record_the_grants_store_writes_is_listed_in_the_lock() {
 /// the store has since declared, and one listed for a store the table does not have, are found as
 /// lines to delete; and a method whose answer the registry keeps is found when it is not paired, when
 /// its type is named nowhere, and when it is paired and keeps none.
+#[cfg(unix)]
 #[test]
 fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_stale_line() {
     use kr_protocol::method::Method;
@@ -9077,6 +9186,7 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
 /// when a listed one is changed. The digest of a set holds how often each listed word occurs where
 /// the code writes it, which a word added beside them does not move, and the definition of the enum
 /// the words stand for, which a variant added to it does.
+#[cfg(unix)]
 #[test]
 fn a_word_added_to_the_enum_behind_a_set_of_words_moves_its_digest() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -9126,6 +9236,7 @@ fn a_word_added_to_the_enum_behind_a_set_of_words_moves_its_digest() {
 /// be followed is reported, never skipped. Two types of one name in two files are two types, a `use`
 /// that renames or groups or globs is followed, and an alias, a name nothing brings in, a type
 /// defined twice in one file, a trait object and a type made by a macro are each reported.
+#[cfg(unix)]
 #[test]
 fn a_held_type_is_followed_to_the_file_that_defines_it_and_what_cannot_be_followed_is_reported() {
     use stored_formats::resolve::{Origin, Type, Workspace};
@@ -9344,6 +9455,7 @@ pub struct Made {
 /// made and closed, every entry of the state root and of the environment's directory is a store's or
 /// is named in the lock with the reason it has no version, and a file that nothing names is found,
 /// whether it is beside the stores or inside a directory a store owns.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn no_file_of_a_state_root_goes_unnamed() {
     let host = a_host_whose_daemon_has_run().await;
@@ -9648,6 +9760,7 @@ fn broken_by_command_written_records(
 /// A line of `OPEN_GAPS` goes when its gap is closed for the record, or the limit is accepted for it
 /// and stated in `ACCEPTED_FOR_CONFIGURATION` and in `docs/host/updates.md`, in the change that
 /// rules it.
+#[cfg(unix)]
 #[test]
 fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_while_a_gap_is_open() {
     let stores: Vec<_> = stored_formats::table::table()
@@ -9731,6 +9844,7 @@ fn no_record_a_command_writes_is_raised_past_what_every_listed_release_reads_whi
 /// at its floor passes whatever gap is open; one raised past it passes only with no gap open for it;
 /// a record nothing holds off, one whose reader requires more than a release without the lock
 /// writes, and one whose writer is given leave for another name or version are refused.
+#[cfg(unix)]
 #[test]
 fn the_gate_on_command_written_records_refuses_what_it_is_for() {
     use stored_formats::Writers;
@@ -9826,6 +9940,7 @@ fn the_gate_on_command_written_records_refuses_what_it_is_for() {
 /// KR-REQ-26.10: a rollback to a release whose manifest lists no store is refused, naming that, and
 /// nothing is switched. This is the premise of the floor of the guard above: every release a host
 /// can switch to lists its stores, and so reads the configuration document at version 2.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_is_refused_to_a_release_that_lists_no_store() {
     let host = Host::bare();
@@ -9868,6 +9983,7 @@ async fn a_rollback_is_refused_to_a_release_that_lists_no_store() {
 ///
 /// Run it after raising the version of a store whose tables or values changed:
 /// `cargo test -p kr-cli --test update write_the_lock -- --ignored`.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "writes stored-formats.lock"]
 async fn write_the_lock() {
@@ -9895,6 +10011,7 @@ async fn write_the_lock() {
 /// writer refuses the ways that are a change nobody gave a version to: a digest that moved while the
 /// version stood still, a version that went down, a store that is kept somewhere else and a store
 /// that is dropped.
+#[cfg(unix)]
 #[test]
 fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
     let store = |version: u32, digest: &str, path: &str| stored_formats::Observed {
@@ -9993,6 +10110,7 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
 /// What the digest leaves out and what it keeps: the words of a doc comment, the spacing and the
 /// comments of the SQL, and the name of a type move nothing; a column, a property, a word and a
 /// quoted default do.
+#[cfg(unix)]
 #[test]
 fn the_digest_follows_what_a_store_keeps_and_not_how_it_is_written() {
     use stored_formats::{normalise_schema, normalise_sql};
