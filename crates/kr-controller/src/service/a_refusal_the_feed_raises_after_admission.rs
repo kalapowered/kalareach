@@ -234,9 +234,13 @@ async fn a_feed_refusal_raised_while_a_commit_stands_on_a_registration_rises_aft
             controller.raise_the_unverified_withdrawal_refusal().await;
         })
     };
-    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0 {
+    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0 && !committing.is_finished() {
         tokio::task::yield_now().await;
     }
+    assert!(
+        !committing.is_finished(),
+        "the commit ended before the raise arrived at the wait for it"
+    );
     let policy_read = Arc::new(AtomicBool::new(false));
     let reading = {
         let (controller, policy_read) = (Arc::clone(&controller), Arc::clone(&policy_read));
