@@ -532,9 +532,9 @@ top directory and the same `release.json` as the other platforms' archive.
 `current` is a directory junction, which any account can make. An update replaces it by renaming a
 new junction over it with `SetFileInformationByHandle`, the `FileRenameInfoEx` class, and the flags
 that replace an existing name and give the rename POSIX semantics. Microsoft documents
-`FileRenameInformationEx` from Windows 10, version 1709 (OS build 16299), which makes that the
-oldest Windows a store runs on. The swap is one step, so a program that reads `current` at any
-moment finds a whole release.
+`FileRenameInformationEx` from Windows 10, version 1709 (OS build 16299), so an older Windows
+cannot make the swap: its first switch fails with the system's error, after the release is in the
+store. The swap is one step, so a program that reads `current` at any moment finds a whole release.
 
 A junction names an absolute path. A store that is moved or copied has a `current` that still
 names the place it was made for, and `kr` refuses it as naming something other than a release of
@@ -589,26 +589,32 @@ with exit 9, before it stops anything, and names the one that fails, unless all 
 
 - the configuration document the daemon read chooses the standalone start;
 - the daemon was started with the environment's two roots as its arguments and no other
-  (`--secret-store file`, `--worker` and `--own-session` each make it another daemon), in the
-  environment's state directory;
-- its home (`HOME`, else `USERPROFILE`) and its `LOCALAPPDATA` are the account's own, which is what
-  the task gives a daemon, so a daemon started by hand with another home is not replaced by one that
-  keeps an agent's tool configuration somewhere else;
-- the task is the one this installation registers and runs `current`'s daemon. A missing task, a
-  stale one and one that belongs to another environment each defer, and the message names
-  `kr host startup --set standalone`, which registers or repairs it.
+  (`--secret-store file` and `--worker` each make it another daemon), in the environment's state
+  directory;
+- the variables the daemon states as deciding where it keeps something, `HOME`, `USERPROFILE` and
+  `LOCALAPPDATA`, are each what the system gives the account (read from the account's own
+  environment, not from the command that runs the update), or absent where the account has none, so
+  a daemon started by hand with another home is not replaced by one that keeps an agent's tool
+  configuration somewhere else;
+- the task is the one this installation registers and runs `current`'s daemon. A missing task or a
+  stale one defers, and the message names `kr host startup --set standalone`, which registers or
+  repairs it. A task that belongs to another environment or account defers too, and the message says
+  so; that command refuses to replace it, and it has to be removed first.
 
-No other variable a daemon reads changes what it serves or where it keeps it. A proxy variable moves
-where a relay check goes, `PATH` what a capability probe finds, and `SystemRoot` and the session
-variables what a reading reports. `KR_SHELL_PACKAGES` makes a daemon of an installed release refuse
-to start, so a daemon the update replaces never has it.
+The daemon states those three variables and no others, so they are the only ones held to the
+account's. The rest of a replacement's environment is the account's, as it is the starting command's
+on the other platforms: `PATH`, `APPDATA`, the proxy variables, `SystemRoot` and the session
+variables. They move what a capability probe finds, where a relay check goes and what a session
+starts with, and a daemon started by hand with a different one of them is replaced by one without
+it. `KR_SHELL_PACKAGES` makes a daemon of an installed release refuse to start, so a daemon the
+update replaces never has it.
 
 A task that does not start the new release's daemon leaves the update recorded as owing it, as on
 the other platforms, and `kr host rollback` or an update to a release without the fault goes on from
-there. A message that names a daemon's process gives `taskkill /PID <pid>`. A daemon that holds the
-environment and does not listen cannot be named: it holds its lock file with no sharing, so the
-message says to stop it and to run the command again, and `Get-Process kr-controller` lists the
-daemons.
+there. A message that names a daemon's process gives `taskkill /F /PID <pid>`, forced because a
+daemon has no window to ask. A daemon that holds the environment and does not listen cannot be
+named: it holds its lock file with no sharing, so the message says that a daemon holds the
+environment and to run the command again, and `Get-Process kr-controller` lists the daemons.
 
 ### The first install over a build run in place
 
@@ -622,8 +628,9 @@ the order is: stop the old daemon, install, repair the task.
 
 `kr attach`, `kr detach` and `kr agent-tools --stdio` hand over to the `kr` of the worker's release.
 Windows cannot replace a process by another, so the first `kr` starts the other as a child, keeps
-that release held, and ignores console control events while the child runs, so that Ctrl+C reaches
-only the program the person sees. It exits with the child's status. The child takes a hold of its
+that release held, and ignores Ctrl+C and Ctrl+Break while the child runs, so that they reach only
+the program the person sees. A console close, a log-off or a shutdown ends it, and its hold with it.
+It exits with the child's status. The child takes a hold of its
 own on starting. If the first `kr` is ended before the child has done so and the release is then
 removed, the child finds its release gone and does not run. On the other platforms the hold passes
 to the replacing process unbroken.
@@ -634,8 +641,8 @@ A daemon asks the environment's task for each worker it needs, and the task's st
 it. The exchange has a protocol number, and the daemon refuses a starter that speaks another,
 naming both numbers. The starter belongs to the release `current` names and the daemon to the
 release it started from. A daemon that outlives a switch, in an environment the update could not
-reach, therefore keeps working only while the exchange changes by additions. A change that is not an
-addition raises the number.
+reach, keeps working only while the two speak the same exchange. Each message accepts the fields it
+knows and no others, so every change to the exchange, an added field included, raises the number.
 
 ### What a Windows host does not do yet
 
