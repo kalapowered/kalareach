@@ -876,8 +876,7 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     host.start_daemon(&started_through_current).await;
     // What a run that stopped after its switch leaves: the daemon stopped, `current` on the
     // target, and the update recorded as switched.
-    host.end_every_daemon();
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
 
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
@@ -929,7 +928,7 @@ async fn a_transaction_with_no_root_settles_on_the_release_roots_that_can_be_rea
     host.put(&two);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     assert!(
         host.record()["update"]["trusted_root"].is_null(),
         "the transaction is one an earlier build began"
@@ -1022,7 +1021,7 @@ async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
     host.put(&two);
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
     two.archive(&archive);
@@ -1661,10 +1660,14 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
             && message.contains("run kr host update again"),
         "{said}"
     );
-    assert!(
-        message.contains(&stop_command(std::process::id())),
-        "the process that holds the environment nothing answers for is named: {said}"
-    );
+    // Where the lock file can be read while it is held, the process that holds the environment
+    // is named; a Windows daemon holds it with no sharing at all, so there none can be.
+    if cfg!(unix) {
+        assert!(
+            message.contains(&stop_command(std::process::id())),
+            "the process that holds the environment nothing answers for is named: {said}"
+        );
+    }
     assert!(
         !message.contains(&stop_command(host.daemons[0].id())),
         "and the daemon that made way is not: {said}"
@@ -5616,7 +5619,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
     let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3);
     host.install(&one);
     host.put(&two);
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     host.store
         .record_roots(
             host.tree.paths().runtime_root(),
@@ -6674,7 +6677,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
     host.install(&one);
     host.put(&two);
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     // The environment a daemon of the store served, as its start records it.
     host.store
         .record_roots(

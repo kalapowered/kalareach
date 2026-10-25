@@ -2439,8 +2439,8 @@ impl Host {
 
     /// What a run that stopped after its switch leaves: `two` current, no daemon running, and the
     /// update recorded as switched, with the daemon of this host to be started as it was.
-    fn record_a_switched_update(&mut self, one: &Assembled, two: &Assembled) {
-        self.end_every_daemon();
+    async fn record_a_switched_update(&mut self, one: &Assembled, two: &Assembled) {
+        self.end_every_daemon().await;
         self.switch(two.name());
         self.record_the_update_as_switched(one, two);
     }
@@ -2448,39 +2448,38 @@ impl Host {
     /// Ends every daemon that serves this host without its leave, as a crash does: each this test
     /// started, and on Windows the one the environment's task created, which is ended by its process
     /// identifier. Returns once no daemon holds the environment.
-    fn end_every_daemon(&mut self) {
+    async fn end_every_daemon(&mut self) {
         for mut daemon in self.daemons.drain(..) {
             daemon.kill().expect("stops");
             daemon.wait().expect("ends");
         }
         #[cfg(windows)]
+        if connect_to_daemon(&self.tree.environment().controller_endpoint().expect("an endpoint"))
+            .await
+            .is_ok()
         {
-            let lock = self.tree.environment().singleton_lock();
-            if let Some(pid) = kr_controller::singleton::SingletonLock::holder(&lock)
-                .ok()
-                .flatten()
-            {
-                let system = std::env::var_os("SystemRoot")
-                    .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-                let ended = Command::new(system.join("System32").join("taskkill.exe"))
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .expect("taskkill runs");
-                assert!(ended.success(), "the daemon, process {pid}, is ended");
-            }
-            let deadline = Instant::now() + LIVENESS_DEADLINE;
-            while kr_controller::singleton::SingletonLock::holder(&lock)
-                .ok()
-                .flatten()
-                .is_some()
+            let pid = self.daemon_started_like().await.pid.get();
+            let system = std::env::var_os("SystemRoot")
+                .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+            let ended = Command::new(system.join("System32").join("taskkill.exe"))
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("taskkill runs");
+            assert!(ended.success(), "the daemon, process {pid}, is ended");
+            let started = Instant::now();
+            while connect_to_daemon(
+                &self.tree.environment().controller_endpoint().expect("an endpoint"),
+            )
+            .await
+            .is_ok()
             {
                 assert!(
-                    Instant::now() < deadline,
-                    "a daemon still holds the environment"
+                    started.elapsed() < LIVENESS_DEADLINE,
+                    "the daemon, process {pid}, still answers"
                 );
-                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
     }
