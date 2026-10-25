@@ -762,6 +762,18 @@
         "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
       ]
     },
+    "RepositoryGeneration": {
+      "digest": "1cefcfd9317cbe7e8681134627a306d8b584e920e7a68ee7c9a4c5787c6fac83",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
     "RequestId": {
       "digest": "02aa4228efc77bd978a88c2be8ba1021561b8170c72c3847843c7f81fd2a0bf5",
       "followed": [
@@ -797,7 +809,7 @@
       ]
     },
     "Sentence": {
-      "digest": "fded400e683eed4ff0f233a9578d38e67bfab3c3c18050bdd41b09a7a4c16ef7",
+      "digest": "b8f5face0bf30ea556af06a2c488f86dbb2fd4fe095cfdbde9194f971eca4caf",
       "followed": [
         "kr_protocol crates/kr-protocol/src/hostinfo.rs: Composed",
         "kr_protocol crates/kr-protocol/src/hostinfo.rs: ContentClass",
@@ -856,8 +868,14 @@
         "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
       ]
     },
+    "SessionReadResult": {
+      "digest": "0b27d07232d00d68f310b4a3774f341a9decf6493f562d002a06ae46b5fa0a9d",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/session.rs: SessionReadResult"
+      ]
+    },
     "SessionSummary": {
-      "digest": "7fe58d83a5989335c94b5e105f5cbce3a42cda57d60510c18ba096a3e6bb6c19",
+      "digest": "9cafe1ef37ff6a31db1abb0699f015b6acc699ba612418fdead619af6a845943",
       "followed": [
         "kr_protocol crates/kr-protocol/src/session.rs: SessionSummary"
       ]
@@ -1009,6 +1027,14 @@
       "digest": "d9e5be53ad95867184e555b8fa52ae77a6b78b2b6f7a0f78d8ef5ef4c2e3c187",
       "followed": [
         "kr_protocol crates/kr-protocol/src/rights.rs: action_rights"
+      ]
+    },
+    "macro closed_label": {
+      "digest": "2e6d973409740a7eb6d2ad9ac623029c51cf95127e72b2635deb8c44a25bc6b2",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/metrics.rs: Shape",
+        "kr_protocol crates/kr-protocol/src/metrics.rs: closed_label",
+        "kr_protocol crates/kr-protocol/src/metrics.rs: impl Shape"
       ]
     },
     "macro counter": {

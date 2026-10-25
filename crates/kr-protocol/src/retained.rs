@@ -61,7 +61,7 @@ pub use surface::{
 /// Every entry has a directory `crates/kr-protocol/retained/<level>/` and a [`RetainedLevel`] in
 /// [`RETAINED`]; `kr-protocol-gen --check` fails when the three disagree.
 pub const RETAINED_WORKER_LEVELS: [CompatibilityLevel; 1] = [CompatibilityLevel::of(
-    crate::hello::PackageVersion::new(0, 76, 0),
+    crate::hello::PackageVersion::new(0, 77, 0),
 )];
 
 /// The roots of the surface a retained level keeps: the frames, the descriptor, and the parameters
@@ -315,77 +315,18 @@ impl RetainedLevel {
     }
 }
 
-/// A package the daemon admits is written for a worker of the retained level without the
-/// generation of its repository, which that level's reader refuses as a member it does not know,
-/// and read from it as admitted under no generation.
-fn leave_out_the_repository_generation(value: &mut CanonicalValue) -> Result<(), String> {
-    remove_member(value, "repository_generation");
-    Ok(())
-}
-
-fn say_no_repository_generation(value: &mut CanonicalValue) -> Result<(), String> {
-    insert_member(
-        value,
-        "repository_generation",
-        CanonicalValue::integer(0).map_err(|error| error.to_string())?,
-    )
-}
-
-/// The frame of a snapshot of admissions that carries one package, as this build writes it with no
-/// generation known, and as the retained level reads it.
-const ADMITTED_PACKAGE_CURRENT: &[u8] =
-    include_bytes!("../retained/0.76/golden/admitted-package.current.cbor");
-const ADMITTED_PACKAGE_RETAINED: &[u8] =
-    include_bytes!("../retained/0.76/golden/admitted-package.retained.cbor");
-
 /// The levels this release retains, in the order of [`RETAINED_WORKER_LEVELS`].
+///
+/// The surface of the retained level equals this build's, so neither table has an entry.
 pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     RETAINED_WORKER_LEVELS[0],
-    include_str!("../retained/0.76/surface.schema.json"),
-    include_str!("../retained/0.76/RELEASE"),
-    include_str!("../retained/0.76/PLUGIN_HOST"),
-    &[Declared {
-        at: "AdmittedPackage.repository_generation",
-        write: leave_out_the_repository_generation,
-        read: say_no_repository_generation,
-        golden: &[Golden {
-            current: ADMITTED_PACKAGE_CURRENT,
-            retained: ADMITTED_PACKAGE_RETAINED,
-        }],
-    }],
-    &[Compatible {
-        at: "SessionSummary.application",
-        reason: "A member that is absent from the wire for a session whose worker knows no \
-                 foreground application, and a worker of the retained level never writes it, so \
-                 this build's daemon reads what that level writes as a session with no \
-                 application, and a session of that level shows none. A summary that carries the \
-                 member is written only by a worker of this build. Summaries travel from a worker \
-                 to the daemon, which hands them on to callers through `session.list` and \
-                 `session.read`; an earlier release's reader, whose summary is a closed object, \
-                 cannot read one that carries the member. No client was released, so there is no \
-                 shim: the public contract may change with a level move until public 1.0 freezes \
-                 at the first client release (`docs/releases/packages.md`). A worker's journal \
-                 keeps the summary in the shape every release reads and the application in a row \
-                 of its own.",
-    },
-    Compatible {
-        at: "SessionReadResult.metrics",
-        reason: "A member that is absent from the wire when the worker has counted nothing of the \
-                 host's own metrics, and a worker of the retained level never writes it, so this \
-                 build's daemon reads what that level writes as a result that carries none, and \
-                 reports nothing of that worker's counts. A result that carries the member is \
-                 written only by a worker of this build, and the daemon takes the counts into its \
-                 own report without passing them on, so what a caller of the daemon reads is what \
-                 it read before. The member is made of strings the daemon reads against its own \
-                 closed lists and leaves out where it does not have the word, so a connector the \
-                 product bundles later or a class of fault added later does not change it and \
-                 needs no level of its own. An earlier release's reader, whose result is a closed \
-                 object, cannot read one that carries the member. No client was released, so \
-                 there is no shim: the public contract may change with a level move until public \
-                 1.0 freezes at the first client release (`docs/releases/packages.md`).",
-    }],
+    include_str!("../retained/0.77/surface.schema.json"),
+    include_str!("../retained/0.77/RELEASE"),
+    include_str!("../retained/0.77/PLUGIN_HOST"),
+    &[],
+    &[],
 )
-.with_public_majors(include_str!("../retained/0.76/PUBLIC_MAJORS"))];
+.with_public_majors(include_str!("../retained/0.77/PUBLIC_MAJORS"))];
 
 /// A level of a test's own: the surface this release retains besides its own, with its definitions
 /// changed by `edit`, and `declared` as the entries that cover what it differs by.
