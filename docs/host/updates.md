@@ -230,9 +230,9 @@ A release is taken in only whole and checked:
   in GNU's form or in the POSIX form that carries `GNU.sparse` keys, writes an archive this host
   does not take. An archive that is not a regular file, a pipe among them, is refused at once.
 - The manifest is signed by a threshold of the release keys the update channel's root names for
-  its targets role. The root the host trusts is the newer of the one the current release carries,
-  at `share/update-root.json`, and the one `install.json` recorded when the host last switched to
-  a release (see "Rolling back"); a release carries that root or the one that follows it, the next
+  its targets role. The root the host trusts is the newest of the one the current release carries,
+  at `share/update-root.json`, the one `install.json` recorded when the host last switched to
+  a release (see "Rolling back") and the roots of an update that is still recorded or that failed; a release carries that root or the one that follows it, the next
   version, signed by a threshold of the current root's root keys as well as its own. A root that
   names one key for two of its roles, or one key under two identifiers in a role, is refused
   wherever the host reads it, the root it kept included; a host that kept such a root (a root made
