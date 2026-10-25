@@ -2302,8 +2302,19 @@ fn restart_of(
 /// arguments and in the directory the task's starter gives a daemon, the environment's roots and its
 /// state directory, and no other (a key store named `file` or a worker program among them); and the
 /// task is this installation's own, as it registers it, so that the task, run after the switch,
-/// starts the daemon of the release `current` then names. The daemon's variables are not compared:
-/// the roots are its arguments, and a Windows daemon keeps nothing where a variable says.
+/// starts the daemon of the release `current` then names.
+///
+/// The daemon the task starts has the account's own environment, whatever environment the daemon
+/// this replaces was started in, so a variable of the old daemon's is compared only where it moves
+/// something the daemon keeps. Of the variables a daemon reads, the roots are its arguments, and
+/// `KR_RUNTIME_DIR` and `KR_STATE_DIR` name nothing once both are given. The ones that decide where
+/// else it keeps something are the account's home (`HOME`, else `USERPROFILE`, where an agent's tool
+/// configuration is written) and `LOCALAPPDATA`: each must be what this command has, which is
+/// what the account has, and a home that `HOME` moves away from the profile defers. The proxy
+/// variables move only where a relay check goes, `PATH` only what a capability probe finds, and
+/// `SystemRoot` and the session variables only what a reading reports; none of them changes what
+/// the daemon serves or where it keeps it. A shell package root named by the environment makes a
+/// daemon of an installed release refuse to start, so it cannot be one the update replaces.
 #[cfg(windows)]
 fn restart_by_task(
     environment: &inventory::Environment,
@@ -2354,6 +2365,28 @@ fn restart_by_task(
     if !same(&started_as.working_directory, environment.paths.state_dir()) {
         return Err(deferred(Shown::said(
             "it was started in another directory than the environment's state directory",
+        )));
+    }
+    let recorded = |name: &str| {
+        started_as
+            .environment
+            .iter()
+            .find(|variable| variable.name == name)
+            .and_then(|variable| variable.value.0.as_deref())
+    };
+    let own = |name: &str| std::env::var(name).ok();
+    let profile = own("USERPROFILE");
+    let home = recorded("HOME").or_else(|| recorded("USERPROFILE"));
+    let local = recorded("LOCALAPPDATA");
+    let place_is = |recorded: Option<&str>, own: Option<&str>| {
+        recorded
+            .zip(own)
+            .is_some_and(|(recorded, own)| same(recorded, std::path::Path::new(own)))
+    };
+    if !place_is(home, profile.as_deref()) || !place_is(local, own("LOCALAPPDATA").as_deref()) {
+        return Err(deferred(Shown::said(
+            "its home or local application data directory is not the account's, so it would keep \
+             what it keeps elsewhere when the task starts it again",
         )));
     }
     crate::startup::task_is_this_installation_s(&environment.paths).map_err(deferred)
