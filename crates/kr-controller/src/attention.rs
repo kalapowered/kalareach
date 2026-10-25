@@ -5676,18 +5676,6 @@ pub(crate) mod tests {
             "the text is held back, so no summary is asked for"
         );
 
-        let owed = Readable {
-            path: world.temp.environment().state_dir().join("closed.sqlite3"),
-            owed: true,
-        };
-        world.changed_through(&owed, &owner(), &Caller::Owner).await;
-        assert_eq!(
-            world.asked(),
-            Vec::new(),
-            "the text is held back while privacy mode's cleanup of the session is owed, so no \
-             summary is asked for"
-        );
-
         let readable = Readable {
             path: world.temp.environment().state_dir().join("closed.sqlite3"),
             owed: false,
@@ -5710,6 +5698,59 @@ pub(crate) mod tests {
             never.asked().len(),
             1,
             "control: text that cannot be read at all does not hold a summary back"
+        );
+    }
+
+    /// KR-REQ-18.02: a finished session's text is not served while privacy mode's cleanup of the
+    /// session is owed, and that is a hold for now: a summary written without the text would
+    /// reach the head and be served for the interval from then on, so none is asked for until the
+    /// cleanup is done. Nothing follows a worker or a closure of a finished session, so only the
+    /// cleanup holds its text back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_privacy_modes_cleanup_of_a_finished_session_is_owed()
+    {
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let path = world.temp.environment().state_dir().join("closed.sqlite3");
+        let readable = |owed: bool| Readable {
+            path: path.clone(),
+            owed,
+        };
+
+        world
+            .module
+            .session_closed(&readable(false), world.session_id)
+            .await;
+        assert!(
+            world.module.finalised(world.session_id),
+            "the session is finished"
+        );
+        {
+            let origins = world.module.origins();
+            assert!(
+                !origins.ended.contains(&world.session_id)
+                    && !origins.watched.contains(&world.session_id)
+                    && !origins.workers.contains_key(&world.session_id),
+                "and the store follows no worker or closure of it"
+            );
+        }
+
+        world
+            .changed_through(&readable(true), &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked(),
+            Vec::new(),
+            "the cleanup is owed, so the text is held back and no summary is asked for"
+        );
+
+        world
+            .changed_through(&readable(false), &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked().len(),
+            1,
+            "once the cleanup is done, the text is read and a summary is asked for"
         );
     }
 
