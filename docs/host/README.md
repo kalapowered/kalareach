@@ -3029,14 +3029,25 @@ What the grant decides, for every request:
 * **Capabilities.** What an attachment is granted is what it asked for intersected with the rights
   this request was decided with, made where the attachment is admitted. See "What an attachment
   may do".
-* **History.** Retained history is not served to a device at all: its scope is the grant's lower
-  bound, that bound is a moment in time and a history page is a byte range, and a host that does
-  not narrow a page to a grant refuses it rather than serving more than the grant allows. The host
-  records when each part of a closed session's output was written (see "When output was
-  produced"), which is what a page narrowed to a grant would be cut by. It serves no page cut that
-  way: bytes with no recorded time, or timed on a clock the worker could not prove, are never
-  served to a bound, and the daemon does not read a live session's record. The
-  session's live screen and the stream that follows it are served when the grant includes them,
+* **History.** A device is served a live session's retained output cut to its grant. A history
+  page is a byte range and the grant's scope is a moment in time, so the session's worker cuts the
+  range by its record of when each part of the output was written (see "When output was
+  produced"), using the history scope of the grant the daemon decided the read under, which the
+  daemon forwards with it. A grant with no history bound, once its own start is filled in where it
+  names no cursor, reaches no retained output, and the daemon refuses its page by name. Otherwise
+  the worker serves the output from the start of the first interval whose proven reading is at or
+  after the grant's first moment, and none before it. Cursors only grow, so everything from that cursor on was written no earlier than that
+  interval's first byte, whether or not an interval times it. An interval read on a clock the
+  worker could not prove is not one to start from, as none is after the wall clock stepped
+  forward. A page asked for from before that cursor begins at it, reports it as the oldest
+  retained cursor, and says what it left out as a gap with no cause, because retention took none
+  of it; where retention took the range as well, the gap names its cause, as for any reader. A
+  grant that reaches no interval yet is served an empty page at the end of the output, and reads
+  on from there as output is written. A grant that reaches every moment is served what the owner
+  is. The page comes from the same retained window as the owner's and leaves by the same path, so
+  what privacy mode removes is gone from both. A closed session has no worker to cut its output,
+  and a paired device is refused it, with that reason. The session's live screen and the stream
+  that follows it are served when the grant includes them,
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
   restoration did not carry. The exception section 10 names is the visible screen, and never the
@@ -4007,8 +4018,9 @@ knows the file. Until then the file holds instants and no content.
 `history.times` reads the intervals between two cursors of a closed session through the control
 daemon, at most 2,048 to an answer, with the cursor to ask from next. A session with no index, or
 one that cannot be read, is answered with no intervals and the reason, and what reads it says its
-output carries no time. It refuses a session whose worker the daemon has not seen end, as
-`history.page` does, and a paired device cannot ask it.
+output carries no time. It refuses a session whose worker the daemon has not seen end, as the
+daemon's own `history.page` does (a live session's page is its worker's), and a paired device
+cannot ask it.
 
 ## The archive service
 
@@ -5845,9 +5857,10 @@ after it.
 Section 10 narrows retained content to the grant that asked for it, and this host cannot narrow a
 moment in time to an item's text: an item carries a sequence in its own source's records, which is
 not a cursor of any session's output, so the record of when output was produced gives it no time.
-That, and the absence of a page cut by a grant's bound, is why it refuses a retained history page to
-a paired device outright. An attention item is not a history page, so it is narrowed rather than
-refused: a caller that did not arrive over the local socket is served the host's own record of a condition (which
+That is why it serves a device no item's text. A history page is different: it is a byte range of
+one session's output, and the session's worker holds the record of when each part was written, so
+the worker cuts a live session's page to the grant (see "When output was produced"). An attention
+item has no such record, so it is narrowed rather than refused: a caller that did not arrive over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either. The changed-since-last-visit view holds only the changes the host recorded
 at or after the moment the caller's history reaches back to. Its cursors end after the last change
@@ -6887,8 +6900,9 @@ after any of its sources. A device whose grant reaches every moment, as an owner
 crosses no bound and is served a summary as the owner is.
 What a model wrote of a session is shown to a device whose history reaches the session's start,
 decided as a summary derived from the interval that is that moment, and a session whose start is
-not known is shown none of it. A retained history page and an export are not served to a paired
-device at all.
+not known is shown none of it. A live session's retained history page is served to a paired device
+cut to what its grant reaches, as the History paragraph above describes. A closed session's page
+and an export are not served to one.
 
 A live-only invitation reaches the currently visible screen and nothing else. Snapshot installation
 goes through the filtered projection rather than the worker's unrestricted state, so the buffer that

@@ -79,7 +79,10 @@ as they scroll down. It holds a bounded run of pages and lets pages go from the 
 the reader is looking at stays where it is as pages come and go. It shows the text the session
 printed, decoded across page boundaries, and leaves out what a terminal would act on: colours,
 titles, cursor moves and clipboard writes. Where the host no longer keeps output it says so, and
-why. Each view keeps its own place across a change of view: the conversation and the output return
+why. Over a host this device is paired with, the host serves the output the device's grant reaches,
+from the first of it, and the view says that the output before it is not shown to this device
+rather than that the host kept none; a session that has written nothing the grant reaches says so
+too. Each view keeps its own place across a change of view: the conversation and the output return
 the reader to the node or page they were reading, or to the live end if they were following it.
 
 A session exports two files, each where the platform's save dialog puts it. The semantic archive
