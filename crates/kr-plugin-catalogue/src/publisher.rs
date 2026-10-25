@@ -3,8 +3,8 @@
 //! A plugin identifier is `publisher/name`, and an installation, an admission, a grant and a
 //! binding are all found by it. Two repositories under different roots that list one publisher
 //! would be two authorities for one name, and a package of the one could replace what the other
-//! installed. So a publisher's name is held by the root that first lists it, and a repository
-//! under another root is refused the name, when it synchronises and when it installs.
+//! installed. So a publisher's name is held by the roots of the repositories that list it, and a
+//! repository under another root is refused the name, when it synchronises and when it installs.
 //!
 //! The binding is read from what the catalogue keeps anyway and written nowhere: an enrolment
 //! holds the publishers its active generation lists and the publishers of what it installed, and
@@ -98,12 +98,17 @@ pub(crate) fn check(
         );
         let overlap: Vec<&String> = names.intersection(publishers).collect();
         if !overlap.is_empty() && !same(&held.enrolment.root) {
+            // A holder whose root descends from one of the candidate's own is ahead of it by a
+            // rotation the candidate has not followed.
+            let ahead = roots
+                .iter()
+                .any(|root| trust::root_descends_from(root, &held.enrolment.root));
             for name in overlap {
-                holders
-                    .entry(name.clone())
-                    .or_default()
-                    .enrolled
-                    .insert(held.enrolment.id.to_string());
+                let holder = holders.entry(name.clone()).or_default();
+                holder.enrolled.insert(held.enrolment.id.to_string());
+                if ahead {
+                    holder.ahead.insert(held.enrolment.id.to_string());
+                }
             }
         }
     }
@@ -145,6 +150,9 @@ pub(crate) fn check(
 struct Holders {
     /// Repositories this host holds an enrolment of.
     enrolled: BTreeSet<String>,
+    /// Of those, the repositories whose root descends from the candidate's own: they follow a
+    /// rotation the candidate has not.
+    ahead: BTreeSet<String>,
     /// Repositories that were removed and left an installation behind.
     removed: BTreeSet<String>,
 }
@@ -152,14 +160,34 @@ struct Holders {
 fn held_by(publisher: &str, holders: &Holders, doing: Doing) -> CatalogueError {
     let join = |names: &BTreeSet<String>| names.iter().cloned().collect::<Vec<_>>().join(", ");
     let all: BTreeSet<String> = holders.enrolled.union(&holders.removed).cloned().collect();
-    // What a person can do differs by what holds the name: an enrolled repository is removed with
-    // what was installed from it, and a repository that is already removed has only what it
-    // installed left to remove.
+    let verb = if all.len() == 1 { "holds" } else { "hold" };
+    // What a person can do differs by what holds the name. A repository that is ahead by a
+    // rotation is caught up with, not removed; an enrolled repository is removed with what was
+    // installed from it, and a repository that is already removed has only what it installed left
+    // to remove.
     let mut steps = Vec::new();
-    if !holders.enrolled.is_empty() {
+    if !holders.ahead.is_empty() {
+        steps.push(match doing {
+            Doing::Synchronising => format!(
+                "this repository's source has not published the root rotation {} follow",
+                join(&holders.ahead)
+            ),
+            Doing::Installing => format!(
+                "this repository has not followed the root rotation {} follow; synchronise it",
+                join(&holders.ahead)
+            ),
+        });
+    }
+    let to_remove: BTreeSet<String> = holders
+        .enrolled
+        .difference(&holders.ahead)
+        .cloned()
+        .collect();
+    if !to_remove.is_empty() {
         steps.push(format!(
-            "remove {} and what was installed from it",
-            join(&holders.enrolled)
+            "remove {} and what was installed from {}",
+            join(&to_remove),
+            if to_remove.len() == 1 { "it" } else { "them" }
         ));
     }
     if !holders.removed.is_empty() {
@@ -174,8 +202,8 @@ fn held_by(publisher: &str, holders: &Holders, doing: Doing) -> CatalogueError {
     };
     CatalogueError::Untrusted {
         detail: format!(
-            "{publisher} is a publisher that {} hold under another root, and a package of this \
-             repository under that name could replace what they installed; {}, then {again}",
+            "{publisher} is a publisher that {} {verb} under another root, and a package of this \
+             repository under that name could stand in for theirs; {}, then {again}",
             join(&all),
             steps.join(" and ")
         ),

@@ -1499,9 +1499,12 @@ impl Catalogue {
                 &mut self.db,
                 &*self.broker,
                 change,
-                // Decided again where the generation becomes the active one: another process can have
-                // synchronised a repository under another root since the check above.
+                // Decided again where the generation becomes the active one: another process can
+                // have synchronised a repository under another root since the check above.
                 |records| {
+                    // The admission is asked first, so a sync whose admission lapsed is refused for
+                    // that and not for what the check finds.
+                    authority.check()?;
                     let current = records.enrolment_by_key(&key)?.ok_or_else(|| {
                         CatalogueError::NotFound {
                             detail: format!("{id} was removed while it synchronised"),
@@ -1540,18 +1543,18 @@ impl Catalogue {
                     };
                     if let Via::Bundle(bundle) = via {
                         require_seeded_in(changes, &key)?;
-                        // Where the bundled generation came from is kept with the commit that activates it,
-                        // so the record names the last bundle this store took a generation from; a later
-                        // synchronisation from the repository itself leaves it, and the doctor shows both
-                        // generation numbers.
+                        // Where the bundled generation came from is kept with the commit that
+                        // activates it, so the record names the last bundle this store took a
+                        // generation from; a later synchronisation from the repository itself
+                        // leaves it, and the doctor shows both generation numbers.
                         changes.put_setting(
                             &format!("{}{key}", seed::PROVENANCE),
                             &seed::provenance_of(bundle),
                         )?;
                     }
                     changes.activate(&key, &active, &accepted_targets)?;
-                    // The generations it no longer keeps go in the same commit that moves it on, the
-                    // oldest first, decided from the records and the budgets as they are now.
+                    // The generations it no longer keeps go in the same commit that moves it on,
+                    // the oldest first, decided from the records and the budgets as they are now.
                     let forgotten = BudgetLedger::new(current.enrolment.budgets).plan_retention(
                         checkpoint,
                         &retained(&changes.kept_generations(&key)?),
@@ -2560,6 +2563,9 @@ impl Catalogue {
             // Decided again where the installation commits: another process can have synchronised
             // a repository under another root while the package was fetched.
             |records| {
+                // The admission is asked first, so an installation whose admission lapsed is
+                // refused for that and not for what the check finds.
+                authority.check()?;
                 let current =
                     records
                         .enrolment_by_key(&key)?
@@ -2618,8 +2624,8 @@ impl Catalogue {
                         changes.retire_release(&retired_from(previous))?;
                     }
                 }
-                // A release installed again is described by its installation, whose grants the owner
-                // confirmed, and no longer by what it held when it was left.
+                // A release installed again is described by its installation, whose grants the
+                // owner confirmed, and no longer by what it held when it was left.
                 changes.forget_retired(
                     environment_id,
                     plugin_id,
