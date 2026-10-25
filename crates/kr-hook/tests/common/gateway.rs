@@ -342,6 +342,13 @@ impl Gateway {
         })
     }
 
+    /// Why the last launch this session's newest backend took did not go, where one did not.
+    pub fn last_launch_failure(&self) -> Option<String> {
+        let newest = self.generation.load(std::sync::atomic::Ordering::SeqCst) - 1;
+        self.backends
+            .launch_failure_of(PromptGeneration::new(newest))
+    }
+
     /// Starts the launcher for an answer, the way the shell does: its child, with the answer's
     /// variable and the person's own variables, in the group every launch of this test runs in.
     /// Standard output goes to a file the test reads, for it is what the terminal prints.

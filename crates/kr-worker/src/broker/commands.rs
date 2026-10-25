@@ -264,7 +264,6 @@ struct Backend {
     ///
     /// It belongs to the backend and not to an instance: a launch that failed before its program
     /// was shown has no instance, and what a launcher declined survives the launch's rollback.
-    #[cfg(windows)]
     launch_failure: Mutex<Option<String>>,
     /// Set when the backend is retired, so a reading of the executable in progress stops.
     stopped: Arc<AtomicBool>,
@@ -1278,7 +1277,6 @@ impl CommandBackends {
     /// It belongs to the backend and not to an instance: a launch that failed before its program was
     /// shown has no instance, and what a launcher declined or what the worker refused is kept here
     /// after the launch is given back.
-    #[cfg(windows)]
     #[must_use]
     pub fn launch_failure_of(&self, prompt_generation: PromptGeneration) -> Option<String> {
         self.backends
@@ -2261,6 +2259,7 @@ async fn continue_launch(
     let registered = match admitted {
         Ok(registered) => registered,
         Err(error) => {
+            record_failure(backend, error.to_string());
             backend.roll_back();
             return Err(error);
         }
@@ -2433,13 +2432,28 @@ fn is_resumed(frame: &[u8]) -> bool {
 }
 
 /// Records why a launch did not go, on the backend that took it.
-#[cfg(windows)]
-fn failed(backend: &Backend, why: String) -> BrokerError {
+fn record_failure(backend: &Backend, why: String) {
     *backend
         .launch_failure
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why.clone());
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+}
+
+/// Records why a launch did not go, on the backend that took it, and returns it as the refusal.
+#[cfg(windows)]
+fn failed(backend: &Backend, why: String) -> BrokerError {
+    record_failure(backend, why.clone());
     BrokerError::denied(why)
+}
+
+/// The saved conversation the launch of this backend works on, where its invocation names one.
+fn saved_conversation_of(backend: &Backend) -> Option<String> {
+    backend
+        .connector
+        .integration()
+        .and_then(|declared| declared.backend.as_ref())
+        .and_then(|declared| declared.saved_conversation(&backend.invocation.typed))
+        .map(str::to_owned)
 }
 
 /// The profile one launch of this backend is recorded under.
@@ -2608,12 +2622,13 @@ async fn continue_launch(
         .prepare_launch(
             launch_profile(backend, environment_id, identity),
             idle.clone(),
-            None,
+            saved_conversation_of(backend),
         )
         .and_then(|intent| broker.execute_launch(&intent, &idle, backend.application_instance_id));
     let reservation = match reserved {
         Ok(reservation) => reservation,
         Err(error) => {
+            record_failure(backend, error.to_string());
             backend.roll_back();
             return Err(error);
         }
@@ -2901,7 +2916,7 @@ async fn admit_claimed<'a>(
     let generation = backend.prompt_generation.get();
     let profile = launch_profile(backend, environment_id, identity);
     let idle = ForegroundMark::idle(generation);
-    let intent = broker.prepare_launch(profile, idle.clone(), None)?;
+    let intent = broker.prepare_launch(profile, idle.clone(), saved_conversation_of(backend))?;
     let reservation = broker.execute_launch(&intent, &idle, backend.application_instance_id)?;
     let managed = ManagedProcess::new(
         backend.application_instance_id,

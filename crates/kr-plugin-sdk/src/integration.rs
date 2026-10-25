@@ -142,6 +142,30 @@ pub struct IntegrationBackend {
 }
 
 impl IntegrationBackend {
+    /// Returns the saved conversation a launch typed as `typed`, the command name first, works on,
+    /// where it names one.
+    ///
+    /// Listing a word as launching also says that the first bare word after it names a saved
+    /// conversation the launch works on, whatever follows that word: the identifier or the name
+    /// the application resumes it by. A launch that types no word after a launching word names
+    /// none, as one typed alone does, and so does a word that is not bare (an option, or longer
+    /// than [`MAX_SAVED_CONVERSATION_BYTES`]). The rule is the same for every launching word, one
+    /// that copies a conversation as well as one that resumes it: the package declares which words
+    /// launch, and the host does not know what an application's word means.
+    #[must_use]
+    pub fn saved_conversation<'a>(&self, typed: &'a [String]) -> Option<&'a str> {
+        let mut words = typed.iter().skip(1);
+        let launching = words.next()?;
+        if !self.launching_words.iter().any(|word| word == launching) {
+            return None;
+        }
+        let named = words.next()?.as_str();
+        (!named.is_empty()
+            && !named.starts_with('-')
+            && named.len() <= MAX_SAVED_CONVERSATION_BYTES)
+            .then_some(named)
+    }
+
     /// Returns why a launch typed as `typed`, the command name first, is not one the declaration
     /// applies to, where it is not.
     ///
@@ -188,6 +212,12 @@ impl IntegrationBackend {
         ))
     }
 }
+
+/// The longest saved conversation a launch names, in bytes.
+///
+/// A longer word is not taken for a conversation's name: the host keeps one record for each
+/// conversation a session's launches hold.
+pub const MAX_SAVED_CONVERSATION_BYTES: usize = 256;
 
 /// The longest option name a reason repeats, in bytes.
 const MAX_OPTION_NAME_BYTES: usize = 64;
@@ -982,6 +1012,39 @@ mod tests {
                 .expect("a refusal")
                 .contains("only the command typed alone")
         );
+    }
+
+    /// KR-REQ-12.05: the saved conversation a launch works on is the first bare word after a
+    /// launching word, whatever follows it, and a launch that types no such word names none.
+    #[test]
+    fn kr_req_12_05_the_saved_conversation_a_launch_names_is_the_bare_word_after_a_launching_word()
+    {
+        let declared = codex_like();
+        let backend = declared.backend.as_ref().expect("a backend");
+        let names = |words: &[&str]| backend.saved_conversation(&typed(words)).map(str::to_owned);
+        assert_eq!(
+            names(&["codex", "resume", "0198-session"]).as_deref(),
+            Some("0198-session")
+        );
+        assert_eq!(
+            names(&["codex", "fork", "0198-session"]).as_deref(),
+            Some("0198-session")
+        );
+        // A name instead of an identifier is taken as typed, and so is what follows it.
+        assert_eq!(
+            names(&["codex", "resume", "my work", "go on"]).as_deref(),
+            Some("my work")
+        );
+        // Nothing is named by a launch that types nothing there, by one that types an option
+        // there, by a word that is not a launching word, or by a word too long to be a name.
+        assert_eq!(names(&["codex"]), None);
+        assert_eq!(names(&["codex", "resume"]), None);
+        assert_eq!(names(&["codex", "resume", "--last"]), None);
+        assert_eq!(names(&["codex", "exec", "0198-session"]), None);
+        assert_eq!(names(&["codex", "0198-session", "resume"]), None);
+        assert_eq!(names(&["codex", "resume", ""]), None);
+        let long = "x".repeat(MAX_SAVED_CONVERSATION_BYTES + 1);
+        assert_eq!(names(&["codex", "resume", long.as_str()]), None);
     }
 
     #[test]

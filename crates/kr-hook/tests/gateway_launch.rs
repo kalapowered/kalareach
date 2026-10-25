@@ -771,6 +771,13 @@ fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_
         "and so was the binding"
     );
     assert_eq!(shell.broker.conversation_owner("thread-9"), Some(owner));
+    assert!(
+        shell
+            .last_launch_failure()
+            .is_some_and(|why| why.contains(&owner.to_string())),
+        "the refused launch names the execution that holds the conversation: {:?}",
+        shell.last_launch_failure()
+    );
 
     // Control: another conversation is served.
     let other = shell
@@ -796,13 +803,6 @@ fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_
     assert!(shell.broker.conversation_owner("thread-9").is_some());
 }
 
-/// KR-REQ-11.35: a connector whose table declares no tested volatile forwarding mode is served no
-/// gateway: the program runs as typed, no server is started, and nothing of the launch is left
-/// published. Control: the same package declaring the mode is served, as the cases around this one
-/// show.
-///
-/// Section 11: such a connector cannot be advertised as a resilient managed gateway, and its
-/// unchanged terminal integration remains the supported path. Not claimed: Windows, where no
 /// KR-REQ-12.05: a conversation resumed by a name stays held under that name for as long as its
 /// execution lives, after the stream has named the thread the name stands for, and the thread's
 /// identifier is held too: a second launch of either runs as typed.
@@ -846,6 +846,13 @@ fn kr_req_12_05_a_name_a_launch_resumed_by_is_held_after_the_stream_names_the_th
     }
 }
 
+/// KR-REQ-11.35: a connector whose table declares no tested volatile forwarding mode is served no
+/// gateway: the program runs as typed, no server is started, and nothing of the launch is left
+/// published. Control: the same package declaring the mode is served, as the cases around this one
+/// show.
+///
+/// Section 11: such a connector cannot be advertised as a resilient managed gateway, and its
+/// unchanged terminal integration remains the supported path. Not claimed: Windows, where no
 /// gateway runs.
 #[test]
 fn kr_req_11_35_a_connector_without_a_tested_volatile_forwarding_mode_runs_the_program_as_typed() {

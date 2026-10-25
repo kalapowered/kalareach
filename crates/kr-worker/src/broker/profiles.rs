@@ -65,12 +65,28 @@ pub struct LaunchIntent {
     pub saved_conversation: Option<String>,
 }
 
+/// The saved conversation a launch named, which its execution holds under that word.
+#[derive(Debug)]
+struct LaunchClaim {
+    /// The word the launch named it by: an identifier, or a name the application resolves.
+    word: String,
+    /// Whether the stream has named a conversation by that same word, which makes it an
+    /// identifier like any other conversation's, held while the execution is in it.
+    named_by_the_stream: bool,
+}
+
 /// The broker's launch profiles and the conversations they own.
 #[derive(Debug, Default)]
 pub struct ProfileStore {
     profiles: BTreeMap<LaunchProfileId, LaunchProfile>,
     /// Which instance owns the live execution of each saved conversation.
     conversations: BTreeMap<String, ApplicationInstanceId>,
+    /// The saved conversation each instance's launch named.
+    ///
+    /// A word the application resolves, a name, stays held for as long as the execution lives,
+    /// since the conversation it stands for is named by an identifier once the stream names it and
+    /// a second launch by the name would otherwise be taken for another conversation.
+    launch_claims: BTreeMap<ApplicationInstanceId, LaunchClaim>,
     /// The profile each instance was launched under.
     instances: BTreeMap<ApplicationInstanceId, LaunchProfileId>,
 }
@@ -133,6 +149,13 @@ impl ProfileStore {
         if let Some(conversation) = intent.saved_conversation.as_ref() {
             self.conversations
                 .insert(conversation.clone(), application_instance_id);
+            self.launch_claims.insert(
+                application_instance_id,
+                LaunchClaim {
+                    word: conversation.clone(),
+                    named_by_the_stream: false,
+                },
+            );
         }
         // Its record was written before this was called, with the instance it now runs as.
         self.keep(intent.profile.clone());
@@ -229,8 +252,12 @@ impl ProfileStore {
                 },
             ));
         }
-        self.conversations
-            .retain(|_, owner| *owner != application_instance_id);
+        if let Some(claim) = self.launch_claims.get_mut(&application_instance_id)
+            && claim.word == conversation
+        {
+            claim.named_by_the_stream = true;
+        }
+        self.free_but_what_the_launch_named(application_instance_id, Some(conversation));
         self.conversations
             .insert(conversation.to_owned(), application_instance_id);
         Ok(())
@@ -238,14 +265,31 @@ impl ProfileStore {
 
     /// Releases whatever conversation one instance owned, because it has selected none.
     pub fn leave_conversation(&mut self, application_instance_id: ApplicationInstanceId) {
-        self.conversations
-            .retain(|_, owner| *owner != application_instance_id);
+        self.free_but_what_the_launch_named(application_instance_id, None);
+    }
+
+    /// Releases the conversations an instance held, except the word its launch named while that
+    /// word is not an identifier the stream has named, or is the conversation `selected`.
+    fn free_but_what_the_launch_named(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        selected: Option<&str>,
+    ) {
+        let kept = self
+            .launch_claims
+            .get(&application_instance_id)
+            .filter(|claim| !claim.named_by_the_stream || Some(claim.word.as_str()) == selected)
+            .map(|claim| claim.word.clone());
+        self.conversations.retain(|conversation, owner| {
+            *owner != application_instance_id || kept.as_ref() == Some(conversation)
+        });
     }
 
     /// Releases the conversation an instance owned, because the instance ended.
     pub fn release(&mut self, application_instance_id: ApplicationInstanceId) {
         self.conversations
             .retain(|_, owner| *owner != application_instance_id);
+        self.launch_claims.remove(&application_instance_id);
         self.instances.remove(&application_instance_id);
     }
 
