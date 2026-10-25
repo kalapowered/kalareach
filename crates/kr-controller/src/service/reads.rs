@@ -852,8 +852,8 @@ fn closed_summary(
     }
 }
 
-/// A page of a closed session's output with its bytes withheld, as the reader is told: the range
-/// the page covered is gone.
+/// A page of retained output with its bytes withheld, as the reader is told: the range the page
+/// covered is gone.
 pub(crate) fn withheld_page(
     page: &kr_protocol::recovery::HistoryPageResult,
 ) -> kr_protocol::recovery::HistoryPageResult {
