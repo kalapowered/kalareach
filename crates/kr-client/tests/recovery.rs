@@ -577,18 +577,35 @@ impl Device {
     }
 
     /// Returns every file on this device's disk, by name, with its bytes.
+    ///
+    /// The lock a store holds beside its record is read by its length: Windows refuses a read of a
+    /// file another handle holds locked, where Unix lets any process read it, and the lock is
+    /// empty by design, so a length of nothing is the whole of what there is to read.
     fn stored(&self) -> Vec<(String, Vec<u8>)> {
         let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(self.disk.path())
             .expect("the disk")
             .map(|entry| entry.expect("an entry").path())
             .filter(|path| path.is_file())
             .map(|path| {
+                let bytes = if path
+                    .extension()
+                    .is_some_and(|extension| extension == "bundle-lock")
+                {
+                    assert_eq!(
+                        std::fs::metadata(&path).expect("its length").len(),
+                        0,
+                        "a store's lock holds nothing"
+                    );
+                    Vec::new()
+                } else {
+                    std::fs::read(&path).expect("its bytes")
+                };
                 (
                     path.file_name()
                         .expect("a name")
                         .to_string_lossy()
                         .into_owned(),
-                    std::fs::read(&path).expect("its bytes"),
+                    bytes,
                 )
             })
             .collect();
