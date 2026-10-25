@@ -5282,22 +5282,24 @@ pub(crate) mod tests {
         IsReplacedMeanwhile,
     }
 
-    /// Whether a summary is asked for the changes of a session with a live link, whose worker
-    /// treats the requests for the text of its records as `worker` says. A read of what changed
-    /// asks for the text of the page first and of the summary's interval after it.
-    async fn summary_asked_of(worker: Worker) -> usize {
+    /// How many summaries are asked for the changes of a session with a live link, and how many
+    /// requests for text its worker is sent, when the worker treats the requests as `worker` says.
+    /// A read of what changed asks for the text of the page first and of the summary's interval
+    /// after it.
+    async fn summary_asked_of(worker: Worker) -> (usize, usize) {
         let mut world = Summarised::start();
         world.record_commands(&[1_000, 1_010], true);
         let (_link, mut reader, mut writer) =
             linked(&world.temp, 1, &world.module, world.session_id).await;
         let module = Arc::clone(&world.module);
         let session_id = world.session_id;
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
         let playing = tokio::spawn(async move {
-            let mut asked = 0_usize;
             while let Ok(ControlFrame::AttentionText(request)) =
                 reader.read_message::<ControlFrame>().await
             {
-                asked += 1;
+                let asked = counted.fetch_add(1, Ordering::SeqCst) + 1;
                 let frame = match worker {
                     Worker::EndsTheLink => return,
                     Worker::CannotReadItsJournal => ControlFrame::Response(Response {
@@ -5349,7 +5351,7 @@ pub(crate) mod tests {
             .changed_through(&Stub { unaccounted: false }, &owner(), &Caller::Owner)
             .await;
         playing.abort();
-        world.asked().len()
+        (world.asked().len(), requests.load(Ordering::SeqCst))
     }
 
     /// KR-REQ-18.02: a summary is written from the text of the changes it covers, and one written
@@ -5357,18 +5359,20 @@ pub(crate) mod tests {
     /// from then on. So none is asked for while a live worker gives no answer, its link ends first,
     /// it cannot read its journal, or it is replaced as the answer is given; the next read asks
     /// again. A worker that answers, and one that refuses in a way that repeats, do not hold it back.
+    /// A worker that gave no answer to the page of changes is not asked again for the summary, so a
+    /// silent worker costs the read one wait.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_summary_is_not_asked_for_while_a_live_workers_text_is_missing_for_now() {
-        for (worker, asked) in [
-            (Worker::EndsTheLink, 0),
-            (Worker::CannotReadItsJournal, 0),
-            (Worker::IsReplacedMeanwhile, 0),
-            (Worker::Answers, 1),
-            (Worker::RefusesTheRequest, 1),
+        for (worker, summaries, requests) in [
+            (Worker::EndsTheLink, 0, 1),
+            (Worker::CannotReadItsJournal, 0, 1),
+            (Worker::IsReplacedMeanwhile, 0, 2),
+            (Worker::Answers, 1, 2),
+            (Worker::RefusesTheRequest, 1, 2),
         ] {
             assert_eq!(
                 summary_asked_of(worker).await,
-                asked,
+                (summaries, requests),
                 "a worker that {worker:?}"
             );
         }
