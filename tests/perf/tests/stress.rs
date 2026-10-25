@@ -68,7 +68,7 @@ use kr_protocol::ids::{
     RepositoryGeneration, RequestId, SessionEpoch, SessionId, SourceEventHandle,
 };
 use kr_protocol::input::{
-    InputAcquireParams, InputAcquireResult, InputWriteParams, InputWriteResult,
+    InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams, InputWriteResult,
 };
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
@@ -571,7 +571,9 @@ impl View {
             attachment_id: self.attachment_id,
             epoch,
             sequence: InputSequence::new(self.sequence),
-            bytes: Bytes::new(bytes.to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(bytes.to_vec()),
+            },
         };
         self.sequence += 1;
         within("an input write", async {
@@ -969,7 +971,9 @@ async fn keystrokes(
             attachment_id: view.attachment_id,
             epoch,
             sequence: InputSequence::new(sequence as u64),
-            bytes: Bytes::new(b"x".to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(b"x".to_vec()),
+            },
         };
         let request_id = RequestId::new((1 << 32) + sequence as u64);
         let encoded = ParamsValue::from_typed(&params)

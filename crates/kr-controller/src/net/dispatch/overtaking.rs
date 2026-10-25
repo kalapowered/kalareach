@@ -269,7 +269,9 @@ mod tests {
                 attachment_id: AttachmentId::new(Uuid::from_bytes([9; 16])),
                 epoch: InputLeaseEpoch::new(1),
                 sequence: InputSequence::new(0),
-                bytes: Bytes::new(b"x".to_vec()),
+                input: kr_protocol::input::InputContent::Bytes {
+                    bytes: Bytes::new(b"x".to_vec()),
+                },
             },
         )
     }

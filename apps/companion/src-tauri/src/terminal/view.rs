@@ -29,7 +29,7 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::hello::PACKAGE_VERSION;
 use kr_protocol::ids::{BuildId, GrantId, RequestId, SessionId};
-use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
+use kr_protocol::input::{InputAcquireParams, InputContent, InputReleaseParams, InputWriteParams};
 use kr_protocol::local::LocalBuild;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
@@ -1064,7 +1064,9 @@ impl View {
             attachment_id: self.attachment.attachment_id,
             epoch: writing.epoch,
             sequence: writing.sequence,
-            bytes: Bytes::new(bytes),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(bytes),
+            },
         };
         let Ok(params) = ParamsValue::from_typed(&params) else {
             return Some(Ending::ended("This view's input could not be written."));

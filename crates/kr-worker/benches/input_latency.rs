@@ -42,7 +42,7 @@ use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, ControllerGeneration, SessionEpoch, SessionId,
 };
-use kr_protocol::input::{InputAcquireParams, InputWriteParams, InputWriteResult};
+use kr_protocol::input::{InputAcquireParams, InputContent, InputWriteParams, InputWriteResult};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
@@ -606,7 +606,9 @@ async fn latency_samples(hosted: &Hosted) -> Result<(Vec<Duration>, record::Cond
             attachment_id,
             epoch,
             sequence: kr_protocol::ids::InputSequence::new(sequence as u64),
-            bytes: Bytes::new(b"x".to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(b"x".to_vec()),
+            },
         };
         let encoded = kr_protocol::envelope::ParamsValue::from_typed(&params)
             .map_err(|error| format!("the request did not encode: {error}"))?;
@@ -1620,7 +1622,9 @@ async fn send_key(
         attachment_id,
         epoch,
         sequence: kr_protocol::ids::InputSequence::new(*sequence),
-        bytes: Bytes::new(bytes.to_vec()),
+        input: InputContent::Bytes {
+            bytes: Bytes::new(bytes.to_vec()),
+        },
     })
     .map_err(|error| format!("the write could not be encoded: {error}"))?;
     *sequence += 1;
@@ -2075,7 +2079,9 @@ async fn write(
         attachment_id,
         epoch,
         sequence: kr_protocol::ids::InputSequence::new(*sequence),
-        bytes: Bytes::new(bytes.to_vec()),
+        input: InputContent::Bytes {
+            bytes: Bytes::new(bytes.to_vec()),
+        },
     };
     *sequence += 1;
     let outcome = client

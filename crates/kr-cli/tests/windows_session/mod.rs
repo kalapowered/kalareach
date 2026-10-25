@@ -157,7 +157,9 @@ impl WorkerTerminal {
                     attachment_id: self.attachment_id,
                     epoch: self.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\r").into_bytes()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(format!("{line}\r").into_bytes()),
+                    },
                 },
             )
             .await

@@ -754,7 +754,9 @@ impl Typist {
                     attachment_id: self.attachment_id,
                     epoch: self.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.sequence),
-                    bytes: Bytes::new(bytes.to_vec()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: Bytes::new(bytes.to_vec()),
+                    },
                 },
             )
             .await

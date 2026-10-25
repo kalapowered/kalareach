@@ -71,7 +71,7 @@ use kr_protocol::agent::AgentSubject;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
-use kr_protocol::input::InputWriteParams;
+use kr_protocol::input::{InputContent, InputWriteParams};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Bytes;
 use kr_protocol::scalars::Nullable;
@@ -6305,7 +6305,9 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                 attachment_id: screen.view.attachment_id(),
                 epoch: InputLeaseEpoch::new(1),
                 sequence: InputSequence::new(0),
-                bytes: Bytes::new(stage.build.harmless.input.as_bytes().to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(stage.build.harmless.input.as_bytes().to_vec()),
+                },
             }));
         let viewer_refusal = match &refused {
             Err(kr_client::error::ClientError::Host(error))

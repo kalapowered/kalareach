@@ -53,7 +53,7 @@ use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, EnvironmentId, InputLeaseEpoch, InputSequence, SessionEpoch,
     SessionId,
 };
-use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{
@@ -1148,7 +1148,9 @@ impl Stalling {
             attachment_id: self.attachment_id,
             epoch,
             sequence: InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+            },
         };
         let written = host.runtime.block_on(async {
             tokio::time::timeout(

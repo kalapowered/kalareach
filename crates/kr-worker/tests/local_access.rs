@@ -26,7 +26,7 @@ use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, ControllerGeneration, InputLeaseEpoch, InputSequence,
     SessionEpoch, SessionId,
 };
-use kr_protocol::input::{InputAcquireParams, InputWriteParams};
+use kr_protocol::input::{InputAcquireParams, InputContent, InputWriteParams};
 use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
@@ -382,7 +382,9 @@ impl World {
                     attachment_id,
                     epoch: InputLeaseEpoch::new(epoch),
                     sequence: InputSequence::new(sequence),
-                    bytes: Bytes::new(bytes.to_vec()),
+                    input: InputContent::Bytes {
+                        bytes: Bytes::new(bytes.to_vec()),
+                    },
                 },
             )
             .await
@@ -797,7 +799,9 @@ async fn input_waiting_for_the_session_when_the_host_restricts_its_owner_is_not_
                     attachment_id: attachment,
                     epoch: InputLeaseEpoch::new(epoch),
                     sequence: InputSequence::new(1),
-                    bytes: Bytes::new(b"kr-late".to_vec()),
+                    input: InputContent::Bytes {
+                        bytes: Bytes::new(b"kr-late".to_vec()),
+                    },
                 },
             )
             .await;

@@ -454,7 +454,9 @@ impl Host {
                     attachment_id: attached.attachment.attachment_id,
                     epoch: acquired.lease.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(0),
-                    bytes: kr_protocol::scalars::Bytes::new(line.as_bytes().to_vec()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(line.as_bytes().to_vec()),
+                    },
                 },
             )
             .await

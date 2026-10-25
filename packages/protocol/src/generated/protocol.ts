@@ -18461,21 +18461,69 @@ export interface InputWriteParams {
    */
   attachment_id: string
   /**
-   * The raw bytes. They are not decoded, re-encoded or normalised.
-   */
-  bytes: string
-  /**
    * The current input lease epoch.
    */
   epoch: string
   /**
-   * The position of these bytes in this connection's ordered input stream.
+   * What is written: raw bytes, or the console's key records.
+   */
+  input:
+    | {
+        /**
+         * The bytes.
+         */
+        bytes: string
+        kind: 'bytes'
+      }
+    | {
+        /**
+         * The records.
+         */
+        keys: ConsoleKey[]
+        kind: 'console_keys'
+      }
+  /**
+   * The position of this input in this connection's ordered input stream.
    */
   sequence: string
   /**
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * One key event the way a Windows console reports it.
+ *
+ * The six numbers of a `KEY_EVENT_RECORD`, carried as the console read them. The worker, which
+ * knows what the session's backend asked for, decides what they are spelled as; a client never
+ * invents a scan code or a spelling here.
+ */
+export interface ConsoleKey {
+  /**
+   * The console's control-key state bits.
+   */
+  control_keys: number
+  /**
+   * True when the key went down, false when it came up.
+   */
+  key_down: boolean
+  /**
+   * How many times the key repeated in this one record.
+   */
+  repeat: number
+  /**
+   * The scan code the keyboard sent, as the console reported it.
+   */
+  scan_code: number
+  /**
+   * One UTF-16 code unit. A character outside the basic plane arrives as two records, a high
+   * surrogate then a low one.
+   */
+  unicode: number
+  /**
+   * The virtual-key code.
+   */
+  virtual_key: number
 }
 /**
  * The result of `input.write`.

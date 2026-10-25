@@ -3410,7 +3410,9 @@ impl Wired {
                     attachment_id,
                     epoch,
                     sequence: kr_protocol::ids::InputSequence::new(sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+                    },
                 })
                 .expect("encodes"),
             },

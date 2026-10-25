@@ -62,7 +62,7 @@ use kr_protocol::ids::{
     StreamId,
 };
 use kr_protocol::input::{
-    InputAcquireParams, InputAcquireResult, InputWriteParams, InputWriteResult,
+    InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams, InputWriteResult,
 };
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::local::LocalClientKind;
@@ -983,7 +983,9 @@ async fn type_and_wait_for(
             epoch: acquired.lease.epoch,
             // A lease starts its ordered stream at zero, and a reconnect starts a new one.
             sequence: kr_protocol::ids::InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the input is accepted");
@@ -1068,7 +1070,9 @@ async fn the_owner_types_until(
                 attachment_id,
                 epoch: acquired.lease.epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+                input: InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+                },
             },
         )
         .await
@@ -1212,7 +1216,9 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the second command is accepted");
@@ -1228,7 +1234,9 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(2),
-            bytes: kr_protocol::scalars::Bytes::new(away.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(away.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the third batch is accepted");
@@ -1954,7 +1962,9 @@ async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_gran
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(TICKING_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(TICKING_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the loop is typed");
@@ -2291,7 +2301,9 @@ async fn a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serv
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(flag_loop(&flag).into_bytes()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(flag_loop(&flag).into_bytes()),
+            },
         })
         .await
         .expect("the loop is typed");
@@ -3445,7 +3457,9 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(spending_command().into_bytes()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(spending_command().into_bytes()),
+            },
         })
         .await
         .expect("the command is accepted");
@@ -4327,9 +4341,11 @@ async fn a_control_plane_outage_leaves_local_terminal_use_working() {
                 attachment_id,
                 epoch: lease.lease.epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: kr_protocol::scalars::Bytes::new(
-                    b"printf 'kr-%s\\n' local-use-in-an-outage\n".to_vec(),
-                ),
+                input: InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(
+                        b"printf 'kr-%s\\n' local-use-in-an-outage\n".to_vec(),
+                    ),
+                },
             },
         )
         .await
@@ -4624,7 +4640,9 @@ async fn asked_in_a_new_session(host: &Host, local: &mut LocalClient) -> Asked {
                 attachment_id,
                 epoch: lease.lease.epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: kr_protocol::scalars::Bytes::new(line.into_bytes()),
+                input: InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(line.into_bytes()),
+                },
             },
         )
         .await
@@ -5309,7 +5327,9 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
         attachment_id: attached.typing,
         epoch: old.lease.epoch,
         sequence: kr_protocol::ids::InputSequence::new(sequence),
-        bytes: kr_protocol::scalars::Bytes::new(command.as_bytes().to_vec()),
+        input: InputContent::Bytes {
+            bytes: kr_protocol::scalars::Bytes::new(command.as_bytes().to_vec()),
+        },
     };
     let mut events = session.events();
     let sent = lane.next_sequence();
@@ -5392,7 +5412,9 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
             attachment_id: attached.typing,
             epoch: new.lease.epoch,
             sequence: kr_protocol::ids::InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the new stream's first batch is accepted");
@@ -5505,9 +5527,11 @@ async fn one_responder_answers_a_query_with_a_local_and_a_remote_client_attached
             attachment_id: attached.typing,
             epoch: lease.lease.epoch,
             sequence: kr_protocol::ids::InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(
-                b"printf '\\033[c'; read -r _; printf 'kala%s-after\\n' reach\n".to_vec(),
-            ),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(
+                    b"printf '\\033[c'; read -r _; printf 'kala%s-after\\n' reach\n".to_vec(),
+                ),
+            },
         })
         .await
         .expect("the command is accepted");
@@ -5518,7 +5542,9 @@ async fn one_responder_answers_a_query_with_a_local_and_a_remote_client_attached
             attachment_id: attached.typing,
             epoch: lease.lease.epoch,
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(b"\n".to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(b"\n".to_vec()),
+            },
         })
         .await
         .expect("the line ends");
@@ -5784,7 +5810,9 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the second command is accepted");
@@ -6327,7 +6355,9 @@ async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more(
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the second command is accepted");
@@ -6405,7 +6435,9 @@ async fn kr_req_10_45_a_devices_own_grant_changes_leave_another_devices_input_le
             attachment_id: attached.typing,
             epoch: lease.lease.epoch,
             sequence: kr_protocol::ids::InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(MARKER_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(MARKER_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the first command is accepted");
@@ -6496,7 +6528,9 @@ async fn kr_req_10_45_a_devices_own_grant_changes_leave_another_devices_input_le
             attachment_id: attached.typing,
             epoch: lease.lease.epoch,
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the typist still holds its lease");
@@ -6806,7 +6840,9 @@ impl OwnerTerminal {
                     attachment_id: self.attachment_id,
                     epoch: self.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.next_sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+                    input: InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+                    },
                 },
             )
             .await

@@ -393,6 +393,16 @@ impl Call {
     }
 }
 
+/// The bytes an `input.write` carries. The view writes nothing else.
+pub fn written(asked: &kr_protocol::input::InputWriteParams) -> &[u8] {
+    match &asked.input {
+        kr_protocol::input::InputContent::Bytes { bytes } => bytes.as_slice(),
+        kr_protocol::input::InputContent::ConsoleKeys { .. } => {
+            panic!("the view wrote console keys")
+        }
+    }
+}
+
 impl Link {
     /// The next call the view makes.
     pub async fn call(&mut self) -> Call {
@@ -1251,7 +1261,7 @@ impl WorkerLease {
                 return;
             }
             self.next += 1;
-            let bytes = asked.bytes.as_slice().to_vec();
+            let bytes = written(&asked).to_vec();
             let forwarded = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             self.written.push((self.epoch, asked.sequence.get(), bytes));
             let answer = kr_protocol::input::InputWriteResult {

@@ -890,7 +890,9 @@ async fn local_input_and_stopping_owned_execution_never_depend_on_the_remote_lea
                 attachment_id: attached.attachment.attachment_id,
                 epoch: acquired.lease.epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: kr_protocol::scalars::Bytes::new(b"echo\n".to_vec()),
+                input: kr_protocol::input::InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(b"echo\n".to_vec()),
+                },
             },
         )
         .await

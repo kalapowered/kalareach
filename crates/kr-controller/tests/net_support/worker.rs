@@ -933,7 +933,9 @@ pub async fn type_into(
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
     use kr_protocol::envelope::ParamsValue;
-    use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+    use kr_protocol::input::{
+        InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
+    };
     use kr_protocol::scalars::DurationMs;
 
     let typist = super::Device::create().await;
@@ -1004,7 +1006,9 @@ pub async fn type_into(
             attachment_id,
             epoch: acquired.lease.epoch,
             sequence: kr_protocol::ids::InputSequence::new(0),
-            bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+            },
         })
         .await
         .expect("the input is accepted");
