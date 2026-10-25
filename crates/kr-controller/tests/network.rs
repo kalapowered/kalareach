@@ -2120,9 +2120,9 @@ impl Membership {
 /// Printed through format strings, so the echo of the command itself matches neither.
 fn flag_loop(flag: &Path) -> String {
     format!(
-        "while :; do printf 'kala%s-tick\\n' reach; if [ -f '{path}' ]; then \
-         printf 'kala%s-flag-%s\\n' reach \"$(cat '{path}')\"; fi; sleep 0.2; done\n",
-        path = flag.display()
+        "while :; do printf 'kala%s-tick\\n' reach; if [ -f {path} ]; then \
+         printf 'kala%s-flag-%s\\n' reach \"$(cat {path})\"; fi; sleep 0.2; done\n",
+        path = kr_worker::testing::shell_quoted(flag)
     )
 }
 
