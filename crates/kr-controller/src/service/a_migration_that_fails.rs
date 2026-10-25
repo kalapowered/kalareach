@@ -42,8 +42,9 @@ impl Drop for ReadOnly {
 }
 
 /// KR-REQ-24.18: the attention store is told apart a journal whose migration was made and failed
-/// from one that cannot be read, which it finishes with gaps that nothing repairs. The migration is
-/// made by the next look once nothing stops it, and the journal is then read.
+/// from one that cannot be read, which it finishes with gaps that nothing repairs. It keeps the
+/// session closing and tries again; the migration is made by the next try once nothing stops it, and
+/// the journal is then read to its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_journal_whose_migration_fails_is_not_taken_for_one_that_cannot_be_read() {
     let temp = TempHost::create();
@@ -74,10 +75,21 @@ async fn a_journal_whose_migration_fails_is_not_taken_for_one_that_cannot_be_rea
     );
     assert_eq!(version_of(&controller, session_id), 3);
 
-    drop(stopped);
+    // The attention store closes the session through the daemon's reach. It keeps it closing, to
+    // try again, and does not finish it with gaps that nothing repairs.
+    let attention = controller.attention();
+    attention.session_closed(&*reach, session_id).await;
     assert!(
-        matches!(reach.closed_journal(session_id), ClosedJournal::Open(_)),
-        "control: once nothing stops it the next look makes the migration and reads the journal"
+        !attention.finished_with(session_id),
+        "the store tries the journal again and does not finish the session over it"
+    );
+
+    drop(stopped);
+    // The store's next try, which its maintenance loop makes once the wait has passed.
+    attention.session_closed(&*reach, session_id).await;
+    assert!(
+        attention.finished_with(session_id),
+        "once nothing stops it the migration is made and the session is read to its end"
     );
     assert_eq!(
         version_of(&controller, session_id),

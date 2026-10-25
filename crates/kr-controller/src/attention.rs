@@ -147,7 +147,8 @@ struct Held {
 /// How many tries that find a closed session's journal failing to migrate the store makes before it
 /// finishes the session with gaps, as it does for a journal it cannot read. With the waits that
 /// grow from [`CLOSURE_RETRY`] to [`CLOSURE_RETRY_MAX`] that is about twenty minutes. The count is
-/// kept in memory and starts again with the daemon.
+/// kept in memory and starts again with the daemon. If the store cannot take the gaps that end the
+/// session, the count is kept, and the next look that finds the migration failing ends it.
 const FAILED_MIGRATION_TRIES: u32 = 10;
 
 /// How often the records of expired actions are let go of.
@@ -353,7 +354,7 @@ pub enum ClosedJournal {
     /// the session may still own it or another recovery holds it. A later look may open it.
     HeldBack,
     /// The journal is of an earlier schema, and bringing it forward was tried and failed. A later
-    /// look may succeed, and the store looks only [`FAILED_MIGRATION_TRIES`] times.
+    /// look may succeed, and the store looks only ten times.
     Failing,
     /// The journal is not there or cannot be read.
     Unreadable,
@@ -1647,8 +1648,9 @@ impl AttentionModule {
     ///
     /// Nothing is asked while the text of a change is absent for now (see [`Self::texts`]): text
     /// that no owner will ever serve leaves the change without it, but text that a later look can
-    /// read is waited for. `silent` names the sessions whose live worker did not answer the read
-    /// this belongs to, which are not asked again.
+    /// read is waited for. `silent` names the sessions whose live worker gave no usable answer to
+    /// the read this belongs to (no answer, a link that ended, or a refusal the next request may
+    /// cure), which are not asked again.
     async fn ask_for_summary(
         &self,
         reach: &dyn Reach,
@@ -1726,6 +1728,10 @@ impl AttentionModule {
     /// closed session while privacy mode is on or its cleanup of the session is owed. Each request
     /// names at most as many records as a text request carries. A worker `silent` in the read this
     /// belongs to is not asked again.
+    ///
+    /// A closed session whose journal fails to migrate is absent for now only while the store still
+    /// tries it ([`Self::finish`]); once the session is finished with gaps it reads as a journal that
+    /// cannot be read.
     ///
     /// The result says whether any text is absent for now rather than for good, which is when a
     /// summary written without it would stand for the interval from then on. Text is absent for now
@@ -2862,12 +2868,31 @@ impl AttentionModule {
                         .saturating_add(u32::from(failed));
                     let mut origins = self.origins();
                     let lifted = origins.lifted.remove(&session_id);
-                    if !lifted && failures >= FAILED_MIGRATION_TRIES {
+                    if !lifted && failed && failures >= FAILED_MIGRATION_TRIES {
                         // The migration failed on every try the store makes, so the journal is
                         // taken for one that cannot be read.
                         drop(origins);
-                        self.gaps_without_end(session_id)
-                            .and_then(|()| self.finalise(session_id))
+                        let finished = self
+                            .gaps_without_end(session_id)
+                            .and_then(|()| self.finalise(session_id));
+                        if finished.is_err() {
+                            // The store could not take the gaps: the tries are used up all the
+                            // same, and the next look ends it as soon as it finds the migration
+                            // failing, with no new set of tries.
+                            let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
+                            self.origins().held_back.insert(
+                                session_id,
+                                Held {
+                                    holds,
+                                    failures,
+                                    not_before_ms: now_ms.saturating_add(
+                                        u64::try_from(CLOSURE_RETRY.as_millis())
+                                            .unwrap_or(u64::MAX),
+                                    ),
+                                },
+                            );
+                        }
+                        finished
                     } else {
                         if lifted {
                             // A read opened the journal while this try was finding it held back:
@@ -3598,7 +3623,8 @@ struct Texts {
     /// Whether some text is absent for now rather than for good, so that a summary written
     /// without it would stand for its interval from then on.
     held_back: bool,
-    /// The sessions whose live worker gave no answer.
+    /// The sessions whose live worker gave no usable answer: none in time, the link ending first,
+    /// or a refusal the next request may cure.
     silent: BTreeSet<SessionId>,
 }
 
@@ -4944,6 +4970,8 @@ pub(crate) mod tests {
         Held,
         /// Its migration was made and failed.
         Fails,
+        /// It can be read, from the journal the reach was given.
+        Reads,
     }
 
     /// A reach whose closed journal answers each look as the script says, and then as its last
@@ -4952,6 +4980,7 @@ pub(crate) mod tests {
         script: std::sync::Mutex<std::collections::VecDeque<Look>>,
         last: std::sync::Mutex<Look>,
         looks: std::sync::atomic::AtomicUsize,
+        journal: Option<std::path::PathBuf>,
     }
 
     impl Scripted {
@@ -4962,7 +4991,14 @@ pub(crate) mod tests {
                 script: std::sync::Mutex::new(script),
                 last: std::sync::Mutex::new(last),
                 looks: std::sync::atomic::AtomicUsize::new(0),
+                journal: None,
             }
+        }
+
+        /// The journal a look that finds it readable opens.
+        fn reading(mut self, journal: std::path::PathBuf) -> Self {
+            self.journal = Some(journal);
+            self
         }
 
         fn looks(&self) -> usize {
@@ -5009,6 +5045,12 @@ pub(crate) mod tests {
             match look {
                 Look::Held => ClosedJournal::HeldBack,
                 Look::Fails => ClosedJournal::Failing,
+                Look::Reads => ClosedJournal::Open(Box::new(
+                    kr_worker::journal::Journal::open(
+                        self.journal.as_ref().expect("a journal to read"),
+                    )
+                    .expect("the journal opens"),
+                )),
             }
         }
 
@@ -5075,6 +5117,90 @@ pub(crate) mod tests {
         );
         tried_until(&module, &held_then_failing, other, &mut now, 4 * tries).await;
         assert!(module.finalised(other), "and the tenth failure ends it");
+    }
+
+    /// How many gaps with no known end the store holds for a session.
+    fn gaps_of(module: &AttentionModule, session_id: SessionId) -> usize {
+        module
+            .store()
+            .expect("the store")
+            .engine()
+            .expect("the engine")
+            .gaps()
+            .iter()
+            .filter(|gap| gap.session_id.0 == Some(session_id) && gap.to_sequence.0.is_none())
+            .count()
+    }
+
+    /// The migration that failed nine times and then can be made is a journal that is read, not one
+    /// that is given up: the session is finished from its journal and no gap is recorded. One that
+    /// fails the tenth time too is finished with gaps. The tries are the same for both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_migration_that_succeeds_on_the_last_try_is_read_and_not_given_up() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let journal = temp.environment().state_dir().join("closed.sqlite3");
+        let reach = Scripted::new(std::iter::repeat_n(Look::Fails, tries - 1).chain([Look::Reads]))
+            .reading(journal);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut now = 100_000_u64;
+
+        module.session_closed_at(&reach, session_id, now).await;
+        tried_until(&module, &reach, session_id, &mut now, tries).await;
+        assert_eq!(
+            reach.looks(),
+            tries,
+            "the tenth try is the one that can read it"
+        );
+        assert!(module.finalised(session_id));
+        assert_eq!(
+            gaps_of(&module, session_id),
+            0,
+            "it was read to its end, and not given up with gaps"
+        );
+    }
+
+    /// The tries are used up when the migration has failed the tenth time even if the store cannot
+    /// take the gaps that end the session just then: the next look that finds it failing ends it
+    /// with gaps, with no new set of tries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_that_cannot_take_the_gaps_does_not_give_the_session_new_tries() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = Scripted::new([Look::Fails]);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut now = 100_000_u64;
+
+        module.session_closed_at(&reach, session_id, now).await;
+        tried_until(&module, &reach, session_id, &mut now, tries - 1).await;
+        assert_eq!(reach.looks(), tries - 1);
+
+        // The store fails for the tenth try: a thread that held its lock panicked.
+        let poisoning = Arc::clone(&module);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoning.store.lock().expect("the store");
+            panic!("the store's holder failed");
+        })
+        .join();
+        now += u64::try_from(module.closure_retry_wait(now).as_millis()).unwrap_or(u64::MAX);
+        module.finish_again_at(&reach, now).await;
+        assert_eq!(reach.looks(), tries);
+        assert!(
+            module.origins().unfinished.contains(&session_id),
+            "the store could not take the gaps, so the session is still to be finished"
+        );
+
+        module.store.clear_poison();
+        now += u64::try_from(module.closure_retry_wait(now).as_millis()).unwrap_or(u64::MAX);
+        module.finish_again_at(&reach, now).await;
+        assert_eq!(reach.looks(), tries + 1);
+        assert!(
+            module.finalised(session_id),
+            "the next look ends it, and does not begin the tries again"
+        );
+        assert!(gaps_of(&module, session_id) > 0);
     }
 
     /// KR-REQ-18.02: a summary is not asked for while the store still tries a journal that fails to
