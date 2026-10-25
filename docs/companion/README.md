@@ -69,10 +69,9 @@ a list the bound cut short says the host holds more. The conversation reads each
 from the entry after the last one it holds, and counts what the host withheld from this device once
 however often it reads; an entry withheld after a read passed its place can go uncounted, so the
 count is a lower bound and says "at least". An agent's history goes with it when it ends, so the conversation says when
-one it was reading ended before its last entries were read. What a package shows arrives on the
-event stream, and a node already held is replaced only by a newer revision of it.
+one it was reading ended before its last entries were read. The conversation shows a package's nodes when a host sends them, and a node already held is replaced only by a newer revision of it. This host sends none: the worker reads and drops the documents a component draws, so no package node arrives on the event stream and the conversation shows none.
 
-A button that a package shows runs that package's action on the session's own worker. The call
+A button that a package shows, when a host sends the node that holds it, runs that package's action on the session's own worker. The call
 names the package that recognised the agent, the action, the agent's instance and the binding
 revision the person saw, and it carries no arguments. The worker checks the action against the
 rights this device holds. The conversation records which instance and binding revision each node
