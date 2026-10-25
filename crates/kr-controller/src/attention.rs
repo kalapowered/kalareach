@@ -354,7 +354,8 @@ pub enum ClosedJournal {
     /// the session may still own it or another recovery holds it. A later look may open it.
     HeldBack,
     /// The journal is of an earlier schema, and bringing it forward was tried and failed. A later
-    /// look may succeed, and the store looks only ten times.
+    /// look may succeed; after ten looks that found it failing the store finishes the session with
+    /// gaps. A look that finds the journal held back is not one of the ten.
     Failing,
     /// The journal is not there or cannot be read.
     Unreadable,
