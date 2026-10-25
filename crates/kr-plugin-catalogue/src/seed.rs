@@ -222,6 +222,7 @@ pub(crate) fn root_role(root: &[u8]) -> CatalogueResult<(Vec<String>, u64)> {
         serde_json::from_slice(root).map_err(|source| CatalogueError::Untrusted {
             detail: format!("a bundled root could not be read: {source}"),
         })?;
+    crate::trust::check_role_keys(&signed.signed)?;
     let role =
         signed
             .signed

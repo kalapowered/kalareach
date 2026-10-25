@@ -387,6 +387,13 @@ impl Enrolment {
             crate::budget::Stage::Actual,
             "root.json",
         )?;
+        // A root that parses is held to the rule for its keys before an owner is asked to adopt
+        // it. One that does not parse is refused by the first load, in its own words.
+        if let Ok(signed) =
+            serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&root)
+        {
+            crate::trust::check_role_keys(&signed.signed)?;
+        }
         if budgets.retained_generations.get() == 0 {
             return Err(CatalogueError::InvalidArgument {
                 detail: "a repository keeps the generation it is on, so it retains at least one \
