@@ -2445,6 +2445,82 @@ async fn device_mutation<P: serde::Serialize + ?Sized>(
     }
 }
 
+/// The event a paired device's run in `device_run` is started by.
+const DEVICE_RUN_EVENT: &str = "evt-device-capture";
+
+/// Runs a workflow as a paired device and returns the run and the status it ended with.
+///
+/// The paired ingress waits a bounded time for an effect, and then answers that it cannot say what
+/// became of it while the effect goes on. A device told so never submits the run again: it asks the
+/// host what became of it. The host keeps no receipt of a run for `action.read`, so the device
+/// reads the workflow's runs until the run its event started has ended.
+async fn device_run(
+    session: &kr_client::session::Session,
+    environment_id: EnvironmentId,
+    document: &WorkflowDefinition,
+) -> (kr_protocol::ids::WorkflowRunId, WorkflowRunStatus) {
+    let asked = session
+        .mutate(
+            Method::WorkflowRun,
+            ActionTarget::environment(environment_id),
+            None,
+            &ParamsValue::empty(),
+            &WorkflowRunParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                event_id: DEVICE_RUN_EVENT.to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+            },
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await;
+    match asked {
+        Ok(settled) => {
+            let run: WorkflowRunResult = typed(
+                settled
+                    .result()
+                    .expect("an automation mutation answers with its result"),
+            );
+            (run.run_id, run.status)
+        }
+        Err(kr_client::error::ClientError::OutcomeUnknown { .. }) => {
+            let began = std::time::Instant::now();
+            loop {
+                let read: WorkflowReadResult = session
+                    .read(
+                        Method::WorkflowRead,
+                        &WorkflowReadParams {
+                            workflow_id: Nullable::some(document.workflow_id),
+                            revision: Nullable::some(document.revision),
+                            run_id: Nullable::null(),
+                            causal_root_id: Nullable::null(),
+                        },
+                    )
+                    .await
+                    .expect("a device reads its own runs");
+                if let Some(run) = read.runs.iter().find(|run| {
+                    run.trigger_event_id == DEVICE_RUN_EVENT
+                        && run.status != WorkflowRunStatus::Pending
+                        && run.status != WorkflowRunStatus::Running
+                }) {
+                    return (run.run_id, run.status);
+                }
+                assert!(
+                    began.elapsed() < LIVENESS,
+                    "waited {} s for the run the host could not report to end",
+                    LIVENESS.as_secs()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        Err(kr_client::error::ClientError::Host(refusal)) => {
+            panic!("the host refused a device its own run: {refusal:?}")
+        }
+        Err(other) => panic!("the call did not reach the daemon: {other}"),
+    }
+}
+
 /// KR-REQ-23.52 and KR-REQ-19.04 at the paired-device ingress.
 ///
 /// The registry is walked for the automation group, and every ingress it lists for a method is
@@ -3044,23 +3120,8 @@ async fn a_workflow_under_a_paired_devices_grant_captures_under_that_grant() {
     )
     .await
     .expect("a device enables its own workflow");
-    let run: WorkflowRunResult = typed(
-        &device_mutation(
-            &session,
-            host.environment_id,
-            Method::WorkflowRun,
-            &WorkflowRunParams {
-                workflow_id: document.workflow_id,
-                revision: document.revision,
-                event_id: "evt-device-capture".to_owned(),
-                event_type: "manual".to_owned(),
-                event_payload: Nullable::null(),
-            },
-        )
-        .await
-        .expect("a device runs its own capture"),
-    );
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    let (run_id, status) = device_run(&session, host.environment_id, &document).await;
+    assert_eq!(status, WorkflowRunStatus::Completed, "{run_id:?}");
 
     let read: WorkflowReadResult = session
         .read(
@@ -3068,7 +3129,7 @@ async fn a_workflow_under_a_paired_devices_grant_captures_under_that_grant() {
             &WorkflowReadParams {
                 workflow_id: Nullable::some(document.workflow_id),
                 revision: Nullable::some(document.revision),
-                run_id: Nullable::some(run.run_id),
+                run_id: Nullable::some(run_id),
                 causal_root_id: Nullable::null(),
             },
         )
@@ -3096,7 +3157,7 @@ async fn a_workflow_under_a_paired_devices_grant_captures_under_that_grant() {
     );
     assert_eq!(
         version.version.provenance.workflow_run_id.0,
-        Some(run.run_id),
+        Some(run_id),
         "the version records the device's run"
     );
 
