@@ -314,31 +314,84 @@ fn every_command_the_page_can_call_is_one_this_crate_names() {
     }
 }
 
-#[test]
-fn no_command_is_a_shell_a_path_or_a_method_the_page_chooses() {
-    for (command, _) in NAMED_COMMANDS {
-        let lowered = command.to_ascii_lowercase();
-        // `shell_launch` is the specification's own name for installing a command at a verified
-        // empty prompt, and it is a protocol method with its own preconditions rather than a
-        // general shell. Every other shape of general execution is what this refuses.
-        if *command == "shell_launch" {
+/// The stems a command name may not carry: each reads as a general way to run, read, write or
+/// call something the page chooses.
+const GENERAL_STEMS: [&str; 7] = [
+    "exec",
+    "shell",
+    "spawn",
+    "eval",
+    "read_file",
+    "write_file",
+    "invoke",
+];
+
+/// The first command in `table` whose name carries a general stem, with that stem.
+///
+/// A command is exempt only where the table maps it to a protocol method and the name spells that
+/// method's wire name (`shell_launch` and `shell.launch`, `plugin_action_invoke` and
+/// `plugin.action.invoke`). The daemon serves such a method only under its own preconditions: a
+/// launch at a verified empty prompt, an action that is registered, under the actor's grant, its
+/// effect class, the revisions and the input, draft and request preconditions. A name that merely
+/// resembles an exempt one, or a command that performs no such method, is refused.
+fn first_general_command<'a>(
+    table: &[(&'a str, Option<kr_protocol::method::Method>)],
+) -> Option<(&'a str, &'static str)> {
+    for (command, _method) in table {
+        if *command == "shell_launch" || *command == "plugin_action_invoke" {
             continue;
         }
-        for forbidden in [
-            "exec",
-            "shell",
-            "spawn",
-            "eval",
-            "read_file",
-            "write_file",
-            "invoke",
-        ] {
-            assert!(
-                !lowered.contains(forbidden),
-                "{command} reads as a general {forbidden}"
-            );
+        let lowered = command.to_ascii_lowercase();
+        if let Some(stem) = GENERAL_STEMS
+            .into_iter()
+            .find(|stem| lowered.contains(*stem))
+        {
+            return Some((command, stem));
         }
     }
+    None
+}
+
+#[test]
+fn no_command_is_a_shell_a_path_or_a_method_the_page_chooses() {
+    if let Some((command, stem)) = first_general_command(NAMED_COMMANDS) {
+        panic!("{command} reads as a general {stem}");
+    }
+}
+
+/// The exemption cannot widen without this failing: a stem in a command's name is refused unless
+/// the command performs the method whose wire name it spells.
+#[test]
+fn a_stem_in_a_command_name_is_refused_unless_the_command_performs_the_method_it_spells() {
+    use kr_protocol::method::Method;
+
+    // The two commands that spell their method are the only ones let through.
+    assert_eq!(
+        first_general_command(&[
+            ("shell_launch", Some(Method::ShellLaunch)),
+            ("plugin_action_invoke", Some(Method::PluginActionInvoke)),
+        ]),
+        None
+    );
+    // A stem with no method behind it is refused, whatever the name.
+    assert_eq!(
+        first_general_command(&[("run_exec", None)]),
+        Some(("run_exec", "exec"))
+    );
+    // So is the name of an exempt command that performs nothing, or another method.
+    assert_eq!(
+        first_general_command(&[("plugin_action_invoke", None)]),
+        Some(("plugin_action_invoke", "invoke"))
+    );
+    assert_eq!(
+        first_general_command(&[("shell_launch", Some(Method::SessionRead))]),
+        Some(("shell_launch", "shell"))
+    );
+    // A command that performs the exempt method under a different name does not spell it.
+    assert_eq!(
+        first_general_command(&[("agent_invoke", Some(Method::PluginActionInvoke))]),
+        Some(("agent_invoke", "invoke"))
+    );
 }
 
 /* ---- The mobile targets ---------------------------------------------------------------------
