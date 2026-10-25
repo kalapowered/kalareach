@@ -3395,8 +3395,9 @@ holds and accepts the next one only under the new key. A policy the organisation
 old key is refused until the organisation signs it again. The managed service signs the policy it
 holds again under the new key, with the same settings and at a revision above every one it has
 signed, at the rotation, and again on a read that finds the policy under a key that no longer
-signs. It signs nothing when its database was restored to an earlier revision than it held: the
-policy then stays under the old key until an administrator sets it again. It serves the stored
+signs. When its authority object has noted the revision its database held and the database was
+restored to an earlier one, it signs nothing: the policy then stays under the old key until an
+administrator sets it again. It serves the stored
 policy when it cannot, so a policy it serves can still be one that a host which followed the new
 chain refuses. A host that has not followed the rotation needs the chain beside the policy:
 `kr organisation policy <policy-file> --chain <chain-file>`.
