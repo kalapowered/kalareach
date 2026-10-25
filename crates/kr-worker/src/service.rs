@@ -394,6 +394,10 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     announcement_watch: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    /// How many authority revision announcements are let by before one finds the dispatch boundary
+    /// held, which this host's own tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    announcements_before_a_held_boundary: Mutex<Option<usize>>,
 }
 
 impl WorkerService {
@@ -741,6 +745,8 @@ impl WorkerService {
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
             announcement_watch: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            announcements_before_a_held_boundary: Mutex::new(None),
         })
     }
 
@@ -1469,6 +1475,48 @@ impl WorkerService {
         reason = "it is the shipped form of a method that reads this service's own watch"
     )]
     const fn announced_inside_boundary(&self) {}
+
+    /// Has the announcement of an authority revision that comes after `others` more find the
+    /// dispatch boundary held, for this host's own tests, and no other: what an announcement meets
+    /// while a mutation, a generation another link presents or a maintenance pass is inside it.
+    ///
+    /// The worker takes the boundary itself as that announcement arrives and keeps it until it has
+    /// answered, so the announcement is refused as one is that meets a boundary someone else holds,
+    /// and the next meets it free whenever the daemon makes it. Nothing waits on a thread of the
+    /// test: which announcement is refused is decided by how many came before it.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_boundary_for_one_announcement_after(&self, others: usize) {
+        *self
+            .announcements_before_a_held_boundary
+            .lock()
+            .expect("the count is not poisoned") = Some(others);
+    }
+
+    /// Takes the boundary for the announcement that is to find it held, where one is armed.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn hold_the_boundary_for_this_announcement(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let mut armed = self
+            .announcements_before_a_held_boundary
+            .lock()
+            .expect("the count is not poisoned");
+        match armed.as_mut() {
+            Some(0) => {
+                *armed = None;
+                drop(armed);
+                Some(
+                    self.dispatch
+                        .lock()
+                        .expect("the dispatch barrier is not poisoned"),
+                )
+            }
+            Some(others) => {
+                *others -= 1;
+                None
+            }
+            None => None,
+        }
+    }
 
     /// Records one request or mutation as it arrives, for this host's own tests.
     #[cfg(feature = "testing")]
@@ -4026,6 +4074,8 @@ impl WorkerService {
                 ),
             );
         }
+        #[cfg(feature = "testing")]
+        let _held_by_a_test = self.hold_the_boundary_for_this_announcement();
         let Ok(_barrier) = self.dispatch.try_lock() else {
             #[cfg(feature = "testing")]
             self.refused_for_the_boundary

@@ -611,8 +611,14 @@ async fn a_restarted_daemon_asks_a_worker_about_the_newest_eight_revocations_onl
 
 /// KR-REQ-10.45, 09.13: a worker that refuses the walk's ask for the moment, with its dispatch
 /// boundary held, is asked again, and the walk goes on to the newest eight revisions and no older
-/// one. The case takes the worker's boundary when the walk's first ask has been answered, so that
-/// the ask after it is refused, and lets it go once the worker has refused.
+/// one.
+///
+/// The worker is told to find its boundary held by the walk's second ask and by no other: it takes
+/// the boundary itself as that ask arrives and keeps it until it has answered, so the ask made
+/// again meets it free whenever the daemon makes it. Nothing here waits for a thread of the case to
+/// wake or for a pause to pass. Another holder of the boundary (a generation another link presents,
+/// the worker's own maintenance) may refuse an ask as well; each refusal is made up for by one ask
+/// again, and the case counts them rather than expect one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemons_walk_asks_a_worker_again_that_refused_it_for_the_moment() {
     let Adopted {
@@ -624,36 +630,19 @@ async fn a_restarted_daemons_walk_asks_a_worker_again_that_refused_it_for_the_mo
     let stopped = host.shut_down().await;
 
     let service = std::sync::Arc::clone(&workers[0].service);
-    let arrived = service.announcement_inside_boundary();
-    let refused = service.refusals_for_the_boundary();
-    // The holder takes the boundary when the walk's first ask holds it, and lets it go itself as
-    // soon as the worker has refused an ask, so that the retries that follow meet it free.
-    let runtime = tokio::runtime::Handle::current();
-    let holder = std::thread::spawn({
-        let service = std::sync::Arc::clone(&service);
-        move || {
-            arrived
-                .recv_timeout(Duration::from_secs(60))
-                .expect("an announcement holds the worker's boundary");
-            // Waits for that announcement to let the boundary go, and holds it from then on.
-            let boundary = service.hold_the_dispatch_boundary();
-            runtime.block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(60),
-                    service.refused_for_the_boundary_beyond(refused),
-                )
-                .await
-                .expect("the worker refused an ask of the walk while its boundary was held");
-            });
-            drop(boundary);
-        }
-    });
+    let refused_before = service.refusals_for_the_boundary();
+    service.hold_the_boundary_for_one_announcement_after(1);
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
     host.controller()
         .what_workers_hold_is_read_back_for_tests()
         .await;
-    holder.join().expect("the holder ends");
+
+    let refused = service.refusals_for_the_boundary() - refused_before;
+    assert!(
+        refused >= 1,
+        "the walk's second ask met the boundary held and was refused"
+    );
     assert_eq!(
         revisions_asked_about(&host),
         newest_eight,
@@ -665,10 +654,10 @@ async fn a_restarted_daemons_walk_asks_a_worker_again_that_refused_it_for_the_mo
         .iter()
         .filter(|sent| sent.evidence_from == 0)
         .count();
-    assert!(
-        first_pages > newest_eight.len(),
-        "the refused ask was made again: {first_pages} first pages for {} revisions",
-        newest_eight.len()
+    assert_eq!(
+        first_pages,
+        newest_eight.len() + refused,
+        "each ask that was refused was made again once"
     );
     host.stop().await;
     drop(workers);
