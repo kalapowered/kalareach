@@ -353,7 +353,8 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
                 other => named.push(other),
             }
         }
-        if named.to_string_lossy().contains(&own) {
+        // Spelled with forward slashes, which is how `own` is written on every platform.
+        if named.to_string_lossy().replace('\\', "/").contains(&own) {
             let there = std::fs::canonicalize(&named).unwrap_or(named);
             if !there.starts_with(&here) {
                 return Some(format!("it was built from the sources at {source}"));
