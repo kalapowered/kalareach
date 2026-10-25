@@ -376,21 +376,27 @@ fn listed_after(seen: &str, label: &str) -> Vec<u32> {
 }
 
 /// KR-REQ-07.46: a new shell owns its terminal before it starts a child. The shell is made
-/// suspended inside the console and the session's job, so the first thing it reads of its console
-/// is a console with no process in it but itself, and the job holds it alone; the first program it
-/// then starts is attached to that same console and held by that same job.
+/// suspended inside the console and the session's job, so before it starts anything its console
+/// has no process in it but itself and the job holds it alone; the first program it then starts
+/// is attached to that same console and held by that same job.
 #[test]
 fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
+    // The shell does not start its child until the test has read the job, so the reading is of a
+    // job that holds the shell alone and not of one the child has joined.
+    let gate = std::env::temp_dir().join(format!("kr-owned-{}.gate", std::process::id()));
+    let _ = std::fs::remove_file(&gate);
     let (pty, mut reader, mut shell) = powershell_in_a_console(&format!(
         "{CONSOLE_LIST}\
          Write-Host -NoNewline \"kr-first=$(Get-KrConsole).kr-first-end\"; \
+         while (-not (Test-Path -LiteralPath '{gate}')) {{ Start-Sleep -Milliseconds 50 }}; \
          $child = Start-Process -PassThru -NoNewWindow -FilePath \"$env:SystemRoot/System32/PING.EXE\" \
              -ArgumentList '-n','120','127.0.0.1'; \
          $deadline = (Get-Date).AddSeconds(30); \
          while (((Get-KrConsole) -split ',') -notcontains \"$($child.Id)\" -and (Get-Date) -lt $deadline) \
              {{ Start-Sleep -Milliseconds 50 }}; \
          Write-Host -NoNewline \"kr-second=$(Get-KrConsole).kr-child=$($child.Id).kr-second-end\"; \
-         Start-Sleep -Seconds 120"
+         Start-Sleep -Seconds 120",
+        gate = gate.display()
     ));
     let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
     let job = kr_worker::windows::job::holding(root).expect("the session's job");
@@ -403,6 +409,12 @@ fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
         vec![root],
         "the console holds the root shell and nothing else before it starts a child: {first:?}"
     );
+    assert_eq!(
+        job.process_ids().expect("the job's process list"),
+        vec![root],
+        "and so does the session's job"
+    );
+    std::fs::write(&gate, b"go").expect("the shell is let go on");
 
     // After it has started one: the same console holds both, and so does the same job.
     let second = read_until(&pty, &mut reader, "kr-second-end");
@@ -424,6 +436,7 @@ fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
         shell.identity().clone(),
     ));
     shell.wait().expect("the shell ends");
+    let _ = std::fs::remove_file(&gate);
 }
 
 /// KR-REQ-07.56: a process that detaches itself from its parent as far as Windows allows is still

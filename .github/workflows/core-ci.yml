@@ -656,6 +656,14 @@ jobs:
       #     store (`kr-attention`) and the loopback listener of a sign-in (`kr-loopback`);
       #   - the repository boundary on its own, the change set's apply (`kr-changeset`'s `apply`)
       #     and the filesystem authority (`kr-transfer`'s library and `authority`);
+      #   - the end of a session and of a daemon: `kr-worker`'s `closure` (a shell that exits, one
+      #     ended from outside, and a close that is ignored until the five seconds are over) and
+      #     `controller_kill` (the control daemon ended while a session is producing output);
+      #   - the membership lease: `kr-controller`'s `grants` and `organisation` suites and five
+      #     cases of its `network` suite, which hold an expired membership to a refusal on a
+      #     connection that stays up, with a real worker;
+      #   - the recovery bundle's write record, `kr-client`'s `recovery`, and the host's events
+      #     reaching a page in a real window, `companion-tauri`'s `host_events`;
       #   - the ARM64 compile of `kr-ipc`, `kr-worker`, `kr-controller`, `kr-cli`, `kr-term` and
       #     `kr-project`, which runs nothing, and the documentation of this platform's own code.
       # "The attach client" means the part of it that runs here - `crates/kr-cli/tests/attach.rs`
@@ -1270,6 +1278,47 @@ jobs:
       - name: Test the descriptions suite
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test descriptions
+
+      # How a session's closure reaches its attachments, on this platform's console: a shell that
+      # exits, a shell ended from outside, and a close that a shell ignores until the five seconds
+      # are over. Each attachment is sent how its session ended, after the output it was owed.
+      - name: Test how a session's closure reaches its attachments
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-worker --test closure
+
+      # The control daemon ended while a session is producing output. Its worker was started
+      # through the environment's scheduled task, so it is in no job the daemon was in, and goes
+      # on: the terminal attached to it keeps its output, and a replacement daemon finds it live.
+      - name: Test the daemon ended during output
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-worker --test controller_kill
+
+      # The decision a membership lease gives: an expired membership blocks organisation-mediated
+      # reads and mutations whatever the transport does, and a personal grant on a host that is
+      # exclusively organisation-managed answers to a lease.
+      - name: Test the decisions a membership lease gives
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller --test grants --test organisation
+
+      # An organisation member's device on a connection that stays up: once its membership lease
+      # has run out, a read and a mutation are refused, a running subscription ends, and the local
+      # owner of an exclusively managed host is held to a lease at the worker and at the daemon.
+      # The cases start a real worker, so they are ignored in an ordinary run.
+      - name: Test an expired membership on a live connection
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller --test network -- --ignored --exact a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serves_the_device_again a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_once_its_lease_ends an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at_the_daemon ending_exclusive_management_serves_the_local_owner_without_a_lease_and_turning_it_on_closes_it_again a_shorter_renewal_ends_the_local_owners_access_at_the_worker_when_the_new_lease_does
+
+      # The recovery bundle's write record, which a store holds an exclusive lock beside for as long
+      # as it is open: a second store for one bundle is refused here as on the other platforms.
+      - name: Test the recovery bundle store and its write record
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-client --test recovery
+
+      # The host's events reaching a page in a real window: WebView2 loads the page, which listens
+      # through the event API and says what it heard.
+      - name: Test the host's events reaching a real window
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p companion-tauri --test host_events
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
       # each daemon starts its workers through the environment's scheduled task, as the shipping
