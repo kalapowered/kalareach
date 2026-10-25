@@ -123,6 +123,16 @@ async fn kr_req_11_21_a_request_the_connector_leaves_to_its_component_becomes_th
     assert_eq!(entry.plugin_id, package());
     assert_eq!(entry.binding_id, binding(1));
     assert_eq!(
+        entry.package_digest,
+        kr_protocol::scalars::Digest256::from_bytes([5; 32]),
+        "the hash the decoding package was installed under"
+    );
+    assert_eq!(
+        Some(entry.source_generation.get()),
+        world.broker().component_generation(binding(1)),
+        "the generation of the source the decoder read is the instance's"
+    );
+    assert_eq!(
         entry.projection.schema_version,
         kr_worker::broker::connectors::component_schema()
     );
@@ -140,6 +150,11 @@ async fn kr_req_11_21_a_request_the_connector_leaves_to_its_component_becomes_th
     assert_eq!(offered, [("allow", "Allow"), ("deny", "Deny")]);
     let sent = frame.to_string();
     assert_eq!(entry.source_bytes.as_slice(), sent.as_bytes());
+    assert_eq!(
+        entry.source_digest,
+        kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(sent.as_bytes())),
+        "the digest names the bytes the decoder read"
+    );
 
     // The component was given the request as the broker recorded it, and decoded it once.
     let account = world.raw_account(1).await.expect("the component answers");
@@ -744,4 +759,85 @@ async fn kr_req_11_33_the_action_that_answers_an_approval_is_answered_by_the_com
     let answers = answers_to(&world, 81);
     assert_eq!(answers.len(), 1, "{answers:?}");
     assert!(!answers[0].contains("via"), "{}", answers[0]);
+}
+
+/// KR-REQ-11.25: a binding that holds no trust to decode reads no request into an approval,
+/// whatever component it ships. The request stays the opaque one it was, the rich answer to it is
+/// refused, the component is not asked and the binding's report counts nothing as not decoded, and
+/// the terminal answers the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_25_a_binding_without_decoding_trust_reads_no_request_and_the_rich_answer_is_refused()
+ {
+    let Some(world) = Observing::start(Options::with(vec![Spec::observer(1)])).await else {
+        return;
+    };
+    world.until_ready(1).await;
+    world.send(&request(95));
+    let recorded = until("the request to be recorded", || async {
+        resource_for(&world, "95")
+    })
+    .await;
+    // The upstream's frames are read in order, so the terminal's round trip is answered after the
+    // request has been recorded and given to whoever decodes it.
+    world.terminal.round_trip(96).await;
+    assert!(
+        !resource_for(&world, "95")
+            .expect("the request is recorded")
+            .interpretation_verified
+    );
+    let mut owner = world.owner().await;
+    let outcome = world
+        .respond(&mut owner, recorded.resource_id, "allow")
+        .await;
+    failed_with(&outcome);
+    assert!(answers_to(&world, 95).is_empty());
+    assert!(
+        !world.reason(1).contains("not decoded"),
+        "no request was given to the component: {}",
+        world.reason(1)
+    );
+    world.terminal.write(&answer(95)).await;
+    until_answered(&world, 95).await;
+}
+
+/// KR-REQ-11.26: a request whose conversation changed while it waited for its decode is not given
+/// to the component: it was made in a generation the instance has left. The request made after the
+/// change is decoded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_26_a_request_of_a_generation_the_instance_has_left_is_not_given_to_the_component()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let queue = world.broker().decode_queue();
+    let hold = queue.hold();
+    world.send(&request(97));
+    until("the request to be queued for its decode", || async {
+        (queue.len() == 1).then_some(())
+    })
+    .await;
+    world
+        .broker()
+        .advance_binding(
+            instance(),
+            Some(kr_protocol::ids::AgentThreadId::new("thread-3").expect("a thread")),
+            kr_protocol::scalars::TimestampMs::new(9),
+        )
+        .expect("the terminal selects another conversation");
+    hold.release();
+
+    world.send(&request(98));
+    approved(&world, "98").await;
+    assert!(
+        resource_for(&world, "97").is_none_or(|resource| !resource.interpretation_verified),
+        "a request of the conversation that was left became an approval"
+    );
+    let account = world.raw_account(1).await.expect("the component answers");
+    assert!(
+        account.starts_with("decode=1;"),
+        "the component was given the request of the conversation that was left: {account}"
+    );
 }
