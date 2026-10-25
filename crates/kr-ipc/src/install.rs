@@ -2147,8 +2147,7 @@ impl Store {
             let path = entry.path();
             // Whatever is in the trash that is not a plain directory is taken away as a name: a
             // junction there would otherwise lead the removal into the directory it names.
-            let is_directory =
-                std::fs::symlink_metadata(&path).is_ok_and(|about| about.file_type().is_dir());
+            let is_directory = true;
             let _ = if is_directory {
                 remove_tree(&path)
             } else {
