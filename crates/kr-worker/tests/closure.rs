@@ -953,8 +953,12 @@ async fn a_root_shell_ended_from_outside_closes_its_session_and_is_not_started_a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_forces_what_ignores_it_only_after_five_seconds_and_records_the_final_status() {
     use kr_ipc::identity::{ProcessState, process_state};
-    use kr_worker::session::{DRAIN_PERIOD, GRACE_PERIOD};
 
+    /// The grace section 7 gives an owned process between the request to stop and force, and the
+    /// time it lets output drain after the owned processes have stopped. They are the specification's
+    /// figures, not the worker's constants, so a worker whose constants drift fails here.
+    const GRACE_PERIOD: Duration = Duration::from_secs(5);
+    const DRAIN_PERIOD: Duration = Duration::from_secs(2);
     /// What the worker is allowed beyond the drain to be scheduled and write the record.
     const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
     /// How often the shell is looked for, and so how close to a moment a sample speaks for it.
