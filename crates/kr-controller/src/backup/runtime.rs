@@ -511,6 +511,7 @@ impl Shared {
                 tokio::select! {
                     () = signals.work.notified() => {}
                     () = signals.fence.notified() => {}
+                    () = signals.person.notified() => {}
                 }
             }
             Wait::Timed {
@@ -521,6 +522,7 @@ impl Shared {
                     () = timer.sleep(duration) => {}
                     () = signals.work.notified() => {}
                     () = signals.fence.notified() => {}
+                    () = signals.person.notified() => {}
                 }
             }
             Wait::Timed {
@@ -530,6 +532,7 @@ impl Shared {
                 tokio::select! {
                     () = timer.sleep(duration) => {}
                     () = signals.fence.notified() => {}
+                    () = signals.person.notified() => {}
                 }
             }
             Wait::Owed { until, duration } => {
@@ -843,13 +846,14 @@ impl BackupRuntime {
         self.shared.signals.work.notify_one();
     }
 
-    /// Tells the carrier to look again now, and returns when the first pass that begins after this
-    /// call has ended. What was written down before the call is what that pass reads, so whatever
-    /// the call is made for has been tried once when it returns. A carrier held by a delay the
-    /// service asked for begins its next pass when the delay has passed, and this waits for it.
+    /// Tells the carrier to look again now, whatever it is waiting for but a delay the service
+    /// asked for, and returns when the first pass that begins after this call has ended. What was
+    /// written down before the call is what that pass reads, so whatever the call is made for has
+    /// been tried once when it returns. A carrier held by a delay the service asked for begins its
+    /// next pass when the delay has passed, and this waits for it.
     pub async fn carry_now(&self) {
         let first = *self.shared.begun.borrow() + 1;
-        self.shared.signals.work.notify_one();
+        self.shared.signals.person.notify_one();
         let mut ended = self.shared.passes.subscribe();
         // The sender goes with the runtime, and a runtime that is gone carries nothing.
         let _ = ended.wait_for(|ended| *ended >= first).await;

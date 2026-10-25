@@ -324,6 +324,11 @@ pub struct BackupSignals {
     /// Something that can change what the producer does happened: a setup was committed, a fence
     /// was released, a generation finished or ciphertext left the disk.
     pub produce: Notify,
+    /// A person asked for a deletion to be sent now, or the fence it waited under came down. It
+    /// ends every wait the carrier makes except the delay the service itself asked for, the wait
+    /// after a failure too: asking again is how a person tries again, and a backoff is not theirs
+    /// to sit out.
+    pub person: Notify,
 }
 
 impl BackupService {
@@ -991,6 +996,7 @@ impl BackupService {
             self.store()
                 .release_fence(fence_generation.get(), resumed_generation.get(), now_ms)?;
         self.signals.work.notify_one();
+        self.signals.person.notify_one();
         self.signals.produce.notify_one();
         Ok(released)
     }
