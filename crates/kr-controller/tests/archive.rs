@@ -1213,7 +1213,7 @@ async fn a_record_of_a_boot_that_cannot_be_compared_or_none_at_all_stops_nothing
     }
 }
 
-/// A record that names an earlier boot of this boot's own kind says the worker went with that boot:
+/// KR-REQ-24.18: a record that names an earlier boot of this boot's own kind says the worker went with that boot:
 /// nothing is stopped, since no process of one boot runs in another, and nothing is listed as
 /// surviving, since nothing outlives a boot. The pass says so, and the closure can give the host's
 /// restart as the reason.
