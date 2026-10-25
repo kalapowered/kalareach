@@ -2652,6 +2652,28 @@ impl Journal {
         actor_id: &ActorId,
         observation: &ActionObservation,
     ) -> Result<Receipt> {
+        self.record_observation_settling(actor_id, observation, None, None)
+    }
+
+    /// Records one observation as [`Self::record_observation`] does, and writes what the evidence
+    /// settled whole when it settles the receipt.
+    ///
+    /// An applied receipt keeps no failure: the error of a receipt is for a refusal, a rejection
+    /// or an outcome nobody can establish, and the outcome has been established. `result` is the
+    /// mutation's result an applied receipt keeps, and `refusal` the failure a refused one does;
+    /// both are written with the state in the one transaction, and neither is used when the
+    /// observation settles nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::record_observation`].
+    pub fn record_observation_settling(
+        &mut self,
+        actor_id: &ActorId,
+        observation: &ActionObservation,
+        result: Option<&[u8]>,
+        refusal: Option<ProtocolError>,
+    ) -> Result<Receipt> {
         let receipt = self
             .read(actor_id.clone(), observation.action_id)?
             .ok_or_else(|| {
@@ -2698,6 +2720,30 @@ impl Journal {
                 WorkerError::InvalidArgument(format!("receipt transition refused: {error}"))
             })?;
             receipt.updated_at_ms = observation.observed_at_ms;
+            match state {
+                ReceiptState::Applied => {
+                    receipt.error = Nullable::null();
+                    if let Some(result) = result {
+                        transaction
+                            .execute(
+                                "INSERT INTO results (actor_id, action_id, result)
+                                 VALUES (?1, ?2, ?3)
+                                 ON CONFLICT (actor_id, action_id)
+                                 DO UPDATE SET result = excluded.result",
+                                params![
+                                    receipt.actor_id.as_str(),
+                                    receipt.action_id.get().as_bytes().as_slice(),
+                                    result
+                                ],
+                            )
+                            .map_err(|error| faulted(&self.health, error))?;
+                    }
+                }
+                ReceiptState::Refused if refusal.is_some() => {
+                    receipt.error = Nullable(refusal);
+                }
+                _ => {}
+            }
             write_state(&self.health, &transaction, &receipt)?;
             advanced = Some(append_event(&self.health, &transaction, &receipt)?);
         }

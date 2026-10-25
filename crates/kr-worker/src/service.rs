@@ -5196,17 +5196,37 @@ impl WorkerService {
     /// may have reached the upstream is. The bound is this worker's own: an upstream that has not
     /// answered by then leaves an outcome nobody can establish, which section 9 records as unknown
     /// rather than as a refusal the caller would read as "nothing happened".
-    async fn finish_upstream(&self, pending: PendingUpstream) -> ControlFrame {
+    async fn finish_upstream(self: &Arc<Self>, pending: PendingUpstream) -> ControlFrame {
         // Everything the broker settles happens on this task, and the resource an answer resolves
         // is settled before the receipt is recorded and before the caller hears: at the deadline,
         // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
         let deadline = tokio::time::Instant::now() + self.upstream_deadline();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
-        let outcome = handoff.carry(deadline).await;
-        off_the_executor(|| {
-            self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
+        let (revision, operation) = (
+            handoff.admitted.binding_revision(),
+            handoff.admitted.operation(),
+        );
+        let (outcome, late) = handoff.carry(deadline).await;
+        let settled = off_the_executor(|| {
+            self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref())
         });
+        // An outcome nobody could establish is settled by the upstream's answer if one comes
+        // later, matched to the operation by the identifier it was sent under. The claim is made
+        // after the receipt says unknown, so the answer is read against that state whenever it
+        // came.
+        if settled == Some(kr_protocol::receipt::ReceiptState::Unknown)
+            && let Some(late) = late
+        {
+            let operation = LateOperation {
+                actor_id: pending.actor_id.clone(),
+                action_id: pending.action_id,
+                name: operation.as_str().to_owned(),
+                revision,
+                request: late.upstream_request_id().clone(),
+            };
+            self.watch_late(operation, &late);
+        }
         // The offer is reported from what the receipt now says: applied is accepted, a refusal the
         // upstream proved is a failure, and anything else is unknown.
         if let Some(claim) = claim {
@@ -5245,12 +5265,10 @@ impl WorkerService {
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
         outcome: std::result::Result<&ParamsValue, &WorkerError>,
-    ) {
+    ) -> Option<kr_protocol::receipt::ReceiptState> {
         let now = kr_ipc::now_ms();
         let mut session = self.runtime.session();
-        let Some(journal) = session.journal_mut() else {
-            return;
-        };
+        let journal = session.journal_mut()?;
         let settled = match outcome {
             // The upstream answered and this is what it said. Nothing earlier than its own
             // acknowledgement reaches here: a queue that took the bytes and a socket that wrote
@@ -5283,12 +5301,107 @@ impl WorkerService {
                 now,
             ),
         };
-        if let Err(failure) = settled {
-            session.note_journal_failure(&failure);
-        }
+        let state = match &settled {
+            Ok(receipt) => Some(receipt.state),
+            Err(failure) => {
+                session.note_journal_failure(failure);
+                None
+            }
+        };
         // Privacy mode is prospective: the content this receipt carries goes where it settles.
         if session.privacy().is_enabled() {
             session.redact_settled_action(actor_id, action_id);
+        }
+        state
+    }
+
+    /// Waits for the upstream's answer to an operation whose receipt says unknown, and records it
+    /// as the evidence it is.
+    ///
+    /// The answer is matched to the operation by the identifier this host sent it under, which is
+    /// correlation evidence the receipt contract lets settle an unknown outcome. A connection that
+    /// ends first ends the wait, and nothing is recorded. The task holds the service weakly, so a
+    /// session that has gone is not kept alive by an answer that never comes.
+    fn watch_late(self: &Arc<Self>, operation: LateOperation, late: &crate::broker::LateHandle) {
+        use crate::broker::LateClaim;
+
+        match late.claim() {
+            LateClaim::Ready(verdict) => {
+                off_the_executor(|| self.record_late(&operation, &verdict));
+            }
+            LateClaim::Refused => {}
+            LateClaim::Waiting(answer) => {
+                let service = Arc::downgrade(self);
+                tokio::spawn(async move {
+                    let Ok(verdict) = answer.await else {
+                        return;
+                    };
+                    if let Some(service) = service.upgrade() {
+                        off_the_executor(|| service.record_late(&operation, &verdict));
+                    }
+                });
+            }
+        }
+    }
+
+    /// Records what the upstream's late answer to an operation said, beside the operation's
+    /// receipt, which the evidence settles when the contract lets it.
+    fn record_late(&self, operation: &LateOperation, verdict: &crate::broker::LateVerdict) {
+        use crate::broker::LateVerdict;
+        use kr_protocol::action::{ActionObservation, ObservationProvenance, ObservedResult};
+
+        let observation = ActionObservation {
+            action_id: operation.action_id,
+            provenance: ObservationProvenance::UpstreamCorrelation,
+            subject: format!("{}:{}", operation.name, operation.request),
+            subject_revision: Nullable::some(U64::new(operation.revision.get())),
+            source_cursor: Nullable::null(),
+            claimed_result: match verdict {
+                LateVerdict::Applied => ObservedResult::Applied,
+                LateVerdict::Refused(_) => ObservedResult::Refused,
+                LateVerdict::Failed => ObservedResult::Indeterminate,
+            },
+            observed_at_ms: kr_ipc::now_ms(),
+        };
+        // What an applied receipt keeps is what the on-time path keeps for the operation: the
+        // identifier it was sent under, and the provenance. A late answer is not read for a turn.
+        let result = matches!(verdict, LateVerdict::Applied)
+            .then(|| {
+                encode(&kr_protocol::agent::AgentMutationResult {
+                    binding_revision: operation.revision,
+                    provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                    upstream_request_id: Nullable::some(operation.request.clone()),
+                    turn_id: Nullable::null(),
+                })
+                .ok()
+                .map(|value| kr_cbor::encode(value.as_value()))
+            })
+            .flatten();
+        let refusal = match verdict {
+            LateVerdict::Refused(detail) => Some(
+                WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused {
+                    detail: detail.clone(),
+                })
+                .to_protocol_error(),
+            ),
+            _ => None,
+        };
+        let mut session = self.runtime.session();
+        let Some(journal) = session.journal_mut() else {
+            return;
+        };
+        match journal.record_observation_settling(
+            &operation.actor_id,
+            &observation,
+            result.as_deref(),
+            refusal,
+        ) {
+            Ok(_) => {
+                if session.privacy().is_enabled() {
+                    session.redact_settled_action(&operation.actor_id, operation.action_id);
+                }
+            }
+            Err(failure) => session.note_journal_failure(&failure),
         }
     }
 
@@ -10702,6 +10815,19 @@ pub struct PendingUpstream {
     handoff: Box<UpstreamHandoff>,
 }
 
+/// An operation whose receipt says unknown and whose upstream answer may still come.
+#[derive(Debug)]
+struct LateOperation {
+    actor_id: ActorId,
+    action_id: kr_protocol::ids::ActionId,
+    /// The operation's name, which the observation's subject begins with.
+    name: String,
+    /// The binding revision the operation was admitted at.
+    revision: kr_protocol::ids::AgentBindingRevision,
+    /// The identifier the operation was sent to the upstream under.
+    request: kr_protocol::ids::UpstreamRequestId,
+}
+
 /// What a connection's loop waits for next.
 enum Next {
     /// A frame the peer sent.
@@ -10870,12 +10996,28 @@ impl UpstreamHandoff {
     /// deadline this stops waiting for that call or for the upstream, and an answer's claim, which
     /// never left this task, leaves its resource uncertain before this returns; whatever the
     /// transport does afterwards settles nothing.
-    async fn carry(self, deadline: tokio::time::Instant) -> Result<ParamsValue> {
+    async fn carry(
+        self,
+        deadline: tokio::time::Instant,
+    ) -> (Result<ParamsValue>, Option<crate::broker::LateHandle>) {
+        let mut late = None;
+        let outcome = self.carry_with(deadline, &mut late).await;
+        (outcome, late)
+    }
+
+    /// Does what [`Self::carry`] does, and leaves in `late` what claims the upstream's answer to
+    /// the operation if it comes after this has stopped waiting for it.
+    async fn carry_with(
+        self,
+        deadline: tokio::time::Instant,
+        late: &mut Option<crate::broker::LateHandle>,
+    ) -> Result<ParamsValue> {
         let now = kr_ipc::now_ms();
         match self.kind {
             UpstreamKind::Mutation => {
                 let taken = self.broker.take_mutation(&self.admitted)?;
                 let pending = submit_within(taken.transmission(), deadline).await?;
+                *late = pending.late_handle();
                 let flight = taken.submitted(pending);
                 encode(&within(deadline, flight.settled()).await??)
             }
@@ -10886,6 +11028,7 @@ impl UpstreamHandoff {
             UpstreamKind::PluginAction => {
                 let taken = self.broker.take_plugin_action(&self.admitted)?;
                 let pending = submit_within(taken.transmission(), deadline).await?;
+                *late = pending.late_handle();
                 let flight = taken.submitted(pending);
                 encode(&within(deadline, flight.settled()).await??)
             }

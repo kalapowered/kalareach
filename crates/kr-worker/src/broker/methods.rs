@@ -166,7 +166,12 @@ pub struct UpstreamOutcome {
 /// different facts, and a transport that answered the first as though it were the third would let
 /// a receipt say `applied` for an operation that never left this host. So a transport answers with
 /// this, and what comes back from it is what the upstream actually did.
-pub struct PendingTransmission(Flight);
+pub struct PendingTransmission {
+    flight: Flight,
+    /// What an operation that was given up on claims the upstream's answer with, where the
+    /// transport can say one came late.
+    late: Option<crate::broker::duplex::LateHandle>,
+}
 
 enum Flight {
     /// The transport has already done everything it is going to do.
@@ -177,7 +182,7 @@ enum Flight {
 
 impl core::fmt::Debug for PendingTransmission {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match &self.0 {
+        match &self.flight {
             Flight::Settled(outcome) => formatter
                 .debug_tuple("PendingTransmission::Settled")
                 .field(outcome)
@@ -191,7 +196,10 @@ impl PendingTransmission {
     /// A transport that has already finished with this operation.
     #[must_use]
     pub const fn settled(outcome: Result<UpstreamOutcome>) -> Self {
-        Self(Flight::Settled(outcome))
+        Self {
+            flight: Flight::Settled(outcome),
+            late: None,
+        }
     }
 
     /// A transport that will say what the upstream did once it knows.
@@ -199,7 +207,24 @@ impl PendingTransmission {
     pub fn carried(
         work: impl core::future::Future<Output = Result<UpstreamOutcome>> + Send + 'static,
     ) -> Self {
-        Self(Flight::Carried(Box::pin(work)))
+        Self {
+            flight: Flight::Carried(Box::pin(work)),
+            late: None,
+        }
+    }
+
+    /// Says what an operation that is given up on claims the upstream's late answer with.
+    #[must_use]
+    pub fn with_late(mut self, late: crate::broker::duplex::LateHandle) -> Self {
+        self.late = Some(late);
+        self
+    }
+
+    /// Returns what an operation that is given up on claims the upstream's late answer with,
+    /// where the transport has one.
+    #[must_use]
+    pub fn late_handle(&self) -> Option<crate::broker::duplex::LateHandle> {
+        self.late.clone()
     }
 
     /// Waits for the transport to say what the upstream did.
@@ -210,7 +235,7 @@ impl PendingTransmission {
     /// that did not go, one that went in part and one the upstream never answered; section 11
     /// forbids opening a second backend or replaying an unknown request instead.
     pub async fn outcome(self) -> Result<UpstreamOutcome> {
-        match self.0 {
+        match self.flight {
             Flight::Settled(outcome) => outcome,
             Flight::Carried(work) => work.await,
         }

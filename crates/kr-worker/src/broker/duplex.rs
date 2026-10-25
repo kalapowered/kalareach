@@ -790,8 +790,10 @@ struct Outstanding {
     next: AtomicU64,
     /// How long, in milliseconds, the upstream has to answer one operation after it was written.
     acknowledgement_ms: AtomicU64,
-    waiting:
-        std::sync::Mutex<BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<UpstreamReply>>>,
+    /// The operations waiting for an answer, and what has become of the answers nobody was waiting
+    /// for. One lock holds all of it, so that an answer is delivered to exactly one of the
+    /// waiter, a claim and the table of answers that came late.
+    waiting: std::sync::Mutex<Waiters>,
     /// The requests the native client made, by the identifier this host sent them under.
     ///
     /// The client mints its own identifiers and so does the upstream, so a client request is
@@ -817,6 +819,91 @@ impl Default for Outstanding {
     }
 }
 
+/// How many answers that came after their operation was given up on are kept for it to claim, and
+/// how many claims wait for an answer that has not come: each is bounded on its own, per
+/// connection. Past it the oldest kept answer goes, and a claim is refused, which leaves an
+/// operation's receipt unknown, as it was.
+pub const MAX_LATE_ANSWERS: usize = 16;
+
+/// The longest detail of an upstream's refusal that is kept with a late answer, in bytes.
+const MAX_LATE_DETAIL_BYTES: usize = 256;
+
+/// What an upstream's answer to one operation of this host's said, as the receipt needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LateVerdict {
+    /// The upstream answered with a result: it acted on the operation.
+    Applied,
+    /// The upstream answered with an error that says the frame was never a call it could make, so
+    /// it did not act on it.
+    Refused(String),
+    /// The upstream answered with an error that says the operation failed and not that it did not
+    /// happen.
+    Failed,
+}
+
+impl LateVerdict {
+    fn of(reply: &UpstreamReply) -> Self {
+        match reply.refusal.clone().map(UpstreamFailure::into_failure) {
+            None => Self::Applied,
+            Some(BrokerError::UpstreamRefused { detail }) => {
+                let kept = detail.floor_char_boundary(MAX_LATE_DETAIL_BYTES.min(detail.len()));
+                Self::Refused(detail[..kept].to_owned())
+            }
+            Some(_) => Self::Failed,
+        }
+    }
+}
+
+/// The operations waiting for an answer, and the answers nobody was waiting for.
+#[derive(Debug, Default)]
+struct Waiters {
+    /// The operations that wait for their answer, by the identifier they were sent under.
+    waiting: BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<UpstreamReply>>,
+    /// What the answers to operations this host sent said, oldest first, kept for the operation
+    /// that was given up on to claim.
+    answered: std::collections::VecDeque<(UpstreamRequestId, LateVerdict)>,
+    /// The operations given up on that wait for their answer to come.
+    claimed: BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<LateVerdict>>,
+}
+
+/// What claiming the answer to an operation that was given up on found.
+#[derive(Debug)]
+pub enum LateClaim {
+    /// The upstream had already answered, and this is what it said.
+    Ready(LateVerdict),
+    /// The upstream has not answered. If it does, its answer comes here; if the connection ends
+    /// first, nothing does.
+    Waiting(tokio::sync::oneshot::Receiver<LateVerdict>),
+    /// This connection already holds as many claims as it keeps. The operation stays unknown.
+    Refused,
+}
+
+/// One operation of this host's, sent under an identifier of this connection: what an operation
+/// that was given up on uses to claim the upstream's answer if it comes.
+///
+/// It belongs to the connection it was made on, so an identifier of the same text on another
+/// connection can never reach it.
+#[derive(Clone, Debug)]
+pub struct LateHandle {
+    outstanding: Arc<Outstanding>,
+    id: UpstreamRequestId,
+}
+
+impl LateHandle {
+    /// Claims the answer to this operation: what the upstream said if it has said it, else a
+    /// receiver for what it says. Each operation claims once.
+    #[must_use]
+    pub fn claim(&self) -> LateClaim {
+        self.outstanding.claim(&self.id)
+    }
+
+    /// The identifier the operation was sent under.
+    #[must_use]
+    pub fn upstream_request_id(&self) -> &UpstreamRequestId {
+        &self.id
+    }
+}
+
 impl Outstanding {
     /// How long the upstream has to answer one operation after it was written.
     fn acknowledgement(&self) -> std::time::Duration {
@@ -825,7 +912,16 @@ impl Outstanding {
 
     /// Mints the next identifier in this host's own namespace.
     fn allocate(&self) -> Result<UpstreamRequestId> {
-        let next = self.next.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        // The last number is never given twice: past it nothing is sent.
+        let next = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(1)
+            })
+            .map_err(|_| {
+                BrokerError::invalid("this connection has used every request identifier it has")
+            })?
+            + 1;
         // It is written in its own JSON form, as a string, so an upstream that echoes it back
         // returns the same identifier and nothing this host minted can equal a bare number the
         // upstream minted.
@@ -842,7 +938,7 @@ impl Outstanding {
     /// Nothing about this connection grows because a reply never came.
     fn expect(self: &Arc<Self>, id: &UpstreamRequestId) -> Waiting {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.held().insert(id.clone(), sender);
+        self.held().waiting.insert(id.clone(), sender);
         Waiting {
             outstanding: Arc::clone(self),
             id: id.clone(),
@@ -851,16 +947,78 @@ impl Outstanding {
     }
 
     /// Gives one reply to whatever is waiting for it, and says whether anything was.
+    ///
+    /// What the reply said is kept as well, for the operation to claim if it gave up on the reply
+    /// before it came: the operation's own wait may still be open when the worker stops waiting
+    /// for it, and may have ended in the same moment the reply was delivered to it. The waiter, the
+    /// claim and the kept answer are decided under one lock, so an answer is never lost between
+    /// them.
     fn answer(&self, reply: UpstreamReply) -> bool {
-        let Some(waiting) = self.held().remove(&reply.upstream_request_id) else {
-            return false;
-        };
-        waiting.send(reply).is_ok()
+        let mut held = self.held();
+        let id = reply.upstream_request_id.clone();
+        let verdict = LateVerdict::of(&reply);
+        let claimed = held
+            .claimed
+            .remove(&id)
+            .is_some_and(|claim| claim.send(verdict.clone()).is_ok());
+        // Only an identifier this connection has sent under is kept: an upstream that answered an
+        // identifier it was never sent has nothing to say about an operation.
+        if !claimed && self.issued(&id) {
+            if held.answered.len() >= MAX_LATE_ANSWERS {
+                held.answered.pop_front();
+            }
+            held.answered.push_back((id.clone(), verdict));
+        }
+        let awaited = held
+            .waiting
+            .remove(&id)
+            .is_some_and(|waiting| waiting.send(reply).is_ok());
+        awaited || claimed
+    }
+
+    /// Returns true when this host has sent a request under this identifier.
+    fn issued(&self, id: &UpstreamRequestId) -> bool {
+        serde_json::from_str::<serde_json::Value>(id.as_str())
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .and_then(|text| text.strip_prefix(HOST_REQUEST_PREFIX))
+                    .and_then(|number| number.parse::<u64>().ok())
+            })
+            .is_some_and(|number| number >= 1 && number <= self.next.load(Ordering::Relaxed))
+    }
+
+    /// Claims the upstream's answer to an operation that was given up on.
+    ///
+    /// The answer the upstream already gave is returned. Otherwise the answer is sent to the claim
+    /// when it comes. Each operation claims once.
+    fn claim(&self, id: &UpstreamRequestId) -> LateClaim {
+        let mut held = self.held();
+        if let Some(at) = held.answered.iter().position(|(seen, _)| seen == id)
+            && let Some((_, verdict)) = held.answered.remove(at)
+        {
+            return LateClaim::Ready(verdict);
+        }
+        if held.claimed.len() >= MAX_LATE_ANSWERS || held.claimed.contains_key(id) {
+            return LateClaim::Refused;
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        held.claimed.insert(id.clone(), sender);
+        LateClaim::Waiting(receiver)
+    }
+
+    /// Lets go of every claim and every kept answer, because the connection is ending: nothing the
+    /// upstream says afterwards is read.
+    fn end_claims(&self) {
+        let mut held = self.held();
+        held.claimed.clear();
+        held.answered.clear();
     }
 
     /// Forgets one identifier, for a request that will never be answered.
     fn forget(&self, id: &UpstreamRequestId) {
-        self.held().remove(id);
+        self.held().waiting.remove(id);
     }
 
     /// Records that one identifier this host minted carries a request of the client's.
@@ -927,12 +1085,7 @@ impl Outstanding {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn held(
-        &self,
-    ) -> std::sync::MutexGuard<
-        '_,
-        BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<UpstreamReply>>,
-    > {
+    fn held(&self) -> std::sync::MutexGuard<'_, Waiters> {
         self.waiting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -955,7 +1108,14 @@ impl Waiting {
     async fn within(mut self, deadline: std::time::Duration) -> Option<UpstreamReply> {
         match tokio::time::timeout(deadline, &mut self.reply).await {
             Ok(Ok(reply)) => Some(reply),
-            Ok(Err(_)) | Err(_) => None,
+            Ok(Err(_)) => None,
+            Err(_) => {
+                // The wait ends under the lock an answer is delivered under, and the channel is
+                // read once more after it: an answer that came as the time ran out is read, and
+                // one that comes after is kept for a claim.
+                self.outstanding.forget(&self.id);
+                self.reply.try_recv().ok()
+            }
         }
     }
 }
@@ -1683,6 +1843,10 @@ impl Dispatch {
                 counted.failed(outcome);
             }
         };
+        let late = LateHandle {
+            outstanding: Arc::clone(&self.outstanding),
+            id: upstream_request_id.clone(),
+        };
         Ok(detached(async move {
             if let Some(refusal) = queued.delivered().await.refusal() {
                 failed(MetricOutcome::Unavailable);
@@ -1714,7 +1878,8 @@ impl Dispatch {
                 turn_id: named.or(turn_id),
                 provenance: ActionProvenance::UpstreamTypedRpc,
             })
-        }))
+        })
+        .with_late(late))
     }
 
     /// Returns true when this connection's upstream sender has been closed.
@@ -2124,6 +2289,7 @@ impl Duplex {
         // Given up while the client end is still taking frames, so the terminal is actually told
         // about the requests this connection is ending with rather than told into a closed end.
         self.abandon_client_requests("this connection ended before the upstream answered");
+        self.outstanding.end_claims();
         self.ends.upstream.close();
         self.ends.client.close();
     }
@@ -3833,5 +3999,115 @@ mod tests {
             failures_counted(&broker),
             vec![(Adapter::Codex, MetricOutcome::Timeout, 1)]
         );
+    }
+
+    /// An answer to one operation of this host's, as the upstream's reader hands it over.
+    fn upstream_answer(id: &UpstreamRequestId, refusal: Option<UpstreamFailure>) -> UpstreamReply {
+        UpstreamReply {
+            upstream_request_id: id.clone(),
+            body: serde_json::json!({}),
+            refusal,
+        }
+    }
+
+    /// KR-REQ-09.05: an answer that came before its operation claimed it is read by the claim, and
+    /// an answer that comes after is sent to it; each says what the upstream said.
+    #[test]
+    fn kr_req_09_05_a_claim_reads_the_answer_whether_it_came_before_or_after() {
+        let outstanding = Outstanding::default();
+        let early = outstanding.allocate().expect("an identifier");
+        let late = outstanding.allocate().expect("an identifier");
+
+        assert!(!outstanding.answer(upstream_answer(&early, None)));
+        let LateClaim::Ready(verdict) = outstanding.claim(&early) else {
+            panic!("the answer that came first is kept for the claim");
+        };
+        assert_eq!(verdict, LateVerdict::Applied);
+
+        let LateClaim::Waiting(mut receiver) = outstanding.claim(&late) else {
+            panic!("an operation the upstream has not answered waits");
+        };
+        let refusal = UpstreamFailure {
+            code: -32_602,
+            message: "invalid params".to_owned(),
+        };
+        assert!(outstanding.answer(upstream_answer(&late, Some(refusal))));
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("the answer is sent to the claim"),
+            LateVerdict::Refused("invalid params".to_owned())
+        );
+    }
+
+    /// KR-REQ-09.05: an operation that is still waiting and has a claim registered is told once and
+    /// its claim is told once; an answer to an identifier this connection never sent under is read
+    /// by nobody.
+    #[test]
+    fn kr_req_09_05_a_waiter_and_a_claim_are_each_told_and_a_stranger_is_not_kept() {
+        let outstanding = Arc::new(Outstanding::default());
+        let id = outstanding.allocate().expect("an identifier");
+        let mut waiting = outstanding.expect(&id);
+        let LateClaim::Waiting(mut claim) = outstanding.claim(&id) else {
+            panic!("the claim waits for the answer");
+        };
+        assert!(outstanding.answer(upstream_answer(&id, None)));
+        assert_eq!(
+            claim.try_recv().expect("the claim is told"),
+            LateVerdict::Applied
+        );
+        assert!(
+            waiting.reply.try_recv().is_ok(),
+            "and so is the operation's own wait"
+        );
+
+        let never_sent =
+            UpstreamRequestId::new("\"kr-99\"".to_owned()).expect("a valid identifier");
+        assert!(!outstanding.answer(upstream_answer(&never_sent, None)));
+        let LateClaim::Waiting(_) = outstanding.claim(&never_sent) else {
+            panic!("an answer to an identifier nobody sent is not kept");
+        };
+    }
+
+    /// KR-REQ-09.05: what a connection keeps for late claims is bounded: past the bound the oldest
+    /// answer goes and a claim is refused, and a connection that ends keeps and waits for nothing.
+    #[test]
+    fn kr_req_09_05_the_answers_and_claims_a_connection_keeps_are_bounded_and_end_with_it() {
+        let outstanding = Outstanding::default();
+        let ids = (0..=MAX_LATE_ANSWERS)
+            .map(|_| outstanding.allocate().expect("an identifier"))
+            .collect::<Vec<_>>();
+        for id in &ids {
+            outstanding.answer(upstream_answer(id, None));
+        }
+        assert!(
+            matches!(outstanding.claim(&ids[0]), LateClaim::Waiting(_)),
+            "the oldest answer was dropped at the bound"
+        );
+        assert!(matches!(
+            outstanding.claim(&ids[MAX_LATE_ANSWERS]),
+            LateClaim::Ready(_)
+        ));
+
+        // The claim above is one; fill the rest and then ask for one more.
+        let mut receivers = Vec::new();
+        for _ in 1..MAX_LATE_ANSWERS {
+            let id = outstanding.allocate().expect("an identifier");
+            let LateClaim::Waiting(receiver) = outstanding.claim(&id) else {
+                panic!("a claim within the bound waits");
+            };
+            receivers.push(receiver);
+        }
+        let over = outstanding.allocate().expect("an identifier");
+        assert!(matches!(outstanding.claim(&over), LateClaim::Refused));
+
+        outstanding.end_claims();
+        for mut receiver in receivers {
+            assert!(
+                receiver.try_recv().is_err(),
+                "a connection that ended tells no claim anything"
+            );
+        }
+        assert!(matches!(outstanding.claim(&ids[1]), LateClaim::Waiting(_)));
     }
 }
