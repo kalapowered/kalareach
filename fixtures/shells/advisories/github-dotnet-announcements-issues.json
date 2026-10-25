@@ -1,0 +1,1261 @@
+[
+ {
+  "number": 445,
+  "title": "Microsoft Security Advisory CVE-2026-102870 | ASP.NET Core Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:04Z",
+  "updated_at": "2026-10-13T18:26:04Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 446,
+  "title": "Microsoft Security Advisory CVE-2026-105016 | Microsoft QUIC Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:09Z",
+  "updated_at": "2026-10-13T18:26:09Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 447,
+  "title": "Microsoft Security Advisory CVE-2026-58280 | .NET and Visual Studio Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:14Z",
+  "updated_at": "2026-10-13T18:26:14Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 448,
+  "title": "Microsoft Security Advisory CVE-2026-66822 | .NET and Visual Studio Information Disclosure Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:19Z",
+  "updated_at": "2026-10-13T18:26:19Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 449,
+  "title": "Microsoft Security Advisory CVE-2026-69651 | .NET and Visual Studio Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:25Z",
+  "updated_at": "2026-10-13T18:26:25Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 450,
+  "title": "Microsoft Security Advisory CVE-2026-70007 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:30Z",
+  "updated_at": "2026-10-13T18:26:30Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 451,
+  "title": "Microsoft Security Advisory CVE-2026-70035 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:35Z",
+  "updated_at": "2026-10-13T18:26:35Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 452,
+  "title": "Microsoft Security Advisory CVE-2026-70159 | ASP.NET Core Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:41Z",
+  "updated_at": "2026-10-15T21:44:01Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n\nV1.1 (10/15/2026): Removed Microsoft.AspNetCore.SignalR.Core, which was incorrectly listed as an affected package.\n"
+ },
+ {
+  "number": 453,
+  "title": "Microsoft Security Advisory CVE-2026-70161 | .NET SDK Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:46Z",
+  "updated_at": "2026-10-13T18:26:46Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 454,
+  "title": "Microsoft Security Advisory CVE-2026-70162 | .NET Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:51Z",
+  "updated_at": "2026-10-13T18:26:51Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 455,
+  "title": "Microsoft Security Advisory CVE-2026-70165 | .NET SDK Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:26:56Z",
+  "updated_at": "2026-10-13T18:26:56Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 456,
+  "title": "Microsoft Security Advisory CVE-2026-70174 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:01Z",
+  "updated_at": "2026-10-13T18:27:01Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 457,
+  "title": "Microsoft Security Advisory CVE-2026-70175 | ASP.NET Core Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:07Z",
+  "updated_at": "2026-10-13T18:27:07Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 458,
+  "title": "Microsoft Security Advisory CVE-2026-70179 | ASP.NET Core Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:13Z",
+  "updated_at": "2026-10-13T18:27:13Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 459,
+  "title": "Microsoft Security Advisory CVE-2026-70181 | ASP.NET Core Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:19Z",
+  "updated_at": "2026-10-13T18:27:19Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 460,
+  "title": "Microsoft Security Advisory CVE-2026-70183 | ASP.NET Core Security Feature Bypass Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:26Z",
+  "updated_at": "2026-10-13T18:27:26Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 461,
+  "title": "Microsoft Security Advisory CVE-2026-70186 | ASP.NET Core Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:32Z",
+  "updated_at": "2026-10-13T18:27:32Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 462,
+  "title": "Microsoft Security Advisory CVE-2026-70188 | ASP.NET Core Security Feature Bypass Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:39Z",
+  "updated_at": "2026-10-13T18:27:39Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 463,
+  "title": "Microsoft Security Advisory CVE-2026-70190 | .NET SDK Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:45Z",
+  "updated_at": "2026-10-13T18:27:45Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 464,
+  "title": "Microsoft Security Advisory CVE-2026-70194 | .NET and Visual Studio Security Feature Bypass Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:51Z",
+  "updated_at": "2026-10-13T18:27:51Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 465,
+  "title": "Microsoft Security Advisory CVE-2026-70196 | ASP.NET Core Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:27:57Z",
+  "updated_at": "2026-10-13T18:27:57Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 466,
+  "title": "Microsoft Security Advisory CVE-2026-70197 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:17Z",
+  "updated_at": "2026-10-13T18:28:17Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 467,
+  "title": "Microsoft Security Advisory CVE-2026-83520 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:22Z",
+  "updated_at": "2026-10-13T18:28:22Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 468,
+  "title": "Microsoft Security Advisory CVE-2026-84008 | .NET Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:27Z",
+  "updated_at": "2026-10-13T18:28:27Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 469,
+  "title": "Microsoft Security Advisory CVE-2026-85363 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:31Z",
+  "updated_at": "2026-10-13T18:28:31Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 470,
+  "title": "Microsoft Security Advisory CVE-2026-85790 | .NET Information Disclosure Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 9.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:36Z",
+  "updated_at": "2026-10-14T15:39:05Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 471,
+  "title": "Microsoft Security Advisory CVE-2026-87697 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:41Z",
+  "updated_at": "2026-10-13T18:28:41Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 472,
+  "title": "Microsoft Security Advisory CVE-2026-88092 | ASP.NET Core Security Feature Bypass Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:47Z",
+  "updated_at": "2026-10-13T18:28:47Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 473,
+  "title": "Microsoft Security Advisory CVE-2026-92707 | ASP.NET Core Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:53Z",
+  "updated_at": "2026-10-13T18:28:53Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 474,
+  "title": "Microsoft Security Advisory CVE-2026-96222 | .NET Spoofing Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:28:57Z",
+  "updated_at": "2026-10-13T18:28:57Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 475,
+  "title": "Microsoft Security Advisory CVE-2026-96224 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:02Z",
+  "updated_at": "2026-10-13T18:29:02Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 476,
+  "title": "Microsoft Security Advisory CVE-2026-96225 | .NET and Visual Studio Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:07Z",
+  "updated_at": "2026-10-13T18:29:07Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 477,
+  "title": "Microsoft Security Advisory CVE-2026-96229 | .NET and Visual Studio Information Disclosure Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:11Z",
+  "updated_at": "2026-10-13T18:29:11Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 478,
+  "title": "Microsoft Security Advisory CVE-2026-96230 | ASP.NET Core Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:17Z",
+  "updated_at": "2026-10-13T18:29:17Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 479,
+  "title": "Microsoft Security Advisory CVE-2026-96231 | .NET and Visual Studio Elevation of Privilege Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:22Z",
+  "updated_at": "2026-10-13T18:29:22Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 480,
+  "title": "Microsoft Security Advisory CVE-2026-96232 | .NET and Visual Studio Information Disclosure Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:27Z",
+  "updated_at": "2026-10-13T18:29:27Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 481,
+  "title": "Microsoft Security Advisory CVE-2026-96233 | .NET and Visual Studio Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:32Z",
+  "updated_at": "2026-10-13T18:29:32Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 482,
+  "title": "Microsoft Security Advisory CVE-2026-96234 | .NET and Visual Studio Information Disclosure Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:37Z",
+  "updated_at": "2026-10-13T18:29:37Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 483,
+  "title": "Microsoft Security Advisory CVE-2026-96235 | .NET and Visual Studio Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:42Z",
+  "updated_at": "2026-10-13T18:29:42Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 484,
+  "title": "Microsoft Security Advisory CVE-2026-96236 | ASP.NET Core Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:47Z",
+  "updated_at": "2026-10-13T18:29:47Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 485,
+  "title": "Microsoft Security Advisory CVE-2026-96237 | .NET SDK Remote Code Execution Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:52Z",
+  "updated_at": "2026-10-13T18:29:52Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 486,
+  "title": "Microsoft Security Advisory CVE-2026-96238 | .NET SDK Security Feature Bypass Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:29:57Z",
+  "updated_at": "2026-10-13T18:29:57Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 487,
+  "title": "Microsoft Security Advisory CVE-2026-96957 | .NET SDK Security Feature Bypass Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:30:01Z",
+  "updated_at": "2026-10-13T18:30:01Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 488,
+  "title": "Microsoft Security Advisory CVE-2026-96958 | .NET and Visual Studio Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:30:06Z",
+  "updated_at": "2026-10-13T18:30:06Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 489,
+  "title": "Microsoft Security Advisory CVE-2026-96959 | .NET and Visual Studio Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:30:12Z",
+  "updated_at": "2026-10-13T18:30:12Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ },
+ {
+  "number": 490,
+  "title": "Microsoft Security Advisory CVE-2026-96960 | .NET and Visual Studio Denial of Service Vulnerability",
+  "state": "open",
+  "labels": [
+   {
+    "name": "Security"
+   },
+   {
+    "name": "Patch-Tuesday"
+   },
+   {
+    "name": ".NET 8.0"
+   },
+   {
+    "name": ".NET 9.0"
+   },
+   {
+    "name": ".NET 10.0"
+   },
+   {
+    "name": ".NET 11.0"
+   }
+  ],
+  "created_at": "2026-10-13T18:30:18Z",
+  "updated_at": "2026-10-13T18:30:18Z",
+  "author_association": "NONE",
+  "body": "### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"
+ }
+]
