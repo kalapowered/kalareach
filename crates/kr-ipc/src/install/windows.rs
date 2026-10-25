@@ -655,9 +655,7 @@ fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
 /// Returns the operating system's error when a program has a file open or runs from it
 /// ([`is_in_use`] holds for it), and otherwise the first refusal, which no program caused.
 pub(super) fn remove_tree(root: &Path) -> io::Result<()> {
-    if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
-        return remove_name(root);
-    }
+    let _ = std::fs::symlink_metadata(root)?;
     let mut left = Left::default();
     remove_directory(root, &mut left);
     left.into_result()
@@ -724,11 +722,6 @@ fn remove_directory(directory: &Path, left: &mut Left) -> bool {
 /// Returns the operating system's error for a program that runs from the file, which
 /// [`is_in_use`] knows, and an error without that code for any other refusal.
 fn remove_name(path: &Path) -> io::Result<()> {
-    if let Ok(about) = std::fs::metadata(path) {
-        let mut permissions = about.permissions();
-        permissions.set_readonly(false);
-        let _ = std::fs::set_permissions(path, permissions);
-    }
     let denied =
         |error: &io::Error| error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed());
     match delete_name(path) {
