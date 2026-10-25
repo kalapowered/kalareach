@@ -1882,8 +1882,28 @@ The encoding is `CSI Vk;Sc;Uc;Kd;Cs;Rc_` (a final underscore, not an APC string)
 virtual key, the scan code the console reported, one UTF-16 code unit, the key-down flag, the
 control-key state and the repeat count, with all six fields written every time. A reader fills in
 `0,0,0,0,0,1` for any that were omitted. Nothing decodes a record and encodes it again with a scan
-code this host chose. A client that sends no records sends legacy VT input, which is accepted
-without any claim about scan-code fidelity.
+code this host chose. A client that sends bytes sends legacy VT input, which is accepted without
+any claim about scan-code fidelity.
+
+A client that has records sends them as they are. `input.write` takes its input in one of two forms,
+`bytes` or `console_keys`, and `console_keys` is a list of records with the six numbers each. The
+worker spells them, under the lock that accepts the write, as its own backend asked. While the
+backend has asked for records, each goes out in the encoding above. While it has not, the worker
+sends what a terminal doing the translation would have sent: the text, the control code the console
+made for a key held with Control, and the key's own sequence otherwise, with the arrows in the form
+the application's DEC mode 1 asks for. That spelling comes from the one encoder every client uses.
+It sends nothing for a key coming up, since legacy input cannot say so, and nothing for a key it has
+no spelling for, such as a function key past F12, because another key would be wrong. A batch of
+key-ups alone is accepted and forwards no bytes.
+
+The choice is made from the state the last batch of the application's output left, which the
+session publishes before it delivers that batch, so a write that follows output a person has seen is
+spelled under what that output set. While the application has negotiated `modifyOtherKeys` or the
+Kitty keyboard protocol, the legacy spelling would be a different key from the one pressed (Ctrl and
+I would reach it as a tab), so a `console_keys` write is refused with `INPUT_INCOMPATIBLE` and
+nothing is written. Records that the backend asked for are sent as they are in any keyboard state.
+What a write spells is held to the size of one input frame, 64 KiB, and a write refused for its
+size or for the encoding takes no sequence number.
 
 What a console inside the session does (`wsl.exe`, an `ssh` client or a nested ConPTY) happens on
 the boundary between that console and the one this worker owns, below this host: what arrives here
@@ -1891,14 +1911,13 @@ is whatever the owned console chose to send, and what this host records is that.
 *client's* console to the modes it had before an attachment is the attach client's own saved mode
 words, and that is what a detach writes back.
 
-**What the console path does not do.** The console reader and the encoder exist and are tested, and
-the worker selects the ConPTY backend so that a mode request from its own console is recorded rather
-than ignored. There is no transport between them: the session protocol carries input as bytes, so a
-local attach client on Windows sends bytes rather than typed key records, and the worker does not
-choose the encoding per client. A session therefore runs on the legacy VT path. Nothing reports that
-at runtime: the engine tracks which fidelity the backend asked for and the reader knows which one it
-is reading, but no receipt, diagnostic or client message carries either answer, so this page is where
-the limit is stated.
+**What the console path does not do.** The Windows attach client sends bytes. It reads the console as
+a byte stream, and it declares a terminal profile only from `TERM`, which a Windows console does not
+set, so it asks for no input lease on its own. The record reader is in the client and is tested, and
+the attach loop does not call it. A session attached from a Windows console therefore runs on the
+legacy VT path whatever its backend asked for. Nothing reports the fidelity at run time: the engine
+tracks which one the backend asked for and the worker spells records accordingly, but no receipt,
+diagnostic or client message carries the answer, so this page is where the limit is stated.
 
 **The standalone start, and signing out.** The standalone start on Windows is one scheduled task
 per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the
@@ -2432,6 +2451,11 @@ Three things that look like input are not: a focus event, a passive scrollback r
 window that is doing nothing all leave the lease exactly where it was. So does the host's own reply
 to a question the application asked, which travels on the same path to the terminal and is not a
 lease event.
+
+`input.write` has two forms of input, and a lease keeps both in one ordered stream. `bytes` is what a
+client has already spelled, forwarded as it is. `console_keys` is a Windows console's key records,
+which the worker spells for the terminal (see the win32 input mode paragraphs). Both go through the
+same paste recogniser, so a write of either form keeps its place among the others on the lease.
 
 What reaches the terminal is not a record of what was typed. `input.write` is an ordered stream
 rather than an admitted action, so no receipt, intent or result is written for a keystroke and
