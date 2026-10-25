@@ -880,6 +880,14 @@
     },
     {
       "scope": "state_root",
+      "path": "conversation-claims-1",
+      "reason": "the locks that keep two launches of one saved conversation apart, across the sessions of the user; empty files named by the digest of the conversation's word, which the workers of every release that carries them open alike",
+      "children": [],
+      "opaque": true,
+      "databases": false
+    },
+    {
+      "scope": "state_root",
       "path": "entry-locks",
       "reason": "the locks that keep two writers of one startup file apart; empty files",
       "children": [],
