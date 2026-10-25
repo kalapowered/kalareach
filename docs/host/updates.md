@@ -557,24 +557,37 @@ next update.
 
 Each file of a release is read-only by attribute. Each file and directory also carries an entry
 that denies its owner the rights that write it (adding a file or a subdirectory, writing,
-appending, deleting, deleting a child), because the read-only attribute of a directory does not stop
-new names. A release is removed by renaming it out of `versions\`, resetting the entries of each
+appending, writing extended attributes or attributes, deleting, deleting a child), because the
+read-only attribute of a directory does not stop new names. A release is removed by renaming it out of `versions\`, resetting the entries of each
 directory and deleting the tree. The deletion follows no junction. It deletes a file as a name,
 through a handle, and changes nothing else about the file: a file of the release that is a second
 name for a file outside it goes as a name, and the file outside keeps its contents, its attribute
-and its entries. The one exception is a file that carries the seal's entries. Deleting a read-only
-file needs the right to change attributes, which those entries deny the owner, so the removal resets
-them first, and a file outside that is a second name for such a file has them reset with it.
+and its entries. The one exception is a file whose list begins with the seal's own entry, the
+denial of the owner-rights principal. Deleting a read-only file needs the right to change
+attributes, which that entry denies the owner, so the removal resets the list first; a file outside
+that is a second name for such a file has its list reset with it. A list that denies the right and
+does not begin so is somebody else's: it is left as it is, the removal reports it, and the release
+stays in `trash\`. Each directory is held open with a share mode that lets nobody rename or delete
+it while its names are removed, so a directory swapped for a junction meanwhile leads the removal
+nowhere.
 
 A program that runs from a file keeps it: the rest of the release is deleted, and what is left
 stays in `trash\` until an update finds the program ended. A refusal that no program caused, such as
-entries the owner cannot reset, is reported and is not taken for a program.
+entries the owner cannot reset, is not taken for a program: `kr host update` says it in its words
+and lists it under `not_removed` in its `--json` document.
 
 ### The archive
 
 The archive is read before any signature is checked, so it is held to bounds first and nothing is
 written until every entry has been looked at: at most 50,000 entries, 8 GiB in all and 2 GiB for one
-file. An archive is refused whole when it has an entry that is a link or a device, that is encrypted
+file. The reader is given the archive's directory only after it has been judged here: the end
+record is the last 22 bytes of the file, with no comment and no 64-bit form, the directory is
+exactly the bytes before it (at most 64 MiB), holding that many entries one after another, each
+with a name of at most 1,024 bytes, at most 1,024 bytes of extra data and no comment, and no other
+end record or locator lies in it. The reader is shown those bytes and zeros for the rest of the
+file until it has its list of entries, so it has no other record to follow. The archive a release is
+packed into has this shape; any other is refused. A name has at most 32 parts. An archive is refused
+whole when it has an entry that is a link or a device, that is encrypted
 or compressed in a way a release is not, or that is named twice, or whose name Windows would read as
 another (an absolute, drive or UNC path, a `..`, a device name such as `CON`, an alternate data
 stream, a trailing dot or space, or two names that differ only in case). A file is read for no more
@@ -604,10 +617,12 @@ with exit 9, before it stops anything, and names the one that fails, unless all 
   repairs it. A task that belongs to another environment or account defers too, and the message says
   so; that command refuses to replace it, and it has to be removed first.
 
-The daemon states those three variables and no others, so they are the only ones held to the
-account's. The rest of a replacement's environment is the account's, as it is the starting command's
-on the other platforms: `PATH`, `APPDATA`, the proxy variables, `SystemRoot` and the session
-variables. They move what a capability probe finds, where a relay check goes and what a session
+Of the variables a daemon states, those three are the ones that decide where a Windows daemon keeps
+something: its roots are its arguments, and the others it states (`TMPDIR` and the `XDG_` variables)
+are read on Unix only. Nothing else of its environment is stated, so those three are the only ones
+held to the account's. The rest of a replacement's environment is the account's, as it is the
+starting command's on the other platforms: `PATH`, `APPDATA`, the proxy variables, `SystemRoot` and
+the session variables. They move what a capability probe finds, where a relay check goes and what a session
 starts with, and a daemon started by hand with a different one of them is replaced by one without
 it. `KR_SHELL_PACKAGES` makes a daemon of an installed release refuse to start, so a daemon the
 update replaces never has it.
