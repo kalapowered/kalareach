@@ -654,9 +654,10 @@ A request published to a feed carries an announcement for the host. Native code 
 computer's stored-envelope key to the host's, and the service places it in the host's mailbox beside
 the request. The host reads its mailbox, finds the announcement and reads the feed at once instead
 of at its next poll. The announcement says that the feed changed and nothing about what changed. It
-expires 55 minutes after it is sealed. The service refuses a change whose announcement expires more
-than an hour after the service's own clock, and it admits a request signed up to five minutes ahead
-of that clock, so a longer expiry would let a computer with a fast clock lose the whole revocation.
+expires 55 minutes after it is sealed. The service declines an announcement that expires more than
+an hour after the service's own clock and commits the change without it, and it admits a request
+signed up to five minutes ahead of that clock, so a longer expiry would let a computer with a fast
+clock lose the announcement, and the host would read the feed at its next poll instead of at once.
 A request whose announcement cannot be sealed is published without one.
 
 The host announces back. When it acknowledges a request, it places an announcement that the feed

@@ -1035,11 +1035,12 @@ reader keeps its own storage, transport and wait, and honours the delay a servic
 
 `services::authority` also seals the announcement a caller places beside a feed change
 (`FeedAnnouncement::sealed_for`). Its payload is empty, and it expires 55 minutes after it is sealed.
-The service refuses the whole change when an announcement expires more than an hour after the
-service's own clock, and it admits a signed request whose time is up to five minutes ahead of that
-clock. An expiry of 55 minutes therefore stays within the service's bound for any sender whose
-request the service admits, as long as the sender seals the announcement on the clock that signs
-the request, no later than it signs it.
+The service declines an announcement that expires more than an hour after the service's own clock:
+it commits the change, places no announcement, and reports the announcement as declined beside the
+change. It admits a signed request whose time is up to five minutes ahead of that clock. An expiry
+of 55 minutes therefore stays within the service's bound for any sender whose request the service
+admits, as long as the sender seals the announcement on the clock that signs the request, no later
+than it signs it.
 
 `services::http` is the exchange underneath them: `HttpService` addresses one gateway origin, which
 it compares as a parsed scheme, host and port before it makes contact, and refuses an address that

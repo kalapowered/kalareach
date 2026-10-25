@@ -471,11 +471,11 @@ is in force and its key is recorded. It makes one when the acknowledgement tells
 new: the first acknowledgement, or a change in how many of the host's sessions have confirmed the
 revocation. A request left pending is therefore not announced on every pass. A refusal carries no
 announcement, because the service takes none on one, and the owner learns of a refusal from the
-feed. The service places an announcement after the change has committed, so one it declines leaves
-the acknowledgement as it was. A service that reads an announcement as invalid refuses the whole
-acknowledgement instead: the carrier stops that pass at the record and seals a new announcement
-when it acknowledges the record again. The host and the companion open what they find in their own
-mailboxes by the same rules, which live in the client library.
+feed. The service places an announcement after the change has committed, so one it declines, for
+whatever reason, leaves the acknowledgement as it was and is reported beside it. When the service
+refuses the whole acknowledgement, the carrier stops that pass at the record and seals a new
+announcement when it acknowledges the record again. The host and the companion open what they find
+in their own mailboxes by the same rules, which live in the client library.
 
 The daemon reads the mailbox when it starts and every ten seconds after that. It takes an item only
 if the item opens against the stored-envelope key of a device the host has paired and whose pairing
