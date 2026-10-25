@@ -187,28 +187,22 @@ pub fn forward_is_safe_for_a_terminal(forward: &[u8]) -> Vec<Violation> {
 }
 
 /// Checks one control sequence for a question, and returns where it ends.
+///
+/// NUL and DEL inside the sequence are padding a terminal discards, so the sequence goes on past
+/// them.
 fn scan_csi(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
     let mut end = at + 2;
-    while forward
-        .get(end)
-        .is_some_and(|byte| (0x30..=0x3f).contains(byte))
-    {
+    let mut parameters = Vec::new();
+    let mut intermediates = Vec::new();
+    let last = loop {
+        match forward.get(end) {
+            Some(0x00 | 0x7f) => {}
+            Some(byte @ 0x30..=0x3f) if intermediates.is_empty() => parameters.push(*byte),
+            Some(byte @ 0x20..=0x2f) => intermediates.push(*byte),
+            Some(byte @ 0x40..=0x7e) => break *byte,
+            _ => return end.max(at + 2),
+        }
         end += 1;
-    }
-    let parameters = &forward[at + 2..end];
-    let intermediates_from = end;
-    while forward
-        .get(end)
-        .is_some_and(|byte| (0x20..=0x2f).contains(byte))
-    {
-        end += 1;
-    }
-    let intermediates = &forward[intermediates_from..end];
-    let Some(&last) = forward
-        .get(end)
-        .filter(|byte| (0x40..=0x7e).contains(*byte))
-    else {
-        return end.max(at + 2);
     };
     let first_number = parameters
         .split(|byte| *byte == b';')
@@ -219,12 +213,19 @@ fn scan_csi(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
                 .parse::<u32>()
                 .ok()
         });
+    let marker = parameters.first().copied();
+    let intermediate = |wanted: u8| intermediates.contains(&wanted);
     let asks = match last {
-        b'c' | b'n' => true,
-        b'p' => intermediates.contains(&b'$'),
-        b'q' => parameters.first() == Some(&b'>'),
-        b'u' | b'm' => parameters.first() == Some(&b'?'),
+        b'c' | b'n' | b'x' => true,
+        b'p' | b'w' | b'u' if intermediate(b'$') => true,
+        b'p' => false,
+        b'q' => marker == Some(b'>'),
+        b'u' | b'm' => marker == Some(b'?'),
+        b'S' => marker == Some(b'?'),
         b't' => first_number.is_some_and(|number| (11..=21).contains(&number)),
+        b'y' => intermediate(b'*'),
+        b'|' => intermediate(b'#'),
+        b'v' => intermediate(b'"'),
         _ => false,
     };
     if asks {
@@ -283,7 +284,12 @@ fn scan_string(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
             .first()
             .and_then(|part| std::str::from_utf8(part).ok())
             .and_then(|part| part.parse::<u32>().ok());
-        if matches!(selector, Some(9 | 52 | 99 | 777)) || parts.contains(&&b"?"[..]) {
+        // A bare `?` asks only where a terminal answers it: the palette and the colours, the
+        // dynamic colour and the clipboard. Elsewhere it is text, as in a title.
+        let asks = matches!(selector, Some(4 | 5 | 10..=19 | 50))
+            && parts.iter().skip(1).any(|part| *part == b"?")
+            || selector == Some(21) && parts.iter().any(|part| part.ends_with(b"=?"));
+        if matches!(selector, Some(9 | 52 | 99 | 777)) || asks {
             found.push(violation(
                 Invariant::ByteSafety,
                 format!("the operating system command at byte {at} acts or asks"),
@@ -460,24 +466,50 @@ pub fn read_split_changes_nothing(whole: &Seen, split: &Seen, how: u64) -> Vec<V
     found
 }
 
-/// An empty tmux envelope, which makes no event.
-const EMPTY_ENVELOPES: [&[u8]; 4] = [
-    b"\x1bPtmux;\x1b\\",
-    b"\x90tmux;\x1b\\",
-    b"\x1bPtmux;\x07",
-    b"\x90tmux;\x07",
-];
+/// The length of the empty tmux envelope at the start of `bytes`, if one is there: an envelope
+/// whose payload, with its doubled escapes undone, is nothing or only empty envelopes within the
+/// nesting bound, so that it makes no event.
+fn empty_envelope(bytes: &[u8], depth: u8) -> Option<usize> {
+    let opener = if bytes.starts_with(b"\x1bPtmux;") {
+        7
+    } else if bytes.starts_with(b"\x90tmux;") {
+        6
+    } else {
+        return None;
+    };
+    if depth >= 4 {
+        return None;
+    }
+    let mut payload = Vec::new();
+    let mut at = opener;
+    let end = loop {
+        match (bytes.get(at), bytes.get(at + 1)) {
+            (Some(0x1b), Some(0x1b)) => {
+                payload.push(0x1b);
+                at += 2;
+            }
+            (Some(0x1b), Some(b'\\')) => break at + 2,
+            (Some(byte), _) => {
+                payload.push(*byte);
+                at += 1;
+            }
+            (None, _) => return None,
+        }
+    };
+    let mut rest = payload.as_slice();
+    while !rest.is_empty() {
+        rest = &rest[empty_envelope(rest, depth + 1)?..];
+    }
+    Some(end)
+}
 
 /// Whether `gap` is empty envelopes and nothing else.
 fn is_empty_envelopes(mut gap: &[u8]) -> bool {
-    'next: while !gap.is_empty() {
-        for envelope in EMPTY_ENVELOPES {
-            if let Some(rest) = gap.strip_prefix(envelope) {
-                gap = rest;
-                continue 'next;
-            }
+    while !gap.is_empty() {
+        match empty_envelope(gap, 0) {
+            Some(length) => gap = &gap[length..],
+            None => return false,
         }
-        return false;
     }
     true
 }
@@ -496,7 +528,7 @@ pub fn events_cover_the_stream(bytes: &[u8], events: &[Event]) -> Vec<Violation>
         if event.passthrough_depth > 0
             && spans
                 .last()
-                .is_some_and(|last| (last.0, last.1) == (start, end))
+                .is_some_and(|last| last.2 > 0 && (last.0, last.1) == (start, end))
         {
             continue;
         }

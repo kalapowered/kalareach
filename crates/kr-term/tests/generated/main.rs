@@ -296,7 +296,7 @@ fn the_checks_name_a_query_in_the_tail_of_an_oversized_string_that_acts() {
 /// each stream passes.
 #[test]
 fn the_scan_names_a_forwarded_question_or_action_the_class_table_would_have_to_catch() {
-    let cases: [&[u8]; 14] = [
+    let cases: [&[u8]; 20] = [
         b"ok\x1bPq~\x1b\\",
         b"ok\x1b_Gi=1;\x1b\\",
         b"ok\x1b]52;c;aGk=\x07",
@@ -311,6 +311,12 @@ fn the_scan_names_a_forwarded_question_or_action_the_class_table_would_have_to_c
         b"ok\x1b[>0q",
         b"ok\x1b[?u",
         b"ok\x1b[18t",
+        b"ok\x1b[6\x00n",
+        b"ok\x1b[\x7f6n",
+        b"ok\x1b]10;?\x07",
+        b"ok\x1b[x",
+        b"ok\x1b[?1;1S",
+        b"ok\x1b[1;1;2;3;4*y",
     ];
     for input in cases {
         names(
@@ -343,5 +349,47 @@ fn the_coverage_check_names_a_duplicated_event_and_a_stream_with_nothing_for_its
     names(
         &events_cover_the_stream(b"\x1bPtmux;\x1b\\LOST", &[]),
         &[Invariant::Coverage],
+    );
+    // BEL ends an OSC string and not a tmux envelope, which is cut at closure and makes an event.
+    names(
+        &events_cover_the_stream(b"\x1bPtmux;\x07", &[]),
+        &[Invariant::Coverage],
+    );
+    // An envelope with an empty envelope in it decodes to nothing, so it makes no event.
+    let nested: &[u8] = b"a\x1bPtmux;\x1b\x1bPtmux;\x1b\x1b\\\x1b\\b";
+    assert!(
+        lex(nested).iter().all(|event| event.span.start() != 1),
+        "the lexer makes no event for it"
+    );
+    assert!(events_cover_the_stream(nested, &lex(nested)).is_empty());
+}
+
+/// KR-ACC-024: a bare `?` in a title, a link or a working directory is text and is forwarded, so the
+/// scan passes the engine's own run of it; the same field in a colour query is a question.
+#[test]
+fn the_scan_passes_a_question_mark_that_is_only_text() {
+    let size = size_of(SIZES[0]);
+    for input in [
+        &b"ok\x1b]2;a;?\x07"[..],
+        b"ok\x1b]0;?\x07",
+        b"ok\x1b]8;;https://example.com/a;?\x1b\\",
+        b"ok\x1b]110;?\x07",
+        b"ok\x1b]10;?\x07",
+    ] {
+        let seen = feed_whole(input, size);
+        let asked = input.starts_with(b"ok\x1b]10;");
+        if asked {
+            assert!(seen.forward != input, "a colour query is not forwarded");
+        } else {
+            assert_eq!(seen.forward, input, "forwarded whole: {input:?}");
+            assert!(
+                invariants::forward_is_safe_for_a_terminal(&seen.forward).is_empty(),
+                "text is not a question: {input:?}"
+            );
+        }
+    }
+    names(
+        &invariants::forward_is_safe_for_a_terminal(b"ok\x1b]10;?\x07"),
+        &[Invariant::ByteSafety],
     );
 }
