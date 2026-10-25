@@ -3649,8 +3649,8 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
         .expect_err("a grant with no geometry right claims no geometry");
     assert_eq!(claimed.code(), ErrorCode::PermissionDenied);
 
-    // Retained history is not something this host can narrow to a grant's lower bound, so it is
-    // refused rather than served in full.
+    // Retained output is served narrowed to the grant's lower bound, which this grant leaves at
+    // its pairing: what the session wrote before then is left out and said to be.
     let history = session
         .history_page(&kr_protocol::recovery::HistoryPageParams {
             session_id,
@@ -3658,8 +3658,11 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
             max_bytes: U64::new(4_096),
         })
         .await
-        .expect_err("retained history is refused");
-    assert_eq!(history.code(), ErrorCode::PermissionDenied);
+        .expect("the grant reaches the output written after its pairing");
+    assert!(
+        history.gap.0.is_some(),
+        "what the session wrote before the pairing is left out of the page"
+    );
 
     // An attachment identifier is not permission: the device may detach its own and nothing else.
     let attached = attach(&session, host.environment_id, session_id).await;

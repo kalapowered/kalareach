@@ -717,7 +717,7 @@ async fn a_paired_device_cannot_pan_above_the_live_screen_into_output_from_befor
 }
 
 /// KR-REQ-13.15: a paired device is refused the retained output of a session that has closed, and
-/// told that is why, until a closed session's output is served to it under its grant.
+/// told why.
 ///
 /// The session is one the registry holds a closure of, as the daemon records one when a session
 /// ends: it has no worker, so nothing can cut its output to a grant.

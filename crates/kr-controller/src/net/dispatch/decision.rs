@@ -786,7 +786,7 @@ impl RemoteConnection {
             // grant's scope is a moment in time, so the session's worker narrows the range to the
             // moment through the record of when each part of the output was produced, from the
             // scope this connection forwards with the read. What is decided here is whether the
-            // grant reaches retained output at all: one that reaches none, the live screen alone,
+            // grant reaches retained output at all: a grant with no history bound reaches none, and
             // is refused by name rather than answered with a page that is empty.
             Method::HistoryPage => {
                 let reaches = kr_worker::history_filter::HistoryFilter::new(
