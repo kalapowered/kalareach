@@ -1022,20 +1022,32 @@ impl CanonicalGrid {
     /// line's `cells_mut` turns a line held in its compact form into one cell per column. The two
     /// forms keep a blank past the end of the text differently, so reading a cell changed what the
     /// line holds, and which lines had been read depended on where the reads of output ended. This
-    /// reads the line as it is.
-    fn read_cell(&self, col: usize, row: i64) -> Option<(CellAttributes, String)> {
-        let screen = self.terminal.screen();
+    /// borrows the line as it is and reads it.
+    ///
+    /// A blank printed past the end of a compact line is not stored: the line reads as blank
+    /// there, which is the cell a person sees and the cell a combining mark that follows joins.
+    /// Such a cell is reported as the plain blank it is, so a mark reaches it whether or not a
+    /// read happened to store it.
+    fn read_cell(&mut self, col: usize, row: i64) -> Option<(CellAttributes, String)> {
+        if col >= usize::try_from(self.size().cols).unwrap_or(usize::MAX) {
+            return None;
+        }
+        let screen = self.terminal.screen_mut();
         let physical = screen.phys_row(row);
-        let line = screen
-            .lines_in_phys_range(physical..physical + 1)
-            .into_iter()
-            .next()?;
-        line.get_cell(col)
-            .map(|cell| (cell.attrs().clone(), cell.str().to_owned()))
+        if physical >= screen.scrollback_rows() {
+            return None;
+        }
+        let line = screen.line_mut(physical);
+        match line.get_cell(col) {
+            Some(cell) => Some((cell.attrs().clone(), cell.str().to_owned())),
+            // The second half of a wide character is covered, and reads as blank as it does in the
+            // library's one-cell-per-column form.
+            None => Some((CellAttributes::blank(), " ".to_owned())),
+        }
     }
 
     /// The text of one cell of the active buffer.
-    fn cell_text(&self, col: usize, row: i64) -> Option<String> {
+    fn cell_text(&mut self, col: usize, row: i64) -> Option<String> {
         self.read_cell(col, row).map(|(_, text)| text)
     }
 
