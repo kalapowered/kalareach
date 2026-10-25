@@ -2140,8 +2140,8 @@ takes the environment's singleton lock first, which a running daemon holds, and 
 daemon or another import holds it. A worker can outlive its daemon, so a journal is not opened while
 anything this host can read says its worker may still be there, or while what would say so cannot be
 read: the environment's registry is read as it is, never brought forward, repaired or written, so an
-environment whose registry is missing, is a link, is at another schema version, has lost a table or
-still holds writes in its write-ahead log imports nothing. A session closed over a worker whose end
+environment whose registry is missing, is a link, is at another schema version, has lost its workers
+or closures table or still holds writes in its write-ahead log imports nothing. A session closed over a worker whose end
 was never confirmed is imported only once the kernel says the process its launch ran has ended,
 which the registry's reservation for the session records; without that, or if the reservation cannot
 be read, its journal is left as it was. Start this build's daemon once and stop
