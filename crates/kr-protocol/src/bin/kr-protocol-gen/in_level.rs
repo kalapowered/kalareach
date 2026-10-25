@@ -214,11 +214,7 @@ pub fn declared_in(schema: &Value, roots: &BTreeSet<String>, whose: &str) -> Res
 /// # Errors
 ///
 /// What differs, release by release; or what could not be read.
-pub fn check(
-    repository: &Path,
-    head: &Head,
-    inventory: &[Release],
-) -> Result<Outcome, String> {
+pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Outcome, String> {
     let at_level = inventory
         .iter()
         .filter(|release| release.level() == head.level && release.commit != head.commit);

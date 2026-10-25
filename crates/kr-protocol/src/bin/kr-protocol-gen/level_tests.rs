@@ -371,12 +371,8 @@ fn a_release_before_the_tables_is_compared_by_schema_and_the_run_says_so() {
     let tag = repo.release("0.76.0", &first);
     let head = repo.commit(&old, "after");
     let releases = inventory(&repo.directory).expect("an inventory");
-    let outcome = check(
-        &repo.directory,
-        &repo.head(&old, &head),
-        &releases,
-    )
-    .expect("the schema is the same");
+    let outcome =
+        check(&repo.directory, &repo.head(&old, &head), &releases).expect("the schema is the same");
     let Outcome::Held { releases, notes } = outcome else {
         panic!("the level holds");
     };
@@ -389,12 +385,8 @@ fn a_release_before_the_tables_is_compared_by_schema_and_the_run_says_so() {
         ..old.clone()
     };
     let releases = inventory(&repo.directory).expect("an inventory");
-    let error = check(
-        &repo.directory,
-        &repo.head(&widened, &head),
-        &releases,
-    )
-    .expect_err("a root the release had no list for changed");
+    let error = check(&repo.directory, &repo.head(&widened, &head), &releases)
+        .expect_err("a root the release had no list for changed");
     assert!(error.contains("PeerParams.member"), "{error}");
 }
 
@@ -430,11 +422,7 @@ fn a_commit_with_no_release_at_its_level_moves_it() {
     let now = Tree::the_level();
     let head = repo.commit(&now, "the next level");
     let releases = inventory(&repo.directory).expect("an inventory");
-    let outcome = check(
-        &repo.directory,
-        &repo.head(&now, &head),
-        &releases,
-    );
+    let outcome = check(&repo.directory, &repo.head(&now, &head), &releases);
     assert_eq!(outcome, Ok(Outcome::MovesTheLevel));
 }
 
@@ -738,37 +726,17 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         Ok(())
     };
     let data = repo.head(&now, &head);
-    conclude(
-        &repo.directory,
-        &data,
-        &releases,
-        true,
-        &cut,
-    )
-    .expect("the cut's check passes");
+    conclude(&repo.directory, &data, &releases, true, &cut).expect("the cut's check passes");
     assert_eq!(
         calls.get(),
         1,
         "run once for the commit that moves the level"
     );
-    conclude(
-        &repo.directory,
-        &data,
-        &releases,
-        false,
-        &cut,
-    )
-    .expect("nothing to compare");
+    conclude(&repo.directory, &data, &releases, false, &cut).expect("nothing to compare");
     assert_eq!(calls.get(), 1, "not run when it is told to leave it");
     let failing = |_: &Path| Err("the cut's check said no".to_owned());
-    let error = conclude(
-        &repo.directory,
-        &data,
-        &releases,
-        true,
-        &failing,
-    )
-    .expect_err("its failure is the check's");
+    let error = conclude(&repo.directory, &data, &releases, true, &failing)
+        .expect_err("its failure is the check's");
     assert!(error.contains("said no"), "{error}");
 
     // A commit at a level that has a release does not run it.
