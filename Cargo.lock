@@ -4502,7 +4502,6 @@ dependencies = [
  "kr-describe",
  "kr-flush",
  "kr-ipc",
- "kr-keys",
  "kr-pairing",
  "kr-plugin-catalogue",
  "kr-plugin-sdk",
@@ -5195,6 +5194,7 @@ name = "kr-term"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "kr-keys",
  "kr-protocol",
  "kr-width",
  "serde",

@@ -1,0 +1,819 @@
+{
+  "name": "console-legacy-input",
+  "profile": "kr-vt/1",
+  "description": "KR-REQ-08.53. The legacy VT input a session is sent for the console's key records when its backend did not ask for them, written by hand from xterm's control sequence documentation and the console API's key state. Every field of every record is written. A case with `bytes` is the exact spelling, and an empty `bytes` is a record that spells nothing; a case with `refused` is a write the worker must not spell, because the application negotiated an encoding legacy input cannot express. `keyboard` is the session's state: DEC mode 1, and the keyboard protocol negotiated. The records have the six fields `input-encodings.json` gives each of its own.",
+  "cases": [
+    {
+      "id": "text-repeated",
+      "covers": "KR-REQ-08.53",
+      "why": "A held character is that many characters, as a terminal's translation would have sent.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 3
+        }
+      ],
+      "bytes": "616161"
+    },
+    {
+      "id": "key-up-says-nothing",
+      "covers": "KR-REQ-08.53",
+      "why": "Legacy input has no way to say a key came up.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": false,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": ""
+    },
+    {
+      "id": "dead-key-has-no-character",
+      "covers": "KR-REQ-08.53",
+      "why": "A key with no character and no name is nothing, not another key.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": ""
+    },
+    {
+      "id": "surrogate-pair-is-one-character",
+      "covers": "KR-REQ-08.53",
+      "why": "The two records of a character outside the basic plane are that character, U+1F600.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 55357,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 56832,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "f09f9880"
+    },
+    {
+      "id": "surrogate-pair-is-repeated-as-one-character",
+      "covers": "KR-REQ-08.53",
+      "why": "The repeat count of the low half repeats the pair, not each half.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 55357,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 56832,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 2
+        }
+      ],
+      "bytes": "f09f9880f09f9880"
+    },
+    {
+      "id": "key-ups-between-the-halves-change-nothing",
+      "covers": "KR-REQ-08.53",
+      "why": "A key coming up between the halves of a pair says nothing.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 55357,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 55357,
+          "key_down": false,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 56832,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 56832,
+          "key_down": false,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "f09f9880"
+    },
+    {
+      "id": "lone-high-surrogate-is-replaced",
+      "covers": "KR-REQ-08.53",
+      "why": "A high surrogate with no low one is replaced by U+FFFD, not dropped and not sent broken.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 55357,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "efbfbd61"
+    },
+    {
+      "id": "lone-high-surrogate-at-the-end-is-replaced",
+      "covers": "KR-REQ-08.53",
+      "why": "The translation of one write is whole characters: a high surrogate that ends the write is replaced.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 55357,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "61efbfbd"
+    },
+    {
+      "id": "lone-low-surrogate-is-replaced",
+      "covers": "KR-REQ-08.53",
+      "why": "A low surrogate with no high one before it is replaced.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 56832,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "efbfbd"
+    },
+    {
+      "id": "arrow-held-is-sent-as-many-times-as-it-repeated",
+      "covers": "KR-REQ-08.53",
+      "why": "A repeat count applies to a sequence as to a character.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 38,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 3
+        }
+      ],
+      "bytes": "1b5b411b5b411b5b41"
+    },
+    {
+      "id": "arrow-up-in-the-ordinary-cursor-mode",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are CSI A to D while DEC mode 1 is off.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 38,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b5b41"
+    },
+    {
+      "id": "arrow-up-in-application-cursor-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are SS3 A to D while the application has set DEC mode 1.",
+      "keyboard": {
+        "application_cursor_keys": true,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 38,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b4f41"
+    },
+    {
+      "id": "arrow-down-in-the-ordinary-cursor-mode",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are CSI A to D while DEC mode 1 is off.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 40,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b5b42"
+    },
+    {
+      "id": "arrow-down-in-application-cursor-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are SS3 A to D while the application has set DEC mode 1.",
+      "keyboard": {
+        "application_cursor_keys": true,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 40,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b4f42"
+    },
+    {
+      "id": "arrow-right-in-the-ordinary-cursor-mode",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are CSI A to D while DEC mode 1 is off.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 39,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b5b43"
+    },
+    {
+      "id": "arrow-right-in-application-cursor-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are SS3 A to D while the application has set DEC mode 1.",
+      "keyboard": {
+        "application_cursor_keys": true,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 39,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b4f43"
+    },
+    {
+      "id": "arrow-left-in-the-ordinary-cursor-mode",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are CSI A to D while DEC mode 1 is off.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 37,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b5b44"
+    },
+    {
+      "id": "arrow-left-in-application-cursor-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "Arrows are SS3 A to D while the application has set DEC mode 1.",
+      "keyboard": {
+        "application_cursor_keys": true,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 37,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b4f44"
+    },
+    {
+      "id": "shifted-arrow-ignores-application-cursor-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "A modified arrow is the CSI form with the modifier, whatever mode 1 says.",
+      "keyboard": {
+        "application_cursor_keys": true,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 38,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 16,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b5b313b3241"
+    },
+    {
+      "id": "home-in-application-cursor-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "Home follows mode 1 as the arrows do.",
+      "keyboard": {
+        "application_cursor_keys": true,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 36,
+          "scan_code": 71,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b4f48"
+    },
+    {
+      "id": "function-keys",
+      "covers": "KR-REQ-08.53",
+      "why": "F1 is SS3 P and F5 is CSI 15 ~; F13 has no spelling and is nothing.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 112,
+          "scan_code": 59,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 116,
+          "scan_code": 63,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 124,
+          "scan_code": 100,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b4f501b5b31357e"
+    },
+    {
+      "id": "shift-tab-is-back-tab",
+      "covers": "KR-REQ-08.53",
+      "why": "The console reports a tab for Shift and Tab, which is a different key.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 9,
+          "scan_code": 15,
+          "unicode": 9,
+          "key_down": true,
+          "control_keys": 16,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b5b5a"
+    },
+    {
+      "id": "alt-letter-has-the-escape-prefix",
+      "covers": "KR-REQ-08.53",
+      "why": "Alt and a letter is the letter after an escape.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 2,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b61"
+    },
+    {
+      "id": "alt-graph-character-is-the-character",
+      "covers": "KR-REQ-08.53",
+      "why": "AltGr is how a layout makes a character: '@' on the layout, not a key with two modifiers.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 50,
+          "scan_code": 3,
+          "unicode": 64,
+          "key_down": true,
+          "control_keys": 9,
+          "repeat": 1
+        }
+      ],
+      "bytes": "40"
+    },
+    {
+      "id": "ctrl-return-is-the-line-feed-the-console-made",
+      "covers": "KR-REQ-08.53",
+      "why": "The console's own control code is the answer: Ctrl and Return is a line feed.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 13,
+          "scan_code": 28,
+          "unicode": 10,
+          "key_down": true,
+          "control_keys": 8,
+          "repeat": 1
+        }
+      ],
+      "bytes": "0a"
+    },
+    {
+      "id": "return-is-the-carriage-return",
+      "covers": "KR-REQ-08.53",
+      "why": "Return alone is a carriage return.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 13,
+          "scan_code": 28,
+          "unicode": 13,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "0d"
+    },
+    {
+      "id": "ctrl-letter-is-its-control-code",
+      "covers": "KR-REQ-08.53",
+      "why": "Ctrl and a is 0x01.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 1,
+          "key_down": true,
+          "control_keys": 8,
+          "repeat": 1
+        }
+      ],
+      "bytes": "01"
+    },
+    {
+      "id": "ctrl-space-is-nul",
+      "covers": "KR-REQ-08.53",
+      "why": "The one key the console reports with no character is the NUL a byte cannot otherwise carry.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 32,
+          "scan_code": 57,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 8,
+          "repeat": 1
+        }
+      ],
+      "bytes": "00"
+    },
+    {
+      "id": "right-ctrl-right-alt-escape-is-a-chord",
+      "covers": "KR-REQ-08.53",
+      "why": "Right Ctrl and right Alt are AltGr's bits, but a control code with them is a chord: an escape after an escape.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 27,
+          "scan_code": 1,
+          "unicode": 27,
+          "key_down": true,
+          "control_keys": 5,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b1b"
+    },
+    {
+      "id": "shift-does-not-change-ctrl-return",
+      "covers": "KR-REQ-08.53",
+      "why": "Shift with Ctrl and Return is still a line feed.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 13,
+          "scan_code": 28,
+          "unicode": 10,
+          "key_down": true,
+          "control_keys": 24,
+          "repeat": 1
+        }
+      ],
+      "bytes": "0a"
+    },
+    {
+      "id": "shift-does-not-change-ctrl-space",
+      "covers": "KR-REQ-08.53",
+      "why": "Shift with Ctrl and Space is still NUL.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 32,
+          "scan_code": 57,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 24,
+          "repeat": 1
+        }
+      ],
+      "bytes": "00"
+    },
+    {
+      "id": "alt-ctrl-i-keeps-the-escape-prefix",
+      "covers": "KR-REQ-08.53",
+      "why": "Alt with Ctrl and I is a tab after an escape, not an ordinary tab.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 73,
+          "scan_code": 23,
+          "unicode": 9,
+          "key_down": true,
+          "control_keys": 10,
+          "repeat": 1
+        }
+      ],
+      "bytes": "1b09"
+    },
+    {
+      "id": "ctrl-shift-tab-has-no-spelling",
+      "covers": "KR-REQ-08.53",
+      "why": "The chord has no spelling here, and a plain tab would be another key.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 9,
+          "scan_code": 15,
+          "unicode": 9,
+          "key_down": true,
+          "control_keys": 24,
+          "repeat": 1
+        }
+      ],
+      "bytes": ""
+    },
+    {
+      "id": "text-and-keys-keep-their-order",
+      "covers": "KR-REQ-08.53",
+      "why": "Text waiting is written before the key that interrupts it.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 38,
+          "scan_code": 72,
+          "unicode": 0,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        },
+        {
+          "virtual_key": 66,
+          "scan_code": 48,
+          "unicode": 98,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "611b5b4162"
+    },
+    {
+      "id": "modify-other-keys-refuses-the-write",
+      "covers": "KR-REQ-08.53",
+      "why": "Under modifyOtherKeys Ctrl and I would reach the application as a tab, so the write is refused and nothing is written.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": {
+          "modify_other_keys": 2
+        }
+      },
+      "records": [
+        {
+          "virtual_key": 73,
+          "scan_code": 23,
+          "unicode": 9,
+          "key_down": true,
+          "control_keys": 8,
+          "repeat": 1
+        }
+      ],
+      "refused": "enhanced"
+    },
+    {
+      "id": "kitty-refuses-the-write",
+      "covers": "KR-REQ-08.53",
+      "why": "Under the Kitty protocol the legacy spelling is a different key, so the write is refused, plain text included.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": {
+          "kitty": 1
+        }
+      },
+      "records": [
+        {
+          "virtual_key": 65,
+          "scan_code": 30,
+          "unicode": 97,
+          "key_down": true,
+          "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "refused": "enhanced"
+    }
+  ]
+}
