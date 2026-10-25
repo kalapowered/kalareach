@@ -202,6 +202,24 @@ impl crate::attention::Reach for AttentionReach {
         })
     }
 
+    fn cleanup_owed<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(controller) = self.0.upgrade() else {
+                return true;
+            };
+            let privacy = Arc::clone(&controller.privacy);
+            // The record's lock is held across slow steps, so it is asked on the blocking pool,
+            // as the reads of a closed session's history ask it. A record that cannot be asked is
+            // one whose cleanup is taken as owed.
+            tokio::task::spawn_blocking(move || privacy.owes_cleanup(session_id))
+                .await
+                .unwrap_or(true)
+        })
+    }
+
     fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
         let Some(controller) = self.0.upgrade() else {
             return ClosedJournal::Unreadable;

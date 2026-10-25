@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use kr_controller::archive::ArchiveService;
 use kr_ipc::client::LocalClient;
+use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionRule};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, ActorId, SessionEpoch, SessionId};
@@ -98,6 +99,32 @@ fn plant(host: &Host, spool: bool) -> SessionId {
         history.append(OUTPUT);
     }
     session_id
+}
+
+/// A notice the session's program raised while no attachment held the lease, which its worker
+/// kept in the journal `plant` made as a host event, and that the closure the daemon then records
+/// leaves in the inbox.
+fn plant_notice(host: &Host, session_id: SessionId, body: &str) {
+    let path = ArchiveService::new(host.tree().environment())
+        .paths()
+        .journal_database(session_id);
+    let mut journal = Journal::open(&path).expect("opens the journal");
+    journal
+        .record_host_event(
+            &kr_term::sideeffect::SideEffect {
+                kind: kr_term::sideeffect::SideEffectKind::Notification {
+                    title: None,
+                    body: body.to_owned(),
+                    id: None,
+                    urgency: kr_term::sideeffect::NotificationUrgency::Normal,
+                    display: kr_term::sideeffect::NotificationDisplay::Always,
+                },
+                destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
+                at: 0,
+            },
+            kr_ipc::now_ms(),
+        )
+        .expect("the journal records the notice");
 }
 
 /// A closed session as a daemon records the end of a worker it could not see leave: a reservation
@@ -286,6 +313,42 @@ async fn until(
         assert!(
             tokio::time::Instant::now() < deadline,
             "{what} did not happen in time: {report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// What the owner's inbox shows of the session's notice: the words of its summary, and none when
+/// the item is there without them. The inbox is read until the daemon has the notice, which it
+/// reads from the journal once the session's closure is recorded.
+async fn notice_words(client: &mut LocalClient, session_id: SessionId) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let read: AttentionReadResult = client
+            .request(
+                Method::AttentionRead,
+                &AttentionReadParams {
+                    session_id: Nullable::null(),
+                    include_acknowledged: true,
+                    max_items: U64::new(50),
+                    after: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the inbox reads")
+            .to_typed()
+            .expect("decodes");
+        if let Some(notice) = read.items.iter().find(|item| {
+            item.rule == AttentionRule::ApplicationNotice
+                && item.session_id == Nullable::some(session_id)
+        }) {
+            return notice.summary.0.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the notice did not reach the inbox: {:?}",
+            read.items
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -547,6 +610,97 @@ async fn an_unconfirmed_worker_is_cleared_by_the_proof_that_its_process_ended() 
     assert!(
         matches!(&owed.standing, PrivacySessionStanding::Unavailable { reason } if reason.contains("worker")),
         "the report says why: {owed:?}"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.28: a notice a closed session kept is not served once the archive has
+/// removed what the session retained and the change reports complete, and turning privacy mode off
+/// brings nothing back. The notice stays in the inbox, as one of a live session does, without its
+/// words. The control is the same read before privacy mode, which shows them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_a_closed_session_kept_is_not_served_once_its_removal_has_finished() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let session_id = plant(&host, false);
+    plant_notice(&host, session_id, "the build finished");
+    host.controller()
+        .retire(&closure(session_id))
+        .await
+        .expect("the closure is recorded");
+
+    assert_eq!(
+        notice_words(&mut client, session_id).await.as_deref(),
+        Some("Normal: the build finished"),
+        "the control serves the notice's words"
+    );
+
+    set(&mut client, &host, true).await;
+    let report = until("the change taking effect", &mut client, |report| {
+        matches!(report.completion, PrivacyCompletion::Complete)
+    })
+    .await;
+    assert!(report.sessions.is_empty(), "{:?}", report.sessions);
+    assert_eq!(
+        notice_words(&mut client, session_id).await,
+        None,
+        "the removal is complete, so the session's notice is served without its words"
+    );
+
+    let off = set(&mut client, &host, false).await;
+    assert!(!off.enabled);
+    assert_eq!(
+        notice_words(&mut client, session_id).await,
+        None,
+        "turning privacy mode off brings nothing back"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-24.28: a notice a closed session kept is not served while its removal is owed. A
+/// directory stands where the oldest segment's file was, so the removal cannot finish, and the
+/// inbox is read while the report says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_a_closed_session_kept_is_not_served_while_its_removal_is_owed() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let session_id = plant(&host, true);
+    plant_notice(&host, session_id, "the build finished");
+    let oldest = host
+        .tree()
+        .environment()
+        .session_spool(session_id)
+        .join(format!("{:020}.out", 0));
+    std::fs::remove_file(&oldest).expect("removes the oldest segment's file");
+    std::fs::create_dir(&oldest).expect("puts a directory in its place");
+    std::fs::write(oldest.join("in-the-way"), b"x").expect("and something in it");
+    host.controller()
+        .retire(&closure(session_id))
+        .await
+        .expect("the closure is recorded");
+
+    assert_eq!(
+        notice_words(&mut client, session_id).await.as_deref(),
+        Some("Normal: the build finished"),
+        "the control serves the notice's words"
+    );
+
+    set(&mut client, &host, true).await;
+    until("the removal being refused", &mut client, |report| {
+        report.sessions.iter().any(|owed| {
+            owed.session_id == session_id
+                && matches!(
+                    &owed.standing,
+                    PrivacySessionStanding::Unavailable { reason }
+                        if reason.contains("could not be removed")
+                )
+        })
+    })
+    .await;
+    assert_eq!(
+        notice_words(&mut client, session_id).await,
+        None,
+        "what the session retained is not served while its removal is owed"
     );
     host.stop().await;
 }

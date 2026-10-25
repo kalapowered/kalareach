@@ -4695,10 +4695,12 @@ Each session is told the generation by the daemon, on a tick once a second, over
 daemon holds to its worker. The worker raises its attention transition, applies the generation to
 the session and answers where its own cleanup stands. The tick tells it again, waiting longer each
 time, until it answers that its cleanup is complete, and only that answer ends its obligation. A
-session whose worker ended first has nobody to tell, so the archive removes what it retained, under
-the session's recovery ownership: the retained output and its time index, through the removal a
-worker makes, which publishes where the output had reached, and the content of the receipts that
-have settled, which keep their identity, state and digests. A receipt that has not settled is
+session whose worker ended first has nobody to tell, so the archive does what the worker would
+have, under the session's recovery ownership. It writes the privacy state in force into the
+session's journal, as a worker does, so that the questions and notices the session recorded stay
+out of what the attention store serves. It removes the retained output and its time index, through
+the removal a worker makes, which publishes where the output had reached, and the content of the
+receipts that have settled, which keep their identity, state and digests. A receipt that has not settled is
 settled first, as a collection pass settles it (a dispatch with no outcome becomes unknown, and an
 accepted intent that was never dispatched is rejected), and then loses its content too, because no
 worker is left to retry it. The obligation ends only when nothing is left. A removal that leaves
@@ -4707,7 +4709,9 @@ lengthens, across a restart. So is a removal that could not start: another recov
 session, or a worker may still own its stores. Removals run one at a time, so a change that answers
 while the tick is removing waits for it and reports what is left after it. While the obligation
 stands, `history.page`, `history.times` and `action.read` of that session are refused with
-`RESOURCE_UNAVAILABLE`. Once the output is removed they answer a gap with no bytes. A page that was
+`RESOURCE_UNAVAILABLE`, and the attention store serves no text from its journal. Once the output is
+removed they answer a gap with no bytes, and the journal's record keeps its text out of the store
+whether privacy mode is on or has been turned off again. A page that was
 read before privacy mode was turned on, and has not yet been written to the reader when it is, is
 written without its bytes, as a range that is gone. `privacy.set` runs the removal before it
 answers, so the answer says where it stands.
@@ -6050,8 +6054,10 @@ same way: each transport write of session text is made through the daemon's rele
 it once the check fails, and a consumer whose transport would send held bytes later on its own
 cannot carry session text. No sender of this host meets that contract, so none carries any, and a
 request already handed to a transport can still leave within that sender's own deadline. Text read
-from a finished session's journal needs no lease, because no transition can follow a closure the
-host confirmed.
+from a finished session's journal carries no lease: it is held to the privacy state it was read under,
+as text a model wrote is, and a transition before the write withholds it. None is served while
+privacy mode is on or its cleanup of the session is owed, and once the archive has written the
+privacy state into the journal none from before it is.
 
 Privacy mode reports complete only once the daemon has recorded the new generation, which a request
 on the current attention connection says when it names that generation. Until then the worker's

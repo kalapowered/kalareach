@@ -309,6 +309,14 @@ pub trait Reach: Send + Sync {
         session_id: SessionId,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 
+    /// Answers whether privacy mode's cleanup of a closed session is still owed: until the archive
+    /// has recorded the privacy state in its journal and removed what it retained, the text the
+    /// journal holds is not served. A record that cannot be read is answered as owed.
+    fn cleanup_owed<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+
     /// Returns the journal of a closed session, brought to the schema this build reads, when it
     /// can be opened, and says when it is held back for now instead.
     fn closed_journal(&self, session_id: SessionId) -> ClosedJournal;
@@ -436,20 +444,26 @@ struct SessionFence {
 /// What must still hold for a response's session text to be released.
 ///
 /// One entry for each live answer the response holds text from. Text read from a finished
-/// session's journal needs none: no transition can follow the closure. A response that carries
-/// text a model wrote also holds the privacy state that text was decided under.
+/// session's journal has no entry: it is held to the privacy state it was read under, as text a
+/// model wrote is, and none is read while privacy mode is on or its cleanup of the session is
+/// owed. A response that carries either also holds the privacy state that text was decided
+/// under.
 #[derive(Clone, Debug, Default)]
 pub struct Ticket {
     entries: Vec<TicketEntry>,
-    generated: Option<Generated>,
+    /// The privacy states the daemon's own readings of text were decided under: text a model wrote
+    /// and text read from a closed session's journal.
+    generated: Vec<Generated>,
 }
 
-/// Text a model wrote that a response carries, and the privacy state it was read under.
+/// Text the daemon read itself that a response carries, and the privacy state it was read under:
+/// text a model wrote, or text read from a closed session's journal.
 ///
-/// Privacy mode removes what a model wrote of a session at the moment it is enabled, so the text is
-/// released only while the state is the one it was read under: not private, and in the same
-/// generation. The worker's own fence says nothing of it, since the daemon holds this text and
-/// the worker did not answer it.
+/// Privacy mode removes what a model wrote of a session at the moment it is enabled, and a closed
+/// session's journal serves none of its text once the archive has written the state into it, so
+/// the text is released only while the state is the one it was read under: not private, and in the
+/// same generation. The worker's own fence says nothing of it, since the daemon holds this text
+/// and the worker did not answer it.
 #[derive(Clone, Debug)]
 pub(crate) struct Generated {
     state: crate::privacy::PrivacyState,
@@ -469,7 +483,7 @@ impl Generated {
 /// The privacy state a response's generated text is released under, held for as long as a write
 /// of it is made: privacy mode cannot be published in between.
 struct Standing<'a> {
-    _reading: Option<crate::privacy::Reading<'a>>,
+    _readings: Vec<crate::privacy::Reading<'a>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -508,28 +522,30 @@ impl Ticket {
     pub(crate) fn of_generated(generated: Generated) -> Self {
         Self {
             entries: Vec::new(),
-            generated: Some(generated),
+            generated: vec![generated],
         }
     }
 
     /// Returns true when the ticket names no text that needs a check.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.generated.is_none()
+        self.entries.is_empty() && self.generated.is_empty()
     }
 
-    /// Takes the privacy state the generated text was read under, and none when it has moved or is
-    /// moving. It waits for nothing. A ticket with no generated text stands on nothing.
+    /// Takes the privacy states the daemon's own readings were decided under, and none when any
+    /// has moved or is moving. It waits for nothing. A ticket with no such text stands on nothing.
     fn standing(&self) -> Option<Standing<'_>> {
-        let Some(generated) = &self.generated else {
-            return Some(Standing { _reading: None });
-        };
-        generated
-            .state
-            .try_reading()
-            .filter(|reading| reading.published() == generated.decided)
-            .map(|reading| Standing {
-                _reading: Some(reading),
+        self.generated
+            .iter()
+            .map(|generated| {
+                generated
+                    .state
+                    .try_reading()
+                    .filter(|reading| reading.published() == generated.decided)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|readings| Standing {
+                _readings: readings,
             })
     }
 
@@ -1516,7 +1532,7 @@ impl AttentionModule {
                         self.summary(reach, caller, params.session_id, source).await
                 {
                     result.summary = Nullable::some(summary);
-                    ticket.generated = Some(generated);
+                    ticket.generated.push(generated);
                 }
                 Ok(Read::with(encode(&result)?, withheld, ticket))
             }
@@ -1670,11 +1686,13 @@ impl AttentionModule {
     /// Reads the text of each record a page names, from the record's owner, as it serves now.
     ///
     /// A live session's worker answers over its link and a closed session's journal is read; a
-    /// session that is neither, or whose owner does not answer in time, serves none. Each request
-    /// names at most as many records as a text request carries.
+    /// session that is neither, or whose owner does not answer in time, serves none. So does a
+    /// closed session while privacy mode's cleanup of it is owed. Each request names at most as
+    /// many records as a text request carries.
     ///
     /// The last of the three answers says whether the text of a closed session is held back for
-    /// now rather than absent: its journal cannot be brought forward yet. A session closed over a
+    /// now rather than absent: its journal cannot be brought forward yet, or privacy mode's cleanup
+    /// of it is owed or privacy mode is on. A session closed over a
     /// worker this host could not account for, a journal that cannot be read, a session that serves
     /// no text and a live worker that does not answer are not held back.
     ///
@@ -1685,7 +1703,7 @@ impl AttentionModule {
     ///
     /// Each live answer that carries text adds its generation and lease end to the ticket its
     /// release is bound by, and keeps it after its session closes; text read from a finished
-    /// session's journal needs none.
+    /// session's journal carries a stamp of the privacy state it was read under instead.
     async fn texts(
         &self,
         reach: &dyn Reach,
@@ -1706,12 +1724,32 @@ impl AttentionModule {
             }
         }
         let batch = usize::try_from(MAX_ATTENTION_TEXT_RECORDS).unwrap_or(usize::MAX);
+        // The privacy state a closed session's journal is read under, taken before any of them is
+        // read and without waiting, since this runs on the runtime: a change of privacy mode that
+        // is being made, or is private already, leaves none of them read. A journal carries the
+        // state only once the archive has written it there.
+        let journals = self.privacy.get().map(|state| {
+            let decided = state.try_reading().map(|reading| reading.published());
+            (state.clone(), decided)
+        });
+        let journals_open = journals
+            .as_ref()
+            .is_none_or(|(_, decided)| decided.is_some_and(|decided| !decided.private));
         // Every live session is asked at once, so a read waits for the slowest worker rather than
         // for each in turn.
         let mut read = Vec::new();
         let mut journals_held_back = BTreeSet::new();
         for (session_id, wanted) in by_session {
-            let owner = self.text_owner(session_id);
+            let mut owner = self.text_owner(session_id);
+            // A closed session's text is served only while privacy mode is off and the cleanup it
+            // owed, which writes that state into its journal, is done. It is held back for now and
+            // not absent: a summary is not written from it until it can be read.
+            if matches!(owner, TextOwner::Journal)
+                && (!journals_open || reach.cleanup_owed(session_id).await)
+            {
+                owner = TextOwner::Nobody;
+                journals_held_back.insert(session_id);
+            }
             let journal = if matches!(owner, TextOwner::Journal) {
                 let closed = reach.closed_journal(session_id);
                 if matches!(closed, ClosedJournal::HeldBack) {
@@ -1818,6 +1856,17 @@ impl AttentionModule {
                     TextOwner::Nobody => false,
                 };
             let texts = texts.filter(|_| still);
+            // Text read from a journal is held to the state it was read under, as a model's is.
+            if matches!(owner, TextOwner::Journal)
+                && texts
+                    .as_ref()
+                    .is_some_and(|texts| texts.iter().any(Option::is_some))
+                && let Some((state, Some(decided))) = &journals
+            {
+                ticket
+                    .generated
+                    .push(Generated::read_under(state.clone(), *decided));
+            }
             held_back |= !unaccounted && journals_held_back.contains(&session_id);
             if let (Some(texts), Some((generation, release_until))) = (&texts, lease)
                 && texts.iter().any(Option::is_some)
@@ -4324,7 +4373,7 @@ pub(crate) mod tests {
         };
         let ticket = |entries: Vec<TicketEntry>| Ticket {
             entries,
-            generated: None,
+            generated: Vec::new(),
         };
         let named = |generation: u64| Some(kr_worker::privacy::PrivacyGeneration::new(generation));
         assert_eq!(ticket(Vec::new()).generation_of(session), Ok(None));
@@ -4375,6 +4424,13 @@ pub(crate) mod tests {
             Box::pin(async move { unaccounted })
         }
 
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
             ClosedJournal::Unreadable
         }
@@ -4406,6 +4462,13 @@ pub(crate) mod tests {
         }
 
         fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
             &'a self,
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
@@ -4505,6 +4568,7 @@ pub(crate) mod tests {
         let held = HeldBack::default();
         let readable = Readable {
             path: temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
         };
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let seconds = |seconds: u64| seconds * 1_000;
@@ -4901,6 +4965,8 @@ pub(crate) mod tests {
     /// A reach whose closed journal can be read, as it can once nothing holds it back.
     struct Readable {
         path: std::path::PathBuf,
+        /// Whether privacy mode's cleanup of the session is owed.
+        owed: bool,
     }
 
     impl Reach for Readable {
@@ -4917,6 +4983,14 @@ pub(crate) mod tests {
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            let owed = self.owed;
+            Box::pin(async move { owed })
         }
 
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
@@ -4957,8 +5031,21 @@ pub(crate) mod tests {
             "the text is held back, so no summary is asked for"
         );
 
+        let owed = Readable {
+            path: world.temp.environment().state_dir().join("closed.sqlite3"),
+            owed: true,
+        };
+        world.changed_through(&owed, &owner(), &Caller::Owner).await;
+        assert_eq!(
+            world.asked(),
+            Vec::new(),
+            "the text is held back while privacy mode's cleanup of the session is owed, so no \
+             summary is asked for"
+        );
+
         let readable = Readable {
             path: world.temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
         };
         world
             .changed_through(&readable, &owner(), &Caller::Owner)
@@ -5533,7 +5620,7 @@ pub(crate) mod tests {
                     release_until: until,
                 })
                 .collect(),
-            generated: None,
+            generated: Vec::new(),
         }
     }
 
@@ -6478,6 +6565,13 @@ pub(crate) mod tests {
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             self.asked.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
             Box::pin(async { false })
         }
 
@@ -7863,6 +7957,13 @@ pub(crate) mod tests {
                 gate.notified().await;
                 false
             })
+        }
+
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
         }
 
         fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {

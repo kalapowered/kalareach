@@ -21,12 +21,17 @@
 //!   and a recovery pass that did not run. A reader paging across a hole is told the range and
 //!   given what follows it.
 //! * **Privacy mode reaches a closed session through the archive.** A session with no worker has
-//!   nobody to be told that privacy mode is on, so the archive removes what it retained, under the
-//!   same recovery ownership ([`ArchiveService::remove_retained_content`]): the output and its
-//!   time index, and the content of the receipts that have settled. The session's obligation ends
-//!   only when nothing is left, and the daemon serves none of what the session retained while the
-//!   obligation stands, so a host that crashed between recording privacy mode and removing what it
-//!   was asked to remove, or whose last removal failed, serves none of it from here.
+//!   nobody to be told that privacy mode is on, so the archive does what the worker would have
+//!   done, under the same recovery ownership ([`ArchiveService::remove_retained_content`]): it
+//!   writes the privacy state in force into the session's journal, so that no question or notice
+//!   recorded before it is served again, and it removes the output and its time index and the
+//!   content of the receipts that have settled. The session's obligation ends only when nothing is
+//!   left. The daemon serves none of what the session retained while the obligation stands (the
+//!   reads of its history and its receipts are refused, and the attention store serves no text
+//!   from its journal), so a host that crashed between recording privacy mode and removing what it
+//!   was asked to remove, or whose last removal failed, serves none of it from here. Afterwards
+//!   the journal's own record keeps the text from being served, whether privacy mode is on or has
+//!   been turned off again.
 //! * **A worker crash closes the session, and what it still owned is stopped first.** The closure
 //!   is recorded and nothing is rebuilt from terminal history. Taking ownership removes the
 //!   worker's published endpoint and descriptor; [`ArchiveService::fence_owned`] then stops what
@@ -56,6 +61,7 @@ use kr_worker::journal::Journal;
 use kr_worker::persistence::fault::RecoveryGap;
 
 use crate::error::{ControllerError, Result};
+use crate::privacy::Published;
 
 mod fence;
 mod import;
@@ -971,23 +977,31 @@ impl ArchiveService {
     /// Removes the content a closed session retained, as privacy mode asks, under recovery
     /// ownership.
     ///
-    /// A live session's worker removes its own retained output and the content of its settled
-    /// receipts when it is told privacy mode is on. A session with no worker has no one to tell,
-    /// so the archive does the same two removals on its stores, with the worker's own functions:
-    /// the output goes through the history that publishes the boundary first, so a reader is told
-    /// where the output had reached and which range is gone, and the settled receipts keep their
-    /// identity, state and digests and lose the intent envelope and the result. An action that had
-    /// not settled is settled first, by the recovery a collection pass runs, because no worker is
-    /// left to read its envelope, and the receipt it leaves loses its content with the rest. The
-    /// time index goes with the output it describes.
+    /// A live session's worker records the privacy state in its journal and removes its own
+    /// retained output and the content of its settled receipts when it is told privacy mode is on.
+    /// A session with no worker has no one to tell, so the archive does the same on its stores,
+    /// with the worker's own functions. The state in force, `privacy`, is recorded in the journal
+    /// first, which is the worker's own record: every question and notice the session recorded
+    /// before it stays out of what the attention store serves, while privacy mode is on and after
+    /// it is turned off. The output goes through the history that publishes the boundary first, so
+    /// a reader is told where the output had reached and which range is gone, and the settled
+    /// receipts keep their identity, state and digests and lose the intent envelope and the
+    /// result. An action that had not settled is settled first, by the recovery a collection pass
+    /// runs, because no worker is left to read its envelope, and the receipt it leaves loses its
+    /// content with the rest. The time index goes with the output it describes.
     ///
     /// Each store's failure is reported in [`Removed::left_behind`] and does not stop the other.
-    /// A removal that left something is not one the caller may call done.
+    /// A removal that left something, the privacy record included, is not one the caller may call
+    /// done.
     ///
     /// # Errors
     ///
     /// Returns an error when a worker may still own the session, and nothing is removed then.
-    pub fn remove_retained_content(&self, ownership: &RecoveryOwnership) -> Result<Removed> {
+    pub fn remove_retained_content(
+        &self,
+        ownership: &RecoveryOwnership,
+        privacy: Published,
+    ) -> Result<Removed> {
         let session_id = ownership.session_id;
         if self.a_worker_may_still_own(session_id) {
             return Err(OwnershipRefusal::WorkerMayRemain {
@@ -999,14 +1013,19 @@ impl ArchiveService {
         // first, under the ownership this holds.
         self.bring_forward_owned(ownership);
         let mut removed = Removed::default();
-        self.remove_receipt_content(session_id, &mut removed);
+        self.remove_journal_content(session_id, privacy, &mut removed);
         self.remove_output_content(session_id, &mut removed);
         Ok(removed)
     }
 
-    /// Takes the content out of the receipts: those that have settled, and those that recovery
-    /// settles first.
-    fn remove_receipt_content(&self, session_id: SessionId, into: &mut Removed) {
+    /// Records the privacy state in the session's journal and takes the content out of its
+    /// receipts: those that have settled, and those that recovery settles first.
+    fn remove_journal_content(
+        &self,
+        session_id: SessionId,
+        privacy: Published,
+        into: &mut Removed,
+    ) {
         let path = self.paths.journal_database(session_id);
         match path.try_exists() {
             Ok(true) => {}
@@ -1019,10 +1038,24 @@ impl ArchiveService {
                 return;
             }
         }
-        match Journal::open_existing(&path).and_then(|mut journal| {
-            recover_open(&mut journal)?;
-            journal.redact_settled_content()
-        }) {
+        let mut journal = match Journal::open_existing(&path) {
+            Ok(journal) => journal,
+            Err(error) => {
+                into.left_behind.push(format!(
+                    "this session's journal could not be opened to take privacy mode: {error}"
+                ));
+                return;
+            }
+        };
+        // First, as a worker records it: a state this host could not write down is not one it may
+        // report as taken. The receipts are taken either way, since a failure here says nothing
+        // of them.
+        if let Err(error) = record_privacy_state(&mut journal, privacy) {
+            into.left_behind.push(format!(
+                "this session's journal could not take the privacy state: {error}"
+            ));
+        }
+        match recover_open(&mut journal).and_then(|_| journal.redact_settled_content()) {
             Ok(records) => into.receipts = records,
             Err(error) => into.left_behind.push(format!(
                 "this session's receipts could not have their content removed: {error}"
@@ -1561,6 +1594,27 @@ impl ArchiveService {
             reference: format!("{session_id}"),
         });
     }
+}
+
+/// Writes the privacy state in force into a closed session's journal, as the session's worker
+/// would have, and leaves a journal that already holds it as it is.
+///
+/// The record is what keeps a question or a notice the session recorded before it from being
+/// served as attention text: it takes the head of each source at this moment, and a closed
+/// journal gains no record after it. A record of another generation or state is replaced. No
+/// worker is left whose late result the generation could tell from a current one, so unlike a
+/// live session's, a closed journal's record is not held to move forward only.
+fn record_privacy_state(
+    journal: &mut Journal,
+    privacy: Published,
+) -> std::result::Result<(), kr_worker::WorkerError> {
+    let held = journal.read_privacy()?;
+    if held.is_some_and(|held| {
+        held.generation == privacy.generation.get() && held.enabled == privacy.private
+    }) {
+        return Ok(());
+    }
+    journal.record_privacy(privacy.generation.get(), privacy.private, kr_ipc::now_ms())
 }
 
 /// Runs section 9's two recovery rules over a journal the archive has open under ownership.

@@ -2010,13 +2010,14 @@ impl Controller {
 impl Controller {
     /// Has the archive remove what the ended workers of the sessions privacy mode owes retained.
     ///
-    /// A live session's worker removes its own retained output and receipts when it is told
-    /// privacy mode is on. A session whose worker has ended has nobody to tell, and what it kept
-    /// is on the disk and served until something removes it, so the archive takes the session's
-    /// recovery ownership and does the two removals itself, one session after another. A session
-    /// whose stores are held by another recovery, or that a worker may still own, is left for the
-    /// next pass; a removal that left something is owed with the reason and tried again on a
-    /// schedule. Only a removal that left nothing ends the session's obligation.
+    /// A live session's worker records the privacy state and removes its own retained output and
+    /// receipts when it is told privacy mode is on. A session whose worker has ended has nobody to
+    /// tell, and what it kept is on the disk until something removes it, so the archive takes the
+    /// session's recovery ownership and records the state and does the removals itself, one
+    /// session after another. A session whose stores are held by another recovery, or that a
+    /// worker may still own, is left for the next pass; a removal that left something is owed with
+    /// the reason and tried again on a schedule. Only a removal that left nothing ends the
+    /// session's obligation.
     pub(crate) async fn remove_closed_content(self: &Arc<Self>) {
         let _alone = self.removing_closed.lock().await;
         let privacy = Arc::clone(&self.privacy);
@@ -2061,7 +2062,9 @@ impl Controller {
                 return;
             }
         };
-        match archive.remove_retained_content(&ownership) {
+        // The state in force when the removal begins: the journal is told the generation a worker
+        // of the session would hold now.
+        match archive.remove_retained_content(&ownership, self.privacy.state().now()) {
             Ok(removed) if removed.is_complete() => {
                 if let Err(error) = self.privacy.note_removed(session_id) {
                     refused(format!(
