@@ -545,7 +545,7 @@ describe('the conversation names each kind of entry in words (KR-REQ-13.19)', ()
 
 describe("a package's control invokes its action on the session's worker (KR-REQ-13.14)", () => {
   /** A group of two controls: one whose action takes nothing, and one that asks for a name. */
-  function controlsNode(): DocumentNode {
+  function controlsNode(revision = '1'): DocumentNode {
     const control = (id: string, label: string, action: string, parameters: unknown[]) => ({
       id,
       revision: '1',
@@ -556,7 +556,7 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
     })
     return {
       id: 'g-1',
-      revision: '1',
+      revision,
       body: {
         kind: 'action_group',
         label: 'Thread',
@@ -605,5 +605,92 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
     await person.click(screen.getByRole('button', { name: 'Rename' }))
     expect(await screen.findByText(/asks for input this view cannot take yet/)).toBeTruthy()
     expect(calls).toHaveLength(1)
+  })
+  it('does not call an action for a control drawn under a conversation the agent has left', async () => {
+    const { port, controls } = fakeHost()
+    const calls: PluginActionInvokeParams[] = []
+    openConversation({
+      ...port,
+      pluginActionInvoke: (params, opening) => {
+        calls.push(params)
+        return port.pluginActionInvoke(params, opening)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    const person = userEvent.setup()
+    await person.type(screen.getByTestId('composer-input'), 'Keep the timer')
+    act(() => {
+      controls.appendNode(controlsNode())
+    })
+    await nextFrame()
+    const subject = { session_id: SESSION_MAIN, application_instance_id: INSTANCE_MAIN }
+    await screen.findByRole('button', { name: 'Refresh' })
+
+    // The agent moves to another conversation. The view learns it when it reads again, which the
+    // composer shows for the draft; the control was drawn before that.
+    controls.records.moveBinding(SESSION_MAIN)
+    await shownAgain()
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+        'The conversation changed since this was written.'
+      )
+    })
+    await person.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText(/conversation moved since this was shown/)).toBeTruthy()
+    expect(calls).toHaveLength(0)
+
+    // The package draws the control again for the conversation the agent is in now.
+    act(() => {
+      controls.appendNode(controlsNode('2'))
+    })
+    await nextFrame()
+    await person.click(await screen.findByRole('button', { name: 'Refresh' }))
+    await waitFor(() => {
+      expect(calls).toHaveLength(1)
+    })
+    const read = await port.agentCapabilities({ subject })
+    expect(calls[0]?.target.binding_revision).toBe(read.binding.binding_revision)
+  })
+
+  it('does not call an action from a form that collects input the call cannot carry', async () => {
+    const { port, controls } = fakeHost()
+    const calls: PluginActionInvokeParams[] = []
+    openConversation({
+      ...port,
+      pluginActionInvoke: (params, opening) => {
+        calls.push(params)
+        return port.pluginActionInvoke(params, opening)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    // The field is optional, so the submit control declares no parameter of its own.
+    act(() => {
+      controls.appendNode({
+        id: 'f-1',
+        revision: '1',
+        body: {
+          kind: 'form',
+          title: 'Rename',
+          fields: { parameters: [{ name: 'to', label: 'New name', kind: { type: 'text' } }] },
+          submit: {
+            id: 'send',
+            revision: '1',
+            label: 'Send',
+            accessible_description: 'Send',
+            action_id: 'thread.rename',
+            parameters: { parameters: [] }
+          }
+        }
+      } as unknown as DocumentNode)
+    })
+    await nextFrame()
+    const person = userEvent.setup()
+    await person.click(await screen.findByRole('button', { name: 'Send' }))
+    expect(await screen.findByText(/asks for input this view cannot take yet/)).toBeTruthy()
+    expect(calls).toHaveLength(0)
   })
 })
