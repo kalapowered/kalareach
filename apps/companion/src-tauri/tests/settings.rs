@@ -1902,6 +1902,7 @@ fn directories_holding(root: &std::path::Path, extension: &str) -> Vec<std::path
 }
 
 /// The directories under `root` with this name.
+#[cfg(unix)]
 fn directories_named(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
