@@ -171,6 +171,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::DeliveryDestinationSecretSet
         | Method::PrivacySet
         | Method::PrivacyRetainedDelete
+        | Method::HostPolicyConfirm
         | Method::PairInvite
         | Method::PairRedeem
         | Method::PairFinish

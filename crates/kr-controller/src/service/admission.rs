@@ -1042,6 +1042,17 @@ impl Controller {
                         parse(&mutation.params)?;
                 }
             }
+            // The policy this host holds belongs to the host, not to a session.
+            Method::HostPolicyConfirm => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "the policy this host holds belongs to this host, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::organisation::HostPolicyConfirmParams =
+                    parse(&mutation.params)?;
+            }
             // A machine group step changes this environment's own record, not a session's. A
             // request that named a session here would be asking for a record scoped to something
             // the record does not have.

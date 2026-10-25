@@ -8,6 +8,12 @@
 //! about the difference: a rights-enlarging owner operation still needs the owner-confirmation
 //! contract, because code already running under the user's account can open this socket too.
 //!
+//! One method is a stated exception: `host.policy.confirm`, which ends the wait a restored policy
+//! puts on every remote grant. While the wait stands the host refuses every owner device, so no
+//! confirmation could be spent, and a new subject for one would change the protocol's level. The
+//! method ends a refusal the host raised against itself and changes no policy, and the account
+//! that can open this socket can already remove the record of the wait and start the daemon again.
+//!
 //! Windows has no numeric account, so [`PeerIdentity::uid`] there is a placeholder (`0`) and
 //! [`PeerIdentity::authorise`] is not the account check. The account is proved from the connection
 //! itself in [`crate::endpoint`]: a client checks the owner of the pipe it reached before it writes,

@@ -658,6 +658,18 @@ methods! {
           the host fences the connections admitted under it. A restriction, so it needs no \
           owner confirmation.";
 
+    HostPolicyConfirm = "host.policy.confirm", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("the wait a restored policy holds"),
+    doc: "Confirm, at the host itself, the policy this host holds after it found that policy \
+          restored from an earlier state, which ends the wait that refuses every grant but the \
+          owner's at this machine. No owner device can confirm it, since the wait refuses every \
+          owner device, and no ceremony stands in for the person at the machine. It confirms the \
+          policy as it stands and changes none of it: what the restore revived is ended by the \
+          commands that end it. The host keeps no record of the call, so asked again after a \
+          reply was lost it answers that it lifted nothing.";
+
     MembershipPresent = "membership.present", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [basis(ResourceOwner)],
     selectors: [Device],
@@ -1872,7 +1884,8 @@ pub enum LocalHold {
 /// membership lease says, apart from the session's own tooling ([`local_hold`]).
 ///
 /// What recovers the host: presenting a lease, reading what the host holds, asking for, answering
-/// and spending the owner's confirmations, and establishing the clock. What only restricts or ends
+/// and spending the owner's confirmations, establishing the clock, and confirming a policy the host
+/// found restored. What only restricts or ends
 /// access: revoking a device or a grant, leaving an organisation, closing a session, detaching,
 /// releasing input, and cancelling what is pending. And the reads those take their arguments from.
 /// Every other method is held.
@@ -1887,6 +1900,7 @@ pub const LOCAL_RECOVERY: &[Method] = &[
     Method::DeviceRevoke,
     Method::GrantRevoke,
     Method::OrganisationWithdraw,
+    Method::HostPolicyConfirm,
     Method::SessionClose,
     Method::SessionDetach,
     Method::InputRelease,
@@ -2110,6 +2124,8 @@ mod tests {
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),
         ("privacy.retained.delete", &[ActionRight::HostManage]),
+        // The person at this machine ends the wait a restored policy puts on every remote grant.
+        ("host.policy.confirm", &[ActionRight::HostManage]),
         // This host's own sign-in to the managed account service: whose balance a phone's call
         // spends is the owner's choice at this machine.
         ("account.sign_in", &[ActionRight::HostManage]),

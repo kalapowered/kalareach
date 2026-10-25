@@ -152,11 +152,12 @@ use crate::machine::{
 use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
 use crate::method::REGISTRY;
 use crate::organisation::{
-    ExclusiveManagementEvent, MembershipPresentParams, MembershipPresentResult,
-    OrganisationEnrolParams, OrganisationEnrolResult, OrganisationEnrolmentView,
-    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationLeaseView,
-    OrganisationListParams, OrganisationListResult, OrganisationMemberView,
-    OrganisationPolicyApplyParams, OrganisationPolicyApplyResult, OrganisationWithdrawParams,
+    ExclusiveManagementEvent, HostPolicyConfirmParams, HostPolicyConfirmResult,
+    MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
+    OrganisationEnrolResult, OrganisationEnrolmentView, OrganisationExclusiveSetParams,
+    OrganisationExclusiveSetResult, OrganisationLeaseView, OrganisationListParams,
+    OrganisationListResult, OrganisationMemberView, OrganisationPolicyApplyParams,
+    OrganisationPolicyApplyResult, OrganisationWithdrawParams,
 };
 use crate::pairing::{
     AuthorityRevisionRecord, DirectChallenge, DirectRedeemProof, GenerationCheckpoint,
@@ -920,6 +921,8 @@ pub fn protocol_schema() -> Value {
         // Organisation policy on a host: opting in, presenting a membership lease, and the list that
         // reports what it holds. Appended for the same reason.
         "exclusive_management_event" => ExclusiveManagementEvent,
+        "host_policy_confirm_params" => HostPolicyConfirmParams,
+        "host_policy_confirm_result" => HostPolicyConfirmResult,
         "membership_present_params" => MembershipPresentParams,
         "membership_present_result" => MembershipPresentResult,
         "organisation_enrol_params" => OrganisationEnrolParams,

@@ -1213,6 +1213,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::pair::establish_clock(&paths, &clock, cli.json).await?;
                 Ok(Completion::Done)
             }
+            HostCommand::Policy(policy) => {
+                kr_cli::organisation::confirm_the_policy(&paths, &policy, cli.json).await?;
+                Ok(Completion::Done)
+            }
             HostCommand::Paths => {
                 // Nothing here reaches the host: these are the directories this user's environment
                 // names, which a daemon started as this user uses.

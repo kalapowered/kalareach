@@ -1332,6 +1332,29 @@ pub enum HostCommand {
     Machine(MachineArguments),
     /// Trust this host's clock again, as its owner.
     Clock(ClockArguments),
+    /// Confirm, as the person at this machine, the policy this host holds after it found that
+    /// policy restored from an earlier state.
+    Policy(PolicyArguments),
+}
+
+/// `kr host policy`.
+///
+/// A host that finds its authority feed holding a revision above its registry's knows the registry
+/// was put back to an earlier state. It carries out again what the feed shows completed, and then
+/// refuses every grant but the owner's at this machine, owner devices included, until the person at
+/// this machine confirms the policy it holds: the enrolments, the exclusive management and the
+/// bounds the restored state brought back. The command shows what the host holds and confirms it.
+#[derive(Args)]
+pub struct PolicyArguments {
+    /// Confirm the policy this host holds. Nothing in it changes: end what you do not want in force
+    /// first, with `kr organisation withdraw` and `kr device revoke`, which need no confirmation.
+    /// Ending exclusive management takes an owner device's confirmation, which the wait refuses, so
+    /// it comes after this command.
+    #[arg(long, required = true)]
+    pub confirm: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr host clock`.

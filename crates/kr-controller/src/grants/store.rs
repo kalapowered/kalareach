@@ -411,6 +411,9 @@ pub struct GrantDirectory {
     /// Whether the last write of the copy failed, so that a lasting failure is reported once and
     /// not at every write.
     mirror_failing: std::sync::atomic::AtomicBool,
+    /// Whether [`Self::stored_policy`] found the mirror there and could not read it, so that a
+    /// registry put back to an earlier state was not noticed. A start reads it.
+    mirror_unreadable: std::sync::atomic::AtomicBool,
     /// Where this host's own tests stop a delegation, a redemption or a transfer once it has
     /// anchored its grant and before it takes the store's transaction. Compiled away in every
     /// shipped build.
@@ -557,6 +560,7 @@ impl GrantDirectory {
             mirror: None,
             mirrored: std::sync::Mutex::new(0),
             mirror_failing: std::sync::atomic::AtomicBool::new(false),
+            mirror_unreadable: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             before_effect: crate::attention::Pause::default(),
         })
@@ -2447,9 +2451,20 @@ impl GrantDirectory {
             // stops nothing: the registry's own row is the policy.
             Err(error) => {
                 eprintln!("kr-controller: could not read the copy of this host's policy: {error}");
+                self.mirror_unreadable
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(row)
             }
         }
+    }
+
+    /// Whether the last read of this host's policy found the copy of it there and could not read
+    /// it. A registry put back to an earlier state is not noticed then, and the host answers by
+    /// waiting for the person at this machine ([`super::restored`]).
+    #[must_use]
+    pub fn mirror_unreadable(&self) -> bool {
+        self.mirror_unreadable
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Writes this host's policy.

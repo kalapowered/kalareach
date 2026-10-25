@@ -74,6 +74,7 @@ mod reads;
 mod recovery;
 pub(crate) mod remote_revocation;
 mod rendezvous;
+mod restored_policy;
 mod revocation;
 mod routes;
 mod standing;
@@ -708,9 +709,9 @@ pub struct Controller {
     /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
     /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
     authority_epoch: std::sync::atomic::AtomicU64,
-    /// Which of the refusals the authority feed puts on remote grants stand now: this host is
-    /// behind its feed, the feed shows a withdrawal this host cannot verify, the feed removed this
-    /// host.
+    /// Which of the refusals on remote grants stand now: this host is behind its feed, this host
+    /// waits for the person at this machine to confirm a policy it found restored, the feed shows
+    /// a withdrawal this host cannot verify, the feed removed this host.
     ///
     /// One word, so a reader sees them in one reading. It mirrors the flags of the policy and is
     /// changed with them under the policy's lock, because a check that runs inside a transaction
@@ -718,6 +719,10 @@ pub struct Controller {
     /// ([`Controller::feed_refusal`]), and the pairing records read it where an owner confirmation
     /// is spent.
     feed_refusal: Arc<crate::grants::RemoteRefusal>,
+    /// The record that the policy this host holds was found restored from an earlier state, and
+    /// the lock that orders a change of it and of the wait it keeps
+    /// ([`crate::grants::restored`]). Taken before the registry's guard.
+    restored_policy: tokio::sync::Mutex<crate::grants::restored::Kept>,
     /// The wait for the pairing records' write lock that a refusal which rose is in, while it has
     /// gone on past the database's busy timeout ([`Controller::stuck_drain`]).
     feed_drain: std::sync::Mutex<Option<remote_revocation::StuckDrain>>,

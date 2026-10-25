@@ -27,7 +27,8 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// missing runs while the fence is owed. `every_local_write_method_the_daemon_performs_is_placed`
 /// walks the registry and fails for a method that is on neither this list nor the list of those
 /// that take an admission.
-pub(super) const NO_ADMISSION: [Method; 9] = [
+pub(super) const NO_ADMISSION: [Method; 10] = [
+    Method::HostPolicyConfirm,
     Method::EnvironmentEnrol,
     Method::EnvironmentForget,
     Method::EnvironmentRefresh,
@@ -968,6 +969,20 @@ impl Controller {
                         Ok(_) => self.backup_bundle_write(mutation).await,
                         Err(error) => Err(error),
                     },
+                    None => Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                }
+            }
+            // The person at this machine confirms the policy this host found restored, which ends
+            // the wait that refuses every other grant. It changes no policy and no grant, so it
+            // takes no admission, and the daemon keeps no record of the action: asked again it
+            // answers that it lifted nothing.
+            Method::HostPolicyConfirm => {
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => self.confirm_the_restored_policy().await,
                     None => Err(ControllerError::WindowExpired {
                         detail: "the deadline this action was admitted under passed before it \
                                  could run"

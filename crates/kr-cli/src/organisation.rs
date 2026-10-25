@@ -15,18 +15,19 @@ use kr_protocol::ids::{OrganisationId, PluginId};
 use kr_protocol::limits::MAX_CONTROL_FRAME_LEN;
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
-    MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
-    OrganisationEnrolResult, OrganisationExclusiveSetParams, OrganisationExclusiveSetResult,
-    OrganisationListParams, OrganisationListResult, OrganisationPolicyApplyParams,
-    OrganisationPolicyApplyResult, OrganisationWithdrawParams,
+    HostPolicyConfirmParams, HostPolicyConfirmResult, MembershipPresentParams,
+    MembershipPresentResult, OrganisationEnrolParams, OrganisationEnrolResult,
+    OrganisationExclusiveSetParams, OrganisationExclusiveSetResult, OrganisationListParams,
+    OrganisationListResult, OrganisationPolicyApplyParams, OrganisationPolicyApplyResult,
+    OrganisationWithdrawParams,
 };
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::sharing::RevocationResult;
 
 use crate::cli::{
-    OrganisationCommand, OrganisationEnrolArguments, OrganisationExclusiveCommand,
-    OrganisationPolicyArguments, OrganisationPresentArguments, OrganisationWithdrawArguments,
-    PrivacyArguments,
+    EnvironmentSelector, OrganisationCommand, OrganisationEnrolArguments,
+    OrganisationExclusiveCommand, OrganisationPolicyArguments, OrganisationPresentArguments,
+    OrganisationWithdrawArguments, PolicyArguments, PrivacyArguments,
 };
 use crate::daemon::{Daemon, identifier};
 use crate::error::{CliError, Result};
@@ -43,7 +44,7 @@ use crate::stdout_line;
 pub async fn run(paths: &HostPaths, command: OrganisationCommand, json: bool) -> Result<()> {
     match command {
         OrganisationCommand::Enrol(arguments) => enrol(paths, &arguments, json).await,
-        OrganisationCommand::List(arguments) => list(paths, &arguments, json).await,
+        OrganisationCommand::List(arguments) => list(paths, &arguments.selector, json).await,
         OrganisationCommand::Withdraw(arguments) => withdraw(paths, &arguments, json).await,
         OrganisationCommand::Present(arguments) => present(paths, &arguments, json).await,
         OrganisationCommand::Policy(arguments) => policy(paths, &arguments, json).await,
@@ -476,8 +477,8 @@ fn what_is_asked(display: &ConfirmationDisplay) -> Option<output::Line> {
 }
 
 /// `kr organisation list`.
-async fn list(paths: &HostPaths, arguments: &PrivacyArguments, json: bool) -> Result<()> {
-    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+async fn list(paths: &HostPaths, selector: &EnvironmentSelector, json: bool) -> Result<()> {
+    let mut daemon = Daemon::open(paths, selector).await?;
     let listed: OrganisationListResult = daemon
         .read(Method::OrganisationList, &OrganisationListParams::default())
         .await?;
@@ -686,6 +687,46 @@ fn document(listed: &OrganisationListResult) -> Document {
         )
         .with("enrolments", enrolments)
         .with("exclusive_events", events)
+}
+
+/// `kr host policy --confirm`.
+///
+/// Shows what the host holds, the enrolments and exclusive management that `kr organisation list`
+/// reports, and then confirms it. The host answers whether it was waiting for the confirmation; a
+/// host that was not changes nothing.
+///
+/// # Errors
+///
+/// Returns the host's refusal or a transport failure.
+pub async fn confirm_the_policy(
+    paths: &HostPaths,
+    arguments: &PolicyArguments,
+    json: bool,
+) -> Result<()> {
+    if !json {
+        list(paths, &arguments.selector, false).await?;
+    }
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let confirmed: HostPolicyConfirmResult = daemon
+        .mutate(Method::HostPolicyConfirm, &HostPolicyConfirmParams {})
+        .await?;
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("lifted", confirmed.lifted),
+        );
+    } else if confirmed.lifted {
+        output::line(&stdout_line!(
+            "This host's policy is confirmed. Remote devices are served again where their grants \
+             allow it. The policy is the one listed above, and nothing in it changed."
+        ));
+    } else {
+        output::line(&stdout_line!(
+            "This host was not waiting for a confirmation, so nothing changed."
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
