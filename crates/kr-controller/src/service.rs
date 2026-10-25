@@ -359,9 +359,14 @@ pub struct Controller {
     /// The connection table is not held for the length of a commit, so what only reads it, and a
     /// registration that is added, never waits for one.
     commit_hold: std::sync::RwLock<()>,
-    /// The connections that ended while a commit stood on a registration, whose registrations go
-    /// when the commit has ended ([`Self::deregister`]).
+    /// The connections that ended while the registrations were held, whose registrations go when
+    /// whoever holds them lets go ([`Self::deregister`]).
     ended: std::sync::Mutex<Vec<ConnectionId>>,
+    /// Where this host's own tests stop a withdrawal once it has taken the registrations of the
+    /// connections that ended and still holds them, so that a connection can end behind it.
+    /// Compiled away in every shipped build.
+    #[cfg(test)]
+    after_the_ended_are_taken: BlockingPause,
     /// How many withdrawals have begun to wait for the commits that stand on a registration, for
     /// a suite that holds a commit and waits for one to arrive.
     #[cfg(test)]
@@ -1265,6 +1270,9 @@ mod a_feed_request_written_down_before_it_takes_effect;
 
 #[cfg(test)]
 mod a_completed_request_carried_out_again;
+
+#[cfg(test)]
+mod a_connection_that_ends_behind_a_withdrawal;
 
 #[cfg(test)]
 mod a_refusal_the_feed_raises_after_admission;

@@ -1188,6 +1188,7 @@ impl Controller {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if flag(&policy) == raised {
+                // Letting go of the hold withdraws the connections that ended while it was held.
                 return false;
             }
             let _table = hold.map(|hold| self.withdrawing(hold));

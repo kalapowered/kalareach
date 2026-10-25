@@ -1046,6 +1046,8 @@ impl Controller {
             commit_hold: std::sync::RwLock::new(()),
             ended: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            after_the_ended_are_taken: BlockingPause::default(),
+            #[cfg(test)]
             withdrawals_waiting: std::sync::atomic::AtomicUsize::new(0),
             identity,
             secret_store: setup.secret_store,
