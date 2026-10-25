@@ -3812,7 +3812,13 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
              if ($r) {{ Write-Output \"kr-runtime=[$($p[0])|$($p[1])|$($r.Id)|$($r.FirstFixed)]\" }} \
              else {{ Write-Output \"kr-runtime=[$($p[0])|$($p[1])||]\" }} }}; \
            foreach ($t in @({texts})) {{ \
-             Write-Output \"kr-described=[$t|$(ConvertFrom-KrFrameworkDescription $t)]\" }} }}"
+             Write-Output \"kr-described=[$t|$(ConvertFrom-KrFrameworkDescription $t)]\" }}; \
+           Write-Output \"kr-judged=[$((Test-KrQualifiedEditor).Reason)]\"; \
+           function Read-KrFrame {{ [byte[]](255,255,255) }}; \
+           try {{ Write-Output \"kr-handshake=[$(Wait-KrHandshake)]\" }} \
+           catch {{ Write-Output \"kr-handshake=[error: $($_.Exception.Message)]\" }}; \
+           function Get-KrFrameworkDescription {{ '.NET Framework 4.8' }}; \
+           Write-Output \"kr-unreadable=[$((Test-KrQualifiedEditor).Reason)]\" }}"
     );
     let asked = std::process::Command::new(&package.executable)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -3847,6 +3853,37 @@ fn a_powershell_release_an_advisory_affects_is_named_and_refused() {
             "the module read {text:?} as something other than {version:?}:\n{said}"
         );
     }
+
+    // A runtime that describes itself in words the module cannot read is refused on the platforms an
+    // advisory lists, and this run's own runtime, read, is not refused for it.
+    let reason = |label: &str| -> String {
+        let prefix = format!("{label}=[");
+        said.lines()
+            .find_map(|line| {
+                line.strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(']'))
+            })
+            .unwrap_or_else(|| panic!("the module said nothing for {label}:\n{said}"))
+            .to_owned()
+    };
+    assert_eq!(
+        reason("kr-unreadable"),
+        "powershell_runtime_unreadable",
+        "a runtime the module cannot read passed on a platform an advisory lists"
+    );
+    assert_ne!(
+        reason("kr-judged"),
+        "powershell_runtime_unreadable",
+        "the runtime this run has was refused as unreadable"
+    );
+
+    // An answer that does not decode ends the handshake with a plain no, not with an error that the
+    // host would show the person.
+    assert_eq!(
+        reason("kr-handshake"),
+        "False",
+        "the handshake over an answer that does not decode"
+    );
 
     // The list the package publishes is the one the manifest pins.
     let record: serde_json::Value = serde_json::from_str(

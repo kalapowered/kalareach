@@ -359,6 +359,11 @@ function ConvertFrom-KrFrameworkDescription {
     try { [System.Management.Automation.SemanticVersion]$Matches[1] } catch { $null }
 }
 
+function Get-KrFrameworkDescription {
+    # What the runtime this host runs on calls itself.
+    [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+}
+
 function Test-KrRuntimeRelease {
     <#
     .SYNOPSIS
@@ -409,7 +414,21 @@ function Test-KrQualifiedEditor {
         }
     }
     $platform = if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
-    $runtime = ConvertFrom-KrFrameworkDescription ([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription)
+    $description = Get-KrFrameworkDescription
+    $runtime = ConvertFrom-KrFrameworkDescription $description
+    if ($null -eq $runtime) {
+        # A runtime that cannot be read is not a runtime that is clear of an advisory, so on a
+        # platform an advisory lists the host is refused, as it is for any other bound it cannot read.
+        $judged = @($script:HostAdvisories | Where-Object {
+                $_.ContainsKey('RuntimeFirstFixed') -and $_.Platforms -contains $platform })
+        if ($judged.Count -gt 0) {
+            return @{
+                Ok     = $false
+                Reason = 'powershell_runtime_unreadable'
+                Detail = "the .NET runtime of PowerShell $($PSVersionTable.PSVersion) describes itself as '$description', which this package cannot read, and $($judged[0].Id) ($($judged[0].Url)) lists $platform; update PowerShell"
+            }
+        }
+    }
     $affected = if ($null -ne $runtime) { Test-KrRuntimeRelease $runtime $platform }
     if ($null -ne $affected) {
         return @{
