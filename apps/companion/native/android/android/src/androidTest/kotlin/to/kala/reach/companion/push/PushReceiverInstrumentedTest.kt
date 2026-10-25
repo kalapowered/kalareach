@@ -184,24 +184,41 @@ class PushReceiverInstrumentedTest {
         assertTrue(shownText(tag) != golden.getString("summary"))
     }
 
-    // KR-REQ-16.15: a preview that opens replaces the alert while it is up, and is not posted over an
-    // alert the person tapped or dismissed meanwhile.
+    // KR-REQ-16.15: a preview that opens replaces the alert, even when the replacement follows the
+    // alert at once, before the system has listed it.
     @Test
-    fun aPreviewReplacesTheAlertWhileItIsUpAndIsNotPostedOverOneThePersonDismissed() {
+    fun aPreviewPostedRightAfterTheAlertReplacesItQuietly() {
+        val tag = "instrumented-" + UUID.randomUUID()
+        val alert = NotificationPlan(tag, "Something needs your attention", "opening")
+        val preview = NotificationPlan(tag, "Allow scripts/release.sh?", "")
+
+        Notifier.show(context, alert, Posting.NEW)
+        Notifier.show(context, preview, Posting.REPLACEMENT)
+
+        assertTrue("the preview took the alert's place", until(30) { shownText(tag) == preview.body })
+    }
+
+    // KR-REQ-16.15: a preview is not posted over an alert the person tapped or dismissed while it was
+    // being opened.
+    @Test
+    fun aPreviewIsNotPostedOverAnAlertThePersonDismissed() {
         val tag = "instrumented-" + UUID.randomUUID()
         val alert = NotificationPlan(tag, "Something needs your attention", "opening")
         val preview = NotificationPlan(tag, "Allow scripts/release.sh?", "")
         Notifier.show(context, alert, Posting.NEW)
         assertTrue("the alert is up", until(30) { shownText(tag) == alert.body })
-
-        Notifier.show(context, preview, Posting.REPLACEMENT)
-        assertTrue("the preview took its place", until(30) { shownText(tag) == preview.body })
-
         val posted = notifications.activeNotifications.first { it.tag == tag }
         notifications.cancel(tag, posted.id)
         assertTrue("the person's dismissal took effect", until(30) { shownText(tag) == null })
+
         Notifier.show(context, preview, Posting.REPLACEMENT)
-        assertTrue("the preview is not posted again", !until(5) { shownText(tag) != null })
+
+        // The system takes one application's posts in the order they were made: once a post made after
+        // the preview is listed, a preview that was posted would be listed too.
+        val after = "instrumented-after-" + UUID.randomUUID()
+        Notifier.show(context, NotificationPlan(after, "Later", ""), Posting.NEW)
+        assertTrue("a later post is listed", until(30) { shownText(after) == "Later" })
+        assertEquals("the preview was not posted", null, shownText(tag))
     }
 
     /** A gateway on this device's loopback interface that answers a post with 200 once it is up. */
