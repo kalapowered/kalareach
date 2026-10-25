@@ -1624,8 +1624,13 @@ async fn a_managed_create_whose_shell_has_no_startup_entry_is_refused_naming_the
         .await
         .expect("the call reaches the daemon")
         .expect_err("a shell with no startup entry cannot be managed");
-    // The daemon reports that it could not start a worker, and carries the worker's own words.
-    assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+    // The daemon carries the worker's own words, under the code that says the shell cannot be
+    // managed: a caller is told to install the entry or choose another shell, not to wait.
+    assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
+    assert!(
+        refused.message.contains("no startup entry"),
+        "the worker's refusal, and not its wait running out, reaches the caller: {refused}"
+    );
     assert!(
         refused.message.contains("kr shell install"),
         "the worker's own words reach the caller: {refused}"
@@ -1677,6 +1682,7 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
         .await
         .expect("the call reaches the daemon")
         .expect_err("a shell that never qualifies cannot be managed");
+    assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
     assert!(
         refused.message.contains("did not qualify"),
         "the worker's own words do not reach the caller: {refused}"
