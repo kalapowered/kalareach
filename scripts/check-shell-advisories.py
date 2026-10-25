@@ -318,6 +318,12 @@ def revised_day(body, created):
         month = MONTHS.get(match.group(1))
         if month:
             days.append(datetime.date(int(match.group(3)), month, int(match.group(2))))
+    # The .NET team writes the day as month, day and year in numbers: `V1.1 (10/15/2026)`.
+    for match in re.finditer(r"V\d+\.\d+ \((\d{1,2})/(\d{1,2})/(\d{4})\)", body or ""):
+        try:
+            days.append(datetime.date(int(match.group(3)), int(match.group(1)), int(match.group(2))))
+        except ValueError:
+            pass
     for match in re.finditer(r"Last Updated\s*(\d{4}-\d{2}-\d{2})", body or ""):
         days.append(datetime.date.fromisoformat(match.group(1)))
     return max(days + [created]) if created else (max(days) if days else None)
@@ -351,6 +357,41 @@ def announcements(api, token):
                 "psreadline",
                 identifier,
                 ["github.com/PowerShell/Announcements/issues/%d" % item["number"]],
+                created,
+                revised,
+                needs_row=recent,
+            )
+        )
+    return found
+
+
+def dotnet_announcements(api, token, labels):
+    """The security advisories the .NET team publishes in dotnet/announcements for the runtime series
+    the module judges (`labels`, such as `.NET 8.0`), under the rules of the PowerShell ones: an
+    advisory needs a row when it was first published on or after the start day or its body dates a
+    revision on or after it, and a comment revises nothing. A runtime advisory reaches PowerShell
+    through the runtime a host finds, so the register assesses each one, and the module's runtime
+    bound is the assessment of the two that reach the bridge's host."""
+    url = "%s/repos/dotnet/announcements/issues?state=all&labels=Security&since=%sT00:00:00Z" % (
+        api,
+        STARTED.isoformat(),
+    )
+    found = []
+    for item in fetch_pages(url, token):
+        names = [label if isinstance(label, str) else (label or {}).get("name") for label in item.get("labels") or []]
+        if "pull_request" in item or "Security" not in names or not set(labels) & set(names):
+            continue
+        cves = re.findall(r"CVE-\d{4}-\d{4,}", item.get("title") or "")
+        identifier = cves[0] if cves else "dotnet/announcements#%d" % item["number"]
+        created = day(item.get("created_at"))
+        revised = revised_day(item.get("body"), created)
+        recent = (created is not None and created >= STARTED) or (revised is not None and revised >= STARTED)
+        found.append(
+            finding(
+                "dotnet/announcements",
+                "psreadline",
+                identifier,
+                ["github.com/dotnet/announcements/issues/%d" % item["number"]],
                 created,
                 revised,
                 needs_row=recent,
@@ -646,8 +687,9 @@ def pinned_versions(root):
         with open(os.path.join(root, "shells", name, "manifest.json")) as handle:
             return json.load(handle)
 
-    floors, host_floors = {}, {}
+    floors, host_floors, runtime_labels = {}, {}, set()
     for advisory in manifest("psreadline")["qualified"]["powershell_advisories"]:
+        runtime_labels.update(".NET " + series for series in advisory.get("runtime_first_fixed", {}))
         for series, fixed in advisory["first_fixed"].items():
             key = numbers(series)
             floors[key] = max(floors.get(key, ()), numbers(fixed))
@@ -679,6 +721,7 @@ def pinned_versions(root):
         "zsh": manifest("zsh")["upstream"]["version"],
         "bash": manifest("bash")["upstream"]["version"],
         "floors": floors,
+        "runtime_labels": sorted(runtime_labels),
     }
 
 
@@ -701,6 +744,7 @@ def collect(root, api, ftp, token, facts, audit, register_text):
         accepted=pins["accepted"]["psreadline"],
     )
     found += announcements(api, token)
+    found += dotnet_announcements(api, token, pins["runtime_labels"])
     found += powershell_releases(api, token, pins["floors"])
     found += fish_releases(api, token, pins["fish"])
     found += zsh_tags(api, token, pins["zsh"])
@@ -819,6 +863,7 @@ def routes():
     ):
         table["/repos/%s/security-advisories" % repository] = fixture("github-%s-security-advisories.json" % name)
     table["/repos/PowerShell/Announcements/issues"] = fixture("github-announcements-issues.json")
+    table["/repos/dotnet/announcements/issues"] = fixture("github-dotnet-announcements-issues.json")
     table["/repos/fish-shell/fish-shell/releases"] = fixture("github-fish-releases.json")
     table["/repos/PowerShell/PowerShell/releases"] = fixture("github-powershell-releases.json")
     table["/repos/zsh-users/zsh/tags"] = fixture("github-zsh-tags.json")
@@ -970,6 +1015,44 @@ def run_self_test():
             expect("the control reads nothing of the pin " + identifier, identifier not in read, str(read))
         # The releases at the module's bound are the ones it accepts, and only a release above one needs a row.
         expect("a release at the bound needs no row", not {"v7.4.21", "v7.5.12", "v7.6.7"} & set(needing), str(needing))
+
+        # The .NET team's advisories for the runtime series the module judges are read under the same
+        # rules: the recorded servicing of 2026-10-13 holds 46, and the control above covers each.
+        dotnet = "/repos/dotnet/announcements/issues"
+        expect("the control reads the .NET advisories", "CVE-2026-96225" in needing and "CVE-2026-70194" in needing, str(needing))
+        outcome = attempt(routes(), now="2026-11-02", text=without("CVE-2026-70194"))
+        expect("without the row of a .NET advisory", says(outcome, "CVE-2026-70194", "no triage row"), str(outcome))
+        def dotnet_issue(number, cve, labels, created, body="### Revisions\n\nV1.0 (10/13/2026): Advisory published.\n"):
+            def add(items):
+                return items + [{
+                    "number": number, "title": "Microsoft Security Advisory %s | .NET Denial of Service Vulnerability" % cve,
+                    "state": "open", "labels": [{"name": name} for name in labels], "created_at": created,
+                    "updated_at": created, "author_association": "NONE", "body": body,
+                }]
+            return add
+        september = "### Revisions\n\nV1.0 (09/01/2026): Advisory published.\n"
+        november = "### Revisions\n\nV1.0 (11/03/2026): Advisory published.\n"
+        for labels, created, body, needs, name in (
+            (["Security", ".NET 10.0"], "2026-11-03T10:00:00Z", november, True, "a new advisory for a series the module judges"),
+            (["Security", ".NET 7.0"], "2026-11-03T10:00:00Z", november, False, "a new advisory for a series the module does not judge"),
+            (["Security", ".NET 10.0"], "2026-09-01T10:00:00Z", september, False, "an advisory from before the start day"),
+            ([".NET 10.0"], "2026-11-03T10:00:00Z", november, False, "an issue without the Security label"),
+        ):
+            outcome = attempt(edited(routes(), dotnet, dotnet_issue(900, "CVE-2026-99001", labels, created, body)), now="2026-11-20")
+            expect(
+                name,
+                not isinstance(outcome, SourceError) and says(outcome, "CVE-2026-99001", "no triage row") == needs,
+                str(outcome),
+            )
+        def revised_dotnet(items):
+            for item in items:
+                if item["number"] == 476:
+                    item["body"] += "\nV1.1 (10/30/2026): The affected platforms were corrected.\n"
+            return items
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet), now="2026-11-10")
+        expect("a .NET advisory revised after its row", says(outcome, "CVE-2026-96225", "revised"), str(outcome))
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet), now="2026-10-30")
+        expect("a .NET advisory revised inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-96225"), str(outcome))
 
         # Each mutation takes away a row the recorded data needs, and the check names the change. It is read
         # on a day after every triage allowance has passed, since v7.6.8 (2026-10-22) is still inside its own on the day the recorded sources were taken.
