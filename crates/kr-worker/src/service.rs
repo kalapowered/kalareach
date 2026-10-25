@@ -5211,10 +5211,11 @@ impl WorkerService {
         let deadline = tokio::time::Instant::now() + self.upstream_deadline();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
-        let (revision, operation, action) = (
+        let (revision, operation, action, turn_id) = (
             handoff.admitted.binding_revision(),
             handoff.admitted.operation(),
             handoff.admitted.action().cloned(),
+            handoff.admitted.turn_id().cloned(),
         );
         let (outcome, late) = handoff.carry(deadline).await;
         let settled = off_the_executor(|| {
@@ -5233,6 +5234,7 @@ impl WorkerService {
                 name: operation.as_str().to_owned(),
                 action,
                 revision,
+                turn_id,
                 request: late.upstream_request_id().clone(),
             };
             self.watch_late(operation, &late);
@@ -5374,14 +5376,16 @@ impl WorkerService {
             observed_at_ms: kr_ipc::now_ms(),
         };
         // What an applied receipt keeps is what the on-time path keeps for the operation: the
-        // identifier it was sent under, and the provenance. A late answer is not read for a turn.
+        // identifier it was sent under, the provenance and the turn it was admitted against. A
+        // late answer is not read for a turn, so a prompt, which learns its turn from its answer,
+        // keeps none.
         let result = matches!(verdict, LateVerdict::Applied)
             .then(|| {
                 let mutation = kr_protocol::agent::AgentMutationResult {
                     binding_revision: operation.revision,
                     provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
                     upstream_request_id: Nullable::some(operation.request.clone()),
-                    turn_id: Nullable::null(),
+                    turn_id: Nullable::from(operation.turn_id.clone()),
                 };
                 match operation.action.clone() {
                     Some(action) => encode(&kr_protocol::agent::PluginActionInvokeResult {
@@ -10962,6 +10966,10 @@ struct LateOperation {
     action: Option<kr_protocol::broker::ActionName>,
     /// The binding revision the operation was admitted at.
     revision: kr_protocol::ids::AgentBindingRevision,
+    /// The turn the operation was admitted against, which a steer or a cancellation names. The
+    /// result of an operation answered on time keeps it, and so does the result of one answered
+    /// late.
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
     /// The identifier the operation was sent to the upstream under.
     request: kr_protocol::ids::UpstreamRequestId,
 }

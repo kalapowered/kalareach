@@ -2033,6 +2033,20 @@ fn upstream_rich() -> kr_protocol::gateway::RichMethodTable {
     }
 }
 
+/// The closed rich table that names the methods a prompt and a cancellation of the running turn go
+/// out as.
+fn upstream_rich_cancelling() -> kr_protocol::gateway::RichMethodTable {
+    let mut table = upstream_rich();
+    table.entries.push(kr_protocol::gateway::RichMethodEntry {
+        method: kr_protocol::ids::UpstreamMethod::new("turn/interrupt").expect("valid"),
+        class: kr_protocol::gateway::NativeMethodClass::Mutation,
+        required_right: kr_protocol::rights::ActionRight::AgentCancel,
+        operation: Nullable::some(kr_protocol::gateway::RichOperation::TurnCancel),
+        provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+    });
+    table
+}
+
 /// One end of a connected pair of local sockets: a Unix socket pair where the platform has one,
 /// and otherwise a loopback connection. This suite needs two connected streams and nothing of the
 /// endpoint they stand in for: a launched agent's endpoint on Windows is a named pipe, and the
@@ -2092,15 +2106,24 @@ impl Drop for RealTransport {
 
 /// Opens the connection and binds its transport to the session's instance.
 async fn real_transport(host: &Host) -> RealTransport {
+    real_transport_with(host, upstream_rich()).await
+}
+
+/// Opens the connection and binds its transport to the session's instance, over a rich table that
+/// lists the operations `rich` does.
+async fn real_transport_with(
+    host: &Host,
+    rich: kr_protocol::gateway::RichMethodTable,
+) -> RealTransport {
     let broker = host.service.broker();
     broker
-        .pin_table(instance(), installed(), upstream_table(), upstream_rich())
+        .pin_table(instance(), installed(), upstream_table(), rich.clone())
         .expect("the installed tables are pinned");
     broker
         .pin_reading(
             instance(),
             &PluginId::new("kalareach.codex").expect("valid"),
-            kr_worker::broker::reading::Reading::spelling(&upstream_rich()),
+            kr_worker::broker::reading::Reading::spelling(&rich),
         )
         .expect("what the connector spells is pinned");
     broker
@@ -2366,10 +2389,27 @@ async fn kr_req_09_05_a_reply_after_the_deadline_is_correlation_evidence_that_se
         .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
         .await;
     assert_eq!(observations_of(&host, &applied).len(), 1);
-    // The receipt a retry is answered with is the settled one.
+    // The receipt a retry is answered with is the settled one, and the result the retry returns is
+    // the one a mutation answered on time has: it names the identifier the prompt was sent under.
     assert_eq!(
         receipt(&mut client, unknown.action_id).await.state,
         ReceiptState::Applied
+    );
+    let mut retry = prompt_mutation(&client, &host, 34);
+    retry.action_id = unknown.action_id;
+    let Outcome::Ok(replayed) = send(&mut client, retry).await else {
+        panic!("a retry of a settled prompt is answered with its result");
+    };
+    let result: kr_protocol::agent::AgentMutationResult = replayed
+        .to_typed()
+        .expect("the result is the one a mutation has");
+    assert_eq!(
+        result.provenance,
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(
+        result.upstream_request_id.as_ref().map(ToString::to_string),
+        Some(id.clone())
     );
 
     // An error that says the frame was never a call the upstream could make: the operation was
@@ -2461,6 +2501,101 @@ async fn kr_req_09_05_a_reply_after_the_workers_own_deadline_still_settles_the_r
         .await
         .expect("the reply is carried");
     until_receipt(&mut client, unknown.action_id, ReceiptState::Applied).await;
+}
+
+/// KR-REQ-09.05: the reply that comes after the deadline to an action of a package settles its
+/// receipt with the result that action has. A retry of the call is answered with the result of an
+/// action, which names the action, the identifier it was sent under and the turn it acted on, as
+/// the result of a cancellation answered on time does, and not with the result of a plain mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_reply_after_the_deadline_to_a_package_action_is_kept_as_that_actions_result()
+ {
+    let host = host().await;
+    register(&host, None);
+    record_evidence(
+        &host,
+        "agent.cancel",
+        CapabilityRevision::new(1),
+        kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+    );
+    let refused = host
+        .service
+        .broker()
+        .register_actions(binding(), &[cancel_declaration()])
+        .expect("the action is registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    let transport = real_transport_with(&host, upstream_rich_cancelling()).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+    host.service
+        .broker()
+        .set_turn(
+            instance(),
+            Some(kr_protocol::ids::AgentTurnId::new("turn-1").expect("valid")),
+        )
+        .expect("a turn is running");
+    let mut client = cli(&host).await;
+    let window_id = client.action_window().action_window_id.clone();
+    let mutation = plugin_invocation(&host, 40, window_id, "turn.cancel", Nullable::null(), b"{}");
+    let action_id = mutation.action_id;
+    let mut retry = mutation.clone();
+    retry.request_id = RequestId::new(41);
+
+    let Outcome::Error(failure) = send(&mut client, mutation).await else {
+        panic!("a cancellation nobody acknowledged is not a success");
+    };
+    assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+    assert!(
+        transport
+            .read
+            .lock()
+            .expect("the record is not poisoned")
+            .contains("turn/interrupt"),
+        "the cancellation reached the upstream"
+    );
+    let id = transport.identifier_of(1).await;
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect("the reply is carried");
+    until_receipt(&mut client, action_id, ReceiptState::Applied).await;
+
+    let Outcome::Ok(replayed) = send(&mut client, retry).await else {
+        panic!("a retry of a settled action is answered with its result");
+    };
+    let result: kr_protocol::agent::PluginActionInvokeResult = replayed
+        .to_typed()
+        .expect("the result is the one an action has");
+    assert_eq!(result.action.as_str(), "turn.cancel");
+    let mutation = result
+        .mutation
+        .as_ref()
+        .expect("the cancellation went upstream");
+    assert_eq!(
+        mutation.provenance,
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(
+        mutation
+            .upstream_request_id
+            .as_ref()
+            .map(ToString::to_string),
+        Some(id),
+        "it names the identifier the cancellation was sent under"
+    );
+    assert_eq!(
+        mutation
+            .turn_id
+            .as_ref()
+            .map(kr_protocol::ids::AgentTurnId::as_str),
+        Some("turn-1"),
+        "and the turn it cancelled"
+    );
 }
 
 /// KR-REQ-09.05: a connection that has ended carries no evidence: a reply the upstream wrote
@@ -3711,6 +3846,20 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
     );
 }
 
+/// The action a package declares to cancel the running turn, which the host carries out itself.
+fn cancel_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": "turn.cancel",
+        "label": "Cancel the turn",
+        "effect": "upstream.cancel",
+        "implementation": { "type": "upstream_cancel" },
+        "parameters": { "parameters": [] },
+        "description": "Stop the turn that is running",
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
+}
+
 /// KR-REQ-12.08 and KR-REQ-11.28: an action the package declares as a cancellation of the running
 /// turn is held, before anything is admitted, to the right to cancel: a device whose grant holds
 /// the rights to prompt and to answer an approval, and to view, is refused `PERMISSION_DENIED`,
@@ -3724,21 +3873,10 @@ async fn kr_req_12_08_a_declared_cancellation_needs_the_right_to_cancel() {
         &host,
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
-    let cancel =
-        serde_json::from_value::<kr_plugin_sdk::effect::ActionDeclaration>(serde_json::json!({
-            "id": "turn.cancel",
-            "label": "Cancel the turn",
-            "effect": "upstream.cancel",
-            "implementation": { "type": "upstream_cancel" },
-            "parameters": { "parameters": [] },
-            "description": "Stop the turn that is running",
-            "confirmation_required": false,
-        }))
-        .expect("a declaration the manifest format reads");
     let refused = host
         .service
         .broker()
-        .register_actions(binding(), &[cancel])
+        .register_actions(binding(), &[cancel_declaration()])
         .expect("the action is registered");
     assert!(refused.is_empty(), "{refused:?}");
     let mut daemon = daemon(&host).await;

@@ -354,6 +354,8 @@ pub struct MutationAdmission {
     resource_id: Option<kr_protocol::ids::PendingResourceId>,
     /// The action this invocation runs, where it runs one.
     action: Option<ActionName>,
+    /// The turn the operation was admitted against, where it acts on one.
+    turn_id: Option<kr_protocol::ids::AgentTurnId>,
 }
 
 impl MutationAdmission {
@@ -374,6 +376,7 @@ impl MutationAdmission {
             provenance: ActionProvenance::UpstreamTypedRpc,
             resource_id: None,
             action: None,
+            turn_id: request.turn_id.clone(),
             permit: std::sync::Mutex::new(Some(ExecutionPermit {
                 request,
                 dispatch,
@@ -510,6 +513,12 @@ impl MutationAdmission {
     #[must_use]
     pub const fn action(&self) -> Option<&ActionName> {
         self.action.as_ref()
+    }
+
+    /// Returns the turn the operation was admitted against, where it acts on one.
+    #[must_use]
+    pub const fn turn_id(&self) -> Option<&kr_protocol::ids::AgentTurnId> {
+        self.turn_id.as_ref()
     }
 
     /// Asks the transport whether it can carry this operation, as the body now stands.
