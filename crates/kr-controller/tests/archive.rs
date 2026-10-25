@@ -2224,7 +2224,7 @@ fn a_journal_a_worker_may_still_own_is_not_imported() {
 fn unconfirmed_session(
     archive: &ArchiveService,
     launcher: Option<&kr_protocol::identity::ProcessStartIdentity>,
-) -> SessionId {
+) -> (SessionId, DisplayNumber) {
     let mut registry = registry(archive);
     let reservation = registry
         .reserve(
@@ -2251,7 +2251,7 @@ fn unconfirmed_session(
     registry
         .record_closure(&record)
         .expect("records the closure");
-    session_id
+    (session_id, reservation.display_number)
 }
 
 #[test]
@@ -2266,10 +2266,10 @@ fn a_closures_unconfirmed_worker_no_longer_blocks_the_import_once_the_process_it
     let ended = kr_ipc::identity::ended_process_identity(5);
     let running = kr_ipc::identity::current_process_start_identity().expect("an identity");
 
-    let lifted = unconfirmed_session(&archive, Some(&ended));
+    let (lifted, _) = unconfirmed_session(&archive, Some(&ended));
     publish_descriptor(&archive, lifted, &ended);
-    let still_running = unconfirmed_session(&archive, Some(&running));
-    let no_launch = unconfirmed_session(&archive, None);
+    let (still_running, _) = unconfirmed_session(&archive, Some(&running));
+    let (no_launch, _) = unconfirmed_session(&archive, None);
 
     let imported = archive.import_journals().expect("imports");
     assert_eq!(
@@ -2296,6 +2296,38 @@ fn a_closures_unconfirmed_worker_no_longer_blocks_the_import_once_the_process_it
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn what_a_lifted_closure_left_of_its_worker_is_fenced_by_the_display_number_of_its_reservation() {
+    // KR-REQ-24.30. With no worker row and no descriptor, the reservation is what says which
+    // endpoint the worker published: the one at its display number is removed before the journal is
+    // opened, and an endpoint at another number is not the session's and stays.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let ended = kr_ipc::identity::ended_process_identity(7);
+    let (session_id, display_number) = unconfirmed_session(&archive, Some(&ended));
+    let own = PublishedEndpoint::of(&archive, display_number);
+    let other = PublishedEndpoint::of(&archive, DisplayNumber::new(display_number.get() + 1));
+
+    let imported = archive.import_journals().expect("imports");
+    assert!(
+        matches!(
+            outcome_of(&imported, session_id),
+            ImportOutcome::Imported { from: 1, .. }
+        ),
+        "{:?}",
+        outcome_of(&imported, session_id)
+    );
+    assert!(
+        !own.exists(),
+        "the endpoint at the reservation's display number was fenced"
+    );
+    assert!(
+        other.exists(),
+        "and another worker's endpoint was not touched"
+    );
+}
+
 #[test]
 fn a_reservation_that_cannot_be_read_only_keeps_the_refusal_it_was_read_to_lift() {
     // The reservation is evidence to lift a closure's claim, never a blocker of its own: a registry
@@ -2304,7 +2336,7 @@ fn a_reservation_that_cannot_be_read_only_keeps_the_refusal_it_was_read_to_lift(
     use kr_controller::archive::ImportOutcome;
     let (_temp, archive) = host();
     let ended = kr_ipc::identity::ended_process_identity(6);
-    let unconfirmed = unconfirmed_session(&archive, Some(&ended));
+    let (unconfirmed, _) = unconfirmed_session(&archive, Some(&ended));
     let plain = session();
     write_version_one_journal(&archive, plain);
     registry(&archive)

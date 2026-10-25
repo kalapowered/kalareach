@@ -7,8 +7,9 @@
 //! there - the registry's worker row, a closure in the registry that never confirmed its worker's
 //! end, and the published descriptor - and a source this host cannot read counts as saying so. A
 //! closure's claim that its worker's end was never confirmed is lifted by the kernel's later answer
-//! about the process the session's launch ran, read from the session's reservation and used for
-//! nothing else (`closure_leaves_a_worker`).
+//! about the process the session's launch ran, read from the session's reservation. The reservation
+//! is used for nothing else, except that its display number names the endpoint to fence after the
+//! claim is lifted (`closure_leaves_a_worker`).
 //! The registry is read as it is, never brought forward or repaired, and an environment without
 //! one has nothing to say about its workers, so nothing below the ladder is imported there. What is
 //! left of a worker whose end is confirmed, its endpoint and then its descriptor, is removed before
@@ -143,9 +144,11 @@ impl ArchiveService {
     /// The caller holds the environment's singleton lock, which is what makes this the only
     /// process touching these files: `kr host import-journals` takes it before it calls this. The
     /// registry is read as it is, with [`Registry::open_to_read`]: one that is not there, is at
-    /// another schema version or has lost a table it is asked is not evidence this host can weigh,
-    /// so every journal below the ladder is refused by name, and a journal inside it is left alone
-    /// as always.
+    /// another schema version or has lost its workers or closures table is not evidence this host
+    /// can weigh, so every journal below the ladder is refused by name, and a journal inside it is
+    /// left alone as always. A registry that lost its reservations refuses only the journals whose
+    /// closure lists a worker whose end was never confirmed, since those are the sessions the
+    /// reservation is read for.
     ///
     /// # Errors
     ///

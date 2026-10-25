@@ -9,7 +9,8 @@ use kr_ipc::testing::TempHost;
 use kr_protocol::ids::SessionId;
 
 use super::a_migration_and_a_recovery_of_one_session::{
-    after_the_first_pass, closure_of, put_back_to_an_earlier_schema, version_of, written_journal,
+    after_the_first_pass, closure_of, put_back_to_an_earlier_schema, until_made, version_of,
+    written_journal,
 };
 use crate::attention::ClosedJournal;
 use crate::service::net::tests::daemon;
@@ -85,8 +86,14 @@ async fn a_journal_whose_migration_fails_is_not_taken_for_one_that_cannot_be_rea
     );
 
     drop(stopped);
-    // The store's next try, which its maintenance loop makes once the wait has passed.
-    attention.session_closed(&*reach, session_id).await;
+    // The store's next try, which its maintenance loop makes once the wait has passed. The gate in
+    // front of a migration puts it off while another task of the daemon holds the registry, so the
+    // try is made again until the session is finished.
+    until_made(
+        || attention.session_closed(&*reach, session_id),
+        |()| attention.finished_with(session_id),
+    )
+    .await;
     assert!(
         attention.finished_with(session_id),
         "once nothing stops it the migration is made and the session is read to its end"
