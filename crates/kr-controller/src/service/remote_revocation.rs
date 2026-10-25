@@ -1955,9 +1955,13 @@ mod tests {
                     .await;
             }
         });
-        while controller.remote_refusal().standing().is_none() {
+        while controller.remote_refusal().standing().is_none() && !rise.is_finished() {
             tokio::task::yield_now().await;
         }
+        assert!(
+            controller.remote_refusal().standing().is_some(),
+            "the refusal rose"
+        );
         rise
     }
 
@@ -2238,6 +2242,33 @@ mod tests {
             .join()
             .expect("the holder ends")
             .expect("the handle is let go");
+    }
+
+    /// KR-REQ-24.15: a wait keeps the time of its first failed attempt, and a reason that replaces
+    /// another has a time of its own, so that what `kr doctor` says of how long the reason that
+    /// stands now has stood is not the age of the wait.
+    #[test]
+    fn a_reason_that_replaces_another_has_its_own_time() {
+        use super::{DrainWhy, StuckDrain};
+
+        let held = StuckDrain::found(None, DrainWhy::Held, 1_000);
+        assert_eq!((held.since_ms, held.why_since_ms), (1_000, 1_000));
+        let still_held = StuckDrain::found(Some(held), DrainWhy::Held, 9_000);
+        assert_eq!(
+            (still_held.since_ms, still_held.why_since_ms),
+            (1_000, 1_000),
+            "the same reason keeps its time"
+        );
+        let failed = StuckDrain::found(
+            Some(still_held),
+            DrainWhy::Failed("the disk is full"),
+            600_000,
+        );
+        assert_eq!(
+            (failed.since_ms, failed.why_since_ms),
+            (1_000, 600_000),
+            "the wait keeps its first time, and the new reason has its own"
+        );
     }
 
     /// KR-REQ-24.15: the feed's removal of this host rises at once while a write to the pairing
