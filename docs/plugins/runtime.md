@@ -4,10 +4,10 @@
 side of the same contract: where a component actually runs, what bounds it, and what happens when it
 misbehaves.
 
-A component runs in `kr-plugin-host`, one process for each environment, started when a binding
-first needs one. A worker never links the engine. It asks the control
-daemon for the process, registers a binding with it and keeps its own ledger, so a component that
-traps costs its binding and nothing else.
+A component runs in `kr-plugin-host`, one process for each environment, started when a binding first
+needs one. A worker never links the engine. It asks the control daemon for the process, registers a
+binding with it and keeps its own ledger, so a component that traps costs its binding and nothing
+else.
 
 ```text
 kr-controller ──start job──▶ service manager ──▶ kr-plugin-host ──▶ component instance
@@ -390,8 +390,8 @@ daemon had accepted it would be serving as a process the daemon might still refu
 
 On success the launcher publishes an owner-only descriptor in the environment's runtime directory,
 in `plugin-host-3.json`, the file `kr-plugin-host/3` names. A worker reads the descriptor,
-challenges the process behind the endpoint, and talks to that process directly. Nothing in the descriptor is acted on before the challenge: a filename and a
-process identifier are hints.
+challenges the process behind the endpoint, and talks to that process directly. Nothing in the
+descriptor is acted on before the challenge: a filename and a process identifier are hints.
 
 ### What a worker sends
 

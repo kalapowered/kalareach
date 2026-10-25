@@ -302,9 +302,9 @@ device has no key for stops there, before anything is decrypted.
 The order is fixed. The keyless rules of the item's own shape run first, so a malformed item costs
 no key at all. An identifier the ledger already holds is refused next, on the record's own claim, so
 a redelivery costs no decryption; the claim is untrusted and that is only an early exit. Then the
-sender is selected, the box is opened and every binding is checked.
-The replay identifier is recorded **last**, after every check has passed, so an item that
-is refused is not recorded and one that was accepted is never accepted again.
+sender is selected, the box is opened and every binding is checked. The replay identifier is
+recorded **last**, after every check has passed, so an item that is refused is not recorded and one
+that was accepted is never accepted again.
 
 `open_envelope` stays public beneath it, for a caller that already knows which key it means. That
 caller takes on the two duties the delivery path discharges: selecting the sender from what it has
