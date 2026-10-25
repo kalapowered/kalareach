@@ -1244,6 +1244,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
                 &harness.actor,
                 draft.draft_id,
                 session_id,
+                crate::support::an_application(),
                 &Admission::none(),
             )
             .expect("records the submission");
@@ -1347,6 +1348,7 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
                 &harness.actor,
                 draft.draft_id,
                 session_id,
+                crate::support::an_application(),
                 &Admission::none()
             )
             .expect("records the prompt"),
@@ -1374,6 +1376,7 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
                 &harness.actor,
                 draft.draft_id,
                 session_id,
+                crate::support::an_application(),
                 &Admission::none()
             )
             .expect("records the prompt again"),
@@ -1381,7 +1384,13 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
     );
     let refusal = harness
         .service
-        .record_prompt(&harness.actor, draft.draft_id, other, &Admission::none())
+        .record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            other,
+            crate::support::an_application(),
+            &Admission::none(),
+        )
         .expect_err("a draft is sent to one session");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
 }
@@ -1440,7 +1449,13 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
 
     let refusal = harness
         .service
-        .record_prompt(&harness.actor, draft.draft_id, other, &Admission::none())
+        .record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            other,
+            crate::support::an_application(),
+            &Admission::none(),
+        )
         .expect_err("another session's prompt is refused");
     assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
     assert!(
@@ -1455,7 +1470,13 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
     assert_eq!(
         harness
             .service
-            .record_prompt(&harness.actor, draft.draft_id, owner, &Admission::none())
+            .record_prompt(
+                &harness.actor,
+                draft.draft_id,
+                owner,
+                crate::support::an_application(),
+                &Admission::none()
+            )
             .expect("the owner's prompt is recorded"),
         1
     );
@@ -1540,6 +1561,7 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
             &harness.actor,
             draft.draft_id,
             session_id,
+            crate::support::an_application(),
             &Admission::none(),
         )
         .expect("records the submission");
@@ -2990,6 +3012,7 @@ fn an_attachment_a_noted_session_names_outlasts_a_later_submission_to_another_se
             &harness.actor,
             later_draft.draft_id,
             later,
+            crate::support::an_application(),
             &Admission::none(),
         )
         .expect("records the prompt");

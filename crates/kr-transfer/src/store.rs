@@ -1484,19 +1484,23 @@ impl Store {
     ///
     /// A draft that targets another session, a draft already sent to another session, and a draft
     /// that holds an attachment belonging to another session are each refused, and the refusal
-    /// writes nothing.
+    /// writes nothing. So is a draft written for another application than the one the prompt is
+    /// for: its text and attachments were composed for that conversation, and sending them to this
+    /// one is not what the person prepared. A draft that names no application is sent to any.
     ///
     /// Returns how many attachments the draft holds.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::InvalidArgument`] for each refusal above,
+    /// Returns [`TransferError::DraftConflict`] for a draft written for another application,
+    /// [`TransferError::InvalidArgument`] for each other refusal above,
     /// [`TransferError::SessionEnded`] when the session has ended, and
     /// [`TransferError::StoreUnavailable`] when the write fails.
     pub fn record_prompt(
         &mut self,
         draft_id: DraftId,
         session_id: SessionId,
+        application_instance_id: ApplicationInstanceId,
         at_ms: TimestampMs,
     ) -> Result<usize> {
         let draft = self
@@ -1508,6 +1512,18 @@ impl Store {
             return Err(TransferError::invalid(
                 "this draft targets another session, so it cannot be sent to this one",
             ));
+        }
+        // The application a draft is for is fixed when it is made, so this read stands for the
+        // transaction below.
+        if draft
+            .application_instance_id
+            .is_some_and(|written_for| written_for != application_instance_id)
+        {
+            return Err(TransferError::DraftConflict {
+                detail: "this draft was written for another application, so it is not sent to \
+                         this one"
+                    .to_owned(),
+            });
         }
         let transaction = self.begin()?;
         let sent_to: Option<Uuid> = transaction

@@ -693,11 +693,12 @@ impl TransferModule {
     ///
     /// Returns the refusal the service decided, other than for a draft it does not hold: among
     /// them a draft that is for another session, or holds an attachment that belongs to one, a
-    /// session that has ended (`SESSION_CLOSED`), and an admission that no longer stands.
+    /// draft written for another application than the prompt's (`DRAFT_CONFLICT`), a session that
+    /// has ended (`SESSION_CLOSED`), and an admission that no longer stands.
     pub(crate) async fn record_submission(
         &self,
         actor_id: &ActorId,
-        draft_id: kr_protocol::ids::DraftId,
+        prompted: PromptedDraft,
         session_id: SessionId,
         admission: Arc<TransferAdmission>,
     ) -> Answer<usize> {
@@ -709,7 +710,13 @@ impl TransferModule {
         blocking(move || {
             #[cfg(feature = "testing")]
             after_the_outer_check.wait();
-            match service.record_prompt(&actor, draft_id, session_id, &admission) {
+            match service.record_prompt(
+                &actor,
+                prompted.draft_id,
+                session_id,
+                prompted.application_instance_id,
+                &admission,
+            ) {
                 Err(kr_transfer::TransferError::UnknownDraft { .. }) => Ok(0),
                 other => Ok(other?),
             }
@@ -1472,22 +1479,35 @@ fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 
+/// A draft a prompt names, and the application the prompt is for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PromptedDraft {
+    /// The draft.
+    pub(crate) draft_id: kr_protocol::ids::DraftId,
+    /// The application instance the prompt is for, which the draft must not be written against
+    /// another of.
+    pub(crate) application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+}
+
 /// The draft a prompt names, when the mutation is a prompt that names a draft.
 ///
 /// A queued prompt counts with a submitted one: the session's agent holds it from the moment the
 /// worker takes it and may run it long after, and this host is not told when it does.
-pub(crate) fn prompted_draft(mutation: &MutationRequest) -> Option<kr_protocol::ids::DraftId> {
+pub(crate) fn prompted_draft(mutation: &MutationRequest) -> Option<PromptedDraft> {
     if !matches!(
         mutation.method.method(),
         Some(Method::AgentPromptSubmit | Method::AgentPromptQueue)
     ) {
         return None;
     }
-    mutation
+    let params = mutation
         .params
         .to_typed::<kr_protocol::agent::AgentPromptParams>()
-        .ok()
-        .and_then(|params| params.draft_id.0)
+        .ok()?;
+    Some(PromptedDraft {
+        draft_id: params.draft_id.0?,
+        application_instance_id: params.target.subject.application_instance_id,
+    })
 }
 
 /// Returns the stored object a transfer mutation acts on, where it names one.

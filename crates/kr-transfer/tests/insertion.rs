@@ -205,6 +205,7 @@ fn a_worker_reads_the_facts_of_a_draft_and_never_its_text_or_the_names_of_its_fi
             &harness.actor,
             created.draft_id,
             session(),
+            crate::support::an_application(),
             &Admission::none(),
         )
         .expect("sends the draft by a prompt");
@@ -646,6 +647,7 @@ fn a_draft_with_an_offer_in_flight_is_neither_sent_nor_rebound() {
             &harness.actor,
             created.draft_id,
             session(),
+            crate::support::an_application(),
             &Admission::none(),
         )
         .expect_err("a draft with an offer in flight");
@@ -678,6 +680,7 @@ fn a_draft_with_an_offer_in_flight_is_neither_sent_nor_rebound() {
             &harness.actor,
             created.draft_id,
             session(),
+            crate::support::an_application(),
             &Admission::none(),
         )
         .expect("the draft is sent once the offer is reported");
@@ -1008,7 +1011,13 @@ fn a_claim_is_refused_for_a_draft_that_is_not_the_workers_and_for_a_file_that_is
     );
     harness
         .service
-        .record_prompt(&harness.actor, sent.draft_id, session(), &Admission::none())
+        .record_prompt(
+            &harness.actor,
+            sent.draft_id,
+            session(),
+            crate::support::an_application(),
+            &Admission::none(),
+        )
         .expect("a prompt sends the draft to the session");
     let gone = draft_for(&harness, Some(session()));
     let (gone, gone_handle) = bind(
@@ -1176,7 +1185,13 @@ fn a_draft_only_sent_to_a_session_that_ends_has_its_offer_failed_and_stays_open(
     );
     harness
         .service
-        .record_prompt(&harness.actor, sent.draft_id, session(), &Admission::none())
+        .record_prompt(
+            &harness.actor,
+            sent.draft_id,
+            session(),
+            crate::support::an_application(),
+            &Admission::none(),
+        )
         .expect("a prompt sends the draft to the session");
     let targeting = draft_for(&harness, Some(session()));
     let before = read(&harness, sent.draft_id);
