@@ -29,6 +29,8 @@ struct Member {
     flags: u16,
     /// The file's mode in the high half, as an archive made on Unix writes it.
     external: u32,
+    /// Extra data the entry carries in the archive's directory.
+    extra: Vec<u8>,
 }
 
 impl Member {
@@ -41,6 +43,7 @@ impl Member {
             method: 0,
             flags: 0,
             external: 0o100_644 << 16,
+            extra: Vec::new(),
         }
     }
 
@@ -136,10 +139,16 @@ fn archive_of(members: &[Member]) -> Vec<u8> {
                 .expect("short")
                 .to_le_bytes(),
         );
-        bytes.extend_from_slice(&[0; 2 + 2 + 2 + 2]);
+        bytes.extend_from_slice(
+            &u16::try_from(member.extra.len())
+                .expect("short")
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&[0; 2 + 2 + 2]);
         bytes.extend_from_slice(&member.external.to_le_bytes());
         bytes.extend_from_slice(&offset.to_le_bytes());
         bytes.extend_from_slice(member.name.as_bytes());
+        bytes.extend_from_slice(&member.extra);
     }
     let directory_len = u32::try_from(bytes.len()).expect("small") - directory_at;
     bytes.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
@@ -486,6 +495,87 @@ fn a_name_too_long_or_too_deep_and_a_directory_too_large_are_refused_before_they
         );
         assert!(case.staged().is_empty(), "{name}: nothing was written");
     }
+}
+
+/// KR-REQ-26.06: the parser is shown one end record and the directory that record names, as a
+/// release archive has them, and an archive that gives it another record to follow is refused
+/// before it sees the archive: a comment after the end record, bytes after it, a 64-bit form, an end
+/// record inside the directory (in an entry's extra data, where a parser that falls back to an
+/// earlier record would take it), a count that the directory does not hold, a size that does not
+/// reach the end record. The control is the same archive without the fault, which is read.
+#[test]
+fn an_archive_with_more_than_one_way_to_read_its_end_is_refused_before_the_parser_sees_it() {
+    let members = release();
+    let good = archive_of(&members);
+    let end = good.len() - 22;
+    let patched = |change: &dyn Fn(&mut Vec<u8>)| {
+        let mut bytes = good.clone();
+        change(&mut bytes);
+        bytes
+    };
+    // A fake end record, as a parser that falls back to an earlier one would take it: it declares
+    // far more entries than any directory here holds.
+    let mut fake = b"PK\x05\x06".to_vec();
+    fake.extend_from_slice(&[0; 4]);
+    fake.extend_from_slice(&40_000_u16.to_le_bytes());
+    fake.extend_from_slice(&40_000_u16.to_le_bytes());
+    fake.extend_from_slice(&[0; 10]);
+    let mut hiding = release();
+    hiding[0].extra = fake;
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "a comment after the end record",
+            patched(&|bytes| {
+                bytes[end + 20] = 3;
+                bytes.extend_from_slice(b"abc");
+            }),
+        ),
+        (
+            "bytes after the end record",
+            patched(&|bytes| bytes.push(0)),
+        ),
+        (
+            "a 64-bit count",
+            patched(&|bytes| bytes[end + 8..end + 12].copy_from_slice(&[0xff; 4])),
+        ),
+        (
+            "an end record in an entry's extra data",
+            archive_of(&hiding),
+        ),
+        (
+            "a count the directory does not hold",
+            patched(&|bytes| {
+                let count = u16::from_le_bytes([bytes[end + 10], bytes[end + 11]]) + 1;
+                bytes[end + 8..end + 10].copy_from_slice(&count.to_le_bytes());
+                bytes[end + 10..end + 12].copy_from_slice(&count.to_le_bytes());
+            }),
+        ),
+        (
+            "a size that does not reach the end record",
+            patched(&|bytes| {
+                let size = u32::from_le_bytes([
+                    bytes[end + 12],
+                    bytes[end + 13],
+                    bytes[end + 14],
+                    bytes[end + 15],
+                ]) - 4;
+                bytes[end + 12..end + 16].copy_from_slice(&size.to_le_bytes());
+            }),
+        ),
+    ];
+    for (name, bytes) in &cases {
+        let case = Case::new();
+        assert!(
+            case.read(bytes, &Limits::DEFAULT).is_err(),
+            "{name} is refused"
+        );
+        assert!(case.staged().is_empty(), "{name}: nothing was written");
+    }
+    let case = Case::new();
+    assert!(
+        case.read(&good, &Limits::DEFAULT).is_ok(),
+        "the archive without the fault is read"
+    );
 }
 
 /// Nothing is written outside the staging directory by an archive that names a place beyond it.
