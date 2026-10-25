@@ -852,6 +852,46 @@ fn closed_summary(
     }
 }
 
+/// A page of a closed session's output with its bytes withheld, as the reader is told: the range
+/// the page covered is gone.
+fn withheld_page(
+    page: &kr_protocol::recovery::HistoryPageResult,
+) -> kr_protocol::recovery::HistoryPageResult {
+    let gap = match page.gap.0 {
+        Some(gap) => kr_protocol::recovery::HistoryGap {
+            from_cursor: gap.from_cursor,
+            to_cursor: page.next_cursor,
+            cause: gap.cause,
+        },
+        None => kr_protocol::recovery::HistoryGap {
+            from_cursor: page.from_cursor,
+            to_cursor: page.next_cursor,
+            cause: None,
+        },
+    };
+    kr_protocol::recovery::HistoryPageResult {
+        from_cursor: page.from_cursor,
+        next_cursor: page.next_cursor,
+        bytes: kr_protocol::scalars::Bytes::new(Vec::new()),
+        oldest_retained_cursor: page.next_cursor,
+        gap: Nullable::some(gap),
+    }
+}
+
+/// The times of a closed session's output with the intervals withheld.
+fn withheld_times(
+    times: &kr_protocol::recovery::HistoryTimesResult,
+) -> kr_protocol::recovery::HistoryTimesResult {
+    kr_protocol::recovery::HistoryTimesResult {
+        intervals: Vec::new(),
+        next_cursor: times.next_cursor,
+        complete: times.complete,
+        unavailable: Nullable::some(
+            "privacy mode was turned on while this was read, so the times are withheld".to_owned(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,45 +935,5 @@ mod tests {
                 (3, SessionState::Creating)
             ]
         );
-    }
-}
-
-/// A page of a closed session's output with its bytes withheld, as the reader is told: the range
-/// the page covered is gone.
-fn withheld_page(
-    page: &kr_protocol::recovery::HistoryPageResult,
-) -> kr_protocol::recovery::HistoryPageResult {
-    let gap = match page.gap.0 {
-        Some(gap) => kr_protocol::recovery::HistoryGap {
-            from_cursor: gap.from_cursor,
-            to_cursor: page.next_cursor,
-            cause: gap.cause,
-        },
-        None => kr_protocol::recovery::HistoryGap {
-            from_cursor: page.from_cursor,
-            to_cursor: page.next_cursor,
-            cause: None,
-        },
-    };
-    kr_protocol::recovery::HistoryPageResult {
-        from_cursor: page.from_cursor,
-        next_cursor: page.next_cursor,
-        bytes: kr_protocol::scalars::Bytes::new(Vec::new()),
-        oldest_retained_cursor: page.next_cursor,
-        gap: Nullable::some(gap),
-    }
-}
-
-/// The times of a closed session's output with the intervals withheld.
-fn withheld_times(
-    times: &kr_protocol::recovery::HistoryTimesResult,
-) -> kr_protocol::recovery::HistoryTimesResult {
-    kr_protocol::recovery::HistoryTimesResult {
-        intervals: Vec::new(),
-        next_cursor: times.next_cursor,
-        complete: times.complete,
-        unavailable: Nullable::some(
-            "privacy mode was turned on while this was read, so the times are withheld".to_owned(),
-        ),
     }
 }
