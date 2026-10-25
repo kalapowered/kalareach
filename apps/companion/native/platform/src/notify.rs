@@ -121,7 +121,7 @@ struct SenderItem {
 }
 
 #[cfg(mobile)]
-async fn call<R: Runtime, T: serde::de::DeserializeOwned>(
+async fn call<R: Runtime, T: serde::de::DeserializeOwned + Send + 'static>(
     app: &AppHandle<R>,
     method: &str,
     arguments: impl Serialize,
@@ -134,7 +134,7 @@ async fn call<R: Runtime, T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(not(mobile))]
-async fn call<R: Runtime, T: serde::de::DeserializeOwned>(
+async fn call<R: Runtime, T: serde::de::DeserializeOwned + Send + 'static>(
     _app: &AppHandle<R>,
     _method: &str,
     _arguments: impl Serialize,

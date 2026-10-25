@@ -514,8 +514,10 @@ person is told, so that off is never off in name only. Choices are made one afte
 that is let go never undoes a choice made after it began. The choice a run tells the host is the one
 recorded when the run begins to tell it, before the keys are filed, so the host is told off after the
 receivers were asked to let the key go, whether or not they did; a choice made after that is told by
-the run when it goes round again. The receivers are given ten seconds to answer a filing of the keys. One that does not answer is a
-filing that failed, and it leaves what the receivers hold unknown: the next filing is made even for a
+the run when it goes round again. The receivers are given ten seconds to answer a filing of the keys. The native call itself runs to its
+end on a task of its own, since Tauri's callback for a native answer panics when the caller has gone,
+and a late answer is discarded. One that does not answer in time is a filing that failed, and it
+leaves what the receivers hold unknown: the next filing is made even for a
 set they held before, the rows say that the keys were not filed in time, and a choice that asked for
 the filing is let go. A filing that fails does not stop a run or start one:
 the host is still registered, the rows of hosts that are on say that the receivers could not be handed
