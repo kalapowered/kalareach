@@ -16,7 +16,7 @@ use kr_ipc::paths::Endpoint as LocalEndpoint;
 use kr_pairing::direct::{CandidateIdentity, redeem_proof};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::ProtocolVersion;
-use kr_protocol::ids::{DeviceId, DeviceKeyRevision, EnvironmentId};
+use kr_protocol::ids::{DeviceId, DeviceKeyRevision, EnvironmentId, GrantId};
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -40,6 +40,8 @@ fn loopback() -> EndpointConfig {
 pub struct Door {
     /// The identity the host gave the device.
     pub device_id: DeviceId,
+    /// The grant the host issued it.
+    pub grant_id: GrantId,
     /// The device's session with the host.
     pub session: Session,
     /// The keys the device holds, which confirm what an owner device confirms.
@@ -51,6 +53,7 @@ pub struct Door {
 /// A device the host has paired, with what it needs to dial the host again.
 struct Paired {
     device_id: DeviceId,
+    grant_id: GrantId,
     keys: DeviceKeys,
     endpoint: Endpoint,
     revision: DeviceKeyRevision,
@@ -155,6 +158,7 @@ async fn pair(
     (
         Paired {
             device_id: confirmed.device_id,
+            grant_id: confirmed.grant_id,
             keys,
             endpoint,
             revision,
@@ -204,6 +208,7 @@ impl Door {
         .expect("the paired device connects");
         Self {
             device_id: paired.device_id,
+            grant_id: paired.grant_id,
             session: Session::start(Arc::new(transport)).expect("a session"),
             keys: paired.keys,
             _endpoint: paired.endpoint,

@@ -145,7 +145,10 @@ async fn apply(
             } else {
                 Nullable::some(value.clone())
             },
-            new_value: Nullable::null(),
+            new_value: arguments
+                .reference_to
+                .clone()
+                .map_or_else(Nullable::null, Nullable::some),
         }),
         _ => Nullable::null(),
     };

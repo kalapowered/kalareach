@@ -1078,3 +1078,263 @@ async fn authority_revoked_after_the_claim_stops_the_effect_through_the_daemon()
 
     host.clients.abort();
 }
+
+/// The output of installed Git in `directory`, for the values a case reads back.
+fn git_output(directory: &Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("installed Git runs");
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A repository adopted by the daemon, with a second commit on `main` to move the reference
+/// between, and the workspace over it and a version captured from it.
+///
+/// Returns the path, the two commits (the older first) and the version to apply.
+async fn adopted_repository_with_two_commits(
+    host: &Host,
+    control: &mut LocalClient,
+    name: &str,
+) -> (
+    PathBuf,
+    [String; 2],
+    kr_protocol::ids::WorkspaceId,
+    ChangesetCaptureResult,
+) {
+    let path = repository(host.work(), name);
+    git_raw(
+        &path,
+        ["commit", "--allow-empty", "-m", "the second commit"],
+    );
+    let older = git_output(&path, &["rev-parse", "HEAD~1"]);
+    let newer = git_output(&path, &["rev-parse", "HEAD"]);
+    let adopted: ProjectAdoptResult = typed(
+        &control
+            .mutate(
+                Method::ProjectAdopt,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ProjectAdoptParams {
+                    destination: host.destination(name),
+                    label: name.to_owned(),
+                    flow: AdoptionFlow::ExistingCheckout,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.adopt succeeds"),
+    );
+    let created: WorkspaceCreateResult = typed(
+        &control
+            .mutate(
+                Method::WorkspaceCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkspaceCreateParams {
+                    project_repository_id: adopted.project.project_repository_id,
+                    label: name.to_owned(),
+                    kind: WorkspaceKind::SharedExisting,
+                    isolation: Nullable::null(),
+                    policy: include_everything(),
+                    base_revision: Nullable::null(),
+                    base_change_set_id: Nullable::null(),
+                    destination: Nullable::null(),
+                    preview_only: false,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workspace.create succeeds"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace")
+        .workspace_id;
+    let captured: ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &capture_params(workspace, Nullable::null(), "the work to apply"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.capture succeeds"),
+    );
+    (path, [older, newer], workspace, captured)
+}
+
+/// The request to move `main` from `old` to `new` in `workspace`.
+fn moving_main(
+    captured: &ChangesetCaptureResult,
+    workspace: kr_protocol::ids::WorkspaceId,
+    old: &str,
+    new: &str,
+) -> DiffApplyParams {
+    DiffApplyParams {
+        change_set_id: captured.version.change_set_id,
+        version: captured.version.version,
+        destination: DestinationClass::VersionedReference,
+        workspace_id: Nullable::some(workspace),
+        expected_reference: Nullable::some(kr_protocol::changeset::ExpectedReference {
+            name: "refs/heads/main".to_owned(),
+            expected_old_value: Nullable::some(old.to_owned()),
+            new_value: Nullable::some(new.to_owned()),
+        }),
+        affected: Vec::new(),
+        paths: Vec::new(),
+        preflight_only: false,
+        acknowledged_limitations: Vec::new(),
+    }
+}
+
+/// KR-REQ-14.27 and KR-REQ-23.44: a versioned reference moves through the daemon, the same action
+/// asked again is answered from its record and moves nothing, and a new action with the same
+/// request finds the reference moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_versioned_reference_moves_through_the_daemon_and_a_repeat_is_answered_from_its_record() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let (path, [older, newer], workspace, captured) =
+        adopted_repository_with_two_commits(&host, &mut control, "moves").await;
+
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = moving_main(&captured, workspace, &newer, &older);
+    let first: DiffApplyResult = typed(
+        &control
+            .mutate(
+                Method::DiffApply,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the reference moves"),
+    );
+    assert_eq!(first.outcome, Nullable::some(ApplyOutcomeClass::Applied));
+    assert_eq!(
+        git_output(&path, &["rev-parse", "refs/heads/main"]),
+        older,
+        "the reference holds the object the request named"
+    );
+
+    // The same action again is answered from the record of the first. The request would now be a
+    // conflict, so an answer that equals the first was not made by asking the reference again.
+    let repeat: DiffApplyResult = typed(
+        &control
+            .mutate(
+                Method::DiffApply,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered"),
+    );
+    assert_eq!(repeat, first, "the answer is the one the first request got");
+    assert_eq!(
+        git_output(&path, &["rev-parse", "refs/heads/main"]),
+        older,
+        "and the repeat moved nothing"
+    );
+
+    // A new action with the same request finds the reference moved, which is a conflict.
+    let conflict = failure(
+        control
+            .mutate(
+                Method::DiffApply,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(conflict.code, ErrorCode::DraftConflict, "{conflict:?}");
+
+    host.clients.abort();
+    let _ = host.clients.await;
+}
+
+/// KR-REQ-23.44: authority withdrawn after the claim stops a reference move, and the answer is the
+/// daemon's own.
+///
+/// The environment's authority is revoked the instant the apply's claim is taken. The reference is
+/// the only thing the apply would have changed, and it holds what it held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authority_revoked_after_the_claim_stops_a_reference_move_through_the_daemon() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let (path, [older, newer], workspace, captured) =
+        adopted_repository_with_two_commits(&host, &mut control, "revoked").await;
+
+    let controller = Arc::clone(&host.controller);
+    host.controller
+        .changesets()
+        .service()
+        .inject(Some(kr_changeset::apply::Fault {
+            after_paths: usize::MAX,
+            act: None,
+            before_rename: None,
+            after_claim: Some(Arc::new(move || {
+                tokio::runtime::Handle::current().block_on(async {
+                    controller
+                        .revoke_authority()
+                        .await
+                        .expect("the revocation is recorded");
+                });
+            })),
+            refuse_staging_record: false,
+            stop: false,
+            detail: String::new(),
+        }));
+    let outcome = control
+        .mutate(
+            Method::DiffApply,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &moving_main(&captured, workspace, &newer, &older),
+        )
+        .await
+        .expect("the call reaches the daemon");
+    host.controller.changesets().service().inject(None);
+
+    let refusal = failure(outcome);
+    assert_eq!(
+        refusal.code,
+        ErrorCode::PermissionDenied,
+        "the refusal is the admission's: {}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("withdrawn"),
+        "the daemon's own sentence reaches the caller: {}",
+        refusal.message
+    );
+    assert_eq!(
+        git_output(&path, &["rev-parse", "refs/heads/main"]),
+        newer,
+        "the reference holds what it held"
+    );
+
+    host.clients.abort();
+    let _ = host.clients.await;
+}

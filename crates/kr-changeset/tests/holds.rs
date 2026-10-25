@@ -189,6 +189,81 @@ fn a_direct_apply_is_turned_away_while_a_capture_holds_the_repository_and_claims
     assert_eq!(read_bytes(&scene.checkout, "README.md"), b"the change\n");
 }
 
+/// KR-REQ-14.32 and KR-REQ-25.20: the move of a versioned reference writes the repository's Git
+/// directory, so it is turned away while a capture holds the repository, claims nothing and
+/// moves nothing, and a preflight, which writes nothing, is not turned away.
+#[test]
+fn a_reference_move_is_turned_away_while_a_capture_holds_the_repository_and_claims_nothing() {
+    use kr_protocol::changeset::ExpectedReference;
+
+    struct Claim(std::cell::Cell<bool>);
+    impl apply::ActionClaim for Claim {
+        fn claim(&self) -> kr_changeset::Result<bool> {
+            self.0.set(true);
+            Ok(true)
+        }
+    }
+
+    let scene = scene();
+    let service = scene.fixture.service();
+    let first = support::git_raw(&scene.checkout, ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    support::git_raw(
+        &scene.checkout,
+        ["commit", "--allow-empty", "-m", "the second commit"],
+    );
+    let second = support::git_raw(&scene.checkout, ["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let request = ExpectedReference {
+        name: "refs/heads/main".to_owned(),
+        expected_old_value: Nullable(Some(second.clone())),
+        new_value: Nullable(Some(first)),
+    };
+    let claim = Claim(std::cell::Cell::new(false));
+    let moving = ApplyOrder {
+        expected_reference: Some(&request),
+        claim: Some(&claim),
+        ..support::apply_order(
+            scene.version,
+            DestinationClass::VersionedReference,
+            scene.shared,
+            &[],
+            &[],
+        )
+    };
+    let checking = ApplyOrder {
+        preflight_only: true,
+        claim: None,
+        ..moving.clone()
+    };
+
+    let project = scene.fixture.project();
+    let opened = project
+        .open_workspace_repository(scene.isolated)
+        .expect("the worktree opens")
+        .identity();
+    let hold = project
+        .hold_workspace(scene.isolated, opened.work_tree, opened.git_dir)
+        .expect("the records read")
+        .expect("the worktree is held");
+    let error = apply::apply(service, &moving).expect_err("a capture holds the repository");
+    assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+    assert!(!claim.0.get(), "nothing is claimed");
+    assert_eq!(
+        support::git_raw(&scene.checkout, ["rev-parse", "refs/heads/main"]).trim(),
+        second,
+        "and the reference did not move"
+    );
+    apply::apply(service, &checking).expect("a preflight writes nothing and is not turned away");
+
+    drop(hold);
+    apply::apply(service, &moving)
+        .expect("the same action moves the reference once nothing holds the repository");
+    assert!(claim.0.get());
+}
+
 /// KR-REQ-14.32: a hold is turned away by a direct apply that is already writing, and a
 /// capture that required the quiesced class is then refused, not served a weaker one.
 #[test]

@@ -1485,6 +1485,23 @@ impl RestrictedProfile {
     /// or runs past its deadline. A non-zero exit is an output rather than an error, because a
     /// caller often needs the exit code.
     pub fn run(&self, request: &GitRequest<'_>) -> Result<GitOutput> {
+        self.run_noting_the_start(request, &mut false)
+    }
+
+    /// As [`Self::run`], and sets `started` once the child exists.
+    ///
+    /// A caller whose invocation writes needs the difference between a failure before Git ran,
+    /// after which nothing was written, and one after it started, which may have written before
+    /// it was stopped, could not be waited on or could not be confirmed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::run`].
+    pub(crate) fn run_noting_the_start(
+        &self,
+        request: &GitRequest<'_>,
+        started: &mut bool,
+    ) -> Result<GitOutput> {
         // The allowlist is checked here rather than at each call site, because here is the one
         // place a subprocess starts.
         check_arguments(request.arguments)?;
@@ -1537,6 +1554,7 @@ impl RestrictedProfile {
             },
             &confinement,
         )?;
+        *started = true;
         let out = child.stdout().map(read_bounded);
         let err = child.stderr().map(read_bounded);
         // How long this invocation may run: its own bound, or the one a test holds reads to.

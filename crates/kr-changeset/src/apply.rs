@@ -8,12 +8,13 @@
 //!   explicitly ask for something weaker, which is what section 14 means by "apply defaults to an
 //!   immutable proposal/change-set result, not blind overwrite of an actively edited worktree".
 //! * [`DestinationClass::VersionedReference`] is reference compare-and-swap: the reference is read
-//!   and compared with the expected old value, and a mismatch is `DRAFT_CONFLICT`. Moving the
-//!   reference itself needs a Git subcommand the project service's restricted execution profile
-//!   does not run, so this host **states that limitation instead of executing it**, which is the
-//!   rule section 14 gives for a faithful interpretation that needs an ungranted helper. It also
-//!   says the thing a caller must not assume: a reference update does not atomically update a
-//!   dirty working tree.
+//!   and compared with the expected old value, a mismatch is `DRAFT_CONFLICT`, and a reference
+//!   that holds it is moved to the object the request names in one expected-old-value update. The
+//!   host makes no commit, so that object is one the repository already holds. It says the thing a
+//!   caller must not assume: a reference update does not atomically update a dirty working tree.
+//!   An apply of this class writes no `applies` row. Its claim, its answer and one evidence row
+//!   are its record, and an apply the host stopped during answers `OUTCOME_UNKNOWN` to the same
+//!   action.
 //! * [`DestinationClass::SharedExisting`] writes the user's own working tree in place. It is
 //!   **best-effort conflict detection**, not universal no-clobber compare-and-swap, and a caller
 //!   cannot choose it until it has passed back the limitation this host returns for it.
@@ -187,10 +188,12 @@ pub fn limitations(destination: DestinationClass) -> Vec<String> {
              atomically update a dirty working tree, and a tree with uncommitted work in it is \
              unchanged by one"
                 .to_owned(),
-            "this host reads the reference and compares it with the value the request expects, \
-             and it does not move the reference: its restricted Git execution profile runs no \
-             subcommand that writes one, so the limitation is stated rather than the update run \
-             under a read-only grant"
+            "this host moves the reference with an expected-old-value update, in which Git \
+             compares the value the reference holds with the value the request expects and moves \
+             it in one step; the host makes no commit, so the object is one the repository \
+             already holds, and this host does not check that it holds the content of this \
+             version; when the reference is the branch checked out in a working tree, Git may \
+             show that tree's files as differing from the new commit"
                 .to_owned(),
         ],
         DestinationClass::SharedExisting => vec![
@@ -452,11 +455,14 @@ fn count<'a>(
 /// # Errors
 ///
 /// Returns [`ChangeSetError::DraftConflict`] when the preflight finds the destination is not what
-/// the request expects, in which case **nothing is written anywhere**;
+/// the request expects, in which case **nothing is written anywhere**, and when a reference
+/// another writer moved after the comparison refuses the update, in which case the reference
+/// holds what that writer set and the action is spent;
 /// [`ChangeSetError::InvalidArgument`] when the request does not carry what the destination needs;
 /// [`ChangeSetError::Unsupported`] when the destination needs something this host does not do; and
 /// [`ChangeSetError::OutcomeUnknown`] when an apply stopped and this host could not establish what
-/// the destination holds.
+/// the destination holds, and when Git reported a failure of a reference update and the reference
+/// holds the object the request moves it to.
 pub fn apply(service: &ChangeSetService, order: &ApplyOrder<'_>) -> Result<DiffApplyResult> {
     let manifest = service.manifest(order.version.change_set_id, order.version.version)?;
     let carried = carried_paths(&manifest, order)?;
@@ -868,7 +874,21 @@ fn proposal(
     })
 }
 
-/// A versioned Git reference: compare-and-swap, and the limitation stated rather than executed.
+/// The names under which a reference lives in one working tree's own directory.
+///
+/// The reads run in the working tree and the move runs in the Git common directory, so in a
+/// linked worktree a name under one of these is one reference in the first place and another in
+/// the second.
+const PER_WORKTREE_PREFIXES: [&str; 3] = ["refs/bisect/", "refs/worktree/", "refs/rewritten/"];
+
+/// A versioned Git reference: compare-and-swap, and the move it guards.
+///
+/// The request is checked in the order that keeps each promise. Its shape is checked before any
+/// Git runs, the repository's facts about the object and the reference before the claim, and the
+/// comparison before the claim too, so a refusal up to there leaves the action untouched. Once
+/// the reference holds the expected value the claim is taken, the evidence is recorded before the
+/// move in words that are true whatever the move does, the daemon's authority is asked again
+/// immediately before it, and the move is one expected-old-value update.
 fn reference(
     service: &ChangeSetService,
     order: &ApplyOrder<'_>,
@@ -886,9 +906,14 @@ fn reference(
             "this destination names the workspace whose repository holds the reference".into(),
         ));
     };
+    let moves_to = object_to_move_to(order, expected)?;
     let resolved = service.resolve(workspace_id)?;
     let repository = service.open_repository(&resolved)?;
-    let observed = read_reference(service.project().profile(), &repository, &expected.name)?;
+    let profile = service.project().profile();
+    if let Some(object) = moves_to {
+        check_the_object_and_the_reference(profile, &repository, &expected.name, object)?;
+    }
+    let observed = read_reference(profile, &repository, &expected.name)?;
     let held = observed == expected.expected_old_value.0;
     let outcome = ReferenceOutcome {
         name: expected.name.clone(),
@@ -913,19 +938,285 @@ fn reference(
         result.reference = Nullable(Some(outcome));
         return Ok(result);
     }
-    // Section 14: when faithful interpretation requires an ungranted helper, expose the limitation
-    // instead of executing it. Moving a reference needs a Git subcommand this host's restricted
-    // execution profile does not run, and widening that profile is not something an apply decides.
-    Err(ChangeSetError::Unsupported {
+    let (Some(new_value), Some(old_value)) = (moves_to, expected.expected_old_value.0.as_deref())
+    else {
+        return Err(names_no_object());
+    };
+    move_reference(service, order, &repository, expected, new_value, old_value)?;
+    Ok(DiffApplyResult {
+        action_id: order.action_id,
+        outcome: Nullable(Some(ApplyOutcomeClass::Applied)),
+        destination: order.destination,
+        applied_version: order.version,
+        proposal_version: Nullable(None),
+        reference: Nullable(Some(ReferenceOutcome {
+            updated: true,
+            ..outcome
+        })),
+        changed_paths: Vec::new(),
+        unresolved_paths: Vec::new(),
+        conflicts: Vec::new(),
+        progress: Vec::new(),
+        recovery: RecoveryObjects {
+            before_version: Nullable(None),
+            after_version: Nullable(None),
+            applied_version: Nullable(Some(order.version)),
+            staged_path: Nullable(None),
+            staged_leftovers: Vec::new(),
+            detail: format!(
+                "the reference {} held {old_value} before this apply and holds {new_value} now; \
+                 moving it back is another apply that names {old_value} as the object and \
+                 {new_value} as the expected value",
+                expected.name
+            ),
+        },
+        limitations: limitations.to_vec(),
         detail: format!(
-            "the reference {} holds the value this request expects, so the compare-and-swap would \
-             hold; this host does not move it, because its restricted Git execution profile runs \
-             no subcommand that writes a reference. {}",
-            kr_project::git::redact(&expected.name),
-            limitations.join(" ")
-        )
-        .into(),
+            "the reference {} was moved from {old_value} to {new_value} in one expected-old-value \
+             update, and no working tree was written",
+            expected.name
+        ),
+        decided_at_ms: kr_ipc::now_ms(),
     })
+}
+
+/// The refusal for an apply that does not say what the reference moves to.
+fn names_no_object() -> ChangeSetError {
+    ChangeSetError::InvalidArgument(
+        "an apply to a versioned Git reference names the object the reference moves to, because \
+         this host makes no commit and moves the reference to one the repository already holds"
+            .into(),
+    )
+}
+
+/// Checks the shape of a request to move a reference, before any Git runs, and returns the object
+/// it moves the reference to.
+///
+/// A preflight needs no object and returns none. Every other request names one, and what the
+/// request says is held to what a reference update takes: a full name that is not a name of one
+/// working tree's own, a value the reference is expected to hold, and an object that is not that
+/// value.
+fn object_to_move_to<'a>(
+    order: &ApplyOrder<'_>,
+    expected: &'a ExpectedReference,
+) -> Result<Option<&'a str>> {
+    let Some(object) = expected.new_value.0.as_deref() else {
+        return if order.preflight_only {
+            Ok(None)
+        } else {
+            Err(names_no_object())
+        };
+    };
+    check_reference_name(&expected.name)?;
+    if PER_WORKTREE_PREFIXES
+        .iter()
+        .any(|prefix| expected.name.starts_with(prefix))
+    {
+        return Err(ChangeSetError::InvalidArgument(
+            "a reference under refs/bisect, refs/worktree or refs/rewritten belongs to one \
+             working tree, so the reference this host reads and the one it would move are not \
+             the same"
+                .into(),
+        ));
+    }
+    let Some(held) = expected.expected_old_value.0.as_deref() else {
+        return Err(ChangeSetError::Unsupported {
+            detail: "this host moves a reference that exists and does not create one, so a move \
+                     names the value the reference holds now"
+                .into(),
+        });
+    };
+    // The runner's own rules, applied before the claim: a full reference name, full lowercase
+    // hexadecimal object names, and neither of them the null object.
+    kr_project::git::check_arguments(&[
+        OsStr::new("update-ref"),
+        OsStr::new(&expected.name),
+        OsStr::new(object),
+        OsStr::new(held),
+    ])?;
+    if object == held {
+        return Err(ChangeSetError::InvalidArgument(
+            "the object the reference moves to is the value it is expected to hold, so the move \
+             would change nothing"
+                .into(),
+        ));
+    }
+    Ok(Some(object))
+}
+
+/// Checks what only the repository can say about a move: that `object` is in the repository's
+/// own format and is held by it, a commit when the reference is a branch, and that the reference
+/// is not a symbolic one.
+///
+/// An update without `--no-deref` moves the reference a symbolic one points to, and the receipt
+/// would name the wrong reference, so such a reference is refused rather than followed.
+fn check_the_object_and_the_reference(
+    profile: &RestrictedProfile,
+    repository: &OpenedRepository,
+    name: &str,
+    object: &str,
+) -> Result<()> {
+    let format = repository.object_format(profile)?;
+    kr_project::git::check_object_name_width(object, format, "the object the reference moves to")?;
+    let arguments: [&OsStr; 3] = [OsStr::new("cat-file"), OsStr::new("-t"), OsStr::new(object)];
+    let output = profile.run(&repository.read(&arguments))?;
+    output.require_complete()?;
+    if !output.success {
+        return Err(ChangeSetError::InvalidArgument(
+            "the repository holds no object with the name this request moves the reference to, or \
+             this host could not read it, and a move names an object the repository holds"
+                .into(),
+        ));
+    }
+    let kind = output.text();
+    if name.starts_with("refs/heads/") && kind.trim() != "commit" {
+        return Err(ChangeSetError::InvalidArgument(
+            format!(
+                "a branch moves to a commit, and the object this request names is a {}",
+                kr_project::git::redact(kind.trim())
+            )
+            .into(),
+        ));
+    }
+    let arguments: [&OsStr; 3] = [
+        OsStr::new("symbolic-ref"),
+        OsStr::new("-q"),
+        OsStr::new(name),
+    ];
+    let output = profile.run(&repository.read(&arguments))?;
+    match output.status {
+        Some(0) => Err(ChangeSetError::InvalidArgument(
+            "the reference is a symbolic reference, and a move would follow it to another \
+             reference than the one the request names"
+                .into(),
+        )),
+        Some(1) => Ok(()),
+        _ => output.require_success().map_err(ChangeSetError::from),
+    }
+}
+
+/// Takes the claim and moves the reference.
+///
+/// From here the apply writes the repository's Git directory: a capture that is holding this
+/// repository turns it away now, before the claim, so nothing is recorded for it and the same
+/// action asked again after the capture has finished is performed. After the claim every error
+/// is recorded with the action, and the action is spent.
+fn move_reference(
+    service: &ChangeSetService,
+    order: &ApplyOrder<'_>,
+    repository: &OpenedRepository,
+    expected: &ExpectedReference,
+    new_value: &str,
+    old_value: &str,
+) -> Result<()> {
+    let profile = service.project().profile();
+    let _writing = service.project().writer_of_repository(
+        if order.revert {
+            "diff.revert"
+        } else {
+            "diff.apply"
+        },
+        repository,
+        None,
+    )?;
+    take_claim(service, order)?;
+    // The record of this apply, written before the move and in words that are true whatever the
+    // move comes to. A reference apply has no row of its own, so this is what names the version
+    // for the accounting a deletion owes, and a move never happens without it.
+    service.record_evidence(
+        order.version.change_set_id,
+        order.version.version,
+        kr_protocol::changeset::EvidenceKind::AppliedChange,
+        &format!(
+            "an apply of this version to the reference {} was asked for by action {}",
+            expected.name, order.action_id
+        ),
+    )?;
+    // The authority this apply arrived under is asked once more, immediately before the move, so
+    // a withdrawal that came after the claim stops it. The hold is on an empty effect: the
+    // daemon's registry is not kept across the Git run the move makes, and the window that remains
+    // is the start of that run, which a direct apply accepts for each file it writes. The format
+    // the run needs was read before the claim, so the run does not read it again after the gate.
+    if let Some(admitted) = order.admitted {
+        admitted.hold(&mut || Ok(()))?;
+    }
+    // Not `--no-deref`: on a symbolic reference that would replace the symbolic reference itself
+    // with a direct one, which is worse than moving its target.
+    if let Err(failure) =
+        repository.update_ref(profile, &expected.name, new_value, old_value, false)
+    {
+        let now = read_reference(profile, repository, &expected.name)
+            .ok()
+            .flatten();
+        return Err(classify_failed_move(
+            failure,
+            now.as_deref(),
+            (old_value, new_value),
+            &expected.name,
+        ));
+    }
+    Ok(())
+}
+
+/// Decides what a move that failed came to, from what Git said and what the reference holds now.
+///
+/// `values` are the value the request expects and the object it moves the reference to.
+///
+/// An outcome the update may have made stays unknown whatever a later read shows: another writer
+/// may have put the old value back. A Git failure is a refusal after Git ran to completion or a
+/// failure to start it, and it usually leaves the reference as it was, so a reference that now
+/// holds a value other than the two is a conflict, and one that holds the expected value, or
+/// cannot be read, is the Git failure. A failed `show-ref` and an absent reference look the same,
+/// so the read is not trusted as absence. Git can also exit non-zero after it wrote the reference,
+/// for instance when it cannot append to the log of a second reference that names the branch, so
+/// the object the request moves to, found there, may be this host's own update: that is unknown
+/// too. Any other error came from before Git ran, wrote nothing and is passed on.
+fn classify_failed_move(
+    failure: kr_project::ProjectError,
+    now: Option<&str>,
+    values: (&str, &str),
+    name: &str,
+) -> ChangeSetError {
+    let (expected, new_value) = values;
+    let failed = matches!(failure, kr_project::ProjectError::GitFailed { .. });
+    if failed && now == Some(new_value) {
+        return ChangeSetError::OutcomeUnknown {
+            detail: format!(
+                "Git reported a failure, and the reference {} now holds the object this request \
+                 moves it to, so this host cannot tell its own update from another writer's",
+                kr_project::git::redact(name)
+            )
+            .into(),
+        };
+    }
+    if failed && now.is_some_and(|value| value != expected) {
+        return ChangeSetError::DraftConflict {
+            detail: format!(
+                "the reference {} no longer holds the value this request expects, and this apply \
+                 did not move it",
+                kr_project::git::redact(name)
+            )
+            .into(),
+        };
+    }
+    failure.into()
+}
+
+/// Refuses a reference name this host will not give to Git.
+fn check_reference_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+    {
+        return Err(ChangeSetError::InvalidArgument(
+            "a reference is named with letters, digits, slashes, underscores, hyphens and full \
+             stops, and this is not"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Reads what one reference holds now.
@@ -934,17 +1225,7 @@ fn read_reference(
     repository: &OpenedRepository,
     name: &str,
 ) -> Result<Option<String>> {
-    if name.is_empty()
-        || name.starts_with('-')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
-    {
-        return Err(ChangeSetError::InvalidArgument(
-            "a reference is named with letters, digits and `/`, `_`, `-` and `.`, and this is not"
-                .into(),
-        ));
-    }
+    check_reference_name(name)?;
     let arguments: [&OsStr; 3] = [
         OsStr::new("show-ref"),
         OsStr::new("--verify"),
@@ -3533,13 +3814,73 @@ mod tests {
                 || line.contains("does not atomically update a dirty working tree")),
             "the compare-and-swap limitation is stated: {stated:?}"
         );
-        assert!(
-            stated
-                .iter()
-                .any(|line| line.contains("runs no \nsubcommand that writes one")
-                    || line.contains("runs no subcommand that writes one")),
-            "what this host does not do is stated: {stated:?}"
+    }
+
+    /// KR-REQ-14.27: a move that failed is told apart by what Git said and by what the reference
+    /// holds now, because Git cannot be made to stop after it commits and no other case reaches
+    /// the unknown outcome.
+    #[test]
+    fn a_failed_move_is_classified_by_what_git_said_and_what_the_reference_holds_now() {
+        use kr_project::ProjectError;
+        use kr_protocol::error::ErrorCode;
+
+        let expected = "a".repeat(40);
+        let other = "c".repeat(40);
+        let refused = || ProjectError::GitFailed {
+            detail: "git update-ref exited 128 and said: cannot lock ref".into(),
+        };
+        let unknown = || ProjectError::OutcomeUnknown {
+            detail: "git update-ref ran longer than its deadline and was stopped".into(),
+        };
+        let before_git = || ProjectError::IdentityChanged {
+            detail: "the repository is not the one this record names".into(),
+        };
+        let new_value = "b".repeat(40);
+        let classified = |failure: ProjectError, now: Option<&str>| {
+            classify_failed_move(
+                failure,
+                now,
+                (expected.as_str(), new_value.as_str()),
+                "refs/heads/main",
+            )
+            .code()
+        };
+
+        // Git may have written the reference, so no later value says it did not.
+        assert_eq!(
+            classified(unknown(), Some(&other)),
+            ErrorCode::OutcomeUnknown
         );
+        assert_eq!(
+            classified(unknown(), Some(&expected)),
+            ErrorCode::OutcomeUnknown,
+            "another writer may have put the old value back"
+        );
+        assert_eq!(classified(unknown(), None), ErrorCode::OutcomeUnknown);
+        // Git ran to completion and refused, which leaves the reference as it was.
+        assert_eq!(
+            classified(refused(), Some(&other)),
+            ErrorCode::DraftConflict,
+            "the reference holds something else now"
+        );
+        assert_eq!(
+            classified(refused(), Some(&new_value)),
+            ErrorCode::OutcomeUnknown,
+            "Git can exit non-zero after it wrote the reference, so the object the request \
+             names, found there, may be this host's own update"
+        );
+        assert_eq!(
+            classified(refused(), Some(&expected)),
+            ErrorCode::UpstreamUnavailable,
+            "the reference is as it was, so the refusal is Git's own"
+        );
+        assert_eq!(
+            classified(refused(), None),
+            ErrorCode::UpstreamUnavailable,
+            "a read that failed is not trusted as an absent reference"
+        );
+        // An error from before Git ran wrote nothing and is passed on whatever the reference holds.
+        assert_eq!(classified(before_git(), Some(&other)), before_git().code(),);
     }
 
     #[test]

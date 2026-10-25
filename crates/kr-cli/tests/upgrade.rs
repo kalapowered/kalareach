@@ -3393,3 +3393,205 @@ async fn a_rollback_from_a_daemon_of_a_later_public_major_goes_on_beside_the_ses
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
+
+/// The definition E2 installs: three apply nodes in the shape the release before stored them, with
+/// no object for a reference to move to. One is a reference apply that is not a preflight, which a
+/// release that moves a reference would refuse for naming none, one is a preflight and one is a
+/// proposal.
+fn a_definition_of_stored_apply_nodes(
+    grant: kr_protocol::ids::GrantId,
+) -> kr_protocol::automation::WorkflowDefinition {
+    use kr_protocol::automation::{
+        WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowNode,
+        WorkflowResourceScope, WorkflowTrigger,
+    };
+    use kr_protocol::changeset::{DestinationClass, DiffApplyParams, ExpectedReference};
+    use kr_protocol::ids::{ChangeSetId, ChangeSetVersion, WorkflowId, WorkspaceId};
+    use kr_protocol::scalars::{U64, Uuid};
+
+    let params = |edit: &dyn Fn(&mut DiffApplyParams)| {
+        let mut params = DiffApplyParams {
+            change_set_id: ChangeSetId::new(Uuid::from_bytes([0x33; 16])),
+            version: ChangeSetVersion::new(1),
+            destination: DestinationClass::Proposal,
+            workspace_id: Nullable::some(WorkspaceId::new(Uuid::from_bytes([0x34; 16]))),
+            expected_reference: Nullable::null(),
+            affected: Vec::new(),
+            paths: Vec::new(),
+            preflight_only: false,
+            acknowledged_limitations: Vec::new(),
+        };
+        edit(&mut params);
+        serde_json::to_string(&params).expect("the node's parameters")
+    };
+    let reference = |expected: Nullable<String>| {
+        Nullable::some(ExpectedReference {
+            name: "refs/heads/main".to_owned(),
+            expected_old_value: expected,
+            new_value: Nullable::null(),
+        })
+    };
+    let node = |id: &str, action_params: String| WorkflowNode {
+        node_id: id.to_owned(),
+        action_kind: WorkflowActionKind::ApplyDiff,
+        action_params,
+        declared_environment: Nullable::null(),
+    };
+    WorkflowDefinition {
+        workflow_id: WorkflowId::new(Uuid::from_bytes([0x41; 16])),
+        revision: U64::new(1),
+        name: "stored apply nodes".to_owned(),
+        description: Nullable::null(),
+        trigger: WorkflowTrigger {
+            event_type: "manual".to_owned(),
+        },
+        resource_scope: WorkflowResourceScope::default(),
+        nodes: vec![
+            node(
+                "move",
+                params(&|params| {
+                    params.destination = DestinationClass::VersionedReference;
+                    params.expected_reference = reference(Nullable::null());
+                }),
+            ),
+            node(
+                "preflight",
+                params(&|params| {
+                    params.destination = DestinationClass::VersionedReference;
+                    params.expected_reference = reference(Nullable::some("a".repeat(40)));
+                    params.preflight_only = true;
+                }),
+            ),
+            node("proposal", params(&|_| {})),
+        ],
+        edges: Vec::new(),
+        deadlines: WorkflowDeadlines::default(),
+        grant_reference: grant,
+        enabled: false,
+        explicit_recurrence: false,
+    }
+}
+
+/// One workflow mutation, made over the daemon's own socket as the person at the host, and what the
+/// daemon answered.
+async fn a_workflow_mutation<P: serde::Serialize + ?Sized>(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    method: Method,
+    params: &P,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    client
+        .mutate(
+            method,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            kr_protocol::envelope::ActionTarget::environment(environment_id),
+            params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// KR-REQ-25.13, KR-REQ-26.10, KR-REQ-26.08: a definition the release before stored is admitted by
+/// this release and by the release before again after a rollback, whatever its apply nodes say.
+///
+/// A stored apply node is decoded again at every run's admission, and the release before decodes
+/// it in the shape it stored. A node this release lets a reference move to an object with is not a
+/// node a stored one can be, and a stored one that names none must stay admitted: a run of the
+/// definition returns a run each time, and never a refusal that names a node. The apply nodes
+/// themselves are refused by name when the run reaches them, as they always were.
+///
+/// This case is rewritten when the workflows store keeps the object a reference moves to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
+    use kr_protocol::automation::{
+        WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams, WorkflowRunResult,
+    };
+
+    let prepared = Updated::prepare(Setup {
+        network: true,
+        ..Setup::default()
+    })
+    .await;
+    let endpoint = prepared
+        .host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let environment_id = prepared.host.tree.environment_id();
+    // The grant a workflow acts under is one the host issued, and the first owner's carries every
+    // right, the right to apply a diff among them.
+    let owner = door::Door::pair_the_first_owner(&endpoint, environment_id).await;
+    let document = a_definition_of_stored_apply_nodes(owner.grant_id);
+    let _: kr_protocol::automation::WorkflowInstallResult = a_workflow_mutation(
+        &endpoint,
+        environment_id,
+        Method::WorkflowInstall,
+        &WorkflowInstallParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+            definition: document.clone(),
+            grant_reference: document.grant_reference,
+        },
+    )
+    .await
+    .expect("the release before installs the definition")
+    .to_typed()
+    .expect("an install result");
+    a_workflow_mutation(
+        &endpoint,
+        environment_id,
+        Method::WorkflowEnable,
+        &WorkflowEnableParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+        },
+    )
+    .await
+    .expect("the release before enables it");
+
+    let run = |event: &'static str| {
+        let (endpoint, document) = (endpoint.clone(), document.clone());
+        async move {
+            a_workflow_mutation(
+                &endpoint,
+                environment_id,
+                Method::WorkflowRun,
+                &WorkflowRunParams {
+                    workflow_id: document.workflow_id,
+                    revision: document.revision,
+                    event_id: event.to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await
+            .unwrap_or_else(|refusal| {
+                panic!("a run of a stored definition is admitted ({event}): {refusal:?}")
+            })
+            .to_typed::<WorkflowRunResult>()
+            .expect("a run result")
+        }
+    };
+    run("evt-before-the-update").await;
+
+    let updated = prepared.update().await;
+    run("evt-after-the-update").await;
+
+    let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "the rollback goes ahead: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        updated.host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    run("evt-after-the-rollback").await;
+    drop(owner);
+}

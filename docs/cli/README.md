@@ -1499,16 +1499,25 @@ you say about the tree and decides nothing, and `--require` refuses a capture th
 class it names.
 
 An apply names its destination every time. `proposal` records a new version and writes to no tree.
-`reference` moves the Git reference `--reference` names, and only while it holds the value
-`--reference-at` gives, or `absent` for one that does not exist yet. `working-tree` writes the
-workspace's own files in place. Every destination but a bare proposal names `--workspace`.
+`reference` moves the Git reference `--reference` names to the object `--reference-to` names, and
+only while the reference holds the value `--reference-at` gives. The host makes no commit, so that
+object is one the repository already holds. The host moves a reference that exists and does not
+create one: `absent` works only with `--preflight` and no `--reference-to`, and then nothing moves.
+Moving the reference back is another apply that names the earlier value as `--reference-to` and the
+later one as `--reference-at`. If the host stops during the move, read the reference to see where
+it stands before you run the command again: each run is a new action, and it finds the reference
+moved, which is `DRAFT_CONFLICT`, or not moved, and moves it. A host of an earlier release
+refuses a request that carries `--reference-to`. Windows refuses every repository
+operation, so this destination is not available there. `working-tree` writes the workspace's own
+files in place. Every destination but a bare proposal names `--workspace`.
 
 Each path the change writes is named with `--expect PATH=DIGEST`, the digest being the one
 `kr diff read` shows, or with `--expect PATH=absent`, and the host checks every one before it
 writes. A destination that is not as expected is `DRAFT_CONFLICT`, and nothing is written. `--path`
 limits the apply to some of the version's paths and `--preflight` checks without writing. A write
 to a working tree is refused until you pass back each limitation the host states for it, with
-`--acknowledge`.
+`--acknowledge`. A `reference` apply reads and writes no path: `--expect` has no effect on it, and
+`--path` does not limit it, though a path it names must still be one the version holds.
 
 `kr diff read` shows `absent` only for a path the change deletes. A path it has no digest for
 otherwise, such as a link or a file the host could not read, shows `unavailable`, which `--expect`

@@ -1522,10 +1522,16 @@ fn a_reference_updates_object_format_is_read_from_the_repository_it_writes_to() 
         ],
     );
     let profile = fixture.service().profile();
-    let repository = OpenedRepository::open(profile, fixture.environment_id(), &linked)
+    // Two records of the same worktree. The first answers before the indirection is rewritten, as
+    // a control that the worktree names a repository of the shorter format. The second is asked
+    // for the first time after it, because a record keeps the answer it read and a record that
+    // had read it earlier would pass whatever the update read it from.
+    let before = OpenedRepository::open(profile, fixture.environment_id(), &linked)
         .expect("the linked worktree opens");
+    let repository = OpenedRepository::open(profile, fixture.environment_id(), &linked)
+        .expect("the linked worktree opens again");
     assert_eq!(
-        repository
+        before
             .object_format(profile)
             .expect("the repository says how it names its objects"),
         kr_project::git::ObjectFormat::Sha1
@@ -1558,6 +1564,52 @@ fn a_reference_updates_object_format_is_read_from_the_repository_it_writes_to() 
             .to_string()
             .contains("a full object name in this repository is 40"),
         "the refusal says what a full name is here, and said {refusal}"
+    );
+}
+
+/// KR-REQ-14.27: a reference update whose caller already has the repository's object format runs
+/// one Git invocation, so the interval between a caller's last check and the update is the start
+/// of that one invocation and not a second read of the format.
+#[cfg(unix)]
+#[test]
+fn a_reference_update_after_the_format_is_known_runs_one_git_invocation() {
+    use std::sync::{Arc, Mutex};
+
+    let mut fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "one-run");
+    let invocations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&invocations);
+    fixture.interpose(kr_project::git::Interposition::new(Arc::new(
+        move |described: &str, _working: &std::path::Path, _temporary: &std::path::Path| {
+            recorded
+                .lock()
+                .expect("the record of invocations")
+                .push(described.to_owned());
+        },
+    )));
+    let profile = fixture.service().profile();
+    let repository = OpenedRepository::open(profile, fixture.environment_id(), &path)
+        .expect("the repository opens");
+    let (head_first, _) = repository.head(profile).expect("first head");
+    let oid_first = head_first.expect("commit exists");
+    write(&path, "extra.txt", "second commit\n");
+    git_raw(&path, ["add", "extra.txt"]);
+    git_raw(&path, ["commit", "-m", "second"]);
+    let (head_second, _) = repository.head(profile).expect("second head");
+    let oid_second = head_second.expect("second commit exists");
+
+    repository
+        .object_format(profile)
+        .expect("the repository says how it names its objects");
+    let known = invocations.lock().expect("the record").len();
+    repository
+        .update_ref(profile, "refs/heads/main", &oid_first, &oid_second, false)
+        .expect("the compare-and-swap holds");
+    let after: Vec<String> = invocations.lock().expect("the record")[known..].to_vec();
+    assert_eq!(after.len(), 1, "the update is one invocation: {after:?}");
+    assert!(
+        after[0].contains("update-ref"),
+        "and it is the update: {after:?}"
     );
 }
 

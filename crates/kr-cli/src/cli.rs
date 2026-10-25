@@ -552,7 +552,8 @@ pub struct DiffReadArguments {
 pub enum DestinationArgument {
     /// A new immutable version, written to no working tree.
     Proposal,
-    /// A Git reference, moved only when it holds the value you expect.
+    /// A Git reference, moved to an object the repository holds only while it holds the value you
+    /// expect.
     Reference,
     /// The workspace's own files, written in place. Conflict detection is best effort.
     WorkingTree,
@@ -578,6 +579,10 @@ pub struct DiffApplyArguments {
     /// The value that reference holds now, or `absent` when it does not exist.
     #[arg(long, requires = "reference")]
     pub reference_at: Option<String>,
+    /// The full name of the object the reference moves to, which the repository already holds.
+    /// A `--preflight` moves nothing and needs none.
+    #[arg(long, requires = "reference")]
+    pub reference_to: Option<String>,
     /// What one path holds now, as `PATH=DIGEST` with the digest `kr diff read` shows, or
     /// `PATH=absent`. Repeat it for every path the change writes.
     #[arg(long = "expect", value_name = "PATH=DIGEST")]
