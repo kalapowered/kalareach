@@ -9880,6 +9880,272 @@ async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
     ask(4).expect("a generation of the generation in force, with two newer published");
 }
 
+/// The store decides a deletion the person asks for in the transaction that writes it down, and
+/// refuses it for each reason on its own. Neither a privacy fence nor the line privacy mode drew
+/// under a generation is one of them: the copies privacy mode lists are what the action is for. The
+/// control is the same deletion with none of the reasons standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_store_refuses_a_deletion_the_person_asks_for_each_reason_on_its_own() {
+    let ask = |host: &Host, generation: u64| {
+        host.service.ask_deletion(
+            archive_id(),
+            BackupGeneration::new(generation),
+            TimestampMs::new(99_000),
+        )
+    };
+    // A host with two published generations and a setup, a fresh one for each case.
+    let published = async || {
+        let host = Host::open();
+        host.set_up();
+        let mut uploader = host.uploader(10_000);
+        host.publish_generations(&mut uploader, 1, 2).await;
+        host
+    };
+    let refused = |answer: Result<u64, ControllerError>| {
+        assert!(
+            matches!(answer, Err(ControllerError::Refused { .. })),
+            "{answer:?}"
+        );
+    };
+
+    // The control: every object of the generation is written down, and asking again changes
+    // nothing it wrote.
+    let host = published().await;
+    assert_eq!(
+        ask(&host, 1).expect("asked"),
+        2,
+        "a member and the manifest"
+    );
+    let written: Vec<_> = host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .iter()
+        .map(|object| (object.object_id, object.deletion_asked_at_ms))
+        .collect();
+    assert!(written.iter().all(|(_, asked)| asked.is_some()));
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(99_500),
+        )
+        .expect("asked again");
+    assert_eq!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .map(|object| (object.object_id, object.deletion_asked_at_ms))
+            .collect::<Vec<_>>(),
+        written,
+        "a request already written down is left as it is"
+    );
+    // The newest generation is deletable too: the person decides what they keep.
+    ask(&host, 2).expect("the newest published generation");
+
+    // A generation this host never admitted.
+    let host = published().await;
+    refused(ask(&host, 9));
+
+    // A privacy fence is not a reason.
+    let host = published().await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    ask(&host, 1).expect("the person's deletion is not stopped by privacy mode");
+
+    // Nor is the line a complete privacy cycle drew under a generation: retention leaves that
+    // generation, and the person may not be refused what retention is.
+    let host = published().await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    host.service
+        .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(98_100))
+        .expect("the work is taken back");
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(98_200))
+        .expect("cleanup");
+    host.service
+        .release_fence(
+            PrivacyGeneration::new(1),
+            PrivacyGeneration::new(2),
+            TimestampMs::new(98_300),
+        )
+        .expect("a release");
+    ask(&host, 1).expect("a generation under the line is the person's to delete");
+
+    // An object another generation names.
+    let host = published().await;
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the store")
+        .execute(
+            "INSERT INTO objects (archive_id, backup_generation, object_id, encrypted_hash,
+                                  encrypted_len, staged_path, local_state, acknowledged_bytes)
+             SELECT archive_id, 2, object_id, encrypted_hash, encrypted_len, staged_path || 'x',
+                    'absent', encrypted_len
+               FROM objects WHERE backup_generation = 1 AND object_id = ?1",
+            rusqlite::params![member_of(1, 0).get().as_bytes().as_slice()],
+        )
+        .expect("a second generation that names the object");
+    refused(ask(&host, 1));
+    assert!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_none()),
+        "a refused deletion writes nothing down"
+    );
+
+    // An attempt of the generation that is still open.
+    let host = published().await;
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the store")
+        .execute(
+            "INSERT INTO outbox (archive_id, backup_generation, step, privacy_generation, status,
+                                 enqueued_at_ms)
+             VALUES (?1, 1, 'upload', 0, 'queued', 1)",
+            rusqlite::params![archive_id().get().as_bytes().as_slice()],
+        )
+        .expect("an open attempt");
+    refused(ask(&host, 1));
+
+    // A retired writer.
+    let host = published().await;
+    host.service
+        .retire_writer(
+            archive_id(),
+            host.producer.writer.key_id(),
+            TimestampMs::new(98_000),
+        )
+        .expect("the writer is retired");
+    refused(ask(&host, 1));
+
+    // An archive that is not the setup's.
+    let host = published().await;
+    let other = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    host.service
+        .commit_setup(
+            &a_setup(other, &host.producer, "QQQQ2345"),
+            true,
+            TimestampMs::new(98_000),
+        )
+        .expect("a replacement");
+    refused(ask(&host, 1));
+
+    // A host with no setup.
+    let host = Host::open();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 2).await;
+    refused(ask(&host, 1));
+}
+
+/// A generation whose outcome this host could not establish is the person's to delete once a newer
+/// generation of the archive is published, because a publication of it landing later would name
+/// objects that are gone. Before then it is refused, and the control is the same generation after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_generation_of_unknown_outcome_is_deleted_by_the_person_only_once_a_newer_one_is_published()
+ {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    host.set_up();
+    let ask = || {
+        host.service.ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(99_000),
+        )
+    };
+    assert!(matches!(ask(), Err(ControllerError::Refused { .. })));
+    assert!(
+        host.service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_none())
+    );
+
+    host.admit(2, &[64]);
+    passes(&mut uploader, 40_000).await;
+    assert_eq!(host.generation(2).remote, Remote::Published);
+    ask().expect("a newer generation is published");
+}
+
+/// Under a privacy fence the carrier sends the deletions the person has just asked for and nothing
+/// else: a deletion this host decided on for itself and wrote down before privacy mode came on is
+/// not sent, because privacy mode's copies go by the person's action and no other. Once the fence is
+/// down the request that was written down is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_a_fence_the_carrier_sends_the_deletions_the_person_asked_for_and_no_others() {
+    let host = Host::open();
+    host.set_up();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    // A retention deletion of generation 1's member, written down and not yet sent.
+    BackupStore::open(&host.state)
+        .expect("the store")
+        .note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(1),
+            member_of(1, 0),
+            2,
+            TimestampMs::new(50_000),
+        )
+        .expect("asked");
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+
+    // The control: the fence alone sends nothing.
+    assert!(passes(&mut uploader, 60_000).await.is_empty());
+    assert_eq!(deletions(&host), 0);
+
+    // The person asks for generation 2: its objects go and no others.
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(2),
+            TimestampMs::new(61_000),
+        )
+        .expect("asked");
+    passes(&mut uploader, 62_000).await;
+    assert!(host.deleted_at_the_service(2));
+    assert_eq!(
+        deletions(&host),
+        2,
+        "a member and the manifest of generation 2"
+    );
+    assert!(host.held_at_the_service(1));
+    assert!(host.held_at_the_service(3));
+
+    // A restart forgets which deletions were just asked for and keeps the rows written down: under
+    // the fence nothing is sent for generation 1.
+    let mut host = host;
+    let (mut uploader, _) = host.restart(70_000).await;
+    assert!(passes(&mut uploader, 70_000).await.is_empty());
+    assert_eq!(deletions(&host), 2);
+
+    // The fence comes down, and the request that was written down is sent. Generation 3 is
+    // untouched.
+    host.service
+        .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(98_100))
+        .expect("the work is taken back");
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(98_200))
+        .expect("cleanup");
+    host.service
+        .release_fence(
+            PrivacyGeneration::new(1),
+            PrivacyGeneration::new(2),
+            TimestampMs::new(98_300),
+        )
+        .expect("a release");
+    passes(&mut uploader, 80_000).await;
+    assert!(host.web.stored_bytes(member_of(1, 0)).is_none());
+    assert!(host.held_at_the_service(3));
+}
+
 /// The end of a production pass tells the cleanup a fence owes, and wakes neither the producer nor
 /// the carrier: a pass that failed would otherwise begin again at once and never wait out its
 /// delay, and a carrier woken at the end of a pass looks again at once, inside a wait that listens

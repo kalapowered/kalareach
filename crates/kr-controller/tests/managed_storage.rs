@@ -62,7 +62,8 @@ use kr_protocol::ids::{
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{
-    PrivacyCompletion, PrivacyReport, PrivacySetParams, PrivacyStatusParams,
+    PrivacyCompletion, PrivacyExported, PrivacyReport, PrivacyRetainedDeleteParams,
+    PrivacyRetainedDeleteResult, PrivacySetParams, PrivacyStatusParams,
 };
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
@@ -506,19 +507,16 @@ impl Rig {
 
     /// Turns privacy mode on or off, through the daemon's local socket as a person does.
     async fn set_privacy(&self, enabled: bool) -> bool {
-        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
-            .await
-            .expect("connects");
-        client
-            .mutate(
-                Method::PrivacySet,
-                ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(self.host.environment_id()),
-                &PrivacySetParams { enabled },
-            )
-            .await
-            .expect("the call reaches the daemon")
-            .is_ok()
+        set_privacy_at(&self.client_endpoint, self.host.environment_id(), enabled).await
+    }
+
+    /// Asks the daemon to delete the copy `privacy.status` lists under `reference`, as a person at
+    /// this machine does.
+    async fn delete_retained(
+        &self,
+        reference: &str,
+    ) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
+        delete_retained_at(&self.client_endpoint, self.host.environment_id(), reference).await
     }
 
     /// Where privacy mode stands, as `privacy.status` says.
@@ -585,6 +583,50 @@ impl Rig {
         drop(controller);
         (host, served, timer)
     }
+}
+
+/// Turns privacy mode on or off at the daemon listening at `endpoint`, as a person does.
+async fn set_privacy_at(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+    enabled: bool,
+) -> bool {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .mutate(
+            Method::PrivacySet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &PrivacySetParams { enabled },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .is_ok()
+}
+
+/// Asks the daemon at `endpoint` to delete the copy `privacy.status` lists under `reference`.
+async fn delete_retained_at(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+    reference: &str,
+) -> Result<PrivacyRetainedDeleteResult, ProtocolError> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .mutate(
+            Method::PrivacyRetainedDelete,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &PrivacyRetainedDeleteParams {
+                reference: reference.to_owned(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|value| value.to_typed().expect("a result of the declared shape"))
 }
 
 /// Writes the configuration document that selects `origin`, or one that selects nothing.
@@ -6542,4 +6584,374 @@ async fn a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_
     eprintln!(
         "history: the daemon backed up a closed session, a kit alone restored it and recorded its generation, and the generation pushed out of two snapshots is a tombstone ({origin})"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The person deletes a copy that privacy mode lists as having left the host.
+// ---------------------------------------------------------------------------------------------
+
+/// The reference `privacy.status` lists a backup generation of the setup's archive under.
+fn reference_of(generation: u64) -> String {
+    format!("{} generation {generation}", archive_id())
+}
+
+/// The copy `privacy.status` lists for a generation of the setup's archive.
+fn listed(report: &PrivacyReport, generation: u64) -> &PrivacyExported {
+    let reference = reference_of(generation);
+    report
+        .exported
+        .iter()
+        .find(|copy| copy.reference == reference)
+        .unwrap_or_else(|| panic!("{reference} is listed: {:?}", report.exported))
+}
+
+impl Rig {
+    /// Records the owner's setup for a host whose first `made` generations the test admitted
+    /// itself, so that the producer numbers the next after them.
+    fn set_up_after(&self, made: u64) {
+        self.set_up();
+        self.controller
+            .backup()
+            .raise_generation_counter(archive_id(), BackupGeneration::new(made))
+            .expect("the count of generations is raised");
+    }
+
+    /// Whether the service holds `object` of the setup's archive.
+    fn held_at_the_service(&self, object: BackupObjectId) -> bool {
+        self.served
+            .web()
+            .stored(&archive_id().to_string(), &object.to_string())
+            .is_some()
+    }
+
+    /// The daemon's rows for the objects of one generation.
+    fn objects_of(&self, generation: u64) -> Vec<kr_controller::backup::store::ObjectRecord> {
+        self.controller
+            .backup()
+            .objects(archive_id(), BackupGeneration::new(generation))
+            .expect("the store reads")
+    }
+}
+
+/// The objects the service holds of generation 1 and of generation 2 in
+/// [`a_host_that_backed_up_twice`]: two members and the manifest, and one member and the manifest.
+fn first_objects() -> [BackupObjectId; 3] {
+    [object_id(1), object_id(2), object_id(0xf1)]
+}
+
+fn second_objects() -> [BackupObjectId; 2] {
+    [object_id(3), object_id(0xf2)]
+}
+
+/// A daemon whose generations 1 and 2 are published at the service, and whose timer is held.
+async fn a_host_that_backed_up_twice(timer: Arc<HeldTimer>) -> Rig {
+    let rig = Rig::start(Arrangement::NORMAL, timer).await;
+    rig.admit(1, &[(1, plaintext(2048)), (2, plaintext(1024))]);
+    rig.until("generation 1 is published", |rig| rig.published(1))
+        .await;
+    rig.admit_to_an_enrolled_archive(2, &[(3, plaintext(2048))]);
+    rig.until("generation 2 is published", |rig| rig.published(2))
+        .await;
+    rig
+}
+
+/// KR-REQ-24.29, stage B: privacy mode lists a published generation of the host's own archive as a
+/// copy the person can have deleted. (Before, the list said the host had no way to ask.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_lists_each_published_generation_as_one_the_person_can_have_deleted() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    rig.set_up_after(2);
+    rig.fence().await;
+
+    let report = rig.privacy_report().await;
+    for generation in [1, 2] {
+        let copy = listed(&report, generation);
+        assert_eq!(copy.kind, "backup archive");
+        assert!(copy.deletable, "{copy:?}");
+    }
+}
+
+/// KR-REQ-24.29, stage B, and KR-ACC-033: under privacy mode, the person's deletion of one
+/// generation asks the service to delete every object of that generation, and no object of another
+/// generation or of another collection of the account. Privacy mode stays on and the report says
+/// what became of the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generation_the_person_deletes_under_privacy_mode_goes_from_the_service_and_nothing_else_does()
+ {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let other = object_id(0x77);
+    web.put_object(
+        &archive_two().to_string(),
+        &other.to_string(),
+        ACCOUNT,
+        vec![7; 64],
+    );
+    rig.set_up_after(2);
+    rig.fence().await;
+    assert_eq!(web.requests_to(DELETE), 0, "the fence deletes nothing");
+
+    let answer = rig
+        .delete_retained(&reference_of(1))
+        .await
+        .expect("the deletion is asked");
+    assert!(answer.deleted, "the service confirmed every object");
+    assert!(answer.report.enabled, "privacy mode stays on");
+
+    for object in first_objects() {
+        assert!(!rig.held_at_the_service(object), "{object} is deleted");
+    }
+    for object in second_objects() {
+        assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+    assert!(
+        web.stored(&archive_two().to_string(), &other.to_string())
+            .is_some(),
+        "another collection of the account is untouched"
+    );
+    assert_eq!(web.requests_to(DELETE), first_objects().len());
+    assert!(
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    );
+
+    let deleted = listed(&answer.report, 1);
+    assert_eq!(
+        deleted.kind,
+        "backup archive, deleted and awaiting removal at the service"
+    );
+    assert!(!deleted.deletable);
+    let kept = listed(&answer.report, 2);
+    assert_eq!(kept.kind, "backup archive");
+    assert!(kept.deletable);
+}
+
+/// KR-REQ-24.29, stage B: a copy the host cannot ask the service to delete, and a reference the
+/// list does not hold, are refused by their codes and send nothing. The control is the same call
+/// once the host has its setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_the_host_cannot_make_is_refused_and_sends_nothing() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    rig.fence().await;
+
+    // With no setup the generations are listed and none is offered for deletion.
+    let report = rig.privacy_report().await;
+    assert!(!listed(&report, 1).deletable);
+    assert_eq!(
+        rig.delete_retained(&reference_of(1))
+            .await
+            .expect_err("a host with no setup deletes nothing")
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    for reference in [
+        "no such copy".to_owned(),
+        reference_of(3),
+        format!("{} generation 1", archive_two()),
+    ] {
+        assert_eq!(
+            rig.delete_retained(&reference)
+                .await
+                .expect_err("the list holds nothing under that reference")
+                .code,
+            ErrorCode::InvalidArgument,
+            "{reference}"
+        );
+    }
+    assert_eq!(web.requests_to(DELETE), 0);
+    for object in first_objects().into_iter().chain(second_objects()) {
+        assert!(rig.held_at_the_service(object), "{object}");
+    }
+
+    // The control: the setup is recorded and the same call deletes.
+    rig.set_up_after(2);
+    assert!(
+        rig.delete_retained(&reference_of(1))
+            .await
+            .expect("asked")
+            .deleted
+    );
+
+    // A copy that is deleted is not one to delete again, and nothing more is sent for it.
+    assert_eq!(
+        rig.delete_retained(&reference_of(1))
+            .await
+            .expect_err("a copy already deleted is not deletable")
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(web.requests_to(DELETE), first_objects().len());
+}
+
+/// KR-REQ-24.29, stage B: an answer the service did not give leaves the deletion asked and not
+/// confirmed; the list says so, and asking again under privacy mode sends what is still unanswered
+/// and confirms it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_asked_again() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    rig.set_up_after(2);
+    rig.fence().await;
+    web.fail(DELETE, 1, Moment::After);
+
+    let first = rig
+        .delete_retained(&reference_of(1))
+        .await
+        .expect("the call is answered");
+    assert!(!first.deleted, "the service has not confirmed");
+    let shown = listed(&first.report, 1);
+    assert_eq!(
+        shown.kind,
+        "backup archive, deletion asked and not yet confirmed"
+    );
+    assert!(shown.deletable, "it can be asked again");
+    assert!(
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.deletion_asked_at_ms.is_some()),
+        "every object of the generation was written down before a request left"
+    );
+    for object in second_objects() {
+        assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+
+    let second = rig
+        .delete_retained(&reference_of(1))
+        .await
+        .expect("asked again");
+    assert!(second.deleted);
+    assert!(
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    );
+    for object in second_objects() {
+        assert!(rig.held_at_the_service(object), "{object} is not asked for");
+    }
+}
+
+/// KR-REQ-24.29, stage B: a deletion asked under privacy mode and not confirmed survives a restart
+/// as its written-down request. While privacy mode stays on the restarted host sends nothing the
+/// person has not just asked for; once it is off the host sends what was asked, with no second ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privacy_mode_is_off() {
+    let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    rig.set_up_after(2);
+    rig.fence().await;
+    web.fail(DELETE, 1, Moment::After);
+    assert!(
+        !rig.delete_retained(&reference_of(1))
+            .await
+            .expect("the call is answered")
+            .deleted
+    );
+    let sent = web.requests_to(DELETE);
+
+    let environment = rig.host.environment_id();
+    let (host, served, timer) = rig.stop().await;
+    let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
+    let runtime = controller.backup_runtime().expect("a carrier");
+    let mut passes = runtime.passes();
+
+    // Still private: the restarted host looks and sends nothing it was not just asked for.
+    runtime.wake();
+    let seen = *passes.borrow_and_update();
+    within("a pass after the restart", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(served.web().requests_to(DELETE), sent);
+
+    // Off: the request that was written down is sent and confirmed, and nothing else is deleted.
+    assert!(set_privacy_at(&endpoint, environment, false).await);
+    within("the request is sent and confirmed", async {
+        loop {
+            let confirmed = controller
+                .backup()
+                .objects(archive_id(), BackupGeneration::new(1))
+                .expect("the store reads")
+                .iter()
+                .all(|object| object.released_at_ms.is_some());
+            if confirmed {
+                break;
+            }
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    let held = |object: BackupObjectId| {
+        served
+            .web()
+            .stored(&archive_id().to_string(), &object.to_string())
+            .is_some()
+    };
+    for object in second_objects() {
+        assert!(held(object), "{object} is not asked for");
+    }
+    for object in first_objects() {
+        assert!(!held(object), "{object} is deleted");
+    }
+}
+
+/// KR-REQ-24.29, stage B: a generation the person is deleting does not count as the backup the
+/// host has. When it is the newest, the first pass after privacy mode goes off makes a new
+/// generation although nothing changed and a day has not passed, and the service holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_person() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed_session(host, b"first line\r\nsecond line\r\n", 9_000);
+    })
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let before = opened_members(&rig, 1);
+
+    // The answer to the first request is lost, so the deletion is only partly confirmed when
+    // privacy mode goes off.
+    rig.fence().await;
+    web.fail(DELETE, 1, Moment::After);
+    assert!(
+        !rig.delete_retained(&reference_of(1))
+            .await
+            .expect("the call is answered")
+            .deleted
+    );
+    assert!(rig.set_privacy(false).await);
+
+    rig.until("a new generation is published", |rig| rig.published(2))
+        .await;
+    assert_eq!(
+        opened_members(&rig, 2),
+        before,
+        "the new generation holds what the deleted one held"
+    );
+    rig.until("the deletion is confirmed", |rig| {
+        rig.objects_of(1)
+            .iter()
+            .all(|object| object.released_at_ms.is_some())
+    })
+    .await;
+    assert!(
+        first_object_ids(&rig)
+            .iter()
+            .all(|object| !rig.held_at_the_service(*object)),
+        "the deleted generation's objects are gone from the service"
+    );
+}
+
+/// The ids of the objects of generation 1 as the daemon's store records them.
+fn first_object_ids(rig: &Rig) -> Vec<BackupObjectId> {
+    rig.objects_of(1)
+        .iter()
+        .map(|object| object.object_id)
+        .collect()
 }
