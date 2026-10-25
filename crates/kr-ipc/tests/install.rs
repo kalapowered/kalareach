@@ -865,6 +865,8 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
         .join("bin")
         .join("kr-plugin-host.exe");
     std::fs::copy(system.join("System32").join("ping.exe"), &waiting).expect("a program");
+    // As an install leaves a release: sealed.
+    seal_tree(&test.store.release_directory(&one));
     let mut running = std::process::Command::new(&waiting)
         .args(["-n", "300", "127.0.0.1"])
         .stdout(std::process::Stdio::null())
@@ -891,6 +893,17 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
         left(),
         1,
         "the running program keeps its release in the trash"
+    );
+    let kept = std::fs::read_dir(test.store.trash())
+        .expect("reads the trash")
+        .flatten()
+        .next()
+        .expect("one entry")
+        .path();
+    let refused = kr_ipc::install::remove_sealed_tree(&kept);
+    assert!(
+        refused.is_err(),
+        "a program still runs from it: {refused:?}"
     );
 
     // A junction in the trash to a sealed directory elsewhere.
