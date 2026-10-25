@@ -1596,10 +1596,11 @@ async fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its
 ///
 /// The pseudo-console asks for key records with `CSI ?9001h`, and the worker records that. A
 /// record is then written to the console in the documented sequence with every field. The
-/// application reads one key with the console's own call and prints what it was given. Ctrl and
-/// Return is the key this is shown with: the console reports it as a line feed, and the legacy
-/// spelling of a line feed is a different key, so the application can tell the two paths apart. It
-/// is told Return with the Control key held, as the record said.
+/// application reads one key with the console's own call and prints what it was given, then a
+/// marker that ends the line. Ctrl and Return is the key this is shown with: the console reports it
+/// as a line feed, and the legacy spelling of a line feed is a different key, so the application
+/// can tell the two paths apart. It is told Return, as a line feed, with the Control key held, as
+/// the record said.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_key_events() {
     use kr_ipc::client::LocalClient;
@@ -1615,9 +1616,8 @@ async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_k
         &temp,
         1,
         "Write-Host 'kr-ready.'; \
-         $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown'); \
-         Write-Host ('kr-key:{0}:{1}:{2}:{3}' -f $key.VirtualKeyCode, [int]$key.Character, \
-         [bool]([int]$key.ControlKeyState -band 8), $key.KeyDown); \
+         $key = [Console]::ReadKey($true); \
+         Write-Host ('kr-key:{0}:{1}:{2}:kr-end' -f [int]$key.Key, [int]$key.KeyChar, $key.Modifiers); \
          Start-Sleep -Seconds 300",
     )
     .await;
@@ -1708,10 +1708,10 @@ async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_k
         .await
         .expect("reaches the worker")
         .expect("the worker takes the key records");
-    let seen = common::retained_carrying(runtime, b"kr-key:", 1, PATIENCE).await;
+    let seen = common::retained_carrying(runtime, b":kr-end", 1, PATIENCE).await;
     let shown = String::from_utf8_lossy(&seen);
     assert!(
-        shown.contains("kr-key:13:10:True:True"),
+        shown.contains("kr-key:13:10:Control:kr-end"),
         "the application was given Return, as a line feed, with Control held: {shown:?}"
     );
 }

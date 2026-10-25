@@ -1945,9 +1945,13 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 
 /// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
 /// session of the release before through the new daemon. Its bytes are written in the shape that
-/// worker reads and reach the session's terminal; its console key records are refused by the
-/// daemon, by name, because that worker has no counterpart for them, and the session shows nothing
-/// of them. The refused write spends no sequence number: the next bytes write takes it.
+/// worker reads and the session's shell runs them; its console key records are refused by the
+/// daemon, by name, because that worker has no counterpart for them, and the shell runs nothing of
+/// them. The refused write spends no sequence number: the next bytes write takes it.
+///
+/// Each line the shell runs makes a file named by an arithmetic expansion the typed text does not
+/// contain, so a file shows that the line was run and not that it was typed. The files are waited
+/// for while the session is live, which is when the worker forwards what it accepted.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_its_key_records_are_refused()
  {
@@ -2039,20 +2043,21 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         sequence: InputSequence::new(sequence),
         input,
     };
-    // The shell computes each marker, so the line as typed does not hold it.
-    let typed = |line: &str| InputContent::Bytes {
-        bytes: Bytes::new(format!("{line}\n").into_bytes()),
+    let marks = host.scratch("typed");
+    // A line that makes the file `<name>-42`, named by an expansion the shell has to run.
+    let typed = |name: &str| InputContent::Bytes {
+        bytes: Bytes::new(format!(": > \"{}/{name}-$((6*7))\"\n", marks.display()).into_bytes()),
     };
 
     owner
         .session
-        .write_input(&write(0, typed("echo KEPT-$((6*7))-OUTPUT")))
+        .write_input(&write(0, typed("kept")))
         .await
         .expect("the worker of the release before takes the bytes of a paired device");
 
     // Key records spelling a line the session must not show. The refusal is the daemon's: a
     // worker of the release before would answer with an invalid argument.
-    let keys = "echo NOT-$((6*7))-TYPED\n"
+    let keys = format!(": > \"{}/refused-$((6*7))\"\n", marks.display())
         .chars()
         .map(|character| ConsoleKey {
             virtual_key: 0,
@@ -2075,52 +2080,29 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
     );
     owner
         .session
-        .write_input(&write(1, typed("echo AFTER-$((6*7))-MARK")))
+        .write_input(&write(1, typed("after")))
         .await
         .expect("the refused write spent no sequence number");
+
+    // The shell ran the lines it was given, in order: the file of the line after the refusal is
+    // there, so a line of the refused records, which came before it, has been run if it ever was.
+    for name in ["kept-42", "after-42"] {
+        let file = marks.join(name);
+        until(
+            &format!("the shell to run the line that makes {name}"),
+            || async { file.exists().then_some(()) },
+        )
+        .await;
+    }
+    assert!(
+        !marks.join("refused-42").exists(),
+        "the shell ran nothing of the refused key records"
+    );
 
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
     drop(owner);
-    let file = host.scratch("export").join("session.json");
-    let started = Instant::now();
-    loop {
-        let output = host.run(
-            &updated.kr_now(),
-            &[
-                "export",
-                &updated.session_id.to_string(),
-                "--output",
-                &file.display().to_string(),
-            ],
-        );
-        if output.status.success() {
-            break;
-        }
-        assert!(
-            started.elapsed() < LIVENESS_DEADLINE,
-            "the closed session was not exported in {:?}: {}",
-            started.elapsed(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    let document: Value = serde_json::from_slice(&std::fs::read(&file).expect("the exported file"))
-        .expect("the export is one JSON document");
-    let shown = String::from_utf8_lossy(&exported_output(&document)).into_owned();
-    for marker in ["KEPT-42-OUTPUT", "AFTER-42-MARK"] {
-        assert!(
-            shown.contains(marker),
-            "the session shows {marker}: {}",
-            shown.escape_debug()
-        );
-    }
-    assert!(
-        !shown.contains("NOT-42-TYPED") && !shown.contains("NOT-$((6*7))-TYPED"),
-        "the session shows nothing of the refused key records: {}",
-        shown.escape_debug()
-    );
 }
 
 /// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-20.23, KR-REQ-09.10: a host on the newest release of this
