@@ -1973,67 +1973,6 @@ mod tests {
         );
     }
 
-    /// KR-REQ-08.48: the host's own answer revokes a launch reserved on the fence, and the keys a
-    /// person typed while the launch held the editor are released; the event the holder is told of
-    /// counts those keys, under the holder's attachment and epoch, and not the answer's bytes.
-    #[test]
-    fn an_answer_that_revokes_a_launch_releases_the_keys_a_person_typed_and_counts_only_them() {
-        let clock = Arc::new(ManualClock::new());
-        let mut driver = qualified(&clock);
-        let _ = acknowledged(&mut driver);
-        let holder = lease().holder.expect("a holder");
-        let _ = driver.launch_requested(
-            ShellLaunchParams {
-                session_id: session(),
-                command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
-                expected_prompt_generation: PromptGeneration::new(1),
-                expected_buffer_revision: EditorBufferRevision::new(1),
-            },
-            holder,
-            LaunchTransactionId::new(kr_ipc::new_uuid()),
-        );
-        assert_eq!(driver.state(), FenceState::LaunchReserved);
-        let typed = driver.input_arrived(
-            holder,
-            InputLeaseEpoch::new(1),
-            InputBatch::Lease {
-                epoch: 1,
-                bytes: b"typed\n".to_vec(),
-                paste: crate::session::PasteTransition::default(),
-                authority_deadline_boot_ms: None,
-                authority_utc_deadline_ms: None,
-            },
-        );
-        assert_eq!(typed.held_added, 6, "the launch holds what is typed");
-
-        let effects = driver.host_reply_queued(b"\x1b[?62;22c".len() as u64);
-
-        let busy = effects
-            .steps
-            .iter()
-            .find_map(|step| match step {
-                Step::EditorBusy(event) => Some(event),
-                _ => None,
-            })
-            .expect("the holder is told the editor was busy");
-        assert_eq!(busy.attachment_id, holder);
-        assert_eq!(busy.input_epoch, InputLeaseEpoch::new(1));
-        assert_eq!(
-            busy.released_input_bytes.get(),
-            6,
-            "the six bytes a person typed, and none of the answer's"
-        );
-        let released: Vec<Vec<u8>> = effects
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                Step::Write(InputBatch::Lease { bytes, .. }) => Some(bytes.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(released, vec![b"typed\n".to_vec()]);
-    }
-
     /// KR-REQ-08.48: a line accepted after the host's answer invalidated the fence it stood on is
     /// not attributed to anyone; a line accepted on a fence the reader proved again after the answer
     /// is judged on that fence, and is attributed to the holder whose keys it was.

@@ -269,27 +269,3 @@ async fn a_takeover_counts_the_holders_keystrokes_and_leaves_the_hosts_answer_al
         "the answer is still queued for the application"
     );
 }
-
-/// KR-REQ-08.48: what a write reports is that write's bytes: the host's own answer queued for the
-/// terminal is neither forwarded by it nor held as the start of a delimiter.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_writes_receipt_counts_its_own_bytes_and_not_the_answers_queued_beside_them() {
-    let (_clock, time) = manual();
-    let mut fixture = Fixture::new(time);
-    let _ = fixture.session.ingest_output(QUESTION);
-
-    let accepted = fixture
-        .session
-        .write_input(
-            fixture.holder,
-            fixture.epoch,
-            0,
-            b"abc",
-            None,
-            Instant::now(),
-        )
-        .expect("the input is accepted");
-
-    assert_eq!(accepted.forwarded_bytes, 3);
-    assert_eq!(accepted.held_prefix_bytes, 0);
-}

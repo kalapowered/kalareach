@@ -1577,6 +1577,22 @@ mod tests {
             }],
             "the answer is queued, with the whole budget still far from spent"
         );
+
+        // The share is still a share: the replies themselves fill it, to the byte, and the next
+        // reply past it is refused.
+        let room = MAX_PENDING_REPLY_BYTES - b"\x1b[0n".len();
+        let reply = |len: usize| crate::projection::LaneReply {
+            bytes: vec![b'r'; len],
+            expires_at_ms: None,
+        };
+        let _ = input.queue_replies(vec![reply(room)]);
+        let _ = input.queue_replies(vec![reply(1)]);
+        let lengths: Vec<usize> = input.take_pending().iter().map(InputBatch::len).collect();
+        assert_eq!(
+            lengths,
+            vec![room],
+            "a reply that fills the share is queued and the one past it is not"
+        );
     }
 
     fn editor_busy(attachment_id: AttachmentId) -> Step {
