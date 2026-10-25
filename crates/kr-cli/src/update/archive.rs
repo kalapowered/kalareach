@@ -341,9 +341,6 @@ fn read_tail(
     // by its signature and falls back to an earlier one when the last does not serve. The end
     // record after it cannot make one with the directory's last bytes, which it begins with `P`.
     if at != directory
-        || judged
-            .windows(4)
-            .any(|window| END_RECORDS.iter().any(|record| record == window))
     {
         return Ok(Err(NOT_A_ZIP));
     }
