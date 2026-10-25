@@ -12,7 +12,7 @@
 
 import type { ActionRight, AuthorityNotice, HeldShare, ShareOffer } from '@kalareach/protocol'
 
-import { ACTION_WORDS, momentWords, nameWords, roleOfRights, roleWords } from './sharing'
+import { ACTION_WORDS, accessOf, accessWords, momentWords, nameWords } from './sharing'
 
 /** What the host is called when this device has no name for it. */
 const UNNAMED_HOST = 'The host'
@@ -120,14 +120,23 @@ export function offerEnds(offer: ShareOffer, nowMs: number): string {
   return `Until ${momentWords(Number(offer.ends_at_ms), nowMs)}`
 }
 
-/** The role an invitation or a share is about, in words. */
-export function offerRole(offer: ShareOffer): string {
-  return roleWords(offer.role ?? roleOfRights(offer.actions))
+/**
+ * What an invitation allows, in words: its role and what it allows beyond the role. The words come
+ * from the actions it carries, the same way for a share held, and not from the role the host names
+ * beside it, which says nothing of a right beyond the role.
+ */
+export function offerAccess(offer: ShareOffer): string {
+  return accessWords(offer.actions)
 }
 
 /** The role of a share held. */
 export function shareRole(share: HeldShare): string {
-  return roleWords(roleOfRights(share.grant.actions))
+  return accessOf(share.grant.actions).role
+}
+
+/** What a share held allows beyond its role, as a sentence, or nothing when the role names it all. */
+export function shareBeyond(share: HeldShare): string {
+  return sentenceCase(accessOf(share.grant.actions).beyond)
 }
 
 /** How long a share lasts, in the row's words. */

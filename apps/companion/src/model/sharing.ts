@@ -8,7 +8,7 @@
  * rather than shortening it: the choices offered here are the ones that fit.
  */
 
-import type { ActionRight, DeviceSummary, GrantSummary } from '@kalareach/protocol'
+import type { ActionRight, DeviceSummary, GrantSummary, SessionRole } from '@kalareach/protocol'
 
 import { failureMessage, type AttemptView } from '../host/port'
 
@@ -289,12 +289,128 @@ export function attemptWords(attempt: AttemptView, nowMs: number): string {
   }
 }
 
-/** The rights of a share, named by the widest role they cover. */
-export function roleOfRights(actions: readonly ActionRight[]): string {
-  if (actions.includes('session.share')) return 'owner'
-  if (actions.includes('terminal.input')) return 'controller'
-  if (actions.includes('files.read')) return 'reviewer'
-  return 'viewer'
+/**
+ * What each role carries when the host writes a grant, in the host's own order of authority.
+ *
+ * A role is a label for a person reading a share. The host decides from a grant's actions and a
+ * grant keeps no role, so this table is only for naming: nothing on the page asks it what a share
+ * may do.
+ */
+const ROLE_RIGHTS: Readonly<Record<SessionRole, readonly ActionRight[]>> = {
+  viewer: ['session.view'],
+  reviewer: ['session.view', 'files.read'],
+  controller: [
+    'session.view',
+    'files.read',
+    'terminal.input',
+    'terminal.geometry',
+    'agent.prompt',
+    'agent.cancel',
+    'agent.approval.respond',
+    'question.respond'
+  ],
+  owner: [
+    'session.view',
+    'files.read',
+    'terminal.input',
+    'terminal.geometry',
+    'terminal.geometry.transfer',
+    'terminal.palette',
+    'agent.prompt',
+    'agent.cancel',
+    'agent.approval.respond',
+    'question.respond',
+    'session.rename',
+    'session.close',
+    'session.share'
+  ]
+}
+
+/** The roles, from the one that carries most to the one that carries least. */
+const WIDEST_FIRST: readonly SessionRole[] = ['owner', 'controller', 'reviewer', 'viewer']
+
+/**
+ * The widest role whose rights a share carries in full, or null when it carries none in full.
+ *
+ * It is the role the host names beside a grant, and the same one `kr share list` prints. A grant
+ * with no view of the session, such as the one a voice call holds, is no viewer.
+ */
+export function roleOfRights(actions: readonly ActionRight[]): SessionRole | null {
+  return (
+    WIDEST_FIRST.find((role) => ROLE_RIGHTS[role].every((right) => actions.includes(right))) ?? null
+  )
+}
+
+/** The rights a share carries that its role does not name, in the order the host lists them. */
+export function rightsBeyond(actions: readonly ActionRight[]): ActionRight[] {
+  const role = roleOfRights(actions)
+  const named = role === null ? [] : ROLE_RIGHTS[role]
+  return actions.filter((right) => !named.includes(right))
+}
+
+/** What each right lets a recipient do, as a clause that follows a subject. */
+const RIGHT_CLAUSES: Readonly<Record<ActionRight, string>> = {
+  'session.view': 'watches the session',
+  'terminal.input': 'types into the terminal',
+  'terminal.geometry': 'resizes the terminal',
+  'terminal.geometry.transfer': 'hands the terminal’s size to another viewer',
+  'terminal.palette': 'changes the terminal’s colours',
+  'agent.prompt': 'sends the agent prompts',
+  'agent.cancel': 'cancels the agent’s turn',
+  'agent.approval.respond': 'answers the agent’s approval requests',
+  'question.respond': 'answers the agent’s questions',
+  'files.read': 'reads files',
+  'files.upload': 'uploads files',
+  'files.apply_diff': 'applies diffs',
+  'project.create': 'creates projects',
+  'workspace.manage': 'manages workspaces',
+  'changeset.create': 'captures change sets',
+  'session.create': 'creates sessions',
+  'session.rename': 'renames the session',
+  'session.close': 'closes the session',
+  'session.share': 'shares the session with other devices',
+  'automation.manage': 'manages automation',
+  'host.manage': 'manages the host',
+  'voice.use': 'holds a voice session'
+}
+
+/** The clause for one right, or its name where this build has no words for it. */
+function rightClause(right: ActionRight): string {
+  return (RIGHT_CLAUSES as Readonly<Record<string, string | undefined>>)[right] ?? right
+}
+
+/** Items in a sentence: "a", "a and b", "a, b and c". */
+function listed(items: readonly string[]): string {
+  const last = items[items.length - 1] ?? ''
+  return items.length < 2 ? last : `${items.slice(0, -1).join(', ')} and ${last}`
+}
+
+/** A share by what it allows: its role, and what it allows beyond that role, in words. */
+export interface Access {
+  /** The role's name, or "Custom access" for a share that carries no role in full. */
+  readonly role: string
+  /** What the share allows beyond the role, or nothing when the role names all of it. */
+  readonly beyond: string
+}
+
+/**
+ * What a share allows, said so that no right it carries goes unnamed: the role that covers part of
+ * it, and every other right beside the role. A viewer who may answer the agent's questions is
+ * therefore a viewer who also answers them, never a plain viewer.
+ */
+export function accessOf(actions: readonly ActionRight[]): Access {
+  const role = roleOfRights(actions)
+  const clauses = rightsBeyond(actions).map(rightClause)
+  return {
+    role: roleWords(role),
+    beyond: clauses.length === 0 ? '' : `${role === null ? '' : 'also '}${listed(clauses)}`
+  }
+}
+
+/** What a share allows, in one phrase for a list. */
+export function accessWords(actions: readonly ActionRight[]): string {
+  const { role, beyond } = accessOf(actions)
+  return beyond === '' ? role : `${role} · ${beyond}`
 }
 
 /**

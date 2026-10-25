@@ -6392,9 +6392,14 @@ carries no notice, a viewer invited to answer the agent's questions carries `age
 the notices follow the actions and not the label. The role the host names beside a grant (in a
 `grant.held` offer, in `kr share list` and in the role line of `kr share invite`) is the widest role
 whose default actions the grant carries, a label for a person to read that the host never decides
-from. A viewer invited to answer is therefore named a viewer there, and the role line of
-`kr share invite` says what a viewer sees, so only the notices say what the grant lets the
-recipient do.
+from. A viewer invited to answer is named a viewer in an offer's role, since that is the widest
+role the grant carries in full, and the role line of `kr share invite` says what a viewer sees; the
+rights line after it names the rest. The lists that show a share put each right its role does not
+cover beside the role: `kr share list` prints `viewer plus question.respond`, and the companion's
+"Who has access", "Invitations" and "Shared with you" lists say that the viewer also answers the
+agent's questions. A grant that carries no role in full, such as a voice call's, is listed as
+custom with its rights. The lists leave out the notices, which the invitation form and the
+recipient's invitation card show.
 
 Restricted typed collaboration would be offered only where the upstream and the broker both enforce
 the boundary it states, and this host offers none today. A question always keeps its free-text

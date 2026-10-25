@@ -600,8 +600,8 @@ describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
     const voice = within(shared).getByRole('button', { name: /Session 4 · Studio/ })
     expect(voice).toHaveTextContent('Custom access')
     expect(voice).not.toHaveTextContent('Viewer')
-    expect(voice).toHaveTextContent('sends the agent prompts')
-    expect(voice).toHaveTextContent('answers the agent’s approval requests')
+    expect(voice).toHaveTextContent(/sends the agent prompts/)
+    expect(voice).toHaveTextContent(/answers the agent’s approval requests/i)
   })
 
   it('opens the session under the share when the row is pressed', async () => {

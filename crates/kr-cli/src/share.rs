@@ -1329,10 +1329,33 @@ const fn state_words(state: GrantState) -> &'static str {
     }
 }
 
+/// What a share allows, as a list prints it: the widest role whose rights the share carries in
+/// full, and every right the role does not cover named beside it. A viewer who may answer the
+/// agent's questions is `viewer plus question.respond`, never a plain viewer; a share that carries
+/// no role in full (a voice call's grant has no view of the session) is `custom` with each right
+/// named. The role is a label for the person reading the line: the host decides from the rights.
+fn access_words(actions: &CanonicalSet<ActionRight>) -> Shown {
+    let role = kr_controller::sharing::roles::describes(actions);
+    let beyond: Vec<Shown> = actions
+        .iter()
+        .filter(|right| role.is_none_or(|role| !role.default_actions().contains(right)))
+        .map(|right| Shown::said(right.as_str()))
+        .collect();
+    match (role, beyond.is_empty()) {
+        (Some(role), true) => Shown::said(role.as_str()),
+        (Some(role), false) => shown!(
+            "{} plus {}",
+            Shown::said(role.as_str()),
+            Shown::joined(beyond, ", ")
+        ),
+        (None, true) => Shown::said("custom"),
+        (None, false) => shown!("custom: {}", Shown::joined(beyond, ", ")),
+    }
+}
+
 /// One share as a line.
 fn list_line(summary: &GrantSummary, devices: &DeviceListResult) -> Line {
-    let role = kr_controller::sharing::roles::describes(&summary.grant.actions)
-        .map_or("custom", SessionRole::as_str);
+    let access = access_words(&summary.grant.actions);
     let session = match &summary.grant.session_selector {
         kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.iter().next(),
         _ => None,
@@ -1350,7 +1373,7 @@ fn list_line(summary: &GrantSummary, devices: &DeviceListResult) -> Line {
         summary.grant.recipient_device_id,
         device.unwrap_or_else(|| Asked::text(Request::Devices, "")),
         session.map_or_else(|| Shown::said("none"), |session| shown!("{}", *session)),
-        Shown::said(role),
+        access,
         Shown::said(if summary.grant.history.include_live_screen {
             " with the live screen"
         } else {

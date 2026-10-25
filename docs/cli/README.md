@@ -1628,9 +1628,11 @@ If the screen has changed, the document also holds the lines the host kept. It a
 command that withdraws the invitation.
 
 `kr share list` shows each share with its state (waiting to be accepted, active, ended or revoked),
-the device it goes to, its role (the widest role whose default actions the share carries, so a
-viewer share that lets the device answer questions is listed as `viewer`), whether it includes the
-live screen, its session and when it ends.
+the device it goes to, what it allows, whether it includes the live screen, its session and when it
+ends. What a share allows is the widest role whose default actions the share carries, then `plus`
+and each right that role does not cover, so a viewer share that lets the device answer questions is
+listed as `viewer plus question.respond`. A share that carries no role in full, such as the grant a
+voice call holds, is listed as `custom:` and its rights.
 `kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
 is complete when every affected session's worker has fenced it; until then it is pending, and the
 command names what it waits for and exits with 1. Asking again is a new revocation. What the device
