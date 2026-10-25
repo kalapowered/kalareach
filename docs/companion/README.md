@@ -72,12 +72,14 @@ count is a lower bound and says "at least". An agent's history goes with it when
 one it was reading ended before its last entries were read. What a package shows arrives on the
 event stream, and a node already held is replaced only by a newer revision of it.
 
-A button that a package shows runs that package's action on the session's own worker. The call names
-the package that recognised the agent, the action, the agent's instance and the binding revision the
-person saw. It carries no arguments, and the worker checks the action against the rights this device
-holds. If the action declares a parameter, the button sends nothing and says that the conversation
-cannot take that input yet. It also sends nothing before the agent has been read, or when no package
-recognised the agent.
+A button that a package shows runs that package's action on the session's own worker. The call
+names the package that recognised the agent, the action, the agent's instance and the binding
+revision the person saw, and it carries no arguments. The worker checks the action against the
+rights this device holds. The button sends nothing, and says why, in these cases: the agent has not
+been read, or no package recognised it; the agent has moved to another conversation since the
+button was drawn, in which case it works again when the package draws it again; the button's
+control declares a parameter, or sits in a form with fields, because the conversation cannot take
+that input yet; or the document does not say what the action takes.
 
 A session has three views: the conversation, the raw terminal and its output. The output view reads
 what the session wrote, as the host keeps it, with `history.page`: from the live end, a page at a

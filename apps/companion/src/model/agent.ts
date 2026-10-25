@@ -77,26 +77,75 @@ export type Invocation =
   | { readonly kind: 'cannot'; readonly because: string }
 
 /**
+ * The conversation a control was drawn under: the instance, the package that recognised it and the
+ * binding revision. A package draws its controls for one conversation, and its document does not
+ * say which; the view records it when the node arrives.
+ */
+export interface DrawnUnder {
+  readonly instance: string
+  readonly plugin_id: string | null
+  readonly revision: string
+}
+
+/** The conversation the session's agent is in now, or null while this view has not read it. */
+export function drawnUnder(
+  instance: AgentInstanceSummary | null,
+  binding: AgentBindingState | null
+): DrawnUnder | null {
+  if (instance === null || binding === null) return null
+  return {
+    instance: instance.application_instance_id,
+    plugin_id: instance.plugin_id,
+    revision: binding.binding_revision
+  }
+}
+
+/**
  * Builds the call a control makes, from what this view has read of the session's agent.
  *
  * The call names the package that recognised the agent, the control's registered action, and the
- * instance at the binding revision the person saw. Only an action that declares no parameters is
- * called: this view has no way yet to collect an argument, and sending an action the arguments
- * it needs would be the host's refusal after a press the person had no way to complete. An action
- * that answers a pending request names the request, which a control does not, and the host
- * refuses it for that.
+ * instance at the binding revision the person saw. A control is called only under the conversation
+ * it was drawn under: after the agent moved, the revision this view holds now is not the one the
+ * control was drawn for, and sending it would hide the move from the host.
+ *
+ * Only a control that declares no parameters, on a surface that collects none, is called: this view
+ * has no way yet to collect an argument, and sending an action what it needs would be the host's
+ * refusal after a press the person had no way to complete. An action that answers a pending
+ * request names the request, which a control does not, and the host refuses it for that.
+ *
+ * `collects` is true for a control that submits a form with fields, whose values the call does not
+ * carry.
  */
 export function invocationOf(
   control: Control,
   sessionId: string,
   instance: AgentInstanceSummary | null,
-  binding: AgentBindingState | null
+  binding: AgentBindingState | null,
+  drawn: DrawnUnder | null | undefined,
+  collects: boolean
 ): Invocation {
-  if (instance === null || binding === null) {
+  const now = drawnUnder(instance, binding)
+  if (instance === null || binding === null || now === null) {
     return { kind: 'cannot', because: 'This view has not read the agent yet.' }
+  }
+  if (drawn === null || drawn === undefined) {
+    return { kind: 'cannot', because: 'This was shown before the agent was read.' }
+  }
+  if (
+    drawn.instance !== now.instance ||
+    drawn.plugin_id !== now.plugin_id ||
+    drawn.revision !== now.revision
+  ) {
+    return {
+      kind: 'cannot',
+      because: 'The conversation moved since this was shown. It is sent again when it is drawn again.'
+    }
   }
   if (instance.plugin_id === null) {
     return { kind: 'cannot', because: 'No package recognised this agent.' }
+  }
+  if (collects) {
+    return { kind: 'cannot', because: 'This form asks for input this view cannot take yet.' }
   }
   if (control.parameters === undefined) {
     return { kind: 'cannot', because: 'This view cannot tell what this action takes.' }

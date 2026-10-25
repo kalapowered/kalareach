@@ -677,10 +677,10 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
           title: 'Rename',
           fields: { parameters: [{ name: 'to', label: 'New name', kind: { type: 'text' } }] },
           submit: {
-            id: 'send',
+            id: 'rename',
             revision: '1',
-            label: 'Send',
-            accessible_description: 'Send',
+            label: 'Apply the name',
+            accessible_description: 'Apply the name',
             action_id: 'thread.rename',
             parameters: { parameters: [] }
           }
@@ -689,7 +689,7 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
     })
     await nextFrame()
     const person = userEvent.setup()
-    await person.click(await screen.findByRole('button', { name: 'Send' }))
+    await person.click(await screen.findByRole('button', { name: 'Apply the name' }))
     expect(await screen.findByText(/asks for input this view cannot take yet/)).toBeTruthy()
     expect(calls).toHaveLength(0)
   })

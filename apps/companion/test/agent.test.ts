@@ -25,9 +25,9 @@ import {
   COMPOSER_CAPABILITIES,
   composerOffers,
   foldWithheld,
+  drawnUnder,
   invocationOf,
   liveInstance,
-  NO_ARGUMENTS,
   targetOf,
   withheldTotal
 } from '../src/model/agent'
@@ -482,8 +482,10 @@ describe('the control state, from what the worker said (KR-REQ-11.48)', () => {
   })
 })
 
-describe("a package's control asks the host for its action (KR-REQ-13.14)", () => {
-  const stop: Control = {
+describe("a package's control asks the host for its action only when it can (KR-REQ-13.14)", () => {
+  // The call a click makes, and the input a form takes, are keyed in the conversation's own cases;
+  // what only the model decides is when it asks nothing of the host.
+  const refresh: Control = {
     id: 'c-2',
     revision: '1',
     label: 'Refresh',
@@ -492,38 +494,42 @@ describe("a package's control asks the host for its action (KR-REQ-13.14)", () =
     parameters: { parameters: [] }
   }
   const live = instance('i-1', '10')
+  const here = drawnUnder(live, binding())
+  const because = (call: ReturnType<typeof invocationOf>) =>
+    call.kind === 'cannot' ? call.because : null
 
-  it('names the package, the action and the binding revision the person saw, and sends no arguments', () => {
-    expect(invocationOf(stop, SESSION, live, binding())).toEqual({
-      kind: 'call',
-      params: {
-        target: targetOf(SESSION, 'i-1', binding()),
-        plugin_id: 'openai.codex',
-        action: 'thread.refresh',
-        draft_id: null,
-        resource_id: null,
-        parameters: NO_ARGUMENTS
-      }
-    })
-    // The empty object, encoded the way the host hashes the action's arguments.
-    expect(atob(NO_ARGUMENTS.replace(/-/g, '+').replace(/_/g, '/'))).toBe('{}')
-  })
-
-  it('asks nothing of the host while the agent is unread, unrecognised, or the action takes input', () => {
-    const because = (call: ReturnType<typeof invocationOf>) =>
-      call.kind === 'cannot' ? call.because : null
-    expect(because(invocationOf(stop, SESSION, null, binding()))).toContain('not read the agent')
-    expect(because(invocationOf(stop, SESSION, live, null))).toContain('not read the agent')
-    expect(
-      because(invocationOf(stop, SESSION, { ...live, plugin_id: null }, binding()))
-    ).toContain('No package recognised')
-    expect(
-      because(invocationOf({ ...stop, parameters: undefined }, SESSION, live, binding()))
-    ).toContain('cannot tell what this action takes')
+  it('asks nothing of the host while the agent is unread, unrecognised or its input is unknown', () => {
+    expect(because(invocationOf(refresh, SESSION, null, binding(), here, false))).toContain(
+      'not read the agent'
+    )
+    expect(because(invocationOf(refresh, SESSION, live, null, here, false))).toContain(
+      'not read the agent'
+    )
+    expect(because(invocationOf(refresh, SESSION, live, binding(), null, false))).toContain(
+      'before the agent was read'
+    )
+    const unrecognised = { ...live, plugin_id: null }
     expect(
       because(
-        invocationOf({ ...stop, parameters: { parameters: [{ name: 'to' }] } }, SESSION, live, binding())
+        invocationOf(refresh, SESSION, unrecognised, binding(), drawnUnder(unrecognised, binding()), false)
       )
-    ).toContain('asks for input')
+    ).toContain('No package recognised')
+    expect(
+      because(invocationOf({ ...refresh, parameters: undefined }, SESSION, live, binding(), here, false))
+    ).toContain('cannot tell what this action takes')
+  })
+
+  it('asks nothing of the host for a control drawn under another instance, package or revision', () => {
+    const elsewhere = [
+      drawnUnder(instance('i-2', '10'), binding()),
+      drawnUnder({ ...live, plugin_id: 'other.package' }, binding()),
+      drawnUnder(live, binding({ binding_revision: '3' }))
+    ]
+    for (const drawn of elsewhere) {
+      expect(because(invocationOf(refresh, SESSION, live, binding(), drawn, false))).toContain(
+        'conversation moved'
+      )
+    }
+    expect(invocationOf(refresh, SESSION, live, binding(), here, false).kind).toBe('call')
   })
 })
