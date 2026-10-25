@@ -1259,10 +1259,39 @@ impl Drop for Host {
             }
         }
         #[cfg(windows)]
-        self.remove_the_standalone_start();
+        {
+            self.remove_the_standalone_start();
+            forget_the_keys(self.tree.environment_id());
+        }
         // An installed release is read-only, and the tree goes whole: its directories are opened
         // to removal first.
         writable(self.store.root());
+    }
+}
+
+/// Takes out of the account's credential store the keys a daemon of `environment` put there. A
+/// daemon started by the environment's task keeps its keys in the platform's store, as a person's
+/// does, and does not remove them when its environment goes; the store holds only so many, and a
+/// test that makes an environment of its own would fill it.
+#[cfg(windows)]
+fn forget_the_keys(environment: kr_protocol::ids::EnvironmentId) {
+    let system = std::env::var_os("SystemRoot").map_or_else(
+        || PathBuf::from(r"C:\Windows"),
+        PathBuf::from,
+    );
+    for place in ["", "network-device/"] {
+        for key in [
+            "authorisation",
+            "notification_preview",
+            "stored_envelope",
+            "transport",
+        ] {
+            let _ = Command::new(system.join("System32").join("cmdkey.exe"))
+                .arg(format!("/delete:{environment}/{place}device-key/{key}.KalaReach"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 

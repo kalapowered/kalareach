@@ -10472,7 +10472,12 @@ async fn what_a_removal_leaves_in_the_trash_is_deleted_by_the_next_update() {
     waiting.kill().expect("the program is ended");
     waiting.wait().expect("and gone");
     update(&releases[3]);
-    assert_eq!(left(), 0, "the next update deletes what was left");
+    let remaining = what_is_under(&host.store.trash());
+    assert_eq!(
+        left(),
+        0,
+        "the next update deletes what was left, and these remain: {remaining:?}"
+    );
 }
 
 /* -------------------------------------------------------------------------------------------- */
