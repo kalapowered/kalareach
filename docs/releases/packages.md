@@ -167,23 +167,24 @@ statements say what moves the level:
 3. A store of its own at version 1, and a store that reads the next version without writing it,
    move no level.
 
-`kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with `git
-ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares the
-commit with every release at its level, whether or not the commit's history reaches it. It fails
-naming the release and each difference, in the schema
-(cut over both revisions' roots, so that a root that was dropped cannot hide a change), in the
-tables of what the worker serves (renaming an event, or serving a method no longer, changes no
-definition of the schema), in the plugin host protocol and in the table of public majors. It also
-compares the protocol schema as a whole, every definition a root, and the plugin SDK schema
+`kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with
+`git ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares
+the commit with every release at its level, whether or not the commit's history reaches it. It fails
+naming the release and each difference, in the schema (cut over both revisions' roots, so that a
+root that was dropped cannot hide a change), in the tables of what the worker serves (renaming an
+event, or serving a method no longer, changes no definition of the schema), in the plugin host
+protocol and in the table of public majors. It also compares the protocol schema as a whole, every
+definition a root, and the plugin SDK schema
 (`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
 commit and of each release) with the same rule as the public contract below, and fails on each
-difference except a variant added to `Method`, a definition that is new, and an optional member
-added to an object the earlier release marked read-only metadata. Descriptions and titles are
-ignored. A release from before `worker-surface.json` has no table to compare, so its tables are
-left out and its schema, plugin host protocol and table of public majors are compared; a release
-from before the SDK schema file is compared without it; the check says so. When no
-release is at the commit's level, the commit moves it, and the check runs
-`scripts/check-retained-release.sh` in the same run.
+difference except a new method, a definition that is new, and an optional member added to an object
+the earlier release marked read-only metadata. A new method is a variant added to `Method` that is
+one plain string constant, whose name no variant of the earlier release had and no other variant
+has. Descriptions and titles are ignored. A release from before `worker-surface.json` has no table
+to compare, so its tables are left out and its schema, plugin host protocol and table of public
+majors are compared. A release of the level without the SDK schema file, or whose file does not
+read, fails the check. When no release is at the commit's level, the commit moves it, and the check
+runs `scripts/check-retained-release.sh` in the same run.
 
 The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
 a release's tree cannot be read and when a source is in a form it does not read, and it never leaves

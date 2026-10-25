@@ -21,11 +21,13 @@
 //! * the protocol the plugin host speaks and the table of public majors;
 //! * the whole protocol schema, every definition a root, which is what a client built from the
 //!   protocol package reads: a member or a variant added to an existing definition, and anything
-//!   removed or changed, is a difference. A definition that is new, a variant added to `Method`
-//!   (a host of the same level answers a method it does not list with `PERMISSION_DENIED`, and a
-//!   client that meets that refusal for a method that is new asks the host a method its level has
-//!   before it takes the refusal for a lack of rights) and an optional member added to an object
-//!   the earlier release marked read-only metadata are not;
+//!   removed or changed, is a difference. A definition that is new, a new method and an optional
+//!   member added to an object the earlier release marked read-only metadata are not. A new method
+//!   is a variant added to `Method` that is one plain string constant, whose name no variant of
+//!   the earlier release had and no other variant has (a host of the same level answers a method
+//!   it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for a method
+//!   that is new asks the host a method its level has before it takes the refusal for a lack of
+//!   rights);
 //! * the plugin SDK schema, from the committed file of each release and of this commit, held to
 //!   the same rule. The file is generated, and `kr-plugin-sdk-gen --check` holds the committed
 //!   one equal to the generated one. A release of the level without the file, or a file that does
