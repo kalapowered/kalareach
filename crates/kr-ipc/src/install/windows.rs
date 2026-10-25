@@ -143,14 +143,29 @@ fn open_reading(path: &Path, share: u32) -> io::Result<File> {
     Ok(file)
 }
 
+/// How long a read of a file of a release waits for a question whether the release is held
+/// ([`is_held`]), which opens the manifest with no sharing for an instant.
+const QUESTION_WAIT: Duration = Duration::from_secs(2);
+
 /// Opens a file of a release for reading without following a link, letting every other handle
 /// read, write and delete.
 ///
+/// A sharing violation is waited out for [`QUESTION_WAIT`]: the only handle that causes one is the
+/// instant of the question whether the release is held, so a reader is never refused by it.
+///
 /// # Errors
 ///
-/// As [`open_reading`].
+/// As [`open_reading`], and the sharing violation itself once the wait has passed.
 pub(super) fn open_regular_file(path: &Path) -> io::Result<File> {
-    open_reading(path, SHARE_ALL)
+    let deadline = Instant::now() + QUESTION_WAIT;
+    loop {
+        match open_reading(path, SHARE_ALL) {
+            Err(error) if is_sharing_violation(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            answer => return answer,
+        }
+    }
 }
 
 /// Opens a release's manifest to hold the release: for reading, with a share mode that allows other
