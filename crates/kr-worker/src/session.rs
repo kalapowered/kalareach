@@ -4090,7 +4090,8 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::SessionClosed`] once the session has begun closing.
+    /// Returns [`WorkerError::SessionClosed`] once the session is closed. A session that has begun
+    /// closing is still running and is not refused here.
     pub fn require_live(&self) -> Result<()> {
         self.require_running()
     }

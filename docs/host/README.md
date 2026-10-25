@@ -3053,13 +3053,15 @@ What the grant decides, for every request:
   output written after that interval's time limits pass (see "When output was produced" for the
   limits and for a full index). A grant that reaches every moment
   is served what the owner is. The page comes from the same retained window as the owner's, so
-  what privacy mode removes is gone from both. A page the worker read before privacy mode started
-  is not sent after it: the daemon sends a page only while the privacy state it was read under
-  stands, and otherwise sends it with none of its output and says the range it covered is gone. A
-  closed session has no worker to cut its output, and a paired device is refused it, with that
-  reason; a worker that still answers while its closure is delivered refuses the page to every
-  caller but the owner. The session's live screen and the stream
-  that follows it are served when the grant includes them,
+  what privacy mode removes is gone from both. The daemon publishes privacy mode before it tells a
+  worker to remove what it retained, so a page is sent only while privacy mode is off and stays off
+  in the generation the page was read in, and the state is held while the bytes are handed to the
+  stream. A page read with privacy mode on, or one for which the state moved before the first byte
+  went, is sent with none of its output and says the range it covered is gone; one for which it
+  moved after the first byte went ends the connection. A closed session has no worker to cut its
+  output, and a paired device is refused it, with that reason; a worker that still answers while its
+  closure is delivered refuses the page to every caller but the owner. The session's live screen and
+  the stream that follows it are served when the grant includes them,
   and "the live screen" means the screen that is showing: a device's attachment is drawn the active
   buffer alone, and the rows of the buffer that is not showing are counted among what its
   restoration did not carry. The exception section 10 names is the visible screen, and never the
