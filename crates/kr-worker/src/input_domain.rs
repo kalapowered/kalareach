@@ -1534,6 +1534,46 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.48: the share of the queue the host's own answers may fill is what the answers
+    /// themselves hold. The keystrokes a takeover made stale wait in the queue until the writer
+    /// reaches them, and they are no answer's: they count against the whole budget, which they
+    /// still hold, and not against the answers' share.
+    #[test]
+    fn the_keystrokes_a_takeover_left_behind_do_not_spend_the_answers_share() {
+        let mut input = domain();
+        input.queue_input(InputBatch::Lease {
+            epoch: 0,
+            bytes: vec![b'x'; MAX_PENDING_REPLY_BYTES],
+            paste: PasteTransition::default(),
+            authority_deadline_boot_ms: None,
+            authority_utc_deadline_ms: None,
+        });
+        // The lease changes hands. Its own count goes with the takeover, and the bytes stay in the
+        // queue until a writer reaches them and sees they are stale; no writer runs here.
+        let ended = input.end_lease();
+        assert_eq!(ended.left, MAX_PENDING_REPLY_BYTES as u64);
+
+        let answer = b"\x1b[0n".to_vec();
+        let _ = input.queue_replies(vec![crate::projection::LaneReply {
+            bytes: answer.clone(),
+            expires_at_ms: None,
+        }]);
+
+        let queued: Vec<InputBatch> = input
+            .take_pending()
+            .into_iter()
+            .filter(|batch| matches!(batch, InputBatch::Reply { .. }))
+            .collect();
+        assert_eq!(
+            queued,
+            vec![InputBatch::Reply {
+                bytes: answer,
+                expires_at_ms: None
+            }],
+            "the answer is queued, with the whole budget still far from spent"
+        );
+    }
+
     fn editor_busy(attachment_id: AttachmentId) -> Step {
         Step::EditorBusy(Box::new(kr_protocol::root::EditorBusyEvent {
             session_id: SessionId::new(kr_ipc::new_uuid()),

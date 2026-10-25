@@ -32,6 +32,7 @@ const QUESTION: &[u8] = b"\x1b[6n";
 /// A session that waits, whose person holds the input lease.
 struct Fixture {
     session: Session,
+    session_id: SessionId,
     holder: AttachmentId,
     epoch: u64,
     sequence: u64,
@@ -85,6 +86,7 @@ impl Fixture {
             .get();
         Self {
             session,
+            session_id,
             holder,
             epoch,
             sequence: 0,
@@ -105,6 +107,31 @@ impl Fixture {
             )
             .expect("the input is accepted");
         self.sequence += 1;
+    }
+
+    /// A second attachment takes the input lease from the person, and is told what the takeover
+    /// discarded.
+    fn seized_by_another(&mut self) -> u64 {
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        let params = SessionAttachParams {
+            session_id: self.session_id,
+            mode: AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: Nullable::some(Dimensions::new(80, 24)),
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+            requested,
+        };
+        let next = AttachmentId::new(kr_ipc::new_uuid());
+        self.session
+            .attach(&params, params.requested.clone(), next)
+            .expect("attaches");
+        self.session
+            .acquire_input(next, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .expect("the lease is taken")
+            .discarded_bytes
+            .get()
     }
 
     /// The replies queued for the application since the last call.
@@ -218,4 +245,51 @@ async fn a_wall_clock_stepped_back_does_not_keep_a_reply_that_has_waited_over_tw
     fixture.type_bytes(PASTE_CLOSE);
     fixture.session.pump_replies();
     assert!(fixture.replies().is_empty(), "the reply expired");
+}
+
+/// KR-REQ-08.48: a takeover discards the previous holder's keystrokes that were not written and
+/// reports how many; the host's own answer waiting beside them is not the holder's, so it is not in
+/// that count and it is not discarded: the application still gets what it asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_counts_the_holders_keystrokes_and_leaves_the_hosts_answer_alone() {
+    let (_clock, time) = manual();
+    let mut fixture = Fixture::new(time);
+    fixture.type_bytes(b"abc");
+    let _ = fixture.session.ingest_output(QUESTION);
+
+    let discarded = fixture.seized_by_another();
+
+    assert_eq!(
+        discarded, 3,
+        "the three keystrokes, and none of the six bytes of the answer"
+    );
+    assert_eq!(
+        fixture.replies(),
+        vec![b"\x1b[1;1R".to_vec()],
+        "the answer is still queued for the application"
+    );
+}
+
+/// KR-REQ-08.48: what a write reports is that write's bytes: the host's own answer queued for the
+/// terminal is neither forwarded by it nor held as the start of a delimiter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writes_receipt_counts_its_own_bytes_and_not_the_answers_queued_beside_them() {
+    let (_clock, time) = manual();
+    let mut fixture = Fixture::new(time);
+    let _ = fixture.session.ingest_output(QUESTION);
+
+    let accepted = fixture
+        .session
+        .write_input(
+            fixture.holder,
+            fixture.epoch,
+            0,
+            b"abc",
+            None,
+            Instant::now(),
+        )
+        .expect("the input is accepted");
+
+    assert_eq!(accepted.forwarded_bytes, 3);
+    assert_eq!(accepted.held_prefix_bytes, 0);
 }
