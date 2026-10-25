@@ -68,6 +68,8 @@ import type {
   HostInfoResult,
   PaletteState,
   PendingResource,
+  PluginActionInvokeParams,
+  PluginActionInvokeResult,
   PluginListParams,
   PluginListResult,
   PrivacyReport,
@@ -1682,7 +1684,17 @@ export interface HostPort {
     params: AgentApprovalRespondParams,
     opening?: string
   ): Promise<Settled<AgentApprovalRespondResult>>
-  pluginActionInvoke(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * Invokes one action a package registered for the session's agent, on the session's own worker.
+   *
+   * The parameters are the method's own: the package, the action, the instance and the binding
+   * revision the person saw, and the action's arguments as the encoded object the host hashes into
+   * the action's token. The host checks the action's rights against this device's grant.
+   */
+  pluginActionInvoke(
+    params: PluginActionInvokeParams,
+    opening?: string
+  ): Promise<Settled<PluginActionInvokeResult>>
 
   /**
    * The drafts this device keeps, and how many files in its store could not be read.

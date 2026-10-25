@@ -53,6 +53,7 @@ import {
   attachOffer,
   bindingStateOf,
   composerOffers,
+  invocationOf,
   subjectOf,
   targetOf,
   withheldTotal,
@@ -671,11 +672,15 @@ export function Conversation({
 
   const invoke = useCallback(
     (control: Control) => {
+      const instance =
+        agent.instances?.find((each) => each.application_instance_id === agent.instance) ?? null
+      const call = invocationOf(control, sessionId, instance, agent.binding)
+      if (call.kind === 'cannot') {
+        say(call.because, 'danger')
+        return
+      }
       port
-        .pluginActionInvoke(
-          { action_id: control.action_id, control_revision: control.revision },
-          subject
-        )
+        .pluginActionInvoke(call.params)
         .then((result) => {
           say(outcomeMessage(control.label, result), outcomeTone(result))
         })
@@ -683,7 +688,7 @@ export function Conversation({
           say(failureMessage(error), 'danger')
         })
     },
-    [port, subject, say]
+    [port, sessionId, agent.instances, agent.instance, agent.binding, say]
   )
 
   /**

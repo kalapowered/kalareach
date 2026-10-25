@@ -1930,13 +1930,13 @@ export function fakeHost(
       checkOpening('approvalRespond', params.target.subject.session_id, opening)
       return Promise.resolve(records.respond(params))
     },
-    pluginActionInvoke: (params) => {
+    pluginActionInvoke: (params, opening) => {
       requireConnection()
-      const actionId = (params as { action_id?: string }).action_id ?? 'unknown'
+      checkOpening('pluginActionInvoke', params.target.subject.session_id, opening)
       return Promise.resolve({
         receipt: receipt(nextActionId(), 'applied', 'plugin.action.invoke'),
         action_id: null,
-        value: { invoked: actionId }
+        value: { mutation: null, action: params.action }
       })
     },
 
