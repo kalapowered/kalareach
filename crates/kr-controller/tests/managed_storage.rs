@@ -4016,6 +4016,51 @@ async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_
         .await;
 }
 
+/// KR-REQ-24.27 and KR-REQ-24.28: a session that closed on this host and went into a generation is
+/// settled when privacy mode is turned on. The registry records its end and no journal exists, as
+/// for a worker that was lost; the output it kept is removed, and the change reports complete. The
+/// control is the generation made before, which holds the session's output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_turned_on_settles_a_closed_session_a_generation_holds() {
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed = Some(closed_session(host, b"a session\r\n", 9_000));
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("a generation is published", |rig| rig.published(1))
+        .await;
+    assert!(
+        opened_members(&rig, 1).contains_key(&format!("sessions/{session}.json")),
+        "the control: the generation holds the session"
+    );
+    let segments = || {
+        std::fs::read_dir(rig.host.environment().session_spool(session))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0)
+    };
+    assert!(segments() > 0, "the control: the session's output is on the disk");
+
+    assert!(rig.set_privacy(true).await, "privacy mode is turned on");
+    within("the change taking effect", async {
+        while !rig.privacy_complete().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let report = rig.privacy_report().await;
+    assert!(
+        report.sessions.is_empty(),
+        "nothing is owed once the output is removed: {:?}",
+        report.sessions
+    );
+    assert_eq!(segments(), 0, "the output is gone");
+}
+
 /// The members together never pass the total a restore accepts, the configuration among them: it
 /// is counted first, and a session that no longer fits beside it is left out whole. The total here
 /// takes the session and the configuration each alone, and not both.
