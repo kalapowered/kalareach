@@ -734,8 +734,8 @@ fn a_release_that_is_gone_or_being_removed_is_not_pinned() {
 
 /// KR-REQ-26.06: asking whether a release is held opens its manifest for an instant with no sharing
 /// at all, and a program that starts in that instant is not refused: it waits out the question and
-/// holds the release. Pinned two thousand times while another thread asks without a pause, every
-/// pin is granted.
+/// holds the release. A program of the release starts two thousand times while another thread asks
+/// without a pause, and every start is granted.
 #[cfg(windows)]
 #[test]
 fn a_program_that_starts_is_not_refused_by_a_question_whether_its_release_is_held() {
@@ -744,7 +744,7 @@ fn a_program_that_starts_is_not_refused_by_a_question_whether_its_release_is_hel
 
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
-    test.install(&one);
+    let program = test.install(&one);
     let asking = Arc::new(AtomicBool::new(true));
     let asked = {
         let store = Store::at(test.store.root());
@@ -761,12 +761,9 @@ fn a_program_that_starts_is_not_refused_by_a_question_whether_its_release_is_hel
     };
     let mut refused = Vec::new();
     for round in 0..2000 {
-        match test.store.pin(&one) {
-            Ok(Some(pin)) => drop(pin),
-            other => refused.push(format!(
-                "round {round}: {:?}",
-                other.map(|pin| pin.is_some())
-            )),
+        match Running::of_image(&program) {
+            Ok(running) => assert_eq!(running.release(), Some(&one)),
+            Err(error) => refused.push(format!("round {round}: {error}")),
         }
     }
     asking.store(false, Ordering::Relaxed);
