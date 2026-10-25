@@ -4595,22 +4595,24 @@ The carrier waits between passes as the service and the cause allow:
 | A privacy fence was raised | At once, whatever else it waits for and whatever token the host holds, because the cleanup a fence owes ends work in flight |
 | Nothing is owed | When something changes |
 
-A delay the service names binds every question to it, and the daemon never waits longer than an
-hour for one, whatever the service writes. The daemon records the delay where the answer arrives,
-and its clients send nothing while a delay is owed: not the question about an earlier publication,
-not the first question about backup storage, not the status read `kr doctor` makes, and not the
-next request of a pass that was running when the delay arrived. That pass ends and says where it
-stopped. A fence that arrives meanwhile does its cleanup and leaves the rest of the delay owed. A
-host under a fence is not held back by a delay at all, because its clients cannot tell cleanup from
-other work; only the question about an earlier publication and the status read `kr doctor` makes
-still stop at a delay, as they do outside a fence. The clients do not send a request again on
-their own after a short delay: the carrier waits it out and asks again. A
-refusal only a person can clear that names a delay is waited for as long as the longer of the delay
-and five minutes, and new work still waits out the delay. A refusal that names a delay and one that needs a
-person can come in the same pass, for example when a publication is refused because the writer is
-not enrolled and the question that follows is turned back with a delay. The pass ends at the delay
-and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about
-one attempt alone, an object the service already holds for example, and the pass goes on to the next.
+A delay the service names binds every question to it, and the daemon never waits longer than an hour
+for one, whatever the service writes. The daemon records the delay where the answer arrives, and its
+clients send nothing while a delay is owed: not the question about an earlier publication, not the
+first question about backup storage, not the status read `kr doctor` makes, and not the next request
+of a pass that was running when the delay arrived. That pass ends and says where it stopped. A fence
+that arrives meanwhile does its cleanup and leaves the rest of the delay owed. Under a fence, the
+requests that end work in flight are not held back by a delay, because the cleanup a fence owes must
+not wait. A deletion the person asked for is not such a request: it waits out the delay under a
+fence as it does outside one, and the carrier sends it once the delay has passed. The question about
+an earlier publication and the status read `kr doctor` makes still stop at a delay, as they do
+outside a fence. The clients do not send a request again on their own after a short delay: the
+carrier waits it out and asks again. A refusal only a person can clear that names a delay is waited
+for as long as the longer of the delay and five minutes, and new work still waits out the delay. A
+refusal that names a delay and one that needs a person can come in the same pass, for example when a
+publication is refused because the writer is not enrolled and the question that follows is turned
+back with a delay. The pass ends at the delay and the daemon keeps the person's refusal for `kr
+doctor`. A refusal that names no delay may be about one attempt alone, an object the service already
+holds for example, and the pass goes on to the next.
 
 A part is 8 MiB and its answer begins only after the whole part has been sent, so storage exchanges
 get 60 seconds to start answering and 90 in all. That is the time the slowest supported uplink needs

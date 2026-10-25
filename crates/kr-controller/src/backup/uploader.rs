@@ -887,8 +887,8 @@ impl Uploader {
             };
             // A service that asked to be left alone is not asked about the next publication either,
             // and not by the first pass: the delay is recorded where the answer arrived. The gate
-            // sends nothing while it is owed, except under a privacy fence, which opens it for
-            // every request, so the loop stops here instead.
+            // sends nothing while it is owed, except under a privacy fence, which opens it for the
+            // requests that end work in flight, so the loop stops here instead.
             if !matches!(self.held(&generation).await, Ok(true)) {
                 if self.quiet.left().is_some() {
                     break;
