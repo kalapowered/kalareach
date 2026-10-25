@@ -8684,19 +8684,26 @@ impl WorkerService {
         // section 27 puts at no more than the recogniser's deadline, began with the write.
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(facts, params.attachment_id)?;
-        let InputContent::Bytes { bytes } = &params.input else {
-            return Err(WorkerError::InvalidArgument(
-                "this worker does not take console key records".to_owned(),
-            ));
-        };
         // Raw input is its own stream with its own bound. Travelling inside a control frame does
-        // not give a keystroke batch the control frame's allowance.
-        if bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
-            return Err(WorkerError::InvalidArgument(format!(
-                "an input batch is at most {} bytes",
-                kr_protocol::limits::MAX_INPUT_FRAME_LEN
-            )));
-        }
+        // not give a keystroke batch the control frame's allowance. Key records are held to the
+        // same bound on the bytes they spell, which is checked as they are spelled, under the
+        // lock that accepts them.
+        let records: Vec<kr_term::win32::KeyRecord>;
+        let entering = match &params.input {
+            InputContent::Bytes { bytes } => {
+                if bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
+                    return Err(WorkerError::InvalidArgument(format!(
+                        "an input batch is at most {} bytes",
+                        kr_protocol::limits::MAX_INPUT_FRAME_LEN
+                    )));
+                }
+                crate::input_domain::Entering::Bytes(bytes.as_slice())
+            }
+            InputContent::ConsoleKeys { keys } => {
+                records = keys.iter().copied().map(Into::into).collect();
+                crate::input_domain::Entering::Keys(&records)
+            }
+        };
         self.wait_before_the_input_session();
         // Before the input domain is taken, and the last thing before it: the check reads the
         // local gate and, for an owner whose membership is bound, the clock and the host's floor,
@@ -8726,11 +8733,11 @@ impl WorkerService {
                 accepted,
                 owed,
                 opened_the_gate,
-            } = input.accept(
+            } = input.accept_entering(
                 params.attachment_id,
                 params.epoch.get(),
                 params.sequence.get(),
-                bytes.as_slice(),
+                entering,
                 // The deadline travels with the bytes, on both clocks it is decided on. This check
                 // is the host's, taken now; the writer's is its own, taken when the terminal
                 // actually takes them.

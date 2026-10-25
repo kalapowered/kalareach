@@ -312,6 +312,18 @@ impl std::fmt::Debug for TerminalEngine {
     }
 }
 
+/// Describes a keyboard encoding for a refusal a caller reads.
+#[must_use]
+pub(crate) fn describe_keyboard(encoding: KeyboardEncoding) -> String {
+    match encoding {
+        KeyboardEncoding::Legacy => "the ordinary terminal encoding".to_owned(),
+        KeyboardEncoding::Kitty(flags) => {
+            format!("the Kitty keyboard protocol with flags {flags}")
+        }
+        KeyboardEncoding::ModifyOtherKeys(level) => format!("modifyOtherKeys level {level}"),
+    }
+}
+
 impl TerminalEngine {
     /// Builds the canonical grid of a session of these dimensions, whose windows are measured on
     /// `clock`.
@@ -320,19 +332,37 @@ impl TerminalEngine {
     ///
     /// Returns an error when the dimensions are outside what a canonical grid may be.
     pub fn new(canonical: Dimensions, clock: Arc<dyn kr_ipc::clock::SharedClock>) -> Result<Self> {
+        Self::for_backend(
+            canonical,
+            clock,
+            if cfg!(windows) {
+                kr_term::policy::Backend::ConPty
+            } else {
+                kr_term::policy::Backend::UnixPty
+            },
+        )
+    }
+
+    /// Builds the canonical grid of a session whose terminal is owned by `backend`.
+    ///
+    /// Which backend owns the terminal decides what the engine does with a request only one of them
+    /// can make. Mode 9001 is the whole of it: on a Windows pseudo-console it is a real request
+    /// from the backend this worker owns, and the session records what it asked for; anywhere else
+    /// it is meaningless and is reported as such.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the dimensions are outside what a canonical grid may be.
+    pub(crate) fn for_backend(
+        canonical: Dimensions,
+        clock: Arc<dyn kr_ipc::clock::SharedClock>,
+        backend: kr_term::policy::Backend,
+    ) -> Result<Self> {
         let size = grid_size(canonical)?;
         let engine = Engine::new(EngineConfig {
             size,
-            // Which backend owns the terminal decides what the engine does with a request only one
-            // of them can make. Mode 9001 is the whole of it: on a Windows pseudo-console it is a
-            // real request from the backend this worker owns, and the session records what it
-            // asked for; anywhere else it is meaningless and is reported as such.
             policy: kr_term::policy::Policy {
-                backend: if cfg!(windows) {
-                    kr_term::policy::Backend::ConPty
-                } else {
-                    kr_term::policy::Backend::UnixPty
-                },
+                backend,
                 ..kr_term::policy::Policy::DEFAULT
             },
             ..EngineConfig::DEFAULT
@@ -450,12 +480,23 @@ impl TerminalEngine {
     /// Describes that encoding for a refusal a caller reads.
     #[must_use]
     pub fn keyboard_in_force(&self) -> String {
-        match self.keyboard_negotiated() {
-            KeyboardEncoding::Legacy => "the ordinary terminal encoding".to_owned(),
-            KeyboardEncoding::Kitty(flags) => {
-                format!("the Kitty keyboard protocol with flags {flags}")
-            }
-            KeyboardEncoding::ModifyOtherKeys(level) => format!("modifyOtherKeys level {level}"),
+        describe_keyboard(self.keyboard_negotiated())
+    }
+
+    /// Returns what the console's key records are spelled as, from what the application and the
+    /// backend have asked for so far.
+    ///
+    /// Only the canonical parser knows it, and a Unix worker's is always legacy input: mode 9001 is
+    /// recorded for a pseudo-console backend alone.
+    #[must_use]
+    pub(crate) fn console_input(&self) -> crate::input_domain::ConsoleInput {
+        let modes = self.engine.modes();
+        crate::input_domain::ConsoleInput {
+            fidelity: modes.backend_input_fidelity(),
+            keyboard: kr_term::win32::Keyboard {
+                application_cursor_keys: modes.is_set(kr_term::modes::ModeKind::Dec, 1),
+                negotiated: modes.keyboard_encoding(),
+            },
         }
     }
 

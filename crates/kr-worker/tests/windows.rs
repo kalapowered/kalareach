@@ -25,6 +25,8 @@ use kr_worker::ownership::{OwnedProcesses, OwnershipBoundary, boundary_for};
 use kr_worker::pty::{Pty, Room, RootShell};
 use kr_worker::testing::{powershell, powershell_command};
 
+mod common;
+
 /// How long a test waits for a shell to say something before it calls that a failure.
 ///
 /// PowerShell 7 is not quick to start, and a build machine under load is slower still, so this is
@@ -1313,6 +1315,11 @@ fn build() -> kr_protocol::ids::BuildId {
 
 /// Starts a worker for a new session in `temp`'s environment, under `display`.
 async fn worker(temp: &kr_ipc::testing::TempHost, display: u64) -> Worker {
+    worker_running(temp, display, "Start-Sleep -Seconds 300").await
+}
+
+/// As [`worker`], for a session whose root shell runs `command`.
+async fn worker_running(temp: &kr_ipc::testing::TempHost, display: u64, command: &str) -> Worker {
     use kr_protocol::ids::{ControllerGeneration, SessionEpoch, SessionId};
 
     let environment = temp.environment();
@@ -1342,7 +1349,7 @@ async fn worker(temp: &kr_ipc::testing::TempHost, display: u64) -> Worker {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: display,
-        shell: powershell_command("Start-Sleep -Seconds 300"),
+        shell: powershell_command(command),
         shell_mode: kr_protocol::session::ShellMode::NativeCompat,
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         desktop: kr_protocol::identity::DesktopBinding::none(),
@@ -1582,4 +1589,129 @@ async fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its
         "an authenticated local caller is still held to the scope of this session"
     );
     assert_eq!(hosted.service.runtime().state().as_str(), "live");
+}
+
+/// KR-REQ-08.53, KR-REQ-08.52: key records written to a session whose terminal is a real
+/// pseudo-console reach the application as the console's own key events.
+///
+/// The pseudo-console asks for key records with `CSI ?9001h`, and the worker records that. A
+/// record is then written to the console in the documented sequence with every field. The
+/// application reads one key with the console's own call and prints what it was given. Ctrl and
+/// Return is the key this is shown with: the console reports it as a line feed, and the legacy
+/// spelling of a line feed is a different key, so the application can tell the two paths apart. It
+/// is told Return with the Control key held, as the record said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_key_events() {
+    use kr_ipc::client::LocalClient;
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    use kr_protocol::input::{ConsoleKey, InputAcquireParams, InputAcquireResult, InputContent};
+    use kr_protocol::local::LocalClientKind;
+    use kr_protocol::scalars::{CanonicalSet, Nullable};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let hosted = worker_running(
+        &temp,
+        1,
+        "Write-Host 'kr-ready.'; \
+         $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown'); \
+         Write-Host ('kr-key:{0}:{1}:{2}:{3}' -f $key.VirtualKeyCode, [int]$key.Character, \
+         [bool]([int]$key.ControlKeyState -band 8), $key.KeyDown); \
+         Start-Sleep -Seconds 300",
+    )
+    .await;
+    let runtime = hosted.service.runtime();
+    common::retained_carrying(runtime, b"kr-ready.", 1, PATIENCE).await;
+    // The request is the first thing the console writes, so it has been through the engine and
+    // been recorded by the time the application says it is ready.
+    let seen = common::retained(runtime);
+    assert!(
+        seen.windows(b"\x1b[?9001h".len())
+            .any(|window| window == b"\x1b[?9001h"),
+        "the pseudo-console asked for key records: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    drop(runtime.session());
+
+    let mut client = LocalClient::connect(&hosted.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = kr_protocol::envelope::ActionTarget {
+        environment_id: hosted.environment_id,
+        session_id: Nullable::some(hosted.session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    let attached: SessionAttachResult = client
+        .mutate(
+            kr_protocol::method::Method::SessionAttach,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &SessionAttachParams {
+                session_id: hosted.session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("kalareach-companion".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    let attachment_id = attached.attachment.attachment_id;
+    let lease: InputAcquireResult = client
+        .mutate(
+            kr_protocol::method::Method::InputAcquire,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &InputAcquireParams {
+                session_id: hosted.session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("acquires")
+        .to_typed()
+        .expect("decodes");
+
+    // Ctrl and Return: virtual key 13, scan code 0x1c, the line feed the console makes of it.
+    client
+        .request(
+            kr_protocol::method::Method::InputWrite,
+            &kr_protocol::input::InputWriteParams {
+                session_id: hosted.session_id,
+                attachment_id,
+                epoch: lease.lease.epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                input: InputContent::ConsoleKeys {
+                    keys: vec![ConsoleKey {
+                        virtual_key: 0x0d,
+                        scan_code: 0x1c,
+                        unicode: 0x0a,
+                        key_down: true,
+                        control_keys: 0x0008,
+                        repeat: 1,
+                    }],
+                },
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the worker takes the key records");
+    let seen = common::retained_carrying(runtime, b"kr-key:", 1, PATIENCE).await;
+    let shown = String::from_utf8_lossy(&seen);
+    assert!(
+        shown.contains("kr-key:13:10:True:True"),
+        "the application was given Return, as a line feed, with Control held: {shown:?}"
+    );
 }

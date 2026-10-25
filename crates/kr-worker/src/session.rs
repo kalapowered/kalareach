@@ -503,15 +503,44 @@ impl Session {
     ///
     /// Returns an error when the terminal cannot be created. A journal that cannot be opened is
     /// recorded rather than fatal: an authorised stop must still work without one.
-    pub fn open(mut config: SessionConfig) -> Result<Self> {
+    pub fn open(config: SessionConfig) -> Result<Self> {
+        Self::open_with(
+            config,
+            if cfg!(windows) {
+                kr_term::policy::Backend::ConPty
+            } else {
+                kr_term::policy::Backend::UnixPty
+            },
+        )
+    }
+
+    /// As [`Self::open`], for a session whose terminal engine follows the policy of `backend`.
+    ///
+    /// A test on one platform runs the other platform's input branch with it: the engine records
+    /// the pseudo-console's request for key records, and the worker spells a client's key records
+    /// as that backend asked. Nothing else about the session changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::open`] returns.
+    #[cfg(feature = "testing")]
+    pub fn open_for_backend(
+        config: SessionConfig,
+        backend: kr_term::policy::Backend,
+    ) -> Result<Self> {
+        Self::open_with(config, backend)
+    }
+
+    fn open_with(mut config: SessionConfig, backend: kr_term::policy::Backend) -> Result<Self> {
         // The creation geometry is admitted here rather than only inside the terminal, so a
         // request that breaks more than one of section 8's three constraints is told about all of
         // them at once instead of one refusal at a time.
         crate::attachments::admit(config.dimensions)?;
         let pty = Pty::open(config.dimensions)?;
-        let engine = crate::projection::TerminalEngine::new(
+        let engine = crate::projection::TerminalEngine::for_backend(
             config.dimensions,
             Arc::clone(&config.time.continuous),
+            backend,
         )?;
         let mut history = match config.spool_directory.as_ref() {
             Some(directory) => {
@@ -3252,6 +3281,13 @@ impl Session {
         // correctly here and by nothing else. The recogniser is told after the batch is parsed,
         // which is the first moment the answer exists.
         self.set_bracketed_paste(self.engine.bracketed_paste());
+        // The same batch may have changed what the console's key records are spelled as: DEC mode 1,
+        // the keyboard protocol, or the backend's request for records. It is published beside the
+        // paste mode, before the batch is delivered, so a write that follows output a person has
+        // seen is spelled under the state that output set.
+        self.input
+            .lock()
+            .set_console_input(self.engine.console_input());
         // The same batch may have changed the keyboard negotiation, and whoever holds the keys has
         // to be able to produce whatever it changed to.
         self.reevaluate_lease();

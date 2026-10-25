@@ -1634,6 +1634,12 @@ impl Wired {
 
 /// Starts a worker service over its own local endpoint, with a real session behind it.
 async fn wired(script: &str) -> Wired {
+    wired_for(script, None).await
+}
+
+/// As [`wired`], for a session whose terminal engine follows the policy of `backend` when one is
+/// named: the other platform's input branch, on this one.
+async fn wired_for(script: &str, backend: Option<kr_term::policy::Backend>) -> Wired {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -1657,7 +1663,11 @@ async fn wired(script: &str) -> Wired {
         .expect("a controller identity");
     let boot_identity = boot.clone();
 
-    let mut session = Session::open(config).expect("opens the session");
+    let mut session = match backend {
+        None => Session::open(config),
+        Some(backend) => Session::open_for_backend(config, backend),
+    }
+    .expect("opens the session");
     session.launch().expect("launches the shell");
     let runtime = Arc::new(
         SessionRuntime::start(
@@ -1764,6 +1774,28 @@ async fn write_over(
     sequence: u64,
     bytes: &[u8],
 ) -> Result<InputWriteResult, kr_protocol::error::ProtocolError> {
+    write_content_over(
+        client,
+        wired,
+        attachment_id,
+        epoch,
+        sequence,
+        InputContent::Bytes {
+            bytes: Bytes::new(bytes.to_vec()),
+        },
+    )
+    .await
+}
+
+/// Writes bytes or key records over `client`.
+async fn write_content_over(
+    client: &mut Client<impl Codec>,
+    wired: &Wired,
+    attachment_id: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+    input: InputContent,
+) -> Result<InputWriteResult, kr_protocol::error::ProtocolError> {
     client
         .request(
             Method::InputWrite,
@@ -1772,9 +1804,7 @@ async fn write_over(
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(sequence),
-                input: InputContent::Bytes {
-                    bytes: Bytes::new(bytes.to_vec()),
-                },
+                input,
             },
         )
         .await
@@ -5212,6 +5242,276 @@ async fn a_forwarded_key_sent_after_a_forwarded_mutation_reaches_the_application
         kr_protocol::envelope::Outcome::Ok(_)
     ));
     proxied
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-08.53: key records, spelled by the worker for the terminal.
+// ---------------------------------------------------------------------------------------------
+
+/// A session that echoes what its terminal receives, with the input lease held by the companion's
+/// view, which can take the keys under every encoding the tests below negotiate.
+///
+/// The application puts the terminal into raw mode with the echo off and copies its input to its
+/// output, so the session's retained output is, in order, the bytes the application received.
+struct Typing {
+    wired: Wired,
+    client: LocalClient,
+    attachment: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+}
+
+impl Typing {
+    async fn start(backend: Option<kr_term::policy::Backend>) -> Self {
+        let wired = wired_for("stty raw -echo; printf 'kr-ready.'; exec cat", backend).await;
+        retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+        let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let attachment = attach_over(&mut client, &wired, Some("kalareach-companion")).await;
+        let lease = acquire_over(&mut client, &wired, attachment)
+            .await
+            .expect("acquires");
+        Self {
+            wired,
+            client,
+            attachment,
+            epoch: lease.lease.epoch,
+            sequence: 0,
+        }
+    }
+
+    /// Writes `input` at the next sequence number, which a refused write leaves where it was.
+    async fn write(
+        &mut self,
+        input: InputContent,
+    ) -> Result<InputWriteResult, kr_protocol::error::ProtocolError> {
+        let written = write_content_over(
+            &mut self.client,
+            &self.wired,
+            self.attachment,
+            self.epoch,
+            self.sequence,
+            input,
+        )
+        .await;
+        if written.is_ok() {
+            self.sequence += 1;
+        }
+        written
+    }
+
+    async fn bytes(&mut self, bytes: &[u8]) {
+        self.write(InputContent::Bytes {
+            bytes: Bytes::new(bytes.to_vec()),
+        })
+        .await
+        .expect("the bytes are accepted");
+    }
+
+    /// Has the application write `negotiation`, which changes what it reads its keys as, and then
+    /// `marker`. The marker is waited for, and the session is taken once so that the batch that
+    /// carried both has been through the engine and has published what it set.
+    async fn negotiates(&mut self, negotiation: &[u8], marker: &[u8]) {
+        let mut wrote = negotiation.to_vec();
+        wrote.extend_from_slice(marker);
+        self.bytes(&wrote).await;
+        retained_within(&self.wired.runtime, marker, LIVENESS_DEADLINE).await;
+        drop(self.wired.runtime.session());
+    }
+
+    /// Waits for `marker` and returns what the terminal received between `first` and it.
+    async fn received_between(&self, first: &[u8], marker: &[u8]) -> Vec<u8> {
+        let seen = retained_within(&self.wired.runtime, marker, LIVENESS_DEADLINE).await;
+        let from = seen
+            .windows(first.len())
+            .position(|window| window == first)
+            .expect("the first marker arrived")
+            + first.len();
+        let to = from
+            + seen[from..]
+                .windows(marker.len())
+                .position(|window| window == marker)
+                .expect("the last marker arrived");
+        seen[from..to].to_vec()
+    }
+}
+
+/// A key the console reported, from a virtual key and the character it made.
+fn console_key(virtual_key: u16, unicode: u16, key_down: bool) -> kr_protocol::input::ConsoleKey {
+    kr_protocol::input::ConsoleKey {
+        virtual_key,
+        scan_code: 0x1e,
+        unicode,
+        key_down,
+        control_keys: 0,
+        repeat: 1,
+    }
+}
+
+fn the_up_arrow() -> InputContent {
+    InputContent::ConsoleKeys {
+        keys: vec![console_key(0x26, 0, true), console_key(0x26, 0, false)],
+    }
+}
+
+/// KR-REQ-08.53: records written to a session whose backend never asked for them reach the
+/// terminal as the legacy input a terminal would have sent, with the arrows in the form the
+/// application's DEC mode 1 asks for; and while the application has negotiated an encoding that
+/// legacy input cannot express, the write is refused by name and nothing is written, and the same
+/// sequence number is accepted again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn key_records_reach_the_terminal_as_legacy_input_in_the_mode_the_application_set() {
+    let mut typing = Typing::start(None).await;
+
+    // The ordinary cursor keys, and a key coming up, which legacy input cannot say.
+    typing.bytes(b"kr-a.").await;
+    typing.write(the_up_arrow()).await.expect("accepted");
+    typing.bytes(b"kr-b.").await;
+    assert_eq!(typing.received_between(b"kr-a.", b"kr-b.").await, b"\x1b[A");
+
+    // Application cursor keys, which an application sets with DEC mode 1: the same key is SS3 A.
+    typing.negotiates(b"\x1b[?1h", b"kr-c.").await;
+    typing.write(the_up_arrow()).await.expect("accepted");
+    typing.bytes(b"kr-d.").await;
+    assert_eq!(typing.received_between(b"kr-c.", b"kr-d.").await, b"\x1bOA");
+
+    // And back: the mode the application last set is the mode a write is spelled in.
+    typing.negotiates(b"\x1b[?1l", b"kr-e.").await;
+    typing.write(the_up_arrow()).await.expect("accepted");
+    typing.bytes(b"kr-f.").await;
+    assert_eq!(typing.received_between(b"kr-e.", b"kr-f.").await, b"\x1b[A");
+
+    // modifyOtherKeys: Ctrl and I would reach the application as a tab, so the write is refused,
+    // whole, and the terminal receives nothing for it. The sequence number it asked for is the one
+    // the next write is accepted at.
+    typing.negotiates(b"\x1b[>4;2m", b"kr-g.").await;
+    let ctrl_i = InputContent::ConsoleKeys {
+        keys: vec![kr_protocol::input::ConsoleKey {
+            control_keys: 0x08,
+            ..console_key(0x49, 0x09, true)
+        }],
+    };
+    let refused = typing.write(ctrl_i.clone()).await.expect_err("refused");
+    assert_eq!(refused.code, ErrorCode::InputIncompatible);
+    typing.bytes(b"kr-h.").await;
+    assert_eq!(
+        typing.received_between(b"kr-g.", b"kr-h.").await,
+        b"",
+        "nothing of the refused write reached the terminal"
+    );
+
+    // Back to the ordinary encoding, the same write is accepted and spelled.
+    typing.negotiates(b"\x1b[>4;0m", b"kr-i.").await;
+    typing.write(ctrl_i).await.expect("accepted");
+    typing.bytes(b"kr-j.").await;
+    assert_eq!(typing.received_between(b"kr-i.", b"kr-j.").await, b"\t");
+
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-08.53: records written to a session whose backend asked for them are spelled in the
+/// documented `CSI Vk;Sc;Uc;Kd;Cs;Rc _` sequence with every field, a key coming up and the scan
+/// code the console gave included; and legacy again once the backend turns the mode off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the real pseudo-console case is in windows.rs; this one runs the pseudo-console's policy on an engine whose terminal is not one"
+)]
+async fn key_records_reach_the_terminal_as_records_while_the_backend_asks_for_them() {
+    let mut typing = Typing::start(Some(kr_term::policy::Backend::ConPty)).await;
+    let a = [
+        console_key(0x41, u16::from(b'a'), true),
+        console_key(0x41, u16::from(b'a'), false),
+    ];
+    let keys = || InputContent::ConsoleKeys { keys: a.to_vec() };
+
+    // Until the backend asks, the engine is at legacy input.
+    typing.bytes(b"kr-a.").await;
+    typing.write(keys()).await.expect("accepted");
+    typing.bytes(b"kr-b.").await;
+    assert_eq!(typing.received_between(b"kr-a.", b"kr-b.").await, b"a");
+
+    // The backend asks for win32 input mode, as a pseudo-console does.
+    typing.negotiates(b"\x1b[?9001h", b"kr-c.").await;
+    typing.write(keys()).await.expect("accepted");
+    typing.bytes(b"kr-d.").await;
+    assert_eq!(
+        typing.received_between(b"kr-c.", b"kr-d.").await,
+        b"\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_",
+        "every field, the scan code and the release included"
+    );
+
+    // And turns it off again.
+    typing.negotiates(b"\x1b[?9001l", b"kr-e.").await;
+    typing.write(keys()).await.expect("accepted");
+    typing.bytes(b"kr-f.").await;
+    assert_eq!(typing.received_between(b"kr-e.", b"kr-f.").await, b"a");
+
+    typing
+        .wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-08.53: bytes and key records on one lease are one ordered stream, and a write refused for
+/// the size of what it spells takes no sequence number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and is the other backend; the real pseudo-console case is in windows.rs"
+)]
+async fn bytes_and_key_records_share_one_stream_and_a_refused_write_spends_no_number() {
+    let mut typing = Typing::start(None).await;
+
+    typing.bytes(b"kr-a.").await;
+    typing.bytes(b"x").await;
+    let a_down = InputContent::ConsoleKeys {
+        keys: vec![console_key(0x41, u16::from(b'a'), true)],
+    };
+    typing.write(a_down).await.expect("accepted");
+    typing.bytes(b"y").await;
+    typing.bytes(b"kr-b.").await;
+    assert_eq!(
+        typing.received_between(b"kr-a.", b"kr-b.").await,
+        b"xay",
+        "the three writes arrived in the order they were made"
+    );
+
+    // One record that repeats as many times as a record can spells more than an input frame may
+    // carry. It is refused for its size, and the sequence number it asked for is accepted next.
+    let held = InputContent::ConsoleKeys {
+        keys: vec![kr_protocol::input::ConsoleKey {
+            repeat: u16::MAX,
+            ..console_key(0x26, 0, true)
+        }],
+    };
+    let refused = typing.write(held).await.expect_err("too long");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    typing.bytes(b"kr-c.").await;
+    assert_eq!(
+        typing.received_between(b"kr-b.", b"kr-c.").await,
+        b"",
+        "nothing of the refused write reached the terminal"
+    );
+
+    typing
         .wired
         .runtime
         .close(ClosureReason::CloseRequested)
