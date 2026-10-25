@@ -1740,7 +1740,8 @@ impl Controller {
                 // as it is. Nothing reads it afterwards either: writing the closure removes the
                 // worker row and retires the descriptor, so the closure carries the fact itself,
                 // and a session whose closure names a worker this host never saw end is refused
-                // every archive read rather than served an incomplete one.
+                // every archive read, rather than served an incomplete one, until the process its
+                // launch ran is shown to have ended.
                 let archive = self.archive();
                 let ownership = archive.take_ownership(
                     row.session_id,
@@ -2088,12 +2089,16 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
     let now_ms = kr_ipc::now_ms();
     let privacy = Arc::clone(&seen.privacy);
     // The record learns which workers have ended before the archive is asked to settle them.
-    let seen = tokio::task::spawn_blocking(move || {
+    let Ok(seen) = tokio::task::spawn_blocking(move || {
         seen.record(now_ms);
         seen
     })
     .await
-    .ok()?;
+    else {
+        // The record's pass stopped before it could say what it learned. The daemon is still here,
+        // so the tick goes on and the next pass learns it again.
+        return Some(false);
+    };
     daemon.upgrade()?.remove_closed_content().await;
     let (notices, dormant) = tokio::task::spawn_blocking(move || {
         let _ = seen.privacy.tick(now_ms);

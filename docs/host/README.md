@@ -4690,16 +4690,19 @@ time, until it answers that its cleanup is complete, and only that answer ends i
 session whose worker ended first has nobody to tell, so the archive removes what it retained, under
 the session's recovery ownership: the retained output and its time index, through the removal a
 worker makes, which publishes where the output had reached, and the content of the receipts that
-have settled, which keep their identity, state and digests. Receipts that have not settled keep
-their intent. The obligation ends only when nothing is left. A removal that leaves something is
-reported as unavailable with the reason, and is tried again on a schedule that lengthens, across a
-restart. So is a removal that could not start: another recovery holds the session, or a worker may
-still own its stores. Removals run one at a time, so a change that answers while the tick is
-removing waits for it and reports what is left after it. While the obligation stands, `history.page`, `history.times` and `action.read` of that
-session are refused with `RESOURCE_UNAVAILABLE`. Once the output is removed they answer a gap with
-no bytes. A page that was read before privacy mode was turned on, and has not yet been written to
-the reader when it is, is written without its bytes, as a range that is gone. `privacy.set` runs the
-removal before it answers, so the answer says where it stands.
+have settled, which keep their identity, state and digests. A receipt that has not settled is
+settled first, as a collection pass settles it (a dispatch with no outcome becomes unknown, and an
+accepted intent that was never dispatched is rejected), and then loses its content too, because no
+worker is left to retry it. The obligation ends only when nothing is left. A removal that leaves
+something is reported as unavailable with the reason, and is tried again on a schedule that
+lengthens, across a restart. So is a removal that could not start: another recovery holds the
+session, or a worker may still own its stores. Removals run one at a time, so a change that answers
+while the tick is removing waits for it and reports what is left after it. While the obligation
+stands, `history.page`, `history.times` and `action.read` of that session are refused with
+`RESOURCE_UNAVAILABLE`. Once the output is removed they answer a gap with no bytes. A page that was
+read before privacy mode was turned on, and has not yet been written to the reader when it is, is
+written without its bytes, as a range that is gone. `privacy.set` runs the removal before it
+answers, so the answer says where it stands.
 
 Creating a new session in privacy mode doesn't wait for a tick. The daemon records the new session's
 obligation before it asks for the worker. That write waits for whatever holds the record, a change
@@ -4900,9 +4903,10 @@ ciphertext of a generation whose descriptor was never published is not deletable
 no deletion of such objects, the entry's kind says so, and a person who wants that copy removed asks
 the service that holds it. A notification a provider queued is listed and is not deletable, because
 this host holds no way to ask the provider to forget it. Backup does not silently delete unrelated
-collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical cleanup of this host's own
-records rather than a claim of physical secure erase: the files are unlinked and the rows are
-cleared, and nothing here says the bytes are unrecoverable from the device they were on.
+collections and does not claim a copy somebody else holds can be recalled. Local deletion is logical
+cleanup of this host's own records rather than a claim of physical secure erase: the files are
+unlinked and the rows are cleared, and nothing here says the bytes are unrecoverable from the device
+they were on.
 
 `privacy.retained.delete` is the separately authorised action that asks the service to delete one of
 those copies. It is its own call, apart from turning privacy mode on. It is served on the owner's

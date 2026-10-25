@@ -1158,10 +1158,11 @@ those created after privacy mode is on, and those that have not yet been cleaned
 mode was turned off (you can list these sessions using `kr privacy status`). If the worker of one of
 these sessions ended before it could complete the cleanup, it stays on the list, even after you turn
 off privacy mode, until the daemon has removed what it kept. The daemon does that when privacy mode
-is turned on, and tries again when it cannot; `kr privacy status` gives the reason. There is no other reason why a
-session would be private. Turning privacy mode off starts new retention from that point, so a
-session that went through a private period but does not owe anything to it anymore is exported, and
-so is a session that was created when privacy mode was on but has completed its cleanup.
+is turned on, and tries again when it cannot; `kr privacy status` gives the reason. There is no
+other reason why a session would be private. Turning privacy mode off starts new retention from that
+point, so a session that went through a private period but does not owe anything to it anymore is
+exported, and so is a session that was created when privacy mode was on but has completed its
+cleanup.
 
 This first reads whether the host is in privacy mode, then reads the sessions, and then reads
 whether the host is in privacy mode again. If the host is in privacy mode at either read, or if the
@@ -1911,18 +1912,17 @@ whose worker has not yet said its own cleanup is complete. `kr privacy off` is r
 service of this host or a session whose worker is running or still starting owes cleanup, and says
 what. A session whose worker has ended does not hold it back, because nothing resumes in its store;
 its obligation stays recorded, and `kr privacy status` keeps reporting it, until the daemon has
-removed what the session kept. Nothing privacy mode
-removed comes back when it is turned off.
+removed what the session kept. Nothing privacy mode removed comes back when it is turned off.
 
 Use `kr privacy status` to also show what data will be retained on this host while in privacy mode
 (and why), and what has left this host (backup archives and notifications, each with whether this
 host holds any way to ask for its removal, and for a copy it can, the command that asks). This
-command does not change anything. Other devices
-paired with this host that are granted `host.manage` can read the same report, but no device can
-enable or disable privacy mode. Other devices that are not granted `host.manage` will see only
-whether the host is in privacy mode, what generation it is at, and whether the host indicates it is
-changing privacy mode, as part of `host.info`. For more information on what each step does, and what
-privacy mode does not affect, see `docs/host/README.md`.
+command does not change anything. Other devices paired with this host that are granted `host.manage`
+can read the same report, but no device can enable or disable privacy mode. Other devices that are
+not granted `host.manage` will see only whether the host is in privacy mode, what generation it is
+at, and whether the host indicates it is changing privacy mode, as part of `host.info`. For more
+information on what each step does, and what privacy mode does not affect, see
+`docs/host/README.md`.
 
 `kr privacy delete <reference>` asks the storage service to delete one backup generation that
 `kr privacy status` lists as deletable. Write the reference as the status shows it, for example

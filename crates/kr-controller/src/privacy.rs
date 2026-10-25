@@ -845,6 +845,9 @@ impl EnvironmentPrivacy {
         }
         for progress in inner.sessions.values_mut() {
             progress.notices = Backoff::default();
+            // An enabling starts the removal of what an ended worker retained afresh: the last
+            // refusal, which an earlier enabling left, does not put this one off.
+            progress.removal.retry = Backoff::default();
         }
         self.apply(&mut inner, &Subsystem::ALL, now_ms);
         Ok(self.report(&inner, now_ms))

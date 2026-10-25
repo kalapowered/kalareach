@@ -976,9 +976,10 @@ impl ArchiveService {
     /// so the archive does the same two removals on its stores, with the worker's own functions:
     /// the output goes through the history that publishes the boundary first, so a reader is told
     /// where the output had reached and which range is gone, and the settled receipts keep their
-    /// identity, state and digests and lose the intent envelope and the result. The envelope of an
-    /// action that has not settled stays, as it does in a worker: recovery reads it. The time
-    /// index goes with the output it describes.
+    /// identity, state and digests and lose the intent envelope and the result. An action that had
+    /// not settled is settled first, by the recovery a collection pass runs, because no worker is
+    /// left to read its envelope, and the receipt it leaves loses its content with the rest. The
+    /// time index goes with the output it describes.
     ///
     /// Each store's failure is reported in [`Removed::left_behind`] and does not stop the other.
     /// A removal that left something is not one the caller may call done.
@@ -1003,7 +1004,8 @@ impl ArchiveService {
         Ok(removed)
     }
 
-    /// Takes the content out of the receipts that have settled.
+    /// Takes the content out of the receipts: those that have settled, and those that recovery
+    /// settles first.
     fn remove_receipt_content(&self, session_id: SessionId, into: &mut Removed) {
         let path = self.paths.journal_database(session_id);
         match path.try_exists() {
@@ -1017,8 +1019,10 @@ impl ArchiveService {
                 return;
             }
         }
-        match Journal::open_existing(&path).and_then(|mut journal| journal.redact_settled_content())
-        {
+        match Journal::open_existing(&path).and_then(|mut journal| {
+            recover_open(&mut journal)?;
+            journal.redact_settled_content()
+        }) {
             Ok(records) => into.receipts = records,
             Err(error) => into.left_behind.push(format!(
                 "this session's receipts could not have their content removed: {error}"

@@ -48,8 +48,10 @@ fn actor() -> ActorId {
     kr_protocol::sharing::local_actor(u64::from(rustix::process::getuid().as_raw()))
 }
 
-/// A closed session as its worker left it: a journal that holds the summary, the closure and one
-/// settled receipt with a result, and, with `spool`, sixteen bytes of retained output.
+/// A closed session as its worker left it: a journal that holds the summary, the closure, one
+/// settled receipt with a result and two that had not settled when the worker ended (one accepted
+/// and never dispatched, one dispatched with no outcome recorded), and, with `spool`, sixteen bytes
+/// of retained output.
 fn plant(host: &Host, spool: bool) -> SessionId {
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let archive = ArchiveService::new(host.tree().environment());
@@ -78,6 +80,13 @@ fn plant(host: &Host, spool: bool) -> SessionId {
                 kr_ipc::now_ms(),
             )
             .expect("the receipt settles with a result");
+        let never_dispatched = submission_numbered(8);
+        journal.accept(&never_dispatched).expect("a receipt");
+        let no_outcome = submission_numbered(9);
+        journal.accept(&no_outcome).expect("a receipt");
+        journal
+            .mark_dispatching(actor(), no_outcome.action_id, kr_ipc::now_ms())
+            .expect("the dispatch is marked");
     }
     if spool {
         let mut history = kr_worker::history::OutputHistory::with_spool(
@@ -187,17 +196,39 @@ fn summary(session_id: SessionId) -> kr_protocol::session::SessionSummary {
 }
 
 fn submission() -> Submission {
+    submission_numbered(7)
+}
+
+fn submission_numbered(number: u8) -> Submission {
     Submission {
         actor_id: actor(),
-        action_id: kr_worker::journal::action_id_from([7; 16]),
+        action_id: kr_worker::journal::action_id_from([number; 16]),
         method: Method::SessionClose.into(),
         method_version: kr_protocol::method::MethodVersion::V1,
-        payload_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
-        subject_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([number; 32]),
+        subject_digest: kr_protocol::scalars::Digest256::from_bytes([number; 32]),
         intent: vec![0xa0],
         accepted_deadline_ms: Some(TimestampMs::new(kr_ipc::now_ms().get() + 120_000)),
         now_ms: kr_ipc::now_ms(),
     }
+}
+
+/// What a session's journal holds of its receipts: how many still carry the intent the caller sent,
+/// and how many have not settled.
+fn receipts_holding(host: &Host, session_id: SessionId) -> (i64, i64) {
+    let path = ArchiveService::new(host.tree().environment())
+        .paths()
+        .journal_database(session_id);
+    let journal = rusqlite::Connection::open(path).expect("the journal");
+    let count = |query: &str| {
+        journal
+            .query_row(query, [], |row| row.get::<_, i64>(0))
+            .expect("a count")
+    };
+    (
+        count("SELECT COUNT(*) FROM receipts WHERE intent IS NOT NULL"),
+        count("SELECT COUNT(*) FROM receipts WHERE state IN ('accepted', 'dispatching')"),
+    )
 }
 
 /// The segments a session's spool holds.
@@ -325,6 +356,11 @@ async fn turning_privacy_mode_on_removes_what_a_closed_session_retained() {
         "and the receipt's result"
     );
     assert!(!segments(&host, with_output).is_empty());
+    assert_eq!(
+        receipts_holding(&host, with_output),
+        (3, 2),
+        "the control: every receipt carries its intent, and two have not settled"
+    );
 
     let report = set(&mut client, &host, true).await;
     assert!(report.enabled);
@@ -346,6 +382,12 @@ async fn turning_privacy_mode_on_removes_what_a_closed_session_retained() {
         let read = receipt(&mut client, session_id).await.expect("a receipt");
         assert_eq!(read.receipt.state, ReceiptState::Applied, "its state stays");
         assert!(read.result.0.is_none(), "and its result is gone");
+        assert_eq!(
+            receipts_holding(&host, session_id),
+            (0, 0),
+            "no worker is left to retry an action that had not settled, so recovery settles it and \
+             no receipt keeps the intent the caller sent"
+        );
     }
     let after = page(&mut client, with_output).await.expect("a page");
     assert!(after.bytes.as_slice().is_empty(), "no byte is served");
