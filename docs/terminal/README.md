@@ -557,9 +557,9 @@ Each place the worker attributes input says what a reply does there:
 | An open paste | Waits for it and takes no lease | `terminal.rs`, `reply_lane.rs` |
 | The replies' share of the queue | Is charged what the replies hold and nothing a takeover left | `input_domain.rs`, `the_keystrokes_a_takeover_left_behind_do_not_spend_the_answers_share` |
 | The lease's byte count and the count a takeover discards | Is in neither, and is not discarded | `reply_lane.rs`, `a_takeover_counts_the_holders_keystrokes_and_leaves_the_hosts_answer_alone` |
-| The receipt of `input.write` | Is in neither `forwarded_bytes` nor `held_prefix_bytes` | `reply_lane.rs`, `a_writes_receipt_counts_its_own_bytes_and_not_the_answers_queued_beside_them` |
+| The receipt of `input.write` | Is in neither `forwarded_bytes` nor `held_prefix_bytes`: they count what the recogniser returned for that write | None; no state shows a reply in a receipt |
 | The writer's check of a lease epoch and an authority deadline | Has none to be checked against, so it is written | The batch has no such field |
-| Input held for a reader transition, and the `editor_busy` event's `released_input_bytes` | Revokes a reserved launch and releases the person's held keys; the count is those keys, under the holder's attachment and epoch | `fence/driver.rs`, `an_answer_that_revokes_a_launch_releases_the_keys_a_person_typed_and_counts_only_them` |
+| Input held for a reader transition, and the `editor_busy` event's `released_input_bytes` | Revokes a reserved launch and releases the person's held keys; the count is those keys, under the holder's attachment and epoch | `fence.rs`, `a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused` |
 | The root editor's launch and fence | Revokes the launch and invalidates the fence | `fence.rs`, KR-REQ-08.49 |
 | The origin of an accepted line | A line accepted on a fence the answer took away is unverifiable; one accepted on a fence proved again after the answer is judged on that fence | `fence/driver.rs`, `a_line_accepted_after_an_answer_is_attributed_only_on_a_fence_proved_after_it` |
 | The process-activity mark | Is a hint to process supervision, set once for each look, and not a record of a person's activity, so there is nothing to attribute | None |
@@ -1633,7 +1633,7 @@ with `kr-term-probe`.
 | `admission.json` | The geometries the budget admits and refuses, and the footprint each one reserves, the same on every supported host | KR-REQ-08.71, KR-REQ-08.79 |
 | `profile.json` | What kr-vt/1 advertises, what it refuses, the identity bytes, and the library record | KR-REQ-08.10, KR-REQ-04.02, KR-REQ-04.24 |
 | `terminfo-xterm-256color.json` | The pinned database and the class of every advertised capability | KR-REQ-08.11, KR-REQ-08.35 |
-| `input-encodings.json` | The console's key records and the bytes the win32 input mode encodes each as, written by hand, with the encoder checked against them | KR-REQ-08.52, KR-REQ-08.56 |
+| `input-encodings.json` | The console's key records and the bytes the win32 input mode encodes each as, written by hand; `tests/win32_input.rs` checks the encoder against them | KR-REQ-08.52, KR-REQ-08.56 |
 | `client-encodings.json` | The bytes the client's input encoder spells a key as under the ordinary encoding, `modifyOtherKeys` and the Kitty protocol, written by hand from xterm's documentation and the protocol's specification. `crates/kr-client/tests/encoder_vectors.rs` checks the encoder against them; a vector made from the encoder's own output would compare it with itself | KR-REQ-08.59 |
 | `projection.json` | What the client renders from a projection, written by hand | KR-REQ-08.40, KR-ACC-023 |
 | `physical/*.json` | One physical terminal build's cursor answers to the probe corpus, beside the grid's | KR-REQ-08.03 |
@@ -1672,7 +1672,7 @@ seed: a seeded xorshift64\* picks up to 40 atoms from these:
   embedded C0 bytes, parameters of 300 digits, and 7-bit and 8-bit introducers;
 - OSC (with 52, 8 and 133 among the selectors), DCS, APC, PM and SOS strings ended by BEL, ST, CAN,
   SUB, a raw 0x9C, ESC and another byte, or nothing;
-- tmux envelopes with doubled escapes nested to depth seven, where the bound is four;
+- tmux envelopes with doubled escapes nested to depth seven, where the bound is four (a small share of the envelopes reach past it);
 - queries, side effects (OSC 52, 9, 99 and 777, and BEL) and graphics strings, each tagged by the
   generator with what it is, from its own tables and not from the class table.
 
@@ -1685,10 +1685,10 @@ with queries in the tail, and a flood of 70,000 queries.
 | --- | --- |
 | 1. The forwarded bytes lie only in events the lexer calls display or mode with the disposition forward | Yes |
 | 2. The forwarded stream, lexed again, gives only forwardable events, and a new engine forwards all of it and asks and does nothing | Yes |
-| 3. The forwarded bytes are valid UTF-8, hold no C1 scalar, and a forwarded control string holds no control byte but its terminator, by a scan that reads neither the lexer nor the class table | Yes |
+| 3. The forwarded bytes are valid UTF-8, hold no C1 scalar, hold no ENQ, BEL or `ESC Z` outside a string and no question a control sequence can ask (a device or status report, a mode report, `CSI > q`, `CSI ? u`, `CSI ? m`, a window report), and a forwarded control string is an operating system command that neither acts (OSC 9, 52, 99, 777) nor asks (a bare `?` part) and holds no control byte but its terminator, by a scan that reads neither the lexer nor the class table | Yes |
 | 4. A tagged atom the lexer frames as one event is never forwarded, a query is answered where it stood, a side effect happens or is refused, and graphics produce nothing | Yes |
 | 5. Where a read is cut changes nothing: the screen, the forwarded bytes, the side effects, the replies and the first projection | No |
-| 6. The events cover the stream without overlap, a tmux envelope's inner events counted once | No |
+| 6. The events cover the stream once, an event of the outer stream counted as it is and a tmux envelope's inner events counted once; only an empty envelope, which makes no event, leaves bytes unclaimed | No |
 | 7. The engine is on ground after `close`, the grid library wrote nothing, the lane holds its bound, and a flood is reported, forwards no query and forwards its text | No |
 | 8. Nothing in a control string past its bound acts, and exactly the queries outside the string are answered | Yes |
 
@@ -1697,13 +1697,15 @@ not produce, with a query, a clipboard write, a raw C1 control, an encoded C1 sc
 string with a control byte in it, and each is named. `KR_FUZZ_STREAMS` sets how many seeds a run
 takes (1,000 by default, from zero). A failing stream is its seed, and the failure prints its bytes.
 
-At the base this found two defects, both in invariant 5. A text run read after a raw C1 byte
-carried the byte's flag when a read ended before the next scalar, so whether the text was forwarded
-depended on where reads ended; the flag now belongs to the sequence that was pending and is cleared
-when it is read. Reading a cell through the grid library's accessor by position converted a line
-held in its compact form into one cell per column, and the two forms keep a blank past the end of the
-text differently, so the screen differed with the read; the cell is now read without changing the
-line. Invariants 1 to 4, 6 to 8 held for every stream.
+The generator found two defects, both fixed. A text run read after a raw C1 byte carried the byte's
+flag when a read ended before the next scalar, so whether the text was forwarded depended on where
+reads ended, and a flood of queries that followed an 8-bit one lost its text; the flag now belongs to
+the sequence that was pending and is cleared when it is read. Reading a cell through the grid
+library's accessor by position converted a line held in its compact form into one cell per column,
+and the two forms keep a blank past the end of the text differently, so the screen differed with the
+read; the cell is now read from the line as it is. A blank printed past the end of a compact line is
+implicit there, and a combining mark that follows it joins the blank all the same. The other
+invariants held for every stream.
 
 What the generator reaches: bytes into one engine on an 80 by 24 or a 7 by 4 grid, at one reading of
 the clock, with no resize, no change of lease and no second client. That covers the lexer, the
