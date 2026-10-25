@@ -37,7 +37,7 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_DENIED_ACE, ACCESS_DENIED_ACE_TYPE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    ACCESS_DENIED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -52,6 +52,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
 };
