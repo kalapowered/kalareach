@@ -10,7 +10,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.06 | the thread a success reply to a selecting request names is the instance's binding, the revision advances only when the thread changed, and rich mutations resume; they wait while a selection is in flight and after one whose outcome is unknown, an older reply never restores a conversation the terminal left, a conversation another execution owns is never published, a turn or a leave about another thread changes nothing, replies are applied in the order their requests were admitted once none is in flight (a success whose newer request is then refused is the binding; a leave of another conversation does not hide an older selection; a leave of the bound conversation survives a newer request that is refused), a notification that closes a conversation a kept reply selected, or reports a turn in it, leaves the terminal's conversation unknown instead of letting the reply restore it; and a request given up at its deadline keeps the instance suspended until a selection names the conversation |
-//! | KR-REQ-12.04 | a prompt, a steer or a cancellation admitted before a turn began or ended is stopped at its take, which reads the turn again; a turn reported in a conversation a kept reply selected is not taken without that reply being weighed |
+//! | KR-REQ-12.04 | a prompt, a steer or a cancellation admitted before a turn began or ended is stopped at its take, which reads the turn again; a turn reported in a conversation a kept reply selected is not taken without that reply being weighed; what the stream says of the conversation and the turn is recorded as history under the revision and the turn it was seen under, a turn the binding leaves running as dropped under the revision it ran in |
 //! | KR-REQ-11.30 | an unlisted frame keeps rich mutations suspended until a selection admitted after it has named the thread and every unlisted request before that has been answered |
 //! | KR-REQ-12.08 | a gateway connection's capability evidence says what its tables let a client do, follows each change of binding, and ends with the connection |
 //! | KR-REQ-11.33 | a request the connector's table answers as a response is interpreted under the binding's trust; the server's own word that it was answered settles what nobody answered and leaves an answer that is being written to its writer; an answer admitted before its decoder's authority was withdrawn is stopped at its take, and one admitted before a fault finishes |
@@ -2507,4 +2507,129 @@ async fn kr_req_11_33_an_answer_admitted_before_its_authority_was_withdrawn_is_s
     let written = world.server_reads().await;
     assert_eq!(written["id"], "approval-1");
     assert_eq!(written["result"]["decision"], "accept");
+}
+
+impl World {
+    /// What the instance's history holds, oldest first: the kind, the text, the binding revision
+    /// each entry was observed under and the turn it names.
+    fn history(&self) -> Vec<(String, String, u64, Option<String>)> {
+        self.broker
+            .replay(
+                instance(),
+                None,
+                &kr_worker::broker::GrantLowerBound {
+                    from: kr_protocol::ids::StreamCursor::new(1),
+                },
+                kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES,
+            )
+            .expect("the history replays")
+            .entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.kind,
+                    entry.text,
+                    entry.binding_revision.get(),
+                    entry.turn_id.0.map(|turn| turn.to_string()),
+                )
+            })
+            .collect()
+    }
+}
+
+/// KR-REQ-12.04: what a gateway-served terminal's stream says about its conversation and its turn
+/// is recorded as history, each entry under the binding revision and the turn it was seen under,
+/// so a reader later knows which owner and which turn it belongs to whatever the binding has moved
+/// on to. A turn the binding left running is recorded under the revision it ran in, and a message
+/// about a conversation the terminal is not in records nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_04_what_the_stream_says_of_the_conversation_and_the_turn_is_recorded_under_them()
+{
+    let world = World::new(1 << 20);
+    assert_eq!(world.history(), []);
+    let before = world.revision();
+    let entry = |kind: &str, text: &str, revision: u64, turn: Option<&str>| {
+        (
+            kind.to_owned(),
+            text.to_owned(),
+            revision,
+            turn.map(str::to_owned),
+        )
+    };
+
+    // A conversation selected, and a turn run in it.
+    let selecting = world.terminal_asks(START).await;
+    world.server_answers(&selecting, &named("thread-1")).await;
+    let one = before + 1;
+    world
+        .server_says(&turn_event("turn/started", "thread-other", "turn-x"))
+        .await;
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-1"))
+        .await;
+    world
+        .server_says(&turn_event("turn/completed", "thread-1", "turn-0"))
+        .await;
+    world
+        .server_says(&turn_event("turn/completed", "thread-1", "turn-1"))
+        .await;
+    assert_eq!(
+        world.history(),
+        [
+            entry("thread.started", "thread-1", one, None),
+            entry("turn.started", "turn-1", one, Some("turn-1")),
+            entry("turn.ended", "turn-1", one, Some("turn-1")),
+        ]
+    );
+
+    // A turn still running when the terminal resumes another conversation was the old owner's:
+    // it is recorded as dropped under the revision it ran in, before the binding moves.
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-2"))
+        .await;
+    let resuming = world.terminal_asks(RESUME).await;
+    world.server_answers(&resuming, &named("thread-2")).await;
+    let two = one + 1;
+    assert_eq!(
+        world.history()[3..],
+        [
+            entry("turn.started", "turn-2", one, Some("turn-2")),
+            entry("turn.dropped", "turn-2", one, Some("turn-2")),
+            entry("thread.started", "thread-2", two, None),
+        ]
+    );
+
+    // The server closes a conversation the terminal is not in, and then the one it is in.
+    world
+        .server_says(r#"{"method":"thread/closed","params":{"threadId":"thread-other"}}"#)
+        .await;
+    assert_eq!(
+        world.history().len(),
+        6,
+        "another conversation's end is not ours"
+    );
+    world
+        .server_says(r#"{"method":"thread/closed","params":{"threadId":"thread-2"}}"#)
+        .await;
+    let three = two + 1;
+    assert_eq!(
+        world.history()[6..],
+        [entry("thread.ended", "thread-2", three, None)]
+    );
+
+    // The terminal leaves a conversation by its own request.
+    let selecting = world.terminal_asks(RESUME).await;
+    world.server_answers(&selecting, &named("thread-2")).await;
+    let four = three + 1;
+    let leaving = world
+        .terminal_asks(r#"{"id":4,"method":"thread/unsubscribe","params":{"threadId":"thread-2"}}"#)
+        .await;
+    world.server_answers(&leaving, r#""result":{}"#).await;
+    assert_eq!(
+        world.history()[7..],
+        [
+            entry("thread.started", "thread-2", four, None),
+            entry("thread.ended", "thread-2", four + 1, None),
+        ]
+    );
 }
