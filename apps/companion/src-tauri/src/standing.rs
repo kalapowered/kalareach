@@ -274,7 +274,8 @@ impl Dial {
                 return Err(Failure::Refused(refusal));
             }
             Ok(Err(other)) => {
-                // An account that left ended the connection, and says so.
+                // This device ended the connection, because the account left or the keeper holds
+                // no lease the host took, and says so.
                 let words = session
                     .transport()
                     .ended_by_this_device()

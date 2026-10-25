@@ -1387,8 +1387,12 @@ again with `Presentation::IfDue`, which sends nothing until the lease the host h
 replaced and then asks the service for a new one, because nothing refreshes the lease of a host that
 is not in use and the host refuses a connection once the lease it holds has ended; a presentation is
 an action the host records and never removes, so one at each use would write a row on the host for
-each. A renewal that cannot be had while the lease the host holds still lasts is no failure of the
-connection. A host that refuses a read on such a connection as not permitted may have lost the lease
+each. A renewal that does not come off is no failure of the connection while the lease the host
+holds still lasts: the service did not answer, the chain of keys could not be read, or the host
+refused the new lease for a cause the keeper waits out (`not_yet_valid`, `clock_untrusted`,
+`issued_before_activation`). The keeper keeps the lease the host took until the host takes the new
+one, and sends nothing, to the service or to the host, until what the failure held against the
+service is over. A host that refuses a read on such a connection as not permitted may have lost the lease
 before this device's clock said it was due, and the inbox presents the lease the device holds
 (`Presentation::First`, which asks for a new one if the host refuses it) and reads once more, when
 the refusal says the host holds no lease it will answer under (`organisation::lease_is_refused`), and
@@ -1414,7 +1418,8 @@ all connections of that kind, and each ends at once when the account signs out, 
 signs in, or the same account signs in again; none is opened while no account is signed in (an account store that cannot be read is told as `Unreachable`, whose words name the organisation's service though the cause is on the device). The
 end is decided from the status the account publishes, asked at every send and at every frame read,
 so a call made after a sign-out has returned reaches nothing and a frame read after it is not
-handed on. The reason (`SignIn` or `AccountChanged`) is kept before the connection is closed, and
+handed on. The reason is kept before the connection is closed: `SignIn` or `AccountChanged` for the
+account, and for a connection that presents no lease of its own, the keeper's stop (below).
 `ControlTransport::ended_by_this_device` gives it to whoever finds the connection closed: the
 application's connection state, a link's `reconnecting`, a terminal view's ending, the inbox's
 refusal and the push run's stop. A pass of the inbox asks once, at its end, whether its connection
@@ -1425,10 +1430,13 @@ own refusal of the list does that. A connection that presents no lease of its ow
 serves the person only while the keeper of its sign-in holds a lease the host took
 (`LeaseKeeper::took_a_lease`): the host binds a device to the first account that presents a lease,
 so a link opened after a switch to an account whose lease the host refuses is ended with the
-keeper's held stop and not served on the lease of the account before. A link opened before the
+keeper's held stop and not served on the lease of the account before. Such a link ends with the
+stop the keeper holds against the service for as long as it holds one (`NotAMember`, `Refused`,
+`TokenRefused`, `Unusable`, `Unreachable` or `Later`). With none held it ends with
+`LeaseStop::Presenting`, whose words say the device is still presenting its lease: before the
 application's connection has had the host take the lease of a new sign-in (after a start, a sign-in
-or a switch) is ended with `LeaseStop::Presenting`, whose words say the device is still presenting
-its lease, and opens again once the host has taken it. The binding hears what the account object
+or a switch), and once a held stop's time has run out, though the host may still refuse the lease.
+It opens again once the host has taken the lease. The binding hears what the account object
 publishes. A change another process of the application makes in the shared store of a desktop, and
 one whose status could not be read when it was published, are not heard: the old account's sessions
 then end at the keeper's next request, and at the latest when the lease ends, up to fifteen minutes.
