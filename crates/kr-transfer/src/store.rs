@@ -1492,7 +1492,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::DraftConflict`] for a draft written for another application,
+    /// Returns [`TransferError::DraftConflict`] for a draft written for another application and for
+    /// one whose attachment is being offered to the agent,
     /// [`TransferError::InvalidArgument`] for each other refusal above,
     /// [`TransferError::SessionEnded`] when the session has ended, and
     /// [`TransferError::StoreUnavailable`] when the write fails.
