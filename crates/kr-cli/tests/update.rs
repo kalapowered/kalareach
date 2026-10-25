@@ -1668,9 +1668,9 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
             "the process that holds the environment nothing answers for is named: {said}"
         );
     }
-    let daemon = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
+    let daemon_pid = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
     assert!(
-        !message.contains(&stop_command(daemon)),
+        !message.contains(&stop_command(daemon_pid)),
         "and the daemon that made way is not: {said}"
     );
     drop(hanging);
