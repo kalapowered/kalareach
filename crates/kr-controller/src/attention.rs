@@ -4438,6 +4438,7 @@ pub(crate) mod tests {
                             transition,
                         }
                     })),
+                    session_event: None,
                 }
             };
         let warning = "kalareach/claude-code 1.0.0 was revoked by its repository";

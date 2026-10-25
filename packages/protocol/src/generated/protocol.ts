@@ -348,6 +348,30 @@ export type AttentionAutomationSubject =
       }
     }
 /**
+ * Work a session's worker recorded, as the attention store reads it.
+ *
+ * The two are told apart by which variant is present rather than by a tag beside them: an
+ * internally tagged union buffers what it decodes before it knows the variant, and buffering is
+ * where a format's own representation of an identifier is lost.
+ */
+export type SessionEventNotice =
+  | {
+      turn_completed: {
+        /**
+         * The upstream agent's current turn identifier, where available.
+         */
+        turn_id: string
+      }
+    }
+  | {
+      command_completed: {
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        exit_status: string
+      }
+    }
+/**
  * One signed revocation request published by a remote owner.
  */
 export type RevocationRequestId = string
@@ -6305,7 +6329,9 @@ export interface AttentionGap {
   to_sequence: U64 | null
 }
 /**
- * One terminal side effect that had no attachment to go to, as the attention store reads it.
+ * One host event of the session's journal, as the attention store reads it: a terminal side effect
+ * that had no attachment to go to, a note of the worker's about a plugin binding it holds, or the
+ * session's own work.
  */
 export interface AttentionHostRecord {
   /**
@@ -6337,6 +6363,20 @@ export interface AttentionHostRecord {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   sequence: string
+  /**
+   * What the session's worker recorded about the session's own work, where this record is that:
+   * an agent turn that ended, or a command that finished with a status other than nought.
+   *
+   * Only the worker writes it, from what it observed itself, so an application's notification
+   * can never be one. The record's sequence is the identity of the turn's result and of the
+   * command: it only grows and a worker that starts again over the same journal goes on from
+   * it, so a turn that ends a second time is a later version and two commands are two things
+   * however alike they read. The work travels whether or not the text does.
+   *
+   * Absent from the wire for every other record, and from a worker of a release that wrote no
+   * such member, so a record of one is byte for byte what that release reads.
+   */
+  session_event?: SessionEventNotice | null
   /**
    * What it said, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves it now,
    * and null when it does not.

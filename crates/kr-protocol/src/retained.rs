@@ -309,14 +309,32 @@ impl RetainedLevel {
 
 /// The levels this release retains, in the order of [`RETAINED_WORKER_LEVELS`].
 ///
-/// The surface of the retained level equals this build's, so neither table has an entry.
+/// The retained level's surface differs from this build's by what the entries cover.
 pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     RETAINED_WORKER_LEVELS[0],
     include_str!("../retained/0.77/surface.schema.json"),
     include_str!("../retained/0.77/RELEASE"),
     include_str!("../retained/0.77/PLUGIN_HOST"),
     &[],
-    &[],
+    &[Compatible {
+        at: "AttentionHostRecord.session_event",
+        reason: "A member that is absent from the wire unless this build's worker recorded an \
+                 agent turn that ended or a command that finished with a status other than \
+                 nought, and a worker of the retained level never writes it, so this build's \
+                 daemon reads a page of that level as one that records no such work, which is \
+                 what that level's worker recorded. A page that carries the member is written \
+                 only by a worker of this build. The retained level's daemon, whose record is a \
+                 closed object, cannot read such a page; it never meets one, because on a \
+                 host that holds a rollback a live session of this build holds it, and on a host \
+                 that does not (a Windows host) it leaves a worker of a level it does not retain \
+                 unreached. What it reads of a journal this build's \
+                 worker wrote is the two host event kinds, which it takes for events that raise \
+                 nothing, and an item this build raised from them reads on after a rollback with \
+                 the text its reader serves: the line of identifiers and the fixed words. No \
+                 client was released, so there is no shim: the public contract may change with a \
+                 level move until public 1.0 freezes at the first client release \
+                 (`docs/releases/packages.md`).",
+    }],
 )
 .with_public_majors(include_str!("../retained/0.77/PUBLIC_MAJORS"))];
 

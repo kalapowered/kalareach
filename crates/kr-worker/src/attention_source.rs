@@ -308,6 +308,7 @@ fn host_record(
                 plugin_id,
                 transition,
             }),
+            session_event: None,
         };
     }
     let notification = event.kind == NOTIFICATION;
@@ -318,6 +319,7 @@ fn host_record(
         text: Nullable(served.then(|| clip(&event.detail))),
         fingerprint: Nullable(notification.then(|| fingerprint(key, &event.detail))),
         adapter: Nullable::null(),
+        session_event: None,
     }
 }
 

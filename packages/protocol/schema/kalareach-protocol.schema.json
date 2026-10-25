@@ -3667,7 +3667,7 @@
     },
     "AttentionHostRecord": {
       "additionalProperties": false,
-      "description": "One terminal side effect that had no attachment to go to, as the attention store reads it.",
+      "description": "One host event of the session's journal, as the attention store reads it: a terminal side effect\nthat had no attachment to go to, a note of the worker's about a plugin binding it holds, or the\nsession's own work.",
       "properties": {
         "adapter": {
           "anyOf": [
@@ -3702,6 +3702,17 @@
         "sequence": {
           "$ref": "#/$defs/U64",
           "description": "Its place in the session's host events."
+        },
+        "session_event": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionEventNotice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the session's worker recorded about the session's own work, where this record is that:\nan agent turn that ended, or a command that finished with a status other than nought.\n\nOnly the worker writes it, from what it observed itself, so an application's notification\ncan never be one. The record's sequence is the identity of the turn's result and of the\ncommand: it only grows and a worker that starts again over the same journal goes on from\nit, so a turn that ends a second time is a later version and two commands are two things\nhowever alike they read. The work travels whether or not the text does.\n\nAbsent from the wire for every other record, and from a worker of a release that wrote no\nsuch member, so a record of one is byte for byte what that release reads."
         },
         "text": {
           "anyOf": [
@@ -4291,7 +4302,7 @@
         },
         {
           "const": "host_events",
-          "description": "Terminal side effects with no attachment to go to.",
+          "description": "The session's host events: terminal side effects with no attachment to go to, and the turns and commands the worker records of the session's own work.",
           "type": "string"
         },
         {
@@ -37097,6 +37108,57 @@
       "description": "The session epoch, fixed at 1 in protocol version 1.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "SessionEventNotice": {
+      "description": "Work a session's worker recorded, as the attention store reads it.\n\nThe two are told apart by which variant is present rather than by a tag beside them: an\ninternally tagged union buffers what it decodes before it knows the variant, and buffering is\nwhere a format's own representation of an identifier is lost.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An agent turn ended, and its result waits to be reviewed.",
+          "properties": {
+            "turn_completed": {
+              "additionalProperties": false,
+              "properties": {
+                "turn_id": {
+                  "$ref": "#/$defs/AgentTurnId",
+                  "description": "The turn that ended."
+                }
+              },
+              "required": [
+                "turn_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "turn_completed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A command finished with a status other than nought.",
+          "properties": {
+            "command_completed": {
+              "additionalProperties": false,
+              "properties": {
+                "exit_status": {
+                  "$ref": "#/$defs/U64",
+                  "description": "The status the command exited with."
+                }
+              },
+              "required": [
+                "exit_status"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "command_completed"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "SessionId": {
       "description": "One KalaReach terminal session.",
