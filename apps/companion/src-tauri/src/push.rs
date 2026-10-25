@@ -478,6 +478,11 @@ pub struct PushDesk {
     /// The keys last filed for the receivers, and the hold that keeps filings in order: a set is
     /// built and handed over under it, so an older set is never filed after a newer one.
     filed: tokio::sync::Mutex<Option<PreviewKeys>>,
+    /// Held for the whole of a choice of previews: its record, its filing for the receivers, what
+    /// it puts back when the filing fails, and the claim of the run that tells the host. Choices go
+    /// one after another, each from the state the one before left, so a choice let go puts back
+    /// what it found and never undoes a choice made after it began. Nothing else waits for it.
+    choosing: tokio::sync::Mutex<()>,
     changed: Box<dyn Fn() + Send + Sync>,
     /// Whether the record on disk is one that could not be read and could not be moved aside, so
     /// that writing would replace it. Nothing is written then, and the page shows what the desk
@@ -667,6 +672,7 @@ impl PushDesk {
             }),
             registering: tokio::sync::Mutex::new(()),
             filed: tokio::sync::Mutex::new(None),
+            choosing: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
             write_blocked,
         });
@@ -785,7 +791,8 @@ impl PushDesk {
     /// to the gateway and asks the person nothing. A host that a run holds is told by that run,
     /// which reads the choice when it gets to the host and goes round again if the choice changed
     /// after. A host that is not on keeps the choice for the run that turns it on, so trying again
-    /// sends it.
+    /// sends it. Choices are made one after another: a second waits until the first is made or let
+    /// go, so the one let go puts back what it found and the last the person made stands.
     ///
     /// # Errors
     ///
@@ -801,6 +808,7 @@ impl PushDesk {
             return Ok(self.view());
         }
         let key = host.host_device_id.to_string();
+        let _choice = self.choosing.lock().await;
         let before = {
             let mut state = lock(&self.state);
             let Some(kept) = state.record.hosts.get_mut(&key) else {
