@@ -1276,7 +1276,7 @@ describe('what has left the host', () => {
     expect(within(retained).getAllByRole('button')).toHaveLength(2)
     const refused = within(retained)
       .getAllByTestId('removal')
-      .filter((line) => line.textContent.includes('This host has no way to ask for its removal.'))
+      .filter((line) => line.textContent.includes('This host cannot ask for its removal.'))
     expect(refused).toHaveLength(2)
   })
 })

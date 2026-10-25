@@ -122,6 +122,15 @@ export function ChangeSets(): ReactNode {
   const [syncCopies, setSyncCopies] = useState<readonly PrivacyExported[]>([])
   // Why those records could not be read: an empty list is then not an answer.
   const [syncFailure, setSyncFailure] = useState<string | null>(null)
+  const [syncReading, setSyncReading] = useState(false)
+  // Set when the person asked to read again after a failure, so that a second failure is said and
+  // not left to look like nothing happened.
+  const retrying = useRef(false)
+  // The announcer as it is now, read when a read ends: it is no reason to read again.
+  const announce = useRef(say)
+  useEffect(() => {
+    announce.current = say
+  }, [say])
   const [failure, setFailure] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   // Every read, on opening, after an action and on a retry, is made under one watch with no
@@ -171,16 +180,23 @@ export function ChangeSets(): ReactNode {
         if (!current()) return
         setPrivacy(null)
       })
+    setSyncReading(true)
     ask(() => port.retainedSyncCopies())
       .then((copies) => {
         if (!current()) return
+        retrying.current = false
         setSyncCopies(copies)
         setSyncFailure(null)
+        setSyncReading(false)
       })
       .catch((error: unknown) => {
         if (!current()) return
+        const words = failureMessage(error)
+        if (retrying.current) announce.current(words, 'danger')
+        retrying.current = false
         setSyncCopies([])
-        setSyncFailure(failureMessage(error))
+        setSyncFailure(words)
+        setSyncReading(false)
       })
   }, [port])
 
@@ -351,7 +367,12 @@ export function ChangeSets(): ReactNode {
         privacy={privacy}
         syncCopies={syncCopies}
         syncFailure={syncFailure}
+        syncReading={syncReading}
         reload={load}
+        retry={() => {
+          retrying.current = true
+          load()
+        }}
       />
     </>
   )

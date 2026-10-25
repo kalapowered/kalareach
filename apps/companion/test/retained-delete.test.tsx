@@ -165,7 +165,7 @@ describe('a copy the host cannot ask the removal of', () => {
       const row = rowOf(retained, reference)
       expect(within(row).queryByRole('button')).toBeNull()
       expect(within(row).getByTestId('removal')).toHaveTextContent(
-        'This host has no way to ask for its removal.'
+        'This host cannot ask for its removal.'
       )
     }
   })
@@ -216,6 +216,41 @@ describe('the copies this computer’s own sync kept', () => {
       expect(within(retained).getAllByTestId('left-copy')).toHaveLength(4)
     })
     expect(within(retained).queryByTestId('sync-copies-unread')).toBeNull()
+    // The button that was pressed is gone, and the focus goes to the section's heading.
+    expect(
+      within(retained).getByRole('heading', { name: 'What has left this host' })
+    ).toHaveFocus()
+  })
+
+  it('says so again when reading them again fails again', async () => {
+    const host = fakeHost()
+    host.controls.retained.syncListFails('a record of the sync could not be read')
+    const { retained, person } = await open(host, 3)
+
+    const unread = within(retained).getByTestId('sync-copies-unread')
+    await person.click(within(unread).getByRole('button', { name: 'Try again' }))
+    // The warning has the same words as before, so the failure is also said where a screen reader
+    // is told of what happened.
+    expect(await screen.findByText('a record of the sync could not be read')).toBeInTheDocument()
+    expect(within(retained).getByTestId('sync-copies-unread')).toBeInTheDocument()
+  })
+
+  it('lists a record that cannot be read as a copy nothing can be asked of, at no known time', async () => {
+    const host = fakeHost()
+    host.controls.retained.keepSyncCopy({
+      kind: 'work sent without an answer, which this device cannot describe',
+      reference: 'a record this build cannot read, kept at /sync/record',
+      left_at_ms: '0',
+      deletable: false
+    })
+    const { retained } = await open(host, 5)
+
+    const row = rowOf(retained, 'a record this build cannot read')
+    expect(within(row).queryByRole('button')).toBeNull()
+    expect(within(row).getByTestId('removal')).toHaveTextContent(
+      'This computer cannot ask the sync service to drop it now: its sync is off, or the record of it cannot be read.'
+    )
+    expect(row).toHaveTextContent('left at a time not known')
   })
 })
 
@@ -242,7 +277,7 @@ describe('a deletion the service did not confirm', () => {
 
     await waitFor(() => {
       expect(within(rowOf(retained, ARCHIVE)).getByTestId('removal')).toHaveTextContent(
-        'This host has no way to ask for its removal.'
+        'This host cannot ask for its removal.'
       )
     })
     expect(within(rowOf(retained, ARCHIVE)).queryByRole('button')).toBeNull()

@@ -37,7 +37,7 @@ export interface FakeRetained {
   holdNextFinish(): { release(): void }
   /** Lists a copy the sync service kept, as this computer's own sync would. */
   keepSyncCopy(copy: PrivacyExported): void
-  /** Makes this computer's own sync list fail with these words, as unreadable records do, or stops that. */
+  /** Makes this computer's own sync list fail with these words, as a store that cannot be read does, or stops that. */
   syncListFails(message: string | null): void
   /** Lists the host's copy as deleted and awaiting removal at the service, as it is once the service confirms. */
   serviceHasDeleted(reference: string): void

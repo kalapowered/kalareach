@@ -58,10 +58,10 @@ function removalNote(row: Row, step: Step, here: boolean): string {
   if (row.sync) {
     return row.copy.deletable
       ? 'This computer can ask the sync service to drop it. A confirmation dialog comes first.'
-      : 'This computer can ask the sync service to drop it while the sync that holds it is on.'
+      : 'This computer cannot ask the sync service to drop it now: its sync is off, or the record of it cannot be read.'
   }
   if (!row.copy.deletable) {
-    return 'This host has no way to ask for its removal. Whoever holds the copy can remove it.'
+    return 'This host cannot ask for its removal.'
   }
   return here
     ? 'This host can ask for its removal. A confirmation dialog comes first.'
@@ -73,7 +73,9 @@ export function LeftTheHost({
   privacy,
   syncCopies,
   syncFailure,
-  reload
+  syncReading,
+  reload,
+  retry
 }: {
   /** The host's report, or null when the host could not be asked. */
   readonly privacy: PrivacyReport | null
@@ -81,14 +83,27 @@ export function LeftTheHost({
   readonly syncCopies: readonly PrivacyExported[]
   /** Why this computer's own sync records could not be read, when they could not: the list is then incomplete. */
   readonly syncFailure: string | null
-  /** Reads both lists again. */
+  /** Whether those records are being read. */
+  readonly syncReading: boolean
+  /** Reads both lists again, after a deletion. */
   readonly reload: () => void
+  /** Reads both lists again, because the person asked after a failure. */
+  readonly retry: () => void
 }): ReactNode {
   const { port, say } = useApp()
   const { rights, paired } = useHeldConnection()
   const here = rights !== null && !paired
   const [steps, setSteps] = useState<ReadonlyMap<string, Step>>(new Map())
   const [refusals, setRefusals] = useState<ReadonlyMap<string, string>>(new Map())
+  // Whether the person asked to read again after a failure: when it works the button goes, and the
+  // heading takes the focus it had.
+  const retried = useRef(false)
+  const heading = useRef<HTMLHeadingElement | null>(null)
+  useEffect(() => {
+    if (!retried.current || syncReading) return
+    retried.current = false
+    if (syncFailure === null) heading.current?.focus()
+  }, [syncReading, syncFailure])
   // Whether this section is still on the screen: a dialog that is answered after it closed has no
   // page left to tell, and its token is dropped.
   const open = useRef(true)
@@ -169,7 +184,9 @@ export function LeftTheHost({
       <header className="page-heading">
         <div>
           <p className="eyebrow">Privacy</p>
-          <h2>What has left this host</h2>
+          <h2 ref={heading} tabIndex={-1}>
+            What has left this host
+          </h2>
           <p>
             {privacy === null
               ? 'This host could not be asked what it sent. These are the copies this computer’s own sync kept.'
@@ -190,7 +207,15 @@ export function LeftTheHost({
                 The copies this computer’s own sync kept could not be read, so this list may be
                 missing some: {syncFailure}
               </p>
-              <Button onClick={reload}>Try again</Button>
+              <Button
+                aria-busy={syncReading}
+                onClick={() => {
+                  retried.current = true
+                  retry()
+                }}
+              >
+                Try again
+              </Button>
             </div>
           )}
           {rows.map((row) => {
@@ -207,7 +232,10 @@ export function LeftTheHost({
                 <div className="spacer">
                   <strong>{row.copy.kind}</strong>
                   <p className="muted small">
-                    {reference} · left {new Date(Number(row.copy.left_at_ms)).toLocaleString()}
+                    {reference} ·{' '}
+                    {Number(row.copy.left_at_ms) === 0
+                      ? 'left at a time not known'
+                      : `left ${new Date(Number(row.copy.left_at_ms)).toLocaleString()}`}
                   </p>
                   <p className="small" data-testid="removal" aria-live="polite">
                     {removalNote(row, step, here)}
