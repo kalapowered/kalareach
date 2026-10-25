@@ -305,15 +305,17 @@ and a draft publication is accounted for and settled there by the same rules as 
   say so. The note is written in the draft store before the record that ends the request, so a stop
   between the two leaves the request counted and the next pass writes the same note again.
 - A refusal names the copy the service kept of this device's write on the copy that comes down
-  beside the draft, as `Draft::retained`. `DraftSync::resolve` records the person's choice about that
-  copy: it takes the copy out of the draft store and drops the one copy on the service that answers
-  it. The choice is recorded before the service is asked, so a service that cannot be told hears of
-  it from `SyncClient::finish_resolutions` later. A refusal whose other content never came down is
-  listed in `exported` as deletable, and `SyncClient::drop_kept_copy` drops it. An application that
-  holds no client for a store at the moment, as a desktop companion does between its passes, lists
-  the same copies from the store with `sync::kept_copies`, which pairs each entry with the
-  `SyncConflictId` that `drop_kept_copy` takes and asks the service nothing. A copy whose drop was
-  chosen and not yet confirmed stays in that list until the service says it is gone;
+  beside the draft, as `Draft::retained`. `DraftSync::resolve` records the person's choice about
+  that copy: it takes the copy out of the draft store and drops the one copy on the service that
+  answers it. The choice is recorded before the service is asked, so a service that cannot be told
+  hears of it from `SyncClient::finish_resolutions` later. A refusal whose other content never came
+  down is listed in `exported` as deletable, and `SyncClient::drop_kept_copy` drops it. An
+  application that holds no client for a store at the moment, as a desktop companion does between
+  its passes, lists the same copies from the store with `sync::kept_copies`, which pairs each entry
+  with the `SyncConflictId` that `drop_kept_copy` takes and asks the service nothing, and
+  `sync::unreadable_records` lists beside them the records the store holds that this build cannot
+  read, which may account for a copy that left and which nothing can describe or drop. A copy whose
+  drop was chosen and not yet confirmed stays in that list until the service says it is gone;
   `finish_resolutions` is what asks again, since `drop_kept_copy` of a copy already chosen records
   nothing and returns none.
 - While privacy mode is on, no draft is published and none is fetched. An answer that comes back for

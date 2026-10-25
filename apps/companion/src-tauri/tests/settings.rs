@@ -1872,16 +1872,74 @@ async fn the_copy_the_service_kept_of_a_refused_settings_write_is_dropped_when_t
     assert_eq!(elsewhere.copies_kept().await, 1);
     assert_eq!(kept_by_the_service(&page).len(), 1, "it is still listed");
 
-    // Asking again reaches the service, which drops that copy.
-    assert!(
-        settings
-            .drop_sync_copy(reference)
-            .await
-            .expect("the service is asked"),
-        "the service dropped it"
-    );
+    // The next step that reaches the service finishes the drop, though the person has settings of
+    // their own to choose between and asks for nothing again.
+    page.sync_now();
     assert_eq!(elsewhere.copies_kept().await, 0, "the service holds none");
     assert!(kept_by_the_service(&page).is_empty());
+    assert_eq!(
+        page.view()["sync"]["conflicts"],
+        1,
+        "and the versions to choose between are still waiting"
+    );
+}
+
+/// The directories under `root` that hold a file with this extension.
+fn directories_holding(root: &std::path::Path, extension: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(directories_holding(&path, extension));
+        } else if path.extension().is_some_and(|found| found == extension)
+            && let Some(parent) = path.parent()
+            && !found.iter().any(|known| known == parent)
+        {
+            found.push(parent.to_path_buf());
+        }
+    }
+    found
+}
+
+/// KR-REQ-24.29: a record of the sync store that this build cannot read may account for a copy that
+/// left, so it is listed beside the copies, as one nothing can be asked of, and the copy the service
+/// kept is listed as before. The control is the list before the record is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_the_sync_store_cannot_read_is_listed_beside_the_copies() {
+    let computer = Computer::new().await;
+    let (page, _elsewhere) = waiting_for_a_choice(&computer).await;
+    assert_eq!(kept_by_the_service(&page).len(), 1, "the control");
+
+    let stores = directories_holding(computer.data.path(), "request");
+    assert_eq!(stores.len(), 1, "{stores:?}");
+    std::fs::write(
+        stores[0].join("0b8a5a8a-0d73-4d62-9f1c-6a2f3a1c6d01.request"),
+        b"not a record",
+    )
+    .expect("a record this build cannot read");
+
+    let listed = kept_by_the_service(&page);
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let unreadable = listed
+        .iter()
+        .find(|entry| entry["deletable"] == false)
+        .expect("the record is listed");
+    assert!(
+        unreadable["reference"]
+            .as_str()
+            .expect("a reference")
+            .starts_with("a record this build cannot read"),
+        "{unreadable:?}"
+    );
+    assert!(
+        listed.iter().any(|entry| entry["deletable"] == true),
+        "and the copy the service kept can still be dropped"
+    );
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    settings
+        .drop_sync_copy(unreadable["reference"].as_str().expect("a reference"))
+        .await
+        .expect_err("nothing can be asked of a record that cannot be read");
 }
 
 /// The person at the dialog, who says what they are made to say.

@@ -320,6 +320,53 @@ pub fn kept_copies(store: &SyncStore) -> Result<Vec<KeptCopy>> {
     Ok(copies)
 }
 
+/// The entries for the records `store` holds that this build cannot read, as
+/// [`SyncClient::exported`] names them: each may account for something that left this device, and
+/// none can be described or dropped.
+///
+/// A list of copies that left out a record it could not read would read as complete, so an
+/// application that lists [`kept_copies`] lists these beside them.
+///
+/// # Errors
+///
+/// Returns [`SyncError::Storage`] when the records cannot be read.
+pub fn unreadable_records(store: &SyncStore) -> Result<Vec<Exported>> {
+    let left = store.what_left()?;
+    Ok(unreadable_entries(
+        &left.requests.unreadable,
+        &left.publications.unreadable,
+    ))
+}
+
+fn unreadable_entries(
+    requests: &[std::path::PathBuf],
+    publications: &[std::path::PathBuf],
+) -> Vec<Exported> {
+    let entry = |kind: &str, path: &std::path::Path| Exported {
+        kind: kind.to_owned(),
+        reference: format!(
+            "a record this build cannot read, kept at {}",
+            path.display()
+        ),
+        left_at_ms: TimestampMs::new(0),
+        deletable: false,
+    };
+    requests
+        .iter()
+        .map(|path| {
+            entry(
+                "work sent without an answer, which this device cannot describe",
+                path,
+            )
+        })
+        .chain(
+            publications
+                .iter()
+                .map(|path| entry("a publication this device cannot describe", path)),
+        )
+        .collect()
+}
+
 /// What asking the service to drop the copies a person chose about established.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resolutions {
@@ -1459,28 +1506,10 @@ impl SyncClient {
             }
             // Nothing else has left: work that was admitted and never sent is still here.
         }
-        for path in requests.unreadable {
-            exported.push(Exported {
-                kind: "work sent without an answer, which this device cannot describe".to_owned(),
-                reference: format!(
-                    "a record this build cannot read, kept at {}",
-                    path.display()
-                ),
-                left_at_ms: TimestampMs::new(0),
-                deletable: false,
-            });
-        }
-        for path in publications.unreadable {
-            exported.push(Exported {
-                kind: "a publication this device cannot describe".to_owned(),
-                reference: format!(
-                    "a record this build cannot read, kept at {}",
-                    path.display()
-                ),
-                left_at_ms: TimestampMs::new(0),
-                deletable: false,
-            });
-        }
+        exported.extend(unreadable_entries(
+            &requests.unreadable,
+            &publications.unreadable,
+        ));
         Ok(exported)
     }
 

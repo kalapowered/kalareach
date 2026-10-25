@@ -390,7 +390,9 @@ pub struct SyncCopy {
     /// Whether this computer can ask the service to drop it now.
     pub deletable: bool,
     place: Place,
-    copy: SyncConflictId,
+    /// The copy's identity, when it is a copy this computer can ask the service to drop. A record
+    /// this build cannot read is listed so that the list does not read as complete, and has none.
+    copy: Option<SyncConflictId>,
 }
 
 /// Which of this computer's synchronisation stores records a copy.
@@ -941,7 +943,7 @@ impl SettingsSync {
             left_at_ms: kept.listed.left_at_ms,
             deletable: deletable && kept.listed.deletable,
             place,
-            copy: kept.copy,
+            copy: Some(kept.copy),
         };
         let mut copies: Vec<SyncCopy> = kr_client::sync::kept_copies(&self.store()?)
             .map_err(sync_failure)?
@@ -951,6 +953,19 @@ impl SettingsSync {
         for (environment, kept) in self.drafts.kept_copies()? {
             copies.push(listed(kept, drafts_on, Place::Drafts(environment)));
         }
+        // A record this build cannot read may account for a copy that left: it is listed, as the
+        // client lists it, and nothing can be asked of it.
+        let mut unreadable =
+            kr_client::sync::unreadable_records(&self.store()?).map_err(sync_failure)?;
+        unreadable.extend(self.drafts.unreadable_records()?);
+        copies.extend(unreadable.into_iter().map(|entry| SyncCopy {
+            kind: entry.kind,
+            reference: entry.reference,
+            left_at_ms: entry.left_at_ms,
+            deletable: false,
+            place: Place::Settings,
+            copy: None,
+        }));
         copies.sort_by_key(|copy| copy.left_at_ms.get());
         Ok(copies)
     }
@@ -976,10 +991,15 @@ impl SettingsSync {
                 "that copy is dropped while the sync that holds it is on",
             ));
         }
+        let Some(copy) = wanted.copy else {
+            return Err(CommandError::refused(
+                "this computer cannot ask the service to drop that copy",
+            ));
+        };
         match wanted.place {
-            Place::Settings => self.drop_settings_copy(wanted.copy).await,
+            Place::Settings => self.drop_settings_copy(copy).await,
             Place::Drafts(environment) => {
-                if !self.drafts.choose_to_drop(environment, wanted.copy)? {
+                if !self.drafts.choose_to_drop(environment, copy)? {
                     return Err(CommandError::refused(
                         "this computer holds no such copy of its drafts at the service",
                     ));
@@ -992,7 +1012,7 @@ impl SettingsSync {
                     .drafts
                     .kept_copies()?
                     .iter()
-                    .any(|(host, kept)| *host == environment && kept.copy == wanted.copy))
+                    .any(|(host, kept)| *host == environment && kept.copy == copy))
             }
         }
     }
@@ -1036,6 +1056,10 @@ impl SettingsSync {
             .reconcile_unsettled(now_ms)
             .await
             .map_err(sync_failure)?;
+        // A copy the person chose to have the service drop is asked about before anything that can
+        // end this step early: a choice of settings that waits for the person must not hold the
+        // drop back, or a service that could not be reached would never be asked again.
+        client.finish_resolutions().await.map_err(sync_failure)?;
         let chosen = self.local.chosen_colour_mode();
         let mut held = store.object(object_id).map_err(sync_failure)?;
         // A marker for settings this computer no longer holds is spent.
@@ -1096,7 +1120,6 @@ impl SettingsSync {
                     .map_err(sync_failure)?;
             }
         }
-        client.finish_resolutions().await.map_err(sync_failure)?;
         // The file is the one source: the object this computer holds is made again whenever it
         // does not carry what the file says, which is also how a change that was written to the
         // file and not yet to the object (a stop between the two) is carried on.

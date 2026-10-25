@@ -574,6 +574,23 @@ impl DraftsSync {
         Ok(found)
     }
 
+    /// The records the host stores hold that this build cannot read, which may account for a copy
+    /// that left. Nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when a store cannot be read.
+    pub fn unreadable_records(&self) -> Result<Vec<kr_client::sync::Exported>> {
+        let mut found = Vec::new();
+        for directory in self.host_stores() {
+            let store = SyncStore::open(&directory).map_err(super::sync::sync_failure)?;
+            found.extend(
+                kr_client::sync::unreadable_records(&store).map_err(super::sync::sync_failure)?,
+            );
+        }
+        Ok(found)
+    }
+
     /// Records, in the host's store, that the person chose to have the service drop a copy it kept.
     /// The next pass that reaches the service asks it, and asks again until it has dropped it.
     /// Returns whether the store holds the copy, whether the choice is new or was made before.

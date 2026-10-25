@@ -71,7 +71,7 @@ use crate::services::{SyncPosition, SyncRecoveryId};
 pub use client::{
     Cancelled, Exported, Fenced, KeptCopy, KeptExplicitly, PublishGate, Published, Reconciled,
     Removed, Resolutions, Resolved, Restored, Resumed, SyncClient, fresh_object_id, fresh_revision,
-    kept_copies,
+    kept_copies, unreadable_records,
 };
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use shared::SharedCollectionService;

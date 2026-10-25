@@ -132,7 +132,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // and the hand-over of control asks an owner device first.
     ("device_list", Some(Method::DeviceList)),
     // What privacy mode reports: whether it is on, and the copies that have left the host and are
-    // shown rather than erased. The page lists them and offers no action on them.
+    // shown rather than erased. The page lists them; deleting one is the commands below.
     ("privacy_status", Some(Method::PrivacyStatus)),
     // Deleting a copy privacy mode lists as having left the host. The page names the copy by the
     // reference the host lists it under and cannot confirm: this process asks in a native dialog,
