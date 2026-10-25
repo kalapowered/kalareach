@@ -98,6 +98,128 @@ final class SealedPreviewTests: XCTestCase {
         return try XCTUnwrap(handedBack)
     }
 
+    /// Keys that hold the read of the host's key until the test lets it go, so that the system's call
+    /// that the time is up can be made while the extension is still opening the preview.
+    private final class HeldKeys: PreviewKeyReading {
+        let inner: GoldenKeys
+        let reading = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+
+        init(_ inner: GoldenKeys) { self.inner = inner }
+
+        func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data {
+            try inner.recipientSeed(forRecipient: recipientKeyID)
+        }
+
+        func senderKey(forSender senderKeyID: Data) throws -> Data {
+            reading.signal()
+            _ = release.wait(timeout: .now() + 30)
+            return try inner.senderKey(forSender: senderKeyID)
+        }
+    }
+
+    /// The bodies the system was handed, from whichever thread handed them.
+    private final class HandedBack {
+        private let lock = NSLock()
+        private var all: [String] = []
+
+        func add(_ body: String) {
+            lock.lock()
+            all.append(body)
+            lock.unlock()
+        }
+
+        var bodies: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return all
+        }
+    }
+
+    private func request(for sealed: Golden) -> UNNotificationRequest {
+        let content = UNMutableNotificationContent()
+        content.body = sealed.alert
+        content.userInfo = ["preview": sealed.preview]
+        return UNNotificationRequest(identifier: "n-2", content: content, trigger: nil)
+    }
+
+    func testAnExpiryWhileThePreviewIsBeingOpenedHandsTheSystemTheGenericAlertOnce() throws {
+        let sealed = try golden()
+        let earlier = NotificationService.parts
+        defer { NotificationService.parts = earlier }
+        let keys = HeldKeys(GoldenKeys(golden: sealed, holdsTheSender: true))
+        NotificationService.parts = ExtensionParts(
+            keys: keys,
+            opener: RustPreviewOpener(),
+            nowMilliseconds: { sealed.nowMilliseconds })
+        let handedBack = HandedBack()
+        let returned = expectation(description: "didReceive returned")
+        let service = NotificationService()
+        let incoming = request(for: sealed)
+        DispatchQueue.global().async {
+            service.didReceive(incoming) { handedBack.add($0.body) }
+            returned.fulfill()
+        }
+
+        XCTAssertEqual(keys.reading.wait(timeout: .now() + 30), .success, "the extension reached the keys")
+        // The system's deadline comes while the preview is still being opened.
+        service.serviceExtensionTimeWillExpire()
+        keys.release.signal()
+        wait(for: [returned], timeout: 30)
+
+        XCTAssertEqual(handedBack.bodies, [sealed.alert], "the generic alert, once, and nothing after it")
+    }
+
+    func testANotificationServedWhileAnotherIsBeingOpenedIsCompletedWithItsOwnHandler() throws {
+        let sealed = try golden()
+        let earlier = NotificationService.parts
+        defer { NotificationService.parts = earlier }
+        let keys = HeldKeys(GoldenKeys(golden: sealed, holdsTheSender: true))
+        NotificationService.parts = ExtensionParts(
+            keys: keys,
+            opener: RustPreviewOpener(),
+            nowMilliseconds: { sealed.nowMilliseconds })
+        let first = HandedBack()
+        let second = HandedBack()
+        let returned = expectation(description: "the first didReceive returned")
+        let service = NotificationService()
+        let opening = request(for: sealed)
+        DispatchQueue.global().async {
+            service.didReceive(opening) { first.add($0.body) }
+            returned.fulfill()
+        }
+        XCTAssertEqual(keys.reading.wait(timeout: .now() + 30), .success, "the extension reached the keys")
+
+        // The same instance is given another notification while the first is still being opened.
+        let other = UNMutableNotificationContent()
+        other.body = "Another alert."
+        service.didReceive(UNNotificationRequest(identifier: "n-3", content: other, trigger: nil)) {
+            second.add($0.body)
+        }
+        keys.release.signal()
+        wait(for: [returned], timeout: 30)
+
+        XCTAssertEqual(second.bodies, ["Another alert."])
+        XCTAssertEqual(first.bodies, [sealed.summary], "each was completed with the handler it came with")
+    }
+
+    func testAnExpiryAfterThePreviewWasShownHandsTheSystemNothingMore() throws {
+        let sealed = try golden()
+        let earlier = NotificationService.parts
+        defer { NotificationService.parts = earlier }
+        NotificationService.parts = ExtensionParts(
+            keys: GoldenKeys(golden: sealed, holdsTheSender: true),
+            opener: RustPreviewOpener(),
+            nowMilliseconds: { sealed.nowMilliseconds })
+        let handedBack = HandedBack()
+        let service = NotificationService()
+
+        service.didReceive(request(for: sealed)) { handedBack.add($0.body) }
+        service.serviceExtensionTimeWillExpire()
+
+        XCTAssertEqual(handedBack.bodies, [sealed.summary], "the preview, once, and nothing after it")
+    }
+
     func testTheExtensionShowsWhatTheHostSealed() throws {
         XCTAssertEqual(try shown(holdingTheSender: true), try golden().summary)
     }
