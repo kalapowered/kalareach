@@ -8982,18 +8982,18 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
 
     let without: Vec<_> = stored_formats::table::known()
         .into_iter()
-        .filter(|line| line.name != "Audience")
+        .filter(|line| line.name != "ShellKind")
         .collect();
     let found = stored_formats::undeclared_in(&table, &without).expect("read");
     assert!(
-        found.iter().any(|said| said.contains("holds Audience")),
+        found.iter().any(|said| said.contains("holds ShellKind")),
         "a nested type without a line is found: {found:?}"
     );
 
     let mut moved = stored_formats::table::known();
     moved
         .iter_mut()
-        .find(|line| line.name == "EventKey")
+        .find(|line| line.name == "ShellKind")
         .expect("listed")
         .pinned = "0000";
     let mut answers: Vec<&str> = stored_formats::table::retained_answers()
@@ -9003,7 +9003,7 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     answers.extend(stored_formats::table::kept_without_a_holder());
     let found = stored_formats::known_that_changed(&table, &moved, &answers).expect("read");
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].starts_with("EventKey "), "{found:?}");
+    assert!(found[0].starts_with("ShellKind "), "{found:?}");
 
     let mut stale = stored_formats::table::known();
     stale.push(stored_formats::known_protocol::<

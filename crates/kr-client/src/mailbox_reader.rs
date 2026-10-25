@@ -11,8 +11,8 @@
 //! paired and whose pairing is in force ([`Reading::senders`]), under
 //! [`kr_crypto::envelope::open_delivered_envelope`]: the routing record outside the envelope is
 //! untrusted and must match what the box authenticated, the expiry must not have passed at the
-//! moment the item is opened, an identifier the reader has accepted before is refused, and a
-//! payload that bears authority is refused whoever sealed it. Anything else is dropped.
+//! moment the item is opened, and an identifier the reader has accepted before is refused. Anything
+//! else is dropped.
 //!
 //! # What is durable, and in which order
 //!

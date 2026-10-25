@@ -222,16 +222,31 @@
           "kind": "sqlite_table",
           "table": "delivery_schema"
         },
-        "version": 10,
-        "migrates_from": 6,
-        "reads_through": 11
+        "version": 11,
+        "migrates_from": 6
       },
-      "digest": "1e4145f3929171238eefc093c117cd82e6b99a8ef008b8b333dc0b42512a155a",
+      "digest": "43f4a7424a4d46099716d218f15f800f6210548642af93eeb27efe6b6d4ed0e1",
       "kept": [
         "PushDeliveryRequest",
         "SealedEnvelope",
-        "Production, Notice (crates/kr-delivery/src/producer.rs)",
-        "PreviewBody (crates/kr-delivery/src/preview.rs)"
+        "PushAlert",
+        "PushUrgency",
+        "Production, Notice, Audience (crates/kr-delivery/src/producer.rs)",
+        "PreviewBody (crates/kr-delivery/src/preview.rs)",
+        "EventKey, EventSource, DeliveryState (crates/kr-delivery/src/journal.rs)",
+        "DestinationKind (crates/kr-delivery/src/destination.rs)",
+        "NextAction (crates/kr-delivery/src/push.rs)",
+        "ContentLine (crates/kr-delivery/src/external.rs)",
+        "StoredMessage, StoredInterval (crates/kr-controller/src/push/client.rs)",
+        "words of push suppression reasons",
+        "PushSuppressionReason",
+        "words of event sources",
+        "words of delivery states",
+        "words of destination kinds",
+        "words of next actions",
+        "words of queued message keys",
+        "words of withheld reasons",
+        "Withheld (crates/kr-delivery/src/external.rs)"
       ]
     },
     {

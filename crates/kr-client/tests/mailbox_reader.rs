@@ -389,27 +389,6 @@ async fn kr_req_20_05_an_item_accepted_once_is_refused_when_it_is_offered_again(
     );
 }
 
-/// KR-REQ-20.04: a payload that bears authority is refused whoever sealed it, and its identifier is
-/// not recorded. The control is an item of a kind that bears none from the same sender, which is
-/// taken.
-#[tokio::test]
-async fn kr_req_20_04_an_item_that_bears_authority_is_dropped_whoever_sealed_it() {
-    let rig = Rig::start();
-    let friend = a_sender();
-    rig.reader.pairs_with(&friend);
-    rig.deliver(&rig.item(&friend, MailboxPayloadType::SignedAuthorityObject, 1))
-        .await;
-    rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, 2))
-        .await;
-
-    rig.pass().await.expect("the pass reads through");
-
-    assert_eq!(rig.reader.accepted_numbers(), [2]);
-    assert_eq!(rig.reader.dropped(), 1);
-    assert_eq!(rig.reader.written().len(), 1);
-    assert_eq!(rig.held(), 0);
-}
-
 /// KR-REQ-20.05: an item whose identifier was written down is never accepted again, even when the
 /// pass that wrote it is dropped before it ends, as a caller's deadline drops it. The pass waits
 /// for the write of the second item on the page and is dropped there: the first item is on record

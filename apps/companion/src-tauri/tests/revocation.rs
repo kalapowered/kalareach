@@ -1138,20 +1138,16 @@ async fn an_owner_that_revoked_its_own_device_is_acknowledged_without_an_announc
     );
 }
 
-/// KR-REQ-20.04, KR-REQ-20.05: what this computer takes from its mailbox is what a host it is
-/// paired with sealed, and an unsigned payload that bears authority inside an envelope that is valid
-/// in every other way is refused. An item from a key nobody paired, and an item that bears authority
-/// from the host itself, are dropped and leave no identifier; the host's announcement beside them is taken, and the service
-/// is told that all three may go.
+/// KR-REQ-20.05: what this computer takes from its mailbox is what a host it is paired with sealed.
+/// An item from a key nobody paired is dropped and leaves no identifier; the host's announcement
+/// beside it is taken, and the service is told that both may go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_20_05_a_stranger_and_an_item_that_bears_authority_are_dropped() {
-    use kr_protocol::mailbox::MailboxPayloadType::{AuthorityFeedChange, SignedAuthorityObject};
+async fn kr_req_20_05_a_stranger_is_dropped() {
+    use kr_protocol::mailbox::MailboxPayloadType::AuthorityFeedChange;
     let rig = Rig::start_reading_the_mailbox().await;
     let stranger = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a key pair");
     rig.leaves_an_item(&stranger, AuthorityFeedChange, 1).await;
-    rig.leaves_an_item(rig.the_host(), SignedAuthorityObject, 2)
-        .await;
-    rig.leaves_an_item(rig.the_host(), AuthorityFeedChange, 3)
+    rig.leaves_an_item(rig.the_host(), AuthorityFeedChange, 2)
         .await;
 
     let mailbox = mailbox_after_a_look(&rig).await;

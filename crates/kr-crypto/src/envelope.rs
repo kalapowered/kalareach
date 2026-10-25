@@ -8,13 +8,11 @@
 //! 2. the key identifiers inside the authenticated plaintext name those two keys;
 //! 3. the untrusted routing record matches the authenticated fields.
 //!
-//! A payload that bears authority is never returned. Section 20 has such a payload signed before
-//! encryption, so that pairwise message authentication cannot stand in for an issuer's signature,
-//! and no reader of a mailbox in this product takes authority from one: a host and a device take
-//! theirs from their own records and the authority feed. [`open_envelope`] therefore refuses it
-//! with [`CryptoError::AuthorityNotAccepted`] once the box, the bindings and the expiry have
-//! passed, so an unsigned object inside an otherwise valid envelope is refused by the same path
-//! as a signed one.
+//! No payload kind bears authority. Section 20 has such a payload signed before encryption, so
+//! that pairwise message authentication cannot stand in for an issuer's signature, and no reader
+//! of a mailbox in this product takes authority from one: a host and a device take theirs from
+//! their own records and the authority feed. The closed set of payload kinds has none that
+//! carries it, so a plaintext that names another kind does not decode.
 //!
 //! # Padding
 //!
@@ -229,15 +227,11 @@ pub fn unpad_notification_preview(padded: &[u8]) -> Result<&[u8]> {
 
 /// Opens one envelope against a previously paired sender key.
 ///
-/// A payload that bears authority is refused after everything else has been checked: the pairwise
-/// box proves that a paired device sealed the item and proves nothing about authority.
-///
 /// # Errors
 ///
 /// Returns [`CryptoError::Authentication`] when the box does not authenticate or the padding is
 /// malformed, [`CryptoError::BindingMismatch`] when a key identifier, a routing field, the declared
-/// bucket or the expiry does not match the authenticated plaintext, and
-/// [`CryptoError::AuthorityNotAccepted`] when the payload bears authority.
+/// bucket or the expiry does not match the authenticated plaintext.
 pub fn open_envelope(
     recipient: &StoredEnvelopeKeyPair,
     sender: &StoredEnvelopeKey,
@@ -294,9 +288,6 @@ pub fn open_envelope(
         return Err(CryptoError::BindingMismatch {
             what: "the expiry of an envelope, which has passed",
         });
-    }
-    if plaintext.payload_type.bears_authority() {
-        return Err(CryptoError::AuthorityNotAccepted);
     }
     Ok(plaintext)
 }

@@ -72,24 +72,6 @@ fn paired_with(sender: &StoredEnvelopeKeyPair) -> PairedSenders {
     senders
 }
 
-/// An envelope that carries a payload of the kind that bears authority, referencing `grant_id`.
-fn authority_envelope(
-    sender: &StoredEnvelopeKeyPair,
-    recipient: &StoredEnvelopeKeyPair,
-    payload: &[u8],
-    grant_id: Option<GrantId>,
-) -> (EnvelopePlaintext, SealedEnvelope) {
-    let mut plaintext = plaintext(
-        sender,
-        recipient,
-        MailboxPayloadType::SignedAuthorityObject,
-        payload.to_vec(),
-    );
-    plaintext.grant_id = grant_id.map_or_else(Nullable::null, Nullable::some);
-    let sealed = seal_envelope(sender, recipient.public(), &plaintext).expect("a sealed envelope");
-    (plaintext, sealed)
-}
-
 // ---------------------------------------------------------------------------
 // KR-REQ-20.04: the versioned envelope, per recipient, under a libsodium nonce
 // ---------------------------------------------------------------------------
@@ -273,56 +255,6 @@ fn an_envelope_version_this_build_does_not_publish_is_not_decoded() {
         serde_json::from_value::<EnvelopePlaintext>(document).is_err(),
         "a field this build does not declare is refused"
     );
-}
-
-// ---------------------------------------------------------------------------
-// KR-REQ-20.04: authority is never taken from a mailbox
-// ---------------------------------------------------------------------------
-
-/// An authorisation-bearing payload, inside an envelope that is valid in every other way, is
-/// rejected whatever the payload holds: the pairwise box proves that a paired device sealed the
-/// item and proves nothing about authority, and no reader of a mailbox takes authority from one.
-/// The control is the same box carrying the same bytes as a kind that bears none, which opens, so
-/// the refusal is the payload's kind and not a fault of the box.
-#[test]
-fn an_authority_payload_inside_an_otherwise_valid_envelope_is_rejected() {
-    let sender = StoredEnvelopeKeyPair::generate().expect("a keypair");
-    let recipient = StoredEnvelopeKeyPair::generate().expect("a keypair");
-    let grant_id = GrantId::new(Uuid::from_bytes([1; 16]));
-    let senders = paired_with(&sender);
-    let payload = b"any bytes a paired sender seals";
-
-    let (_, sealed) = authority_envelope(&sender, &recipient, payload, Some(grant_id));
-    assert!(
-        matches!(
-            open_envelope(&recipient, sender.public(), &sealed, NOW_MS),
-            Err(CryptoError::AuthorityNotAccepted)
-        ),
-        "an authority payload from a paired sender is refused"
-    );
-    let mut ledger = ReplayLedger::new();
-    assert!(
-        matches!(
-            open_delivered_envelope(&recipient, &senders, &mut ledger, &sealed, NOW_MS),
-            Err(CryptoError::AuthorityNotAccepted)
-        ),
-        "an authority payload is refused on the path a service's delivery takes"
-    );
-    assert!(
-        ledger.is_empty(),
-        "a refused item records no replay identifier"
-    );
-
-    // The control: the same bytes carried as a kind that bears no authority open, so the box, the
-    // bindings and the expiry were all sound and the refusal above is the kind's.
-    let carried = plaintext(
-        &sender,
-        &recipient,
-        MailboxPayloadType::StateReference,
-        payload.to_vec(),
-    );
-    let sealed = seal_envelope(&sender, recipient.public(), &carried).expect("a sealed envelope");
-    assert!(open_envelope(&recipient, sender.public(), &sealed, NOW_MS).is_ok());
 }
 
 // ---------------------------------------------------------------------------

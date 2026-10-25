@@ -997,12 +997,7 @@ fn services() -> Value {
             "items_per_device": U64::new(MAX_MAILBOX_ITEMS).to_string(),
             "bytes_per_device": U64::new(MAX_MAILBOX_BYTES).to_string(),
             "seal_overhead_bytes": U64::new(SEAL_OVERHEAD_BYTES).to_string(),
-            "payload_types": MailboxPayloadType::ALL.map(MailboxPayloadType::as_str),
-            "coalesced_payload_types": MailboxPayloadType::ALL
-                .iter()
-                .filter(|kind| !kind.bears_authority())
-                .map(|kind| kind.as_str())
-                .collect::<Vec<_>>()
+            "payload_types": MailboxPayloadType::ALL.map(MailboxPayloadType::as_str)
         },
         "sync_limits": {
             "object_plaintext_bytes": U64::new(MAX_SYNC_OBJECT_PLAINTEXT_BYTES).to_string(),

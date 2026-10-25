@@ -2888,6 +2888,100 @@ async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_befor
     host.end_the_plugin_host().await;
 }
 
+/// The version the delivery journal records and the privacy generation it holds, read from the
+/// file beside the daemon that has it open.
+fn delivery_journal_of(host: &Host) -> (i64, i64) {
+    let path = host
+        .tree
+        .environment()
+        .state_dir()
+        .join(kr_controller::push::DELIVERY_JOURNAL);
+    let connection =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("the delivery journal opens");
+    let version = connection
+        .query_row("SELECT version FROM delivery_schema", [], |row| row.get(0))
+        .expect("the journal records a version");
+    let generation = connection
+        .query_row(
+            "SELECT generation FROM delivery_privacy WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the journal records a privacy generation");
+    (version, generation)
+}
+
+/// Turns privacy mode on and then off with the `kr` of the current release, which writes the
+/// privacy generation of the delivery journal twice. The change can report that it is still
+/// settling, so each is asked for until the status says it took.
+async fn privacy_on_and_off(host: &Host) {
+    for enabled in [true, false] {
+        let word = if enabled { "on" } else { "off" };
+        until(&format!("privacy mode to be {word}"), || async {
+            let _ = host.kr_json(&["privacy", word, "--json"]);
+            let (_, status) = host.kr_json(&["privacy", "status", "--json"]);
+            (status["enabled"] == Value::Bool(enabled)).then_some(())
+        })
+        .await;
+    }
+}
+
+/// KR-REQ-26.10, KR-REQ-26.08: the update brings the delivery journal to version 11 and keeps what
+/// it holds; this release writes it; and after a rollback the release before opens it at 11,
+/// writes it too, and the file still says 11. The privacy generation is what the suite can see of
+/// the journal: no `kr` command reads a notification. Each daemon writes it from the privacy
+/// record it keeps, so the case shows the open, the write and the version, and not the content of
+/// a notification.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_the_delivery_journal_at_version_11_and_the_release_before_reads_it() {
+    let prepared = Updated::prepare(Setup::default()).await;
+    let host = &prepared.host;
+
+    // The release before writes the journal at version 10: two turns of privacy mode are
+    // generation 2.
+    privacy_on_and_off(host).await;
+    assert_eq!(delivery_journal_of(host), (10, 2));
+
+    // The update brings it to 11 and keeps the generation.
+    let updated = prepared.update().await;
+    let host = &updated.host;
+    assert_eq!(
+        delivery_journal_of(host),
+        (11, 2),
+        "the update brought the journal to version 11 and kept what it held"
+    );
+
+    // This release writes it.
+    privacy_on_and_off(host).await;
+    assert_eq!(delivery_journal_of(host), (11, 4));
+
+    // The rollback starts the release before's daemon, which opens the journal at version 11,
+    // reads the generation this release wrote and writes the next ones.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    assert_eq!(delivery_journal_of(host), (11, 4));
+    privacy_on_and_off(host).await;
+    assert_eq!(
+        delivery_journal_of(host),
+        (11, 6),
+        "the release before wrote the journal and left its version alone"
+    );
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
 /// The retained output an export document carries, joined.
 fn exported_output(document: &Value) -> Vec<u8> {
     use base64::Engine as _;
