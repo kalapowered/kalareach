@@ -253,7 +253,6 @@ async fn run(
     // Held until the daemon has taken its environment: an update that switches `current` from then
     // on hands the environment over first.
     let controller = {
-        #[cfg(unix)]
         let _starting = hold_the_start(running, &paths, &environment)?;
         kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
             paths: environment.clone(),
@@ -363,7 +362,6 @@ fn starter(_arguments: &Arguments) -> ExitCode {
 /// while it switches `current`. So `current` cannot change between this daemon's look at it and its
 /// taking the environment: a daemon that finds another release current has been superseded, and
 /// exits rather than serving an environment the current release's daemon is about to serve.
-#[cfg(unix)]
 fn hold_the_start(
     running: &Running,
     paths: &HostPaths,
