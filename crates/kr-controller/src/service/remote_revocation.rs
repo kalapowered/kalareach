@@ -707,11 +707,13 @@ impl Controller {
     /// written, so a registry that cannot take a write restricts all the same.
     ///
     /// It rises as the other refusals do, in the order a withdrawal takes its locks in, so that
-    /// work which checked the refusal before it rose has committed before it returns, and it ends
-    /// the links of the connections it reaches. It does not wait for the writes to the pairing
-    /// records that were under way, as the two refusals on every remote grant do: an owner
-    /// confirmation reads those two and never the removal, so the wait would order nothing, and a
-    /// registry that cannot take a write would keep the removal from being recorded and shown.
+    /// work which holds the registry's guard or the connection table from its check to its commit
+    /// is wholly before it or wholly after it, and it ends the links of the connections it
+    /// reaches. It does not wait for the writes to the pairing records that were under way, as the
+    /// two refusals on every remote grant do. A write that read the standing before the removal
+    /// rose, an owner confirmation among them, can commit after the raise has returned: nothing
+    /// that follows depends on the order, and a registry that cannot take a write would keep the
+    /// removal from being recorded and shown.
     async fn refuse_the_grants_that_rest_on_the_feed(&self) {
         if self
             .put_a_feed_refusal(
@@ -1088,9 +1090,11 @@ impl Controller {
     ///
     /// A raise first takes the registry's guard and then the connection table, the order a
     /// withdrawal takes them in (registry, policy, table), so a write that holds either from its
-    /// check to its commit is wholly before the raise or wholly after it: nothing admitted before
-    /// the refusal rose completes under the standing it was admitted under. A lift needs no order.
-    /// Nothing is taken when the word already says what is asked.
+    /// check to its commit is wholly before the raise or wholly after it. A write that releases
+    /// them before its commit is not ordered by this: a write to the pairing records that read the
+    /// word before it rose commits after it, and the wait of [`Self::move_a_feed_refusal`] is what
+    /// orders those. A lift needs no order. Nothing is taken when the word already says what is
+    /// asked.
     async fn put_a_feed_refusal(
         &self,
         bit: u8,
@@ -1239,16 +1243,7 @@ impl Controller {
         &self,
         grant: Option<&kr_protocol::grant::Grant>,
     ) -> Option<crate::grants::Refusal> {
-        if let Some(standing) = self.feed_refusal.standing() {
-            return Some(standing);
-        }
-        let word = self.feed_refusal.word();
-        (word & RemoteRefusal::FEED_REMOVED != 0
-            && grant.is_some_and(|grant| {
-                grant.organisation.is_present()
-                    || word & RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED != 0
-            }))
-        .then_some(crate::grants::Refusal::AuthorityFeedRemoved)
+        self.feed_refusal.standing_of(grant)
     }
 
     /// The refusal the authority feed puts on `connection` now, when it came through the network
@@ -2077,10 +2072,10 @@ mod tests {
     }
 
     /// KR-REQ-24.15: the feed's removal of this host rises at once while a write to the pairing
-    /// records is held. No owner confirmation reads the removal, so the carrier raises it and ends
-    /// the links it reaches without the wait that the two refusals on every remote grant make, and
-    /// a registry that cannot take a write does not keep the grants that rest on the feed from
-    /// being refused. Another handle holds a write here.
+    /// records is held. The carrier raises it and ends the links it reaches without the wait that
+    /// the two refusals on every remote grant make, and a registry that cannot take a write does
+    /// not keep the grants that rest on the feed from being refused. Another handle holds a write
+    /// here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_removal_of_the_host_rises_at_once_while_a_write_to_the_pairing_records_is_held() {
         use crate::service::a_transfer_left_unanswered::daemon;

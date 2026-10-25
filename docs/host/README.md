@@ -6822,9 +6822,9 @@ carrier reads no more of the feed, and `kr doctor` shows the check as a warning 
 refusal waits for the registry to take a write, since when, and why; the log says it when the
 wait is first found stuck and when its reason changes. The
 wait asks again by itself and goes on when the registry takes a write. The feed's removal
-of the host does not wait: no owner confirmation reads it, so the carrier raises it and ends the
-links it reaches at once, and a start that restores it waits for nothing, since no endpoint is bound
-yet and no confirmation can be under way. What
+of the host does not wait: the carrier raises it and ends the links it reaches at once, and a start
+that restores it waits for nothing, since no endpoint is bound yet and no confirmation can be under
+way. A spend that read the removal clear before it rose commits after it. What
 a spend that had committed before the refusal rose goes on
 to do, such as trusting a catalogue or installing a plugin, commits under that spend. The terminal is left as it is: it confirms the pairing of a first
 owner and the end of exclusive organisation management, and on a host that has an owner it confirms
@@ -6845,6 +6845,17 @@ commits. The host does not end the link to the worker of a connection it newly r
 that checked the standing just before the change can commit under it, so input that a worker already
 holds for such a connection can still reach the terminal. The owner at the machine
 is never refused, and can stop any session locally.
+
+An owner confirmation that a remote owner device signed is spent under the standing of that
+device's pairing grant, so the removal refuses it, with `PERMISSION_DENIED` and the words of the
+removal, when that grant rests on the feed, and leaves it alone when it does not. The removal is read
+where the confirmation is spent, as it is at admission, and a spend that read it clear before it
+rose commits. A host can be left with no way to confirm: every owner device it has rests on the
+removed feed, and the terminal does not open. The terminal confirms the pairing of a first owner and
+the host's clock only while the host has no owner, and the end of exclusive organisation management
+only while the host is exclusive and no device that could confirm for it is left, which it counts
+without asking the removal. The owner then points `authority.origin` at another feed or at none and
+starts the daemon again, which ends the removal.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says

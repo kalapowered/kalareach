@@ -6,7 +6,7 @@
 //! because a check that runs inside a transaction cannot take that lock again. Everything that
 //! commits on a remote device's authority reads it there: a request admitted before a refusal rose
 //! does not complete under the standing it had, and nor does an owner confirmation a remote owner
-//! device signed.
+//! device signed, which is spent under the standing of that device's pairing grant.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -54,14 +54,32 @@ impl RemoteRefusal {
 
     /// The refusal that stands on every remote grant now, if one does: being behind the feed, or a
     /// withdrawal this host cannot verify. The feed's removal of this host is not among them,
-    /// because it refuses by kind of grant.
+    /// because it refuses by kind of grant ([`Self::standing_of`]).
     #[must_use]
     pub fn standing(&self) -> Option<Refusal> {
+        self.standing_of(None)
+    }
+
+    /// The refusal that stands now for `grant`, if one does: the two that stand on every remote
+    /// grant, and the feed's removal of this host when `grant` rests on the feed. That is an
+    /// organisation's grant, and a personal one while personal grants rest on the feed. No grant is
+    /// no removal.
+    ///
+    /// The word is read once, so the answer is one reading of the refusals.
+    #[must_use]
+    pub fn standing_of(&self, grant: Option<&kr_protocol::grant::Grant>) -> Option<Refusal> {
         let word = self.word();
         if word & Self::BEHIND_ITS_FEED != 0 {
             Some(Refusal::BehindItsFeed)
         } else if word & Self::WITHDRAWAL_UNVERIFIED != 0 {
             Some(Refusal::WithdrawalUnverified)
+        } else if word & Self::FEED_REMOVED != 0
+            && grant.is_some_and(|grant| {
+                grant.organisation.is_present()
+                    || word & Self::PERSONAL_GRANTS_REST_ON_THE_FEED != 0
+            })
+        {
+            Some(Refusal::AuthorityFeedRemoved)
         } else {
             None
         }

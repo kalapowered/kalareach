@@ -1481,10 +1481,13 @@ fn signer_still_authorised(
         ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
             // A refusal the authority feed puts on every remote grant takes an owner device's
             // standing away whole, and what that device signed is spent under the standing the
-            // refusal leaves it. This is read inside the spend's transaction, which holds the
-            // pairing records' write lock, and a refusal that is raised waits for it
+            // refusal leaves it. The feed's removal of this host does the same to a device whose
+            // grant rests on the feed (below), and leaves one whose grant does not alone. This is
+            // read inside the spend's transaction, which holds the pairing records' write lock, and
+            // a refusal on every grant that is raised waits for it
             // ([`Controller::wait_for_the_confirmations_being_spent`]): a confirmation is spent
-            // wholly before the refusal rose or wholly refused by it.
+            // wholly before such a refusal rose or wholly refused by it. The removal does not wait:
+            // a spend that read the word clear before it rose commits after it.
             if let Some(standing) = refusal.standing() {
                 return Err(ControllerError::PermissionDenied {
                     detail: standing.detail(),
@@ -1507,6 +1510,9 @@ fn signer_still_authorised(
                 .map_err(ControllerError::registry)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(ControllerError::registry)?;
+            // A key can be held by more than one live row, so the removal is asked of each row that
+            // would stand, and its words are used only when none stands but for it.
+            let mut removed = None;
             let standing = rows.iter().any(|(device_id, key, grant)| {
                 let signed = <[u8; 32]>::try_from(key.as_slice()).is_ok_and(|key| {
                     kr_crypto::keys::key_id(KeyPurpose::Authorisation, &key) == proof.signer_key_id
@@ -1514,12 +1520,27 @@ fn signer_still_authorised(
                 signed
                     && uuid(Some(device_id)).is_ok_and(|device_id| {
                         decode::<Grant>(grant).is_ok_and(|grant| {
-                            grant.permits(ActionRight::HostManage)
-                                && lifetimes.in_force_now(DeviceId::new(device_id), &grant)
+                            if !(grant.permits(ActionRight::HostManage)
+                                && lifetimes.in_force_now(DeviceId::new(device_id), &grant))
+                            {
+                                return false;
+                            }
+                            match refusal.standing_of(Some(&grant)) {
+                                Some(refused) => {
+                                    removed.get_or_insert(refused);
+                                    false
+                                }
+                                None => true,
+                            }
                         })
                     })
             });
             if !standing {
+                if let Some(refused) = removed {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: refused.detail(),
+                    });
+                }
                 return Err(lapsed(
                     "the device that answered this confirmation is no longer an owner device of \
                      this host",

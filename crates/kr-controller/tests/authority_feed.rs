@@ -1301,6 +1301,42 @@ async fn an_owner_confirmation_a_remote_owner_device_signed_is_not_spent_while_t
         .expect("a confirmation signed once the refusal has ended is spent");
 }
 
+/// KR-REQ-24.15: an owner confirmation a remote owner device signed is not spent after the feed
+/// removed the host when that device's grant rests on the feed: here the owner bounded offline
+/// validity, so the personal grant of the device rests on it. The removal takes the standing of such
+/// a device away at the door and where its confirmation is spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_confirmation_is_not_spent_after_the_feed_removed_the_host_when_the_signers_grant_rests_on_it()
+ {
+    let rig = Rig::start().await;
+    rig.the_owner_bounds_offline_validity();
+    rig.the_feed_removes_the_host().await;
+    let mut local = rig.host.client().await;
+    let refused = rig
+        .owner_device_invites(&mut local)
+        .await
+        .expect_err("a confirmation is not spent under a grant that rests on a removed feed");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("was removed"),
+        "refused for the removal and in its words: {refused:?}"
+    );
+}
+
+/// KR-REQ-24.15: the removal leaves alone an owner device whose grant does not rest on the feed, the
+/// default non-expiring owner grant: what it signed is spent after the removal, so the owner who
+/// has such a device still confirms without the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_confirmation_is_spent_after_the_feed_removed_the_host_when_the_signers_grant_does_not_rest_on_it()
+ {
+    let rig = Rig::start().await;
+    rig.the_feed_removes_the_host().await;
+    let mut local = rig.host.client().await;
+    rig.owner_device_invites(&mut local)
+        .await
+        .expect("a grant that does not rest on the feed is not refused by its removal");
+}
+
 /// KR-REQ-24.15: the terminal confirms the pairing of a host's first owner while the host refuses
 /// remote grants, as it does otherwise: a host with no owner has no remote owner device to
 /// confirm, and no device to refuse.
