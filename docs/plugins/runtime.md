@@ -525,10 +525,10 @@ the daemon answers with the runtime of the protocol the worker's level speaks.
   adopted, or that the daemon started for an earlier worker, may be of another release of the same
   level, and it serves every worker of that level, since they speak one surface; the pinning of a
   worker to the release it was started with holds for the launch and not for a host that is shared.
-- A host keeps no release store on Windows, and neither does a tree that is not installed in one.
-  Where there is none, and no host of the retained protocol runs, the daemon starts none and answers
-  that the runtime cannot be reached, with the reason, and answers the same each time it is asked.
-  The terminal and every other binding of that worker carry on, and the worker's rich
+- A daemon on Windows starts no host of a retained protocol from a release store, and a tree that is
+  not installed in one has none. Where it starts none, and no host of the retained protocol runs, the
+  daemon answers that the runtime cannot be reached, with the reason, and answers the same each time
+  it is asked. The terminal and every other binding of that worker carry on, and the worker's rich
   bindings are unavailable until its session ends, as they are after a crash of the runtime. This is
   the case of a worker of the release before that first needs a runtime after an update, or whose
   host has been lost; a host that runs is adopted wherever it is.
