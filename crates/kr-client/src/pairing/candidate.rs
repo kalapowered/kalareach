@@ -64,7 +64,7 @@ use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
 use super::BoxFuture;
-use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host, selection_refused};
+use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
 use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
 use super::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
@@ -1673,7 +1673,9 @@ fn link_failed(error: &LinkError, tries: Option<u32>) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, false),
         LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
-        LinkError::Selection(refusal) => selection_refused(refusal),
+        // The host answered, and what it answered is not the host the bundle names: a new try gets
+        // the same answer, and costs one of this device's tries.
+        LinkError::Selection(_) => FailureKind::HostMismatch,
         LinkError::Configuration(_) => FailureKind::DidNotFinish,
     };
     PairingFailure::new(kind, error.said()).with_tries(tries)

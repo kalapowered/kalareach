@@ -13,7 +13,6 @@
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::pairing::PairingConsumedReason;
-use kr_transport::error::SelectionRefusal;
 use serde::Serialize;
 
 use crate::shown::{Said, Shown};
@@ -179,20 +178,6 @@ pub fn refused_by_host(code: ErrorCode, direct: bool) -> FailureKind {
         ErrorCode::PairingAuthFailed => FailureKind::NotAuthenticated,
         ErrorCode::PairingAttemptsExhausted if !direct => FailureKind::HostTriesUsed,
         ErrorCode::PairingExpired => FailureKind::Expired,
-        _ => FailureKind::DidNotFinish,
-    }
-}
-
-/// What a host selection this device refused means for the attempt.
-///
-/// A host that answers under another endpoint's identity is not the host the invitation names. A
-/// host that answers an offer with a selection that does not fit it is the one named, and speaks
-/// an exchange this device did not offer: the attempt cannot go on, and the evidence does not let
-/// a person act on more than that.
-#[must_use]
-pub const fn selection_refused(refusal: &SelectionRefusal) -> FailureKind {
-    match refusal {
-        SelectionRefusal::OtherEndpoint => FailureKind::HostMismatch,
         _ => FailureKind::DidNotFinish,
     }
 }

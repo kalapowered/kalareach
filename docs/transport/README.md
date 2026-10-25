@@ -242,10 +242,11 @@ The first bidirectional stream carries four frames, in this order:
 A `Refused` reply, and an error answer on the unpaired pairing surface, reach the caller as
 `TransportError::Refused` with the peer's own protocol error, while `TransportError::Handshake` is
 this side's own conclusion, such as a reply that never came, a stream that ended or an answer to
-another request, and says nothing about what the peer decided. A client that refuses the host's
-selection, on the paired path and the unpaired one alike, reports `TransportError::Selection`: a
-version, capability or limit outside its offer, a nonce the selection does not echo, or an endpoint
-other than the one that answered.
+another request, and says nothing about what the peer decided. A selection that a client refuses
+because it does not answer the offer (a version, capability or limit outside the offer, or a nonce
+it does not echo) or because it names an endpoint other than the one that answered reaches the
+caller as `TransportError::Selection`, on the paired path and the unpaired one alike. An extension
+the offer did not carry and limits below the floor stay `TransportError::Handshake`.
 
 The host verifies the client's proof before sending its own, so a peer that cannot prove its
 authorisation key never obtains the host's signature over a transcript it chose.

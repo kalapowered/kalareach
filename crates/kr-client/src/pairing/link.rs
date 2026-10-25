@@ -59,8 +59,9 @@ use crate::transport::{ControlTransport, NetworkTransport};
 /// Why a call to a host did not answer.
 ///
 /// What it says is the host's own refusal or the membership failure, through [`Shown::protocol`],
-/// or which of the other two it was. The text those two carry is not said: this library puts only
-/// what a reducer decided there, and anything else that builds one can put any text there.
+/// the check that refused a selection, in this program's own words, or which of the other two it
+/// was. The text those two carry is not said: this library puts only what a reducer decided
+/// there, and anything else that builds one can put any text there.
 #[derive(Clone, PartialEq, Eq)]
 pub enum LinkError {
     /// The host answered with a refusal of its own.
@@ -76,7 +77,8 @@ pub enum LinkError {
     /// The host answered, and this device refused its selection before using anything under it:
     /// the selection names another endpoint than the one that answered, or does not answer this
     /// device's offer. The host is reachable and is not who it said, or not speaking the exchange
-    /// that was offered, which a new try does not change.
+    /// that was offered, which a new try does not change. Both pairing flows end such an attempt as
+    /// a host that did not match.
     Selection(SelectionRefusal),
     /// The network configuration a host gave could not be used.
     Configuration(String),
@@ -221,6 +223,10 @@ pub trait HostLink: Send + Sync {
     ) -> BoxFuture<'a, Result<Connection, LinkError>>;
 
     /// Opens the pre-authorisation surface on `connection`, offering `identity`.
+    ///
+    /// The surface it returns holds a selection that answers the offer and names the endpoint that
+    /// answered on `connection`: a link that opens one on another footing breaks the pairing
+    /// flows, which rely on that and do not check it again.
     fn open_unpaired<'a>(
         &'a self,
         connection: &'a Connection,

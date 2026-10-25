@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use super::candidate::{
     AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, Unpaired, WAIT_STEP, awaiting, ended, within,
 };
-use super::failure::{FailureKind, PairingFailure, refused_by_host, selection_refused};
+use super::failure::{FailureKind, PairingFailure, refused_by_host};
 use super::link::{ConnectionPeer, LinkError};
 use super::paired::{AttemptMode, PairedHost, PendingAttempt};
 use crate::shown::{Said, Shown};
@@ -207,7 +207,9 @@ fn reached(error: &LinkError) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, true),
         LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
-        LinkError::Selection(refusal) => selection_refused(refusal),
+        // The host answered, and what it answered is not the host the invitation names: a new try
+        // gets the same answer.
+        LinkError::Selection(_) => FailureKind::HostMismatch,
         LinkError::Configuration(_) => FailureKind::NotAnInvitation,
     };
     PairingFailure::new(kind, error.said())

@@ -133,10 +133,15 @@ async fn scripted_host(selects: Selects) -> (DirectQrPayload, JoinHandle<bool>) 
             .write_message(&HelloReply::Selected(Box::new(selection)))
             .await
             .expect("the selection is sent");
-        let asked = matches!(
-            tokio::time::timeout(ASKING, reader.read_message::<Request>()).await,
-            Ok(Ok(Some(_)))
-        );
+        // The device either asks the host something or lets the connection go; one that does
+        // neither inside the wait is stuck, and the case reports it as such.
+        let asked = match tokio::time::timeout(ASKING, reader.read_message::<Request>()).await {
+            Ok(Ok(Some(_))) => true,
+            Ok(_) => false,
+            Err(_) => {
+                panic!("the device neither asked the host anything nor let the connection go")
+            }
+        };
         // Nothing is answered: the stream ends, and the connection is let go.
         writer.finish_and_flush(Duration::from_secs(1)).await;
         asked
@@ -190,23 +195,22 @@ async fn a_selection_naming_another_endpoint_is_a_host_that_did_not_match() {
     );
 }
 
-/// KR-REQ-10.19: a selection that does not answer the offer ends the attempt as one that did not
-/// finish, with nothing asked of the host, and not as a host that could not be reached.
+/// KR-REQ-10.19: a selection that does not answer the offer is also a host that did not match,
+/// with nothing asked of it, and not a host that could not be reached: asking again gets the same
+/// answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_selection_that_does_not_answer_the_offer_is_not_an_unreachable_host() {
     assert_eq!(
         ending(Selects::AnotherNonce).await,
-        (FailureKind::DidNotFinish, false)
+        (FailureKind::HostMismatch, false)
     );
 }
 
 /// KR-REQ-10.19: the control for both. A selection that answers the offer under the endpoint that
-/// answers is accepted, and the device goes on to ask the host for its challenge; the host then
-/// answers nothing, which is a host that could not be reached.
+/// answers is accepted, and the device goes on to ask the host for its challenge, which the other
+/// two cases show it does not when it refuses the selection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_selection_that_answers_the_offer_is_asked_for_a_challenge() {
-    assert_eq!(
-        ending(Selects::Correctly).await,
-        (FailureKind::HostUnreachable, true)
-    );
+    let (_, asked) = ending(Selects::Correctly).await;
+    assert!(asked, "the device asked the host for its challenge");
 }
