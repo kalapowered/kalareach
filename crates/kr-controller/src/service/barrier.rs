@@ -1320,7 +1320,7 @@ impl Controller {
                         })
                         .flatten()
                         .collect();
-                let mut admitted = self.admitted_write();
+                let mut admitted = self.admitted_withdraw();
                 if host_wide {
                     admitted.retain(|_, connection| connection.admitted_revision >= revision);
                 } else {

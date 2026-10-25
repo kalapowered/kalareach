@@ -397,9 +397,9 @@ impl Controller {
     /// What has been withdrawn already is refused before the record is read. After that the store
     /// writes and flushes the new record, and replaces the old one through [`StepStanding`], which
     /// runs the replacement only while the registration, the authority revision and the accepted
-    /// deadline stand: [`Self::under_registration`] holds the connection table across that check
-    /// and the replacement, so a revocation lands wholly before it or wholly after, and a deadline
-    /// that passes while the record is being written leaves the old record. The table is not held
+    /// deadline stand: [`Self::under_registration`] holds the registration standing across that
+    /// check and the replacement, so a revocation lands wholly before it or wholly after, and a deadline
+    /// that passes while the record is being written leaves the old record. Nothing is held
     /// while the file is written and flushed, or while a replacement that the platform refuses for
     /// a moment waits to be tried again.
     async fn machine_perform(

@@ -1010,8 +1010,9 @@ const HELD_COMMITS: usize = 2;
 /// and the runtime here has one worker, so a key could not reach the application until the change
 /// was done. A change also holds its connection's registration standing for the length of each
 /// commit, and a key is decided under the same table of registrations, which it must not wait
-/// behind. The case holds the change inside two of its commits, with the registration held, types
-/// a key at each and waits for the application to have it, and only then lets the change go on; a
+/// behind, whether or not another connection comes or goes meanwhile. The case holds the change
+/// inside two of its commits, with the registration held, connects a second device and lets it go,
+/// types a key and waits for the application to have it, and only then lets the change go on; a
 /// change that held the worker or the table is let go by the watchdog five seconds later, which
 /// fails the case. It decides by what reached the application, never by how long anything took.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1189,6 +1190,10 @@ impl Holds {
                     "{method:?}: the change never reached commit {held}; its answer: {answer:?}"
                 );
             }
+            // A device that connects and goes while the change is inside its commit: the host
+            // registers it and withdraws it, and neither waits for the commit or stops a key.
+            let (device, record) = &rig.paired;
+            RawDevice::connect(&rig.host, device, record).await.close();
             rig.send_key(b"k").await;
             let arrived = rig.until_everything_typed_arrived().await;
             assert!(
