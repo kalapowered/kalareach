@@ -57,11 +57,37 @@ fn what_holds_it_is_gone(error: &kr_ipc::IpcError) -> Option<&std::io::Error> {
         return None;
     };
     let gone = source.kind() == std::io::ErrorKind::NotFound
-        || source.raw_os_error().is_some_and(|code| {
-            [libc::ENOTDIR, libc::ESTALE, libc::ENODEV, libc::ENXIO].contains(&code)
-        });
+        || source
+            .raw_os_error()
+            .is_some_and(|code| WHAT_IS_GONE.contains(&code));
     gone.then_some(source)
 }
+
+/// The errors that say what holds an identity is gone, besides a name that is not there: a
+/// directory above is not a directory, the file system behind it is stale, or its device or address
+/// is not there.
+#[cfg(unix)]
+const WHAT_IS_GONE: [i32; 4] = [libc::ENOTDIR, libc::ESTALE, libc::ENODEV, libc::ENXIO];
+
+/// The errors that say what holds an identity is gone, besides a name that is not there: a
+/// directory above is not a directory, a drive or a network name is not there, or a device is not
+/// ready or not connected.
+#[cfg(windows)]
+const WHAT_IS_GONE: [i32; 7] = {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST, ERROR_DIRECTORY,
+        ERROR_INVALID_DRIVE, ERROR_NOT_READY, ERROR_NETNAME_DELETED,
+    };
+    [
+        ERROR_DIRECTORY.cast_signed(),
+        ERROR_INVALID_DRIVE.cast_signed(),
+        ERROR_NOT_READY.cast_signed(),
+        ERROR_BAD_NETPATH.cast_signed(),
+        ERROR_DEV_NOT_EXIST.cast_signed(),
+        ERROR_BAD_NET_NAME.cast_signed(),
+        ERROR_NETNAME_DELETED.cast_signed(),
+    ]
+};
 
 /// Every environment the store's daemons have served whose state is still there, in the order of
 /// their identities: the order their locks are taken in, and the roots of those whose state is

@@ -2072,6 +2072,12 @@ async fn start_one(
             crate::startup::start_by_service(&known, &handover::majors_of(store, current)).await?;
             handover::answers_as(store, &environment, current, None).await
         }
+        #[cfg(windows)]
+        Start::Arguments { .. } => Err(CliError::Other(Shown::said(
+            "a daemon recorded as started with arguments is not started again on this system, where \
+             the environment's scheduled task starts every daemon",
+        ))),
+        #[cfg(unix)]
         Start::Arguments {
             arguments,
             working_directory,
@@ -2240,6 +2246,10 @@ fn settle(store: &Store, record: &mut Record) -> Result<()> {
 /// Which it was is decided by the configuration document the daemon itself reads, at the directory
 /// it said, and not by the one this command reads: a daemon started with variables of its own may
 /// read another, and the document of this command's environment says nothing of how it was started.
+///
+/// On Windows a daemon is created by the environment's scheduled task and by nothing else, so a
+/// daemon is started again by the task or the update does not stop it: [`restart_by_task`] decides
+/// that before anything is stopped.
 fn restart_of(
     environment: &inventory::Environment,
     started_as: &kr_protocol::update::HostUpdateHandoverResult,
@@ -2260,8 +2270,13 @@ fn restart_of(
         ),
         None => crate::startup::Chosen::read(&environment.paths),
     };
+    #[cfg(windows)]
+    restart_by_task(environment, started_as, &chosen)?;
+    #[cfg(unix)]
     let service =
         chosen.controller == Some(kr_protocol::hostinfo::configuration::ControllerStartup::Service);
+    #[cfg(windows)]
+    let service = true;
     Ok(Restart {
         environment: environment.environment_id,
         runtime_root: text(environment.host.runtime_root())?,
@@ -2277,6 +2292,86 @@ fn restart_of(
             }
         },
     })
+}
+
+/// Whether the daemon that answered `prepare` is one the environment's scheduled task starts again
+/// as it was, which is the only way a daemon is created on Windows.
+///
+/// All of these hold, or the update is deferred before it stops anything and says why: the daemon's
+/// configuration document chooses the standalone start; the daemon was started with exactly the
+/// arguments and in the directory the task's starter gives a daemon, the environment's roots and its
+/// state directory, and no other (a key store named `file` or a worker program among them); it reads
+/// the configuration document this command's environment names; and the task is this installation's
+/// own, as it registers it, so that the task, run after the switch, starts the daemon of the release
+/// `current` then names.
+#[cfg(windows)]
+fn restart_by_task(
+    environment: &inventory::Environment,
+    started_as: &kr_protocol::update::HostUpdateHandoverResult,
+    chosen: &crate::startup::Chosen,
+) -> Result<()> {
+    let deferred = |why: Shown| {
+        CliError::UpdateDeferred(shown!(
+            "the control daemon of environment {} is not one the scheduled task starts again as it \
+             is, so the update stops nothing: {}; stop that daemon, then start it with kr new",
+            environment.environment_id,
+            why
+        ))
+    };
+    if chosen.controller
+        != Some(kr_protocol::hostinfo::configuration::ControllerStartup::Standalone)
+    {
+        return Err(deferred(Shown::said(
+            "its configuration document does not choose the standalone start, so it was started by \
+             hand",
+        )));
+    }
+    // Spelled as the starter spells them: the verbatim prefix is not part of a place's name.
+    let same = |one: &str, other: &std::path::Path| {
+        let plain = |text: &str| {
+            text.strip_prefix(r"\\?\")
+                .unwrap_or(text)
+                .trim_end_matches('\\')
+                .to_lowercase()
+        };
+        other
+            .to_str()
+            .is_some_and(|other| plain(one) == plain(other))
+    };
+    let arguments_match = matches!(
+        started_as.arguments.as_slice(),
+        [runtime_flag, runtime, state_flag, state]
+            if runtime_flag == "--runtime-dir"
+                && state_flag == "--state-dir"
+                && same(runtime, environment.host.runtime_root())
+                && same(state, environment.host.state_root())
+    );
+    if !arguments_match {
+        return Err(deferred(Shown::said(
+            "it was not started with the environment's roots and nothing else",
+        )));
+    }
+    if !same(&started_as.working_directory, environment.paths.state_dir()) {
+        return Err(deferred(Shown::said(
+            "it was started in another directory than the environment's state directory",
+        )));
+    }
+    let ours = crate::doctor::configuration::document_path(&environment.paths);
+    let theirs = started_as
+        .configuration_directory
+        .as_deref()
+        .map(|directory| {
+            std::path::Path::new(directory).join(kr_protocol::hostinfo::configuration::FILE_NAME)
+        });
+    if !theirs.as_deref().is_some_and(|theirs| {
+        ours.to_str()
+            .is_some_and(|ours| same(ours, theirs.as_path()))
+    }) {
+        return Err(deferred(Shown::said(
+            "it reads another configuration document than this command's environment names",
+        )));
+    }
+    crate::startup::task_is_this_installation_s(&environment.paths).map_err(deferred)
 }
 
 /// What an update an earlier run left part way came to.
