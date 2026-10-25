@@ -38,6 +38,15 @@ fn spelled(id: &str) -> &'static [u8] {
         .bytes
 }
 
+/// The records the fixture states for a case.
+fn recorded(id: &str) -> &'static [KeyRecord] {
+    kr_term::conformance::WIN32_INPUT_CASES
+        .iter()
+        .find(|case| case.id == id)
+        .unwrap_or_else(|| panic!("no case {id}"))
+        .records
+}
+
 /// A record for one key going down, with nothing held.
 fn pressed(virtual_key: u16, scan_code: u16, unicode: u16) -> KeyRecord {
     KeyRecord {
@@ -181,6 +190,7 @@ fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08
         repeat: 1,
     };
     assert_eq!(encode_all(&[composed]), spelled("composed-character"));
+    assert_eq!(recorded("composed-character"), [composed]);
     assert_eq!(
         decode(spelled("composed-character")).expect("a record"),
         composed
@@ -197,6 +207,7 @@ fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08
     };
     let bytes = encode_all(&[high, low]);
     assert_eq!(bytes, spelled("character-outside-the-basic-plane"));
+    assert_eq!(recorded("character-outside-the-basic-plane"), [high, low]);
     assert_eq!(
         String::from_utf16(&[0xD867, 0xDE3D]).expect("a character"),
         "\u{29E3D}"
@@ -219,6 +230,10 @@ fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.56 */) {
     let composed_e = pressed(0x45, 0x12, 0x00EA); // LATIN SMALL LETTER E WITH CIRCUMFLEX
     let bytes = encode_all(&[dead_circumflex, composed_e]);
     assert_eq!(bytes, spelled("dead-key-then-the-character-it-composes"));
+    assert_eq!(
+        recorded("dead-key-then-the-character-it-composes"),
+        [dead_circumflex, composed_e]
+    );
     let sequences: Vec<&[u8]> = bytes
         .split_inclusive(|byte| *byte == b'_')
         .filter(|part| !part.is_empty())
@@ -253,6 +268,7 @@ fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.56 */) {
     assert!(at_sign.is_alt_graph());
     let encoded = encode_all(&[at_sign]);
     assert_eq!(encoded, spelled("alt-graph"));
+    assert_eq!(recorded("alt-graph"), [at_sign]);
     let read_back = decode(&encoded).expect("a record");
     assert_eq!(read_back.control_keys, at_sign.control_keys);
     assert!(read_back.is_alt_graph());
@@ -276,6 +292,7 @@ fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts(/* KR-REQ-08.
     };
     let bytes = encode_all(&[down, up]);
     assert_eq!(bytes, spelled("repeat-and-key-up"));
+    assert_eq!(recorded("repeat-and-key-up"), [down, up]);
     let sequences: Vec<&[u8]> = bytes
         .split_inclusive(|byte| *byte == b'_')
         .filter(|part| !part.is_empty())
