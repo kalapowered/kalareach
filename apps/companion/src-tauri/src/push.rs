@@ -122,6 +122,16 @@ const CHALLENGE_WAIT: Duration = Duration::from_millis(CHALLENGE_WITHIN_MS + 30_
 /// answers must not hold every choice of previews and every filing for every host for ever.
 const KEYS_WITHIN: Duration = Duration::from_secs(10);
 
+/// The change a run makes over the line to a host that stopped it.
+#[derive(Clone, Copy)]
+enum Step {
+    /// Reaching the host.
+    Connect,
+    /// The registration, which carries the credential and the choice of previews.
+    Register,
+    /// Telling the host which preview key this phone holds.
+    PreviewKey,
+}
 
 /// The soonest the same host is tried again after a try that needed the person: asking the system
 /// or the gateway again at every foreground would be a loop with a person in it.
@@ -1544,25 +1554,32 @@ impl PushDesk {
         // sent nothing until the run is asked about again: before the connection, after it, and
         // before each of the changes.
         let wanted = || self.wanted(host.host_device_id, run);
-        let not_taken = |stop: LineStop, issued: bool| -> Stop {
+        let not_taken = |stop: LineStop, step: Step| -> Stop {
             if !wanted() {
                 return forgotten_host();
             }
-            match stop {
-                LineStop::Phone(words) => words.into(),
+            match (stop, step) {
+                (LineStop::Phone(words), _) => words.into(),
+                // The host took the registration, and it is the preview key that it did not take
+                // or did not answer: it holds this phone as a destination.
+                (LineStop::Host(words), Step::PreviewKey) => format!(
+                    "The host took this phone as a destination, but did not take its preview \
+                     key: {words}"
+                )
+                .into(),
                 // The gateway issued before the host was asked, and an issue retires the credential
                 // the host holds: a host that refuses what follows, or whose answer is lost, may
                 // hold one the gateway no longer takes, and may not be able to notify this phone
                 // until a registration is taken.
-                LineStop::Host(words) if !full && issued => format!(
+                (LineStop::Host(words), Step::Register) if !full => format!(
                     "The host did not take this choice of previews, and it may not be able to \
                      notify this phone until it takes a registration: {words}"
                 )
                 .into(),
-                LineStop::Host(words) if !full => {
+                (LineStop::Host(words), _) if !full => {
                     format!("The host did not take this choice of previews: {words}").into()
                 }
-                LineStop::Host(words) => {
+                (LineStop::Host(words), _) => {
                     format!("The host did not take this phone as a destination: {words}").into()
                 }
             }
@@ -1574,7 +1591,7 @@ impl PushDesk {
             .registrar
             .connect(host, reach)
             .await
-            .map_err(|words| not_taken(LineStop::Host(words), false))?;
+            .map_err(|words| not_taken(LineStop::Host(words), Step::Connect))?;
         if !wanted() {
             return Err(forgotten_host());
         }
@@ -1598,7 +1615,7 @@ impl PushDesk {
             previews_enabled: previews,
         })
         .await
-        .map_err(|stop| not_taken(stop, true))?;
+        .map_err(|stop| not_taken(stop, Step::Register))?;
         if !wanted() {
             return Err(forgotten_host());
         }
@@ -1618,7 +1635,7 @@ impl PushDesk {
                 revision,
             )
             .await
-            .map_err(|stop| not_taken(stop, true))?;
+            .map_err(|stop| not_taken(stop, Step::PreviewKey))?;
         }
         // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);

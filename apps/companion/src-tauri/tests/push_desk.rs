@@ -328,6 +328,8 @@ struct Registered {
     hold_answer: bool,
     /// What the registration ends in instead of the host's answer.
     register_stops: Option<LineStop>,
+    /// What telling the host the preview key ends in instead of the host's answer.
+    key_update_stops: Option<LineStop>,
     /// What a connection to the host fails with, when it does.
     connect_fails: Option<String>,
 }
@@ -422,12 +424,12 @@ impl HostLine for Line {
         _revision: DeviceKeyRevision,
     ) -> LineFuture<'_, ()> {
         Box::pin(async move {
-            self.script
-                .lock()
-                .expect("what was handed")
-                .keys
-                .push((self.host, preview_key));
-            Ok(())
+            let mut script = self.script.lock().expect("what was handed");
+            script.keys.push((self.host, preview_key));
+            match script.key_update_stops.clone() {
+                Some(stop) => Err(stop),
+                None => Ok(()),
+            }
         })
     }
 }
@@ -1737,6 +1739,45 @@ async fn a_host_unpaired_while_the_gateway_issues_for_it_is_told_nothing() {
     })
     .await;
     assert_eq!(sent(&phone), (1, 0, 0));
+}
+
+/// KR-REQ-16.08: a host that took the registration and then did not take the preview key holds this
+/// phone as a destination, and the row does not say it refused the destination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_took_the_registration_and_refused_the_key_is_not_said_to_refuse_the_destination()
+ {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let reference = phone.references().remove(0);
+    phone
+        .registered
+        .lock()
+        .expect("the script")
+        .key_update_stops = Some(LineStop::Host("the host did not take it".to_owned()));
+
+    phone.desk.enable(&reference).expect("the person asks");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    let words = phone.view().hosts[0].words.clone();
+    assert!(
+        words.starts_with(
+            "The host took this phone as a destination, but did not take its preview key"
+        ),
+        "{words:?}"
+    );
+    assert_eq!(
+        phone
+            .registered
+            .lock()
+            .expect("the script")
+            .credentials
+            .len(),
+        1,
+        "the host was registered"
+    );
 }
 
 /// KR-REQ-16.08: the gateway issues the authorisation for a host once the host has been reached.

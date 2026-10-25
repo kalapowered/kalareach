@@ -550,7 +550,9 @@ host. "Try again" on such a row does the same and starts no sequence, since a se
 gateway's issues and retire the credential the host holds without changing what the store refuses.
 A host that refuses a change of previews, or whose answer is lost, after the gateway has issued for it
 may be left with a credential the gateway no longer takes, and the row says that it may not be able to
-notify this phone until it takes a registration.
+notify this phone until it takes a registration. A host that took the registration and then refused
+the preview key, or whose answer to the key was lost, is said to hold this phone as a destination and
+not to have taken its key.
 
 The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
 `push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. Every view
