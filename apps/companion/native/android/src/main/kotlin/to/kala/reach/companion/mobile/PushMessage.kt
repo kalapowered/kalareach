@@ -113,6 +113,11 @@ enum class Posting {
  * alert goes up first, and a preview that opens replaces it in place, under the same tag and
  * without a second sound. A message with no sealed preview has nothing to open and is shown once.
  *
+ * The decision about a sealed preview, from the first read of the keys to the post of the preview,
+ * is made under [PreviewKeyGate]: the person turning previews off waits for it to finish, and a
+ * decision that starts after reads the keys as the person left them. So no preview is posted from
+ * keys that the person had already taken away.
+ *
  * `decide` is the decision about the preview. `show` posts a plan the way it is told, and says
  * whether it posted. `repeated` says an earlier try of this delivery may already have posted its
  * alert, so that this try's first post does not sound again. Returns the plan the delivery ended
@@ -125,20 +130,21 @@ fun showDelivery(
     show: (plan: NotificationPlan, posting: Posting) -> Boolean
 ): NotificationPlan {
     val first = if (repeated) Posting.REPEAT else Posting.NEW
-    val opens = PREVIEW_KEY in delivery.data
-    if (opens) {
-        show(NotificationPlan(delivery.collapseId, delivery.alert, reason = "opening"), first)
+    if (PREVIEW_KEY !in delivery.data) {
+        // Nothing to open: the keys are not read, and the one post is the whole of it.
+        val plan = planNotification(delivery, decide())
+        show(plan, first)
+        return plan
     }
-    val decision = decide()
-    val plan = planNotification(delivery, decision)
-    return when {
-        !opens -> {
-            show(plan, first)
+    show(NotificationPlan(delivery.collapseId, delivery.alert, reason = "opening"), first)
+    return PreviewKeyGate.deciding {
+        val decision = decide()
+        val plan = planNotification(delivery, decision)
+        // The alert is already up, and a preview that stayed closed says nothing more.
+        if (decision is PreviewDecision.Reveal && !show(plan, Posting.REPLACEMENT)) {
+            plan.copy(reason = ALERT_GONE)
+        } else {
             plan
         }
-        // The alert is already up, and a preview that stayed closed says nothing more.
-        decision is PreviewDecision.Reveal && !show(plan, Posting.REPLACEMENT) ->
-            plan.copy(reason = ALERT_GONE)
-        else -> plan
     }
 }

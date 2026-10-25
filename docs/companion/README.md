@@ -499,7 +499,12 @@ Below those words, once the person has asked for notifications, a switch named "
 what a notification shows: what needs the person (on, which is the default), or only that something
 does. The switch reads as changed at once and waits while a step runs. Turning it off takes the host's
 key out of what the phone's receivers hold before the host is told, so a preview already on its way is
-not opened; turning it on files the key first. The host is then told with `device.push.register`,
+not opened; turning it on files the key first. A receiver that is deciding at that moment is ordered
+against the change. On Android, the change of the keys waits until every receiver that is deciding has
+posted what it decided, and a receiver that starts later reads the keys as the person left them. On
+iOS, the extension reads the host's key again after it opens the preview and shows the preview only if
+that key is still there; a notification that passed this read before the key was removed was already
+on its way to the screen. The host is then told with `device.push.register`,
 which carries the choice: a host seals nothing and names no recipient key in later notifications when
 it is off. Only that registration is repeated, under the authorisation identifier the phone already
 keeps and with no new token proposal. A host that cannot be told leaves the row needing the person,

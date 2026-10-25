@@ -316,6 +316,12 @@ in the shared one. Both groups carry the team prefix the build resolves, and a b
 none refuses to read or write rather than searching its own default group. On Android the set is one
 item in a directory of its own, wrapped by the hardware-backed keystore.
 
+A receiver can be opening a preview when the person turns previews off, and the preview is not shown
+then. On Android the receiver decides under a lock that a change of the keys also takes: the change
+waits until the receivers that are deciding have posted, and one that starts after it reads the keys
+as they are. On iOS the extension reads the host's key again after the preview has opened, and a key
+that has gone leaves the generic alert (`sender_unknown`).
+
 The opening is one Rust function, `companion-preview`, so a sealed preview is read in one place. On
 Android the application's library carries it and the receiver calls it through JNI. On iOS the
 extension links it as a static library of its own, built for the extension's platform by a build

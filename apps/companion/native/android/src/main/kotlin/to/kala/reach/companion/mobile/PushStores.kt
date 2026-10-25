@@ -142,9 +142,13 @@ class PreviewKeySet private constructor(
 class LimitedKeys(directory: File, sealer: Sealer) {
     private val files = SecretFiles(directory, sealer)
 
-    /** Makes the store hold exactly `keys`. */
+    /**
+     * Makes the store hold exactly `keys`, once the decisions in progress have posted what they
+     * decided ([PreviewKeyGate]): when this returns, every decision made with the keys before it has
+     * posted, and none that starts later reads them.
+     */
     fun replace(keys: PreviewKeySet) {
-        files.write(ITEM, keys.toJson().toByteArray(Charsets.UTF_8))
+        PreviewKeyGate.changing { files.write(ITEM, keys.toJson().toByteArray(Charsets.UTF_8)) }
     }
 
     /** The set the store holds, or null when none was ever handed over. */
