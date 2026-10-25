@@ -68,11 +68,13 @@ pub const CATEGORIES: [Category; 6] = [
     Category {
         name: "input-encodings",
         owns: "The input protocols the profile advertises and the bytes each encodes a key as: \
-               the console's key records, and the client's ordinary, modifyOtherKeys and Kitty \
-               encodings.",
+               the console's key records, what the legacy spelling of them is for a session whose \
+               backend did not ask for records, and the client's ordinary, modifyOtherKeys and \
+               Kitty encodings.",
         fixtures: &[
             "profile.json",
             "input-encodings.json",
+            "console-legacy-input.json",
             "client-encodings.json",
         ],
     },

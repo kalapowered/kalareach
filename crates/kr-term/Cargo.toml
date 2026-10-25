@@ -21,6 +21,8 @@ required-features = ["conformance"]
 
 [dependencies]
 base64.workspace = true
+# The one encoder that spells a key, which console keys read as text are spelled with.
+kr-keys.workspace = true
 kr-protocol.workspace = true
 kr-width.workspace = true
 serde.workspace = true

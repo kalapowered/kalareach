@@ -63,12 +63,16 @@
           "sha256": "c0c8acd815649a6aec54cacf9c0d526d2f9dc1157ea098dccba980e76edd3da1"
         },
         {
+          "path": "console-legacy-input.json",
+          "sha256": "b13b5d529b53f52c4a4889b9e7870e825f60ccd63f60b02b355a90718391d3f2"
+        },
+        {
           "path": "client-encodings.json",
           "sha256": "5dfacf27ffd8475d378ed47470c455d26ca9ea10d0e8dbd90e7125d6f2c77ab6"
         }
       ],
       "name": "input-encodings",
-      "owns": "The input protocols the profile advertises and the bytes each encodes a key as: the console's key records, and the client's ordinary, modifyOtherKeys and Kitty encodings."
+      "owns": "The input protocols the profile advertises and the bytes each encodes a key as: the console's key records, what the legacy spelling of them is for a session whose backend did not ask for records, and the client's ordinary, modifyOtherKeys and Kitty encodings."
     },
     {
       "fixtures": [

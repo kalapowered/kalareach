@@ -138,8 +138,6 @@ libc.workspace = true
 rustix = { workspace = true, features = ["event", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-# The spelling of a console key the session's terminal reads as text.
-kr-keys.workspace = true
 windows-sys.workspace = true
 # The path of a folder a restore holds open, read from the handle: the record is given its name from
 # the folder the handle holds and not from the text the person typed, which a junction can change.

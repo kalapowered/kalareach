@@ -28,10 +28,21 @@
 //! owe is that a nested transition cannot leave a **client's** console in the wrong mode after
 //! detach, which is the attach client's saved console modes rather than this state.
 //!
+//! **The two ways to spell records.** A session whose backend asked for records is sent them in
+//! this encoding ([`records_within`]). One whose backend did not is sent what a terminal doing the
+//! translation would have sent ([`legacy_within`]), with no scan code, because none is sent. Both
+//! are bounded on what they produce, and both keep to the order of the records. A producer that
+//! reads a console in pieces keeps a character outside the basic plane in one write with
+//! [`PairHold`].
+//!
 //! What the record path is **not** is a promise about fidelity. A client that sends no records
 //! sends legacy VT input, which this host accepts without claiming it carries scan codes; and the
 //! records an outer ConPTY produces carry whatever that console gave them, which on a remote or
 //! virtual keyboard is not a hardware scan code at all. [`Fidelity`] is how that is reported.
+
+mod legacy;
+
+pub use legacy::{Keyboard, Refused, legacy_within};
 
 /// The control-key state bits a console record carries, named as the console API names them.
 ///
@@ -139,17 +150,128 @@ pub fn encode(record: &KeyRecord) -> Vec<u8> {
     out
 }
 
+impl From<kr_protocol::input::ConsoleKey> for KeyRecord {
+    fn from(key: kr_protocol::input::ConsoleKey) -> Self {
+        let kr_protocol::input::ConsoleKey {
+            virtual_key,
+            scan_code,
+            unicode,
+            key_down,
+            control_keys,
+            repeat,
+        } = key;
+        Self {
+            virtual_key,
+            scan_code,
+            unicode,
+            key_down,
+            control_keys,
+            repeat,
+        }
+    }
+}
+
+impl From<KeyRecord> for kr_protocol::input::ConsoleKey {
+    fn from(record: KeyRecord) -> Self {
+        let KeyRecord {
+            virtual_key,
+            scan_code,
+            unicode,
+            key_down,
+            control_keys,
+            repeat,
+        } = record;
+        Self {
+            virtual_key,
+            scan_code,
+            unicode,
+            key_down,
+            control_keys,
+            repeat,
+        }
+    }
+}
+
+/// A spelling that would be longer than the bound it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooLong;
+
 /// Encodes a run of records, in the order they were read, into one buffer.
 ///
 /// The order is the record path's own promise: a key-down and the key-up that follows it arrive in
 /// that order, and a repeat count is one record rather than several.
 #[must_use]
 pub fn encode_all(records: &[KeyRecord]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(records.len() * 24);
+    records_within(records, usize::MAX).unwrap_or_default()
+}
+
+/// Encodes a run of records as [`encode_all`] does, and stops at the first one that would take the
+/// buffer past `limit` bytes.
+///
+/// The bound is checked before each record is appended, so the buffer never holds more than the
+/// bound and a run is never built to be refused.
+///
+/// # Errors
+///
+/// Returns [`TooLong`] when the encoding would be longer than `limit`.
+pub fn records_within(records: &[KeyRecord], limit: usize) -> Result<Vec<u8>, TooLong> {
+    let mut out = Vec::with_capacity(records.len().saturating_mul(24).min(limit));
+    // The longest record is under 48 bytes, so one buffer serves every record in turn.
+    let mut spelled = Vec::with_capacity(48);
     for record in records {
-        encode_into(record, &mut out);
+        spelled.clear();
+        encode_into(record, &mut spelled);
+        if spelled.len() > limit - out.len() {
+            return Err(TooLong);
+        }
+        out.extend_from_slice(&spelled);
     }
-    out
+    Ok(out)
+}
+
+/// Keeps a character outside the basic plane in one write when a console is read in pieces.
+///
+/// The console reports such a character as two key-down records, the high surrogate and then the
+/// low one, and one read can end between them. The translation of a write is stateless, so a
+/// producer passes each batch it reads through here before it sends: the records from the last
+/// high surrogate that is still waiting for its low one, to the end of the batch, wait for the
+/// next batch, key-ups included so that their order is kept. The next batch completes the pair, or
+/// starts something else, and then the waiting records go out as they were: a high surrogate with
+/// no low one is replaced by the translation, as it would be without any of this.
+#[derive(Debug, Default)]
+pub struct PairHold {
+    waiting: Vec<KeyRecord>,
+}
+
+impl PairHold {
+    /// A hold with nothing waiting.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            waiting: Vec::new(),
+        }
+    }
+
+    /// Returns the records that can be sent now, in order: what was waiting, then `batch`, less
+    /// the tail that has to wait for the next batch.
+    pub fn take(&mut self, batch: &[KeyRecord]) -> Vec<KeyRecord> {
+        let mut records = std::mem::take(&mut self.waiting);
+        records.extend_from_slice(batch);
+        // Only a high surrogate that is the last key to go down is still waiting for its low half:
+        // any other key after it has started something else.
+        if let Some(last) = records.iter().rposition(|record| record.key_down)
+            && records[last].is_high_surrogate()
+        {
+            self.waiting = records.split_off(last);
+        }
+        records
+    }
+
+    /// Returns everything that is waiting, as it is, for a producer that has something other than
+    /// a key to deliver and so will not see the low half in order.
+    pub fn release(&mut self) -> Vec<KeyRecord> {
+        std::mem::take(&mut self.waiting)
+    }
 }
 
 fn encode_into(record: &KeyRecord, out: &mut Vec<u8>) {
