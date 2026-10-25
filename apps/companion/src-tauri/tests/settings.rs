@@ -4,7 +4,7 @@
 //! Drafts travel in the same collection when the person turns that on: they are held to the privacy
 //! mode of the host they were written for, one host's store at a time, and a draft from another
 //! device arrives as a kept copy. What this computer can read of a host's privacy mode is scripted
-//! here ([`ScriptedHosts`]): the connection to a real host that answers `privacy.status` is the
+//! here ([`ScriptedHosts`]): the connection to a real host that answers `host.info` is the
 //! companion's own and is not under test.
 //!
 //! KR-REQ-24.28: a host in privacy mode stops what leaves for the sync service at its recorded

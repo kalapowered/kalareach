@@ -291,7 +291,7 @@ impl Scene {
 
 /// Whether `read` is the host being unread because it said nothing of its privacy mode.
 fn says_nothing(read: HostPrivacy) -> bool {
-    matches!(read, HostPrivacy::Unreadable { reason } if reason.contains("did not say where"))
+    matches!(read, HostPrivacy::Unreadable { reason } if reason.contains("where its privacy mode stands"))
 }
 
 /// KR-REQ-24.28: a device that holds no right to manage the host reads where its privacy mode
