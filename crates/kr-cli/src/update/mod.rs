@@ -2674,7 +2674,7 @@ fn collect(
     }
     // What an earlier removal left because a program that holds nothing ran from the release.
     #[cfg(windows)]
-    let _ = update;
+    let _ = store.sweep_trash(update);
     removed
 }
 
