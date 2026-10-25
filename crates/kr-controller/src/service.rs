@@ -359,6 +359,13 @@ pub struct Controller {
     /// The connection table is not held for the length of a commit, so what only reads it, and a
     /// registration that is added, never waits for one.
     commit_hold: std::sync::RwLock<()>,
+    /// The connections that ended while a commit stood on a registration, whose registrations go
+    /// when the commit has ended ([`Self::deregister`]).
+    ended: std::sync::Mutex<Vec<ConnectionId>>,
+    /// How many withdrawals have begun to wait for the commits that stand on a registration, for
+    /// a suite that holds a commit and waits for one to arrive.
+    #[cfg(test)]
+    withdrawals_waiting: std::sync::atomic::AtomicUsize,
     identity: ControllerIdentity,
     /// Which store this daemon keeps its keys in.
     secret_store: kr_crypto::store::StoreSelection,

@@ -729,8 +729,8 @@ impl Controller {
     /// written, so a registry that cannot take a write restricts all the same.
     ///
     /// It rises as the other refusals do, in the order a withdrawal takes its locks in, so that
-    /// work which holds the registry's guard or the connection table from its check to its commit
-    /// is wholly before it or wholly after it, and it ends the links of the connections it
+    /// work which holds the registry's guard or a registration standing from its check to its
+    /// commit is wholly before it or wholly after it, and it ends the links of the connections it
     /// reaches. It does not wait for the writes to the pairing records that were under way, as the
     /// two refusals on every remote grant do. A write that read the standing before the removal
     /// rose, an owner confirmation among them, can commit after the raise has returned: nothing
@@ -1154,12 +1154,12 @@ impl Controller {
     /// flag and the word that mirrors it change together, under the policy's lock, and the epoch
     /// moves after. Says whether it changed anything.
     ///
-    /// A raise first takes the registry's guard and then the hold on commits that stand on a
-    /// registration and the connection table ([`Self::admitted_withdraw`]), the order a
-    /// withdrawal takes them in (registry, policy, hold, table), so a write that holds either from
-    /// its check to its commit is wholly before the raise or wholly after it. It waits for a
-    /// commit that is running, holding the registry and the policy's lock meanwhile. A write that releases
-    /// them before its commit is not ordered by this: a write to the pairing records that read the
+    /// A raise first takes the registry's guard, then waits for the commits that stand on a
+    /// registration ([`Self::withdraw_hold`]), then takes the policy's lock and the connection
+    /// table (registry, hold, policy, table), so a write that holds the registry or the
+    /// registration from its check to its commit is wholly before the raise or wholly after it.
+    /// It waits for a commit that is running holding the registry, and not the policy's lock. A
+    /// write that releases them before its commit is not ordered by this: a write to the pairing records that read the
     /// word before it rose commits after it, and the wait of [`Self::move_a_feed_refusal`] is what
     /// orders those. A lift needs no order. Nothing is taken when the word already says what is
     /// asked.
@@ -1179,6 +1179,9 @@ impl Controller {
         } else {
             None
         };
+        // The wait for a commit that stands on a registration is made before the policy's lock is
+        // taken, so that what needs the policy does not wait for it.
+        let hold = raised.then(|| self.withdraw_hold());
         {
             let mut policy = self
                 .policy
@@ -1187,7 +1190,7 @@ impl Controller {
             if flag(&policy) == raised {
                 return false;
             }
-            let _held = raised.then(|| self.admitted_withdraw());
+            let _table = hold.map(|hold| self.withdrawing(hold));
             set(&mut policy, raised);
             if raised {
                 self.feed_refusal.raise(bit);

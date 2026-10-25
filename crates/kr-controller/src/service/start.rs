@@ -1044,6 +1044,9 @@ impl Controller {
             reservations: Arc::default(),
             admitted: std::sync::RwLock::new(BTreeMap::new()),
             commit_hold: std::sync::RwLock::new(()),
+            ended: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            withdrawals_waiting: std::sync::atomic::AtomicUsize::new(0),
             identity,
             secret_store: setup.secret_store,
             generation,

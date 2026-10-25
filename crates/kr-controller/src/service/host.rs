@@ -117,15 +117,14 @@ impl Controller {
         };
         // Everything above can wait: for this task to be scheduled, for the lock, for the checks
         // to read the agent's tree. The admission this change was accepted under is asked after
-        // those waits, and the dispatch marker is written while this daemon's connection table is
-        // held, so a revocation cannot complete between the answer and the marker: withdrawing a
-        // registration takes the same lock. The answer is the check every service asks from
+        // those waits, and the dispatch marker is written while the connection's registration is
+        // held standing, so a revocation cannot complete between the answer and the marker:
+        // withdrawing a registration waits for it. The answer is the check every service asks from
         // inside its work: a fence this host owes and could not raise, the connection's
         // registration under the revision it was admitted at, then the deadline.
-        let registrations = self.admitted_read();
-        self.check_registration_in(&registrations, &carried)?;
-        installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
-        drop(registrations);
+        self.under_registration(&carried, || {
+            installer.mark_dispatching(actor_id, mutation.action_id, &digest)
+        })??;
         let result = match method {
             Method::AgentToolsInstall => encode(&installer.install(&params)?)?,
             Method::AgentToolsRemove => encode(&installer.remove(&params)?)?,

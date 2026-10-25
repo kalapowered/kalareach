@@ -198,27 +198,30 @@ async fn a_connection_admitted_before_the_feed_removed_the_host_is_refused_by_th
 /// rises after the commit, as a withdrawal does: the commit's check read no refusal, so the commit
 /// is the whole of what the connection did under the standing it had, and a commit that begins
 /// after the raise reads it. The commit holds the registration and not the connection table, so
-/// the case holds a commit and lets the raise try to rise inside it.
+/// the case holds a commit, starts the raise, waits until it has arrived at the wait for the
+/// commit, and asks the commit what it reads. The raise does not hold the policy's lock while it
+/// waits: the commit is let go by a watchdog if the policy cannot be read meanwhile, which fails
+/// the case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_refusal_raised_while_a_commit_stands_on_a_registration_rises_after_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let (_temp, controller) = daemon().await;
     let (remote, _) = registered(&controller);
     let (entered, waiting) = std::sync::mpsc::channel::<()>();
-    let (raising, begun) = std::sync::mpsc::channel::<()>();
+    let (go, going) = std::sync::mpsc::channel::<()>();
     let committing = {
         let controller = Arc::clone(&controller);
         tokio::task::spawn_blocking(move || {
             controller.under_registration(&remote, || {
                 entered.send(()).expect("the case is waiting");
-                begun.recv().expect("the raise has begun");
-                // A raise that does not wait for this commit rises while it is given the chance.
-                for _ in 0..10_000 {
-                    if controller.feed_refusal.word() != 0 {
-                        break;
-                    }
-                    std::thread::yield_now();
-                }
-                controller.feed_refusal.word()
+                let let_go_by_the_case = going
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+                (
+                    let_go_by_the_case,
+                    controller.check_registration(&remote).is_ok(),
+                )
             })
         })
     };
@@ -228,16 +231,35 @@ async fn a_feed_refusal_raised_while_a_commit_stands_on_a_registration_rises_aft
     let raise = {
         let controller = Arc::clone(&controller);
         tokio::spawn(async move {
-            raising.send(()).expect("the commit is waiting");
             controller.raise_the_unverified_withdrawal_refusal().await;
         })
     };
-    let word = committing
+    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let policy_read = Arc::new(AtomicBool::new(false));
+    let reading = {
+        let (controller, policy_read) = (Arc::clone(&controller), Arc::clone(&policy_read));
+        tokio::task::spawn_blocking(move || {
+            let _policy = controller.policy();
+            policy_read.store(true, Ordering::SeqCst);
+        })
+    };
+    while !policy_read.load(Ordering::SeqCst) && !reading.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let _ = go.send(());
+    let (let_go_by_the_case, read_no_refusal) = committing
         .await
         .expect("the commit ends")
         .expect("the commit's check read no refusal");
-    assert_eq!(word, 0, "the refusal rose inside the commit");
+    assert!(
+        let_go_by_the_case,
+        "the policy could not be read while the raise waited for the commit"
+    );
+    assert!(read_no_refusal, "the refusal rose inside the commit");
     raise.await.expect("the raise ends");
+    reading.await.expect("the policy was read");
     assert!(
         controller.check_registration(&remote).is_err(),
         "a check that begins after the raise reads it"
