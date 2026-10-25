@@ -817,9 +817,6 @@ pub async fn install(
     root: Option<&std::path::Path>,
     installer: Option<&str>,
 ) -> Result<Installed> {
-    if cfg!(windows) {
-        return Err(unsupported());
-    }
     let running = kr_ipc::install::this_process().map_err(|error| CliError::Other(said(error)))?;
     if running.store().is_some() {
         return Err(CliError::Usage(Shown::said(
@@ -1004,9 +1001,6 @@ fn remove_staging(staging: &std::path::Path) -> std::io::Result<()> {
 ///
 /// Returns a failure when this kr is not of an installed release, or the store cannot be read.
 pub fn versions() -> Result<Vec<Kept>> {
-    if cfg!(windows) {
-        return Err(unsupported());
-    }
     let running = kr_ipc::install::this_process().map_err(|error| CliError::Other(said(error)))?;
     let Some(store) = running.store() else {
         return Err(CliError::HostUnavailable(Shown::said(
@@ -1051,9 +1045,6 @@ pub fn versions() -> Result<Vec<Kept>> {
 /// and what to do, with every daemon it stopped started again from the release still current; and
 /// a refusal or a failure otherwise.
 pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Updated> {
-    if cfg!(windows) {
-        return Err(unsupported());
-    }
     let (store, source) = this_release_store()?;
     let Some(archive) = archive else {
         return Err(CliError::Usage(Shown::said(
@@ -1163,9 +1154,6 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
 /// something live holds it, and a refusal naming every store the older release cannot read as it
 /// is, with nothing switched.
 pub async fn rollback(to: Option<&str>) -> Result<Updated> {
-    if cfg!(windows) {
-        return Err(unsupported());
-    }
     let (store, source) = this_release_store()?;
     let update_lock = store
         .try_lock_update()
@@ -3143,11 +3131,4 @@ mod tests {
             "an environment that is not held keeps its roots named, and so does a pair nothing was found through"
         );
     }
-}
-
-/// What a platform that keeps no store says.
-fn unsupported() -> CliError {
-    CliError::HostUnavailable(Shown::said(
-        "this host keeps no store of releases on Windows: its installer replaces the release",
-    ))
 }
