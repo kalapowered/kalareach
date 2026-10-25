@@ -621,7 +621,12 @@ struct Left {
 
 impl Left {
     fn add(&mut self, error: io::Error) {
-        self.held.get_or_insert(error);
+        let slot = if is_in_use(&error) {
+            &mut self.held
+        } else {
+            &mut self.refused
+        };
+        slot.get_or_insert(error);
     }
 
     fn into_result(self) -> io::Result<()> {
@@ -631,8 +636,8 @@ impl Left {
 
 /// A failure that is not a program's hold: the operating system's code is left out of it, so that
 /// nothing takes it for one.
-fn refused(_what: &str, _path: &Path, error: &io::Error) -> io::Error {
-    io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(5))
+fn refused(what: &str, path: &Path, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{what} {}: {error}", path.display()))
 }
 
 /// Deletes the tree at `root`, a release that was sealed or one that was only staged, whole: every
