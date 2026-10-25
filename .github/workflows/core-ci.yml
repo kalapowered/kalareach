@@ -659,6 +659,8 @@ jobs:
       #   - how a session's closure reaches its attachments, `kr-worker`'s `closure`: a shell that
       #     exits, one ended from outside, and a close that is ignored until the five seconds are
       #     over;
+      #   - the control daemon ended while a session is producing output, `kr-worker`'s
+      #     `controller_kill`;
       #   - the ARM64 compile of `kr-ipc`, `kr-worker`, `kr-controller`, `kr-cli`, `kr-term` and
       #     `kr-project`, which runs nothing, and the documentation of this platform's own code.
       # "The attach client" means the part of it that runs here - `crates/kr-cli/tests/attach.rs`
@@ -1280,6 +1282,13 @@ jobs:
       - name: Test how a session's closure reaches its attachments
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test closure
+
+      # The control daemon ended while a session is producing output. Its worker was started
+      # through the environment's scheduled task, so it is in no job the daemon was in, and goes
+      # on: the terminal attached to it keeps its output, and a replacement daemon finds it live.
+      - name: Test the daemon ended during output
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-worker --test controller_kill
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
       # each daemon starts its workers through the environment's scheduled task, as the shipping
