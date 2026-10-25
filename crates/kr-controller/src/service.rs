@@ -805,6 +805,14 @@ pub struct Controller {
     /// reconciliation this daemon does on its own both reach that point for the same session, so
     /// the two steps are one transaction.
     finalising: Mutex<()>,
+    /// Held while the archive removes what the sessions that have ended retained for privacy mode.
+    ///
+    /// A change to privacy mode removes it before it answers, and the privacy tick removes it on
+    /// its own schedule, so two removals can reach the same session together. Each takes the
+    /// session's recovery lock without waiting, so the second would find the session held and
+    /// leave it owed, and the change would answer that it was. The second waits for the first
+    /// and then asks what is still owed.
+    removing_closed: Mutex<()>,
     /// The sessions whose crashed worker is being cleaned up, each under a lock of its own.
     ///
     /// A worker's death is noticed by a read, a list, the closure watcher, the barrier and the

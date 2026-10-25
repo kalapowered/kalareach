@@ -1219,6 +1219,7 @@ impl Controller {
                 kr_ipc::install::measured_environment(),
             )),
             finalising: Mutex::new(()),
+            removing_closed: Mutex::new(()),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
             left_by_an_earlier_boot: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             collection: crate::collection::Collection::default(),
@@ -2016,6 +2017,7 @@ impl Controller {
     /// next pass; a removal that left something is owed with the reason and tried again on a
     /// schedule. Only a removal that left nothing ends the session's obligation.
     pub(crate) async fn remove_closed_content(self: &Arc<Self>) {
+        let _alone = self.removing_closed.lock().await;
         let privacy = Arc::clone(&self.privacy);
         let now_ms = kr_ipc::now_ms();
         let due = tokio::task::spawn_blocking(move || privacy.awaiting_removal(now_ms))
