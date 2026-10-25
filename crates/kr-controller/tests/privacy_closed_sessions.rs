@@ -91,15 +91,23 @@ fn plant(host: &Host, spool: bool) -> SessionId {
     session_id
 }
 
-/// A closed session as a daemon records the end of a worker it proved dead: a reservation that
-/// closed and the closure the registry holds, with sixteen bytes of retained output in its spool
-/// and no journal, since the worker never wrote one.
-fn plant_recorded(host: &Host) -> SessionId {
+/// A closed session as a daemon records the end of a worker it could not see leave: a reservation
+/// that closed and the closure the registry holds, with sixteen bytes of retained output in its
+/// spool and no journal, since the worker never wrote one.
+///
+/// With `unconfirmed`, the closure says the daemon closed the session without confirming that its
+/// worker ended, and `launched` is the process the reservation names for the launch, if any.
+fn plant_recorded(
+    host: &Host,
+    unconfirmed: bool,
+    launched: Option<&kr_protocol::identity::ProcessStartIdentity>,
+) -> SessionId {
     use kr_controller::registry::{LaunchPhase, Registry};
     use kr_protocol::scalars::Digest256;
+    use kr_protocol::session::SurvivingResource;
 
-    let mut registry = Registry::open(host.registry_database(), host.environment_id)
-        .expect("opens the registry");
+    let mut registry =
+        Registry::open(host.registry_database(), host.environment_id).expect("opens the registry");
     let admission = registry
         .reserve(
             &actor(),
@@ -110,12 +118,23 @@ fn plant_recorded(host: &Host) -> SessionId {
         )
         .expect("a reservation");
     let session_id = admission.reservation.session_id;
+    if let Some(identity) = launched {
+        registry
+            .record_launch(admission.reservation.reservation_id, identity)
+            .expect("the launch's process");
+    }
     registry
         .set_phase(admission.reservation.reservation_id, LaunchPhase::Closed)
         .expect("the session closes");
-    registry
-        .record_closure(&closure(session_id))
-        .expect("the closure");
+    let mut record = closure(session_id);
+    if unconfirmed {
+        record.surviving = vec![SurvivingResource {
+            kind: kr_controller::archive::UNACCOUNTED_WORKER.to_owned(),
+            detail: "this host closed the session without confirming that its worker ended"
+                .to_owned(),
+        }];
+    }
+    registry.record_closure(&record).expect("the closure");
     let mut history = kr_worker::history::OutputHistory::with_spool(
         8,
         ArchiveService::new(host.tree().environment())
@@ -422,7 +441,7 @@ async fn a_removal_the_archive_cannot_finish_is_owed_and_not_served_until_it_has
 async fn turning_privacy_mode_on_removes_what_a_session_only_the_registry_closed_retained() {
     let host = Host::start_unowned().await;
     let mut client = host.client().await;
-    let session_id = plant_recorded(&host);
+    let session_id = plant_recorded(&host, false, None);
 
     let before = page(&mut client, session_id).await.expect("a page");
     assert_eq!(
@@ -446,5 +465,46 @@ async fn turning_privacy_mode_on_removes_what_a_session_only_the_registry_closed
     let after = page(&mut client, session_id).await.expect("a page");
     assert!(after.bytes.as_slice().is_empty(), "no byte is served");
     assert!(after.gap.0.is_some(), "and the range is said to be gone");
+    host.stop().await;
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.28: a session whose worker's end the daemon never confirmed keeps its
+/// output while nothing proves the worker gone, and is settled once the kernel says the process the
+/// launch ran has ended. The first session names no process, so a worker may still be writing its
+/// stores: its output stays, and the report says why. The second names a process that has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unconfirmed_worker_is_cleared_by_the_proof_that_its_process_ended() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let ended = kr_ipc::identity::ended_process_identity(4_000_100);
+    let unproved = plant_recorded(&host, true, None);
+    let proved = plant_recorded(&host, true, Some(&ended));
+
+    set(&mut client, &host, true).await;
+    let report = until("the proved session being settled", &mut client, |report| {
+        report.sessions.iter().all(|owed| owed.session_id != proved)
+            && report
+                .sessions
+                .iter()
+                .any(|owed| owed.session_id == unproved)
+    })
+    .await;
+    assert!(
+        segments(&host, proved).is_empty(),
+        "the proved session's output is gone"
+    );
+    assert!(
+        !segments(&host, unproved).is_empty(),
+        "the control: output a worker may still write is not removed"
+    );
+    let owed = report
+        .sessions
+        .iter()
+        .find(|owed| owed.session_id == unproved)
+        .expect("the unproved session is owed");
+    assert!(
+        matches!(&owed.standing, PrivacySessionStanding::Unavailable { reason } if reason.contains("worker")),
+        "the report says why: {owed:?}"
+    );
     host.stop().await;
 }
