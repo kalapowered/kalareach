@@ -104,10 +104,36 @@ pub(crate) fn resets_floors(old: &[u8], new: &[u8]) -> CatalogueResult<bool> {
     .any(|role| old.signed.keys(role).ne(new.signed.keys(role))))
 }
 
-/// What the remedy for a root that cannot be trusted is, said wherever one is refused.
-const ROLE_KEY_REMEDY: &str = "ask the repository's publisher for a root that gives each role a \
-                               key of its own, and enrol the repository with it (a repository \
-                               this host already holds is removed first)";
+/// Where a root that cannot be trusted is met, which decides what a person can do about it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Met {
+    /// A root offered to be adopted for a repository.
+    Enrolment,
+    /// The root of the generation this build carries.
+    Bundle,
+    /// A root a repository's metadata moved to, or ended on.
+    Rotation,
+}
+
+impl Met {
+    /// What to do about a root met here: said in each refusal, because the way out differs.
+    const fn remedy(self) -> &'static str {
+        match self {
+            Self::Enrolment => {
+                "ask the repository's publisher for a root that gives each role a key of its \
+                 own, and enrol the repository with that root"
+            }
+            Self::Bundle => {
+                "the bundled catalogue is not seeded by this build, and a later release of the \
+                 product carries a root that gives each role a key of its own"
+            }
+            Self::Rotation => {
+                "the repository stays on the root it holds until its publisher signs a next \
+                 root over it that gives each role a key of its own"
+            }
+        }
+    }
+}
 
 /// The name of a top-level role, as a refusal says it.
 const fn role_name(role: tough::schema::RoleType) -> &'static str {
@@ -120,9 +146,15 @@ const fn role_name(role: tough::schema::RoleType) -> &'static str {
     }
 }
 
+/// A key as the client parsed it: its family and its public bytes.
+pub(crate) type KeyMaterial = (&'static str, Vec<u8>);
+
+/// The keys a root names for one role.
+pub(crate) type RoleKeys = BTreeSet<KeyMaterial>;
+
 /// A key as the client parsed it: its family and its public bytes. Two names for one key differ in
 /// the identifier, the member order or the description's spelling, and share these.
-fn key_material(key: &tough::schema::key::Key) -> (&'static str, Vec<u8>) {
+fn key_material(key: &tough::schema::key::Key) -> KeyMaterial {
     use tough::schema::key::Key;
     match key {
         Key::Ed25519 { keyval, .. } => ("ed25519", keyval.public.to_vec()),
@@ -136,7 +168,7 @@ fn key_material(key: &tough::schema::key::Key) -> (&'static str, Vec<u8>) {
 /// The keys a root names for its own role, which are what a repository's trust is anchored in: the
 /// same set is the same root whatever its version, its expiry or the other roles' keys, and a
 /// rotation that replaces one of them is another set. `None` when the root cannot be read.
-pub(crate) fn root_role_keys(root: &[u8]) -> Option<BTreeSet<(&'static str, Vec<u8>)>> {
+pub(crate) fn root_role_keys(root: &[u8]) -> Option<RoleKeys> {
     let signed: tough::schema::Signed<tough::schema::Root> = serde_json::from_slice(root).ok()?;
     let role = signed.signed.roles.get(&tough::schema::RoleType::Root)?;
     Some(
@@ -166,11 +198,12 @@ pub(crate) fn root_role_keys(root: &[u8]) -> Option<BTreeSet<(&'static str, Vec<
 ///
 /// # Errors
 ///
-/// Returns [`CatalogueError::Untrusted`] naming the roles, and what to do about it.
-pub(crate) fn check_role_keys(root: &tough::schema::Root) -> CatalogueResult<()> {
+/// Returns [`CatalogueError::Untrusted`] naming the roles, and what to do about it where `met`
+/// says the root was met.
+pub(crate) fn check_role_keys(root: &tough::schema::Root, met: Met) -> CatalogueResult<()> {
     let mut roles: Vec<_> = root.roles.iter().collect();
     roles.sort_by_key(|(role, _)| role_name(**role));
-    let mut named: Vec<(&'static str, BTreeSet<(&'static str, Vec<u8>)>)> = Vec::new();
+    let mut named: Vec<(&'static str, RoleKeys)> = Vec::new();
     for (role, keys) in roles {
         let identifiers: HashSet<_> = keys.keyids.iter().collect();
         let material: BTreeSet<_> = identifiers
@@ -184,8 +217,9 @@ pub(crate) fn check_role_keys(root: &tough::schema::Root) -> CatalogueResult<()>
             return Err(CatalogueError::Untrusted {
                 detail: format!(
                     "the root names one key under two identifiers for its {} role, which counts \
-                     it twice toward the role's threshold; {ROLE_KEY_REMEDY}",
-                    role_name(*role)
+                     it twice toward the role's threshold; {}",
+                    role_name(*role),
+                    met.remedy()
                 ),
             });
         }
@@ -197,7 +231,8 @@ pub(crate) fn check_role_keys(root: &tough::schema::Root) -> CatalogueResult<()>
                 return Err(CatalogueError::Untrusted {
                     detail: format!(
                         "the root names one key for its {first} role and for its {second} role, \
-                         so whoever holds that key acts for both; {ROLE_KEY_REMEDY}"
+                         so whoever holds that key acts for both; {}",
+                        met.remedy()
                     ),
                 });
             }
@@ -590,7 +625,7 @@ pub async fn verify(
             {
                 // The root a load moved to before it failed is kept so that old trust is not
                 // restored; one that gives two roles a key is not kept, and says why.
-                check_role_keys(&new_signed.signed)?;
+                check_role_keys(&new_signed.signed, Met::Rotation)?;
                 on_root_rotated(bytes)?;
             }
             return Err(classify(&source));
@@ -609,7 +644,7 @@ pub async fn verify(
     // the rule before anything that follows can use it. The root the host held before the load is
     // not refused first, because the publisher's way out of a root that fails is a root signed
     // over it, which a host that refused it first could never read.
-    check_role_keys(&repository.root().signed)?;
+    check_role_keys(&repository.root().signed, Met::Rotation)?;
     let versions = MetadataVersions {
         root: repository.root().signed.version.get(),
         timestamp: repository.timestamp().signed.version.get(),

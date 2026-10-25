@@ -9874,6 +9874,18 @@ fn keys_that_share_one() -> KeySet {
     }
 }
 
+/// What a build trusts when it names the key identifiers `root` gives its own role.
+fn trusting(root: &[u8]) -> kr_plugin_catalogue::SeedTrust {
+    let document: serde_json::Value = serde_json::from_slice(root).expect("a readable root");
+    let ids: Vec<String> = document["signed"]["roles"]["root"]["keyids"]
+        .as_array()
+        .expect("identifiers")
+        .iter()
+        .map(|id| id.as_str().expect("an identifier").to_owned())
+        .collect();
+    kr_plugin_catalogue::SeedTrust::named(Vec::new(), 1, Some(ids))
+}
+
 fn enrolment_over(root: Vec<u8>, generation: &Generation) -> CatalogueResult<Enrolment> {
     Enrolment::new(
         repository(),
@@ -10004,47 +10016,105 @@ async fn kr_req_26_40_a_rotation_to_a_root_that_shares_a_key_is_refused_before_i
 }
 
 /// A bundle whose root gives two roles one key is not a root the build trusts, whatever key
-/// identifiers the build names, so the seed enrols nothing from it.
-#[test]
-fn kr_req_26_40_a_bundled_root_that_shares_a_key_is_not_trusted() {
-    let keys = KeySet::generate();
-    let root_of = |keys: &KeySet| {
-        let home = tempfile::tempdir().expect("a temporary directory");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a runtime");
-        runtime
-            .block_on(Generation::build(
-                home.path(),
-                GenerationSpec {
-                    keys: Some(keys.clone()),
-                    ..GenerationSpec::default()
-                },
-            ))
-            .root_bytes()
-    };
-    let trusting = |root: &[u8]| {
-        let document: serde_json::Value = serde_json::from_slice(root).expect("a readable root");
-        let ids: Vec<String> = document["signed"]["roles"]["root"]["keyids"]
-            .as_array()
-            .expect("identifiers")
+/// identifiers the build names, so the seed enrols nothing from it and says which roles share the
+/// key. A bundle whose root gives each role a key of its own is seeded.
+#[tokio::test]
+async fn kr_req_26_40_a_seed_over_a_root_that_shares_a_key_enrols_nothing() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let mut catalogue =
+        Catalogue::open(&home.path().join("catalogue"), local()).expect("a catalogue");
+    catalogue.set_fetches_network(false);
+
+    let shared = Generation::build(
+        &home.path().join("shared"),
+        GenerationSpec {
+            keys: Some(keys_that_share_one()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let bundle = support::seed_bundle_trusting(&shared, trusting(&shared.root_bytes_highest()));
+    let outcome = catalogue
+        .seed(&bundle, environment(), RepositoryBudgets::defaults())
+        .await;
+    assert!(
+        !outcome.enrolled && !outcome.committed,
+        "{}",
+        outcome.report()
+    );
+    assert!(
+        outcome
+            .notes
             .iter()
-            .map(|id| id.as_str().expect("an identifier").to_owned())
-            .collect();
-        kr_plugin_catalogue::SeedTrust::named(Vec::new(), 1, Some(ids))
-    };
-    let sound = root_of(&keys);
-    trusting(&sound)
-        .permit(&sound)
-        .expect("a root with a key for each role is trusted");
-    let shared = root_of(&KeySet {
-        timestamp: keys.snapshot.clone(),
-        ..keys
-    });
-    let refusal = trusting(&shared)
-        .permit(&shared)
-        .expect_err("a root that shares a key");
-    assert!(refusal.to_string().contains("snapshot"), "{refusal}");
+            .any(|note| note.contains("snapshot") && note.contains("timestamp")),
+        "{}",
+        outcome.report()
+    );
+    assert!(
+        catalogue.repositories().expect("readable").is_empty(),
+        "nothing was enrolled"
+    );
+
+    let sound = Generation::build(&home.path().join("sound"), GenerationSpec::default()).await;
+    let outcome = catalogue
+        .seed(
+            &support::seed_bundle(&sound),
+            environment(),
+            RepositoryBudgets::defaults(),
+        )
+        .await;
+    assert!(outcome.enrolled, "{}", outcome.report());
+}
+
+/// A load that moves to a root that gives two roles one key and then fails is not kept at that
+/// root: the repository stays on the root it was on, and the refusal names the roles that share
+/// the key rather than the failure that ended the load.
+#[tokio::test]
+async fn kr_req_26_40_a_load_that_moves_to_a_root_that_shares_a_key_and_fails_keeps_the_old_root() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    let before = catalogue
+        .repository(&repository())
+        .expect("readable")
+        .expect("enrolled")
+        .root;
+
+    generation
+        .rotate_to(GenerationSpec {
+            generation: 2,
+            root_version: 2,
+            keys: Some(keys_that_share_one()),
+            ..GenerationSpec::default()
+        })
+        .await;
+    std::fs::remove_file(generation.metadata_dir().join("timestamp.json"))
+        .expect("the timestamp is withheld, so the load fails after it reached the new root");
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("a load that ends at a root that shares a key");
+    let text = refusal.to_string();
+    assert!(
+        text.contains("snapshot") && text.contains("timestamp"),
+        "{text}"
+    );
+    assert_eq!(
+        catalogue
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
+        before,
+        "the root the repository was on is the one it is still on"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
