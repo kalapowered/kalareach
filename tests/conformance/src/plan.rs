@@ -1622,6 +1622,18 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the host's events reaching a real window",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "companion-tauri",
+                "--test",
+                "host_events",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the real-worker host tests, through the environment's scheduled task",
             &["test", "--locked", "-p", "kr-worker", "--test", "host"],
         ),

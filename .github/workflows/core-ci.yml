@@ -665,6 +665,8 @@ jobs:
       #     cases of its `network` suite, which hold an expired membership to a refusal on a
       #     connection that stays up, with a real worker;
       #   - the recovery bundle's write record, `kr-client`'s `recovery`;
+      #   - the host's events reaching a page in a real window, `companion-tauri`'s
+      #     `host_events`;
       #   - the ARM64 compile of `kr-ipc`, `kr-worker`, `kr-controller`, `kr-cli`, `kr-term` and
       #     `kr-project`, which runs nothing, and the documentation of this platform's own code.
       # "The attach client" means the part of it that runs here - `crates/kr-cli/tests/attach.rs`
@@ -1314,6 +1316,12 @@ jobs:
       - name: Test the recovery bundle store and its write record
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-client --test recovery
+
+      # The host's events reaching a page in a real window: WebView2 loads the page, which listens
+      # through the event API and says what it heard.
+      - name: Test the host's events reaching a real window
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p companion-tauri --test host_events
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
       # each daemon starts its workers through the environment's scheduled task, as the shipping

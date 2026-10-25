@@ -1001,9 +1001,10 @@ On macOS the same command opens real windows for two checks with a main thread o
 has a scripted session worker push events on a link the application reached as it reaches a real
 worker, and a page in a real web view, allowed only what the interface's capability allows, listen
 for them through the event API as the interface does: it checks that the page receives each event in
-order, with its stream, sequence and type, and its payload as JSON or as null.
+order, with its stream, sequence and type, and its payload as JSON or as null. On Windows
+`tests/host_events.rs` runs the same check in WebView2.
 
-On Windows the same command runs `tests/windows_hello.rs`, which reads what Windows reports about
+On Windows the same command also runs `tests/windows_hello.rs`, which reads what Windows reports about
 Windows Hello and checks that the page is sent that ceremony or none. Its tests that raise Windows
 Hello's dialog are ignored: they need a signed-in desktop with Windows Hello set up, and the file
 says how to run them there. They check that the dialog prints the exact message the review gave
