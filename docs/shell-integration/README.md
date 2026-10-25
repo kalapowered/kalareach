@@ -771,9 +771,10 @@ when it is removed, except where the person has since bound that key themselves.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
 3.0. The module declares the versions it found in its handshake and the worker refuses an editor
-ABI it was not qualified for. The module also refuses a PowerShell release that a published
-advisory affects, naming the advisory and the first fixed release of the series
-(`powershell_release_affected`; the advisories are listed in `docs/shell-integration/upstream.md`). The module makes that refusal inside the shell, which then sends no hello, so a managed create learns of it when the qualification bound runs out; the words it ends with name the entry and the publish command, and the publish names the advisory. On Linux and macOS it does the same for a .NET runtime below the fixed one of the advisory that lists the platform, and it refuses a runtime that describes itself in words it cannot read (`powershell_runtime_unreadable`) rather than taking it as clear. A build that does not keep the reader's own key queue where this
+ABI it was not qualified for. The module also refuses a PowerShell release below the first fixed release of an advisory in
+its own list, naming the advisory and that release (`powershell_release_affected`;
+`docs/shell-integration/upstream.md` names the advisory in its table of sources and assesses every
+other advisory without the module refusing a host for it). The module makes that refusal inside the shell, which then sends no hello, so a managed create learns of it when the qualification bound runs out; the words it ends with name the entry and the publish command, and the publish names the advisory. On Linux and macOS it does the same for a .NET runtime below the fixed one of the advisory that lists the platform, and it refuses a runtime that describes itself in words it cannot read (`powershell_runtime_unreadable`) rather than taking it as clear. A build that does not keep the reader's own key queue where this
 package was qualified to find it is refused with a named error rather than registered.
 
 Section 7 says this package does not claim that the stock public API has an asynchronous editing
