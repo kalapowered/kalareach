@@ -151,8 +151,6 @@ struct Profiles {
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
     made: Vec<PathBuf>,
     copies: Option<tempfile::TempDir>,
-    /// Released after the profiles are back, and so after everything the case placed has gone.
-    _turn: Turn,
 }
 
 impl Profiles {
@@ -161,7 +159,7 @@ impl Profiles {
     /// # Panics
     ///
     /// Panics when a file that is there cannot be read, since it could not be put back.
-    fn saved(package: &ShellPackage, turn: Turn) -> Self {
+    fn saved(package: &ShellPackage) -> Self {
         assert!(
             std::env::var(PROFILE_SWITCH).is_ok_and(|value| value == "1"),
             "this case writes the account's PowerShell profiles; set {PROFILE_SWITCH}=1 where that \
@@ -222,7 +220,6 @@ impl Profiles {
             files,
             made,
             copies: Some(copies),
-            _turn: turn,
         }
     }
 }
@@ -280,23 +277,28 @@ struct Managed {
     /// Before the packages, so the daemon and its workers are gone before the files they read.
     host: WorkerHost,
     packages: tempfile::TempDir,
-    /// Last, so the profiles come back after the shell that read them has ended.
+    /// After the daemon, so the profiles come back after the shell that read them has ended.
     _profiles: Profiles,
+    /// Last, so the turn is given up once the profiles are back and the programs placed beside the
+    /// test have gone.
+    _turn: Turn,
 }
 
 impl Managed {
     /// Publishes the package, saves the profiles, and starts the daemon on `prepared`, which `turn`
-    /// made.
+    /// made. Arguments are given up last to first, so a setup that panics gives up the programs
+    /// `prepared` placed before the turn.
     async fn start(turn: Turn, prepared: Prepared) -> Self {
         let packages = tempfile::tempdir().expect("a directory on the internal disk");
         let directory = publish(packages.path());
         let package = ShellPackage::read(&directory).expect("the host reads the published package");
-        let profiles = Profiles::saved(&package, turn);
+        let profiles = Profiles::saved(&package);
         let host = prepared.start(Some(packages.path().to_path_buf())).await;
         Self {
             host,
             packages,
             _profiles: profiles,
+            _turn: turn,
         }
     }
 
