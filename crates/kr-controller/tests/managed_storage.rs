@@ -3769,11 +3769,12 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     );
 }
 
-/// A journal of an earlier build for a closed session: the session's own record in it, at the schema
-/// that build wrote.
+/// A journal of an earlier build for a closed session, at the schema that build wrote: with the
+/// session's own record in it, or with none where `with_the_session` is false.
 fn journal_of_an_earlier_build(
     host: &kr_ipc::testing::TempHost,
     session_id: kr_protocol::ids::SessionId,
+    with_the_session: bool,
 ) {
     use kr_protocol::ids::SessionEpoch;
     use kr_protocol::session::{
@@ -3783,29 +3784,31 @@ fn journal_of_an_earlier_build(
     let path = host.environment().journal_database(session_id);
     std::fs::create_dir_all(path.parent().expect("a directory")).expect("the directory");
     let mut journal = kr_worker::journal::Journal::open(&path).expect("the journal opens");
-    journal
-        .record_session(&SessionSummary {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            environment_id: host.environment_id(),
-            display_number: DisplayNumber::new(1),
-            state: SessionState::Live,
-            shell_mode: ShellMode::NativeCompat,
-            shell_path: "/bin/sh".to_owned(),
-            cwd: "/recovered".to_owned(),
-            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-            desktop: kr_protocol::identity::DesktopBinding::none(),
-            created_at_ms: TimestampMs::new(1_000),
-            dimensions: Dimensions::new(80, 24),
-            attachment_count: kr_protocol::scalars::U64::new(1),
-            application_state: Nullable::null(),
-            root_process: Nullable::null(),
-            closure: Nullable::null(),
-            environment_sources: None,
-            root: None,
-            application: None,
-        })
-        .expect("records the session");
+    if with_the_session {
+        journal
+            .record_session(&SessionSummary {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                environment_id: host.environment_id(),
+                display_number: DisplayNumber::new(1),
+                state: SessionState::Live,
+                shell_mode: ShellMode::NativeCompat,
+                shell_path: "/bin/sh".to_owned(),
+                cwd: "/recovered".to_owned(),
+                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                desktop: kr_protocol::identity::DesktopBinding::none(),
+                created_at_ms: TimestampMs::new(1_000),
+                dimensions: Dimensions::new(80, 24),
+                attachment_count: kr_protocol::scalars::U64::new(1),
+                application_state: Nullable::null(),
+                root_process: Nullable::null(),
+                closure: Nullable::null(),
+                environment_sources: None,
+                root: None,
+                application: None,
+            })
+            .expect("records the session");
+    }
     drop(journal);
     rusqlite::Connection::open(&path)
         .expect("opens the store")
@@ -3832,7 +3835,7 @@ async fn a_session_packed_while_its_journal_was_held_back_is_packed_again_once_i
     let mut recovery = None;
     let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
         let session = closed_session(host, b"a session\r\n", 9_000);
-        journal_of_an_earlier_build(host, session);
+        journal_of_an_earlier_build(host, session, true);
         recovery = Some(
             kr_controller::archive::ArchiveService::new(host.environment())
                 .take_ownership(
@@ -3873,6 +3876,56 @@ async fn a_session_packed_while_its_journal_was_held_back_is_packed_again_once_i
         "/recovered",
         "and made again from the session's own record once nothing holds it"
     );
+}
+
+/// KR-REQ-24.18: a session whose journal is of an earlier schema, and cannot be brought forward
+/// while another recovery holds the session, is packed with the summary the closure alone gives.
+/// When the hold lifts and the journal then holds no record of the session, the summary packed is
+/// the same one, so the generation is not made again: what is packed has not changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_packed_while_held_back_is_not_packed_again_when_its_journal_holds_no_session() {
+    use kr_protocol::session::DisplayNumber;
+
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let mut recovery = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        journal_of_an_earlier_build(host, session, false);
+        recovery = Some(
+            kr_controller::archive::ArchiveService::new(host.environment())
+                .take_ownership(
+                    session,
+                    DisplayNumber::new(1),
+                    &kr_ipc::identity::ended_process_identity(4_000_033),
+                )
+                .expect("a recovery holds the session"),
+        );
+        closed = Some(session);
+    })
+    .await;
+    assert!(closed.is_some(), "a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+
+    // The hold lifts, and a day on the pass finds the journal brought forward with no record of
+    // the session in it.
+    drop(recovery);
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    timer.run_by_itself();
+    let looked = *rig.controller.production_looks().borrow();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.production_looked(looked + 1).await;
+    assert_eq!(
+        rig.controller.backup().generations().expect("a read").len(),
+        1,
+        "the closure-only summary packed is the one the journal gives, so nothing is made again"
+    );
+    let (_, detail) = rig.production_check().await;
+    assert!(detail.contains("nothing has changed"), "{detail}");
 }
 
 /// The sizes a generation is held to are the convention's, which a restore accepts: an external
