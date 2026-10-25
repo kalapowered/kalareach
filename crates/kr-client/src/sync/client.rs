@@ -284,6 +284,42 @@ crate::debug_fields!(Exported {
     deletable
 });
 
+/// A copy the service kept of a refused write, as [`Exported`] lists it, with the identity that
+/// [`SyncClient::drop_kept_copy`] asks the service to drop it by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptCopy {
+    /// The entry [`SyncClient::exported`] lists for it.
+    pub listed: Exported,
+    /// The copy's identity.
+    pub copy: SyncConflictId,
+}
+
+/// Every copy the service kept of a refused write that `store` records and the service may still
+/// hold, oldest first.
+///
+/// It reads this device's record and asks the service nothing, so it answers while the service is
+/// out of reach and while privacy mode is on.
+///
+/// # Errors
+///
+/// Returns [`SyncError::Storage`] when the records cannot be read.
+pub fn kept_copies(store: &SyncStore) -> Result<Vec<KeptCopy>> {
+    let mut copies: Vec<KeptCopy> = store
+        .what_left()?
+        .requests
+        .items
+        .iter()
+        .filter_map(|record| {
+            kept_copy(record).map(|copy| KeptCopy {
+                listed: kept_copy_entry(record, copy),
+                copy,
+            })
+        })
+        .collect();
+    copies.sort_by_key(|kept| kept.listed.left_at_ms.get());
+    Ok(copies)
+}
+
 /// What asking the service to drop the copies a person chose about established.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resolutions {
@@ -1373,19 +1409,7 @@ impl SyncClient {
             // list is for. It is the one entry here with a way out: the service drops a copy it
             // kept when asked, and `drop_kept_copy` is the asking.
             if let Some(conflict_id) = kept_copy(&record) {
-                exported.push(Exported {
-                    kind: format!(
-                        "synchronised {}, kept as a copy by the service",
-                        record.kind
-                    ),
-                    reference: format!(
-                        "{}, which the service holds as copy {}",
-                        record.collection(),
-                        conflict_id
-                    ),
-                    left_at_ms: record.left_at(),
-                    deletable: true,
-                });
+                exported.push(kept_copy_entry(&record, conflict_id));
                 continue;
             }
             // A dispatch with no answer may have reached the service. Saying so is the honest
@@ -1775,6 +1799,23 @@ pub(crate) fn diverged(
             expected: held,
             found,
         }
+    }
+}
+
+/// How [`SyncClient::exported`] lists a copy the service kept of a refused write.
+fn kept_copy_entry(record: &RequestRecord, conflict_id: SyncConflictId) -> Exported {
+    Exported {
+        kind: format!(
+            "synchronised {}, kept as a copy by the service",
+            record.kind
+        ),
+        reference: format!(
+            "{}, which the service holds as copy {}",
+            record.collection(),
+            conflict_id
+        ),
+        left_at_ms: record.left_at(),
+        deletable: true,
     }
 }
 
