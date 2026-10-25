@@ -95,10 +95,21 @@ pub fn unpack(
     if !file.metadata().is_ok_and(|about| about.is_file()) {
         return Err(unreadable("is not a regular file"));
     }
+    let declared = file
+        .try_clone()
+        .and_then(|mut copy| declared_entries(&mut copy))
+        .map_err(|_| unreadable("is not a zip archive this host reads"))?;
     let mut zipped = ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|_| unreadable("is not a zip archive this host reads"))?;
     if zipped.is_empty() {
         return Err(unreadable("is empty"));
+    }
+    // The reader keeps one entry for each name, the last of two that share one, so an archive that
+    // names a file twice shows fewer entries than its directory declares.
+    if declared != Some(zipped.len() as u64) {
+        return Err(unreadable(
+            "has the same name twice, or a directory that does not say how many entries it has",
+        ));
     }
     if zipped.len() > limits.entries {
         return Err(unreadable("holds more entries than a release does"));
@@ -195,15 +206,65 @@ pub fn unpack(
         let mut member = zipped
             .by_index(entry.index)
             .map_err(|_| unreadable("has an entry this host cannot read"))?;
-        let mut bounded = (&mut member).take(entry.size.saturating_add(1));
-        let summary = write_new(&destination, &mut bounded)
+        // No more than the entry says is written. A byte read past it, which writes nothing, shows
+        // that the entry holds more than it says.
+        let summary = write_new(&destination, &mut (&mut member).take(entry.size))
             .map_err(|error| write_failure(&destination, &error))?;
-        if summary.0 != entry.size {
+        let mut past = [0_u8; 1];
+        let more = member
+            .read(&mut past)
+            .map_err(|_| unreadable("has an entry this host cannot read"))?;
+        if summary.0 != entry.size || more != 0 {
             return Err(unreadable(
-                "has an entry that holds more bytes than it says",
+                "has an entry that does not hold the bytes it says",
             ));
         }
         written.insert(entry.relative.join("/"), summary);
     }
     Ok((directory, written))
+}
+
+/// The number of entries an archive's end-of-central-directory record declares, read from the tail
+/// of the file: the last record whose comment ends the file, with the 64-bit record that follows its
+/// locator where the count does not fit in 16 bits. `None` where there is no such record.
+fn declared_entries(file: &mut std::fs::File) -> std::io::Result<Option<u64>> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    const END: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+    const LOCATOR: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
+    const END64: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
+    let length = file.seek(SeekFrom::End(0))?;
+    // The record is 22 bytes and a comment of at most 65,535 bytes, with the locator before it.
+    let window = length.min(22 + 65_535 + 20);
+    file.seek(SeekFrom::Start(length - window))?;
+    let mut tail = vec![0_u8; usize::try_from(window).unwrap_or(0)];
+    file.read_exact(&mut tail)?;
+    let Some(at) = (0..tail.len().saturating_sub(21)).rev().find(|&at| {
+        tail[at..at + 4] == END
+            && usize::from(u16::from_le_bytes([tail[at + 20], tail[at + 21]]))
+                == tail.len() - (at + 22)
+    }) else {
+        return Ok(None);
+    };
+    let entries = u16::from_le_bytes([tail[at + 10], tail[at + 11]]);
+    if entries != u16::MAX {
+        return Ok(Some(u64::from(entries)));
+    }
+    let Some(locator) = at
+        .checked_sub(20)
+        .filter(|&locator| tail[locator..locator + 4] == LOCATOR)
+    else {
+        return Ok(Some(u64::from(entries)));
+    };
+    let mut offset = [0_u8; 8];
+    offset.copy_from_slice(&tail[locator + 8..locator + 16]);
+    file.seek(SeekFrom::Start(u64::from_le_bytes(offset)))?;
+    let mut record = [0_u8; 56];
+    file.read_exact(&mut record)?;
+    if record[..4] != END64 {
+        return Ok(None);
+    }
+    let mut total = [0_u8; 8];
+    total.copy_from_slice(&record[32..40]);
+    Ok(Some(u64::from_le_bytes(total)))
 }
