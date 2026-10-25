@@ -110,14 +110,17 @@ impl<R: Runtime> Platform<R> {
     }
 }
 
-/// Runs `call` on a task of its own and waits for the task, so that the call runs to its end even
-/// when the caller stops waiting for it.
+/// Runs `call` to its end even when the caller stops waiting for it.
 ///
 /// Tauri hands the answer of a native command to a callback that unwraps the send on the channel
 /// the caller waits on. A caller that is dropped (a timeout, a run that was cancelled) takes the
 /// channel with it, and the native answer, when it comes, panics in a callback the native side
-/// called into, which ends the process. The task keeps the channel until the answer comes; a
-/// caller that left finds its answer discarded.
+/// called into, which ends the process. So the call is moved to a task of its own, which keeps the
+/// channel until the answer comes; a caller that left finds its answer discarded.
+///
+/// The caller makes the first poll, which is the one that sends the command: commands reach the
+/// platform in the order callers ask, whatever the task below is doing, so a set of keys asked for
+/// later is never sent before one asked for earlier.
 ///
 /// # Errors
 ///
@@ -126,6 +129,14 @@ impl<R: Runtime> Platform<R> {
 async fn to_its_end<T: Send + 'static>(
     call: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<T, PlatformError> {
+    use std::task::Poll;
+
+    let mut call = Box::pin(call);
+    if let Poll::Ready(answer) =
+        std::future::poll_fn(|context| Poll::Ready(call.as_mut().poll(context))).await
+    {
+        return Ok(answer);
+    }
     tauri::async_runtime::spawn(call)
         .await
         .map_err(|error| PlatformError::new(format!("the platform's call was lost: {error}")))
@@ -205,5 +216,34 @@ mod tests {
             "the call was dropped before it answered"
         );
         assert_eq!(to_its_end(async { 7_u8 }).await.expect("an answer"), 7);
+    }
+
+    /// Commands must reach the platform in the order callers ask, so the poll that sends a command is
+    /// the caller's own: a task started for it could be run after a command asked for later.
+    #[tokio::test]
+    async fn a_call_is_first_polled_in_the_turn_of_its_caller() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let polled_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = std::sync::Arc::clone(&polled_on);
+        let call = async move {
+            seen.lock()
+                .expect("the thread of the first poll")
+                .get_or_insert(std::thread::current().id());
+            let _ = gate.await;
+        };
+        let mut waiting = Box::pin(to_its_end(call));
+        tokio::select! {
+            biased;
+            _ = &mut waiting => unreachable!("the call cannot have answered"),
+            () = std::future::ready(()) => {}
+        }
+
+        assert_eq!(
+            *polled_on.lock().expect("the thread of the first poll"),
+            Some(std::thread::current().id()),
+            "the command was not sent in the caller's turn"
+        );
+        drop(waiting);
+        let _ = release.send(());
     }
 }
