@@ -1016,12 +1016,27 @@ impl CanonicalGrid {
         })
     }
 
+    /// The attributes and text of one cell of the active buffer.
+    ///
+    /// The library's accessor for a cell by position takes the screen mutably, and through the
+    /// line's `cells_mut` turns a line held in its compact form into one cell per column. The two
+    /// forms keep a blank past the end of the text differently, so reading a cell changed what the
+    /// line holds, and which lines had been read depended on where the reads of output ended. This
+    /// reads the line as it is.
+    fn read_cell(&self, col: usize, row: i64) -> Option<(CellAttributes, String)> {
+        let screen = self.terminal.screen();
+        let physical = screen.phys_row(row);
+        let line = screen
+            .lines_in_phys_range(physical..physical + 1)
+            .into_iter()
+            .next()?;
+        line.get_cell(col)
+            .map(|cell| (cell.attrs().clone(), cell.str().to_owned()))
+    }
+
     /// The text of one cell of the active buffer.
-    fn cell_text(&mut self, col: usize, row: i64) -> Option<String> {
-        self.terminal
-            .screen_mut()
-            .get_cell(col, row)
-            .map(|cell| cell.str().to_owned())
+    fn cell_text(&self, col: usize, row: i64) -> Option<String> {
+        self.read_cell(col, row).map(|(_, text)| text)
     }
 
     /// Adds combining marks to the cell the previous text run ended on.
@@ -1061,12 +1076,7 @@ impl CanonicalGrid {
             return;
         }
         let marks = &marks[..keep];
-        let Some((attributes, found)) = self
-            .terminal
-            .screen_mut()
-            .get_cell(tail.col, tail.row)
-            .map(|cell| (cell.attrs().clone(), cell.str().to_owned()))
-        else {
+        let Some((attributes, found)) = self.read_cell(tail.col, tail.row) else {
             self.dropped_marks = self.dropped_marks.saturating_add(1);
             return;
         };
