@@ -1764,7 +1764,7 @@ async fn a_host_that_took_the_registration_and_refused_the_key_is_not_said_to_re
     let words = phone.view().hosts[0].words.clone();
     assert!(
         words.starts_with(
-            "The host took this phone as a destination, but did not take its preview key"
+            "The host took this phone as a destination, but did not confirm its preview key"
         ),
         "{words:?}"
     );
