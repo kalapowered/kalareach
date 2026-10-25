@@ -237,6 +237,11 @@ async fn unpumped() -> Unpumped {
 
 /// The same, with the shell the script names.
 async fn unpumped_running(script: &str) -> Unpumped {
+    unpumped_under(script, kr_worker::session::StartTerms::default()).await
+}
+
+/// The same, started under `terms`.
+async fn unpumped_under(script: &str, terms: kr_worker::session::StartTerms) -> Unpumped {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -261,6 +266,7 @@ async fn unpumped_running(script: &str) -> Unpumped {
 
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
     let mut session = Session::open(config).expect("opens the session");
+    session.start_under(terms);
     session.launch().expect("launches the shell");
     session.install_fence(FenceDriver::new(
         session_id,
@@ -7915,6 +7921,924 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
         })
         .await
         .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved its queues again"));
+        shell.close().await;
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-13.11: `shell.launch.surface` says whether a launch could be made at the root editor now,
+// and the press agrees with it.
+// --------------------------------------------------------------------------------------------
+
+/// Connects the way the host's own caller does, which sees the live screen.
+async fn surface_client(wired: &Wired) -> LocalClient {
+    LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects")
+}
+
+/// Asks the worker for the launch surface over `client`.
+async fn surface_over(
+    client: &mut LocalClient,
+    session_id: SessionId,
+) -> kr_protocol::root::ShellLaunchSurfaceResult {
+    client
+        .request(
+            Method::ShellLaunchSurface,
+            &kr_protocol::root::ShellLaunchSurfaceParams { session_id },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("reads")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// The reason a read gives for the editor not being verified. A verified one fails the case.
+fn reason_of(
+    surface: &kr_protocol::root::ShellLaunchSurfaceResult,
+) -> kr_protocol::root::LaunchUnverified {
+    match &surface.editor {
+        kr_protocol::root::LaunchEditor::Unverified { reason } => *reason,
+        kr_protocol::root::LaunchEditor::Verified { .. } => {
+            panic!("the editor is verified: {surface:?}")
+        }
+    }
+}
+
+/// The numbers a verified read names. An unverified one fails the case.
+fn verified_numbers(
+    surface: &kr_protocol::root::ShellLaunchSurfaceResult,
+) -> (PromptGeneration, EditorBufferRevision, CwdRevision) {
+    match &surface.editor {
+        kr_protocol::root::LaunchEditor::Verified {
+            prompt_generation,
+            buffer_revision,
+            cwd_revision,
+        } => (*prompt_generation, *buffer_revision, *cwd_revision),
+        kr_protocol::root::LaunchEditor::Unverified { reason } => {
+            panic!("the editor is not verified ({reason:?}): {surface:?}")
+        }
+    }
+}
+
+/// A launch of `command` that quotes `generation` and `revision`.
+fn launch_quoting(
+    wired: &Wired,
+    generation: PromptGeneration,
+    revision: EditorBufferRevision,
+    command: &[&str],
+) -> ShellLaunchParams {
+    ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::Arguments(command.iter().map(|word| (*word).to_owned()).collect()),
+        expected_prompt_generation: generation,
+        expected_buffer_revision: revision,
+    }
+}
+
+/// Presses a launch on `client`, which comes back with the answer.
+fn pressing(
+    mut client: LocalClient,
+    target: ActionTarget,
+    params: ShellLaunchParams,
+) -> tokio::task::JoinHandle<(
+    LocalClient,
+    std::result::Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError>,
+)> {
+    tokio::spawn(async move {
+        let outcome = client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await
+            .expect("reaches the worker");
+        (client, outcome)
+    })
+}
+
+/// Waits for the launch the worker hands the reader's mailbox.
+async fn the_reader_is_asked(
+    wired: &mut Wired,
+) -> kr_shell_integration::contract::requests::LaunchMailboxRequest {
+    loop {
+        if let ToBridge::Request { request, .. } = wired.next().await
+            && let WorkerRequest::Launch(request) = *request
+        {
+            return request;
+        }
+    }
+}
+
+/// The reader installs the launch it was asked for.
+async fn the_reader_installs(
+    wired: &mut Wired,
+    request: &kr_shell_integration::contract::requests::LaunchMailboxRequest,
+    generation: PromptGeneration,
+    buffer: EditorBufferRevision,
+) {
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Accepted(LaunchAccepted {
+                transaction: request.transaction,
+                installed: request.command.clone(),
+                fence_id: request.fence_id,
+                prompt_generation: generation,
+                buffer_revision: buffer,
+                reader_revision: ReaderRevision::new(1),
+            })),
+        )
+        .await
+        .expect("installs");
+}
+
+/// The reader refuses the launch it was asked for.
+async fn the_reader_refuses(
+    wired: &mut Wired,
+    request: &kr_shell_integration::contract::requests::LaunchMailboxRequest,
+    reason: LaunchRejectionReason,
+    generation: PromptGeneration,
+) {
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Rejected(LaunchRejection {
+                transaction: request.transaction,
+                reason,
+                fence_id: request.fence_id,
+                prompt_generation: generation,
+                buffer_revision: EditorBufferRevision::new(1),
+            })),
+        )
+        .await
+        .expect("refuses");
+}
+
+/// Reads the worker's frames until it has handled every event sent before this call, and returns
+/// them.
+///
+/// The frames on the bridge's endpoint arrive in the order the worker sent them and the worker
+/// handles the reader's events in the order they came, so once the answer to a later event is
+/// here, the worker has handled everything before it and every frame it sent for that has been
+/// read.
+async fn settled(wired: &mut Wired) -> Vec<ToBridge> {
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandBlock(Box::new(
+            kr_protocol::root::RootCommandBlockParams {
+                session_id: wired.session_id,
+                prompt_generation: PromptGeneration::new(1),
+                command: "true".to_owned(),
+                started_at_ms: kr_protocol::scalars::TimestampMs::new(1_700_000_000_000),
+                duration_ms: Nullable::null(),
+                exit_status: Nullable::null(),
+                cwd: "/tmp".to_owned(),
+                cwd_revision: CwdRevision::new(1),
+            },
+        )))
+        .await
+        .expect("reports");
+    let mut seen = Vec::new();
+    loop {
+        let frame = wired.next().await;
+        if let ToBridge::EventResult { result, .. } = &frame
+            && matches!(
+                **result,
+                kr_shell_integration::contract::transport::EventOutcome::CommandBlockRecorded(_)
+            )
+        {
+            return seen;
+        }
+        seen.push(frame);
+    }
+}
+
+/// Fails the case if a launch reached the reader's mailbox.
+async fn nothing_was_asked_of_the_reader(wired: &mut Wired) {
+    for frame in settled(wired).await {
+        assert!(
+            !matches!(&frame, ToBridge::Request { request, .. } if matches!(**request, WorkerRequest::Launch(_))),
+            "a launch reached the reader: {frame:?}"
+        );
+    }
+}
+
+/// The reader leaves the prompt it is at.
+async fn the_reader_leaves(wired: &mut Wired, prompt: u64) {
+    wired
+        .bridge
+        .send_event(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: wired.session_id,
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(1),
+            reason: kr_protocol::root::EditorLeaveReason::ReaderTakeover,
+        }))
+        .await
+        .expect("leaves");
+    let _ = settled(wired).await;
+}
+
+/// Takes a session whose shell ignores an interrupt to a stage of its own: managed, registered, with
+/// the keys held by an attachment of `client`'s connection and a fence published at `prompt`.
+async fn wired_ignoring_interrupts() -> Wired {
+    wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging::on_a_clock_of_its_own(),
+        |config| {
+            // Bracketed paste on, so a lone Escape may begin a delimiter, and an interrupt ignored.
+            config.shell = kr_worker::testing::posix_script(
+                "printf '\\033[?2004hkr-ready.'; trap '' INT; exec cat",
+            );
+        },
+    )
+    .await
+}
+
+/// KR-REQ-13.11: a press that quotes what a verified read named is installed by the reader, and the
+/// read then follows the editor: it is a launch in progress while the reader holds the command, no
+/// prompt once the reader leaves, and verified at the next prompt with that prompt's numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_press_quoting_a_verified_read_is_installed_and_the_read_then_follows_the_prompt()
+ {
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+
+    let surface = surface_over(&mut client, wired.session_id).await;
+    let (generation, revision, directory) = verified_numbers(&surface);
+    assert_eq!(generation, fence.prompt_generation);
+    assert_eq!(revision, EditorBufferRevision::new(1));
+    assert_eq!(directory, CwdRevision::new(1));
+    assert_eq!(surface.input, kr_protocol::root::LaunchInput::HeldHere);
+    assert_eq!(
+        surface.shell.0,
+        Some(kr_protocol::root::LaunchShell::Zsh),
+        "the managed package names the shell"
+    );
+
+    let calling = pressing(
+        client,
+        wired.target(),
+        launch_quoting(&wired, generation, revision, &["claude"]),
+    );
+    let request = the_reader_is_asked(&mut wired).await;
+    assert_eq!(
+        request.command,
+        LaunchCommand::Arguments(vec!["claude".to_owned()]),
+        "the reader is asked for what the press named"
+    );
+    the_reader_installs(
+        &mut wired,
+        &request,
+        generation,
+        EditorBufferRevision::new(2),
+    )
+    .await;
+    let (mut client, outcome) = calling.await.expect("joins");
+    outcome.expect("the reader installed it");
+
+    // The reader holds the command. The buffer it acknowledged empty is not the editor's now, though
+    // the machine is fenced again and no launch is outstanding.
+    let surface = surface_over(&mut client, wired.session_id).await;
+    assert_eq!(
+        reason_of(&surface),
+        kr_protocol::root::LaunchUnverified::LaunchInProgress
+    );
+
+    the_reader_leaves(&mut wired, 1).await;
+    let surface = surface_over(&mut client, wired.session_id).await;
+    assert_eq!(
+        reason_of(&surface),
+        kr_protocol::root::LaunchUnverified::NotAtPrompt
+    );
+
+    // The next prompt is proved afresh, and the read names its numbers.
+    let next = fenced(&mut wired, 2, 1).await;
+    let surface = surface_over(&mut client, wired.session_id).await;
+    let (generation, _, _) = verified_numbers(&surface);
+    assert_eq!(generation, next.prompt_generation);
+    assert_ne!(generation, fence.prompt_generation);
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: a press that a read does not support installs nothing. While no fence stands the
+/// read says so, and a press quoting the numbers the prompt entered with is refused before the
+/// reader is asked; once the fence stands, a press quoting an earlier prompt is refused as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_press_the_read_does_not_support_installs_nothing() {
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let fence_id = asked_for_a_fence(&mut wired).await;
+
+    let surface = surface_over(&mut client, wired.session_id).await;
+    assert_eq!(
+        reason_of(&surface),
+        kr_protocol::root::LaunchUnverified::NoFence
+    );
+    assert_eq!(surface.input, kr_protocol::root::LaunchInput::HeldHere);
+    let (client, outcome) = pressing(
+        client,
+        wired.target(),
+        launch_quoting(
+            &wired,
+            PromptGeneration::new(1),
+            EditorBufferRevision::new(1),
+            &["claude"],
+        ),
+    )
+    .await
+    .expect("joins");
+    outcome.expect_err("no fence stands, so nothing can be installed");
+    nothing_was_asked_of_the_reader(&mut wired).await;
+
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
+        .await
+        .expect("acknowledges");
+    let _ = published(&mut wired).await;
+    let mut client = client;
+    let surface = surface_over(&mut client, wired.session_id).await;
+    let (generation, _, _) = verified_numbers(&surface);
+    let (_client, outcome) = pressing(
+        client,
+        wired.target(),
+        launch_quoting(
+            &wired,
+            PromptGeneration::new(generation.0.get() - 1),
+            EditorBufferRevision::new(1),
+            &["claude"],
+        ),
+    )
+    .await
+    .expect("joins");
+    let refused = outcome.expect_err("a quote of an earlier prompt is stale");
+    assert_eq!(refused.code, ErrorCode::DraftConflict);
+    nothing_was_asked_of_the_reader(&mut wired).await;
+    wired.close().await;
+}
+
+/// The reader's acknowledgement of a fence, with the buffer state it names.
+fn drained_with(
+    prompt: u64,
+    revision: u64,
+    fence_id: kr_protocol::root::FenceId,
+    editor: EditorState,
+) -> BridgeAnswer {
+    let mut answer = drained(prompt, revision, fence_id);
+    if let BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) = &mut answer {
+        acknowledgement.editor = editor;
+    }
+    answer
+}
+
+/// Takes the session to a published fence whose acknowledgement names `editor`.
+async fn fenced_on(wired: &mut Wired, prompt: u64, editor: EditorState) {
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, prompt, 1))
+        .await
+        .expect("enters");
+    let fence_id = asked_for_a_fence(wired).await;
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            drained_with(prompt, 1, fence_id, editor),
+        )
+        .await
+        .expect("acknowledges");
+    let _ = published(wired).await;
+}
+
+/// KR-REQ-13.11: what the worker admits or learns after the fence was proved makes the read
+/// unverified until the next prompt: a key held through the exchange, a key, an interrupt, a lone
+/// Escape the paste recogniser still holds, a launch the reader refused because the editor had
+/// moved, and a report of the reader that differs from what it acknowledged. A report that agrees
+/// with it clears nothing, because a report and a forwarded key can cross.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_what_changes_the_picture_after_the_fence_makes_the_read_unverified() {
+    use kr_protocol::root::LaunchUnverified::ChangedSinceFence;
+    let mut wired = wired_ignoring_interrupts().await;
+    let mut client = surface_client(&wired).await;
+    let holder = holder_over(&mut client, &wired).await;
+
+    // A key typed while the reader is asked is held, and goes to the terminal when the fence is
+    // published: the reader's snapshot never accounted for it.
+    let _ = fenced_with(&mut wired, holder, Some(b"x")).await;
+    let _ = published(&mut wired).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "a key held through the exchange"
+    );
+
+    // A key admitted after the fence.
+    let _ = fenced(&mut wired, 2, 1).await;
+    assert!(
+        verified_numbers(&surface_over(&mut client, wired.session_id).await).0
+            == PromptGeneration::new(2)
+    );
+    type_keys(&wired, holder, 1, b"x");
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "a key admitted after the fence"
+    );
+    // The reader reports what it acknowledged. That is not proof the buffer is still empty.
+    wired
+        .bridge
+        .send_event(idle(wired.session_id, 2, 1))
+        .await
+        .expect("reports");
+    let _ = settled(&mut wired).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "a report that agrees clears nothing"
+    );
+
+    // An interrupt.
+    let _ = fenced(&mut wired, 3, 1).await;
+    let epoch = wired.runtime.session().lease().epoch.get();
+    wired
+        .runtime
+        .session()
+        .interrupt(holder, epoch)
+        .expect("interrupts");
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "an interrupt"
+    );
+
+    // A launch the reader refused because the editor had moved. The fence still stands, so the read
+    // would otherwise give the refused numbers again.
+    let fence = fenced(&mut wired, 4, 1).await;
+    let (generation, revision, _) =
+        verified_numbers(&surface_over(&mut client, wired.session_id).await);
+    let calling = pressing(
+        client,
+        wired.target(),
+        launch_quoting(&wired, generation, revision, &["claude"]),
+    );
+    let request = the_reader_is_asked(&mut wired).await;
+    the_reader_refuses(
+        &mut wired,
+        &request,
+        LaunchRejectionReason::BufferNotEmpty,
+        fence.prompt_generation,
+    )
+    .await;
+    let (mut client, outcome) = calling.await.expect("joins");
+    assert_eq!(
+        outcome.expect_err("the buffer is not empty").code,
+        ErrorCode::DraftConflict
+    );
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "a launch the reader refused because the editor had moved"
+    );
+
+    // A report that differs from what the reader acknowledged.
+    let _ = fenced(&mut wired, 5, 1).await;
+    let mut differing = idle(wired.session_id, 5, 1);
+    if let BridgeEvent::ReaderIdle(report) = &mut differing {
+        report.editor = editor_state(true, 2);
+    }
+    wired.bridge.send_event(differing).await.expect("reports");
+    let _ = settled(&mut wired).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "a report of another buffer revision"
+    );
+
+    // The next prompt is proved afresh.
+    let _ = fenced(&mut wired, 6, 1).await;
+    assert_eq!(
+        verified_numbers(&surface_over(&mut client, wired.session_id).await).0,
+        PromptGeneration::new(6)
+    );
+
+    // A lone Escape, which the recogniser holds in case it begins a paste delimiter: the worker
+    // accepted it and the machine has not seen it. The write is stamped an hour on, so the
+    // recogniser's deadline is not one this case races.
+    echoed(&wired.runtime, b"kr-ready.").await;
+    let epoch = wired.runtime.session().lease().epoch.get();
+    wired
+        .runtime
+        .session()
+        .write_input(
+            holder,
+            epoch,
+            3,
+            b"\x1b",
+            None,
+            std::time::Instant::now() + Duration::from_secs(3600),
+        )
+        .expect("the Escape is accepted");
+    assert!(
+        wired.runtime.session().paste_deadline().is_some(),
+        "the recogniser is holding it"
+    );
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        ChangedSinceFence,
+        "a prefix the worker accepted and holds"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: the reader's own account of its buffer at the fence decides the reason when
+/// nothing has changed since: text in the buffer, or an operation in progress in the reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_the_buffer_the_reader_acknowledged_decides_the_reason() {
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    fenced_on(&mut wired, 1, editor_state(false, 1)).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        kr_protocol::root::LaunchUnverified::BufferNotEmpty
+    );
+    let mut searching = editor_state(true, 1);
+    searching.pending.search = true;
+    fenced_on(&mut wired, 2, searching).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        kr_protocol::root::LaunchUnverified::ReaderPending
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: before a prompt there is no editor to launch in, a reader that is not the primary
+/// prompt is not one either, and the editor leaving takes the verification with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_only_the_primary_prompt_of_a_registered_reader_is_launchable() {
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    // The hooks are live once the worker has handled the event the harness sent.
+    let _ = settled(&mut wired).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        kr_protocol::root::LaunchUnverified::NotAtPrompt,
+        "no root editor is registered yet"
+    );
+    let _ = fenced_read(&mut wired, 1, 1).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        kr_protocol::root::LaunchUnverified::NotPrimaryPrompt,
+        "the `read` builtin is not the primary prompt"
+    );
+    let _ = fenced(&mut wired, 2, 1).await;
+    verified_numbers(&surface_over(&mut client, wired.session_id).await);
+    the_reader_leaves(&mut wired, 2).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        kr_protocol::root::LaunchUnverified::NotAtPrompt
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: a launch the reader is deciding keeps the read from verifying, a launch the
+/// worker revoked at its hold's end still does until the reader answers, and a reader that
+/// installed nothing leaves the fence it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_launch_in_flight_is_in_progress_until_the_reader_answers() {
+    use kr_protocol::root::LaunchUnverified::LaunchInProgress;
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    let mut reading = surface_client(&wired).await;
+    let calling = pressing(
+        client,
+        wired.target(),
+        launch_quoting(
+            &wired,
+            fence.prompt_generation,
+            EditorBufferRevision::new(1),
+            &["claude"],
+        ),
+    );
+    let request = the_reader_is_asked(&mut wired).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut reading, wired.session_id).await),
+        LaunchInProgress,
+        "the reader is deciding"
+    );
+
+    wired.pass(THE_HOLD);
+    loop {
+        if matches!(wired.next().await, ToBridge::LaunchRevoked { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        reason_of(&surface_over(&mut reading, wired.session_id).await),
+        LaunchInProgress,
+        "the revocation bounds the hold on input, not the reader's decision"
+    );
+
+    the_reader_refuses(
+        &mut wired,
+        &request,
+        LaunchRejectionReason::Revoked,
+        fence.prompt_generation,
+    )
+    .await;
+    let (_client, outcome) = calling.await.expect("joins");
+    assert_eq!(
+        outcome.expect_err("it was revoked").code,
+        ErrorCode::EditorBusy
+    );
+    let surface = surface_over(&mut reading, wired.session_id).await;
+    assert_eq!(
+        verified_numbers(&surface).0,
+        fence.prompt_generation,
+        "the reader installed nothing, so the fence and what it proved stand"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: how the asking connection stands to the session's input. A connection with two
+/// attachments, one of which holds the keys, holds them; another connection does not; and nobody
+/// holding them is free, which no managed session verifies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_the_input_relation_is_the_asking_connections() {
+    use kr_protocol::root::LaunchInput;
+    let wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let surface = surface_over(&mut client, wired.session_id).await;
+    assert_eq!(surface.input, LaunchInput::Free);
+    assert!(
+        matches!(
+            surface.editor,
+            kr_protocol::root::LaunchEditor::Unverified { .. }
+        ),
+        "a session nobody holds is never verified"
+    );
+
+    let _holder = holder_over(&mut client, &wired).await;
+    // A second attachment of the same connection, which does not hold the keys.
+    let _second: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &terminal(wired.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        surface_over(&mut client, wired.session_id).await.input,
+        LaunchInput::HeldHere
+    );
+
+    // Another connection asks while this connection's attachment holds the keys.
+    let mut other = surface_client(&wired).await;
+    assert_eq!(
+        surface_over(&mut other, wired.session_id).await.input,
+        LaunchInput::HeldElsewhere
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-13.11: a session whose integration has not qualified is starting, not lost; one that
+/// lost its hooks is lost, and a press quoting what it was verified at is refused before the
+/// reader is asked; one that is closing says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_session_is_starting_until_it_qualifies_and_lost_when_it_loses_its_hooks() {
+    use kr_protocol::root::LaunchUnverified;
+    // Authenticated and not qualified: the startup files have not finished.
+    let starting = wired_with(ShellMode::Managed, false).await;
+    let mut client = surface_client(&starting).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, starting.session_id).await),
+        LaunchUnverified::Starting
+    );
+    starting.close().await;
+
+    let mut wired = wired().await;
+    let mut client = surface_client(&wired).await;
+    let _holder = holder_over(&mut client, &wired).await;
+    let _ = fenced(&mut wired, 1, 1).await;
+    let (generation, revision, _) =
+        verified_numbers(&surface_over(&mut client, wired.session_id).await);
+    let _ = wired
+        .runtime
+        .drive_fence(|driver| driver.integration_lost(IntegrationLoss::SemanticHookLoss));
+    assert_eq!(
+        reason_of(&surface_over(&mut client, wired.session_id).await),
+        LaunchUnverified::IntegrationLost
+    );
+    let (_client, outcome) = pressing(
+        client,
+        wired.target(),
+        launch_quoting(&wired, generation, revision, &["claude"]),
+    )
+    .await
+    .expect("joins");
+    outcome.expect_err("a session that lost its hooks installs nothing");
+    nothing_was_asked_of_the_reader(&mut wired).await;
+    wired.close().await;
+
+    let closing = wired_with(ShellMode::Managed, true).await;
+    let mut client = surface_client(&closing).await;
+    let _ = closing
+        .runtime
+        .drive_fence(|driver| driver.session_closing());
+    assert_eq!(
+        reason_of(&surface_over(&mut client, closing.session_id).await),
+        LaunchUnverified::Closing
+    );
+    closing.close().await;
+}
+
+/// KR-REQ-13.11: a stock shell is shown instructions and its offers, a launch profile that forbids
+/// a fenced launch is told so, and neither is a managed session's verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_stock_shell_and_a_forbidding_profile_are_told_apart_from_a_managed_prompt()
+{
+    use kr_protocol::root::{LaunchShell, LaunchUnverified};
+    let stock = wired_with(ShellMode::NativeCompat, false).await;
+    let mut client = surface_client(&stock).await;
+    let surface = surface_over(&mut client, stock.session_id).await;
+    assert_eq!(reason_of(&surface), LaunchUnverified::StockShell);
+    assert_eq!(
+        surface.shell.0,
+        Some(LaunchShell::Sh),
+        "the program's file name names the shell where no package does"
+    );
+    stock.close().await;
+
+    let forbidding = wired_profiled(
+        ShellMode::Managed,
+        true,
+        kr_protocol::session::LaunchProfile {
+            fenced_launch: false,
+            ..kr_protocol::session::LaunchProfile::default()
+        },
+    )
+    .await;
+    let mut client = surface_client(&forbidding).await;
+    assert_eq!(
+        reason_of(&surface_over(&mut client, forbidding.session_id).await),
+        LaunchUnverified::ProfileForbids
+    );
+    forbidding.close().await;
+}
+
+/// KR-REQ-13.11: a session the host started to run a command has no shell to type into, and is not
+/// shown instructions for one either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_session_whose_root_is_a_command_is_not_a_shell() {
+    let unpumped = unpumped_under(
+        "exec cat",
+        kr_worker::session::StartTerms {
+            root_is_command: true,
+            not_after_boot_ms: None,
+        },
+    )
+    .await;
+    let mut client = LocalClient::connect(&unpumped.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let surface = surface_over(&mut client, unpumped.session_id).await;
+    assert_eq!(
+        reason_of(&surface),
+        kr_protocol::root::LaunchUnverified::NotAShell
+    );
+    assert_eq!(
+        surface.shell.0, None,
+        "there is no shell to quote for, so none is named"
+    );
+    unpumped.close().await;
+}
+
+/// Waits until a real reader's picture is one a launch could rest on, and returns the prompt it is
+/// at: a fence stands, the reader acknowledged an empty buffer with nothing pending, and nothing
+/// the worker admitted or learned since has changed that. A prompt before `after` is not the one.
+#[cfg(unix)]
+async fn until_launchable(
+    shell: &RealShell,
+    kind: ShellKind,
+    after: Option<PromptGeneration>,
+) -> PromptGeneration {
+    use kr_shell_integration::contract::fence::LaunchStanding;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(LaunchStanding::Fenced(editor)) = shell.runtime.session().launch_standing()
+                && editor.acknowledged.buffer_empty
+                && editor.acknowledged.pending.is_idle()
+                && !editor.changed
+                && after.is_none_or(|earlier| editor.prompt_generation > earlier)
+            {
+                return editor.prompt_generation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{kind:?}: the reader never became launchable"))
+}
+
+/// KR-REQ-13.11: a real reader is launchable at its first prompt; the key a person types there makes
+/// it unlaunchable until the next prompt; and the next prompt is launchable at a later generation.
+///
+/// This holds the plan's reading of what each reader reports against the reader's real reports: the
+/// acknowledgement's buffer state is what the worker rests on, and no report of an unchanged reader
+/// differs from it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn kr_req_13_11_a_real_reader_is_launchable_at_its_prompt_and_not_after_a_key_until_the_next()
+{
+    use kr_shell_integration::contract::fence::LaunchStanding;
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+        let package = installed_package_of(kind);
+        let shell = RealShell::start(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+        )
+        .await;
+        let mut keys = shell.keys();
+        let first = until_launchable(&shell, kind, None).await;
+
+        {
+            let mut session = shell.runtime.session();
+            session
+                .write_input(
+                    keys.attachment_id,
+                    keys.epoch,
+                    keys.sequence,
+                    b"x",
+                    None,
+                    std::time::Instant::now(),
+                )
+                .expect("the key is accepted");
+            keys.sequence += 1;
+        }
+        shell.runtime.flush_input();
+        let changed = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if matches!(
+                    shell.runtime.session().launch_standing(),
+                    Some(LaunchStanding::Fenced(editor)) if editor.changed
+                ) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            changed.is_ok(),
+            "{kind:?}: a key typed at the prompt changed nothing"
+        );
+
+        // Erase it and end the line: the reader returns an empty line and draws the next prompt.
+        {
+            let mut session = shell.runtime.session();
+            session
+                .write_input(
+                    keys.attachment_id,
+                    keys.epoch,
+                    keys.sequence,
+                    b"\x7f\r",
+                    None,
+                    std::time::Instant::now(),
+                )
+                .expect("the keys are accepted");
+        }
+        shell.runtime.flush_input();
+        let second = until_launchable(&shell, kind, Some(first)).await;
+        assert!(
+            second > first,
+            "{kind:?}: the next prompt is a later generation"
+        );
         shell.close().await;
     }
 }

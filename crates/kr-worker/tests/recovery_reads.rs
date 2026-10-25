@@ -15,6 +15,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-23.48 | every `kr_req_23_48_` test here |
+//! | KR-REQ-13.11 | the launch surface a paired device reads is what its grant's live screen shows |
 
 #![cfg(unix)]
 
@@ -232,8 +233,12 @@ impl Host {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn host() -> Host {
+    host_in(ShellMode::NativeCompat).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn host_in(mode: ShellMode) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -262,7 +267,7 @@ async fn host() -> Host {
         environment_id,
         display_number: DisplayNumber::new(1),
         shell: kr_worker::testing::posix_script("exec cat"),
-        shell_mode: ShellMode::NativeCompat,
+        shell_mode: mode,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
         dimensions: Dimensions::new(80, 24),
@@ -280,6 +285,32 @@ async fn host() -> Host {
     }
     let mut session = TerminalSession::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
+    if mode == ShellMode::Managed {
+        // Registered and qualified without a bridge: the phases are the driver's own, and what a
+        // read of the launch surface needs from them is a session that has qualified.
+        session.install_fence(kr_worker::fence::FenceDriver::new(
+            session_id,
+            kr_shell_integration::contract::fence::LeaseView::unheld(
+                kr_protocol::ids::InputLeaseEpoch::new(0),
+            ),
+            Arc::new(kr_transport::clock::SystemContinuousClock::new()),
+        ));
+        let mut driver = session.fence_mut().expect("a driver");
+        assert!(driver.registered(
+            kr_shell_integration::contract::qualification::ShellKind::Zsh,
+            "zle-5.9"
+        ));
+        let _ = driver.bridge_event(
+            RequestId::new(1),
+            &kr_shell_integration::contract::events::BridgeEvent::HooksActivated(
+                kr_shell_integration::contract::events::HooksActivated {
+                    session_id,
+                    prompt_generation: kr_protocol::root::PromptGeneration::new(1),
+                    modules: Vec::new(),
+                },
+            ),
+        );
+    }
     let runtime = Arc::new(
         SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
             .expect("starts the runtime"),
@@ -1355,4 +1386,67 @@ async fn kr_req_23_48_a_devices_subscription_is_held_to_its_grant_and_its_frame_
         early.union(&late).copied().collect(),
         "the owner is shown everything"
     );
+}
+
+/// A grant's history scope that reaches back to `lower_bound_ms` and not to the live screen.
+fn without_the_live_screen(lower_bound_ms: u64) -> HistoryScope {
+    HistoryScope {
+        include_live_screen: false,
+        ..reaching_back_to(lower_bound_ms)
+    }
+}
+
+/// KR-REQ-13.11: what the launch surface says of the editor and of who holds the input is what the
+/// live screen shows, so a paired device whose grant does not reach the screen is told neither, and
+/// one that does is told which reason holds and who has the keys. The read is forwarded as the
+/// daemon forwards a device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_13_11_a_device_that_cannot_see_the_screen_is_told_neither_the_editor_nor_the_input()
+{
+    use kr_protocol::root::{
+        LaunchEditor, LaunchInput, LaunchUnverified, ShellLaunchSurfaceParams,
+        ShellLaunchSurfaceResult,
+    };
+    let host = host_in(ShellMode::Managed).await;
+    let mut daemon = daemon(&host).await;
+    let params = ShellLaunchSurfaceParams {
+        session_id: host.session_id,
+    };
+
+    let blind: ShellLaunchSurfaceResult = forwarded(
+        &mut daemon,
+        Some(without_the_live_screen(3_000)),
+        Method::ShellLaunchSurface,
+        &params,
+    )
+    .await
+    .expect("the read is answered")
+    .to_typed()
+    .expect("decodes");
+    assert_eq!(
+        blind.editor,
+        LaunchEditor::Unverified {
+            reason: LaunchUnverified::NotShown
+        }
+    );
+    assert_eq!(blind.input, LaunchInput::Withheld);
+
+    let seeing: ShellLaunchSurfaceResult = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(3_000)),
+        Method::ShellLaunchSurface,
+        &params,
+    )
+    .await
+    .expect("the read is answered")
+    .to_typed()
+    .expect("decodes");
+    assert_eq!(
+        seeing.editor,
+        LaunchEditor::Unverified {
+            reason: LaunchUnverified::NotAtPrompt
+        },
+        "a device that sees the screen is told which reason holds"
+    );
+    assert_eq!(seeing.input, LaunchInput::Free);
 }

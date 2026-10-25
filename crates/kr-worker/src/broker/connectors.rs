@@ -46,6 +46,7 @@ use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, MAX_TABLE_METHODS, NativeFraming, RichMethodTable,
 };
 use kr_protocol::ids::{MethodTableVersion, PluginId, PublisherId, UpstreamMethod};
+use kr_protocol::root::{LaunchCommand, LaunchOffer};
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::session::EnvironmentVariable;
 pub use kr_shell_integration::host::command::lookup_name;
@@ -371,6 +372,24 @@ impl InstalledConnector {
     #[must_use]
     pub const fn table(&self) -> &ConnectorManifest {
         &self.table
+    }
+
+    /// Returns the command a person starts this agent with, where the package gives one.
+    ///
+    /// It is the command the manifest declares as its command integration, whether or not the
+    /// installation holds the capability that lets the integration run, and otherwise the file stem
+    /// of the first match rule that names no directory. A rule that names the directory an
+    /// application installs into recognises a file there; it is not the name a person types.
+    #[must_use]
+    pub fn offered_command(&self) -> Option<String> {
+        if let Some(declared) = &self.manifest.command_integration {
+            return Some(declared.command.clone());
+        }
+        self.manifest
+            .match_rules
+            .iter()
+            .find(|rule| rule.executable.path_suffix.is_empty())
+            .map(|rule| rule.executable.file_stem.clone())
     }
 
     /// Says why the gateway serves no launch of this connector, when its table declares no tested
@@ -933,6 +952,65 @@ impl ConnectorSources {
             .by_command
             .get(&*lookup_name(command))
             .cloned()
+    }
+
+    /// Returns what a person could start an agent with: one offer for each distinct command among
+    /// the connectors held, in the order of the command.
+    ///
+    /// Where connectors give one command, the one whose integration applies wins, then one that
+    /// declares an integration the installation did not grant, then the one whose plugin identifier
+    /// sorts first, so the answer is the same after a restart. Nothing here says the executable is
+    /// installed: the shell finds out when the command runs.
+    #[must_use]
+    pub fn launch_offers(&self) -> Vec<LaunchOffer> {
+        struct Candidate<'a> {
+            rank: (bool, bool, String),
+            connector: &'a Arc<InstalledConnector>,
+            command: String,
+        }
+        let held = self
+            .held
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut chosen: BTreeMap<String, Candidate<'_>> = BTreeMap::new();
+        for connector in &held.connectors {
+            let Some(command) = connector.offered_command() else {
+                continue;
+            };
+            let rank = (
+                connector.integration().is_none(),
+                connector.manifest().command_integration.is_none(),
+                connector.plugin_id().to_string(),
+            );
+            let candidate = Candidate {
+                rank,
+                connector,
+                command,
+            };
+            match chosen.entry(lookup_name(&candidate.command).into_owned()) {
+                std::collections::btree_map::Entry::Vacant(vacant) => {
+                    vacant.insert(candidate);
+                }
+                std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                    if candidate.rank < occupied.get().rank {
+                        occupied.insert(candidate);
+                    }
+                }
+            }
+        }
+        chosen
+            .into_values()
+            .map(|candidate| LaunchOffer {
+                plugin_id: candidate.connector.plugin_id(),
+                label: candidate
+                    .connector
+                    .manifest()
+                    .display_name
+                    .as_str()
+                    .to_owned(),
+                command: LaunchCommand::Arguments(vec![candidate.command]),
+            })
+            .collect()
     }
 }
 

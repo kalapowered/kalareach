@@ -1198,6 +1198,14 @@ impl Session {
         self.input.lock().outstanding_launches()
     }
 
+    /// Says what stands between a caller and a launch at the root editor.
+    ///
+    /// `None` for a session that has no managed root editor.
+    #[must_use]
+    pub fn launch_standing(&self) -> Option<kr_shell_integration::contract::fence::LaunchStanding> {
+        self.input.lock().launch_standing()
+    }
+
     /// Sends the terminal's configured interrupt to the foreground process group.
     fn interrupt_foreground(&mut self) -> Result<()> {
         if self.pty.interrupt_foreground().is_ok() {
