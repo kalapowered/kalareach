@@ -1166,8 +1166,8 @@ mod tests {
         index.note_at(0, 4, 1_000, true, 5_000);
         // A minute on the wall clock against a millisecond on the continuous one.
         index.note_at(100, 4, 61_000, true, 5_001);
-        assert_eq!(index.first_cursor_from(500), None);
-        assert_eq!(index.first_cursor_from(0), Some(0));
+        assert_eq!(index.first_cursor_from(1_001), None);
+        assert_eq!(index.first_cursor_from(1_000), Some(0));
     }
 
     #[test]
