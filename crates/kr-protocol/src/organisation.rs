@@ -112,6 +112,21 @@ pub struct OrganisationWithdrawParams {
     pub organisation_id: OrganisationId,
 }
 
+/// The parameters of `host.policy.confirm`. There are none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostPolicyConfirmParams {}
+
+/// The result of `host.policy.confirm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostPolicyConfirmResult {
+    /// True when the host was waiting for the person at this machine to confirm the policy it
+    /// holds and this call ended the wait. False when nothing was waiting, as when the call is
+    /// made again after one that ended it: the host keeps no record of the call.
+    pub lifted: bool,
+}
+
 /// The result of `organisation.exclusive.set`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

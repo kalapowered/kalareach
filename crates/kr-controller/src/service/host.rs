@@ -780,6 +780,9 @@ impl Controller {
                 self.authority_feed().is_removed(),
             ),
         });
+        // Only while the host waits for the person at this machine to confirm a restored policy,
+        // and whether or not it reads a feed.
+        checks.extend(self.restored_policy_check());
         checks.push(match &self.relay_keeper {
             Some(keeper) => keeper.doctor_check(self),
             None => crate::relay_leases::RelayKeeper::unconfigured_check(),

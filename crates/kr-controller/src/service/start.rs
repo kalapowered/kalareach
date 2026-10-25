@@ -511,7 +511,9 @@ impl Controller {
         // The policy and the feed are read back from the store rather than rebuilt empty. A host
         // that came back unrestricted after every restart would be the same failure as one that
         // accepted a restored old policy, by a different route.
-        let stored = match sharing.grants().stored_policy()? {
+        let held = sharing.grants().stored_policy()?;
+        let policy_held = held.is_some();
+        let stored = match held {
             Some(stored) => stored,
             None => crate::grants::HostPolicy::personal(authority_revision).snapshot(),
         };
@@ -541,6 +543,19 @@ impl Controller {
         // left out and written back so, and a host that cannot write that also stops: an entry
         // that stays could meet an enrolment made later that has its revision, which a registry
         // restored to an earlier state can give it.
+        // Whether this host found the policy it holds restored, and nobody has confirmed it: the
+        // record of that is read, and written first if the mirror could not be read, before
+        // `store_policy` below replaces the mirror and with it the evidence.
+        let mut restored_policy = crate::grants::restored::Kept::new(
+            crate::grants::restored::file_beside(&setup.paths.registry_database()),
+        );
+        let policy_waits = Self::wait_for_a_restored_policy(
+            &mut restored_policy,
+            policy_held.then(|| policy.snapshot()).as_ref(),
+            sharing.grants().mirror_unreadable(),
+            wall.now_ms(),
+        )?;
+        policy.set_restored_policy_waits(policy_waits);
         let applied = crate::grants::applied::read(setup.paths.state_dir())?;
         policy.restore_applied_policies(&applied);
         let applied_now = policy.applied_policies();
@@ -700,17 +715,19 @@ impl Controller {
         net::invitations::prepare(&devices)?;
         // Which refusals of the authority feed stand: the owner authority's pairing records read the
         // word where an owner device's confirmation is spent.
-        let feed_refusal = Arc::new(crate::grants::RemoteRefusal::with(
-            if policy
+        let feed_refusal = Arc::new(crate::grants::RemoteRefusal::with({
+            let policy = policy
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .personal_grants_rest_on_the_feed()
-            {
-                crate::grants::RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED
-            } else {
-                0
-            },
-        ));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut bits = 0;
+            if policy.personal_grants_rest_on_the_feed() {
+                bits |= crate::grants::RemoteRefusal::PERSONAL_GRANTS_REST_ON_THE_FEED;
+            }
+            if policy.restored_policy_waits() {
+                bits |= crate::grants::RemoteRefusal::RESTORED_POLICY_WAITS;
+            }
+            bits
+        }));
         // Whether the host is exclusively organisation-managed is the policy's, which the owner
         // authority reads when it decides what the terminal can confirm.
         let exclusive = {
@@ -1214,6 +1231,7 @@ impl Controller {
             policy,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             feed_refusal,
+            restored_policy: tokio::sync::Mutex::new(restored_policy),
             feed_drain: std::sync::Mutex::default(),
             #[cfg(test)]
             lock_ask: std::sync::Mutex::default(),

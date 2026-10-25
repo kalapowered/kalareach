@@ -147,6 +147,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         Method::DescriptionSetup | Method::DescriptionConfigure | Method::DescriptionDownload => {
             at(DESCRIBE, "Setup")
         }
+        Method::HostPolicyConfirm => at(HOST, "The remote authority feed"),
         Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => {
             at(HOST, "Machine groups")
         }

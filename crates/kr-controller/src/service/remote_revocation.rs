@@ -411,6 +411,12 @@ impl Controller {
         // A withdrawal the host cannot verify refuses remote grants, and a device that manages the
         // host acts by this decision on the feed it reads, which the refusal does not close.
         policy.set_withdrawal_unverified(false);
+        // A policy restored from an earlier state waits for the person at this machine and refuses
+        // remote grants, and the feed is how a known owner reaches the host then too: a request on
+        // it can only revoke, and a key it lists can only remove the host from the feed. Left in,
+        // the wait would refuse every request on the feed as lacking owner authority, and the
+        // host would name no owner's key to the feed.
+        policy.set_restored_policy_waits(false);
         let decided = crate::config::ceilings::decide_with_ceiling(
             ceiling.as_ref(),
             &device.grant,
@@ -1119,7 +1125,7 @@ impl Controller {
     /// without that wait ([`Self::refuse_the_grants_that_rest_on_the_feed`]).
     ///
     /// The callers are the carrier's one pass at a time.
-    async fn move_a_feed_refusal(
+    pub(super) async fn move_a_feed_refusal(
         &self,
         bit: u8,
         raised: bool,

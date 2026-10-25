@@ -853,6 +853,9 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         ("organisation.policy.apply", EffectClass::Write),
         ("organisation.exclusive.set", EffectClass::Write),
         ("organisation.withdraw", EffectClass::Write),
+        // The person at this machine confirms the policy a host found restored: the local socket
+        // alone, behind host management, as the rest of the group.
+        ("host.policy.confirm", EffectClass::Write),
     ];
     for (name, effect) in organisation {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
@@ -1680,6 +1683,45 @@ fn an_invitation_is_issued_over_local_ipc_only() {
             decide("pair.invite", MethodVersion::V1, ingress),
             AuthorityDecision::Denied(DenialReason::ForbiddenIngress { ingress }),
             "{ingress:?} cannot issue an invitation"
+        );
+    }
+}
+
+/// KR-REQ-24.15: the person at this machine ends the wait that a restored policy puts on every
+/// remote grant, on the local socket alone and behind host management.
+///
+/// It takes no owner confirmation, which is a stated exception to the rule that a rights-enlarging
+/// owner operation does. While the wait stands the host refuses every owner device, so no
+/// confirmation a device signs could be spent, and a confirmation for it would be a new subject of
+/// an existing type. It ends a refusal the host raised against itself and changes no policy, and
+/// code already running under the user's account can remove the record of the wait and start the
+/// daemon again. It is a method of recovery, so a host that is exclusively organisation-managed
+/// serves it to its local owner whose lease has lapsed, which may be what the restore lost.
+#[test]
+fn the_confirmation_of_a_restored_policy_is_the_person_at_the_machines_alone() {
+    let entry = lookup("host.policy.confirm").expect("host.policy.confirm is in the registry");
+    assert_eq!(entry.effect, EffectClass::Write);
+    assert_eq!(entry.ingress, &[ActorIngress::LocalIpc]);
+    assert_eq!(
+        entry.required_rights,
+        &[RequiredRight::right(ActionRight::HostManage)]
+    );
+    assert_eq!(entry.confirmation, ConfirmationRequirement::None);
+    assert!(
+        kr_protocol::method::LOCAL_RECOVERY.contains(&Method::HostPolicyConfirm),
+        "a local owner with no live lease can still end the wait"
+    );
+    for ingress in [
+        ActorIngress::PairedDevice,
+        ActorIngress::UnpairedPeer,
+        ActorIngress::Workflow,
+        ActorIngress::Plugin,
+        ActorIngress::ServiceClient,
+    ] {
+        assert_eq!(
+            decide("host.policy.confirm", MethodVersion::V1, ingress),
+            AuthorityDecision::Denied(DenialReason::ForbiddenIngress { ingress }),
+            "{ingress:?} cannot confirm a restored policy"
         );
     }
 }

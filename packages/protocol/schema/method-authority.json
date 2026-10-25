@@ -1013,6 +1013,39 @@
       "history_filter": "not_applicable",
       "idempotency": {
         "keyed": {
+          "key": "the wait a restored policy holds"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "host.policy.confirm",
+      "name": "host.policy.confirm",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "Confirm, at the host itself, the policy this host holds after it found that policy restored from an earlier state, which ends the wait that refuses every grant but the owner's at this machine. No owner device can confirm it, since the wait refuses every owner device, and no ceremony stands in for the person at the machine. It confirms the policy as it stands and changes none of it: what the restore revived is ended by the commands that end it. The host keeps no record of the call, so asked again after a reply was lost it answers that it lifted nothing.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
           "key": "the lease's signing-input digest"
         }
       },

@@ -2893,6 +2893,8 @@ export interface KalaReachProtocol {
   host_clock_establish_result?: HostClockEstablishResult
   host_doctor_result?: HostDoctorResult
   host_info_result?: HostInfoResult
+  host_policy_confirm_params?: HostPolicyConfirmParams
+  host_policy_confirm_result?: HostPolicyConfirmResult
   host_selection?: HostSelection
   host_update_handover_params?: HostUpdateHandoverParams
   host_update_handover_result?: HostUpdateHandoverResult
@@ -18141,6 +18143,21 @@ export interface ProtocolVersion7 {
   minor: number
 }
 /**
+ * The parameters of `host.policy.confirm`. There are none.
+ */
+export interface HostPolicyConfirmParams {}
+/**
+ * The result of `host.policy.confirm`.
+ */
+export interface HostPolicyConfirmResult {
+  /**
+   * True when the host was waiting for the person at this machine to confirm the policy it
+   * holds and this call ended the wait. False when nothing was waiting, as when the call is
+   * made again after one that ended it: the host keeps no record of the call.
+   */
+  lifted: boolean
+}
+/**
  * `host.update.handover` parameters.
  */
 export interface HostUpdateHandoverParams {
@@ -19226,6 +19243,7 @@ export interface MethodEntry {
     | 'organisation.policy.apply'
     | 'organisation.exclusive.set'
     | 'organisation.withdraw'
+    | 'host.policy.confirm'
     | 'membership.present'
     | 'pair.invite'
     | 'pair.redeem'
@@ -28334,6 +28352,7 @@ export interface ServiceRequestPayload {
     | 'organisation.policy.apply'
     | 'organisation.exclusive.set'
     | 'organisation.withdraw'
+    | 'host.policy.confirm'
     | 'membership.present'
     | 'pair.invite'
     | 'pair.redeem'
