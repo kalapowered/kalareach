@@ -213,10 +213,10 @@ impl EventKey {
     /// Names one completed pairing, by the invitation the device paired through and the device it
     /// created.
     ///
-    /// The identity cannot be an announcement's: it holds a separator no announcement's does. It
-    /// names the device so that the one device a pairing does not tell of itself stays left out
-    /// whenever the notification is produced, including by a pass that finishes what a stopped
-    /// host took.
+    /// The identity cannot be an announcement's: an announcement's begins with a session identifier
+    /// or `-` and then a `/`, and this one begins with `pairing|`. It names the device so that the
+    /// one device a pairing does not tell of itself stays left out whenever the notification is
+    /// produced, including by a pass that finishes what a stopped host took.
     #[must_use]
     pub fn pairing(invitation: InvitationId, device: DeviceId) -> Self {
         Self {

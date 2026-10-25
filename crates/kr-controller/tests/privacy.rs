@@ -1942,9 +1942,9 @@ async fn kr_req_18_08_an_external_destination_is_told_only_under_its_rule_and_it
     )
     .await;
 
-    // Every destination was decided in the transaction that admitted the message above. The
-    // devices that paired are told of their pairing to the destinations configured by then, which
-    // is not what this case asks about, so only what the question produced is read.
+    // Every destination was decided in the transaction that admitted the message above. Each
+    // completed pairing is also a notice to the destinations configured by then, which is not what
+    // this case asks about, so only what the question produced is read.
     let records = controller
         .delivery()
         .with(|producer| Ok(producer.journal().deliveries().expect("a read")))

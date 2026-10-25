@@ -756,12 +756,12 @@ impl PairingEvent {
     /// The notice a completed pairing owes the owner's devices.
     ///
     /// It belongs to the environment, so it reaches the devices whose grant carries `host.manage`
-    /// and whose history reaches the moment the pairing committed; a device paired afterwards
-    /// reaches nothing before its own start. It is dated and expires from the moment of the
-    /// pairing and not from the moment it is produced, so a pairing read again from the start of
-    /// the outbox after a journal was lost is one that has expired, and sends nothing. The device's
-    /// name is the one thing in it that a person chose, so it goes inside a push preview's seal and
-    /// into no external message.
+    /// and whose history reaches the moment the pairing committed; a device whose history starts
+    /// after that moment is not told. It is dated and expires from the moment of the pairing and
+    /// not from the moment it is produced, so a pairing read again from the start of the outbox
+    /// after a journal was lost sends nothing once it is four hours old. The device's name is the
+    /// one thing in it that a person chose, so it goes inside a push preview's seal and into no
+    /// external message.
     #[must_use]
     fn notice(&self) -> Notice {
         Notice {
@@ -4488,8 +4488,8 @@ mod tests {
 
     const PAIRINGS: &str = "pairings";
 
-    /// KR-REQ-10.08: a completed pairing is a notification to the owner's devices that existed
-    /// before it, in the closed vocabulary's generic words. The name the new device chose is inside
+    /// KR-REQ-10.08: a completed pairing is a notification to the owner's devices that may manage
+    /// the host, in the closed vocabulary's generic words. The name the new device chose is inside
     /// the seal of a push preview and in no message that leaves unsealed. The device that paired,
     /// and a device that may only see sessions, are not told, and an event the outbox offers again
     /// produces nothing more.
