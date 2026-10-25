@@ -1297,7 +1297,7 @@ impl BridgeStream {
             tokio::pin!(arrived);
             // Registered before the queue is read, so a frame that arrives in between wakes this.
             arrived.as_mut().enable();
-            let deadline = {
+            let (deadline, waited) = {
                 let mut pending = self.shared.lock();
                 if let Some(index) = pending.frames.iter().position(|(frame, _)| wanted(frame)) {
                     let (frame, charged) = pending
@@ -1315,25 +1315,19 @@ impl BridgeStream {
                 // session says nothing until it has made it. A wait without one is held to the
                 // stream's silence.
                 match limit {
-                    Some(limit) => asked + limit,
-                    None => pending.last_heard + self.shared.silence,
+                    Some(limit) => (asked + limit, limit),
+                    None => (
+                        pending.last_heard + self.shared.silence,
+                        self.shared.silence,
+                    ),
                 }
             };
-            if tokio::time::timeout_at(deadline, arrived).await.is_err() {
-                let pending = self.shared.lock();
-                let now = tokio::time::Instant::now();
-                match limit {
-                    Some(limit) if now >= asked + limit => {
-                        return Err(Refusal::Silent { waited: limit });
-                    }
-                    None if now >= pending.last_heard + self.shared.silence => {
-                        return Err(Refusal::Silent {
-                            waited: self.shared.silence,
-                        });
-                    }
-                    _ => {}
-                }
+            // Read before waiting, so that frames arriving one after another cannot keep a wait
+            // that is already due going.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Refusal::Silent { waited });
             }
+            let _ = tokio::time::timeout_at(deadline, arrived).await;
         }
     }
 
