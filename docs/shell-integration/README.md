@@ -224,7 +224,9 @@ hint rather than turned into a native empty-prompt end of file.
 
 The secret is in the exported environment only until the handshake succeeds. The integration then
 removes both bootstrap variables from the exported environment and wipes its own copy: the compiled
-bridges clear the buffer the secret was decoded into, and the PowerShell module clears its array.
+bridges clear the buffer the secret was decoded into (they leave the hash's working variables and
+the decoder's accumulator uncleared, as `docs/crypto/README.md` says), and the PowerShell module
+clears its array.
 Nothing reads the secret again, because activation is its only reader and a bridge that is lost
 finds the variables gone. Copies that no bridge code can clear remain: the base64url text of the
 secret stays in the memory the process was started with after the variable is unset and in the
