@@ -663,7 +663,12 @@ pub async fn run(variants: Variants) -> ! {
         sent: BTreeMap::new(),
         commands: Vec::new(),
         second_asked: false,
-        threads: BTreeMap::new(),
+        threads: std::env::var(crate::variants::SAVED_VARIABLE)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|saved| !saved.is_empty())
+            .map(|saved| (saved.to_owned(), false))
+            .collect(),
         threads_made: 0,
         turns_made: 0,
         running: None,

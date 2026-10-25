@@ -711,6 +711,91 @@ fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
     }
 }
 
+/// KR-REQ-12.05 and KR-REQ-02.10: a launch of a saved conversation that an execution of the session
+/// already holds is not served a second server. The program runs as typed, no server is started
+/// for it and nothing of the launch is left published. The conversation a launch names is the first
+/// bare word after the command's launching word, and it is held for as long as the execution lives.
+///
+/// Controls: a launch of another conversation is served, and so is a launch of the first
+/// conversation again once the execution that held it has ended. Not claimed: another session,
+/// which this worker cannot see, and Windows, where no gateway runs.
+#[test]
+fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_as_typed() {
+    let shell = answering();
+    let held = |saved: &'static str| {
+        [
+            ("KR_STAND_IN", "stay"),
+            ("KR_STAND_IN_SAVED", saved),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+        ]
+    };
+    let first = shell
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let mut running =
+        shell.launch_typed(&first, "first", &held("thread-9"), &["resume", "thread-9"]);
+    running.prints("TUI: a turn is running");
+    let owner = shell
+        .broker
+        .conversation_owner("thread-9")
+        .expect("the launch holds the conversation it resumed");
+    assert_eq!(shell.servers().len(), 1);
+
+    // The same conversation again, while the first execution lives.
+    let second = shell
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let registration = PathBuf::from(&second.environment[0].value);
+    let mut again =
+        shell.launch_typed(&second, "again", &held("thread-9"), &["resume", "thread-9"]);
+    eventually("the second launch ran as typed or was served", || {
+        again.child.try_wait().ok().flatten().is_some()
+            || again.printed().contains("TUI: a turn is running")
+    });
+    assert!(
+        !again.printed().contains("TUI:"),
+        "the second launch was served a server: {}",
+        again.printed()
+    );
+    let status = again.ends();
+    assert_eq!(status.code(), Some(2), "{}", again.said());
+    assert!(
+        again.said().contains("serves `app-server"),
+        "it ran with the arguments it was typed with"
+    );
+    assert_eq!(shell.servers().len(), 1, "no second server was started");
+    assert!(!registration.exists(), "the registration was taken back");
+    assert_eq!(
+        shell.broker.live_bindings().len(),
+        1,
+        "and so was the binding"
+    );
+    assert_eq!(shell.broker.conversation_owner("thread-9"), Some(owner));
+
+    // Control: another conversation is served.
+    let other = shell
+        .establish(&["codex", "resume", "thread-8"])
+        .expect("a backend is established");
+    let mut served =
+        shell.launch_typed(&other, "other", &held("thread-8"), &["resume", "thread-8"]);
+    served.prints("TUI: a turn is running");
+    assert_eq!(shell.servers().len(), 2);
+
+    // Control: the first conversation is free once the execution that held it has ended.
+    let _ = running.child.kill();
+    let _ = running.ends();
+    eventually("the conversation is free again", || {
+        shell.broker.conversation_owner("thread-9").is_none()
+    });
+    let third = shell
+        .establish(&["codex", "resume", "thread-9"])
+        .expect("a backend is established");
+    let mut resumed =
+        shell.launch_typed(&third, "third", &held("thread-9"), &["resume", "thread-9"]);
+    resumed.prints("TUI: a turn is running");
+    assert!(shell.broker.conversation_owner("thread-9").is_some());
+}
+
 /// KR-REQ-11.35: a connector whose table declares no tested volatile forwarding mode is served no
 /// gateway: the program runs as typed, no server is started, and nothing of the launch is left
 /// published. Control: the same package declaring the mode is served, as the cases around this one

@@ -20,6 +20,17 @@ const SIGN_IN: i64 = 4;
 const THREAD: i64 = 2;
 pub(crate) const TURN: i64 = 3;
 
+/// The request that begins the terminal's conversation: resuming the saved one it was started
+/// with (`resume <id>`), or a new one.
+fn begin(prompt: &str) -> Value {
+    match prompt.strip_prefix("resume ") {
+        Some(saved) => {
+            json!({ "id": THREAD, "method": "thread/resume", "params": { "threadId": saved } })
+        }
+        None => json!({ "id": THREAD, "method": "thread/start", "params": {} }),
+    }
+}
+
 /// Runs the terminal against the server at `socket`, and returns the exit status it ends with.
 pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &str) -> i32 {
     if variants.idle {
@@ -231,10 +242,10 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
                                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                                 }
                             }
-                            send!(json!({ "id": THREAD, "method": "thread/start", "params": {} }));
+                            send!(begin(prompt));
                         }
                     }
-                    "thread/start" => {
+                    "thread/start" | "thread/resume" => {
                         thread = frame["result"]["thread"]["id"]
                             .as_str()
                             .unwrap_or_default()

@@ -360,17 +360,46 @@ impl Gateway {
         name: &str,
         own: &[(&std::ffi::OsStr, &std::ffi::OsStr)],
     ) -> Launched {
+        self.launch_typing(answer, name, own, &[])
+    }
+
+    /// Starts the launcher for an answer to a launch that typed `words` after the command, as the
+    /// shell does: the answer's variable and the person's own variables, with the words after the
+    /// flags the integration added.
+    pub fn launch_typed(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        own: &[(&str, &str)],
+        words: &[&str],
+    ) -> Launched {
+        let own: Vec<(&std::ffi::OsStr, &std::ffi::OsStr)> = own
+            .iter()
+            .map(|(variable, value)| (variable.as_ref(), value.as_ref()))
+            .collect();
+        self.launch_typing(answer, name, &own, words)
+    }
+
+    fn launch_typing(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        own: &[(&std::ffi::OsStr, &std::ffi::OsStr)],
+        words: &[&str],
+    ) -> Launched {
         use std::os::unix::process::CommandExt as _;
 
         let printed = self.outputs.join(name);
-        let mut command = self.placed.command(&[
+        let mut arguments = vec![
             "launch",
             "--",
             self.executable.to_str().expect("a text path"),
             "codex",
             "--remote",
             "{gateway}",
-        ]);
+        ];
+        arguments.extend_from_slice(words);
+        let mut command = self.placed.command(&arguments);
         for variable in &answer.environment {
             command.env(&variable.name, &variable.value);
         }

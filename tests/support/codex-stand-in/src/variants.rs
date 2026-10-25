@@ -33,6 +33,10 @@ pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
 /// method, and the method of a request.
 pub const RECEIVED_VARIABLE: &str = "KR_STAND_IN_RECEIVED";
 
+/// The saved conversations the server holds when it starts, as thread identifiers separated by
+/// commas, which a terminal started with `resume <id>` can resume.
+pub const SAVED_VARIABLE: &str = "KR_STAND_IN_SAVED";
+
 /// The ways a run can differ from the default.
 #[derive(Clone, Debug, Default)]
 pub struct Variants {
