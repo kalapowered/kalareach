@@ -647,3 +647,155 @@ async fn a_control_frame_is_stamped_when_it_is_read_and_not_when_the_handler_rea
     drop(authorised);
     listener.shutdown().await;
 }
+
+/// A host that sends two control frames once the client has spoken: the first under an admission
+/// that admits every attempt, the second under one that refuses the second attempt to hand bytes
+/// over, and says what each send answered.
+#[derive(Debug)]
+struct SendingHandler {
+    client: PairedPeer,
+    answers: std::sync::Mutex<Vec<bool>>,
+}
+
+impl PairedDirectory for SendingHandler {
+    fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
+        (endpoint_id == &self.client.endpoint_id).then_some(self.client)
+    }
+}
+
+impl HostHandler for SendingHandler {
+    fn principal_for(&self, device_id: &DeviceId) -> ActorId {
+        kr_transport::listener::device_principal(device_id)
+    }
+
+    fn authority_revision(&self) -> AuthorityRevision {
+        AuthorityRevision::default()
+    }
+
+    fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
+        None
+    }
+
+    fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let sender = session.control.sender();
+            let frame = ControlFrame::Event(ControlEvent::Keepalive);
+            if session.control.recv().await.is_some() {
+                let always = |attempt: &mut dyn FnMut()| {
+                    attempt();
+                    true
+                };
+                let first = sender
+                    .send_while(&frame, &always)
+                    .await
+                    .expect("the first frame is sent");
+                // The client has read the first frame before the second is abandoned: a reset
+                // stream discards what its reader has not read.
+                if session.control.recv().await.is_none() {
+                    return;
+                }
+                // The check before anything is written, then the prefix; the payload is refused.
+                let calls = AtomicUsize::new(0);
+                let until_the_payload = |attempt: &mut dyn FnMut()| {
+                    if calls.fetch_add(1, Ordering::AcqRel) >= 2 {
+                        return false;
+                    }
+                    attempt();
+                    true
+                };
+                let second = sender
+                    .send_while(&frame, &until_the_payload)
+                    .await
+                    .expect("the second frame is abandoned, not failed");
+                self.answers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend([first, second]);
+            }
+            while session.control.recv().await.is_some() {}
+        })
+    }
+}
+
+/// A control frame is handed to the stream inside the admission of each attempt: one whose attempts
+/// are all admitted arrives whole, and one refused at its payload is abandoned with the stream
+/// reset, so the client never reads a frame that was not admitted all the way.
+#[tokio::test]
+async fn a_control_frame_is_sent_only_while_each_attempt_to_hand_bytes_over_is_admitted() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(SendingHandler {
+        client: client.record,
+        answers: std::sync::Mutex::new(Vec::new()),
+    });
+    let listener = register(
+        ListenerConfig::new(
+            EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                ..EndpointConfig::default()
+            },
+            epochs(),
+            ControllerGeneration::new(1),
+        ),
+        Arc::clone(&host.identity),
+        &host.keys.transport,
+        Arc::clone(&handler),
+    )
+    .await
+    .expect("a listener");
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+
+    authorised
+        .control_writer
+        .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+        .await
+        .expect("the client speaks");
+    let first: ControlFrame = authorised
+        .control_reader
+        .read_message()
+        .await
+        .expect("the stream is readable")
+        .expect("the frame whose attempts were all admitted arrives");
+    assert!(matches!(
+        first,
+        ControlFrame::Event(ControlEvent::Keepalive)
+    ));
+    authorised
+        .control_writer
+        .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+        .await
+        .expect("the client has read the first frame");
+    let second = authorised
+        .control_reader
+        .read_message::<ControlFrame>()
+        .await;
+    assert!(
+        second.is_err(),
+        "a frame refused at its payload is not read as a frame: {second:?}"
+    );
+    wait_until(|| {
+        !handler
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    })
+    .await;
+    assert_eq!(
+        *handler
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [true, false],
+        "the first send went, the second was refused"
+    );
+
+    drop(authorised);
+    listener.shutdown().await;
+}

@@ -1455,13 +1455,35 @@ async fn a_device_reads_an_agents_history_and_an_approval_record_under_its_grant
     world.serving.abort();
 }
 
-/// A control stream that keeps every frame it is handed, after its own check.
-#[derive(Debug, Default)]
-struct Kept(std::sync::Mutex<Vec<kr_protocol::envelope::ControlFrame>>);
+/// A control stream that keeps every frame it is handed, inside the admission that handed it over,
+/// and says whether privacy mode could have been changed at that moment.
+#[derive(Debug)]
+struct Kept {
+    frames: std::sync::Mutex<Vec<kr_protocol::envelope::ControlFrame>>,
+    /// For each frame handed over, whether the privacy state `watching` could have been changed
+    /// while the frame was being handed over.
+    changeable: std::sync::Mutex<Vec<bool>>,
+    watching: crate::privacy::PrivacyState,
+}
 
 impl Kept {
+    fn watching(state: crate::privacy::PrivacyState) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            frames: std::sync::Mutex::default(),
+            changeable: std::sync::Mutex::default(),
+            watching: state,
+        })
+    }
+
     fn frames(&self) -> Vec<kr_protocol::envelope::ControlFrame> {
-        self.0
+        self.frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn changeable_while_handed_over(&self) -> Vec<bool> {
+        self.changeable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -1472,122 +1494,182 @@ impl super::output::FrameSink for std::sync::Arc<Kept> {
     fn send_while<'a>(
         &'a self,
         frame: &'a kr_protocol::envelope::ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
     {
         Box::pin(async move {
-            if !admits() {
-                return Ok(false);
-            }
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(frame.clone());
-            Ok(true)
+            Ok(admits(&mut || {
+                self.changeable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.watching.changeable_now());
+                self.frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+            }))
         })
     }
 
     fn close(&self) {}
 }
 
-/// A page of retained output is released to a device only under the privacy state it was read in.
-///
-/// The worker answers the page while privacy mode is off, and the answer waits for the
-/// connection's turn to be written. Privacy mode starts while it waits. What is written when the
-/// turn comes carries none of the output, and says that the range it covered is gone; a page read
-/// and written with no change of state between them is written whole.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_page_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
+/// A daemon whose one worker answers every `history.page` a device forwards with `page`, which it
+/// does whatever the privacy mode of the daemon says: it is never told of a change of mode, as a
+/// worker the daemon has not reached yet is not.
+async fn worker_answering_pages_with(
+    page: &kr_protocol::recovery::HistoryPageResult,
+) -> crate::service::a_close_a_worker_never_answers::Silent {
     use std::sync::Arc;
-
-    use kr_protocol::envelope::{ControlFrame, Request};
-    use kr_protocol::recovery::{HistoryPageParams, HistoryPageResult};
-    use kr_protocol::scalars::{Bytes, TimestampMs, U64};
 
     use crate::service::a_close_a_worker_never_answers as fake;
 
-    let page = HistoryPageResult {
+    let recorded: fake::Recorded = Arc::default();
+    let world = answering_worker(
+        {
+            let page = page.clone();
+            Arc::new(move |request: &kr_protocol::envelope::Request| {
+                match request.method.method()? {
+                    Method::HistoryPage => ParamsValue::from_typed(&page).ok(),
+                    _ => None,
+                }
+            })
+        },
+        recorded,
+        reads_scopes(),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    world
+}
+
+/// Turns privacy mode on at the daemon as its record does, and returns once it is published.
+async fn privacy_mode_is_turned_on(controller: &crate::service::Controller) {
+    let privacy = std::sync::Arc::clone(&controller.privacy);
+    tokio::task::spawn_blocking(move || {
+        let admitted = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
+        privacy
+            .enable(&[], kr_ipc::now_ms(), &admitted)
+            .expect("privacy mode is turned on");
+    })
+    .await
+    .expect("privacy mode's change ran");
+}
+
+fn history_page_of(session_id: SessionId, request_id: u64) -> kr_protocol::envelope::Request {
+    use kr_protocol::recovery::HistoryPageParams;
+    use kr_protocol::scalars::U64;
+
+    device_request(
+        request_id,
+        Method::HistoryPage,
+        &HistoryPageParams {
+            session_id,
+            from_cursor: U64::ZERO,
+            max_bytes: U64::new(4096),
+        },
+    )
+}
+
+fn a_page_of_retained_output() -> kr_protocol::recovery::HistoryPageResult {
+    use kr_protocol::scalars::{Bytes, U64};
+
+    kr_protocol::recovery::HistoryPageResult {
         from_cursor: U64::new(0),
         next_cursor: U64::new(16),
         bytes: Bytes::new(b"retained output!".to_vec()),
         oldest_retained_cursor: U64::new(0),
         gap: Nullable::null(),
-    };
-    let recorded: fake::Recorded = Arc::default();
-    let world = answering_worker(
-        {
-            let page = page.clone();
-            Arc::new(move |request: &Request| match request.method.method()? {
-                Method::HistoryPage => ParamsValue::from_typed(&page).ok(),
-                _ => None,
-            })
-        },
-        Arc::clone(&recorded),
-        reads_scopes(),
-    )
-    .await;
-    let controller = &world.controller;
-    fake::acknowledged(controller, world.session_id);
-    let viewer = paired(controller, 61, |grant| {
-        grant.history.lower_bound_ms = Nullable::some(TimestampMs::new(2_000));
+    }
+}
+
+/// A device paired with a grant that reaches retained output from a moment, and a connection of
+/// its own that keeps what it is written.
+fn viewing_connection(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    byte: u8,
+) -> (super::RemoteConnection, std::sync::Arc<Kept>) {
+    let viewer = paired(controller, byte, |grant| {
+        grant.history.lower_bound_ms =
+            Nullable::some(kr_protocol::scalars::TimestampMs::new(2_000));
         grant.history.include_live_screen = true;
     });
-    let kept = Arc::new(Kept::default());
+    let kept = Kept::watching(controller.privacy.state().clone());
     let connection = super::RemoteConnection::for_test_writing_to(
         controller,
         viewer,
-        Box::new(Arc::clone(&kept)),
+        Box::new(std::sync::Arc::clone(&kept)),
     );
-    let ask = |request_id| {
-        device_request(
-            request_id,
-            Method::HistoryPage,
-            &HistoryPageParams {
-                session_id: world.session_id,
-                from_cursor: U64::ZERO,
-                max_bytes: U64::new(4096),
-            },
-        )
-    };
-    let written_page =
-        |index: usize| -> HistoryPageResult { answered(kept.frames()[index].clone()) };
+    (connection, kept)
+}
 
-    // Read and written under one state: the page goes whole.
+/// A page of retained output goes to a device whole when no change of privacy mode falls between the
+/// worker's answer and the write, and the write holds the privacy state while the bytes are handed
+/// over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_is_written_whole_under_the_privacy_state_it_was_read_in_and_holds_it_while_it_goes()
+{
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::recovery::HistoryPageResult;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 61);
+
     let answer = connection
-        .answer_now(ControlFrame::Request(ask(1)))
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
         .await
         .expect("an answer");
     assert!(
         connection.write_answer(answer).await,
         "the connection stands"
     );
-    assert_eq!(written_page(0), page);
+    let written: HistoryPageResult = answered(kept.frames()[0].clone());
+    assert_eq!(written, page);
+    assert_eq!(
+        kept.changeable_while_handed_over(),
+        [false],
+        "privacy mode could not be changed while the page was handed over"
+    );
+    assert!(
+        kept.watching.changeable_now(),
+        "and can be once it has been"
+    );
+    world.serving.abort();
+}
 
-    // Read under it, then held at the writer while privacy mode starts.
+/// A page the worker answered while privacy mode was off is withheld when privacy mode is turned on
+/// before the page is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::recovery::HistoryPageResult;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 62);
+
+    // Read under the state it will be written after, then held at the writer while the mode starts.
     let answer = connection
-        .answer_now(ControlFrame::Request(ask(2)))
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
         .await
         .expect("an answer");
     let turn = connection.output.hold_the_turn().await;
-    let state = controller.privacy.state().clone();
-    let before = state.now();
     let (stands, ()) = tokio::join!(connection.write_answer(answer), async {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while connection.output.writes_queued() < 2 {
+            while connection.output.writes_queued() < 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("the answer is waiting for the writer");
-        state.set(crate::privacy::Published {
-            generation: kr_worker::privacy::PrivacyGeneration::new(before.generation.get() + 1),
-            private: true,
-        });
+        privacy_mode_is_turned_on(controller).await;
         drop(turn);
     });
     assert!(stands, "the connection stands");
-    assert_eq!(kept.frames().len(), 2, "one answer more");
-    let withheld = written_page(1);
+    let withheld: HistoryPageResult = answered(kept.frames()[0].clone());
     assert!(
         withheld.bytes.as_slice().is_empty(),
         "none of the output goes once privacy mode has started: {withheld:?}"
@@ -1601,6 +1683,36 @@ async fn a_page_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it
         (0, 16),
         "{gap:?}"
     );
+    world.serving.abort();
+}
+
+/// A page a worker answers after the daemon published privacy mode and before the worker was told,
+/// which still holds the output that privacy mode removes, is withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_read_before_the_worker_is_told_of_privacy_mode_is_withheld() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::recovery::HistoryPageResult;
+
+    let page = a_page_of_retained_output();
+    let world = worker_answering_pages_with(&page).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 63);
+
+    privacy_mode_is_turned_on(controller).await;
+    let answer = connection
+        .answer_now(ControlFrame::Request(history_page_of(world.session_id, 1)))
+        .await
+        .expect("an answer");
+    assert!(
+        connection.write_answer(answer).await,
+        "the connection stands"
+    );
+    let written: HistoryPageResult = answered(kept.frames()[0].clone());
+    assert!(
+        written.bytes.as_slice().is_empty(),
+        "the worker's output goes to nobody while privacy mode is on: {written:?}"
+    );
+    assert!(written.gap.0.is_some(), "and the range is said to be gone");
     world.serving.abort();
 }
 

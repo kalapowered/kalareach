@@ -68,11 +68,12 @@ pub struct RemoteOutput {
 /// can be exercised against a writer that is held and a peer that stops reading, which a real
 /// stream does not let a test arrange on demand.
 pub(super) trait FrameSink: Send + Sync + std::fmt::Debug {
-    /// Sends one frame for as long as `admits` holds, as [`ControlSender::send_while`] does.
+    /// Sends one frame for as long as `admits` holds, making each attempt to hand bytes over inside
+    /// it, as [`ControlSender::send_while`] does.
     fn send_while<'a>(
         &'a self,
         frame: &'a ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>;
 
     /// Ends the connection, which is what stops a write that is still waiting on it.
@@ -90,7 +91,7 @@ impl FrameSink for ControlStream {
     fn send_while<'a>(
         &'a self,
         frame: &'a ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
     {
         Box::pin(self.sender.send_while(frame, admits))
@@ -107,8 +108,10 @@ impl FrameSink for ControlStream {
 /// The privacy state a page of retained output was read under.
 ///
 /// The page is released only while that state stands: privacy mode off, in the generation it was
-/// read in. Output a worker read before privacy mode started is not sent after it, however long
-/// the answer waited to be written.
+/// read in, and held while the bytes are handed to the stream. A page read with privacy mode on is
+/// never released: the daemon publishes the mode before it tells a worker to remove what it
+/// retained, so a worker can still answer with output that is about to go. Output a worker read
+/// before privacy mode started is not sent after it, however long the answer waited to be written.
 #[derive(Clone, Debug)]
 pub(super) struct ReadUnder {
     state: crate::privacy::PrivacyState,
@@ -136,13 +139,24 @@ impl ReadUnder {
         Ok(Self { state, decided })
     }
 
-    /// Answers whether the state the page was read under still stands. It waits for nothing, so it
-    /// can be asked in the poll that hands bytes to the stream: a change of state being made, or
-    /// waiting to be, counts as the state having moved.
-    pub(super) fn stands(&self) -> bool {
+    /// Takes the state the page was read under, held, when it still stands and privacy mode was
+    /// off. A change of state waits until the reading is dropped.
+    ///
+    /// It waits for nothing, so it can be asked in the poll that hands bytes to the stream: a
+    /// change of state being made, or waiting to be, counts as the state having moved.
+    pub(super) fn holding(&self) -> Option<crate::privacy::Reading<'_>> {
+        if self.decided.private {
+            return None;
+        }
         self.state
             .try_reading()
-            .is_some_and(|reading| reading.published() == self.decided)
+            .filter(|reading| reading.published() == self.decided)
+    }
+
+    /// Answers whether the state the page was read under still stands, for a decision that is not
+    /// the write of a byte.
+    pub(super) fn stands(&self) -> bool {
+        self.holding().is_some()
     }
 }
 
@@ -495,29 +509,40 @@ impl RemoteOutput {
             self.withdraw();
             return Written::Withdrawn;
         }
-        let decided = || {
+        let bounds_hold_now = || {
             !(answer
                 && self
                     .authority
                     .controller
                     .feed_refusal_on(self.authority.connection_id)
                     .is_some())
-                && read_under.is_none_or(ReadUnder::stands)
                 && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()
                     .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
         };
+        let decided = || bounds_hold_now() && read_under.is_none_or(ReadUnder::stands);
         if !decided() {
             return Written::Undecided;
         }
         // Set the first time a byte may have gone. Until then the stream is whole whatever
         // happens to this frame.
         let begun = AtomicBool::new(false);
-        let admits = || {
-            let admitted = self.fence() && decided();
+        // The privacy state a page was read under is taken for the attempt and kept until the
+        // bytes of the attempt are handed over, so a change of privacy mode is published before
+        // the check or after the write, and never between them.
+        let admits = |attempt: &mut dyn FnMut()| {
+            let _standing = match read_under {
+                Some(read_under) => match read_under.holding() {
+                    Some(standing) => Some(standing),
+                    None => return false,
+                },
+                None => None,
+            };
+            let admitted = self.fence() && bounds_hold_now();
             if admitted {
                 begun.store(true, Ordering::Release);
+                attempt();
             }
             admitted
         };

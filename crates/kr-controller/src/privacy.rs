@@ -214,6 +214,13 @@ impl PrivacyState {
         }
     }
 
+    /// Answers whether a change of state could be made now, for this crate's own tests of what a
+    /// decision holds the state for.
+    #[cfg(test)]
+    pub(crate) fn changeable_now(&self) -> bool {
+        self.published.try_write().is_ok()
+    }
+
     /// Returns the state as it stands now.
     #[must_use]
     pub fn now(&self) -> Published {

@@ -193,7 +193,7 @@ impl RemoteConnection {
             fn send_while<'a>(
                 &'a self,
                 _frame: &'a ControlFrame,
-                _admits: &'a (dyn Fn() -> bool + Send + Sync),
+                _admits: kr_transport::codec::Admission<'a>,
             ) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>,
             > {

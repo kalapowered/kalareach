@@ -92,13 +92,13 @@ impl FrameSink for Arc<HeldStream> {
     fn send_while<'a>(
         &'a self,
         frame: &'a ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
     {
         Box::pin(async move {
             self.waits.add_permits(1);
             let _writer = self.writer.acquire().await.expect("the writer stays open");
-            if !admits() {
+            if !admits(&mut || {}) {
                 return Ok(false);
             }
             if let Some(room) = &self.room {
@@ -109,18 +109,16 @@ impl FrameSink for Arc<HeldStream> {
                 self.waits.add_permits(1);
                 let _room = room.acquire().await.expect("the peer stays open");
             }
-            if !admits() {
-                return Ok(false);
-            }
-            self.reached
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(Reached::Whole);
-            self.frames
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(frame.clone());
-            Ok(true)
+            Ok(admits(&mut || {
+                self.reached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Reached::Whole);
+                self.frames
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+            }))
         })
     }
 
@@ -766,18 +764,16 @@ impl FrameSink for Arc<Recording> {
     fn send_while<'a>(
         &'a self,
         frame: &'a ControlFrame,
-        admits: &'a (dyn Fn() -> bool + Send + Sync),
+        admits: kr_transport::codec::Admission<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
     {
         Box::pin(async move {
-            if !admits() {
-                return Ok(false);
-            }
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(frame.clone());
-            Ok(true)
+            Ok(admits(&mut || {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+            }))
         })
     }
 
