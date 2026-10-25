@@ -717,8 +717,10 @@ fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
 /// bare word after the command's launching word, and it is held for as long as the execution lives.
 ///
 /// Controls: a launch of another conversation is served, and so is a launch of the first
-/// conversation again once the execution that held it has ended. Not claimed: another session,
-/// which this worker cannot see, and Windows, where no gateway runs.
+/// conversation again once the execution that held it has ended. The session here holds no claim
+/// on the host, so the conversation is free as soon as the instance ends; with the host's claims
+/// it stays held until the server is retired, and another session is refused, in the case that
+/// follows the next one. Not claimed: Windows, where no gateway runs.
 #[test]
 fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_as_typed() {
     let shell = answering();
@@ -833,6 +835,10 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
     let server = first.servers().remove(0);
 
     // Another session, while the first lives: the program runs as typed.
+    let claimed = kr_worker::broker::host_claims::HostClaims::new(
+        &kr_ipc::paths::HostPaths::new(claims.root().join("run"), claims.root().join("state"))
+            .expect("the roots the sessions share"),
+    );
     let refused = |name: &str| {
         let answer = second
             .establish(&["codex", "resume", "thread-9"])
@@ -850,12 +856,16 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
         let served = again.printed().contains("TUI:");
         let _ = again.child.kill();
         let _ = again.ends();
-        (served, second.servers().len())
+        // The reason the worker kept for refusing the launch.
+        let held = second
+            .last_launch_failure()
+            .is_some_and(|why| why.contains("still held"));
+        (served, second.servers().len(), held)
     };
     assert_eq!(
         refused("alive"),
-        (false, 0),
-        "a second session is not served"
+        (false, 0, true),
+        "a second session is not served, because the conversation is held"
     );
 
     // The first program ends, and its instance with it. The server is still being retired.
@@ -871,7 +881,7 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
     );
     assert_eq!(
         refused("retiring"),
-        (false, 0),
+        (false, 0, true),
         "the conversation is held while the server that ran against it runs"
     );
     assert_eq!(
@@ -880,9 +890,14 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
         "and the server ran throughout the refusal"
     );
 
-    // The server is gone: the conversation is free.
+    // The server is gone: the conversation is free. The server's end is the first part of its
+    // retirement, which goes on to end what it started, so what is waited for is the claim
+    // itself, taken and let go of.
     eventually("the server has ended", || {
         kr_ipc::identity::process_state(&server) == kr_ipc::identity::ProcessState::Ended
+    });
+    eventually("the conversation is free", || {
+        claimed.take("thread-9").is_ok()
     });
     let answer = second
         .establish(&["codex", "resume", "thread-9"])

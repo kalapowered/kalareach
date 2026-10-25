@@ -2519,8 +2519,9 @@ fn launched_on(broker: &Broker, word: &str, id: ApplicationInstanceId) -> Result
 fn kr_req_12_05_a_conversation_another_session_holds_is_not_launched_against() {
     let (_directory, first, second) = two_sessions();
     launched_on(&first, "thread-7", instance(2)).expect("the first session launches it");
+    let server = process_identity(77, 1_000);
     first
-        .set_instance_backend(instance(2), process_identity(77, 1_000))
+        .set_instance_backend(instance(2), server.clone())
         .expect("the instance has a server");
 
     let refusal = launched_on(&second, "thread-7", instance(3))
@@ -2542,7 +2543,7 @@ fn kr_req_12_05_a_conversation_another_session_holds_is_not_launched_against() {
         Err(BrokerError::ConversationHeldElsewhere)
     ));
     // The retirement is over with nothing left running: the conversation is free.
-    first.server_retired(instance(2), true);
+    first.server_retired(instance(2), &server, true);
     launched_on(&second, "thread-7", instance(3)).expect("the conversation is free once it is");
 }
 
@@ -2553,10 +2554,11 @@ fn kr_req_12_05_a_conversation_another_session_holds_is_not_launched_against() {
 fn kr_req_12_05_a_server_that_left_a_process_running_keeps_its_conversation_held() {
     let (_directory, first, second) = two_sessions();
     launched_on(&first, "thread-7", instance(2)).expect("launched");
+    let server = process_identity(77, 1_000);
     first
-        .set_instance_backend(instance(2), process_identity(77, 1_000))
+        .set_instance_backend(instance(2), server.clone())
         .expect("the instance has a server");
-    first.server_retired(instance(2), false);
+    first.server_retired(instance(2), &server, false);
     assert!(first.end(instance(2)));
     assert!(matches!(
         launched_on(&second, "thread-7", instance(3)),
@@ -2569,11 +2571,88 @@ fn kr_req_12_05_a_server_that_left_a_process_running_keeps_its_conversation_held
     let (_directory, first, second) = two_sessions();
     launched_on(&first, "thread-7", instance(2)).expect("launched");
     first
-        .set_instance_backend(instance(2), process_identity(77, 1_000))
+        .set_instance_backend(instance(2), server.clone())
         .expect("the instance has a server");
-    first.server_retired(instance(2), true);
+    first.server_retired(instance(2), &server, true);
     assert!(first.end(instance(2)));
     launched_on(&second, "thread-7", instance(3)).expect("free at once");
+}
+
+/// KR-REQ-12.05: the retirement of one server settles that server's conversations and no other's.
+/// An instance launched again under the identifier of one that ended has a server of its own,
+/// and the earlier server's retirement, which can arrive after the second launch, frees what the
+/// earlier instance held and leaves what the later one holds.
+#[test]
+fn kr_req_12_05_the_retirement_of_an_earlier_server_frees_only_the_conversations_it_ran_against() {
+    let (_directory, first, second) = two_sessions();
+    let (earlier, later) = (process_identity(77, 1_000), process_identity(78, 1_001));
+    launched_on(&first, "earlier", instance(2)).expect("launched");
+    first
+        .set_instance_backend(instance(2), earlier.clone())
+        .expect("a server");
+    assert!(first.end(instance(2)));
+    launched_on(&first, "later", instance(2)).expect("launched again under the identifier");
+    first
+        .set_instance_backend(instance(2), later.clone())
+        .expect("a server");
+
+    // The earlier retirement arrives after the second launch.
+    first.server_retired(instance(2), &earlier, true);
+    launched_on(&second, "earlier", instance(3))
+        .expect("what the earlier server ran against is free");
+    assert!(first.end(instance(2)));
+    assert!(
+        matches!(
+            launched_on(&second, "later", instance(4)),
+            Err(BrokerError::ConversationHeldElsewhere)
+        ),
+        "what the later server runs against is held until its own retirement"
+    );
+    first.server_retired(instance(2), &later, true);
+    launched_on(&second, "later", instance(4)).expect("free once the later server is retired");
+}
+
+/// KR-REQ-12.05: an instance that ends while its server is still being started keeps its
+/// conversations, whether the server is then recorded (and its retirement frees them) or never
+/// started (and giving it up does), and no server is started for an instance that has ended.
+#[test]
+fn kr_req_12_05_an_instance_that_ends_while_its_server_starts_keeps_its_conversation_held() {
+    let (_directory, first, second) = two_sessions();
+    let server = process_identity(77, 1_000);
+    launched_on(&first, "recorded", instance(2)).expect("launched");
+    first
+        .server_starting(instance(2))
+        .expect("a server is to be started");
+    assert!(first.end(instance(2)));
+    assert!(matches!(
+        launched_on(&second, "recorded", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    first
+        .set_instance_backend(instance(2), server.clone())
+        .expect_err("the instance has ended, and the server is the caller's to retire");
+    assert!(matches!(
+        launched_on(&second, "recorded", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    first.server_retired(instance(2), &server, true);
+    launched_on(&second, "recorded", instance(3)).expect("free once the server is retired");
+
+    launched_on(&first, "unstarted", instance(4)).expect("launched");
+    first
+        .server_starting(instance(4))
+        .expect("a server is to be started");
+    assert!(first.end(instance(4)));
+    assert!(matches!(
+        launched_on(&second, "unstarted", instance(5)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    first.server_not_started(instance(4));
+    launched_on(&second, "unstarted", instance(5)).expect("free once the start is given up");
+
+    first
+        .server_starting(instance(4))
+        .expect_err("no server is started for an instance that has ended");
 }
 
 /// A hook the instance's application started, as the kernel recorded it starting at `kernel`.
@@ -2742,10 +2821,23 @@ fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_th
     let paths =
         kr_ipc::paths::HostPaths::new(directory.path().join("run"), directory.path().join("state"))
             .expect("the roots");
-    std::fs::create_dir_all(paths.state_root()).expect("the state root");
+    kr_ipc::paths::create_private_tree(paths.state_root(), paths.state_root())
+        .expect("a state root that is as it should be");
     std::fs::write(paths.conversation_claims_dir(), b"").expect("a file where the directory is");
-    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    let ledger = directory.path().join("ledger.sqlite");
+    let broker =
+        Broker::open(Some(&ledger), session(), JournalHealth::shared()).expect("the broker opens");
     broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&paths));
+    let launched_instances = || -> i64 {
+        rusqlite::Connection::open(&ledger)
+            .expect("the ledger opens")
+            .query_row(
+                "SELECT COUNT(*) FROM broker_profiles WHERE application_instance_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the profiles are counted")
+    };
 
     let refusal = launched_on(&broker, "thread-7", instance(2)).expect_err("refused");
     assert!(
@@ -2754,6 +2846,11 @@ fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_th
     );
     assert!(broker.profile_of(instance(2)).is_none() && broker.binding_state(instance(2)).is_err());
     assert_eq!(broker.conversation_owner("thread-7"), None);
+    assert_eq!(
+        launched_instances(),
+        0,
+        "and no profile is recorded for an instance"
+    );
 
     // A launch that names no conversation claims nothing, and its stream's selection is refused.
     let intent = broker
@@ -2769,6 +2866,11 @@ fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_th
         .register(IntegrationMode::Gateway, Some(managed(instance(3))))
         .expect("registered")
         .commit();
+    assert_eq!(
+        launched_instances(),
+        1,
+        "the one that named no conversation is recorded"
+    );
     assert!(matches!(
         broker.advance_binding(
             instance(3),
