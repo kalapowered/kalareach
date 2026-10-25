@@ -112,15 +112,18 @@ static CASE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// would put the first's entries back. The programs a case places beside this test's executable are
 /// the ones the daemon this process hosts finds, so a second case that started its daemon while they
 /// were there would run the first case's forwarder.
-struct Turn(std::sync::MutexGuard<'static, ()>);
+struct Turn {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
 
 impl Turn {
     /// Waits for the case that has the turn.
     fn take() -> Self {
-        Self(
-            CASE.lock()
+        Self {
+            _held: CASE
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        }
     }
 }
 
