@@ -2249,7 +2249,7 @@
           "type": "array"
         },
         "launching_words": {
-          "description": "The words that may follow the command name for a launch the server is declared for.\n\nA launch whose first word is absent, or one of these, and that types no option, is a plain\nlaunch of the terminal. Any other launch (a subcommand that is not a terminal, an option,\na prompt) runs as typed, because the closed list is what the package qualified.",
+          "description": "The words that may follow the command name for a launch the server is declared for.\n\nA launch whose first word is absent, or one of these, and that types no option, is a plain\nlaunch of the terminal. Any other launch (a subcommand that is not a terminal, an option,\na prompt) runs as typed, because the closed list is what the package qualified.\n\nListing a word also says that the first bare word after it names a saved conversation the\nlaunch works on (see [`IntegrationBackend::saved_conversation`]), whatever the word means\nto the application: the host keeps a second launch of that conversation from running as a\nsecond execution of it.",
           "items": {
             "type": "string"
           },
