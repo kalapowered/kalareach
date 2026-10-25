@@ -1,12 +1,13 @@
 //! The frames this release reads from and writes to a plugin host of the release before, taken from
 //! a real one.
 //!
-//! This release's control daemon starts a host of the release before's protocol, or adopts one a
-//! daemon of that release started, for a worker of that release. What it says to such a host is a
-//! claim it reads (`HostRendezvous`), the acknowledgement it writes (`RendezvousAccepted`), the
-//! descriptor it publishes and later reads, and `Hello` and `Verify` with their answers. Everything
-//! else of that protocol is spoken between the worker of the release before and the host of that
-//! release, and this release never sees it.
+//! This release's control daemon adopts a plugin host that a daemon of the release before started,
+//! and the daemon of the release before adopts one of this release's after a rollback. What either
+//! says to such a host is a claim it reads (`HostRendezvous`), the acknowledgement it writes
+//! (`RendezvousAccepted`), the descriptor it publishes and later reads, and `Hello` and `Verify`
+//! with their answers. Only the protocol's name tells the two releases that these frames agree, so
+//! the real program of the release before is run and its frames kept. Everything else of the
+//! protocol is spoken between a worker and the host, and the daemon never sees it.
 //!
 //! The case runs the release before's real `kr-plugin-host` as its launcher would, keeps the
 //! payload of every frame, and checks each one decodes with this build's types and encodes back to
@@ -106,10 +107,10 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
     assert_eq!(claim.reservation_id, reservation_id);
     assert_eq!(
         claim.endpoint,
-        launcher::host_endpoint(&environment, &HostProtocol::SECOND)
+        launcher::host_endpoint(&environment, &HostProtocol::THIS)
             .expect("an endpoint")
             .as_text(),
-        "the host serves on the endpoint of the release before's protocol"
+        "the host serves on the endpoint of the protocol both releases speak"
     );
 
     // The acknowledgement this build writes, which the program takes before it serves.
@@ -126,7 +127,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
 
     // `Hello`, a `Hello` for a protocol it does not speak, and `Verify`.
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::SECOND.name.to_owned(),
+        protocol: HostProtocol::THIS.name.to_owned(),
         environment_id: environment.environment_id(),
         reservation_id: claim.reservation_id,
         endpoint: claim.endpoint.clone(),
@@ -145,7 +146,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
         (
             1,
             RequestBody::Hello {
-                protocol: HostProtocol::SECOND.name.to_owned(),
+                protocol: HostProtocol::THIS.name.to_owned(),
             },
         ),
         (
@@ -182,7 +183,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
                     descriptor: told,
                 },
             ) => {
-                assert_eq!(protocol, HostProtocol::SECOND.name);
+                assert_eq!(protocol, HostProtocol::THIS.name);
                 // The host's own account of its descriptor names no reservation: the launcher's
                 // is the one published.
                 assert_eq!(told.reservation_id.to_string(), uuid_nil());
@@ -226,19 +227,19 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
     );
     terminal.ready().await;
     let program = start_agent(&prepared.host, &terminal, &agent).await;
-    prepared.host.plugin_holding_at(Wire::Two, 1).await;
+    prepared.host.plugin_holding_at(Wire::Three, 1).await;
     let published = std::fs::read(
         prepared
             .host
             .tree
             .environment()
             .runtime_dir()
-            .join(Wire::Two.descriptor_file()),
+            .join(Wire::Three.descriptor_file()),
     )
     .expect("the descriptor the release before published");
     let read: HostDescriptor =
         serde_json::from_slice(&published).expect("this build reads the descriptor");
-    assert_eq!(read.protocol, HostProtocol::SECOND.name);
+    assert_eq!(read.protocol, HostProtocol::THIS.name);
     assert_eq!(
         serde_json::to_vec(&read).expect("a descriptor encodes"),
         published,
@@ -250,7 +251,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
         .host
         .close(&prepared.kr_before(), &prepared.display);
     prepared.host.worker_ended(&prepared.worker).await;
-    prepared.host.end_the_plugin_host_at(Wire::Two).await;
+    prepared.host.end_the_plugin_host_at(Wire::Three).await;
 
     if std::env::var_os("KR_RECORD_PLUGIN_HOST_FRAMES").is_some() {
         let record = serde_json::json!({
