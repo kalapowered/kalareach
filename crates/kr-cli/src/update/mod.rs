@@ -574,8 +574,6 @@ pub struct Updated {
     pub restarted: Vec<EnvironmentId>,
     /// The releases removed because nothing needs them.
     pub removed: Vec<ReleaseName>,
-    /// What could not be removed for a reason no running program gave.
-    pub not_removed: Vec<NotRemoved>,
     /// The environments no daemon served, whose registries the update brought forward.
     pub carried: Vec<CarriedRegistry>,
     /// The environments the store records that the update could not reach.
@@ -584,40 +582,6 @@ pub struct Updated {
     pub checked_only: bool,
     /// Whether this went back to an older release rather than forward to a newer one.
     pub rolled_back: bool,
-}
-
-/// A release, or what an earlier removal left of one, that the update could not remove for a reason
-/// no running program gave. A release a program still holds is not one of these: it stays and is
-/// tried again at the next update.
-pub struct NotRemoved {
-    /// The release, or nothing for what lies in the store's trash.
-    pub release: Option<ReleaseName>,
-    /// Why it could not be removed.
-    pub reason: Shown,
-}
-
-impl NotRemoved {
-    /// What `--json` says of it.
-    fn document(&self) -> Document {
-        Document::new()
-            .with("release", self.release.as_ref().map(crate::shown::release))
-            .with("reason", self.reason.clone())
-    }
-
-    /// What is said to a person.
-    fn said(&self) -> Shown {
-        match &self.release {
-            Some(release) => shown!(
-                "release {} could not be removed: {}",
-                crate::shown::release(release),
-                self.reason
-            ),
-            None => shown!(
-                "something an earlier removal left in the store's trash could not be removed: {}",
-                self.reason
-            ),
-        }
-    }
 }
 
 /// An environment's registry an update brought forward to the schema its release reads, because no
@@ -722,13 +686,6 @@ impl Updated {
                     .collect::<Vec<_>>(),
             )
             .with(
-                "not_removed",
-                self.not_removed
-                    .iter()
-                    .map(NotRemoved::document)
-                    .collect::<Vec<_>>(),
-            )
-            .with(
                 "carried",
                 self.carried
                     .iter()
@@ -792,7 +749,6 @@ impl Updated {
                 crate::shown::release(removed)
             ));
         }
-        lines.extend(self.not_removed.iter().map(NotRemoved::said));
         lines
     }
 }
@@ -1157,7 +1113,6 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
             source,
             restarted,
             removed: Vec::new(),
-            not_removed: Vec::new(),
             carried: Vec::new(),
             unreached: Vec::new(),
             checked_only: check,
@@ -1329,8 +1284,8 @@ async fn carry_out(
         Ok(restarted) => restarted,
         Err(error) => return Err(report.annotate(error)),
     };
-    let (removed, not_removed) = if check {
-        (Vec::new(), Vec::new())
+    let removed = if check {
+        Vec::new()
     } else {
         collect(store, record, update_lock)
     };
@@ -1339,7 +1294,6 @@ async fn carry_out(
         target: target.release,
         restarted,
         removed,
-        not_removed,
         carried: report.carried,
         unreached: report.unreached,
         checked_only: check,
@@ -2351,14 +2305,11 @@ fn restart_of(
 /// starts its replacement with; and the task is this installation's own, as it registers it, so
 /// that the task, run after the switch, starts the daemon of the release `current` then names.
 ///
-/// Of the variables a daemon states, those are the three that decide where a Windows daemon keeps
-/// something: its roots are its arguments, and the others it states (`TMPDIR` and the `XDG_`
-/// variables) are read by the paths code on Unix only. Nothing else of its environment is stated,
-/// so nothing else can be held to the account's. The rest of it (`PATH`, `APPDATA`, the proxy
-/// variables, `SystemRoot` and the session variables) is the account's in a replacement, as it is
-/// the starting command's on the other platforms, and it moves what a capability probe finds, where
-/// a relay check goes and what a session starts with, not what the daemon serves or where it keeps
-/// it. A shell package
+/// The daemon states those variables and no others, so they are the only ones that can be held to
+/// the account's. The rest of its environment (`PATH`, `APPDATA`, the proxy variables, `SystemRoot`
+/// and the session variables) is the account's in a replacement, as it is the starting command's on
+/// the other platforms, and it moves what a capability probe finds, where a relay check goes and
+/// what a session starts with, not what the daemon serves or where it keeps it. A shell package
 /// root named in the environment makes a daemon of an installed release refuse to start, so a
 /// daemon an update replaces never has one.
 #[cfg(windows)]
@@ -2703,43 +2654,28 @@ const MAKE_WRITABLE: &str = if cfg!(windows) {
 };
 
 /// Removes every release nothing needs: not the current one, not the previous one, not one staged
-/// for a later update, and not one a running program holds. Returns what it removed, and what it
-/// could not remove for a reason no running program gave.
+/// for a later update, and not one a running program holds. Returns what it removed.
 fn collect(
     store: &Store,
     record: &Record,
     update: &kr_ipc::install::StoreLock,
-) -> (Vec<ReleaseName>, Vec<NotRemoved>) {
+) -> Vec<ReleaseName> {
     let Ok(current) = store.current() else {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     };
     let mut removed = Vec::new();
-    let mut not_removed = Vec::new();
     for release in store.releases().unwrap_or_default() {
         let needed = current.as_ref() == Some(&release)
             || record.previous.as_ref() == Some(&release)
             || record.staged.as_ref() == Some(&release);
-        if needed {
-            continue;
-        }
-        match store.retire(&release, update) {
-            Ok(true) => removed.push(release),
-            Ok(false) => {}
-            Err(error) => not_removed.push(NotRemoved {
-                release: Some(release),
-                reason: said(&error),
-            }),
+        if !needed && store.retire(&release, update).unwrap_or(false) {
+            removed.push(release);
         }
     }
     // What an earlier removal left because a program that holds nothing ran from the release.
     #[cfg(windows)]
-    if let Err(error) = store.sweep_trash(update) {
-        not_removed.push(NotRemoved {
-            release: None,
-            reason: said(&error),
-        });
-    }
-    (removed, not_removed)
+    let _ = store.sweep_trash(update);
+    removed
 }
 
 #[cfg(all(test, unix))]
@@ -3124,7 +3060,6 @@ mod tests {
             target: release("0.2.0+bbbbbbbbbbbb"),
             restarted: Vec::new(),
             removed: Vec::new(),
-            not_removed: Vec::new(),
             carried: vec![CarriedRegistry {
                 environment,
                 from: 4,
