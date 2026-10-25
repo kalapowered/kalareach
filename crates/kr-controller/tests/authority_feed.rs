@@ -22,6 +22,7 @@ use std::time::Duration;
 use kr_client::services::authority::{AuthorityFeedClient, AuthorityFeedState, RejectionReason};
 use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
 use kr_controller::authority_feed::FeedRuntime;
+use kr_controller::grants::restored::{self, Found};
 use kr_controller::service::Clocks;
 use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
@@ -31,6 +32,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
 use kr_protocol::method::Method;
+use kr_protocol::organisation::{HostPolicyConfirmParams, HostPolicyConfirmResult};
 use kr_protocol::pairing::{
     AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, RevocationAcknowledgement,
     RevocationCompletion, RevocationRequest, RevocationTarget,
@@ -783,10 +785,15 @@ async fn a_registry_put_back_to_an_earlier_state_is_raised_to_the_feed_and_carri
     // Out before the handshake is over, or refused on its first request: never served.
     rig.connects_while_a_revocation_is_held(&revoked.0, &revoked.1)
         .await;
-    let session = connect(&rig.host, &kept.0, &kept.1).await;
-    rig.doctor_as(&session)
+    let waits = rig.serves(&kept.0, &kept.1).await;
+    assert!(
+        is_refused_for_the_restored_policy(&waits),
+        "the host has caught up and still waits for the person at the machine: {waits:?}"
+    );
+    assert!(rig.the_owner_confirms().await.lifted);
+    rig.serves(&kept.0, &kept.1)
         .await
-        .expect("the device that was not revoked is served");
+        .expect("the device that was not revoked is served once the person has confirmed");
     let shown = rig.shown().await;
     assert!(
         shown
@@ -894,10 +901,474 @@ async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pas
     })
     .await;
     rig.until_the_carrier_is_idle().await;
-    let session = connect(&rig.host, &kept.0, &kept.1).await;
-    rig.doctor_as(&session)
+    assert!(
+        is_refused_for_the_restored_policy(&rig.serves(&kept.0, &kept.1).await),
+        "the host has caught up and still waits for the person at the machine"
+    );
+    assert!(rig.the_owner_confirms().await.lifted);
+    rig.serves(&kept.0, &kept.1)
         .await
-        .expect("the device is served once the host has caught up");
+        .expect("the device is served once the host has caught up and the person has confirmed");
+}
+
+impl Rig {
+    /// The person at this machine confirms the policy the host holds.
+    async fn the_owner_confirms(&self) -> HostPolicyConfirmResult {
+        let mut local = self.host.client().await;
+        net_support::pairing::mutate(
+            self.host.environment_id,
+            &mut local,
+            Method::HostPolicyConfirm,
+            &HostPolicyConfirmParams {},
+        )
+        .await
+        .expect("the person at this machine confirms")
+    }
+
+    /// The same, when the host may refuse.
+    async fn the_owner_tries_to_confirm(
+        &self,
+    ) -> Result<HostPolicyConfirmResult, kr_protocol::error::ProtocolError> {
+        let mut local = self.host.client().await;
+        net_support::pairing::mutate(
+            self.host.environment_id,
+            &mut local,
+            Method::HostPolicyConfirm,
+            &HostPolicyConfirmParams {},
+        )
+        .await
+    }
+
+    /// What the host has written down of a restore.
+    fn the_record(&self) -> Found {
+        restored::read(&restored::file_beside(
+            &self.host.tree().environment().registry_database(),
+        ))
+    }
+
+    /// Whether the host serves a paired device its doctor, and why not if it does not.
+    async fn serves(
+        &self,
+        device: &Device,
+        record: &kr_controller::service::net::devices::DeviceRecord,
+    ) -> Result<(), kr_client::ClientError> {
+        device_is_served(&self.host, device, record).await
+    }
+
+    /// The doctor's check of a restored policy, as the person at this machine reads it.
+    async fn the_restored_policy_check(&self) -> Option<kr_protocol::hostinfo::DoctorCheck> {
+        let mut local = self.host.client().await;
+        let doctor: HostDoctorResult =
+            net_support::pairing::read(&mut local, Method::HostDoctor, &())
+                .await
+                .expect("the host's diagnostics");
+        doctor
+            .checks
+            .into_iter()
+            .find(|check| check.id() == "restored-policy")
+    }
+}
+
+/// Whether `host` serves a paired device its doctor, and why not if it does not.
+async fn device_is_served(
+    host: &Host,
+    device: &Device,
+    record: &kr_controller::service::net::devices::DeviceRecord,
+) -> Result<(), kr_client::ClientError> {
+    match paired_dial(host, device, record).try_dial().await {
+        Ok(transport) => {
+            let session =
+                kr_client::session::Session::start(Arc::new(transport)).expect("a session");
+            within("the host answers", async {
+                session
+                    .read::<(), HostDoctorResult>(Method::HostDoctor, &())
+                    .await
+            })
+            .await
+            .map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a device was refused for the policy the host found restored.
+fn is_refused_for_the_restored_policy(outcome: &Result<(), kr_client::ClientError>) -> bool {
+    outcome
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains("restored from an earlier state"))
+}
+
+/// A copy of the policy mirror as it stands, taken while the daemon runs.
+fn a_copy_of_the_mirror(host: &Host, name: &str) -> std::path::PathBuf {
+    let mirror =
+        kr_controller::grants::mirror::file_beside(&host.tree().environment().registry_database());
+    let copy = mirror.with_file_name(name);
+    std::fs::copy(mirror, &copy).expect("the mirror is copied");
+    copy
+}
+
+/// Puts a copy of the mirror back where the mirror stands, with the host stopped.
+fn put_the_mirror_back(tree: &kr_ipc::testing::TempHost, copy: &std::path::Path) {
+    let mirror =
+        kr_controller::grants::mirror::file_beside(&tree.environment().registry_database());
+    std::fs::copy(copy, mirror).expect("the copy is put back");
+}
+
+/// As [`a_revocation_the_registry_will_lose`], with the mirror copied beside the registry, and the
+/// owner bounding offline validity after the copy, so that the state the copy holds lacks a
+/// restriction the host later gained.
+async fn a_policy_the_registry_will_lose() -> (Restorable, std::path::PathBuf) {
+    let rig = Rig::start().await;
+    let revoked = rig.pairs(&[ActionRight::SessionView]).await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let earlier = a_copy_of_the_registry(&rig.host, "registry-earlier.sqlite3");
+    let earlier_mirror = a_copy_of_the_mirror(&rig.host, "mirror-earlier.cbor");
+    rig.the_owner_bounds_offline_validity();
+    let request = rig
+        .owner_publishes(0xb1, devices(revoked.1.device_id))
+        .await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+    let held = rig.held(&request).await;
+    let acknowledged = held.acknowledgement.0.as_ref().expect("acknowledged");
+    assert_eq!(acknowledged.completion, RevocationCompletion::Complete);
+    let revision = acknowledged.authority_revision;
+    (
+        Restorable {
+            rig,
+            revoked,
+            kept,
+            earlier,
+            revision,
+        },
+        earlier_mirror,
+    )
+}
+
+/// KR-REQ-24.15: a host that found its registry put back to an earlier state, with the mirror, has
+/// caught up with its feed, and still refuses every grant but the owner's at this machine, because
+/// the policy it holds is the restored one and the feed carries withdrawals and no policy. The
+/// record of the finding is written, the doctor says the policy waits, the device that was not
+/// revoked is refused for the wait, and the person at this machine ends it: the device is served,
+/// and the policy in force is still the restored one, which has lost the bound the owner chose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_found_restored_waits_for_the_person_at_the_machine_after_the_host_has_caught_up()
+{
+    let (
+        Restorable {
+            rig,
+            revoked,
+            kept,
+            earlier,
+            revision,
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
+    assert!(
+        rig.host.controller().policy().offline_validity().is_some(),
+        "the owner's bound stands before the restore"
+    );
+
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+
+    assert!(
+        rig.host
+            .controller()
+            .authority_revision()
+            .await
+            .expect("a revision")
+            >= revision,
+        "the host has caught up with its feed"
+    );
+    assert!(
+        rig.host.controller().policy().offline_validity().is_none(),
+        "and the policy it holds is the restored one, without the bound"
+    );
+    let Found::Record(record) = rig.the_record() else {
+        panic!("the finding is written down");
+    };
+    assert_eq!(
+        record.subject,
+        restored::subject_of(&rig.host.controller().policy().snapshot()),
+        "and names the row the host holds"
+    );
+    rig.connects_while_a_revocation_is_held(&revoked.0, &revoked.1)
+        .await;
+    let outcome = rig.serves(&kept.0, &kept.1).await;
+    assert!(
+        is_refused_for_the_restored_policy(&outcome),
+        "the device the restore did not revoke is refused for the wait: {outcome:?}"
+    );
+    let check = rig
+        .the_restored_policy_check()
+        .await
+        .expect("the doctor says the policy waits");
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        rig.shown()
+            .await
+            .check
+            .is_some_and(|check| !check.detail().contains("catching up")),
+        "while the feed check says the host has caught up"
+    );
+
+    assert!(rig.the_owner_confirms().await.lifted);
+    rig.serves(&kept.0, &kept.1)
+        .await
+        .expect("the device is served once the person at this machine has confirmed");
+    assert!(
+        rig.host.controller().policy().offline_validity().is_none(),
+        "the confirmation changed nothing: the policy is the restored one"
+    );
+    assert_eq!(rig.the_record(), Found::Missing);
+}
+
+/// KR-REQ-24.15: the finding is on disk before anything is carried out again, so a pass that stops
+/// part way, and a restart that cannot reach the feed, still find the restored policy waiting. The
+/// registry here cannot take the write the carrying out begins with, so the pass stops there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_finding_is_written_down_before_anything_is_carried_out_again() {
+    let (
+        Restorable {
+            rig, kept, earlier, ..
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+            rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("the registry opens")
+                .execute_batch(
+                    "CREATE TRIGGER refuse_revision BEFORE UPDATE OF authority_revision
+                         ON environment BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+                )
+                .expect("the fault is in place");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        rig.shown()
+            .await
+            .check
+            .is_some_and(|check| check.detail().contains("catching up")),
+        "the host cannot finish catching up"
+    );
+    let Found::Record(record) = rig.the_record() else {
+        panic!("the finding is written down although nothing was carried out");
+    };
+    let outcome = rig.the_owner_tries_to_confirm().await;
+    assert!(
+        outcome.is_err(),
+        "the confirmation is refused while the host is behind its feed"
+    );
+
+    // The host stops, and starts with the feed down: it makes no comparison, and reads the record.
+    let (host, served) = rig.restarted_while_the_feed_is_down().await;
+    let outcome = device_is_served(&host, &kept.0, &kept.1).await;
+    assert!(
+        is_refused_for_the_restored_policy(&outcome),
+        "a restart that cannot reach the feed still finds the restored policy waiting: {outcome:?}"
+    );
+    assert_eq!(
+        restored::read(&restored::file_beside(
+            &host.tree().environment().registry_database()
+        )),
+        Found::Record(record),
+        "and the record is as it was written"
+    );
+    drop(served);
+}
+
+/// KR-REQ-24.15: the wait outlives the host's having caught up and the feed's being out of reach:
+/// with the record on disk and the registry already past the feed, a restart with the feed down, a
+/// restart with it up and a restart with no feed chosen all leave the device refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wait_outlives_a_restart_with_the_feed_down_up_or_unchosen() {
+    let (
+        Restorable {
+            rig, kept, earlier, ..
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let Found::Record(record) = rig.the_record() else {
+        panic!("the finding is written down");
+    };
+
+    let rig = rig.restarted(false, |_| {}).await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(
+        is_refused_for_the_restored_policy(&rig.serves(&kept.0, &kept.1).await),
+        "a restart with the feed up and the registry past it"
+    );
+    let (host, served) = rig.restarted_while_the_feed_is_down().await;
+    let outcome = device_is_served(&host, &kept.0, &kept.1).await;
+    assert!(
+        is_refused_for_the_restored_policy(&outcome),
+        "a restart with the feed down: {outcome:?}"
+    );
+    let stopped = host.shut_down().await;
+    net_support::write_feed_document(stopped.tree(), None);
+    let host = stopped.start_with_timer(HeldTimer::held() as _).await;
+    let outcome = device_is_served(&host, &kept.0, &kept.1).await;
+    assert!(
+        is_refused_for_the_restored_policy(&outcome),
+        "a restart with no feed chosen at all: {outcome:?}"
+    );
+    assert_eq!(
+        restored::read(&restored::file_beside(
+            &host.tree().environment().registry_database()
+        )),
+        Found::Record(record),
+        "and the record is as it was written"
+    );
+    drop(served);
+}
+
+/// KR-REQ-24.15: a host that cannot write the record of a restore does not carry anything out or
+/// move the registry; the pass ends with an error, the host stays behind its feed, and the next
+/// pass, once the file can be written, writes it and goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_cannot_write_the_record_carries_nothing_out_until_it_can() {
+    let (
+        Restorable {
+            rig,
+            revoked,
+            kept,
+            earlier,
+            revision,
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+            // Something that is not a file stands where the record goes.
+            std::fs::create_dir(restored::file_beside(
+                &tree.environment().registry_database(),
+            ))
+            .expect("an obstacle");
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    let behind = rig
+        .host
+        .controller()
+        .authority_revision()
+        .await
+        .expect("a revision");
+    assert!(
+        behind < revision,
+        "nothing was carried out and the registry did not move"
+    );
+    assert!(
+        rig.shown()
+            .await
+            .check
+            .is_some_and(|check| check.detail().contains("catching up")),
+        "the host is behind its feed and says so"
+    );
+    let outcome = rig.serves(&kept.0, &kept.1).await;
+    assert!(
+        outcome.is_err(),
+        "and refuses the device meanwhile: {outcome:?}"
+    );
+
+    let record = restored::file_beside(&rig.host.tree().environment().registry_database());
+    std::fs::remove_dir(&record).expect("the obstacle goes");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    rig.timer.release_held();
+    within("a pass finishes", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(matches!(rig.the_record(), Found::Record(_)));
+    assert!(
+        rig.host
+            .controller()
+            .authority_revision()
+            .await
+            .expect("a revision")
+            >= revision,
+        "the next pass wrote the record and caught up"
+    );
+    rig.connects_while_a_revocation_is_held(&revoked.0, &revoked.1)
+        .await;
+    assert!(is_refused_for_the_restored_policy(
+        &rig.serves(&kept.0, &kept.1).await
+    ));
+}
+
+/// KR-REQ-24.15: a remote owner's request on the feed is still judged and carried out while the
+/// policy waits, and the keys the feed may remove the host by stay the owners' keys. The wait
+/// refuses remote grants, and the feed is how a known owner reaches the host then too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_owners_revocation_is_carried_out_while_the_policy_waits() {
+    let (
+        Restorable {
+            rig, kept, earlier, ..
+        },
+        earlier_mirror,
+    ) = a_policy_the_registry_will_lose().await;
+    let rig = rig
+        .restarted(false, |tree| {
+            put_the_registry_back(tree, &earlier);
+            put_the_mirror_back(tree, &earlier_mirror);
+        })
+        .await;
+    rig.until_the_carrier_is_idle().await;
+    assert!(matches!(rig.the_record(), Found::Record(_)));
+
+    let request = rig.owner_publishes(0xb2, devices(kept.1.device_id)).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+    assert_eq!(
+        rig.held(&request)
+            .await
+            .acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion),
+        Some(RevocationCompletion::Complete),
+        "the request of an owner the host knows is carried out"
+    );
+    assert!(
+        rig.host
+            .controller()
+            .devices()
+            .record_for_device(kept.1.device_id)
+            .expect("readable")
+            .is_some_and(|record| record.revoked_at_ms.is_some()),
+        "and the device is revoked"
+    );
+    assert!(
+        rig.feed_as_the_owner_sees_it()
+            .await
+            .summary
+            .removal_keys
+            .contains(&rig.owner.authorisation.key_id()),
+        "while the owner's key stays among the keys that may remove the host from the feed"
+    );
 }
 
 /// KR-REQ-24.15: a host whose registry stands at the feed's revision is not behind, and refuses
@@ -1141,6 +1612,13 @@ async fn a_withdrawal_by_an_owner_the_host_does_not_know(
     if then_idle {
         rig.until_the_carrier_is_idle().await;
         rig.until_the_carrier_is_idle().await;
+        // The host found its policy restored with its registry, and waits for the person at the
+        // machine as well; what these cases hold is what the feed does beyond that wait. A feed
+        // that turns the change back keeps the host from finishing its catch-up, and the
+        // confirmation waits for that.
+        if delegations.is_empty() {
+            rig.the_owner_confirms().await;
+        }
     }
     Unverifiable {
         rig,
@@ -2539,6 +3017,7 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_cannot_verify_is_carri
         first,
     } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(false).await;
     rig.until_the_carrier_is_idle().await;
+    rig.the_owner_confirms().await;
 
     let refused = rig.answers(&kept.0, &kept.1).await;
     assert!(
@@ -2595,6 +3074,7 @@ async fn a_request_put_off_ahead_of_a_withdrawal_the_host_carried_out_again_is_r
         first,
     } = a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(true).await;
     rig.until_the_carrier_is_idle().await;
+    rig.the_owner_confirms().await;
 
     let held = rig.held_as(&issuer.0.keys().authorisation, &first).await;
     assert_eq!(

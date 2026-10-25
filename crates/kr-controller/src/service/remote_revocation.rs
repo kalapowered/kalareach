@@ -789,11 +789,14 @@ impl Controller {
     ///
     /// A registry restored together with its mirror is one earlier state this host accepts, and
     /// the feed is the one record outside both that still holds the highest revision the host
-    /// issued. Nothing is stored for the refusal: a start or a pass compares again.
+    /// issued. The refusal of being behind is not stored: a start or a pass compares again. The
+    /// finding is: the policy this host holds is then written down as found restored, and waits
+    /// for the person at this machine ([`Self::find_the_policy_restored`]).
     ///
     /// # Errors
     ///
-    /// Returns an error when the registry cannot be read.
+    /// Returns an error when the registry cannot be read, or the record of the finding cannot be
+    /// written.
     pub(crate) async fn authority_feed_behind(&self, feed_revision: u64) -> Result<bool> {
         let registry = self.authority_revision().await?;
         if feed_revision > registry.get() {
@@ -804,6 +807,10 @@ impl Controller {
                 crate::grants::HostPolicy::set_behind_its_feed,
             )
             .await;
+            // Written down now, before anything is carried out again and before the registry
+            // moves: once it has, the comparison finds nothing, and a stop or a failed pass
+            // would lose the finding.
+            self.find_the_policy_restored().await?;
             return Ok(true);
         }
         Ok(self.policy().behind_its_feed())
@@ -1387,6 +1394,9 @@ impl Controller {
     /// Returns the barrier's error. The refusal stands then, and the next pass finds the registry
     /// still behind and does this again.
     pub(crate) async fn authority_feed_caught_up(&self, feed_revision: u64) -> Result<()> {
+        // What was carried out again can have changed the policy this host holds, and the record
+        // names it. A record that cannot be written stops the catch-up, which the next pass repeats.
+        self.keep_the_record_of_the_policy_held().await?;
         self.catch_up_with_the_feed(AuthorityRevision::new(feed_revision))
             .await?;
         self.move_a_feed_refusal(

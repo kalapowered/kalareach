@@ -120,6 +120,50 @@ impl Controller {
         self.policy().restored_policy_waits()
     }
 
+    /// Writes down that the policy this host holds was found restored, and raises the wait.
+    ///
+    /// Called when the feed is first found ahead of the registry, before anything is carried out
+    /// again and before the registry is raised: once it has moved, the comparison finds nothing.
+    /// A record already durable for this row costs no write. Nothing is raised until the record is
+    /// durable, and the wait it raises stays when the host has caught up.
+    ///
+    /// # Errors
+    ///
+    /// Returns the write's error. The pass stops, nothing is carried out and the registry does not
+    /// move, so the next pass finds the feed ahead again and writes again.
+    pub(crate) async fn find_the_policy_restored(&self) -> Result<()> {
+        let mut kept = self.restored_policy.lock().await;
+        kept.ensure(
+            restored::subject_of(&self.policy().snapshot()),
+            self.wall_now_ms(),
+        )?;
+        self.move_a_feed_refusal(
+            RemoteRefusal::RESTORED_POLICY_WAITS,
+            true,
+            crate::grants::HostPolicy::restored_policy_waits,
+            crate::grants::HostPolicy::set_restored_policy_waits,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Makes sure the record names the row this host holds now, as the catch-up begins: carrying
+    /// out the feed's withdrawals again can unbind a member device and so change the row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the write's error; the catch-up does not begin.
+    pub(crate) async fn keep_the_record_of_the_policy_held(&self) -> Result<()> {
+        let mut kept = self.restored_policy.lock().await;
+        if !self.policy().restored_policy_waits() {
+            return Ok(());
+        }
+        kept.ensure(
+            restored::subject_of(&self.policy().snapshot()),
+            self.wall_now_ms(),
+        )
+    }
+
     /// `host.policy.confirm`: the person at this machine confirms the policy this host holds,
     /// which ends the wait. Nothing about the policy changes.
     ///
@@ -306,5 +350,105 @@ mod tests {
             Found::Missing,
             "and is removed"
         );
+    }
+
+    /// A finding and a confirmation take the one lock, so a confirmation that passed its check
+    /// cannot remove the record a finding has just relied on, and the other way round.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finding_and_a_confirmation_wait_for_each_other() {
+        use crate::service::a_floor_owed_its_record::daemon;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        controller
+            .find_the_policy_restored()
+            .await
+            .expect("the finding is written down");
+        assert!(controller.restored_policy_waits());
+
+        let held = controller.restored_policy.lock().await;
+        let mut confirmation = std::pin::pin!(controller.confirm_the_restored_policy());
+        let mut finding = std::pin::pin!(controller.find_the_policy_restored());
+        let pending = |name: &'static str, polled: std::task::Poll<()>| {
+            assert!(polled.is_pending(), "{name} waits for the lock");
+        };
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        pending(
+            "the confirmation",
+            std::future::Future::poll(confirmation.as_mut(), &mut cx).map(|_| ()),
+        );
+        pending(
+            "the finding",
+            std::future::Future::poll(finding.as_mut(), &mut cx).map(|_| ()),
+        );
+        drop(held);
+
+        // Whichever takes the lock first, they leave the wait and the record in step.
+        let (confirmed, found) = tokio::join!(confirmation, finding);
+        confirmed.expect("the confirmation is answered");
+        found.expect("the finding is written down");
+        let record = restored::read(&restored::file_beside(
+            &controller.paths().registry_database(),
+        ));
+        assert_eq!(
+            controller.restored_policy_waits(),
+            matches!(record, Found::Record(_)),
+            "a wait stands exactly when its record does"
+        );
+    }
+    /// The confirmation is refused while the host is still catching up with its feed, since the
+    /// policy it holds is not yet the one it will hold, and lifts the wait once it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_confirmation_is_refused_while_the_host_is_behind_its_feed() {
+        use crate::grants::HostPolicy;
+        use crate::service::a_floor_owed_its_record::daemon;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        controller
+            .find_the_policy_restored()
+            .await
+            .expect("the finding is written down");
+        controller
+            .move_a_feed_refusal(
+                RemoteRefusal::BEHIND_ITS_FEED,
+                true,
+                HostPolicy::behind_its_feed,
+                HostPolicy::set_behind_its_feed,
+            )
+            .await;
+        let refused = controller.confirm_the_restored_policy().await;
+        assert!(
+            matches!(&refused, Err(ControllerError::PermissionDenied { detail }) if detail.contains("catching up")),
+            "{refused:?}"
+        );
+        assert!(
+            controller.restored_policy_waits(),
+            "and the wait stands, with its record"
+        );
+        assert!(matches!(
+            restored::read(&restored::file_beside(
+                &controller.paths().registry_database()
+            )),
+            Found::Record(_)
+        ));
+
+        controller
+            .move_a_feed_refusal(
+                RemoteRefusal::BEHIND_ITS_FEED,
+                false,
+                HostPolicy::behind_its_feed,
+                HostPolicy::set_behind_its_feed,
+            )
+            .await;
+        let confirmed: HostPolicyConfirmResult = controller
+            .confirm_the_restored_policy()
+            .await
+            .expect("the host has caught up")
+            .to_typed()
+            .expect("an answer");
+        assert!(confirmed.lifted);
+        assert!(!controller.restored_policy_waits());
     }
 }

@@ -647,9 +647,11 @@ macro_rules! unverified_remedy {
          of it. Then pair a new owner device, revoke what the request names, set \
          `authority.origin` back and start the daemon again. If this host bounds offline \
          validity, finish this inside the bound: once it ends, the host refuses every remote \
-         request under a personal grant, an owner device's included. Until you revoke them, this \
-         host serves the devices the request names, and while it reads no feed it learns no \
-         remote revocation."
+         request under a personal grant, an owner device's included. If the doctor also says \
+         this host found the policy it holds restored, run `kr host policy --confirm` at this \
+         machine before you pair a new owner device: pairing waits for an owner device's \
+         confirmation, which that wait refuses. Until you revoke them, this host serves the \
+         devices the request names, and while it reads no feed it learns no remote revocation."
     };
 }
 
@@ -672,8 +674,10 @@ const UNVERIFIED_WAITING_REMEDY: &str = concat!(
 
 /// What a person who finds the host refusing remote access while it catches up with its feed does.
 const CATCHING_UP_REMEDY: &str = "This host catches up by itself and asks again. If it stays like \
-     this, the registry cannot take the write: check the disk and the permissions of the state \
-     directory.";
+     this, the registry cannot take the write, or the record that the policy this host holds was \
+     found restored cannot be written: check the disk and the permissions of the state \
+     directory. Once it has caught up, `kr host policy --confirm` at this machine ends the wait \
+     that restored policy puts on remote access.";
 
 /// What a person who finds a refusal waiting for the registry to take a write does.
 const STUCK_DRAIN_REMEDY: &str = "This host asks again by itself and goes on once the registry \
@@ -940,10 +944,15 @@ async fn pass(
         // registry restored to an earlier state is behind a revision this host issued.
         if !compared {
             compared = true;
-            let behind = controller
-                .authority_feed_behind(now.revision)
-                .await
-                .map_err(Stopped::local)?;
+            let behind = match controller.authority_feed_behind(now.revision).await {
+                Ok(behind) => behind,
+                Err(error) => {
+                    // A finding that could not be written down stops the pass with the host still
+                    // behind its feed, and the doctor says so.
+                    shared.observed().catching_up = controller.policy().behind_its_feed();
+                    return Err(Stopped::local(error));
+                }
+            };
             shared.observed().catching_up = behind;
         }
         for record in &state.records {

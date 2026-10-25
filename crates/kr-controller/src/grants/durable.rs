@@ -34,7 +34,9 @@
 //! to an earlier point takes the floors back with it, so this stops a *policy document* from
 //! reviving authority and not a restore of the host's entire state. That is recorded rather than
 //! claimed away: an authority store recovered wholesale is a recovery event, and the remedy is the
-//! remote feed, which this host does not issue and cannot rewind.
+//! remote feed, which this host does not issue and cannot rewind. A host that finds the feed ahead
+//! of its registry waits for the person at this machine before it serves the policy it holds
+//! ([`super::restored`]).
 
 use std::collections::BTreeMap;
 
