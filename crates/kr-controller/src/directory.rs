@@ -25,12 +25,10 @@ use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
-use kr_protocol::local::LocalBuild;
 use kr_protocol::method::Method;
 use kr_protocol::retained::Level;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState, SessionSummary};
-use kr_protocol::update::ReleaseName;
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::Result;
@@ -54,34 +52,6 @@ pub struct KnownWorker {
     /// read and written under. Kept in memory only: a daemon that starts again meets the worker
     /// again and reads it from its answer.
     pub level: Level,
-    /// The release the worker stated it runs, where it stated one (`kr-worker/<release>`), which
-    /// is the release the control daemon starts a plugin host from for it when it is of a retained
-    /// level and no host of its protocol runs. Kept in memory only, with the level.
-    pub release: Option<ReleaseName>,
-}
-
-/// What a worker stated of itself when this daemon met it: the level every frame to and from it is
-/// read and written under, and the release it runs.
-#[derive(Clone, Debug)]
-pub struct Stated {
-    /// The level.
-    pub level: Level,
-    /// The release, where the worker stated one.
-    pub release: Option<ReleaseName>,
-}
-
-impl Stated {
-    /// What the worker behind `link` stated in its answer to the hello.
-    pub fn of(link: &BoundLink) -> Self {
-        Self {
-            level: link.level(),
-            release: link
-                .acknowledgement()
-                .build
-                .as_ref()
-                .and_then(LocalBuild::worker_release),
-        }
-    }
 }
 
 /// Why a descriptor is not in the directory.
@@ -198,13 +168,12 @@ impl Directory {
                 continue;
             }
             match reconnect_to(&descriptor, reconnect).await {
-                Ok((endpoint, described, stated)) => {
+                Ok((endpoint, described, level)) => {
                     directory.insert(
                         KnownWorker {
                             descriptor,
                             endpoint,
-                            level: stated.level,
-                            release: stated.release,
+                            level,
                         },
                         described,
                     );
@@ -347,7 +316,7 @@ pub struct Reconnect<'a> {
 async fn reconnect_to(
     descriptor: &WorkerDescriptor,
     reconnect: &Reconnect<'_>,
-) -> std::result::Result<(Endpoint, Option<SessionSummary>, Stated), String> {
+) -> std::result::Result<(Endpoint, Option<SessionSummary>, Level), String> {
     let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| error.to_string())?;
     // Bounded, because starting the daemon must not depend on a worker that never answers. A
     // descriptor that runs out of time is quarantined like any other that fails its challenge.
@@ -375,7 +344,7 @@ async fn reconnect_to(
     .await
     .map_err(|_| "the worker did not answer its challenge in time".to_owned())??;
     let described = describe(&mut client, descriptor.session_id).await;
-    Ok((endpoint, described, Stated::of(&client)))
+    Ok((endpoint, described, client.level()))
 }
 
 /// Asks a worker this daemon has just verified to describe its session, over the connection it
@@ -427,7 +396,6 @@ mod tests {
             .expect("an endpoint");
         KnownWorker {
             level: kr_protocol::retained::Level::this(),
-            release: None,
             descriptor: WorkerDescriptor {
                 session_id,
                 session_epoch: SessionEpoch::V1,
