@@ -540,8 +540,9 @@ the host is still registered, the rows of hosts that are on say that the receive
 the keys until a filing succeeds, and each look files them again, alone, without the gateway or the
 host. "Try again" on such a row does the same and starts no sequence, since a sequence would spend the
 gateway's issues and retire the credential the host holds without changing what the store refuses.
-A host that refuses a registration after the gateway has issued for it is left with a credential the
-gateway no longer takes, and the row says that it cannot notify this phone until it takes one.
+A host that refuses a change of previews, or whose answer is lost, after the gateway has issued for it
+may be left with a credential the gateway no longer takes, and the row says that it may not be able to
+notify this phone until it takes a registration.
 
 The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
 `push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. `push.rs`
