@@ -743,7 +743,7 @@ The component is asked after the request is accepted, so an action it prepares c
 upstream after a request the same client sent later. A client that needs the order waits for the
 action's answer before it sends the next request. The arguments of every action that a component
 prepares or that answers a pending request are read against its declared parameters; the arguments
-of an action the host carries out itself by redrawing the package's document are read by no one.
+of an action the host carries out itself by answering with its receipt, which is what a `presentation` action is, are read by no one.
 
 What the component proposes is a proposal. The worker builds the effect it validates from the
 invocation and the declaration, never from the component's words: the plan must be for the action
