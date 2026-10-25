@@ -261,8 +261,7 @@ can do defeats that.
 ## A signature is provenance, not safety
 
 Whoever signed a package, its contents are untrusted input. Before anything is activated the host
-runs the same validator the publishing pipeline runs, so a package this host accepts is a package
-that repository's build accepted. It rejects a path that escapes the package, an entry that is not a
+runs the validator in `kr-plugin-sdk`, the code the publishing pipeline runs at the core revision that repository pins. A host built from another revision validates with its own, and the pipeline applies publication rules of its own beyond the validator, so acceptance by one is not acceptance by the other. It rejects a path that escapes the package, an entry that is not a
 regular file, duplicate and case-colliding names, a file the manifest does not declare, a payload
 that is absent, and a length or digest that is not what was declared.
 
