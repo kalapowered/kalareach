@@ -1,21 +1,24 @@
 //! The control daemon killed while a session is producing output.
 //!
-//! The daemon here is a process of its own, so ending it is what ending a daemon is: `SIGKILL`,
-//! with no drop, no flush and nothing said to anybody. That process is this test binary run again
+//! The daemon here is a process of its own, so ending it is what ending a daemon is: `SIGKILL`
+//! (`TerminateProcess` on Windows), with no drop, no flush and nothing said to anybody. That process is this test binary run again
 //! in a mode where it serves a control daemon and nothing else, which is the daemon library the
 //! `kr-controller` executable runs, started the same way. The worker it starts is the real worker
 //! executable, and the terminal that watches is a local client on the worker's own endpoint.
 //!
 //! Everything a launched process touches is on the internal disk: both executables are copied into
 //! the test's temporary host, which is also every process's working directory.
-
-#![cfg(unix)]
+//!
+//! On Windows the daemon starts the worker through the environment's scheduled task, as the
+//! shipping daemon does, so the worker is not a member of any job the killed daemon or this test
+//! run belongs to.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kr_controller::service::{Controller, ControllerSetup};
+#[cfg(not(windows))]
 use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
@@ -40,6 +43,11 @@ const ROOT: &str = "KR_KILL_TEST_ROOT";
 
 /// The worker executable the daemon half starts.
 const WORKER: &str = "KR_KILL_TEST_WORKER";
+
+/// The program the environment's scheduled task runs to start a worker, which the daemon half
+/// expects the task to have been registered with.
+#[cfg(windows)]
+const STARTER: &str = "KR_KILL_TEST_STARTER";
 
 /// The name of the daemon half, as the test harness selects it.
 const DAEMON_HALF: &str = "serve_a_control_daemon_for_the_kill_test";
@@ -87,7 +95,7 @@ fn serve_a_control_daemon_for_the_kill_test() {
                     }),
                     secret_store: StoreSelection::File,
                     boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                    supervisor: Box::new(DetachedSupervisor::new()),
+                    supervisor: supervisor(&environment),
                     worker_program: worker.clone(),
                     build_id: build(),
                     release: "0".to_owned(),
@@ -106,6 +114,30 @@ fn serve_a_control_daemon_for_the_kill_test() {
             let _ = Arc::clone(&controller).serve_clients(clients).await;
             let _ = serving.await;
         });
+}
+
+/// The supervisor the daemon half starts workers through.
+///
+/// A detached process of the daemon's own where there is a service manager to do without; on
+/// Windows the environment's scheduled task, which the test registered and whose starter creates
+/// each worker outside the jobs this run holds its daemon in.
+fn supervisor(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> Box<dyn kr_controller::supervision::WorkerSupervisor> {
+    #[cfg(windows)]
+    {
+        let starter = std::env::var_os(STARTER).expect("the starter the task was registered with");
+        kr_controller::supervision::windows::testing::supervisor_for(
+            environment,
+            std::path::Path::new(&starter),
+        )
+        .unwrap_or_else(|failure| panic!("the environment's task: {failure}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = environment;
+        Box::new(DetachedSupervisor::new())
+    }
 }
 
 /// The daemon process this test started, ended however the test ends.
@@ -155,13 +187,15 @@ fn start_daemon(
     program: &Path,
     host: &kr_ipc::testing::TempHost,
     worker: &Path,
+    #[cfg(windows)] starter: &Path,
 ) -> std::process::Child {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(host.root().join("daemon.log"))
         .expect("opens the daemon's log");
-    std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args([
             "--exact",
             DAEMON_HALF,
@@ -175,7 +209,10 @@ fn start_daemon(
         .current_dir(host.root())
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().expect("duplicates the log"))
-        .stderr(log)
+        .stderr(log);
+    #[cfg(windows)]
+    command.env(STARTER, starter);
+    command
         .spawn()
         .unwrap_or_else(|error| panic!("the daemon starts: {error:?}"))
 }
@@ -465,7 +502,11 @@ fn ticks_only_a_replay_shows(shown: &str, stream: &str) -> Vec<u64> {
 async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect_finds_it() {
     let host = teardown::Tree::create();
     let environment_id = host.environment_id();
-    let worker = host.root().join("kr-worker");
+    let worker = host.root().join(if cfg!(windows) {
+        "kr-worker.exe"
+    } else {
+        "kr-worker"
+    });
     // Started once here, where nothing is timed, so the operating system's check of a new
     // executable is not paid inside a create's rendezvous.
     kr_ipc::testing::place_and_start_once(
@@ -475,13 +516,34 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     );
     // Placed by a process of its own, so no child this test starts is handed a descriptor that
     // holds the copy open for writing when the copy is started.
-    let program = host.root().join("kill-test-daemon");
+    let program = host.root().join(if cfg!(windows) {
+        "kill-test-daemon.exe"
+    } else {
+        "kill-test-daemon"
+    });
     kr_ipc::testing::place_program(
         &std::env::current_exe().expect("this test's own executable"),
         &program,
     );
+    // The environment's task, which starts every worker of either daemon. It belongs to the host
+    // rather than to a daemon, so the replacement daemon finds the same task.
+    #[cfg(windows)]
+    let starter = kr_controller::supervision::windows::testing::built_binary("kr-controller")
+        .unwrap_or_else(|missing| panic!("{missing}"));
+    #[cfg(windows)]
+    let _task = kr_controller::supervision::windows::testing::TestTask::register(
+        &host.environment(),
+        &starter,
+    )
+    .unwrap_or_else(|failure| panic!("the environment's task: {failure}"));
     let mut started = Started {
-        daemon: Some(start_daemon(&program, &host, &worker)),
+        daemon: Some(start_daemon(
+            &program,
+            &host,
+            &worker,
+            #[cfg(windows)]
+            &starter,
+        )),
         tree: host.holder(),
     };
 
@@ -554,7 +616,13 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     watching.shown("kr-typed-with-no-daemon", 1).await;
 
     // A replacement daemon finds the session live, with the terminal still attached.
-    started.daemon = Some(start_daemon(&program, &host, &worker));
+    started.daemon = Some(start_daemon(
+        &program,
+        &host,
+        &worker,
+        #[cfg(windows)]
+        &starter,
+    ));
     let mut local = daemon_client(&host).await;
     let listed: SessionListResult = local
         .request(
