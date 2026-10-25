@@ -2929,8 +2929,10 @@ async fn privacy_on_and_off(host: &Host) {
 
 /// KR-REQ-26.10, KR-REQ-26.08: the update brings the delivery journal to version 11 and keeps what
 /// it holds; this release writes it; and after a rollback the release before opens it at 11,
-/// reads what this release wrote and writes it too, and the file still says 11. The privacy
-/// generation is what the suite can see of the journal: no `kr` command reads a notification.
+/// writes it too, and the file still says 11. The privacy generation is what the suite can see of
+/// the journal: no `kr` command reads a notification. Each daemon writes it from the privacy
+/// record it keeps, so the case shows the open, the write and the version, and not the content of
+/// a notification.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_delivery_journal_at_version_11_and_the_release_before_reads_it() {
     let prepared = Updated::prepare(Setup::default()).await;

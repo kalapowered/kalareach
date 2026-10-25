@@ -31,7 +31,7 @@
 //! | [`protocol`] | The frames, the two proof transcripts and the published descriptor |
 //! | [`client`] | What a worker uses: connect, verify, register, deliver, call, unbind |
 //! | [`launcher`] | Starting the host as its own job, taking its rendezvous, publishing its descriptor |
-//! //! | [`notices`] | The bounded queue a connection's unasked-for news waits in |
+//! | [`notices`] | The bounded queue a connection's unasked-for news waits in |
 //! | [`vocabulary`] | The records a call carries, the bounds both ends share, and their wire forms |
 //! | [`error`] | What the client reports when the host does not answer |
 

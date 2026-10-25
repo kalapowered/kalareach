@@ -113,8 +113,8 @@ impl Drop for Waiting {
 
 /// Returns the publication turn of one environment's descriptor of one protocol.
 ///
-/// The turn belongs to the file and not to the environment alone: two protocols publish different
-/// files, and a publication that took its number first must not make the other one stale.
+/// The turn belongs to the file the protocol names, so a publication of another file never makes
+/// this one stale.
 fn publication_turn(
     environment_id: EnvironmentId,
     protocol: &HostProtocol,
@@ -1356,6 +1356,29 @@ mod tests {
         let first = an_identity();
         let second = an_identity();
         assert_ne!(first.public_key(), second.public_key());
+    }
+
+    /// A host another release started is found by the name the release derives for the protocol, so
+    /// the name is held as a literal here and not read back from the protocol's own constant.
+    #[test]
+    fn the_endpoint_of_the_protocol_is_the_name_every_release_that_speaks_it_derives() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let endpoint = host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+        #[cfg(not(windows))]
+        assert_eq!(
+            endpoint,
+            Endpoint::from_path(environment.runtime_dir().join("p3.sock")).expect("a path")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            endpoint,
+            Endpoint::from_name(format!(
+                "kalareach-{}-p3.sock",
+                kr_ipc::paths::short_prefix(host.environment_id())
+            ))
+            .expect("a name")
+        );
     }
 
     #[test]

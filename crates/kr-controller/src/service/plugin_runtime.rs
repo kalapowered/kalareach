@@ -23,8 +23,9 @@
 //! holds one [`PluginRuntime`] and answers the workers of every level it speaks to with it. It
 //! adopts a host that runs, which a daemon of the other release started and which outlived an
 //! update or a rollback, and otherwise starts the `kr-plugin-host` beside this daemon. A host that
-//! survives serves the sessions of both levels until it ends, so a fix to the plugin host reaches
-//! the sessions of the other level only after that.
+//! survives serves the sessions of both levels until it ends, so a change to the plugin host (a
+//! fix, its engine, its bounds or its component interface) reaches the sessions of the other level
+//! only after that.
 //!
 //! # Starting is bounded
 //!

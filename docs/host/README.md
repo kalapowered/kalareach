@@ -1236,7 +1236,7 @@ A worker of the release before speaks the same protocol, `kr-plugin-host/3`, and
 under the same names. The daemon answers it as it answers a worker of this release: it adopts a
 host that a daemon of the other release started and that outlived an update or a rollback, and
 otherwise starts the `kr-plugin-host` beside it, on a host with a release store and on one with
-none. A host that survives serves the sessions of both releases until it ends, so a fix to the
+none. A host that survives serves the sessions of both releases until it ends, so a change to the
 plugin host reaches the sessions of the other release only after that.
 `docs/plugins/runtime.md` has the details.
 

@@ -3,10 +3,9 @@
 //!
 //! Only the host the application is connected to can be asked. It is asked whether it holds a
 //! session, which is how a draft comes to be known as that host's, and it is asked where its privacy
-//! mode stands. A host says that in `host.info`, to every device it is paired with. A host of an
-//! earlier build does not, and tells it only to a device the host gave the right to manage it, in
-//! the answer to `privacy.status`. Everything else is a host this device cannot read, and its drafts
-//! stay on this device ([`HostPrivacy::Unreadable`], [`Holds::Unknown`]).
+//! mode stands. A host says that in `host.info`, to every device it is paired with. A host that does
+//! not say it, one that is changing it and one that does not answer are hosts this device cannot
+//! read, and their drafts stay on this device ([`HostPrivacy::Unreadable`], [`Holds::Unknown`]).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};

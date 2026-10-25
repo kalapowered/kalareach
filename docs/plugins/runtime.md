@@ -514,7 +514,8 @@ runtime, and the daemon answers the same way for a worker of either release.
   the same way. A host takes no hold on its release: after the store retires a release, a host that
   was started from it runs on from its open program.
 - A host that survives an update or a rollback serves the sessions of both releases until it ends,
-  so a fix to the plugin host reaches the sessions of the other release only after that.
+  so a change to the plugin host (a fix, its engine, its bounds or its component interface) reaches
+  the sessions of the other release only after that.
 - A host that a daemon or a rollback leaves behind stays until it ends, and costs memory only. An
   update or a rollback adopts the host that is still there.
 

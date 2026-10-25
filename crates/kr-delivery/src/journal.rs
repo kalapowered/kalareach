@@ -4083,7 +4083,7 @@ fn insert_notification(
     Ok(())
 }
 
-/// Brings a version 6, 7, 8 or 9 journal forward to version 10, in one transaction.
+/// Brings a version 6, 7, 8, 9 or 10 journal forward to version 11, in one transaction.
 ///
 /// Version 7 added one column, the stamp of the stored credential an external destination sends
 /// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a

@@ -620,6 +620,9 @@ mod tests {
         );
     }
 
+    /// KR-REQ-20.04: the payload kinds are a closed set, none of them is an action and none bears
+    /// authority: a mailbox carries announcements, receipts, references, previews and sync
+    /// changes, so a kind outside the set, an action's or an authority object's, does not decode.
     #[test]
     fn the_payload_kinds_are_closed_and_none_of_them_is_an_action() {
         // Section 9 is a list of what a mailbox does not queue: keystrokes, shell commands,
@@ -635,6 +638,18 @@ mod tests {
                 "sync_change",
             ]
         );
+        for kind in [
+            "keystroke",
+            "shell_command",
+            "approval_decision",
+            "session_closure",
+            "signed_authority_object",
+        ] {
+            assert!(
+                serde_json::from_value::<MailboxPayloadType>(serde_json::json!(kind)).is_err(),
+                "{kind} is not a kind a mailbox carries"
+            );
+        }
     }
 
     fn sealed(bucket: u64, expires_at_ms: u64) -> SealedEnvelope {
