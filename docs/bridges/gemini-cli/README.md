@@ -40,17 +40,19 @@ session's working directory, so a project holding a newer manifest at
 `~/.gemini/extensions/kalareach/` inside itself would be offered as an update. Nothing can be read
 from `/dev/null/kalareach`, so Gemini CLI never offers one; KalaReach replaces the files itself.
 
-The record is installed before the other two files and removed after them. The recipe's removal
-deletes each file only while it still holds the installed bytes, and it can neither remove a
-directory nor keep a file on a condition, so whatever applies it owes two more things. It takes the
-record only once nothing else is left in `extensions/kalareach/`: beside a file of the person's, or
-one that changed since it was installed, the record stays, so Gemini CLI does not refuse to start.
-What it does then depends on what stayed: with no manifest left it skips the directory with a
-warning, but a manifest that changed and stayed still loads, with the hooks of a hooks file that
-changed and stayed, so a changed extension can remain active. And it removes the directories the
-installation created once they are empty: an empty `extensions/kalareach/` is a directory with no
-record, which stops Gemini CLI from starting under an allow list and is warned about at every start
-without one.
+The record is installed before the other two files, and removed after them. When a recipe is
+removed, each file is removed only if it still holds the bytes that were installed. The recipe
+cannot make the file stick around conditionally, but the host can. The host takes the record out
+last, after the directories the installation created inside `extensions/kalareach/`, and only once
+nothing else is left there. If either the person's own file or a changed file persists, the record
+persists with it, so that Gemini CLI still starts, and the next reconciliation removes it once they
+are gone. What happens then depends on what's left. If the manifest is gone, Gemini CLI skips the
+directory and warns the user. If the changed manifest is still there, it will be loaded. If the
+hooks file has been changed and persists, its hooks will be loaded. In this way, a changed extension
+can remain active. The host also removes the directories the installation created once they are
+empty. This is done because an empty `extensions/kalareach/` is a directory with no record: under an
+allow list Gemini CLI refuses to start, and without one it prints a warning every time it starts. A
+recipe whose removal does not end with the record is refused.
 
 The core repository keeps a copy of all three files in `fixtures/bridges/gemini-cli/`, pinned by the
 SHA-256 digests the package's recipe records, and `crates/kr-hook/tests/fixtures.rs` checks that
