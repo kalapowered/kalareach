@@ -501,6 +501,14 @@ impl Runtime {
         }
     }
 
+    /// Holds the compilation pool's jobs until the returned hold is dropped, for the tests of what
+    /// a caller does while a compile it queued is not done. See [`CompilePool::hold`].
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_compiles(&self) -> crate::runtime::compile::CompileHold {
+        self.pool.hold()
+    }
+
     /// Submits a component for compilation, lazily and at background priority.
     ///
     /// Returns as soon as the work is queued. This is the only place a component is compiled, and
