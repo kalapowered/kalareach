@@ -724,8 +724,7 @@ mod tests {
         assert!(first.reason.contains("was lost"), "{}", first.reason);
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                let PluginRuntimeState::Unavailable(told) = runtime.request().await
-                else {
+                let PluginRuntimeState::Unavailable(told) = runtime.request().await else {
                     panic!("an attempt that failed was answered that the runtime is running");
                 };
                 if told.reason.contains("ended abnormally") {
@@ -794,7 +793,6 @@ mod tests {
     /// handshake, so the holder adopts it.
     struct StandIn {
         _listener: tokio::task::JoinHandle<()>,
-        descriptor: kr_plugin_service::protocol::HostDescriptor,
     }
 
     impl StandIn {
@@ -851,10 +849,7 @@ mod tests {
                     }
                 }
             });
-            Self {
-                _listener: task,
-                descriptor,
-            }
+            Self { _listener: task }
         }
     }
 

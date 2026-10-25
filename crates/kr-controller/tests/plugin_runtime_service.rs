@@ -28,7 +28,8 @@ use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::ids::RepositoryGeneration;
 use kr_plugin_sdk::version::PackageVersion;
 use kr_plugin_service::client::{PluginClient, new_binding_id};
-use kr_plugin_service::protocol::ComponentSource;
+use kr_plugin_service::launcher;
+use kr_plugin_service::protocol::{ComponentSource, HostProtocol};
 use kr_plugin_service::vocabulary::{BindingActivity, BindingFacts};
 use kr_protocol::ids::PluginId;
 
@@ -98,6 +99,19 @@ async fn the_plugin_host_is_started_by_the_platform_when_the_worker_asks_and_rep
     let runtime = hosted.runtime().await;
     assert_eq!(hosted.started(), 1);
     let host = hosted.published().expect("the host is published");
+    // The host publishes the endpoint its protocol names, which is the one (and on Windows the
+    // pipe name) every release that speaks the protocol derives, so a daemon of either release
+    // reaches it.
+    let published = launcher::read_descriptor(&hosted.environment(), &HostProtocol::THIS)
+        .expect("the descriptor reads")
+        .expect("the host is published");
+    assert_eq!(
+        published.endpoint,
+        launcher::host_endpoint(&hosted.environment(), &HostProtocol::THIS)
+            .expect("an endpoint")
+            .as_text(),
+        "the host publishes the endpoint its protocol names"
+    );
     // Not in this process's group, so a signal aimed at this process's group does not reach it.
     // (Where the platform has no service manager the host is this process's child, in a group of
     // its own.)

@@ -43,13 +43,12 @@ mod organisation_support;
 // A person's terminal: a program run on a pseudo-terminal that a case types at.
 #[path = "upgrade/terminal.rs"]
 mod terminal;
-// The plugin hosts an environment publishes, one for each protocol, seen from outside.
+// The plugin host an environment publishes, seen from outside.
 #[path = "upgrade/plugin_hosts.rs"]
 mod plugin_hosts;
 // The frames of a plugin host of the release before, taken from a real one.
 #[path = "upgrade/plugin_host_frames.rs"]
 mod plugin_host_frames;
-use plugin_hosts::Wire;
 
 include!("support/update_harness.rs");
 
@@ -2641,296 +2640,12 @@ fn assert_runs_the_host_of(
 }
 
 /// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: the plugin host the release before started
-/// speaks `kr-plugin-host/2` and outlives the update, and a session of this release gets a host of
-/// its own protocol: two processes, each published in the file its protocol names, each holding the
-/// one binding its release's worker registered, each refusing a `Hello` for the other's protocol.
-/// Neither ends when the programs that bound to it do.
+/// outlives the update and serves the sessions of both releases. A session of this release binds
+/// a component and gets the process the release before started, not another, and so does a session
+/// created after the daemon of this release stops and starts again. The host stays until it is
+/// ended, whichever session binds to it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plugin_host_of_each_protocol_serves_the_session_of_its_own_release_at_once() {
-    let prepared = Updated::prepare(Setup {
-        plugin: true,
-        ..Setup::default()
-    })
-    .await;
-    let host_ref = &prepared.host;
-    let agent = host_ref.plugin_agent();
-    let first = terminal_for(
-        host_ref,
-        &prepared.kr_before(),
-        &["attach", &prepared.display],
-    );
-    first.ready().await;
-    let first_program = start_agent(host_ref, &first, &agent).await;
-    host_ref.plugin_holding_at(Wire::Two, 1).await;
-    let old_host = host_ref
-        .plugin_host_of(Wire::Two)
-        .expect("the release before started a plugin host");
-    assert_runs_the_host_of(&old_host, prepared.one.name());
-    assert_eq!(
-        host_ref.plugin_host_of(Wire::Three),
-        None,
-        "the release before has no host of this release's protocol"
-    );
-
-    let updated = prepared.update().await;
-    let host = &updated.host;
-    assert_eq!(
-        host.plugin_host_of(Wire::Two),
-        Some(old_host.clone()),
-        "the update left the release before's host alone"
-    );
-    host.plugin_holding_at(Wire::Two, 1).await;
-
-    // A session of this release: its worker gets a host of this release, in its own file.
-    let (second_display, second_session) = host.new_session(&updated.kr_now());
-    let second_worker = host.worker_process(second_session);
-    let second = terminal_for(host, &updated.kr_now(), &["attach", &second_display]);
-    second.ready().await;
-    let second_program = start_agent(host, &second, &agent).await;
-    let new_host = until("a plugin host of this release to be published", || async {
-        host.plugin_host_of(Wire::Three)
-    })
-    .await;
-    assert_ne!(new_host, old_host, "this release's host is another process");
-    assert_runs_the_host_of(&new_host, updated.two.name());
-
-    // Each holds the binding of its own release's worker, and only that one.
-    host.plugin_holding_at(Wire::Three, 1).await;
-    host.plugin_holding_at(Wire::Two, 1).await;
-    assert_eq!(
-        host.plugin_host_of(Wire::Two),
-        Some(old_host.clone()),
-        "the release before's worker still has its own host"
-    );
-
-    // A request for the other protocol reaches neither host.
-    assert!(
-        host.plugin_host_refuses(Wire::Two, Wire::Three.protocol())
-            .await,
-        "the host of the release before refuses a Hello for this release's protocol"
-    );
-    assert!(
-        host.plugin_host_refuses(Wire::Three, Wire::Two.protocol())
-            .await,
-        "this release's host refuses a Hello for the release before's protocol"
-    );
-
-    // Both programs end, and with them their bindings; no host ends with them.
-    end_program(&first_program);
-    end_program(&second_program);
-    host.plugin_holding_at(Wire::Two, 0).await;
-    host.plugin_holding_at(Wire::Three, 0).await;
-    assert_eq!(host.plugin_host_of(Wire::Two), Some(old_host.clone()));
-    assert_eq!(host.plugin_host_of(Wire::Three), Some(new_host.clone()));
-    for process in [&old_host, &new_host] {
-        assert_eq!(
-            kr_ipc::identity::process_state(process),
-            kr_ipc::identity::ProcessState::Running,
-            "a host runs until it is ended"
-        );
-    }
-
-    updated.the_worker_is_as_it_was().await;
-    drop(second);
-    drop(first);
-    host.close(&updated.kr_now(), &second_display);
-    host.worker_ended(&second_worker).await;
-    host.close(&updated.kr_before(), &updated.display);
-    host.worker_ended(&updated.worker).await;
-    host.end_the_plugin_host_at(Wire::Three).await;
-    host.end_the_plugin_host_at(Wire::Two).await;
-}
-
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: a program the package recognises, started
-/// in the session of the release before after the update, makes its worker ask the daemon of this
-/// release for the plugin runtime of its own protocol. No host of either protocol runs before it.
-/// The daemon starts the release before's program from the store and publishes it in the file the
-/// release before reads, the worker registers with it, and a session of this release then gets a
-/// host of its own protocol beside it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_worker_of_the_release_before_asks_this_releases_daemon_for_a_host_of_its_own_protocol() {
-    let updated = Updated::prepare(Setup {
-        plugin: true,
-        ..Setup::default()
-    })
-    .await
-    .update()
-    .await;
-    let host = &updated.host;
-    for wire in [Wire::Two, Wire::Three] {
-        assert_eq!(
-            host.plugin_host_of(wire),
-            None,
-            "no program has wanted a {} host yet",
-            wire.protocol()
-        );
-    }
-    let agent = host.plugin_agent();
-    let old = terminal_for(host, &updated.kr_before(), &["attach", &updated.display]);
-    old.ready().await;
-    let old_program = start_agent(host, &old, &agent).await;
-    host.plugin_holding_at(Wire::Two, 1).await;
-    let old_host = host
-        .plugin_host_of(Wire::Two)
-        .expect("the daemon started a host for the worker of the release before");
-    assert_runs_the_host_of(&old_host, updated.one.name());
-    assert_eq!(
-        host.plugin_host_of(Wire::Three),
-        None,
-        "the worker of the release before wanted no host of this release's protocol"
-    );
-
-    // A session of this release gets a host of this release's protocol.
-    let (display, session_id) = host.new_session(&updated.kr_now());
-    let worker = host.worker_process(session_id);
-    let now = terminal_for(host, &updated.kr_now(), &["attach", &display]);
-    now.ready().await;
-    let now_program = start_agent(host, &now, &agent).await;
-    host.plugin_holding_at(Wire::Three, 1).await;
-    let new_host = host
-        .plugin_host_of(Wire::Three)
-        .expect("this release's host is published");
-    assert_ne!(new_host, old_host);
-    assert_runs_the_host_of(&new_host, updated.two.name());
-    assert_eq!(
-        host.plugin_host_of(Wire::Two),
-        Some(old_host),
-        "the host of the release before is the one it was"
-    );
-
-    updated.the_worker_is_as_it_was().await;
-    // The programs end before the sessions do: a worker whose host ends while its program runs
-    // asks for another, and nothing here would end that one.
-    end_program(&old_program);
-    end_program(&now_program);
-    drop(now);
-    drop(old);
-    host.close(&updated.kr_now(), &display);
-    host.worker_ended(&worker).await;
-    host.close(&updated.kr_before(), &updated.display);
-    host.worker_ended(&updated.worker).await;
-    host.end_the_plugin_host_at(Wire::Three).await;
-    host.end_the_plugin_host_at(Wire::Two).await;
-}
-
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: a plugin host ends while a program the
-/// package recognises still runs, and the worker, left without a host, asks the daemon of this
-/// release for another of its own protocol. For the release before's worker the daemon starts the
-/// release before's program again; for a worker of this release it starts this release's. Each
-/// replacement leaves the other protocol's host as it was. A rollback then adopts the host the
-/// daemon of this release started from the release before's program.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_plugin_host_that_ends_under_a_running_program_is_replaced_by_one_of_the_same_protocol() {
-    let prepared = Updated::prepare(Setup {
-        plugin: true,
-        ..Setup::default()
-    })
-    .await;
-    let agent = prepared.host.plugin_agent();
-    let terminal = terminal_for(
-        &prepared.host,
-        &prepared.kr_before(),
-        &["attach", &prepared.display],
-    );
-    terminal.ready().await;
-    let old_program = start_agent(&prepared.host, &terminal, &agent).await;
-    prepared.host.plugin_holding_at(Wire::Two, 1).await;
-    let first_two = prepared
-        .host
-        .plugin_host_of(Wire::Two)
-        .expect("the release before started a plugin host");
-
-    let updated = prepared.update().await;
-    let host = &updated.host;
-    host.plugin_holding_at(Wire::Two, 1).await;
-    assert_eq!(host.plugin_host_of(Wire::Two), Some(first_two.clone()));
-
-    // The release before's host ends under the program still running in its session. The daemon
-    // of this release starts the release before's program again, and the worker registers with it.
-    host.end_the_plugin_host_at(Wire::Two).await;
-    let second_two = host.another_plugin_host_of(Wire::Two, &first_two).await;
-    assert_runs_the_host_of(&second_two, updated.one.name());
-    host.plugin_holding_at(Wire::Two, 1).await;
-    assert_eq!(
-        host.plugin_host_of(Wire::Three),
-        None,
-        "a worker of the release before asks for no host of this release's protocol"
-    );
-
-    // A session of this release with its own host.
-    let (display, session_id) = host.new_session(&updated.kr_now());
-    let worker = host.worker_process(session_id);
-    let now = terminal_for(host, &updated.kr_now(), &["attach", &display]);
-    now.ready().await;
-    let now_program = start_agent(host, &now, &agent).await;
-    host.plugin_holding_at(Wire::Three, 1).await;
-    let first_three = host
-        .plugin_host_of(Wire::Three)
-        .expect("this release's host is published");
-
-    // This release's host ends under the program still running in its session.
-    host.end_the_plugin_host_at(Wire::Three).await;
-    let second_three = host.another_plugin_host_of(Wire::Three, &first_three).await;
-    assert_runs_the_host_of(&second_three, updated.two.name());
-    host.plugin_holding_at(Wire::Three, 1).await;
-    assert_eq!(
-        host.plugin_host_of(Wire::Two),
-        Some(second_two.clone()),
-        "the release before's host was not touched"
-    );
-
-    updated.the_worker_is_as_it_was().await;
-    end_program(&old_program);
-    end_program(&now_program);
-    drop(now);
-    host.close(&updated.kr_now(), &display);
-    host.worker_ended(&worker).await;
-
-    // A rollback now: the daemon of the release before finds a host of its protocol that the
-    // daemon of this release started, from the release before's own program, and adopts it
-    // instead of starting another.
-    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "kr host rollback: {said} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        host.daemon_build().await,
-        format!("kr-controller/{}", updated.one.name()),
-        "the daemon is the release before's again"
-    );
-    let (late_display, late_session) = host.new_session(&updated.kr_before());
-    let late_worker = host.worker_process(late_session);
-    let late = terminal_for(host, &updated.kr_before(), &["attach", &late_display]);
-    late.ready().await;
-    let late_program = start_agent(host, &late, &agent).await;
-    host.plugin_holding_at(Wire::Two, 1).await;
-    assert_eq!(
-        host.plugin_host_of(Wire::Two),
-        Some(second_two),
-        "the release before's daemon adopted the host this release's daemon started"
-    );
-
-    end_program(&late_program);
-    drop(late);
-    drop(terminal);
-    host.close(&updated.kr_before(), &late_display);
-    host.worker_ended(&late_worker).await;
-    host.close(&updated.kr_before(), &updated.display);
-    host.worker_ended(&updated.worker).await;
-    host.end_the_plugin_host_at(Wire::Three).await;
-    host.end_the_plugin_host_at(Wire::Two).await;
-}
-
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: the daemon of this release stops and
-/// starts again while a host of each protocol runs. It adopts both: neither is replaced, a worker
-/// of the release before that asks for the first time after the restart is told its host runs and
-/// registers with the host the release before started, and a session of this release registers with
-/// this release's.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_daemon_that_starts_again_adopts_the_plugin_host_of_each_protocol() {
+async fn a_plugin_host_the_release_before_started_serves_the_sessions_of_both_releases() {
     let prepared = Updated::prepare(Setup {
         plugin: true,
         ..Setup::default()
@@ -2944,18 +2659,22 @@ async fn a_daemon_that_starts_again_adopts_the_plugin_host_of_each_protocol() {
     );
     first.ready().await;
     let first_program = start_agent(&prepared.host, &first, &agent).await;
-    prepared.host.plugin_holding_at(Wire::Two, 1).await;
-    // A second session of the release before, whose program starts only after the restart.
-    let (late_display, late_session) = prepared.host.new_session(&prepared.kr_before());
-    let late_worker = prepared.host.worker_process(late_session);
-    let late = terminal_for(
-        &prepared.host,
-        &prepared.kr_before(),
-        &["attach", &late_display],
-    );
-    late.ready().await;
+    prepared.host.plugin_holding(1).await;
+    let old_host = prepared
+        .host
+        .plugin_host()
+        .expect("the release before started a plugin host");
+    assert_runs_the_host_of(&old_host, prepared.one.name());
 
     let mut updated = prepared.update().await;
+    assert_eq!(
+        updated.host.plugin_host(),
+        Some(old_host.clone()),
+        "the update left the release before's host alone"
+    );
+    updated.host.plugin_holding(1).await;
+
+    // A session of this release binds a component and is served by the same process.
     let (second_display, second_session) = updated.host.new_session(&updated.kr_now());
     let second_worker = updated.host.worker_process(second_session);
     let second = terminal_for(
@@ -2965,17 +2684,15 @@ async fn a_daemon_that_starts_again_adopts_the_plugin_host_of_each_protocol() {
     );
     second.ready().await;
     let second_program = start_agent(&updated.host, &second, &agent).await;
-    updated.host.plugin_holding_at(Wire::Three, 1).await;
-    let two = updated
-        .host
-        .plugin_host_of(Wire::Two)
-        .expect("a host of the release before");
-    let three = updated
-        .host
-        .plugin_host_of(Wire::Three)
-        .expect("a host of this release");
+    updated.host.plugin_holding(2).await;
+    assert_eq!(
+        updated.host.plugin_host(),
+        Some(old_host.clone()),
+        "this release's session is served by the host the release before started"
+    );
 
-    // The daemon stops and starts again; the workers and both hosts run on.
+    // The daemon of this release stops and starts again: it adopts the host, and a session that
+    // binds afterwards is served by it too.
     assert!(
         updated.host.stop_the_daemon().await,
         "no daemon serves the host"
@@ -2983,95 +2700,115 @@ async fn a_daemon_that_starts_again_adopts_the_plugin_host_of_each_protocol() {
     let controller = updated.host.store.stable(Program::Controller);
     updated.host.start_daemon(&controller).await;
     let host = &updated.host;
-    assert_eq!(host.plugin_host_of(Wire::Two), Some(two.clone()));
-    assert_eq!(host.plugin_host_of(Wire::Three), Some(three.clone()));
-    host.plugin_holding_at(Wire::Two, 1).await;
-    host.plugin_holding_at(Wire::Three, 1).await;
-
-    // A worker of the release before that has not asked yet is told its host runs, and registers
-    // with it; no second host is started.
-    let late_program = start_agent(host, &late, &agent).await;
-    host.plugin_holding_at(Wire::Two, 2).await;
-    assert_eq!(
-        host.plugin_host_of(Wire::Two),
-        Some(two.clone()),
-        "the daemon adopted the release before's host"
-    );
-    // A new session of this release registers with this release's host, the same process.
+    assert_eq!(host.plugin_host(), Some(old_host.clone()));
+    host.plugin_holding(2).await;
     let (third_display, third_session) = host.new_session(&updated.kr_now());
     let third_worker = host.worker_process(third_session);
     let third = terminal_for(host, &updated.kr_now(), &["attach", &third_display]);
     third.ready().await;
     let third_program = start_agent(host, &third, &agent).await;
-    host.plugin_holding_at(Wire::Three, 2).await;
+    host.plugin_holding(3).await;
     assert_eq!(
-        host.plugin_host_of(Wire::Three),
-        Some(three.clone()),
-        "the daemon adopted this release's host"
+        host.plugin_host(),
+        Some(old_host.clone()),
+        "the daemon adopted the host and started no other"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&old_host),
+        kr_ipc::identity::ProcessState::Running,
+        "a host runs until it is ended"
     );
 
-    for program in [
-        &first_program,
-        &late_program,
-        &second_program,
-        &third_program,
-    ] {
+    updated.the_worker_is_as_it_was().await;
+    for program in [&first_program, &second_program, &third_program] {
         end_program(program);
     }
     drop(third);
     drop(second);
-    drop(late);
     drop(first);
     host.close(&updated.kr_now(), &third_display);
     host.worker_ended(&third_worker).await;
     host.close(&updated.kr_now(), &second_display);
     host.worker_ended(&second_worker).await;
-    host.close(&updated.kr_before(), &late_display);
-    host.worker_ended(&late_worker).await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
-    host.end_the_plugin_host_at(Wire::Three).await;
-    host.end_the_plugin_host_at(Wire::Two).await;
+    host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-26.08, KR-REQ-26.10, KR-ACC-035: a rollback waits for a live
-/// session of this release (exit 9, naming it) and then goes on. The host of this release's
-/// protocol survives it, running and published in its own file, which the release before does not
-/// read. A session the release before's daemon then creates binds a component and gets a host of
-/// its own, started by that daemon from its own program, and not this release's.
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: with no plugin host running, a program the
+/// package recognises, started in the session of the release before after the update, makes its
+/// worker ask the daemon of this release for the plugin runtime. The daemon starts this release's
+/// own host, the worker registers with it, and when the host ends under the running program the
+/// daemon starts another of this release's.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_leaves_the_host_of_this_releases_protocol_running_and_the_release_before_gets_its_own()
- {
-    let prepared = Updated::prepare(Setup {
+async fn a_session_of_the_release_before_gets_the_plugin_host_this_releases_daemon_starts() {
+    let updated = Updated::prepare(Setup {
         plugin: true,
         ..Setup::default()
     })
+    .await
+    .update()
     .await;
-    let agent = prepared.host.plugin_agent();
-    let first = terminal_for(
-        &prepared.host,
-        &prepared.kr_before(),
-        &["attach", &prepared.display],
-    );
-    first.ready().await;
-    let first_program = start_agent(&prepared.host, &first, &agent).await;
-    prepared.host.plugin_holding_at(Wire::Two, 1).await;
-    let first_two = prepared
-        .host
-        .plugin_host_of(Wire::Two)
-        .expect("the release before started a plugin host");
-
-    let updated = prepared.update().await;
     let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        None,
+        "no program has wanted a plugin host yet"
+    );
+    let agent = host.plugin_agent();
+    let old = terminal_for(host, &updated.kr_before(), &["attach", &updated.display]);
+    old.ready().await;
+    let program = start_agent(host, &old, &agent).await;
+
+    // First use: the daemon starts this release's host.
+    host.plugin_holding(1).await;
+    let first = host
+        .plugin_host()
+        .expect("the daemon started a host for the worker of the release before");
+    assert_runs_the_host_of(&first, updated.two.name());
+
+    // The host ends under the program still running; the worker asks again and gets another of
+    // this release's.
+    host.end_the_plugin_host().await;
+    let second = host.another_plugin_host(&first).await;
+    assert_runs_the_host_of(&second, updated.two.name());
+    host.plugin_holding(1).await;
+
+    updated.the_worker_is_as_it_was().await;
+    // The program ends before the session does: a worker whose host ends while its program runs
+    // asks for another, and nothing here would end that one.
+    end_program(&program);
+    drop(old);
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
+}
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-26.08, KR-REQ-26.10, KR-ACC-035: a rollback waits for a live
+/// session of this release (exit 9, naming it) and then goes on. The plugin host this release's
+/// daemon started survives it, running and published, and a session the release before's daemon
+/// then creates binds a component and is served by that host, which the daemon adopts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_before_to_adopt() {
+    let updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+    let agent = host.plugin_agent();
     let (second_display, second_session) = host.new_session(&updated.kr_now());
     let second_worker = host.worker_process(second_session);
     let second = terminal_for(host, &updated.kr_now(), &["attach", &second_display]);
     second.ready().await;
     let second_program = start_agent(host, &second, &agent).await;
-    host.plugin_holding_at(Wire::Three, 1).await;
-    let three = host
-        .plugin_host_of(Wire::Three)
-        .expect("this release's host is published");
+    host.plugin_holding(1).await;
+    let this_host = host
+        .plugin_host()
+        .expect("this release's daemon started a host");
+    assert_runs_the_host_of(&this_host, updated.two.name());
 
     // The session of this release holds the rollback.
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
@@ -3096,18 +2833,12 @@ async fn a_rollback_leaves_the_host_of_this_releases_protocol_running_and_the_re
         "nothing was switched"
     );
 
-    // Its program and session end; the release before's host ends too, so the daemon the rollback
-    // restores has to start one.
+    // Its program and session end, and the rollback goes on.
     end_program(&second_program);
     drop(second);
     host.close(&updated.kr_now(), &second_display);
     host.worker_ended(&second_worker).await;
-    end_program(&first_program);
-    drop(first);
-    host.plugin_holding_at(Wire::Two, 0).await;
-    host.end_the_plugin_host_at(Wire::Two).await;
-    assert_eq!(host.plugin_host_of(Wire::Three), Some(three.clone()));
-
+    host.plugin_holding(0).await;
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3124,33 +2855,28 @@ async fn a_rollback_leaves_the_host_of_this_releases_protocol_running_and_the_re
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
     );
-    // This release's host survived the rollback, running and published in the file the release
-    // before does not read.
-    assert_eq!(host.plugin_host_of(Wire::Three), Some(three.clone()));
     assert_eq!(
-        kr_ipc::identity::process_state(&three),
+        host.plugin_host(),
+        Some(this_host.clone()),
+        "this release's host survived the rollback"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&this_host),
         kr_ipc::identity::ProcessState::Running,
         "this release's host runs on"
     );
-    host.plugin_holding_at(Wire::Three, 0).await;
 
-    // A session of the release before binds a component and gets a runtime of its own.
+    // A session of the release before binds a component; its daemon adopts the host.
     let (third_display, third_session) = host.new_session(&updated.kr_before());
     let third_worker = host.worker_process(third_session);
     let third = terminal_for(host, &updated.kr_before(), &["attach", &third_display]);
     third.ready().await;
     let third_program = start_agent(host, &third, &agent).await;
-    host.plugin_holding_at(Wire::Two, 1).await;
-    let second_two = host
-        .plugin_host_of(Wire::Two)
-        .expect("the release before's daemon started a host");
-    assert_ne!(second_two, first_two, "a host started after the rollback");
-    assert_ne!(second_two, three, "and not this release's host");
-    assert_runs_the_host_of(&second_two, updated.one.name());
+    host.plugin_holding(1).await;
     assert_eq!(
-        host.plugin_host_of(Wire::Three),
-        Some(three),
-        "this release's host is still the one it was"
+        host.plugin_host(),
+        Some(this_host),
+        "the release before's daemon adopted the host this release's daemon started"
     );
 
     end_program(&third_program);
@@ -3159,8 +2885,7 @@ async fn a_rollback_leaves_the_host_of_this_releases_protocol_running_and_the_re
     host.worker_ended(&third_worker).await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
-    host.end_the_plugin_host_at(Wire::Three).await;
-    host.end_the_plugin_host_at(Wire::Two).await;
+    host.end_the_plugin_host().await;
 }
 
 /// The retained output an export document carries, joined.

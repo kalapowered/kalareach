@@ -4,8 +4,8 @@
 side of the same contract: where a component actually runs, what bounds it, and what happens when it
 misbehaves.
 
-A component runs in `kr-plugin-host`, one process for each plugin host protocol and environment,
-started when a binding first needs one. A worker never links the engine. It asks the control
+A component runs in `kr-plugin-host`, one process for each environment, started when a binding
+first needs one. A worker never links the engine. It asks the control
 daemon for the process, registers a binding with it and keeps its own ledger, so a component that
 traps costs its binding and nothing else.
 
@@ -321,7 +321,7 @@ entry is a reason to recompile rather than a reason to refuse the binding.
 
 ## The service
 
-One process for each protocol and environment, `kr-plugin-host`, started by the control daemon
+One process for each environment, `kr-plugin-host`, started by the control daemon
 through the same supervisor trait a worker is started through: a launchd job, a systemd transient
 user service, or a detached process on a Unix host with no service manager, or, on Windows, a
 process the starter of the environment's scheduled task creates, in each case its own job outside
