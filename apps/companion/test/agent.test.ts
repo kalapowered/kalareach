@@ -25,7 +25,9 @@ import {
   COMPOSER_CAPABILITIES,
   composerOffers,
   foldWithheld,
+  invocationOf,
   liveInstance,
+  NO_ARGUMENTS,
   targetOf,
   withheldTotal
 } from '../src/model/agent'
@@ -477,5 +479,51 @@ describe('the control state, from what the worker said (KR-REQ-11.48)', () => {
     expect(
       visibilityOf(control, controlStateOf({ ...facts, bindingState: null, rights: null }))
     ).toEqual({ kind: 'hidden', because: 'this client does not know whether its condition is met' })
+  })
+})
+
+describe("a package's control asks the host for its action (KR-REQ-13.14)", () => {
+  const stop: Control = {
+    id: 'c-2',
+    revision: '1',
+    label: 'Refresh',
+    accessible_description: 'Reads the thread again.',
+    action_id: 'thread.refresh',
+    parameters: { parameters: [] }
+  }
+  const live = instance('i-1', '10')
+
+  it('names the package, the action and the binding revision the person saw, and sends no arguments', () => {
+    expect(invocationOf(stop, SESSION, live, binding())).toEqual({
+      kind: 'call',
+      params: {
+        target: targetOf(SESSION, 'i-1', binding()),
+        plugin_id: 'openai.codex',
+        action: 'thread.refresh',
+        draft_id: null,
+        resource_id: null,
+        parameters: NO_ARGUMENTS
+      }
+    })
+    // The empty object, encoded the way the host hashes the action's arguments.
+    expect(atob(NO_ARGUMENTS.replace(/-/g, '+').replace(/_/g, '/'))).toBe('{}')
+  })
+
+  it('asks nothing of the host while the agent is unread, unrecognised, or the action takes input', () => {
+    const because = (call: ReturnType<typeof invocationOf>) =>
+      call.kind === 'cannot' ? call.because : null
+    expect(because(invocationOf(stop, SESSION, null, binding()))).toContain('not read the agent')
+    expect(because(invocationOf(stop, SESSION, live, null))).toContain('not read the agent')
+    expect(
+      because(invocationOf(stop, SESSION, { ...live, plugin_id: null }, binding()))
+    ).toContain('No package recognised')
+    expect(
+      because(invocationOf({ ...stop, parameters: undefined }, SESSION, live, binding()))
+    ).toContain('cannot tell what this action takes')
+    expect(
+      because(
+        invocationOf({ ...stop, parameters: { parameters: [{ name: 'to' }] } }, SESSION, live, binding())
+      )
+    ).toContain('asks for input')
   })
 })
