@@ -2062,6 +2062,86 @@ mod tests {
         assert_eq!(visibly("plain text ünï"), "plain text ünï");
     }
 
+    /// A share to a device, as the host lists it, carrying exactly these rights.
+    fn share_with(seed: u8, rights: &[ActionRight]) -> GrantSummary {
+        use kr_protocol::grant::{
+            EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+        };
+        use kr_protocol::ids::AuthorityRevision;
+
+        GrantSummary {
+            grant: Grant {
+                grant_id: GrantId::new(Uuid::from_bytes([seed; 16])),
+                parent_grant_id: Nullable::null(),
+                issuer_device_id: DeviceId::new(Uuid::from_bytes([200; 16])),
+                recipient_device_id: DeviceId::new(Uuid::from_bytes([seed; 16])),
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::None,
+                actions: rights.iter().copied().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry: GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(NOW),
+                },
+                organisation: Nullable::null(),
+            },
+            state: GrantState::Active,
+            revoked_at_ms: Nullable::null(),
+            revoked_by_parent: Nullable::null(),
+            ends_at_ms: Nullable::some(TimestampMs::new(NOW)),
+        }
+    }
+
+    /// The text of the line `kr share list` prints for a share.
+    fn listed(rights: &[ActionRight]) -> String {
+        let devices = DeviceListResult {
+            devices: Vec::new(),
+            authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
+            feed_synchronised_at_ms: Nullable::null(),
+            feed_stale: false,
+            feed_removed: false,
+        };
+        list_line(&share_with(1, rights), &devices)
+            .text()
+            .to_owned()
+    }
+
+    /// KR-REQ-10.42: a share is listed by what it allows. A viewer who may answer the agent's
+    /// questions, and a grant a voice call holds, are not listed as a plain viewer: the role is the
+    /// widest one whose rights the share carries in full, and each right beyond it is named beside
+    /// it. A share that carries exactly a role's rights says only the role.
+    #[test]
+    fn a_share_is_listed_by_what_it_allows() {
+        let plain = listed(&[ActionRight::SessionView]);
+        assert!(plain.contains("viewer"), "{plain}");
+        assert!(!plain.contains("session.view"), "{plain}");
+
+        let answering = listed(&[ActionRight::SessionView, ActionRight::QuestionRespond]);
+        assert!(answering.contains("viewer"), "{answering}");
+        assert!(answering.contains("question.respond"), "{answering}");
+
+        let voice = listed(&[
+            ActionRight::AgentApprovalRespond,
+            ActionRight::AgentPrompt,
+            ActionRight::VoiceUse,
+        ]);
+        assert!(!voice.contains("viewer"), "{voice}");
+        for right in ["agent.approval.respond", "agent.prompt", "voice.use"] {
+            assert!(voice.contains(right), "{voice}");
+        }
+
+        let controller = listed(SessionRole::Controller.default_actions());
+        assert!(controller.contains("controller"), "{controller}");
+        for right in SessionRole::Controller.default_actions() {
+            assert!(!controller.contains(right.as_str()), "{controller}");
+        }
+    }
+
     /// The list document carries the device's own name only as asked-for text, and every other leaf
     /// as the protocol encodes it.
     #[test]

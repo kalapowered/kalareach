@@ -12,6 +12,7 @@
  */
 
 import type {
+  ActionRight,
   DeviceSummary,
   GrantCreateParams,
   GrantCreateResult,
@@ -73,6 +74,11 @@ export interface OfferSpec {
   /** The session's number on the host. */
   readonly session?: string
   readonly role?: RoleSelection['role']
+  /**
+   * The actions the share carries, where a test needs a set no role compiles to: a viewer who
+   * answers the agent's questions, or a grant a voice call holds. They replace the role's.
+   */
+  readonly actions?: readonly ActionRight[]
   /** Whether the live view of the screen is included. */
   readonly live?: boolean
   /** How long the invitation lasts from now, in milliseconds. */
@@ -374,7 +380,7 @@ export class ScriptedSharing implements FakeSharing {
       include_question_respond: false,
       history_from_cursor_ms: null
     } as unknown as RoleSelection
-    const actions = actionsOf(selection)
+    const actions = spec.actions === undefined ? actionsOf(selection) : [...spec.actions]
     const offer: ShareOffer = {
       actions,
       display_number: spec.session ?? '3',
