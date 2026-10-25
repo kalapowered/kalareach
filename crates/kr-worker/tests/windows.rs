@@ -345,6 +345,87 @@ fn the_session_job_kills_on_close_and_refuses_breakaway() {
     shell.wait().expect("the shell ends");
 }
 
+/// The identifiers of the processes attached to the console the caller runs in, as a PowerShell
+/// function: sorted and comma-separated, as `Get-KrConsole`.
+const CONSOLE_LIST: &str = "\
+    Add-Type -Namespace Kr -Name Console -MemberDefinition \
+        '[DllImport(\"kernel32.dll\")] public static extern uint GetConsoleProcessList(uint[] list, uint count);'; \
+    function Get-KrConsole { \
+        $list = New-Object 'uint32[]' 64; \
+        $count = [Kr.Console]::GetConsoleProcessList($list, 64); \
+        (($list | Select-Object -First $count | Sort-Object) -join ',') \
+    }; ";
+
+/// Reads the comma-separated identifiers that follow `label` in `seen`, up to the next full stop.
+fn listed_after(seen: &str, label: &str) -> Vec<u32> {
+    let rest = seen
+        .split(label)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the shell printed {label}: {seen:?}"));
+    rest.split('.')
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(|digits| {
+            digits
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("an identifier after {label}: {seen:?}"))
+        })
+        .collect()
+}
+
+/// KR-REQ-07.46: a new shell owns its terminal before it starts a child. The shell is made
+/// suspended inside the console and the session's job, so the first thing it reads of its console
+/// is a console with no process in it but itself, and the job holds it alone; the first program it
+/// then starts is attached to that same console and held by that same job.
+#[test]
+fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
+    let (pty, mut reader, mut shell) = powershell_in_a_console(&format!(
+        "{CONSOLE_LIST}\
+         Write-Host -NoNewline \"kr-first=$(Get-KrConsole).kr-first-end\"; \
+         $child = Start-Process -PassThru -NoNewWindow -FilePath \"$env:SystemRoot/System32/PING.EXE\" \
+             -ArgumentList '-n','120','127.0.0.1'; \
+         $deadline = (Get-Date).AddSeconds(30); \
+         while (((Get-KrConsole) -split ',') -notcontains \"$($child.Id)\" -and (Get-Date) -lt $deadline) \
+             {{ Start-Sleep -Milliseconds 50 }}; \
+         Write-Host -NoNewline \"kr-second=$(Get-KrConsole).kr-child=$($child.Id).kr-second-end\"; \
+         Start-Sleep -Seconds 120"
+    ));
+    let root = u32::try_from(shell.identity().pid.get()).expect("an identifier");
+    let job = kr_worker::windows::job::holding(root).expect("the session's job");
+
+    // Before the shell has started anything: its console holds the shell alone, and so does the
+    // job, so nothing ran in this terminal or outside this boundary first.
+    let first = read_until(&pty, &mut reader, "kr-first-end");
+    assert_eq!(
+        listed_after(&first, "kr-first="),
+        vec![root],
+        "the console holds the root shell and nothing else before it starts a child: {first:?}"
+    );
+
+    // After it has started one: the same console holds both, and so does the same job.
+    let second = read_until(&pty, &mut reader, "kr-second-end");
+    let child = named_child(&second);
+    let attached = listed_after(&second, "kr-second=");
+    assert!(
+        attached.contains(&root) && attached.contains(&child),
+        "the first child is attached to the root shell's console: {attached:?}"
+    );
+    let held = job.process_ids().expect("the job's process list");
+    assert!(
+        held.contains(&root) && held.contains(&child),
+        "and held by the session's job: {held:?}"
+    );
+
+    // Ending the job ends the shell and the program it started with it.
+    kr_worker::ownership::force_stop(&OwnedProcesses::establish(
+        boundary_for(shell.foreground_group(), shell.identity()),
+        shell.identity().clone(),
+    ));
+    shell.wait().expect("the shell ends");
+}
+
 /// KR-REQ-07.56: a process that detaches itself from its parent as far as Windows allows is still
 /// held by the session's job, so it cannot outlive the session by leaving its parent chain.
 ///
