@@ -1397,6 +1397,55 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-24.24: the history keeps a bounded text for each entry, so the entries it retains are
+/// bounded in bytes by their number. An entry whose text is longer is kept cut at a character
+/// boundary and says how many bytes it left out, so a cut text is never read as the whole of what
+/// was said.
+#[test]
+fn kr_req_24_24_the_text_of_a_retained_entry_is_bounded_and_says_what_it_left_out() {
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(instance(), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
+    // Multi-byte text, so the cut has a character boundary to respect.
+    let said = "ab\u{e9}".repeat(400_000);
+    broker
+        .observe(instance(), "message", &said, TimestampMs::new(1))
+        .expect("observed");
+    broker
+        .observe(instance(), "message", "short", TimestampMs::new(2))
+        .expect("observed");
+    let replay = broker
+        .replay(
+            instance(),
+            None,
+            &GrantLowerBound {
+                from: StreamCursor::new(1),
+            },
+            MAX_SEMANTIC_SNAPSHOT_BYTES,
+        )
+        .expect("the replay succeeds");
+    let [long, short] = replay.entries.as_slice() else {
+        panic!("two entries were observed: {:?}", replay.entries.len());
+    };
+    assert!(
+        long.text.len() <= 4096,
+        "the retained text is {} bytes",
+        long.text.len()
+    );
+    assert!(
+        said.starts_with(&long.text),
+        "what is kept is the start of it"
+    );
+    assert_eq!(
+        long.omitted_text_bytes.get(),
+        (said.len() - long.text.len()) as u64,
+        "the entry says how much it left out"
+    );
+    assert_eq!(short.text, "short");
+    assert_eq!(short.omitted_text_bytes.get(), 0);
+}
+
 /// KR-REQ-11.22 and KR-REQ-12.06: one broker admission carries every check a mutation depends on,
 /// so nothing it checked can move before the answer is transmitted.
 ///
