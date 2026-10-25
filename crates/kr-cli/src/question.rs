@@ -1476,45 +1476,75 @@ async fn locate(
     build_id: BuildId,
 ) -> Result<(WorkerDescriptor, Question, LocalClient)> {
     let mut unread = Vec::new();
+    // The first worker that could not say whether it holds the question, with its display number.
+    // A question that no worker lists is unknown only if every worker was asked: one that could
+    // not be asked may hold it.
+    let mut unasked: Option<(u64, CliError)> = None;
     for descriptor in descriptors(paths, &Scope::Everything)? {
-        let Ok(mut client) = open_worker(&descriptor, build_id.clone()).await else {
-            continue;
+        let display = descriptor.display_number.get();
+        let mut client = match open_worker(&descriptor, build_id.clone()).await {
+            Ok(client) => client,
+            Err(error) => {
+                unasked.get_or_insert((display, error));
+                continue;
+            }
         };
         if let Some(other) = Other::of(client.acknowledgement().build.as_ref()) {
-            unread.push(Unread {
-                display: descriptor.display_number.get(),
-                other,
-            });
+            unread.push(Unread { display, other });
             continue;
         }
+        // The worker's questions, not the one by name: a refusal of the named read cannot be told
+        // from a worker that lacks the question, and of the list it is a refusal to show them.
         let outcome: Result<QuestionReadResult> = read(
             &mut client,
             &QuestionReadParams {
                 session_id: descriptor.session_id,
-                question_id: Nullable::some(question_id),
+                question_id: Nullable::null(),
                 include_resolved: true,
             },
         )
         .await;
-        if let Ok(result) = outcome
-            && let Some(question) = result.questions.into_iter().next()
-        {
-            return Ok((descriptor, question, client));
+        match outcome {
+            Ok(result) => {
+                if let Some(question) = result
+                    .questions
+                    .into_iter()
+                    .find(|question| question.question_id == question_id)
+                {
+                    return Ok((descriptor, question, client));
+                }
+            }
+            Err(error) => {
+                unasked.get_or_insert((display, error));
+            }
         }
     }
     if unread.is_empty() {
+        if let Some((_, error)) = unasked {
+            return Err(error);
+        }
         return Err(CliError::Usage(shown!(
             "no session on this host has question {}",
             question_id
         )));
     }
     let notes = unread.iter().map(|worker| worker.said("question"));
+    // A worker that could not be asked is named beside the ones another release runs, so that the
+    // person is not told the question is in the latter alone.
+    let unasked = unasked.map(|(display, error)| {
+        let why = match &error {
+            CliError::Refused(refusal) => Shown::protocol(refusal),
+            other => other.said(),
+        };
+        shown!(". Session {} could not be asked either: {}", display, why)
+    });
     Err(CliError::Refused(kr_client::error::refusal(
         ErrorCode::UnsupportedSchema,
         shown!(
-            "no session this kr reads has question {}, and nothing was sent. {}",
+            "no session this kr reads has question {}, and nothing was sent. {}{}",
             question_id,
-            Shown::joined(notes, " ")
+            Shown::joined(notes, " "),
+            unasked.unwrap_or_else(|| Shown::said(""))
         ),
     )))
 }
