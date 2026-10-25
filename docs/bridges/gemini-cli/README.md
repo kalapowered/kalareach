@@ -52,7 +52,11 @@ hooks file has been changed and persists, its hooks will be loaded. In this way,
 can remain active. The host also removes the directories the installation created once they are
 empty. This is done because an empty `extensions/kalareach/` is a directory with no record: under an
 allow list Gemini CLI refuses to start, and without one it prints a warning every time it starts. A
-recipe whose removal does not end with the record is refused.
+directory the installation created that something else holds, as `hooks/` does while a changed
+hooks file is in it, stays recorded, so that the next reconciliation takes it, and the record with
+it, once that is gone. While the removal waits, the package is not applied again, a later release
+of it included, and the doctor names what holds it. A recipe whose removal does not end with the
+record is refused.
 
 The core repository keeps a copy of all three files in `fixtures/bridges/gemini-cli/`, pinned by the
 SHA-256 digests the package's recipe records, and `crates/kr-hook/tests/fixtures.rs` checks that
