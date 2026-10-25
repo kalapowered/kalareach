@@ -4849,6 +4849,7 @@ pub(crate) mod tests {
         let held = HeldBack::default();
         let readable = Readable {
             path: world.temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
         };
         let seconds = |seconds: u64| seconds * 1_000;
 
@@ -4911,6 +4912,13 @@ pub(crate) mod tests {
             Box::pin(async { false })
         }
 
+        fn cleanup_owed<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
         fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
             self.module.lift_the_wait(session_id);
             ClosedJournal::HeldBack
@@ -4932,6 +4940,7 @@ pub(crate) mod tests {
         };
         let readable = Readable {
             path: temp.environment().state_dir().join("closed.sqlite3"),
+            owed: false,
         };
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let seconds = |seconds: u64| seconds * 1_000;
@@ -5008,6 +5017,13 @@ pub(crate) mod tests {
         }
 
         fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn cleanup_owed<'a>(
             &'a self,
             _session_id: SessionId,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
