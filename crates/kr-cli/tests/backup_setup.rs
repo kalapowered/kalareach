@@ -38,7 +38,7 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration, BuildId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
-use kr_service_stand_in::{Moment, Served, TOKEN, serve};
+use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
 use serde_json::Value;
 
 mod support;
@@ -115,6 +115,7 @@ impl AccountService for NeverAsked {
 struct Rig {
     temp: kr_ipc::testing::TempHost,
     served: Arc<Served>,
+    timer: Arc<HeldTimer>,
     endpoint: Endpoint,
     controller: Arc<Controller>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
@@ -199,6 +200,7 @@ impl Rig {
         Self {
             temp,
             served,
+            timer,
             endpoint,
             controller,
             serving,
@@ -237,10 +239,16 @@ impl Rig {
     /// Runs `kr` with `line` and waits for it. Its standard input is empty and its output is a
     /// pipe, so it is not at a terminal.
     fn run(&self, line: &[&str]) -> std::process::Output {
+        self.run_with(line, &[])
+    }
+
+    /// As [`Self::run`], with more variables in the command's environment.
+    fn run_with(&self, line: &[&str], more: &[(&str, &str)]) -> std::process::Output {
         std::process::Command::new(kr())
             .args(line)
             .env_clear()
             .envs(self.variables())
+            .envs(more.iter().copied())
             .current_dir(&self.work)
             .stdin(std::process::Stdio::null())
             .output()
@@ -312,9 +320,14 @@ impl Rig {
 }
 
 fn write_document(host: &kr_ipc::testing::TempHost, origin: &str) {
+    write_document_at(host, origin, 1);
+}
+
+/// As [`write_document`], at the revision named: a document changed in place is a changed backup.
+fn write_document_at(host: &kr_ipc::testing::TempHost, origin: &str, revision: u64) {
     let environment = host.environment();
     let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
-    document.revision = 1;
+    document.revision = revision;
     document.storage.origin = Nullable::some(origin.to_owned());
     let path = kr_worker::config::document_path(&environment);
     std::fs::create_dir_all(path.parent().expect("a state directory")).expect("the directory");
@@ -1333,6 +1346,172 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
         "{}",
         text(&carried)
     );
+}
+
+/// KR-ACC-033 and KR-REQ-24.29, end to end through the real `kr`: privacy mode lists the retained
+/// archives with a deletion, `kr privacy delete` asks the service to delete one while privacy mode
+/// is on, and a fresh host with nothing but the kit restores what is left and not what was deleted.
+///
+/// A set up host makes two generations. With privacy mode on, the older is deleted at a terminal
+/// and the newest through `--yes`; a reference the list does not hold and a command inside a session
+/// delete nothing, and another collection of the account is untouched. A fresh host, whose own
+/// privacy mode is off, restores the newest generation after the older was deleted (the control)
+/// and cannot restore once the newest is deleted too, and writes nothing. Turning privacy mode off
+/// makes the next backup, which the fresh host restores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_longer_restore() {
+    // The host's backups hold its configuration, which is all this case needs them to hold.
+    let rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    window.wait_for("kr ended 0");
+    let BackupSetupState::Committed { archive_id, .. } = rig.status().await.setup else {
+        panic!("the host is set up");
+    };
+    rig.until_published(archive_id, 1).await;
+
+    // A day later, with the configuration changed, the host makes a second generation.
+    rig.timer.advance_day(Duration::from_secs(25 * 3600));
+    write_document_at(&rig.temp, rig.origin(), 2);
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until_published(archive_id, 2).await;
+
+    // Another collection of the account, which no deletion of this host's may touch.
+    let other = ArchiveId::new(kr_ipc::new_uuid());
+    let other_object = kr_protocol::ids::BackupObjectId::new(kr_ipc::new_uuid());
+    rig.served.web().put_object(
+        &other.to_string(),
+        &other_object.to_string(),
+        ACCOUNT,
+        vec![7; 64],
+    );
+
+    let objects_of = |generation: u64| -> Vec<kr_protocol::ids::BackupObjectId> {
+        rig.controller
+            .backup()
+            .objects(archive_id, BackupGeneration::new(generation))
+            .expect("the store reads")
+            .iter()
+            .map(|object| object.object_id)
+            .collect()
+    };
+    let held = |object: kr_protocol::ids::BackupObjectId| {
+        rig.served
+            .web()
+            .stored(&archive_id.to_string(), &object.to_string())
+            .is_some()
+    };
+    let first = format!("{archive_id} generation 1");
+    let second = format!("{archive_id} generation 2");
+    assert!(!objects_of(1).is_empty() && !objects_of(2).is_empty());
+
+    // Privacy mode on: both archives are listed with the command that deletes them.
+    let on = rig.run(&["privacy", "on"]);
+    assert!(
+        on.status.success(),
+        "{}{}",
+        text(&on.stdout),
+        text(&on.stderr)
+    );
+    let listed = rig.run(&["privacy", "status"]);
+    let shown = text(&listed.stdout);
+    for reference in [&first, &second] {
+        let line = shown
+            .lines()
+            .find(|line| line.contains(reference.as_str()))
+            .unwrap_or_else(|| panic!("{reference} is listed: {shown}"));
+        assert!(line.contains("kr privacy delete"), "{line}");
+    }
+
+    // Nothing is deleted by a reference the list does not hold, or from inside a session, or
+    // without a terminal to confirm at.
+    let unknown = rig.run(&[
+        "privacy",
+        "delete",
+        "--yes",
+        &format!("{archive_id} generation 9"),
+    ]);
+    assert!(!unknown.status.success());
+    let inside = rig.run_with(
+        &["privacy", "delete", "--yes", &first],
+        &[("KR_SESSION", "1")],
+    );
+    assert!(!inside.status.success());
+    let unconfirmed = rig.run(&["privacy", "delete", &first]);
+    assert!(!unconfirmed.status.success());
+    assert_eq!(rig.requests_to("/api/storage/object/delete"), 0);
+    for generation in [1, 2] {
+        assert!(objects_of(generation).into_iter().all(held));
+    }
+
+    // The older generation is deleted at a terminal, by typing the word.
+    let mut deleting = Window::run(&rig, &["privacy", "delete", &first]);
+    deleting.wait_for("Type delete");
+    deleting.type_line("delete");
+    deleting.wait_for("kr ended 0");
+    assert!(objects_of(1).into_iter().all(|object| !held(object)));
+    assert!(objects_of(2).into_iter().all(held));
+    assert!(
+        rig.served
+            .web()
+            .stored(&other.to_string(), &other_object.to_string())
+            .is_some(),
+        "another collection of the account is untouched"
+    );
+
+    // A fresh host with nothing but the kit restores the newest generation, which is intact.
+    let fresh = Rig::start_at(Arc::clone(&rig.served), |_| {}).await;
+    let kit_file = fresh.work.join("kit.txt");
+    std::fs::write(&kit_file, &kit.text).expect("the kit file");
+    let kit_arg = kit_file.display().to_string();
+    let restore = |into: &Path, more: &[&str]| {
+        let into_arg = into.display().to_string();
+        let mut line = vec![
+            "backup",
+            "restore",
+            "--into",
+            &into_arg,
+            "--kit-file",
+            &kit_arg,
+        ];
+        line.extend_from_slice(more);
+        fresh.run(&line)
+    };
+    let restored_into = fresh.work.join("restored");
+    std::fs::create_dir(&restored_into).expect("a folder to fill");
+    let preview = restore(&restored_into, &["--preview", "--json"]);
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    let digest = plan["digest"].as_str().expect("a digest").to_owned();
+    let restored = restore(&restored_into, &["--confirm-plan", &digest, "--json"]);
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    assert!(!tree(&restored_into).is_empty());
+
+    // The newest is deleted too, without a terminal. The fresh host cannot restore it, and writes
+    // nothing.
+    let deleted = rig.run(&["privacy", "delete", "--yes", &second]);
+    assert!(deleted.status.success(), "{}", text(&deleted.stderr));
+    assert!(objects_of(2).into_iter().all(|object| !held(object)));
+    let refused_into = fresh.work.join("refused");
+    std::fs::create_dir(&refused_into).expect("a folder to fill");
+    let refused = restore(&refused_into, &["--preview", "--json"]);
+    assert!(!refused.status.success(), "{}", text(&refused.stdout));
+    assert!(tree(&refused_into).is_empty());
+
+    // Privacy mode off: the host makes its next backup, and the fresh host restores it.
+    let off = rig.run(&["privacy", "off"]);
+    assert!(off.status.success(), "{}", text(&off.stderr));
+    rig.until_published(archive_id, 3).await;
+    let again_into = fresh.work.join("again");
+    std::fs::create_dir(&again_into).expect("a folder to fill");
+    let preview = restore(&again_into, &["--preview", "--json"]);
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    let digest = plan["digest"].as_str().expect("a digest").to_owned();
+    let restored = restore(&again_into, &["--confirm-plan", &digest, "--json"]);
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    assert!(!tree(&again_into).is_empty());
 }
 
 /// The convention's sizes, at their real values: the producer packs sessions up to the total a
