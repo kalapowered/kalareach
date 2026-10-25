@@ -62,6 +62,7 @@ use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::session::SessionState;
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::requests::LaunchTransactionId;
+use kr_term::win32::{Fidelity, KeyRecord, Keyboard, Refused};
 
 use crate::error::{Result, WorkerError};
 use crate::fence::{Effects, FenceDriver, FenceFrame, Outbound, Step, TakeoverReceipt};
@@ -333,6 +334,41 @@ impl WriterHandles {
     }
 }
 
+/// What spelling the console's key records take for this session's terminal.
+///
+/// The session publishes it after each batch of the application's output, in the place it tells the
+/// recogniser about bracketed paste, because the canonical parser is the only thing that knows what
+/// the application and the backend asked for. A write is spelled under the lock that accepts it, so
+/// the choice and the write are one step: a write that follows output a person has seen is spelled
+/// under the state that output set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConsoleInput {
+    /// Whether the owned backend asked for key records, or never did.
+    pub fidelity: Fidelity,
+    /// What the legacy spelling has to honour: DEC mode 1, and the keyboard protocol negotiated.
+    pub keyboard: Keyboard,
+}
+
+impl ConsoleInput {
+    /// What a session that has not heard from its application is in: legacy input, in the ordinary
+    /// encoding.
+    pub(crate) const INITIAL: Self = Self {
+        fidelity: Fidelity::LegacyVt,
+        keyboard: Keyboard {
+            application_cursor_keys: false,
+            negotiated: kr_term::modes::KeyboardEncoding::Legacy,
+        },
+    };
+}
+
+/// What one write carries, before it is bytes.
+pub(crate) enum Entering<'a> {
+    /// Bytes a client spelled, which are forwarded unchanged.
+    Bytes(&'a [u8]),
+    /// Key records, which the domain spells for the terminal under the lock that accepts the write.
+    Keys(&'a [KeyRecord]),
+}
+
 /// Everything a keystroke and the recogniser's timer touch.
 #[derive(Debug)]
 pub struct InputDomain {
@@ -343,6 +379,8 @@ pub struct InputDomain {
     session_id: SessionId,
     lease: InputLease,
     framer: PasteFramer,
+    /// What the console's key records are spelled as, published by the session.
+    console: ConsoleInput,
     /// What a lease that ended without anybody asking left behind, waiting to be reported.
     ///
     /// A takeover reports what the lease it displaced lost, in its own answer. A lease the host
@@ -441,6 +479,17 @@ fn unauthenticated() -> WorkerError {
     }
 }
 
+/// The refusal a lease gives a write, as the worker reports it.
+fn lease_refusal(checked: std::result::Result<(), LeaseRefusal>) -> Result<()> {
+    match checked {
+        Ok(()) => Ok(()),
+        Err(LeaseRefusal::LeaseLost) => Err(WorkerError::LeaseLost),
+        Err(LeaseRefusal::OutOfOrder { expected, received }) => Err(WorkerError::InvalidArgument(
+            format!("input sequence {received} does not follow {expected}"),
+        )),
+    }
+}
+
 impl InputDomain {
     /// Creates the domain of a session that has not started its shell.
     pub(crate) fn new(session_id: SessionId) -> Self {
@@ -449,6 +498,7 @@ impl InputDomain {
             session_id,
             lease: InputLease::new(),
             framer: PasteFramer::new(),
+            console: ConsoleInput::INITIAL,
             interrupted: Interrupted::default(),
             held_input_deadline: None,
             held_input_utc_deadline: None,
@@ -1026,6 +1076,29 @@ impl InputDomain {
             .is_none_or(|driver| driver.phase().accepts_external_input())
     }
 
+    /// Spells key records as the terminal asks for them, within the bound on one write.
+    fn spell(&self, keys: &[KeyRecord]) -> Result<Vec<u8>> {
+        let limit = kr_protocol::limits::MAX_INPUT_FRAME_LEN;
+        let spelled = match self.console.fidelity {
+            Fidelity::Records => kr_term::win32::records_within(keys, limit)
+                .map_err(|kr_term::win32::TooLong| Refused::TooLong),
+            Fidelity::LegacyVt => {
+                kr_term::win32::legacy_within(keys, &self.console.keyboard, limit)
+            }
+        };
+        spelled.map_err(|refusal| match refusal {
+            Refused::TooLong => {
+                WorkerError::InvalidArgument(format!("an input batch is at most {limit} bytes"))
+            }
+            Refused::Enhanced(negotiated) => WorkerError::InputIncompatible {
+                required: crate::projection::describe_keyboard(negotiated),
+                offered: "console key records, which this worker can only spell in the ordinary \
+                          terminal encoding"
+                    .to_owned(),
+            },
+        })
+    }
+
     /// Accepts ordered input for the pseudo-terminal.
     ///
     /// The bytes are forwarded unchanged. Nothing here decodes, re-encodes or normalises them; the
@@ -1044,6 +1117,38 @@ impl InputDomain {
         authority: InputAuthority,
         now: Instant,
     ) -> Result<Accepted> {
+        self.accept_entering(
+            attachment_id,
+            epoch,
+            sequence,
+            Entering::Bytes(bytes),
+            authority,
+            now,
+        )
+    }
+
+    /// Accepts ordered input that is either bytes or key records.
+    ///
+    /// Key records are spelled here, under the lock that accepts them, as the session's terminal
+    /// asks for them, and what comes out is handed on exactly as bytes are. The lease and the
+    /// sequence are checked first and the spelling second, and both come before the write takes its
+    /// sequence number, so a write refused for being too long, or for an encoding that key records
+    /// cannot express, takes no number and the same one is accepted again.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::accept`] returns, [`WorkerError::InvalidArgument`] when the spelling is
+    /// longer than one input frame may carry, and [`WorkerError::InputIncompatible`] while the
+    /// application has negotiated an encoding that legacy input cannot express.
+    pub(crate) fn accept_entering(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        sequence: u64,
+        entering: Entering<'_>,
+        authority: InputAuthority,
+        now: Instant,
+    ) -> Result<Accepted> {
         let authority_deadline_boot_ms = authority.boot_ms;
         if !self.state.accepts_input() {
             return Err(WorkerError::SessionClosed);
@@ -1057,15 +1162,16 @@ impl InputDomain {
                     .to_owned(),
             });
         }
-        match self.lease.accept_write(attachment_id, epoch, sequence) {
-            Ok(()) => {}
-            Err(LeaseRefusal::LeaseLost) => return Err(WorkerError::LeaseLost),
-            Err(LeaseRefusal::OutOfOrder { expected, received }) => {
-                return Err(WorkerError::InvalidArgument(format!(
-                    "input sequence {received} does not follow {expected}"
-                )));
+        let spelled;
+        let bytes: &[u8] = match entering {
+            Entering::Bytes(bytes) => bytes,
+            Entering::Keys(keys) => {
+                lease_refusal(self.lease.check_write(attachment_id, epoch, sequence))?;
+                spelled = self.spell(keys)?;
+                &spelled
             }
-        }
+        };
+        lease_refusal(self.lease.accept_write(attachment_id, epoch, sequence))?;
         // The budget is checked before the recogniser is fed, so a refused frame leaves the
         // framing exactly as it was: what is refused is the whole frame, not part of it. A push
         // can also release a prefix it was holding, which is at most one delimiter short of a
@@ -1241,6 +1347,11 @@ impl InputDomain {
     pub(crate) fn set_bracketed_paste(&mut self, enabled: bool) -> (Vec<Step>, bool) {
         let released = self.framer.set_bracketed_paste(enabled);
         self.release_prefix(released)
+    }
+
+    /// Records what the console's key records are spelled as from now on.
+    pub(crate) fn set_console_input(&mut self, console: ConsoleInput) {
+        self.console = console;
     }
 
     /// Queues bytes the recogniser has stopped holding, under the lease that sent them.

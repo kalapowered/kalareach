@@ -605,6 +605,22 @@ impl InputLease {
         epoch: u64,
         sequence: u64,
     ) -> Result<(), LeaseRefusal> {
+        self.check_write(attachment_id, epoch, sequence)?;
+        self.next_sequence += 1;
+        Ok(())
+    }
+
+    /// Checks a write against the lease and its ordered stream, and takes no sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::accept_write`] returns.
+    pub fn check_write(
+        &self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<(), LeaseRefusal> {
         if self.holder != Some(attachment_id) || self.epoch != epoch {
             return Err(LeaseRefusal::LeaseLost);
         }
@@ -614,7 +630,6 @@ impl InputLease {
                 received: sequence,
             });
         }
-        self.next_sequence += 1;
         Ok(())
     }
 
