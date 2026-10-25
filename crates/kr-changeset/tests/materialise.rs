@@ -1621,3 +1621,58 @@ fn a_materialisation_under_a_chosen_identifier_is_found_again_from_it() {
     materialise::discard_unrecorded(fixture.service(), orphan).expect("left alone");
     assert!(beside.join("not ours").exists());
 }
+
+/// A version derived from a changed materialisation is recorded like a capture: the host is told,
+/// and it is the newest version of its change set, for the session the version it came from was
+/// recorded for.
+#[test]
+fn a_derived_version_is_told_to_the_host_and_is_the_newest_of_its_change_set() {
+    let fixture = Fixture::create();
+    ordinary_repository(fixture.work(), "derived-head");
+    let workspace = fixture.workspace("derived-head");
+    let session = kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+    let record = fixture.capture_for(workspace, None, Some(session));
+    let told = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    fixture.service().on_version_recorded({
+        let told = std::sync::Arc::clone(&told);
+        move || {
+            told.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let made = materialise::materialise(
+        fixture.service(),
+        reference(&record),
+        MaterialisationPurpose::Test,
+        "the test copy",
+        None,
+    )
+    .expect("the version is materialised");
+    std::fs::write(
+        Path::new(&made.directory_path).join("src/lib.rs"),
+        b"pub fn answer() -> u32 { 43 }\n",
+    )
+    .expect("the run edits its copy");
+    let result = record_a_run(
+        &fixture,
+        made.materialisation_id,
+        &report(),
+        &materialise::Outputs::none(),
+    )
+    .expect("the result is recorded");
+    let Nullable(Some(derived)) = result.derived_output_version else {
+        panic!("a changed materialisation records the version the directory held");
+    };
+
+    assert_eq!(told.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let heads = fixture
+        .service()
+        .newest_versions_after(&std::collections::BTreeMap::from([(
+            record.change_set_id,
+            record.version,
+        )]))
+        .expect("the store reads");
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].change_set_id, derived.change_set_id);
+    assert_eq!(heads[0].version, derived.version);
+    assert_eq!(heads[0].session_id, Some(session));
+}

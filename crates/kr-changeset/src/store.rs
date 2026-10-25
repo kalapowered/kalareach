@@ -767,6 +767,60 @@ impl Store {
             .transpose()
     }
 
+    /// Returns the highest version number each change set has, without reading any record or
+    /// manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails or a stored identifier is
+    /// not one.
+    pub fn newest_versions(&self) -> Result<Vec<(ChangeSetId, ChangeSetVersion)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT change_set_id, MAX(version) FROM versions GROUP BY change_set_id")
+            .map_err(ChangeSetError::store)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    ChangeSetId::new(uuid_column(row, 0)?),
+                    version_of(row.get::<_, i64>(1)?, 1)?,
+                ))
+            })
+            .map_err(ChangeSetError::store)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ChangeSetError::store)
+    }
+
+    /// Returns one version's record as canonical bytes and the moment it was captured, without
+    /// reading its manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn version_record(
+        &self,
+        change_set_id: ChangeSetId,
+        version: ChangeSetVersion,
+    ) -> Result<Option<(Vec<u8>, TimestampMs)>> {
+        self.connection
+            .query_row(
+                "SELECT record, captured_at_ms FROM versions
+                   WHERE change_set_id = ?1 AND version = ?2",
+                params![
+                    uuid_bytes(change_set_id.get()),
+                    i64::try_from(version.get()).map_err(ChangeSetError::store)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        TimestampMs::new(row.get::<_, i64>(1)? as u64),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ChangeSetError::store)
+    }
+
     /// Takes the next version number one change set hands out, and moves it on.
     ///
     /// Durable and monotonic: the number is written before the version that uses it exists, so a

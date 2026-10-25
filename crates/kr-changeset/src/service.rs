@@ -17,8 +17,9 @@
 //!         └─▶ diff.read         └─▶ diff.apply / diff.revert ─▶ one of five outcomes
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_project::store::RetainedRow;
@@ -28,7 +29,7 @@ use kr_protocol::changeset::{
     MAX_CHANGESET_ENTRIES, Provenance, SourceConsistency, VersionRef,
 };
 use kr_protocol::ids::{
-    ChangeSetId, ChangeSetVersion, EnvironmentId, ProjectRepositoryId, WorkspaceId,
+    ChangeSetId, ChangeSetVersion, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
 };
 use kr_protocol::project::{
     FilesystemIdentity, IsolationMechanism, RetainedKind, WorkspaceReadParams, WorkspaceSummary,
@@ -138,6 +139,32 @@ pub struct Recovery {
     pub staged_left: u64,
 }
 
+/// The newest version one change set holds, and the session it was recorded for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersionHead {
+    /// The change set.
+    pub change_set_id: ChangeSetId,
+    /// Its newest version.
+    pub version: ChangeSetVersion,
+    /// When that version was recorded.
+    pub captured_at_ms: TimestampMs,
+    /// The session it was recorded for, when it was recorded for one.
+    pub session_id: Option<SessionId>,
+}
+
+/// What the host asked to be told each time a version is recorded.
+#[derive(Default)]
+struct VersionHook(OnceLock<Box<dyn Fn() + Send + Sync>>);
+
+impl std::fmt::Debug for VersionHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VersionHook")
+            .field("set", &self.0.get().is_some())
+            .finish()
+    }
+}
+
 /// The change-set service of one environment.
 #[derive(Debug)]
 pub struct ChangeSetService {
@@ -146,6 +173,7 @@ pub struct ChangeSetService {
     store: Mutex<Store>,
     objects: ObjectStore,
     root: AuthorisedDirectory,
+    version_hook: VersionHook,
     /// Runs immediately after one apply has written this many paths, so a test can stop an apply
     /// where a crash would stop it. Nothing in production sets it.
     #[cfg(feature = "fault-injection")]
@@ -176,6 +204,7 @@ impl ChangeSetService {
             store: Mutex::new(store),
             objects,
             root,
+            version_hook: VersionHook::default(),
             #[cfg(feature = "fault-injection")]
             fault: Mutex::new(None),
         })
@@ -209,6 +238,71 @@ impl ChangeSetService {
     #[must_use]
     pub const fn environment_id(&self) -> EnvironmentId {
         self.environment_id
+    }
+
+    /// Has `hook` run each time a version has been recorded, for a capture and for a version this
+    /// service derives, and once for a version whose pin then failed.
+    ///
+    /// It runs on the thread that recorded the version, after the store's transaction committed and
+    /// its lock was let go of, so it must not wait for anything. Only the first hook set is kept.
+    pub fn on_version_recorded(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.version_hook.0.set(Box::new(hook));
+    }
+
+    fn version_recorded(&self) {
+        if let Some(hook) = self.version_hook.0.get() {
+            hook();
+        }
+    }
+
+    /// Returns the newest version of each change set whose newest version is above what `seen`
+    /// holds for it, with the session that version was recorded for.
+    ///
+    /// Only the newest record of such a change set is decoded and no manifest is read, so asking
+    /// again after nothing was recorded costs one pass over the version numbers. A change set whose
+    /// newest version was deleted answers with the newest it still holds, and a version deleted
+    /// between the two reads is left for the next call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the store cannot be read.
+    pub fn newest_versions_after(
+        &self,
+        seen: &BTreeMap<ChangeSetId, ChangeSetVersion>,
+    ) -> Result<Vec<VersionHead>> {
+        let records = {
+            let store = self.locked()?;
+            let mut records = Vec::new();
+            for (change_set_id, version) in store.newest_versions()? {
+                if seen
+                    .get(&change_set_id)
+                    .is_some_and(|held| *held >= version)
+                {
+                    continue;
+                }
+                if let Some((record, captured_at_ms)) =
+                    store.version_record(change_set_id, version)?
+                {
+                    records.push((change_set_id, version, captured_at_ms, record));
+                }
+            }
+            records
+        };
+        Ok(records
+            .into_iter()
+            .map(
+                |(change_set_id, version, captured_at_ms, record)| VersionHead {
+                    change_set_id,
+                    version,
+                    captured_at_ms,
+                    // A record that does not decode names no session, so one damaged version leaves
+                    // every other change set's review work alone.
+                    session_id: decode_stored::<ChangeSetVersionRecord>(&record)
+                        .ok()
+                        .and_then(|record| record.provenance.session_id.0),
+                },
+            )
+            .collect())
     }
 
     /// Returns the project service every repository read goes through.
@@ -589,6 +683,7 @@ impl ChangeSetService {
             &captured.objects,
             order.admitted,
         )?;
+        self.version_recorded();
         let mut pinned = false;
         if order.pin {
             // The pin goes through the project service, so a workspace removal accounts for it
@@ -909,6 +1004,7 @@ impl ChangeSetService {
             &objects,
             admitted,
         )?;
+        self.version_recorded();
         Ok(record)
     }
 }
