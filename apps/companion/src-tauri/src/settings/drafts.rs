@@ -557,7 +557,7 @@ impl DraftsSync {
     /// Returns a local failure when a store cannot be read.
     pub fn kept_copies(&self) -> Result<Vec<(EnvironmentId, KeptCopy)>> {
         let mut found = Vec::new();
-        for directory in self.host_stores() {
+        for directory in self.listed_host_stores()? {
             let Some(environment) = directory
                 .parent()
                 .and_then(std::path::Path::file_name)
@@ -582,7 +582,7 @@ impl DraftsSync {
     /// Returns a local failure when a store cannot be read.
     pub fn unreadable_records(&self) -> Result<Vec<kr_client::sync::Exported>> {
         let mut found = Vec::new();
-        for directory in self.host_stores() {
+        for directory in self.listed_host_stores()? {
             let store = SyncStore::open(&directory).map_err(super::sync::sync_failure)?;
             found.extend(
                 kr_client::sync::unreadable_records(&store).map_err(super::sync::sync_failure)?,
@@ -1107,6 +1107,41 @@ impl DraftsSync {
             })
             .filter_map(|directory| environment_of(directory.parent()?.file_name()?.to_str()?))
             .collect()
+    }
+
+    /// The directory of every host's store there is on this computer, for a list of what left: a
+    /// directory or an entry that cannot be read is an error, and not a shorter list that would
+    /// read as complete.
+    fn listed_host_stores(&self) -> Result<Vec<PathBuf>> {
+        let unread = |what: &str, error: std::io::Error| {
+            CommandError::local_failure(format!(
+                "the drafts' stores could not be listed, {what}: {error}"
+            ))
+        };
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(unread("the directory", error)),
+        };
+        let mut stores = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| unread("an entry", error))?;
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| environment_of(name).is_some())
+            {
+                continue;
+            }
+            let path = entry.path().join(STORE);
+            match std::fs::metadata(&path) {
+                Ok(found) if found.is_dir() => stores.push(path),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(unread("a store", error)),
+            }
+        }
+        Ok(stores)
     }
 
     /// The directory of every host's store there is on this computer.

@@ -363,7 +363,8 @@ fn the_deletable_sync_copy(
     }
     if !copy.deletable {
         return Err(CommandError::refused(
-            "that copy is dropped while the sync that holds it is on",
+            "this computer cannot ask the sync service to drop that copy now: its sync is off, or \
+             the record of it cannot be read",
         ));
     }
     Ok(Some(copy))

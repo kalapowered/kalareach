@@ -986,16 +986,17 @@ impl SettingsSync {
                 "this computer lists no one copy kept by the sync service under that reference",
             ));
         };
+        let Some(copy) = wanted.copy else {
+            return Err(CommandError::refused(
+                "this computer cannot ask the sync service to drop that copy: the record of it \
+                 cannot be read",
+            ));
+        };
         if !wanted.deletable {
             return Err(CommandError::refused(
                 "that copy is dropped while the sync that holds it is on",
             ));
         }
-        let Some(copy) = wanted.copy else {
-            return Err(CommandError::refused(
-                "this computer cannot ask the service to drop that copy",
-            ));
-        };
         match wanted.place {
             Place::Settings => self.drop_settings_copy(copy).await,
             Place::Drafts(environment) => {

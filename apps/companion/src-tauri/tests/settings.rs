@@ -1901,6 +1901,21 @@ fn directories_holding(root: &std::path::Path, extension: &str) -> Vec<std::path
     found
 }
 
+/// The directories under `root` with this name.
+fn directories_named(root: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|each| each == name) {
+                found.push(path.clone());
+            }
+            found.extend(directories_named(&path, name));
+        }
+    }
+    found
+}
+
 /// KR-REQ-24.29: a record of the sync store that this build cannot read may account for a copy that
 /// left, so it is listed beside the copies, as one nothing can be asked of, and the copy the service
 /// kept is listed as before. The control is the list before the record is there.
@@ -1940,6 +1955,34 @@ async fn a_record_the_sync_store_cannot_read_is_listed_beside_the_copies() {
         .drop_sync_copy(unreadable["reference"].as_str().expect("a reference"))
         .await
         .expect_err("nothing can be asked of a record that cannot be read");
+}
+
+/// KR-REQ-24.29: the stores of the drafts that left are listed with the copies the service kept,
+/// and a directory that cannot be read fails the list. A shorter list would read as complete. The
+/// control is the same list before the directory is spoilt.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drafts_directory_that_cannot_be_read_fails_the_list_of_kept_copies() {
+    let computer = Computer::new().await;
+    let (page, _elsewhere) = waiting_for_a_choice(&computer).await;
+    assert_eq!(kept_by_the_service(&page).len(), 1, "the control");
+
+    let drafts = directories_named(computer.data.path(), "drafts");
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    // The directory can be entered and not listed, so what is in it is read by name and the stores
+    // it holds are not found.
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&drafts[0], std::fs::Permissions::from_mode(0o300))
+        .expect("the directory is made unlistable");
+    let listed = std::fs::read_dir(&drafts[0]).is_ok();
+    let answer = page.call("retained_sync_copies", json!({}));
+    std::fs::set_permissions(&drafts[0], std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is restored");
+    if listed {
+        // A process that is not held to the directory's mode (the superuser) lists it anyway.
+        return;
+    }
+    answer.expect_err("the stores cannot be listed, and no list is made of what could be read");
 }
 
 /// The person at the dialog, who says what they are made to say.
