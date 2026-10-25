@@ -1560,10 +1560,10 @@ impl PushDesk {
             }
             match (stop, step) {
                 (LineStop::Phone(words), _) => words.into(),
-                // The host took the registration, and it is the preview key that it did not take
-                // or did not answer: it holds this phone as a destination.
+                // The host took the registration, and it is the preview key that it refused or did
+                // not answer: it holds this phone as a destination, and the key may be there too.
                 (LineStop::Host(words), Step::PreviewKey) => format!(
-                    "The host took this phone as a destination, but did not take its preview \
+                    "The host took this phone as a destination, but did not confirm its preview \
                      key: {words}"
                 )
                 .into(),
