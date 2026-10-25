@@ -956,9 +956,9 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
 
     running.kill().expect("the program is ended");
     running.wait().expect("and gone");
-    let last = kr_ipc::install::remove_sealed_tree(&kept);
-    assert!(last.is_ok(), "removal after the program ended: {last:?}");
-    test.store.sweep_trash(&update).expect("sweeps");
+    test.store
+        .sweep_trash(&update)
+        .expect("a sweep after the program ended deletes the release and the junction");
     let result = (
         left(),
         std::fs::read(outside.join("kept")).ok(),
@@ -1022,6 +1022,64 @@ fn a_release_that_cannot_be_removed_for_no_program_s_sake_is_reported() {
     assert!(
         swept.is_err(),
         "nor does a sweep take it for one: {swept:?}"
+    );
+}
+
+/// KR-REQ-26.06: a file of a release that is a second name for a file outside, whose access list
+/// denies its owner the right to change attributes but is not the seal's, is not given back: the
+/// list of the file outside is as it was, the removal reports it, and the release stays in the trash.
+#[cfg(windows)]
+#[test]
+fn a_list_that_is_not_the_seal_s_is_left_as_it_is() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let program = test.install(&one);
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(&outside).expect("a directory elsewhere");
+    let shared = outside.join("shared");
+    std::fs::write(&shared, b"shared contents").expect("written");
+    std::fs::remove_file(&program).expect("the copy goes");
+    std::fs::hard_link(&shared, &program).expect("a hard link");
+    let mut permissions = std::fs::metadata(&shared).expect("there").permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&shared, permissions).expect("read-only");
+    let icacls = |arguments: &[&str]| {
+        let run = std::process::Command::new("icacls")
+            .arg(&shared)
+            .args(arguments)
+            .output()
+            .expect("icacls runs");
+        assert!(run.status.success(), "icacls {arguments:?}");
+        String::from_utf8_lossy(&run.stdout).into_owned()
+    };
+    icacls(&["/deny", "*S-1-1-0:(WA)"]);
+    let before = icacls(&[]);
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let answer = test.store.retire(&one, &update);
+    let after = icacls(&[]);
+
+    // Put it right, so that the test leaves nothing behind.
+    icacls(&["/remove:d", "*S-1-1-0"]);
+    let kept = std::fs::read_dir(test.store.trash())
+        .expect("reads the trash")
+        .flatten()
+        .next()
+        .expect("what could not be removed is in the trash")
+        .path();
+    kr_ipc::install::remove_sealed_tree(&kept).expect("the release goes once the list is right");
+    assert!(
+        answer.is_err(),
+        "a list that is not the seal's is reported, not taken for a program: {answer:?}"
+    );
+    assert_eq!(before, after, "the list of the file outside is as it was");
+    assert_eq!(
+        std::fs::read(&shared).expect("still there"),
+        b"shared contents"
     );
 }
 
@@ -1309,8 +1367,30 @@ fn removing_a_release_follows_no_link_and_touches_nothing_outside_it() {
     std::fs::set_permissions(outside.join("shared"), permissions).expect("read-only");
     std::fs::remove_file(&program).expect("the copy goes");
     std::fs::hard_link(outside.join("shared"), &program).expect("a hard link");
+    // And a junction inside the release to a directory elsewhere.
+    std::fs::create_dir_all(outside.join("inner")).expect("a directory elsewhere");
+    std::fs::write(outside.join("inner/kept"), b"kept").expect("written");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(test.store.release_directory(&two).join("bin/linked"))
+        .arg(outside.join("inner"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("mklink runs");
+    assert!(made.success(), "a junction inside the release");
     assert!(test.store.retire(&two, &update).expect("removes"));
     assert!(!test.store.release_directory(&two).exists());
+    let in_the_trash = std::fs::read_dir(test.store.trash()).map(|entries| entries.count());
+    assert_eq!(
+        in_the_trash.ok(),
+        Some(0),
+        "and nothing of it is left in the trash"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("inner/kept")).ok().as_deref(),
+        Some(&b"kept"[..]),
+        "what the junction inside it named is not followed"
+    );
     assert_eq!(
         std::fs::read(outside.join("shared")).expect("still there"),
         b"shared contents"
