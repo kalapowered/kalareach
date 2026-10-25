@@ -2070,17 +2070,28 @@ fn socket_pair() -> (SocketStream, SocketStream) {
     (ready(here), ready(there))
 }
 
-/// Section 9 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
-/// nobody can read as applied.
-///
-/// The transport here is the real one, over a real socket pair. The upstream reads the whole frame
-/// and says nothing, which is the case a queue-shaped transport cannot tell from success: the
-/// bytes went, so nothing failed, and the upstream never acted, so nothing succeeded. What the
-/// caller is told and what the receipt says is that nobody can establish it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_receipt() {
-    let host = host().await;
-    register(&host, None);
+/// The real transport of a session's one gateway connection, over a socket pair, to an upstream
+/// the test plays: it reads everything the connection writes to it, and says only what the test has
+/// the connection's owner read.
+struct RealTransport {
+    owner: Arc<kr_worker::broker::Duplex>,
+    /// Everything the upstream has read, in the lines it was written in.
+    read: Arc<std::sync::Mutex<String>>,
+    driving: tokio::task::JoinHandle<()>,
+    reading: tokio::task::JoinHandle<()>,
+    /// The terminal's end, kept open.
+    _client: SocketStream,
+}
+
+impl Drop for RealTransport {
+    fn drop(&mut self) {
+        self.reading.abort();
+        self.driving.abort();
+    }
+}
+
+/// Opens the connection and binds its transport to the session's instance.
+async fn real_transport(host: &Host) -> RealTransport {
     let broker = host.service.broker();
     broker
         .pin_table(instance(), installed(), upstream_table(), upstream_rich())
@@ -2102,7 +2113,7 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
         )
         .expect("the native connection is authenticated");
     let (upstream_here, upstream_there) = socket_pair();
-    let (client_here, _client_there) = socket_pair();
+    let (client_here, client_there) = socket_pair();
     let (owner, writes) = kr_worker::broker::Duplex::new(
         Arc::clone(broker),
         kr_protocol::ids::GatewayConnectionId::new(1),
@@ -2136,7 +2147,61 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
             }
         })
     };
+    RealTransport {
+        owner,
+        read,
+        driving,
+        reading,
+        _client: client_there,
+    }
+}
 
+impl RealTransport {
+    /// The identifier the host sent its `number`th request under, as the upstream read it, once
+    /// the upstream has read that many.
+    async fn identifier_of(&self, number: usize) -> String {
+        let started = std::time::Instant::now();
+        loop {
+            let line = self
+                .read
+                .lock()
+                .expect("the record is not poisoned")
+                .lines()
+                .nth(number - 1)
+                .map(str::to_owned);
+            if let Some(line) = line {
+                let frame: serde_json::Value = serde_json::from_str(&line).expect("a frame");
+                return frame["id"].to_string();
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the upstream read {number} requests by now"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The upstream says something to the connection's owner, as its reader would hand it over.
+    async fn says(&self, frame: &str) -> Result<kr_worker::broker::Carried, BrokerError> {
+        self.owner
+            .from_upstream(frame.as_bytes(), TimestampMs::new(5))
+            .await
+    }
+}
+
+/// Section 9 and KR-REQ-11.33: a request that went in full and was never answered leaves a receipt
+/// nobody can read as applied.
+///
+/// The transport here is the real one, over a real socket pair. The upstream reads the whole frame
+/// and says nothing, which is the case a queue-shaped transport cannot tell from success: the
+/// bytes went, so nothing failed, and the upstream never acted, so nothing succeeded. What the
+/// caller is told and what the receipt says is that nobody can establish it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_receipt() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    let read = Arc::clone(&transport.read);
     let mut client = cli(&host).await;
     let mutation = prompt_mutation(&client, &host, 31);
     let action_id = mutation.action_id;
@@ -2201,8 +2266,226 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
         "its receipt still says what it said"
     );
 
-    reading.abort();
-    driving.abort();
+    drop(transport);
+}
+
+/// What the journal holds of the observations made about one action.
+fn observations_of(
+    host: &Host,
+    receipt: &kr_protocol::receipt::Receipt,
+) -> Vec<kr_protocol::action::ActionObservation> {
+    host.service
+        .runtime()
+        .session()
+        .journal_mut()
+        .expect("the session journals")
+        .observations(&receipt.actor_id, receipt.action_id)
+        .expect("the observations are read")
+}
+
+/// Waits until the action's receipt says `state`.
+async fn until_receipt(
+    client: &mut Client<impl Codec>,
+    action_id: ActionId,
+    state: ReceiptState,
+) -> kr_protocol::receipt::Receipt {
+    let started = std::time::Instant::now();
+    loop {
+        let read = receipt(client, action_id).await;
+        if read.state == state {
+            return read;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the receipt says {} and not {state} by now",
+            read.state
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Sends a prompt the upstream does not answer within the shortened deadline, and returns the
+/// action whose receipt says nobody can establish what became of it.
+async fn unanswered_prompt(
+    client: &mut LocalClient,
+    host: &Host,
+    request_id: u64,
+) -> kr_protocol::receipt::Receipt {
+    let mutation = prompt_mutation(client, host, request_id);
+    let action_id = mutation.action_id;
+    let Outcome::Error(failure) = send(client, mutation).await else {
+        panic!("an operation nobody acknowledged is not a success");
+    };
+    assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+    let unknown = receipt(client, action_id).await;
+    assert_eq!(unknown.state, ReceiptState::Unknown);
+    unknown
+}
+
+/// Section 9 and KR-REQ-09.05: an upstream that answers an operation after the host stopped
+/// waiting has said, by the identifier the host sent the operation under, what became of it. That
+/// is correlation evidence the receipt contract lets settle an unknown outcome: a success reply
+/// makes it applied, an error that proves the operation was not acted on makes it refused, and any
+/// other error is recorded and settles nothing. Whatever the evidence says, the receipt stays what
+/// it was when it is not unknown, and a screen the host parsed never settles it (section 9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_reply_after_the_deadline_is_correlation_evidence_that_settles_an_unknown_receipt()
+ {
+    use kr_protocol::action::{ActionObservation, ObservationProvenance, ObservedResult};
+
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+    let mut client = cli(&host).await;
+
+    // A success reply, late: the operation was acted on.
+    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let id = transport.identifier_of(1).await;
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect("the reply is carried");
+    let applied = until_receipt(&mut client, unknown.action_id, ReceiptState::Applied).await;
+    assert!(
+        !applied.error.is_present(),
+        "an applied receipt does not keep the failure of the wait: {:?}",
+        applied.error
+    );
+    let seen = observations_of(&host, &applied);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].provenance,
+        ObservationProvenance::UpstreamCorrelation
+    );
+    assert_eq!(seen[0].claimed_result, ObservedResult::Applied);
+    // The same reply again settles nothing and records nothing more.
+    let _ = transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await;
+    assert_eq!(observations_of(&host, &applied).len(), 1);
+    // The receipt a retry is answered with is the settled one.
+    assert_eq!(
+        receipt(&mut client, unknown.action_id).await.state,
+        ReceiptState::Applied
+    );
+
+    // An error that says the frame was never a call the upstream could make: the operation was
+    // not acted on.
+    let unknown = unanswered_prompt(&mut client, &host, 32).await;
+    let id = transport.identifier_of(2).await;
+    transport
+        .says(&format!(
+            r#"{{"id":{id},"error":{{"code":-32602,"message":"no such parameter"}}}}"#
+        ))
+        .await
+        .expect("the reply is carried");
+    let refused = until_receipt(&mut client, unknown.action_id, ReceiptState::Refused).await;
+    assert!(
+        refused.error.is_present(),
+        "a refused receipt says what the upstream refused"
+    );
+    assert_eq!(
+        observations_of(&host, &refused)[0].claimed_result,
+        ObservedResult::Refused
+    );
+
+    // An error that says the operation failed and not that it did not happen: recorded, and the
+    // receipt stays unknown.
+    let unknown = unanswered_prompt(&mut client, &host, 33).await;
+    let id = transport.identifier_of(3).await;
+    transport
+        .says(&format!(
+            r#"{{"id":{id},"error":{{"code":-32603,"message":"internal error"}}}}"#
+        ))
+        .await
+        .expect("the reply is carried");
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        seen = observations_of(&host, &unknown);
+        if !seen.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(seen.len(), 1, "the evidence is recorded");
+    assert_eq!(seen[0].claimed_result, ObservedResult::Indeterminate);
+    assert_eq!(
+        receipt(&mut client, unknown.action_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    // Control: a screen the host parsed that claims the same operation was applied is recorded and
+    // changes nothing, however clearly it reads.
+    let screen = ActionObservation {
+        action_id: unknown.action_id,
+        provenance: ObservationProvenance::InferredScreen,
+        subject: "agent.prompt:screen".to_owned(),
+        subject_revision: Nullable::null(),
+        source_cursor: Nullable::null(),
+        claimed_result: ObservedResult::Applied,
+        observed_at_ms: TimestampMs::new(9),
+    };
+    let after = host
+        .service
+        .runtime()
+        .session()
+        .journal_mut()
+        .expect("the session journals")
+        .record_observation(&unknown.actor_id, &screen)
+        .expect("the observation is recorded");
+    assert_eq!(after.state, ReceiptState::Unknown);
+    assert_eq!(observations_of(&host, &unknown).len(), 2);
+}
+
+/// KR-REQ-09.05: the host's own deadline for an operation can pass before the transport's wait for
+/// the upstream's answer has ended. The receipt then says unknown, and the reply that comes later
+/// still settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_reply_after_the_workers_own_deadline_still_settles_the_receipt() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_secs(3_600));
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_millis(20));
+    let mut client = cli(&host).await;
+    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let id = transport.identifier_of(1).await;
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect("the reply is carried");
+    until_receipt(&mut client, unknown.action_id, ReceiptState::Applied).await;
+}
+
+/// KR-REQ-09.05: a connection that has ended carries no evidence: a reply the upstream wrote
+/// before the connection went is not read afterwards, and the receipt stays unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_05_a_connection_that_ended_settles_nothing() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    transport
+        .owner
+        .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+    let mut client = cli(&host).await;
+    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let id = transport.identifier_of(1).await;
+    transport.owner.shutdown();
+    transport
+        .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+        .await
+        .expect_err("a connection that ended reads nothing");
+    assert_eq!(
+        receipt(&mut client, unknown.action_id).await.state,
+        ReceiptState::Unknown
+    );
+    assert!(observations_of(&host, &unknown).is_empty());
 }
 
 /// KR-REQ-11.35 and KR-REQ-11.37: the receipt journal and the broker's ledger are behind one
