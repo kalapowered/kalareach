@@ -157,18 +157,45 @@ pub struct ApplicationDirectory {
 /// contact skill's installation uses. The daemon's environment is not the one Claude Code runs in,
 /// so a directory that variable names elsewhere is not read from it, and does not get the bridge.
 ///
+/// Gemini CLI's is `.gemini` in the home directory, where it reads `extensions/`. Its recipe's
+/// removal leaves the record of where an extension is installed in place for as long as anything
+/// else stays in the extension's directory ([`keeps_while_others_remain`]), because Gemini CLI
+/// refuses to start while such a directory has no record.
+///
 /// An application this host does not name here has no directory, and a recipe for it places
-/// nothing. Gemini CLI's is not named: its recipe must leave the record of where its extension is
-/// installed in place for as long as anything else stays in the extension's directory, because
-/// Gemini CLI refuses to start while such a directory has no record, and a recipe's removal steps
-/// cannot say "last, and only when nothing else is left".
+/// nothing.
 #[must_use]
 pub fn application_directories(home: &Path) -> Vec<ApplicationDirectory> {
-    vec![ApplicationDirectory {
-        application: "Claude Code".to_owned(),
-        directory: home.join(".claude"),
-    }]
+    vec![
+        ApplicationDirectory {
+            application: "Claude Code".to_owned(),
+            directory: home.join(".claude"),
+        },
+        ApplicationDirectory {
+            application: "Gemini CLI".to_owned(),
+            directory: home.join(".gemini"),
+        },
+    ]
 }
+
+/// The file of an application's registration that its removal takes last, and only when nothing
+/// else is left beside it.
+///
+/// Gemini CLI refuses to start at all where the person's settings list the extensions allowed and
+/// an extension's directory has no record of where it is installed. So the record of an extension
+/// stays for as long as the extension's directory holds anything else (a file of the person's, or a
+/// file of the registration that changed since it was installed and so stays), and it goes with
+/// the directory when it is the last thing in it. A recipe's removal steps each delete a file that
+/// still holds its bytes and cannot say that, so the host does.
+fn keeps_while_others_remain(application: &str, path: &str) -> bool {
+    application == "Gemini CLI"
+        && path.rsplit_once('/').is_some_and(|(directory, name)| {
+            name == GEMINI_RECORD && directory.starts_with("extensions/")
+        })
+}
+
+/// The name of the file that says where a Gemini CLI extension is installed.
+const GEMINI_RECORD: &str = ".gemini-extension-install.json";
 
 /// What an installation wants in place: one release's recipe, and what it is checked against.
 #[derive(Clone, Debug)]
@@ -1635,7 +1662,14 @@ impl NativeBridges {
                 return self.save(journal);
             }
         };
-        for removal in &release.removal {
+        // The file the application needs for as long as anything else of the registration stays
+        // is taken after everything else, the directories this host made inside its directory
+        // included.
+        let last = |removal: &Removal| {
+            matches!(removal, Removal::File { path, .. }
+                if keeps_while_others_remain(&release.application, path))
+        };
+        for removal in release.removal.iter().filter(|removal| !last(removal)) {
             let Some(index) = journal
                 .changes
                 .iter()
@@ -1644,7 +1678,7 @@ impl NativeBridges {
                 continue;
             };
             let outcome = match removal {
-                Removal::File { .. } => self.remove_file(journal, &root, index)?,
+                Removal::File { .. } => self.remove_file(journal, &root, index, false)?,
                 Removal::Key { .. } => self.remove_key(journal, &root, index)?,
             };
             self.settle_removal(journal, &root, index, outcome)?;
@@ -1683,7 +1717,18 @@ impl NativeBridges {
             })
             .collect();
         made.sort_by_key(|path| std::cmp::Reverse(tree::components(path).len()));
+        let mut pending: Vec<&Removal> = release
+            .removal
+            .iter()
+            .filter(|removal| last(removal))
+            .collect();
         for path in made {
+            // The file taken last goes just before the directory that holds it, which this host
+            // made, is itself taken out.
+            self.take_last(journal, &root, &mut pending, |file| {
+                file.rsplit_once('/')
+                    .is_some_and(|(directory, _)| directory == path)
+            })?;
             let Some(index) = journal.changes.iter().position(
                 |change| matches!(change, Change::Directory { path: recorded, .. } if *recorded == path),
             ) else {
@@ -1692,7 +1737,42 @@ impl NativeBridges {
             let outcome = self.remove_directory(journal, &root, index)?;
             self.settle_removal(journal, &root, index, outcome)?;
         }
+        // And where its directory was not made by this host, after every directory that was.
+        self.take_last(journal, &root, &mut pending, |_| true)?;
         self.save(journal)
+    }
+
+    /// Takes the files the application needs for as long as anything else of the registration
+    /// stays, among `pending`, whose path `fits`. Each goes only if nothing else is in its
+    /// directory.
+    fn take_last(
+        &self,
+        journal: &mut Journal,
+        root: &Dir,
+        pending: &mut Vec<&Removal>,
+        fits: impl Fn(&str) -> bool,
+    ) -> Run<()> {
+        let mut rest = Vec::new();
+        for removal in std::mem::take(pending) {
+            let Removal::File { path, .. } = removal else {
+                continue;
+            };
+            if !fits(path) {
+                rest.push(removal);
+                continue;
+            }
+            let Some(index) = journal
+                .changes
+                .iter()
+                .position(|change| undoes(removal, change))
+            else {
+                continue;
+            };
+            let outcome = self.remove_file(journal, root, index, true)?;
+            self.settle_removal(journal, root, index, outcome)?;
+        }
+        *pending = rest;
+        Ok(())
     }
 
     /// Records how one removal step ended: gone, left for good, or left for the next run.
@@ -1719,7 +1799,15 @@ impl NativeBridges {
         self.save(journal)
     }
 
-    fn remove_file(&self, journal: &Journal, root: &Dir, index: usize) -> Run<Outcome> {
+    /// Takes one file this host installed out, while it is the file and holds the bytes that were
+    /// installed. With `alone`, only if nothing else is in its directory.
+    fn remove_file(
+        &self,
+        journal: &Journal,
+        root: &Dir,
+        index: usize,
+        alone: bool,
+    ) -> Run<Outcome> {
         let Change::File {
             path,
             digest,
@@ -1765,6 +1853,23 @@ impl NativeBridges {
                 Outcome::Kept("it has changed since it was installed".to_owned()),
             ),
             Ok(Fetched::File(_)) => {
+                if alone {
+                    match directory.names() {
+                        Ok(names) if names.iter().all(|other| other == name) => {}
+                        Ok(_) => {
+                            return Ok(Outcome::Unfinished(
+                                "the directory holds something else beside it, and \
+                                 the application needs it for as long as that stays"
+                                    .to_owned(),
+                            ));
+                        }
+                        Err(error) => {
+                            return Ok(Outcome::Unfinished(format!(
+                                "the directory could not be listed: {error}"
+                            )));
+                        }
+                    }
+                }
                 self.step("unlink", &directory.join(name))?;
                 if let Err(error) = directory.remove_file(name) {
                     return Ok(Outcome::Unfinished(format!(
@@ -2464,6 +2569,8 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
         root: &'static str,
         tails: &'static [&'static str],
         enabling: Option<(&'static str, &'static str, &'static str)>,
+        /// The tail whose removal is the recipe's last: [`keeps_while_others_remain`].
+        last: Option<&'static str>,
     }
     let layout = match recipe.application.as_str() {
         "Claude Code" => Layout {
@@ -2474,6 +2581,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
                 "hooks/hooks.json",
             ],
             enabling: Some(("settings.json", "enabledPlugins.", "@skills-dir")),
+            last: None,
         },
         "Gemini CLI" => Layout {
             root: "extensions",
@@ -2483,6 +2591,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
                 "hooks/hooks.json",
             ],
             enabling: None,
+            last: Some(GEMINI_RECORD),
         },
         other => {
             return Err(format!(
@@ -2550,6 +2659,21 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
                      than once"
                 ));
             }
+        }
+    }
+    if let Some(record) = layout.last {
+        let last_removed = match recipe.remove.last() {
+            Some(BridgeRemoval::RemoveFile { destination, .. }) => {
+                destination.as_str().rsplit_once('/').map(|(_, name)| name)
+            }
+            _ => None,
+        };
+        if last_removed != Some(record) {
+            return Err(format!(
+                "the recipe does not take {record} out last, which this host requires of a native \
+                 bridge for {application}: the application refuses to start while an extension's \
+                 directory has no record, so the record goes only once nothing else is left beside it"
+            ));
         }
     }
     for step in &recipe.install {
