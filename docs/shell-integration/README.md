@@ -367,7 +367,7 @@ program out of the integration, and it is asked once about each command the line
 shell runs it as typed or through the launcher. A handler the person sets later is theirs and stays
 where they put it: one that calls the handler it replaced still reaches this one, and one that does
 not leaves the commands to run as typed. The handler for a name about to be looked up
-(`PreCommandLookupAction`) is not touched. The handler acts on a line that is one
+(`PreCommandLookupAction`) is not touched, and a program it answers with is a program found like any other. A handler of the person's that throws leaves the command to run as typed. The handler acts on a line that is one
 native command whose words are all plain constants, and only when the command PowerShell would run
 for that name is the program: an alias, a function, a cmdlet or a script that has the name is what
 runs, and nothing is asked. It changes a lookup only when the worker answers with a backend, so

@@ -252,6 +252,13 @@ fn a_program_the_worker_does_not_take_leaves_the_status_it_left() {
 /// KR-REQ-12.07
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_command_a_later_handler_replaces_leaves_the_status_of_what_ran() {
+    shellpkg::a_command_a_later_handler_replaces_leaves_the_status_of_what_ran(PWSH);
+}
+
+/// KR-REQ-12.07
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
 fn a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed() {
     shellpkg::a_launcher_that_cannot_start_runs_the_program_once_and_one_that_fails_is_not_followed(
         PWSH,

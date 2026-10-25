@@ -590,6 +590,62 @@ pub fn a_program_the_worker_does_not_take_leaves_the_status_it_left(kind: ShellK
     );
 }
 
+/// KR-REQ-12.07: a command that a handler the person set after the module's replaces, once it has
+/// called the module's, is not a command the launcher ran, and its line has the status of what ran.
+///
+/// The module's handler has been asked and has answered with the launcher's block by then; the
+/// later handler's command is what the engine runs, so the block never starts. The status the line
+/// leaves is the replacement's, and not the exit code an earlier program left in `$LASTEXITCODE`.
+pub fn a_command_a_later_handler_replaces_leaves_the_status_of_what_ran(kind: ShellKind) {
+    assert_eq!(
+        kind,
+        ShellKind::PowerShell,
+        "only PowerShell looks names up"
+    );
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes_and(
+        &package,
+        &probes,
+        "function global:kr-replacement { 'replacement-' + 'ran' }",
+    );
+    // A program that exits with 5 leaves that in `$LASTEXITCODE`, which a line the launcher ran would
+    // report in place of `$?`.
+    let _ = session.submit("sh -c 'exit 5'", "never-printed-by-the-line");
+    assert_eq!(session.status_of("sh -c 'exit 5'"), Some(5));
+
+    session.commands.policy = ResolvePolicy::Backend {
+        launcher: told(&probes.launcher()),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let installed = format!(
+        "$kr_saved = $ExecutionContext.InvokeCommand.PostCommandLookupAction; \
+         $ExecutionContext.InvokeCommand.PostCommandLookupAction = {{ param($n, $e) \
+         $kr_saved.Invoke($n, $e); if ($n -eq 'kr-probe') {{ \
+         $e.Command = $ExecutionContext.InvokeCommand.GetCommand('kr-replacement', 'Function') }} \
+         }}.GetNewClosure(); {}",
+        print_assembled(kind, "kr-installed")
+    );
+    assert!(
+        session.run(&installed, "kr-installed"),
+        "the handler was not set:\n{}",
+        session.terminal_output()
+    );
+    let (runs, launches) = (probes.runs().len(), probes.launches().len());
+    let _ = session.submit(
+        "kr-probe replaced-after-the-module",
+        "never-printed-by-the-line",
+    );
+    assert_eq!(
+        session.status_of("kr-probe replaced-after-the-module"),
+        Some(0),
+        "the line reported an earlier program's exit code in place of what ran"
+    );
+    assert_eq!(probes.runs().len(), runs, "the program ran");
+    assert_eq!(probes.launches().len(), launches, "the launcher ran");
+}
+
 /// KR-REQ-12.07: a launcher that cannot be started leaves the program to run once, as typed, and
 /// a launcher that runs and fails is not followed by the program, whatever the person's profile
 /// does with a failed program.
