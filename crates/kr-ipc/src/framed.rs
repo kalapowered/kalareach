@@ -1025,13 +1025,19 @@ mod tests {
             ]))
             .expect("encodes"),
         });
+        let (accepted, peer_is_there) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (connection, _) = listener.accept().await.expect("accepts");
+            accepted.send(()).expect("the case waits for the peer");
             let (mut reader, _writer) = split(connection, StreamKind::Control);
             reader.read_message::<ControlFrame>().await
         });
         let client = Connection::connect(&endpoint).await.expect("connects");
         let (_reader, mut writer) = split(client, StreamKind::Control);
+        // The peer has accepted before the client writes and closes. macOS drops a connection its
+        // client closes before the listener accepted it, and a peer that waits to accept it then
+        // waits for ever; waiting here also gives the runtime its turn on the new connection.
+        peer_is_there.await.expect("the peer accepts");
 
         let frame = FrameWriter::encode(StreamKind::Control, &big).expect("encodes");
         // The check allows the first write and refuses the second. A Windows named pipe that is new
