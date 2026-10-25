@@ -247,8 +247,8 @@ impl Controller {
     /// first or waits behind it.
     ///
     /// Taken before any lock a withdrawal holds for longer than the change it makes (the policy's),
-    /// and never while holding one a commit takes. Letting go of it withdraws the registrations of
-    /// the connections that ended meanwhile ([`WithdrawHold`]).
+    /// and never while holding one a commit takes. Letting go of it, however it is let go of,
+    /// withdraws the registrations of the connections that ended meanwhile ([`Held`]).
     pub(super) fn withdraw_hold(&self) -> WithdrawHold<'_> {
         #[cfg(test)]
         self.withdrawals_waiting
@@ -266,7 +266,7 @@ impl Controller {
         } else {
             wait()
         };
-        WithdrawHold {
+        Held {
             guard: Some(guard),
             controller: self,
         }
@@ -287,15 +287,22 @@ impl Controller {
         self.withdrawing(hold)
     }
 
+    /// The hold on commits for writing, where no commit stands on a registration and no
+    /// withdrawal is under way now; `None` where one is. It does not wait, so it queues nothing
+    /// that would hold later commits off.
+    fn try_commit_write(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        match self.commit_hold.try_write() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(held)) => Some(held.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// As [`Self::admitted_withdraw`], where no commit stands on a registration now; `None` where
-    /// one does. It does not wait, so it queues no withdrawal that would hold later commits off.
+    /// one does.
     fn try_admitted_withdraw(&self) -> Option<Withdrawing<'_>> {
-        let guard = match self.commit_hold.try_write() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
-        Some(self.withdrawing(WithdrawHold {
+        let guard = self.try_commit_write()?;
+        Some(self.withdrawing(Held {
             guard: Some(guard),
             controller: self,
         }))
@@ -467,15 +474,18 @@ impl Controller {
         admission: &crate::authority::AdmittedMutation,
         commit: impl FnOnce() -> T,
     ) -> Result<T> {
-        let hold = self
-            .commit_hold
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Letting go of the hold, at the end of the commit or by a panic in it, withdraws the
+        // registrations of the connections that ended meanwhile.
+        let _hold: CommitHold<'_> = Held {
+            guard: Some(
+                self.commit_hold
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            controller: self,
+        };
         let checked = self.check_registration_in(&self.admitted_read(), admission);
-        let committed = checked.map(|()| commit());
-        drop(hold);
-        self.settle_ended();
-        committed
+        checked.map(|()| commit())
     }
 
     /// Returns the wall-clock deadline a mutation was accepted under, for the receipt it leaves.
@@ -608,10 +618,10 @@ impl Controller {
 
     /// Withdraws one connection's registration.
     ///
-    /// A withdrawal is ordered after every commit that stands on a registration. Where one is
-    /// running, the connection is noted as ended and its registration goes when the commit has
-    /// ended ([`Self::settle_ended`]): nothing waits for the commit, and no withdrawal is queued
-    /// that would hold the commits that begin meanwhile off.
+    /// A withdrawal is ordered after every commit that stands on a registration and every other
+    /// withdrawal. Where one is under way, the connection is noted as ended and its registration
+    /// goes when whoever holds the registrations lets go ([`Self::settle_ended`]): nothing waits
+    /// for it, and no withdrawal is queued that would hold the commits that begin meanwhile off.
     pub(super) fn deregister(&self, connection_id: ConnectionId) {
         if let Some(mut table) = self.try_admitted_withdraw() {
             table.remove(&connection_id);
@@ -621,22 +631,47 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(connection_id);
-        // A commit can have ended between the attempt above and the note.
+        // The holder can have let go between the attempt above and the note.
         self.settle_ended();
     }
 
     /// Withdraws the registrations of the connections that ended while the registrations were
     /// held, once nothing holds them. Whoever holds them settles the rest when it lets go: a
-    /// commit that stands on a registration ([`Self::under_registration`]) and a withdrawal
-    /// ([`WithdrawHold`]) both do.
+    /// commit that stands on a registration ([`CommitHold`]) and a withdrawal ([`WithdrawHold`])
+    /// both do. A connection that ends while this holds them is withdrawn by the next turn of
+    /// its loop.
     fn settle_ended(&self) {
-        let waiting = !self
+        while self.ended_waiting() {
+            let Some(hold) = self.try_commit_write() else {
+                return;
+            };
+            let mut table = self.admitted_write();
+            self.remove_ended(&mut table);
+            drop(table);
+            drop(hold);
+        }
+    }
+
+    /// Whether a connection has ended whose registration is still to go.
+    fn ended_waiting(&self) -> bool {
+        !self
             .ended
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty();
-        if waiting {
-            drop(self.try_admitted_withdraw());
+            .is_empty()
+    }
+
+    /// Removes from `table` the registrations of the connections that ended while the
+    /// registrations were held.
+    fn remove_ended(&self, table: &mut BTreeMap<ConnectionId, AdmittedConnection>) {
+        let ended = std::mem::take(
+            &mut *self
+                .ended
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for connection_id in ended {
+            table.remove(&connection_id);
         }
     }
 
@@ -1290,19 +1325,27 @@ impl From<LeaseDenied> for ControllerError {
     }
 }
 
-/// The hold against the commits that stand on a registration, taken for writing by a withdrawal
-/// or a replacement of registrations ([`Controller::withdraw_hold`]).
+/// The hold on commits ([`Controller::commit_hold`]), for reading by a commit that stands on a
+/// registration ([`CommitHold`]) or for writing by a withdrawal or a replacement of registrations
+/// ([`WithdrawHold`]).
 ///
-/// A connection that ends while the hold is taken is noted, and its registration goes when the
-/// hold is let go of ([`Controller::deregister`]). Whoever holds it, and however it is let go of,
-/// the registrations of the connections that ended are withdrawn once it is: a holder that had
-/// already taken the notes before the connection ended cannot leave the registration standing.
-pub(super) struct WithdrawHold<'a> {
-    guard: Option<std::sync::RwLockWriteGuard<'a, ()>>,
+/// A connection that ends while the registrations are held is noted, and its registration goes
+/// when the hold is let go of ([`Controller::deregister`]), or when a commit that began first
+/// ends, whichever withdraws it. Whoever holds the registrations, and however the hold is let go
+/// of, the connections that ended are withdrawn once it is: a holder that had already taken the
+/// notes before the connection ended cannot leave the registration standing.
+pub(super) struct Held<'a, Guard> {
+    guard: Option<Guard>,
     controller: &'a Controller,
 }
 
-impl Drop for WithdrawHold<'_> {
+/// The hold on commits taken for reading by a commit that stands on a registration.
+type CommitHold<'a> = Held<'a, std::sync::RwLockReadGuard<'a, ()>>;
+
+/// The hold on commits taken for writing by a withdrawal or a replacement of registrations.
+pub(super) type WithdrawHold<'a> = Held<'a, std::sync::RwLockWriteGuard<'a, ()>>;
+
+impl<Guard> Drop for Held<'_, Guard> {
     fn drop(&mut self) {
         drop(self.guard.take());
         self.controller.settle_ended();
@@ -1314,26 +1357,18 @@ impl Drop for WithdrawHold<'_> {
 ///
 /// The registrations of the connections that ended while the hold was taken
 /// ([`Controller::deregister`]) go when this is let go of, before the table is, and those that
-/// ended after that go when the hold is let go of ([`WithdrawHold`]).
+/// ended after that go when the hold is let go of ([`Held`]).
 pub(super) struct Withdrawing<'a> {
-    // Declared in the order they are let go of: the table, then the hold.
+    // The fields are let go of in the order they are declared: the table, then the hold. The
+    // hold's letting go takes the table again, so a table still held by this thread then would
+    // wait for itself.
     table: std::sync::RwLockWriteGuard<'a, BTreeMap<ConnectionId, AdmittedConnection>>,
     hold: WithdrawHold<'a>,
 }
 
 impl Drop for Withdrawing<'_> {
     fn drop(&mut self) {
-        let ended = std::mem::take(
-            &mut *self
-                .hold
-                .controller
-                .ended
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for connection_id in ended {
-            self.table.remove(&connection_id);
-        }
+        self.hold.controller.remove_ended(&mut self.table);
         #[cfg(test)]
         self.hold.controller.after_the_ended_are_taken.wait();
     }

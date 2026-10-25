@@ -1347,12 +1347,13 @@ change's registration standing, so a revocation or a withdrawn connection is ord
 the change or wholly after it, and a request whose deadline or authority ran out while it waited
 behind a sync or a download changes nothing. The daemon's table of admitted connections is held
 only for the check, not for the commit: a request, a typed key, an output batch and a connection
-that is registered never wait for a commit, and a connection that ends is withdrawn when the commit
-is over, without anything waiting for it. A revocation, or a refusal the authority feed raises,
-that lands during a commit does wait for it. It holds the registry meanwhile, so the requests that
-need the registry wait with it, and one runtime thread; a commit that begins behind it waits too.
+that is registered never wait for a commit, and a connection that ends is withdrawn once no commit
+or withdrawal holds the registrations, without anything waiting for it. A revocation, or a refusal
+the authority feed raises, that lands during a commit does wait for it. It holds the registry
+meanwhile, so the requests that need the registry wait with it, and one runtime thread; a commit
+that begins behind it waits too.
 A connection whose control stream was lost keeps its registration, and so its lease renewal, until
-the commit that is running ends.
+no commit or withdrawal holds the registrations.
 
 The catalogue's work that grows with a catalogue (a mutation, a read, the seed, a change of the
 adapters an organisation allows, and the plan of an installation a person confirms) runs on a

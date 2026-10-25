@@ -500,7 +500,8 @@ impl HostHandler for NetworkHost {
         // data streams, and stopping remote lease renewal is the host's half. Withdrawing the
         // registration is what does it here, because a lease is renewed only for a connection the
         // authority store still holds. A commit that stands on a registration while the stream is
-        // lost delays the withdrawal until it has ended, and the lease is renewed meanwhile.
+        // lost delays the withdrawal until no commit or withdrawal holds the registrations, and
+        // the lease is renewed meanwhile.
         if let Some(controller) = self.controller.upgrade() {
             tokio::spawn(async move {
                 controller.deregister(connection_id);
