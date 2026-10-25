@@ -3673,3 +3673,95 @@ async fn a_rollback_from_a_daemon_of_a_later_public_major_goes_on_beside_the_ses
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
+
+/// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-24.15: the record that a restored policy waits for the person
+/// at the machine is a store of its own that the release before does not name. A rollback to it is
+/// not refused, and it leaves the record where it was, unread: the release before serves the policy
+/// to remote devices as it always did, which is the loss the guide states. An update again finds the
+/// record, and the host waits again, with the record rewritten to name the policy it holds and the
+/// moment the restore was found kept, until the person at the machine confirms.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_waits_on_it() {
+    use kr_controller::grants::restored::{self, Found, Record};
+    use kr_protocol::organisation::{HostPolicyConfirmParams, HostPolicyConfirmResult};
+
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let environment = host.tree.environment();
+    let file = restored::file_beside(&environment.registry_database());
+    let found = Record::of(
+        kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+        kr_protocol::scalars::TimestampMs::new(1_000),
+    );
+    restored::write(&file, &found).expect("a record of a restore");
+    let written = std::fs::read(&file).expect("the record reads");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a record of a restore does not refuse a rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("the record is still there"),
+        written,
+        "the release before leaves the record alone"
+    );
+
+    let archive = host.scratch("archives").join("two-again.tar.gz");
+    updated.two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the update again goes ahead: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon is this build's again"
+    );
+    let Found::Record(named) = restored::read(&file) else {
+        panic!("the record stands");
+    };
+    assert_ne!(
+        named.subject, found.subject,
+        "it was written to name the policy the host holds"
+    );
+    assert_eq!(
+        named.found_at_ms, found.found_at_ms,
+        "and the moment the restore was found stays"
+    );
+
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let confirmed: HostPolicyConfirmResult = pairing::mutate_as(
+        host.tree.environment_id(),
+        &mut client,
+        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        Method::HostPolicyConfirm,
+        &HostPolicyConfirmParams {},
+    )
+    .await
+    .expect("the person at this machine confirms");
+    assert!(confirmed.lifted, "the update again found a wait to end");
+    assert_eq!(restored::read(&file), Found::Missing, "and it ended it");
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
