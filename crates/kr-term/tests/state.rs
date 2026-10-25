@@ -59,6 +59,33 @@ fn the_screen_is_the_same_wherever_the_reads_end() {
     assert_eq!(whole.cursor, split.cursor);
 }
 
+/// KR-ACC-024: a combining mark joins the space it follows, whether or not the library stored that
+/// space. A blank printed past the end of a row is implicit in the library's compact form of the
+/// row, and reading it must not make it vanish: the mark belongs to the cell the person sees.
+#[test]
+fn a_combining_mark_joins_a_blank_the_library_keeps_implicit() {
+    // Column two, two spaces, U+0301, then a letter.
+    let input: &[u8] = b"\x1b[2G  \xcc\x81X";
+    let mut whole = engine();
+    whole.feed(input, 0);
+    whole.close(0);
+    let mut split = engine();
+    for byte in input {
+        split.feed(&[*byte], 0);
+    }
+    split.close(0);
+    let whole = whole.snapshot(viewport(&whole), 0).0;
+    let split = split.snapshot(viewport(&split), 0).0;
+    let first_row = |snapshot: &kr_term::snapshot::Snapshot| text_of(&snapshot.rows)[0].clone();
+    assert!(
+        first_row(&whole).contains('\u{301}'),
+        "the mark is kept: {:?}",
+        first_row(&whole)
+    );
+    assert_eq!(first_row(&whole), first_row(&split));
+    assert_eq!(whole.rows, split.rows);
+}
+
 // ---------------------------------------------------------------------- geometry
 
 #[test]
