@@ -4789,12 +4789,10 @@ impl GeminiSite {
     }
 }
 
-/// KR-REQ-11.42: a host names Claude Code's directory, `.claude` under the account's home, and no
-/// other application's. Gemini CLI's is not named, so its recipe places nothing on a host: removal
-/// would have to keep the install record for as long as anything else stays in the extension's
-/// directory, which a recipe cannot say.
+/// KR-REQ-11.42: a host names Claude Code's directory, `.claude` under the account's home, and
+/// Gemini CLI's, `.gemini`, and no other application's.
 #[test]
-fn kr_req_11_42_the_host_names_claude_codes_directory_and_no_other() {
+fn kr_req_11_42_the_host_names_claude_codes_and_gemini_clis_directories_and_no_other() {
     use kr_controller::catalogue::native_bridge::application_directories;
     let home = Path::new("/home/somebody");
     let named: Vec<(String, PathBuf)> = application_directories(home)
@@ -4803,7 +4801,10 @@ fn kr_req_11_42_the_host_names_claude_codes_directory_and_no_other() {
         .collect();
     assert_eq!(
         named,
-        [("Claude Code".to_owned(), home.join(".claude"))],
+        [
+            ("Claude Code".to_owned(), home.join(".claude")),
+            ("Gemini CLI".to_owned(), home.join(".gemini")),
+        ],
         "the application directories a host names"
     );
 }
@@ -4951,12 +4952,13 @@ fn kr_req_11_42_removing_the_gemini_cli_recipe_restores_the_directory() {
 /// holds its bytes goes. The control is the case above: a directory with nothing else in it loses
 /// the record with the rest.
 ///
-/// A recipe's removal steps each delete a file that still holds its bytes, so no recipe can say
-/// "this one last, and only when the directory is otherwise empty": the case fails until the
-/// recipe format has such a step.
+/// A recipe's removal steps each delete a file that still holds its bytes and cannot say "this one
+/// last, and only when the directory is otherwise empty", so the host does: it takes the record
+/// after everything else and the directories it made inside the extension's, and only if nothing
+/// is left beside it. The record stays recorded, and the next reconciliation takes it once what
+/// stayed is gone.
 #[cfg(unix)]
 #[test]
-#[ignore = "the recipe format has no removal step that waits until nothing else is left"]
 fn kr_req_11_42_the_gemini_cli_record_stays_while_anything_else_stays_beside_it() {
     for (name, beside) in [
         ("a file of their own", "notes.txt"),
@@ -4992,7 +4994,45 @@ fn kr_req_11_42_the_gemini_cli_record_stays_while_anything_else_stays_beside_it(
             !matches!(settled, Settled::Removed),
             "{name}: a removal that left something is not reported as complete: {settled:?}"
         );
+
+        // What stayed goes, the journal is read again by a new run, and the record goes with the
+        // directory the installation made.
+        std::fs::remove_file(directory.join(beside)).expect("the file goes");
+        if beside == "hooks/hooks.json" {
+            std::fs::remove_dir(directory.join("hooks")).expect("the folder goes");
+        }
+        let again = site
+            .bridges()
+            .reconcile(&gemini(), None)
+            .expect("removes again");
+        assert_eq!(again, Settled::Removed, "{name}: {again:?}");
+        assert!(
+            !site.tree().contains_key(GEMINI_RECORD_PATH)
+                && !site.tree().contains_key("extensions/kalareach"),
+            "{name}: nothing of the extension is left: {:?}",
+            site.tree().keys().collect::<Vec<_>>()
+        );
     }
+}
+
+/// KR-REQ-11.42: a Gemini CLI recipe whose removal does not end with the install record is refused
+/// before anything is written, because the application refuses to start while an extension's
+/// directory has no record.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_42_a_gemini_cli_recipe_that_does_not_take_its_record_out_last_is_refused() {
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let mut release = site.release();
+    release.recipe.remove.reverse();
+
+    let settled = site
+        .bridges()
+        .reconcile(&gemini(), Some(&release))
+        .expect("reconciles");
+
+    assert!(refused(&settled).contains("out last"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
 }
 
 /// KR-REQ-11.42: an application the host does not know places nothing: a Gemini CLI recipe on a
@@ -5547,18 +5587,14 @@ fn kr_req_11_42_the_doctor_warns_for_an_applied_bridge_that_no_longer_matches() 
 #[test]
 fn kr_req_11_42_the_doctor_warns_for_a_removal_that_left_something_in_place() {
     use kr_protocol::hostinfo::DoctorStatus;
-    let site = GeminiSite::new();
+    let site = Site::new();
     let bridges = site.bridges();
     bridges
-        .reconcile(&gemini(), Some(&site.release()))
+        .reconcile(&plugin(), Some(&site.release()))
         .expect("applies");
-    std::fs::write(
-        site.application().join(GEMINI_HOOKS_PATH),
-        b"{\"somebody\": 1}",
-    )
-    .expect("changed");
+    std::fs::write(site.application().join(HOOKS_PATH), b"{\"somebody\": 1}").expect("changed");
 
-    let settled = bridges.reconcile(&gemini(), None).expect("removes");
+    let settled = bridges.reconcile(&plugin(), None).expect("removes");
 
     assert_eq!(settled, Settled::Removed, "{settled:?}");
     let reports = bridges.reports().expect("reads");
