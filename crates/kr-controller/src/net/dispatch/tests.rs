@@ -3439,7 +3439,7 @@ async fn a_local_prompt_whose_admission_lapses_before_its_draft_is_recorded_reco
     lapsing_before_the_record(
         controller,
         || {
-            controller.admitted_table().remove(&admission.connection_id);
+            controller.admitted_write().remove(&admission.connection_id);
         },
         async {
             answered = Some(
@@ -3494,7 +3494,7 @@ async fn a_paired_prompt_whose_admission_lapses_before_its_draft_is_recorded_rec
         controller,
         || {
             controller
-                .admitted_table()
+                .admitted_write()
                 .remove(&connection.connection_id());
         },
         async {

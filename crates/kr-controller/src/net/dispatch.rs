@@ -214,7 +214,7 @@ impl RemoteConnection {
         sink: Box<dyn FrameSink>,
     ) -> Self {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        controller.admitted_table().insert(
+        controller.admitted_write().insert(
             connection_id,
             crate::service::AdmittedConnection::new(
                 device.principal(),

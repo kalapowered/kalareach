@@ -3237,7 +3237,7 @@ mod tests {
         fn admission(&self, lifetime: Duration) -> AdmittedMutation {
             let connection_id = ConnectionId::new(uuid(77));
             let revision = self.controller.policy().authority_revision();
-            self.controller.admitted_table().insert(
+            self.controller.admitted_write().insert(
                 connection_id,
                 AdmittedConnection::new(
                     kr_transport::listener::device_principal(&self.device_id),

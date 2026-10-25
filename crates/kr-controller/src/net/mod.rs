@@ -551,7 +551,7 @@ impl NetworkHost {
                     .to_owned(),
             });
         }
-        let mut admitted = controller.admitted_table();
+        let mut admitted = controller.admitted_write();
         admitted.insert(
             session.connection_id,
             AdmittedConnection::new(record.principal(), admitted_revision),
@@ -4346,7 +4346,7 @@ pub(crate) mod tests {
         let kept = ConnectionId::new(kr_ipc::new_uuid());
         let principal = || ActorId::new("device:test").expect("a principal");
         for connection_id in [lost, kept] {
-            controller.admitted_table().insert(
+            controller.admitted_write().insert(
                 connection_id,
                 crate::service::AdmittedConnection::new(principal(), revision),
             );
@@ -4384,7 +4384,7 @@ pub(crate) mod tests {
         network.guard.host.control_stream_lost(lost);
         // The withdrawal runs on a task of its own.
         let waited = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while controller.admitted_table().contains_key(&lost) {
+        while controller.admitted_read().contains_key(&lost) {
             assert!(
                 std::time::Instant::now() < waited,
                 "the lost connection's registration is withdrawn"

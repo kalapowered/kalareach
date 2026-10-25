@@ -1320,7 +1320,7 @@ impl Controller {
                         })
                         .flatten()
                         .collect();
-                let mut admitted = self.admitted_table();
+                let mut admitted = self.admitted_write();
                 if host_wide {
                     admitted.retain(|_, connection| connection.admitted_revision >= revision);
                 } else {
@@ -1339,7 +1339,7 @@ impl Controller {
                     // refused inside its own transaction as before.
                     admitted.retain(|_, connection| {
                         !revoked.contains(&connection.actor_id)
-                            && connection.acting.is_disjoint(&revoked_grants)
+                            && connection.acts_under_none_of(&revoked_grants)
                     });
                     for connection in admitted.values_mut() {
                         connection.admitted_revision = revision;

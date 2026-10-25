@@ -1018,7 +1018,7 @@ impl Controller {
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             reservations: Arc::default(),
-            admitted: std::sync::Mutex::new(BTreeMap::new()),
+            admitted: std::sync::RwLock::new(BTreeMap::new()),
             identity,
             secret_store: setup.secret_store,
             generation,

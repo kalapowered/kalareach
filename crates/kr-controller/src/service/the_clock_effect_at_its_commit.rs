@@ -76,7 +76,7 @@ async fn an_establishment_that_lapses_while_it_waits(at: At, lapse: Lapse) {
         Lapse::TheDeadlinePasses => continuous.advance(Duration::from_secs(61)),
         Lapse::AFenceIsOwed => controller.hold_fence(true),
         Lapse::TheRegistrationIsWithdrawn => {
-            controller.admitted_table().remove(&door.connection_id());
+            controller.admitted_write().remove(&door.connection_id());
         }
     }
     go.send(()).expect("the effect goes on");
@@ -265,8 +265,8 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
         })
     };
     assert!(
-        controller.admitted.try_lock().is_err(),
-        "the registrations are held while the effect commits"
+        controller.admitted.try_write().is_err(),
+        "the registrations are held against a change while the effect commits"
     );
     assert!(
         !withdrawal.is_finished(),

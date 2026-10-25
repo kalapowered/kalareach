@@ -131,7 +131,7 @@ fn output_for(
     actor_id: ActorId,
 ) -> RemoteOutput {
     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-    controller.admitted_table().insert(
+    controller.admitted_write().insert(
         connection_id,
         crate::service::AdmittedConnection::new(actor_id, controller.policy().authority_revision()),
     );

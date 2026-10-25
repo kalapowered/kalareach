@@ -349,7 +349,7 @@ pub struct Controller {
     /// This is the daemon's authority store for live connections. A registration is written in the
     /// same critical section as the caller's final record validation, and withdrawn when the
     /// authority it was made under is revoked or the connection ends.
-    admitted: std::sync::Mutex<BTreeMap<ConnectionId, AdmittedConnection>>,
+    admitted: std::sync::RwLock<BTreeMap<ConnectionId, AdmittedConnection>>,
     identity: ControllerIdentity,
     /// Which store this daemon keeps its keys in.
     secret_store: kr_crypto::store::StoreSelection,
