@@ -34,8 +34,10 @@ widestring.workspace = true
 # access is read with the entry types and security classes the system services declare: those
 # are the first three features this crate brings in beyond the workspace's own list. The boot
 # identity is read from the kernel's process list and from the boot counter in the page the kernel
-# shares with every process: the last four declare that call and that page's layout.
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_SystemServices", "Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
+# shares with every process: the last four declare that call and that page's layout. A store's
+# `current` junction is set through the file system's control codes, which `Win32_System_Ioctl`
+# declares.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_SystemServices", "Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Ioctl"] }
 
 [features]
 # A disposable owner-only host tree for the other host crates' tests.
@@ -52,7 +54,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
-# crate denies it instead and allows it in exactly twelve modules, each of which says why:
+# crate denies it instead and allows it in exactly thirteen modules, each of which says why:
 # `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control lists),
 # `paths::account` (the system's account database, which a directory-service account is only in),
 # `identity::process_times` (a process's creation time, whether it has exited, and ending it),
@@ -63,8 +65,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 # platform), `starter::windows` (the launch pipe, a process's facts and a child created
 # suspended), `framed::pipe_probe` (what has become of a named pipe's other end),
 # `framed::readiness` (a connection's own descriptor registered with the runtime's reactor) and
-# `inheritance` (marking, in a forked child, the descriptors it would pass on at `exec`). Nothing
-# else in this crate may relax the rule.
+# `inheritance` (marking, in a forked child, the descriptors it would pass on at `exec`) and
+# `install::windows` (a store's junction, the image of a process and the access-control list of a
+# sealed release). Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
