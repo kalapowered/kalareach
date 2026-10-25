@@ -12,11 +12,14 @@
 //!
 //! The delivery gate is shown on the delivery module itself, with a transport and a credential
 //! store that answer when the test lets them. The two moments it guards, a send on the wire when
-//! privacy mode is turned on and a send claimed before the boundary and presented after it, cannot
-//! be held open inside a running daemon, whose senders are real.
+//! privacy mode is turned on and a send claimed before the boundary and presented after it, are held
+//! open here on that module. A real webhook send held on the wire inside a running daemon while the
+//! change is asked for is in `delivery_path.rs`.
 //!
-//! No description process runs here, so inference in flight cannot be shown: a generated
-//! description is written to the store as the description service would have written it.
+//! No description process runs here: a generated description is written to the store as the
+//! description service would have written it. Inference in flight is shown through a daemon and
+//! the stub description process in `descriptions.rs`, and an upload in flight through a daemon and
+//! the storage service stand-in in `managed_storage.rs`.
 //!
 //! Everything is on the internal disk: the environment is a temporary host tree, and the session's
 //! shell runs a POSIX shell from a directory inside it.
@@ -2311,12 +2314,13 @@ async fn kr_req_24_14_a_pin_outlives_the_session_closing() {
     environment.stop().await;
 }
 
-/// KR-REQ-24.28: an obligation for a session that has no worker and no launch does not hold
-/// turning privacy mode off back. The record a daemon that stopped left says privacy mode is on and
-/// that one more session, whose journal is on the disk, owes its cleanup; no worker is recorded for
-/// it and the registry holds no reservation that could still produce one, so the daemon takes it for
-/// ended and says so. Privacy mode is then turned off, and the obligation stays, because what the
-/// session kept is the archive's.
+/// KR-REQ-24.28: an obligation for a session that has no worker, no launch and nothing on the disk
+/// does not hold privacy mode on, and is ended by the archive. The record a daemon that stopped
+/// left says privacy mode is on and that one more session owes its cleanup; no worker is recorded
+/// for it and the registry holds no reservation that could still produce one, so the daemon takes
+/// it for ended. The archive has nothing of it to remove, which is the evidence that nothing it
+/// kept is left, and the obligation ends: the change reports complete, and privacy mode is then
+/// turned off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_28_an_obligation_with_no_worker_and_no_launch_does_not_hold_privacy_mode_on() {
     let gone = SessionId::new(kr_ipc::new_uuid());
@@ -2344,33 +2348,27 @@ async fn kr_req_24_28_an_obligation_with_no_worker_and_no_launch_does_not_hold_p
     .await;
 
     // The daemon read the record: privacy mode is on. Its live session answers for itself; the
-    // session that has gone is taken for ended.
+    // session that has gone is taken for ended, the archive finds nothing of it to remove, and its
+    // obligation ends.
     let report = environment
         .status_until(
-            "the daemon taking the session that has gone for ended",
+            "the archive ending the obligation of the session that has gone",
             |report| {
                 report.enabled
-                    && report.sessions.iter().any(|owed| {
-                        owed.session_id == gone
-                            && matches!(owed.standing, PrivacySessionStanding::WorkerEnded)
-                    })
-                    && report.sessions.iter().all(|owed| owed.session_id == gone)
+                    && report.sessions.iter().all(|owed| owed.session_id != gone)
+                    && report.completion == PrivacyCompletion::Complete
             },
         )
         .await;
-    assert!(
-        !matches!(report.completion, PrivacyCompletion::Complete),
-        "what the session that has gone kept is not gone: {:?}",
-        report.completion
-    );
+    assert!(report.enabled);
     let off = environment
         .set(false)
         .await
         .expect("a session that has gone does not hold privacy mode on");
     assert!(!off.enabled);
     assert!(
-        off.sessions.iter().any(|owed| owed.session_id == gone),
-        "its obligation stays: {:?}",
+        off.sessions.iter().all(|owed| owed.session_id != gone),
+        "its obligation has ended: {:?}",
         off.sessions
     );
     environment.stop().await;

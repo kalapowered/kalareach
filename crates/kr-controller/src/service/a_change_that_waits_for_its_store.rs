@@ -773,13 +773,30 @@ fn is_ended(controller: &Controller, session_id: SessionId) -> bool {
         })
 }
 
+/// Whether privacy mode's record has stopped waiting for the session's worker: it has been taken
+/// for ended, and the archive may have found nothing of it to remove and ended its obligation.
+fn is_over(controller: &Controller, session_id: SessionId) -> bool {
+    controller
+        .privacy
+        .status(kr_ipc::now_ms())
+        .sessions
+        .iter()
+        .all(|owed| {
+            owed.session_id != session_id
+                || !matches!(
+                    owed.standing,
+                    kr_protocol::privacy::PrivacySessionStanding::AwaitingWorker
+                )
+        })
+}
+
 /// Waits until privacy mode's tick has taken every session in `sessions` for ended, and fails the
 /// test when it has not within thirty seconds.
-async fn ended(controller: &Controller, sessions: &[SessionId]) {
+async fn over(controller: &Controller, sessions: &[SessionId]) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !sessions
         .iter()
-        .all(|session_id| is_ended(controller, *session_id))
+        .all(|session_id| is_over(controller, *session_id))
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -943,9 +960,9 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
     // for ended is a pass that has read the registry with the second fenced, so once it has been
     // seen the second is known to have been passed over, and it holds the change back.
     recorded_as(&controller, claim, LaunchPhase::Failed).await;
-    ended(&controller, &[claim]).await;
+    over(&controller, &[claim]).await;
     assert!(
-        !is_ended(&controller, fenced),
+        !is_over(&controller, fenced),
         "the fenced launch may still produce a worker, so its session is not ended"
     );
     let refused = controller
@@ -958,15 +975,19 @@ async fn the_tick_ends_a_session_only_once_the_registry_shows_its_launch_is_over
     );
 
     // Both are over: the next pass takes them for ended, and privacy mode is turned off. What each
-    // had retained is the archive's, so their obligations stay.
+    // had retained is the archive's, which finds nothing of either on the disk and ends their
+    // obligations.
     recorded_as(&controller, fenced, LaunchPhase::Closed).await;
-    ended(&controller, &[claim, fenced]).await;
+    over(&controller, &[claim, fenced]).await;
     let off = controller
         .privacy
         .disable(kr_ipc::now_ms(), &standing)
         .expect("sessions whose launches are over do not hold privacy mode on");
     assert!(!off.enabled);
-    assert_eq!(obligations_on_disk(&temp), 2);
+    until("the archive ending the two obligations", || {
+        obligations_on_disk(&temp) == 0
+    })
+    .await;
 }
 
 /// How many obligations privacy mode's record holds on the disk.

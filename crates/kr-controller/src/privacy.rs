@@ -28,8 +28,9 @@
 //! * **Sessions apply the generation themselves.** Each live session's worker is told the
 //!   generation and answers with its own completion; a session's obligation ends only when its
 //!   worker says its cleanup is complete. A session whose worker has ended keeps its obligation,
-//!   reported as unavailable, because what it retained is the archive's and nothing here removes
-//!   it.
+//!   reported as unavailable, until the archive has removed what it retained
+//!   ([`crate::archive::ArchiveService::remove_retained_content`]); a removal that leaves
+//!   something is owed with its reason and tried again.
 //! * **A launch is recorded before its worker runs.** A session created while privacy mode is on
 //!   owes its cleanup from the moment its worker is asked for
 //!   ([`EnvironmentPrivacy::note_session_launching`]), and its worker is told the state in its
@@ -450,6 +451,17 @@ struct SessionProgress {
     reach: Reach,
     answer: Option<Answer>,
     notices: Backoff,
+    /// How the archive's removal of what an ended worker retained stands.
+    removal: Removal,
+}
+
+/// How the archive's removal of an ended worker's content stands.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Removal {
+    /// Why the last try left content behind, when it did.
+    failure: Option<String>,
+    /// When the next try is due.
+    retry: Backoff,
 }
 
 /// Whether a session's worker can be told anything.
@@ -520,7 +532,7 @@ pub enum Standing {
         reason: String,
     },
     /// Its worker ended before it said its cleanup was complete. What it retained is the
-    /// archive's, and the obligation stays until something gives evidence that it is gone.
+    /// archive's, and the obligation stays until the archive has removed it.
     WorkerEnded,
 }
 
@@ -1091,6 +1103,68 @@ impl EnvironmentPrivacy {
         } else {
             inner.sessions.remove(&session_id);
         }
+    }
+
+    /// Returns the sessions whose worker has ended and whose obligation the archive is to settle by
+    /// removing what the worker retained, whose turn has come.
+    ///
+    /// A session whose removal was refused is returned again on a schedule that lengthens, as every
+    /// refused step is.
+    #[must_use]
+    pub fn awaiting_removal(&self, now_ms: TimestampMs) -> Vec<SessionId> {
+        let inner = self.inner();
+        inner
+            .obligations
+            .keys()
+            .filter(|session_id| {
+                inner.sessions.get(session_id).is_some_and(|progress| {
+                    progress.reach == Reach::Ended && progress.removal.retry.due(now_ms)
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Whether a session's cleanup is still owed, so that what it retained is not served.
+    #[must_use]
+    pub fn owes_cleanup(&self, session_id: SessionId) -> bool {
+        self.inner().obligations.contains_key(&session_id)
+    }
+
+    /// Records that the archive removed what an ended worker retained, and ends its obligation,
+    /// durably.
+    ///
+    /// The obligation is deleted from the record first and the session forgotten only once that
+    /// has landed: a delete the store refuses leaves it owed, and the next removal, which finds
+    /// nothing more to take, ends it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the obligation's end cannot be
+    /// written.
+    pub fn note_removed(&self, session_id: SessionId) -> Result<()> {
+        let mut inner = self.inner();
+        let generation = inner.mode.generation();
+        if inner.obligations.contains_key(&session_id) {
+            inner.record.discharge(session_id, generation)?;
+            inner.obligations.remove(&session_id);
+        }
+        inner.unrecorded.remove(&session_id);
+        inner.sessions.remove(&session_id);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Records that the archive could not remove all that an ended worker retained, and why. The
+    /// obligation stays, reported with the reason, and the removal is tried again on a schedule.
+    pub fn note_removal_refused(&self, session_id: SessionId, reason: String, now_ms: TimestampMs) {
+        let mut inner = self.inner();
+        if !inner.obligations.contains_key(&session_id) {
+            return;
+        }
+        let progress = inner.sessions.entry(session_id).or_default();
+        progress.removal.failure = Some(reason);
+        progress.removal.retry = progress.removal.retry.after_failure(now_ms);
     }
 
     /// Returns the sessions this record follows or holds an obligation for whose worker it has no
@@ -1799,7 +1873,7 @@ impl crate::service::Controller {
         sessions.dedup();
         let controller = Arc::clone(self);
         let now_ms = kr_ipc::now_ms();
-        let report = tokio::task::spawn_blocking(move || {
+        let mut report = tokio::task::spawn_blocking(move || {
             controller
                 .privacy
                 .set(params.enabled, &sessions, now_ms, &|write| {
@@ -1810,6 +1884,16 @@ impl crate::service::Controller {
         .map_err(|_| ControllerError::RegistryUnavailable {
             detail: "the privacy change stopped before it could say what it did".to_owned(),
         })??;
+        if params.enabled {
+            // A session whose worker has ended has nobody to tell, so the archive removes what it
+            // retained now, and the answer says where that stands and not where it stood.
+            self.settle_closed_sessions().await;
+            let privacy = Arc::clone(&self.privacy);
+            let now_ms = kr_ipc::now_ms();
+            if let Ok(later) = tokio::task::spawn_blocking(move || privacy.status(now_ms)).await {
+                report = later;
+            }
+        }
         kr_protocol::envelope::ParamsValue::from_typed(&self.with_viewer_copies(report))
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -1935,7 +2019,14 @@ fn obligations(inner: &Inner) -> Vec<Obligation> {
         .map(|(session_id, owed_at)| {
             let progress = inner.sessions.get(session_id);
             let standing = match progress {
-                Some(progress) if progress.reach == Reach::Ended => Standing::WorkerEnded,
+                Some(progress) if progress.reach == Reach::Ended => {
+                    match &progress.removal.failure {
+                        Some(reason) => Standing::Unavailable {
+                            reason: reason.clone(),
+                        },
+                        None => Standing::WorkerEnded,
+                    }
+                }
                 Some(SessionProgress {
                     answer: Some(answer),
                     ..

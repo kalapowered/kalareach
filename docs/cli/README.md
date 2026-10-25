@@ -1156,8 +1156,9 @@ it, and only write it if you approve.
 This does not export private sessions. All sessions are private when in privacy mode, including
 those created after privacy mode is on, and those that have not yet been cleaned up after privacy
 mode was turned off (you can list these sessions using `kr privacy status`). If the worker of one of
-these sessions ended before it could complete the cleanup, it stays on the list even after you turn
-off privacy mode, because what it kept belongs to the archive. There is no other reason why a
+these sessions ended before it could complete the cleanup, it stays on the list, even after you turn
+off privacy mode, until the daemon has removed what it kept. The daemon does that when privacy mode
+is turned on, and tries again when it cannot; `kr privacy status` gives the reason. There is no other reason why a
 session would be private. Turning privacy mode off starts new retention from that point, so a
 session that went through a private period but does not owe anything to it anymore is exported, and
 so is a session that was created when privacy mode was on but has completed its cleanup.
@@ -1908,7 +1909,8 @@ far it has got: work that had already left this host and has not been answered, 
 whose worker has not yet said its own cleanup is complete. `kr privacy off` is refused while a
 service of this host or a session whose worker is running or still starting owes cleanup, and says
 what. A session whose worker has ended does not hold it back, because nothing resumes in its store;
-its obligation stays recorded and `kr privacy status` keeps reporting it. Nothing privacy mode
+its obligation stays recorded, and `kr privacy status` keeps reporting it, until the daemon has
+removed what the session kept. Nothing privacy mode
 removed comes back when it is turned off.
 
 Use `kr privacy status` to also show what data will be retained on this host while in privacy mode

@@ -164,10 +164,23 @@ impl Controller {
     }
 
     /// Whether this daemon answers a read with text it can take back before it leaves: what a
-    /// session's worker answered and what a model wrote. Such a read is served with
-    /// [`Self::read_released`].
-    pub(super) fn releases(method: Method) -> bool {
-        crate::attention::AttentionModule::serves(method) || method == Method::SessionDescribe
+    /// session's worker answered, what a model wrote and what a closed session retained. Such a
+    /// read is served with [`Self::read_released`].
+    pub(super) fn releases(request: &Request) -> bool {
+        match request.method.method() {
+            Some(Method::HistoryPage | Method::HistoryTimes) => true,
+            // A receipt of an action the host performed itself names no session, and the
+            // catalogue answers it.
+            Some(Method::ActionRead) => request
+                .params
+                .to_typed::<kr_protocol::receipt::ActionReadParams>()
+                .is_ok_and(|params| params.session_id.is_some()),
+            Some(method) => {
+                crate::attention::AttentionModule::serves(method)
+                    || method == Method::SessionDescribe
+            }
+            None => false,
+        }
     }
 
     /// Serves one read whose answer is released under a privacy fence, to the owner at this
@@ -179,6 +192,11 @@ impl Controller {
         actor_id: &ActorId,
         request: &Request,
     ) -> crate::attention::Released {
+        if let Some(method @ (Method::HistoryPage | Method::HistoryTimes | Method::ActionRead)) =
+            request.method.method()
+        {
+            return self.archive_read_released(actor_id, request, method).await;
+        }
         if request.method.method() == Some(Method::SessionDescribe) {
             // A session's name is the environment's metadata, filtered for whoever asks.
             let described = async {

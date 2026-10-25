@@ -20,12 +20,13 @@
 //!   inside the retained range where a segment has gone - an interval durable writing was lost,
 //!   and a recovery pass that did not run. A reader paging across a hole is told the range and
 //!   given what follows it.
-//! * **Privacy mode is the worker's, not the archive's.** A store recovered here is not checked
-//!   for an unfinished privacy cleanup, and a content read is not held while one is owed, so a
-//!   host that crashed between recording privacy mode and removing what it was asked to remove
-//!   serves that content from here, and so does one whose last redaction failed. Recovery would
-//!   have to read the privacy generation under ownership and run both obligations, and a content
-//!   read would have to be refused while either is owed; neither is built.
+//! * **Privacy mode reaches a closed session through the archive.** A session with no worker has
+//!   nobody to be told that privacy mode is on, so the archive removes what it retained, under the
+//!   same recovery ownership ([`ArchiveService::remove_retained_content`]): the output and its
+//!   time index, and the content of the receipts that have settled. The session's obligation ends
+//!   only when nothing is left, and the daemon serves none of what the session retained while the
+//!   obligation stands, so a host that crashed between recording privacy mode and removing what it
+//!   was asked to remove, or whose last removal failed, serves none of it from here.
 //! * **A worker crash closes the session, and what it still owned is stopped first.** The closure
 //!   is recorded and nothing is rebuilt from terminal history. Taking ownership removes the
 //!   worker's published endpoint and descriptor; [`ArchiveService::fence_owned`] then stops what
@@ -278,6 +279,29 @@ pub struct Collected {
     pub receipts_retained: Option<u64>,
     /// Why receipts past their retention are still there, when some are.
     pub receipts_left_behind: Option<String>,
+}
+
+/// What removing a closed session's content for privacy mode took, and what it could not.
+///
+/// The two stores are reported apart from the count: output with its time index, and the content
+/// of settled receipts. Either can refuse on its own, and a session's cleanup is complete only
+/// when neither did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Removed {
+    /// Bytes of retained output that went.
+    pub output_bytes: u64,
+    /// Receipt records whose content went.
+    pub receipts: u64,
+    /// Why some of it is still there, one reason for each store that refused.
+    pub left_behind: Vec<String>,
+}
+
+impl Removed {
+    /// Whether everything the cleanup was asked to remove is gone.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.left_behind.is_empty()
+    }
 }
 
 /// Exclusive recovery ownership of one session's stores.
@@ -944,6 +968,108 @@ impl ArchiveService {
             .or_else(|| into.times_left_behind.take());
     }
 
+    /// Removes the content a closed session retained, as privacy mode asks, under recovery
+    /// ownership.
+    ///
+    /// A live session's worker removes its own retained output and the content of its settled
+    /// receipts when it is told privacy mode is on. A session with no worker has no one to tell,
+    /// so the archive does the same two removals on its stores, with the worker's own functions:
+    /// the output goes through the history that publishes the boundary first, so a reader is told
+    /// where the output had reached and which range is gone, and the settled receipts keep their
+    /// identity, state and digests and lose the intent envelope and the result. The envelope of an
+    /// action that has not settled stays, as it does in a worker: recovery reads it. The time
+    /// index goes with the output it describes.
+    ///
+    /// Each store's failure is reported in [`Removed::left_behind`] and does not stop the other.
+    /// A removal that left something is not one the caller may call done.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a worker may still own the session, and nothing is removed then.
+    pub fn remove_retained_content(&self, ownership: &RecoveryOwnership) -> Result<Removed> {
+        let session_id = ownership.session_id;
+        if self.a_worker_may_still_own(session_id) {
+            return Err(OwnershipRefusal::WorkerMayRemain {
+                session: session_id.to_string(),
+            }
+            .into());
+        }
+        // The journal is opened for writing, so a store an earlier build wrote is brought forward
+        // first, under the ownership this holds.
+        self.bring_forward_owned(ownership);
+        let mut removed = Removed::default();
+        self.remove_receipt_content(session_id, &mut removed);
+        self.remove_output_content(session_id, &mut removed);
+        Ok(removed)
+    }
+
+    /// Takes the content out of the receipts that have settled.
+    fn remove_receipt_content(&self, session_id: SessionId, into: &mut Removed) {
+        let path = self.paths.journal_database(session_id);
+        match path.try_exists() {
+            Ok(true) => {}
+            // A session that never had a journal has no receipt to take content from.
+            Ok(false) => return,
+            Err(error) => {
+                into.left_behind.push(format!(
+                    "this session's journal could not be looked for: {error}"
+                ));
+                return;
+            }
+        }
+        match Journal::open_existing(&path).and_then(|mut journal| journal.redact_settled_content())
+        {
+            Ok(records) => into.receipts = records,
+            Err(error) => into.left_behind.push(format!(
+                "this session's receipts could not have their content removed: {error}"
+            )),
+        }
+    }
+
+    /// Takes the retained output and its time index away, keeping where the output had reached.
+    fn remove_output_content(&self, session_id: SessionId, into: &mut Removed) {
+        let times = self.paths.session_output_times(session_id);
+        // A worker killed while it made the index left the file it was building, which nothing
+        // else names.
+        if let Err(why) = kr_worker::output_times::remove_unfinished(&times) {
+            into.left_behind.push(why);
+        }
+        let directory = self.paths.session_spool(session_id);
+        match directory.try_exists() {
+            Ok(true) => {}
+            // No spool, but an index could be there: it describes output that is not.
+            Ok(false) => {
+                if let Err(why) = kr_worker::output_times::TimeIndex::new(times).discard() {
+                    into.left_behind.push(why);
+                }
+                return;
+            }
+            Err(error) => {
+                into.left_behind.push(format!(
+                    "this session's spool could not be looked for: {error}"
+                ));
+                return;
+            }
+        }
+        // The opener that creates and repairs nothing: removal takes what is there, and a
+        // directory that is not there is not one to make.
+        let mut history = match kr_worker::history::OutputHistory::read_spool(
+            &directory,
+            kr_worker::history::SpoolLayout::DEFAULT,
+        ) {
+            Ok(history) => history.with_time_index(times),
+            Err(error) => {
+                into.left_behind.push(error.to_string());
+                return;
+            }
+        };
+        let discarded = history.discard_retained();
+        into.output_bytes = discarded.bytes;
+        if let Some(why) = discarded.left_behind {
+            into.left_behind.push(why);
+        }
+    }
+
     /// Gives up output of a closed session so that the host-wide cap holds, and returns how many
     /// bytes went.
     ///
@@ -1194,10 +1320,45 @@ impl ArchiveService {
         action_id: kr_protocol::ids::ActionId,
         owner: bool,
     ) -> Result<ActionReadResult> {
-        use kr_worker::history_filter::retained::{
-            Disclosure, Occasion, shown_receipt, shown_result, withheld_entirely,
-        };
+        let (receipt, retained) = self.load_receipt(session_id, actor_id, action_id)?;
+        Self::show_receipt(&receipt, retained, owner)
+    }
 
+    /// Reads one retained receipt of a closed session twice over: as the owner is shown it, and as
+    /// the answer reads when what it carries has been withheld, which is the state of the action
+    /// alone.
+    ///
+    /// The second is what a read is released as when privacy mode is turned on between the read
+    /// and the write of its answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::receipt`], for the owner's.
+    pub fn receipt_and_its_withheld(
+        &self,
+        session_id: SessionId,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> Result<(ActionReadResult, ActionReadResult)> {
+        use kr_worker::history_filter::retained::{Disclosure, shown_receipt};
+
+        let (receipt, retained) = self.load_receipt(session_id, actor_id, action_id)?;
+        let whole = Self::show_receipt(&receipt, retained.clone(), true)?;
+        let withheld =
+            Self::show_receipt(&receipt, retained, false).unwrap_or_else(|_| ActionReadResult {
+                receipt: shown_receipt(&Disclosure::StateOnly, receipt),
+                result: Nullable(None),
+            });
+        Ok((whole, withheld))
+    }
+
+    /// Reads the receipt of an action of a closed session, and the result it kept.
+    fn load_receipt(
+        &self,
+        session_id: SessionId,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> Result<(Receipt, Option<Vec<u8>>)> {
         self.bring_forward(session_id);
         let path = self.paths.journal_database(session_id);
         if !path.exists() {
@@ -1216,6 +1377,20 @@ impl ArchiveService {
         let retained = journal
             .read_result(actor_id, action_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        Ok((receipt, retained))
+    }
+
+    /// Shows a receipt and its result to `owner` whole, or to anybody else as the state of the
+    /// action.
+    fn show_receipt(
+        receipt: &Receipt,
+        retained: Option<Vec<u8>>,
+        owner: bool,
+    ) -> Result<ActionReadResult> {
+        use kr_worker::history_filter::retained::{
+            Disclosure, Occasion, shown_receipt, shown_result, withheld_entirely,
+        };
+
         let disclosure = if owner {
             Disclosure::Whole
         } else {
@@ -1241,7 +1416,7 @@ impl ArchiveService {
             })
             .transpose()?;
         Ok(ActionReadResult {
-            receipt: shown_receipt(&disclosure, receipt),
+            receipt: shown_receipt(&disclosure, receipt.clone()),
             result: Nullable(result),
         })
     }

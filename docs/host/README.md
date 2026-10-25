@@ -4684,9 +4684,17 @@ Each session is told the generation by the daemon, on a tick once a second, over
 daemon holds to its worker. The worker raises its attention transition, applies the generation to
 the session and answers where its own cleanup stands. The tick tells it again, waiting longer each
 time, until it answers that its cleanup is complete, and only that answer ends its obligation. A
-session whose worker ended first keeps its obligation, reported as unavailable with the archive
-named as what holds its output, because an ended worker is no evidence that what it retained is
-gone.
+session whose worker ended first has nobody to tell, so the archive removes what it retained, under
+the session's recovery ownership: the retained output and its time index, through the removal a
+worker makes, which publishes where the output had reached, and the content of the receipts that
+have settled, which keep their identity, state and digests. Receipts that have not settled keep
+their intent. The obligation ends only when nothing is left. A removal that leaves something is
+reported as unavailable with the reason, and is tried again on a schedule that lengthens, across a
+restart. While the obligation stands, `history.page`, `history.times` and `action.read` of that
+session are refused with `RESOURCE_UNAVAILABLE`. Once the output is removed they answer a gap with
+no bytes. A page that was read before privacy mode was turned on, and has not yet been written to
+the reader when it is, is written without its bytes, as a range that is gone. `privacy.set` runs the
+removal before it answers, so the answer says where it stands.
 
 Creating a new session in privacy mode doesn't wait for a tick. The daemon records the new session's
 obligation before it asks for the worker. That write waits for whatever holds the record, a change
@@ -4709,7 +4717,8 @@ A record it cannot read stops the start rather than leaving the daemon to guess.
 
 Turning it off is refused while a daemon subsystem, or a session whose worker is running or may
 still start, owes cleanup, and the refusal names what is owed. A session whose worker has ended does
-not hold it back, because nothing resumes in its store, and its obligation stays recorded. A session
+not hold it back, because nothing resumes in its store, and its obligation stays recorded until the
+archive has removed what the session retained. A session
 counts as ended only when the registry shows its launch is over: it has no reservation, or one whose
 launch failed after a worker claimed it, or whose session has closed. A session whose worker has not
 reported yet is one this host has not reached, and it holds turning privacy mode off back until its
@@ -4931,9 +4940,14 @@ what it removes is exactly the thing a person cannot check for themselves.
 
 * **A worker that claims its reservation and then fails keeps its obligation.** A worker that
   reports it could not start after it claimed its reservation, or that ended before it said its
-  cleanup was complete, is taken for ended. Its obligation is preserved, and the report names the
-  archive as what holds whatever it kept. Differently, a launch that fails before any claim is
-  forgotten, since it ran no shell.
+  cleanup was complete, is taken for ended. Its obligation is preserved until the archive has
+  removed whatever it kept, or found nothing of it on the disk, and the report names the archive
+  as what holds it until then. Differently, a launch that fails before any claim is forgotten,
+  since it ran no shell.
+* **Change sets are not stopped.** A change set is the person's own capture of repository work
+  under file grants, and stopping it would stop the completion, test and review workflow under
+  privacy mode; the "outboxes and captures" privacy mode fences are session content: output,
+  descriptions and the queues that carry them off this host.
 * **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
   privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
   daemon takes through the steps.

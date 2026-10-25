@@ -16,6 +16,7 @@ use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 use crate::registry::LaunchPhase;
 
+use super::routes::is_owners_own_socket;
 use super::workers::{UNACCOUNTED_WORKER, WORKER_EXCHANGE};
 use super::{Controller, encode, parse};
 
@@ -213,6 +214,7 @@ impl Controller {
     ) -> Result<ParamsValue> {
         let params: kr_protocol::recovery::HistoryPageParams = parse(params)?;
         self.refuse_if_live(params.session_id).await?;
+        self.refuse_while_cleanup_is_owed(params.session_id).await?;
         let page = self.archive().history_page(
             params.session_id,
             params.from_cursor.get(),
@@ -233,6 +235,7 @@ impl Controller {
     ) -> Result<ParamsValue> {
         let params: kr_protocol::recovery::HistoryTimesParams = parse(params)?;
         self.refuse_if_live(params.session_id).await?;
+        self.refuse_while_cleanup_is_owed(params.session_id).await?;
         let archive = self.archive();
         let (from, to) = (params.from_cursor.get(), params.to_cursor.get());
         let read = tokio::task::spawn_blocking(move || {
@@ -313,10 +316,119 @@ impl Controller {
             ));
         };
         self.refuse_if_live(session_id).await?;
+        self.refuse_while_cleanup_is_owed(session_id).await?;
         let read = self
             .archive()
             .receipt(session_id, actor_id, params.action_id, owner)?;
         encode(&read)
+    }
+
+    /// Serves a read of a closed session's retained content as an answer that is released under
+    /// the privacy state it was read under.
+    ///
+    /// The read is the archive's, with its own refusals. What it carries is output or the content
+    /// of a receipt, which privacy mode removes, so the answer leaves only while privacy mode
+    /// stands as it did when the read began: if it is turned on between the read and the write,
+    /// the answer that is written is the same with its content withheld, a range the reader is
+    /// told is gone. The state is taken before the archive is read.
+    pub(super) async fn archive_read_released(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        request: &Request,
+        method: kr_protocol::method::Method,
+    ) -> crate::attention::Released {
+        use kr_protocol::method::Method;
+
+        let state = self.privacy.state().clone();
+        let decided = state.now();
+        let read: Result<(ParamsValue, ParamsValue)> = async {
+            match method {
+                Method::HistoryPage => {
+                    let value = self.archive_history_page(&request.params).await?;
+                    let page: kr_protocol::recovery::HistoryPageResult = value
+                        .to_typed()
+                        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                    Ok((value, encode(&withheld_page(&page))?))
+                }
+                Method::HistoryTimes => {
+                    let value = self.archive_history_times(&request.params).await?;
+                    let times: kr_protocol::recovery::HistoryTimesResult = value
+                        .to_typed()
+                        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                    Ok((value, encode(&withheld_times(&times))?))
+                }
+                _ => {
+                    let params: kr_protocol::receipt::ActionReadParams = parse(&request.params)?;
+                    let session_id = params.session_id.ok_or_else(|| {
+                        ControllerError::InvalidArgument(
+                            "a receipt this daemon serves belongs to a session, which this \
+                             request does not name"
+                                .to_owned(),
+                        )
+                    })?;
+                    self.refuse_if_live(session_id).await?;
+                    self.refuse_while_cleanup_is_owed(session_id).await?;
+                    let owner = is_owners_own_socket(actor_id);
+                    let (whole, withheld) = self.archive().receipt_and_its_withheld(
+                        session_id,
+                        actor_id,
+                        params.action_id,
+                    )?;
+                    let shown = if owner {
+                        whole
+                    } else {
+                        self.archive()
+                            .receipt(session_id, actor_id, params.action_id, false)?
+                    };
+                    Ok((encode(&shown)?, encode(&withheld)?))
+                }
+            }
+        }
+        .await;
+        match read {
+            Ok((value, withheld)) => crate::attention::Released::of(
+                request.request_id,
+                Ok(crate::attention::Read::with(
+                    value,
+                    withheld,
+                    crate::attention::Ticket::of_generated(
+                        crate::attention::Generated::read_under(state, decided),
+                    ),
+                )),
+            ),
+            Err(error) => {
+                crate::attention::Released::of(request.request_id, Err(error.to_protocol_error()))
+            }
+        }
+    }
+
+    /// Refuses a read of what a closed session retained while privacy mode's cleanup of it is
+    /// owed: the content is on the disk until the archive has removed it, and is not served.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal naming the session, with the code of a resource that is not there to be
+    /// read yet.
+    pub(super) async fn refuse_while_cleanup_is_owed(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Result<()> {
+        let privacy = Arc::clone(&self.privacy);
+        let owed = tokio::task::spawn_blocking(move || privacy.owes_cleanup(session_id))
+            .await
+            .map_err(|_| ControllerError::RegistryUnavailable {
+                detail: "privacy mode's record could not be read".to_owned(),
+            })?;
+        if owed {
+            return Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: format!(
+                    "privacy mode's cleanup of session {session_id} is not finished, so what it \
+                     retained is not served"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Refuses a read of a session whose worker this daemon has not confirmed gone.
@@ -779,5 +891,45 @@ mod tests {
                 (3, SessionState::Creating)
             ]
         );
+    }
+}
+
+/// A page of a closed session's output with its bytes withheld, as the reader is told: the range
+/// the page covered is gone.
+fn withheld_page(
+    page: &kr_protocol::recovery::HistoryPageResult,
+) -> kr_protocol::recovery::HistoryPageResult {
+    let gap = match page.gap.0 {
+        Some(gap) => kr_protocol::recovery::HistoryGap {
+            from_cursor: gap.from_cursor,
+            to_cursor: page.next_cursor,
+            cause: gap.cause,
+        },
+        None => kr_protocol::recovery::HistoryGap {
+            from_cursor: page.from_cursor,
+            to_cursor: page.next_cursor,
+            cause: None,
+        },
+    };
+    kr_protocol::recovery::HistoryPageResult {
+        from_cursor: page.from_cursor,
+        next_cursor: page.next_cursor,
+        bytes: kr_protocol::scalars::Bytes::new(Vec::new()),
+        oldest_retained_cursor: page.next_cursor,
+        gap: Nullable::some(gap),
+    }
+}
+
+/// The times of a closed session's output with the intervals withheld.
+fn withheld_times(
+    times: &kr_protocol::recovery::HistoryTimesResult,
+) -> kr_protocol::recovery::HistoryTimesResult {
+    kr_protocol::recovery::HistoryTimesResult {
+        intervals: Vec::new(),
+        next_cursor: times.next_cursor,
+        complete: times.complete,
+        unavailable: Nullable::some(
+            "privacy mode was turned on while this was read, so the times are withheld".to_owned(),
+        ),
     }
 }
