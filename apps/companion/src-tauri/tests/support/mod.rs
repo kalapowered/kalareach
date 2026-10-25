@@ -681,6 +681,7 @@ impl Companion {
                 companion_tauri::commands::agent_turn_steer,
                 companion_tauri::commands::agent_turn_cancel,
                 companion_tauri::commands::agent_approval_respond,
+                companion_tauri::commands::plugin_action_invoke,
                 companion_tauri::commands::action_read,
                 companion_tauri::commands::action_cancel,
                 companion_tauri::commands::history_page,
