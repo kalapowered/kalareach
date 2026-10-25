@@ -558,10 +558,17 @@ next update.
 Each file of a release is read-only by attribute. Each file and directory also carries an entry
 that denies its owner the rights that write it (adding a file or a subdirectory, writing,
 appending, deleting, deleting a child), because the read-only attribute of a directory does not stop
-new names. A release is removed by renaming it out of `versions\`, resetting those entries and
-deleting the tree. The deletion follows no junction and changes no file by its path: a file of the
-release that is a second name for a file outside it is deleted as a name, and the file outside
-keeps its attribute and its entries.
+new names. A release is removed by renaming it out of `versions\`, resetting the entries of each
+directory and deleting the tree. The deletion follows no junction. It deletes a file as a name,
+through a handle, and changes nothing else about the file: a file of the release that is a second
+name for a file outside it goes as a name, and the file outside keeps its contents, its attribute
+and its entries. The one exception is a file that carries the seal's entries. Deleting a read-only
+file needs the right to change attributes, which those entries deny the owner, so the removal resets
+them first, and a file outside that is a second name for such a file has them reset with it.
+
+A program that runs from a file keeps it: the rest of the release is deleted, and what is left
+stays in `trash\` until an update finds the program ended. A refusal that no program caused, such as
+entries the owner cannot reset, is reported and is not taken for a program.
 
 ### The archive
 

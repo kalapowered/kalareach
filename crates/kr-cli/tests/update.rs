@@ -1067,7 +1067,7 @@ async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
 /// Windows the new release's daemon is a program the environment's task cannot run.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_next_run() {
+async fn a_daemon_the_task_cannot_start_after_the_switch_keeps_the_update_for_the_next_run() {
     let mut host = Host::bare();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
@@ -2278,7 +2278,7 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
 /// program holds is not replaced, and the install waits.
 #[cfg(windows)]
 #[test]
-fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
+fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run_on_windows() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let program = format!("bin/{}", Program::Kr.file_name());
     // What is done to the kept release, given its directory, a directory outside the store and the
