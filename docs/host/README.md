@@ -4104,10 +4104,16 @@ so the announcements about its pending questions and approvals are held back fro
 they are while any closure is under way. While the hold lasts none of the session's text is
 served; a read that finds the journal can be brought forward serves it at once, and ends the wait
 the session had, so the store finishes it on its next pass and its items are delivered then, not
-at the end of that wait. On Linux a
-process of a later boot that repeats the launch process's identifier and start tick reads as the
-worker for as long as it runs, because an identity carries no boot; the reads and the collection
-leave the session alone until it ends.
+at the end of that wait. A migration that was made and failed (the store was busy or full, or
+damaged) is not a hold for a worker, and it is not an unreadable journal either: the session is
+tried the same way, the items held and no text served, but only so often. After ten tries that
+found the migration failing the store finishes the session with gaps, as it does for a journal it
+cannot read, and a migration made later does not repair them. The count is kept in memory and
+starts again when the daemon does; a try that finds the journal held back for a worker is not one
+of the ten. A summary of the session's changes is not asked for while the store still tries it. On
+Linux a process of a later boot that repeats the launch process's identifier and start tick reads
+as the worker for as long as it runs, because an identity carries no boot; the reads and the
+collection leave the session alone until it ends.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the

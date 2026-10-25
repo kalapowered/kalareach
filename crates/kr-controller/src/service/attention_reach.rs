@@ -208,13 +208,15 @@ impl crate::attention::Reach for AttentionReach {
         };
         // A session that closed under an earlier build wrote an earlier schema, and the archive
         // brings it forward once no worker may own it. Until then the journal is held back, which
-        // the store tries again later and does not take for a journal it cannot read.
+        // the store tries again later and does not take for a journal it cannot read. A migration
+        // that was made and failed is told apart, since the store tries it again only so often.
         let forward = controller.archive().bring_forward(session_id);
         match kr_worker::journal::Journal::open_read_only(
             controller.paths.journal_database(session_id),
         ) {
             Ok(journal) => ClosedJournal::Open(Box::new(journal)),
             Err(_) if forward == crate::archive::Forward::HeldBack => ClosedJournal::HeldBack,
+            Err(_) if forward == crate::archive::Forward::Failed => ClosedJournal::Failing,
             Err(_) => ClosedJournal::Unreadable,
         }
     }
