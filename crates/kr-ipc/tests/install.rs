@@ -805,6 +805,34 @@ fn a_release_a_program_holds_cannot_be_renamed_or_deleted_by_anyone() {
     std::fs::rename(&directory, &elsewhere).expect("once nothing holds it, it moves");
 }
 
+/// KR-REQ-26.06: a release as an install leaves it, sealed, is removed whole: nothing of it is left
+/// in the store or in the trash, and a file of it that is a second name for a file outside is deleted
+/// as a name and the file outside is not changed.
+#[cfg(windows)]
+#[test]
+fn a_sealed_release_is_removed_whole() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let directory = test.store.release_directory(&one);
+    std::fs::create_dir_all(directory.join("share")).expect("a directory");
+    std::fs::write(directory.join("share/data"), b"data").expect("a file");
+    seal_tree(&directory);
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(test.store.retire(&one, &update).expect("removes"));
+    assert!(!directory.exists(), "the store has no trace of it");
+    let left: Vec<_> = std::fs::read_dir(test.store.trash())
+        .expect("reads the trash")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert!(left.is_empty(), "and neither has the trash: {left:?}");
+}
+
 /// KR-REQ-26.06: a read of a file of a release is not refused by the question whether the release
 /// is held, which opens the manifest with no sharing for an instant: `kr host versions` asks it of
 /// every release while another command reads a manifest. A manifest is read two thousand times while
@@ -865,6 +893,8 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
         .join("bin")
         .join("kr-plugin-host.exe");
     std::fs::copy(system.join("System32").join("ping.exe"), &waiting).expect("a program");
+    // As an install leaves a release: sealed.
+    seal_tree(&test.store.release_directory(&one));
     let mut running = std::process::Command::new(&waiting)
         .args(["-n", "300", "127.0.0.1"])
         .stdout(std::process::Stdio::null())
@@ -892,6 +922,17 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
         1,
         "the running program keeps its release in the trash"
     );
+    let kept = std::fs::read_dir(test.store.trash())
+        .expect("reads the trash")
+        .flatten()
+        .next()
+        .expect("one entry")
+        .path();
+    let refused = kr_ipc::install::remove_sealed_tree(&kept);
+    assert!(
+        refused.is_err(),
+        "a program still runs from it: {refused:?}"
+    );
 
     // A junction in the trash to a sealed directory elsewhere.
     let outside = test.root.join("outside");
@@ -909,6 +950,8 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
 
     running.kill().expect("the program is ended");
     running.wait().expect("and gone");
+    let last = kr_ipc::install::remove_sealed_tree(&kept);
+    assert!(last.is_ok(), "removal after the program ended: {last:?}");
     test.store.sweep_trash(&update).expect("sweeps");
     let result = (
         left(),
