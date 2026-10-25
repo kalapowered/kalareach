@@ -925,7 +925,12 @@ impl InputDomain {
         let mut queued_bytes = 0_u64;
         for reply in replies {
             let queued = self.writer.queued_input_bytes.load(Ordering::Acquire);
-            let held = queued.saturating_sub(self.writer.queued_lease_bytes.load());
+            // What the replies themselves hold: queued and neither written nor dropped. The queue
+            // holds more than that. The keystrokes a takeover made stale stay in it until the
+            // writer reaches them, and the count of the lease they were accepted under went with
+            // the takeover, so taking the lease's share off the queue would charge them to the
+            // replies.
+            let held = self.writer.unwritten_replies.load(Ordering::Acquire);
             // Two bounds, both of them this reply's: its own share, so an application that asks
             // questions without reading the answers cannot fill the terminal by itself, and the
             // whole budget, so its share cannot be spent on top of a full queue. What the root
