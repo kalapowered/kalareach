@@ -115,10 +115,11 @@ pub fn check_selection_against_offer(offer: &ClientOffer, selection: &HostSelect
 /// The checks, in order:
 ///
 /// 1. the selection answers the offer ([`check_selection_against_offer`]);
-/// 2. each side's declared key revision equals the paired record's, so a stale key is rejected;
-/// 3. the selection's endpoint identity equals the host's paired endpoint;
-/// 4. the live iroh endpoints equal the paired endpoints on both sides;
-/// 5. both signatures verify over the exact transcript.
+/// 2. each side's declared device identity equals the paired record's;
+/// 3. each side's declared key revision equals the paired record's, so a stale key is rejected;
+/// 4. the selection's endpoint identity equals the host's paired endpoint;
+/// 5. the live iroh endpoints equal the paired endpoints on both sides;
+/// 6. both signatures verify over the exact transcript.
 ///
 /// Returns the transcript digest, which the caller records for the connection.
 ///

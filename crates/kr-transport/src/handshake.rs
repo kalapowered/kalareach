@@ -564,8 +564,11 @@ impl Drop for WindowGuard<'_> {
 ///
 /// Returns the first refusal or mismatch: [`TransportError::Refused`] when the host refused the
 /// offer or the proof itself, and [`TransportError::Handshake`] for what this side concluded, such
-/// as a reply that never came or a selection or acceptance it cannot use. A client that cannot
-/// verify the host's proof never enables an authorised stream, whatever the host said.
+/// as a reply that never came, an extension it did not offer, limits below what a connection needs
+/// or an acceptance it cannot use. [`TransportError::Crypto`] reports a selection that does not
+/// answer the offer (a version, a capability or a limit the offer did not name, or a nonce it does
+/// not echo) and a proof or record binding that does not hold. A client that cannot verify the
+/// host's proof never enables an authorised stream, whatever the host said.
 pub async fn connect(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -737,10 +740,11 @@ impl CandidateConnection {
 /// extension this side did not offer, or its limits are below what a connection needs;
 /// [`TransportError::Crypto`] when the selection does not answer the offer (a version, a capability
 /// or a limit the offer did not name, or a nonce it does not echo); or a stream failure. The
-/// selection is checked as the paired [`connect`] checks it, so a candidate never talks to a host
-/// whose answer it would refuse on a paired connection. A host that answers with an acceptance is
-/// refused here: a connection with no paired record must not be treated as authorised however the
-/// host replied.
+/// selection is checked against the offer as the paired [`connect`] checks it. What only a paired
+/// record can confirm (the host's device identity, key revision and endpoint identity) is not
+/// checked here and is the caller's to check. A host that answers with an acceptance is refused
+/// here: a connection with no paired record must not be treated as authorised however the host
+/// replied.
 pub async fn connect_unpaired(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -791,8 +795,8 @@ fn client_offer(identity: &LocalIdentity) -> Result<ClientOffer> {
 
 /// Refuses a selection the client cannot use, before anything is used under it.
 ///
-/// Both client paths run it on the host's selection, the paired one and the candidate one, since
-/// neither has anything to verify the host's word against but its own offer:
+/// Both client paths run it on the host's selection, the paired one and the candidate one. It
+/// needs no paired record, because it judges the selection against the client's own offer:
 ///
 /// * an extension the offer did not carry with that hash is not in force, because neither side
 ///   agreed on its schema;

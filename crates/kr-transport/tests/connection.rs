@@ -2063,10 +2063,9 @@ async fn a_candidate_connects_when_the_selection_answers_its_offer() {
 /// The binding failure a candidate ends with against a host that plays `script`, and the check it
 /// names.
 async fn candidate_binding_failure(script: HostScript) -> &'static str {
-    let TransportError::Crypto(kr_crypto::CryptoError::BindingMismatch { what }) =
-        candidate_ending(script).await
-    else {
-        panic!("a selection that does not answer the offer is a binding failure");
+    let error = candidate_ending(script).await;
+    let TransportError::Crypto(kr_crypto::CryptoError::BindingMismatch { what }) = error else {
+        panic!("a selection that does not answer the offer is a binding failure, not {error}");
     };
     what
 }
