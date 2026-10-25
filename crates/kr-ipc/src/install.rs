@@ -203,9 +203,6 @@ pub enum InstallError {
         #[source]
         source: std::io::Error,
     },
-    /// This platform keeps no store.
-    #[error("this host keeps no store of releases on this platform")]
-    Unsupported,
 }
 
 impl InstallError {
@@ -2147,7 +2144,18 @@ impl Store {
             Err(error) => return Err(InstallError::io("read", &trash, error)),
         };
         for entry in entries.flatten() {
-            let _ = remove_tree(&entry.path());
+            let path = entry.path();
+            // Whatever is in the trash that is not a plain directory is taken away as a name: a
+            // junction there would otherwise lead the removal into the directory it names.
+            let is_directory =
+                std::fs::symlink_metadata(&path).is_ok_and(|about| about.file_type().is_dir());
+            let _ = if is_directory {
+                remove_tree(&path)
+            } else {
+                std::fs::remove_dir(&path)
+                    .or_else(|_| std::fs::remove_file(&path))
+                    .map_err(|error| InstallError::io("remove", &path, error))
+            };
         }
         Ok(())
     }
