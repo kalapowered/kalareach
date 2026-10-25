@@ -27,8 +27,8 @@
 //! accepted before is refused. Anything else is dropped. An item that opens but is not an
 //! announcement that the feed changed is taken off the service and does nothing: the mailbox
 //! carries no keystroke, command, decision or closure, and nothing the host reads from it executes
-//! anything. A payload that bears authority is refused here whatever it says, because this host
-//! takes its authority from its feed and from its own records.
+//! anything. No payload kind bears authority, because this host takes its authority from its feed
+//! and from its own records.
 //!
 //! # What is durable, and in which order
 //!

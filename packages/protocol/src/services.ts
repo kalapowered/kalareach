@@ -133,20 +133,8 @@ export const MAILBOX_PAYLOAD_TYPES: readonly MailboxPayloadType[] = [
   'authority_feed_change',
   'action_receipt',
   'state_reference',
-  'signed_authority_object',
   'notification_preview',
   'sync_change'
-]
-
-/**
- * The payload kinds that carry authority of their own.
- *
- * A forwarded signed object is authority rather than a state notification, so it is never
- * coalesced and never names a thread: section 10 keeps revocation records outside notification
- * coalescing.
- */
-export const AUTHORITY_BEARING_PAYLOAD_TYPES: readonly MailboxPayloadType[] = [
-  'signed_authority_object'
 ]
 
 /** Every synchronised object kind, in the order the protocol declares them. */
@@ -624,7 +612,6 @@ export type StructureRefusal =
   | { readonly reason: 'too_large'; readonly bucket: bigint; readonly limit: number }
   | { readonly reason: 'lifetime_too_long'; readonly ahead: bigint; readonly limit: number }
   | { readonly reason: 'already_expired'; readonly behind: bigint }
-  | { readonly reason: 'authority_coalesced' }
   | {
     readonly reason: 'bundle_length'
     readonly length: number
@@ -635,10 +622,9 @@ export type StructureRefusal =
 /**
  * Everything about a sealed mailbox item a service can check without a key, or null.
  *
- * Five rules: the payload kind is one of the closed set, the declared bucket is a length the
- * padding rules produce, the ciphertext is exactly that bucket plus the seal's overhead, the item
- * expires inside the day section 9 gives it and not in the past, and a payload that carries
- * authority names no coalescing thread.
+ * Four rules: the payload kind is one of the closed set, the declared bucket is a length the
+ * padding rules produce, the ciphertext is exactly that bucket plus the seal's overhead, and the
+ * item expires inside the day section 9 gives it and not in the past.
  *
  * The first is what keeps an action out of a mailbox. Section 9 queues no keystroke, no shell
  * command, no approval decision and no closure, and the way that holds is that the kinds are a
@@ -674,12 +660,6 @@ export function checkSealedEnvelope (
   const stored = envelopeStoredBytes(envelope)
   if (stored > MAX_MAILBOX_ITEM_BYTES) {
     return { reason: 'item_too_large', stored, limit: MAX_MAILBOX_ITEM_BYTES }
-  }
-  if (
-    (AUTHORITY_BEARING_PAYLOAD_TYPES as readonly string[]).includes(routing.payload_type) &&
-    routing.thread_id !== null
-  ) {
-    return { reason: 'authority_coalesced' }
   }
   return null
 }

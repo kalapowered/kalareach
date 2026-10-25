@@ -15,7 +15,6 @@ import { describe, expect, it } from 'vitest'
 
 import {
   AUTHORITY_REVISION_DOMAIN,
-  AUTHORITY_BEARING_PAYLOAD_TYPES,
   BACKUP_PUBLICATION_DOMAIN,
   BACKUP_WRITER_DOMAIN,
   KEY_ID_DOMAIN,
@@ -344,11 +343,6 @@ describe('the mailbox', () => {
     expect(document.mailbox_limits['bytes_per_device']).toBe(String(MAX_MAILBOX_BYTES))
     expect(document.mailbox_limits['seal_overhead_bytes']).toBe(String(SEAL_OVERHEAD_BYTES))
     expect(document.mailbox_limits['payload_types']).toEqual(MAILBOX_PAYLOAD_TYPES)
-    expect(document.mailbox_limits['coalesced_payload_types']).toEqual(
-      MAILBOX_PAYLOAD_TYPES.filter(
-        (kind) => !(AUTHORITY_BEARING_PAYLOAD_TYPES as readonly string[]).includes(kind)
-      )
-    )
   })
 
   it('admits the published item and measures what it stores', () => {
@@ -391,21 +385,6 @@ describe('the mailbox', () => {
       }
       expect(checkSealedEnvelope(declared, created)?.reason).toBe('unknown_payload_type')
     }
-  })
-
-  it('refuses a payload that carries authority and asks to be coalesced', () => {
-    const created = Number(plaintext.created_at_ms)
-    const authority: SealedEnvelope = {
-      ...sealed,
-      routing: { ...sealed.routing, payload_type: 'signed_authority_object' }
-    }
-    expect(checkSealedEnvelope(authority, created)?.reason).toBe('authority_coalesced')
-    expect(
-      checkSealedEnvelope(
-        { ...authority, routing: { ...authority.routing, thread_id: null } },
-        created
-      )
-    ).toBeNull()
   })
 
   it('catches a service that relabelled or re-threaded an item', () => {

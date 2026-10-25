@@ -58,18 +58,6 @@ pub enum MailboxPayloadType {
     /// A reference and not the state: what it names is read under current authority from the host
     /// that holds it. It is the repeated kind, so it is the one coalescing is mostly about.
     StateReference,
-    /// A payload that bears authority.
-    ///
-    /// No reader of a mailbox takes authority from one: a host and a device take theirs from their
-    /// own records and the authority feed, so an item of this kind is refused whoever sealed it.
-    /// Nothing produces one.
-    ///
-    /// The variant stays while the release before reads the delivery store at a version that
-    /// keeps it: removing it changes what `SealedEnvelope` reaches, which moves the delivery
-    /// store's version, and that store is read through at version 11 and written at 10. It goes,
-    /// with [`Self::bears_authority`], in the release that writes version 11, once the release
-    /// that read it ahead is the one retained.
-    SignedAuthorityObject,
     /// An encrypted notification preview.
     NotificationPreview,
     /// An announcement that a synchronised object changed.
@@ -78,11 +66,10 @@ pub enum MailboxPayloadType {
 
 impl MailboxPayloadType {
     /// Every payload kind, in declaration order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::AuthorityFeedChange,
         Self::ActionReceipt,
         Self::StateReference,
-        Self::SignedAuthorityObject,
         Self::NotificationPreview,
         Self::SyncChange,
     ];
@@ -94,26 +81,8 @@ impl MailboxPayloadType {
             Self::AuthorityFeedChange => "authority_feed_change",
             Self::ActionReceipt => "action_receipt",
             Self::StateReference => "state_reference",
-            Self::SignedAuthorityObject => "signed_authority_object",
             Self::NotificationPreview => "notification_preview",
             Self::SyncChange => "sync_change",
-        }
-    }
-
-    /// Returns true when a payload of this type bears authority.
-    ///
-    /// No reader of a mailbox here accepts one, so a reader refuses an item of such a type after
-    /// the box, the bindings and the expiry have passed. It goes with
-    /// [`Self::SignedAuthorityObject`], whose removal condition is stated there.
-    #[must_use]
-    pub const fn bears_authority(self) -> bool {
-        match self {
-            Self::SignedAuthorityObject => true,
-            Self::AuthorityFeedChange
-            | Self::ActionReceipt
-            | Self::StateReference
-            | Self::NotificationPreview
-            | Self::SyncChange => false,
         }
     }
 }
@@ -302,14 +271,6 @@ pub enum EnvelopeStructureError {
         /// The limit.
         limit: u64,
     },
-    /// An authority-bearing payload asked to be coalesced.
-    ///
-    /// Coalescing replaces an older unread item with a newer one of the same thread, and a
-    /// forwarded signed object is authority rather than a state notification: section 10 keeps
-    /// revocation records outside notification coalescing, so a payload that carries authority
-    /// carries no thread identifier either.
-    #[error("a payload that carries authority is never coalesced, so it names no thread")]
-    AuthorityCoalesced,
 }
 
 impl SealedEnvelope {
@@ -366,10 +327,6 @@ impl SealedEnvelope {
                 stored,
                 limit: MAX_MAILBOX_ITEM_BYTES,
             });
-        }
-
-        if self.routing.payload_type.bears_authority() && self.routing.thread_id.is_present() {
-            return Err(EnvelopeStructureError::AuthorityCoalesced);
         }
 
         Ok(())
@@ -674,23 +631,10 @@ mod tests {
                 "authority_feed_change",
                 "action_receipt",
                 "state_reference",
-                "signed_authority_object",
                 "notification_preview",
                 "sync_change",
             ]
         );
-    }
-
-    #[test]
-    fn only_a_forwarded_signed_object_bears_authority() {
-        assert!(MailboxPayloadType::SignedAuthorityObject.bears_authority());
-        // An announcement is not authority: the device synchronises the feed to learn what
-        // changed, and the feed's own signed records carry the authority.
-        assert!(!MailboxPayloadType::AuthorityFeedChange.bears_authority());
-        assert!(!MailboxPayloadType::ActionReceipt.bears_authority());
-        assert!(!MailboxPayloadType::StateReference.bears_authority());
-        assert!(!MailboxPayloadType::NotificationPreview.bears_authority());
-        assert!(!MailboxPayloadType::SyncChange.bears_authority());
     }
 
     fn sealed(bucket: u64, expires_at_ms: u64) -> SealedEnvelope {
@@ -761,21 +705,6 @@ mod tests {
             past.check_structure(1_000),
             Err(EnvelopeStructureError::AlreadyExpired { behind: 100 })
         );
-    }
-
-    #[test]
-    fn a_forwarded_signed_object_names_no_thread() {
-        let mut envelope = sealed(KIB, 2_000);
-        envelope.routing.payload_type = MailboxPayloadType::SignedAuthorityObject;
-        envelope.routing.thread_id = Nullable::some(crate::ids::MailboxThreadId::new(
-            crate::scalars::Uuid::from_bytes([9; 16]),
-        ));
-        assert_eq!(
-            envelope.check_structure(1_000),
-            Err(EnvelopeStructureError::AuthorityCoalesced)
-        );
-        envelope.routing.thread_id = Nullable::null();
-        assert_eq!(envelope.check_structure(1_000), Ok(()));
     }
 
     #[test]

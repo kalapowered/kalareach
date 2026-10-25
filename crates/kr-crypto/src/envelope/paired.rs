@@ -96,16 +96,12 @@ impl PairedSenders {
 /// only one that takes a [`ReplayLedger`]: an item that is accepted is recorded, because a caller
 /// that could open without recording could be given the same item twice.
 ///
-/// A payload that bears authority is refused, as [`super::open_envelope`] refuses it, and its
-/// identifier is not recorded: nothing in a mailbox is authority.
-///
 /// # Errors
 ///
 /// Returns [`CryptoError::BindingMismatch`] when the item's shape is not one this contract admits,
 /// when its routing record names a sender this device has not paired with, when a field inside the
 /// envelope does not match the one outside it, when the expiry has passed or when the replay
-/// identifier has been seen; [`CryptoError::Authentication`] when the box does not verify; and
-/// [`CryptoError::AuthorityNotAccepted`] when the payload bears authority.
+/// identifier has been seen; and [`CryptoError::Authentication`] when the box does not verify.
 pub fn open_delivered_envelope(
     recipient: &StoredEnvelopeKeyPair,
     senders: &PairedSenders,
@@ -114,8 +110,8 @@ pub fn open_delivered_envelope(
     now_ms: u64,
 ) -> Result<EnvelopePlaintext> {
     // Everything a reader can settle without a key, first. The declared bucket, the ciphertext's
-    // length, the lifetime and the coalescing rule are the service's own admission rules, and a
-    // recipient that did not apply them would accept an item the service should never have stored.
+    // length and the lifetime are the service's own admission rules, and a recipient that did not
+    // apply them would accept an item the service should never have stored.
     sealed_envelope
         .check_structure(now_ms)
         .map_err(|_| CryptoError::BindingMismatch {

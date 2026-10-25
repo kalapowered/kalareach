@@ -279,9 +279,6 @@ fn structure_refusal(broken: EnvelopeStructureError) -> ServiceHttpAnswer {
         EnvelopeStructureError::ItemTooLarge { .. } => {
             "A stored item is at most the megabyte a control message may carry.".to_owned()
         }
-        EnvelopeStructureError::AuthorityCoalesced => {
-            "A payload that carries authority names no coalescing thread.".to_owned()
-        }
     })
 }
 

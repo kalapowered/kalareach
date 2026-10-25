@@ -15096,7 +15096,6 @@ export interface EnvelopePlaintext {
     | 'authority_feed_change'
     | 'action_receipt'
     | 'state_reference'
-    | 'signed_authority_object'
     | 'notification_preview'
     | 'sync_change'
   /**
@@ -25270,7 +25269,6 @@ export interface EnvelopeRouting {
     | 'authority_feed_change'
     | 'action_receipt'
     | 'state_reference'
-    | 'signed_authority_object'
     | 'notification_preview'
     | 'sync_change'
   /**

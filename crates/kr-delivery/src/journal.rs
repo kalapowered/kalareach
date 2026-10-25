@@ -73,26 +73,18 @@ use crate::error::{DeliveryError, Result};
 /// how a decision made while it was on is told from one made after. Version 9 adds the table of
 /// revocations this host owes a gateway. Version 10 adds the mark on a notification whose detail
 /// may have left this host in an object placed in a device's mailbox, which is a copy that left
-/// whether or not the push that refers to it ever did. A journal written under version 6, 7, 8 or 9
-/// is brought forward in place, once, when it is opened (`migrate_forward`); a journal written
-/// under a version below 6 or above [`READS_THROUGH`] is refused rather than read with the columns
-/// of another shape, matched against bindings this build no longer computes the same way, or
-/// trusted to hold no request it should not.
-pub const SCHEMA_VERSION: i64 = 10;
+/// whether or not the push that refers to it ever did. Version 11 is version 10 without the
+/// `signed_authority_object` payload type of a sealed envelope, which nothing produced, and
+/// nothing else: its tables, columns and rows are version 10's, so the step from 10 records the
+/// version only. A journal written under version 6, 7, 8, 9 or 10 is brought forward in place,
+/// once, when it is opened (`migrate_forward`); a journal written under a version below 6 or
+/// above this one is refused rather than read with the columns of another shape, matched against
+/// bindings this build no longer computes the same way, or trusted to hold no request it should
+/// not.
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The oldest schema this build brings forward rather than refusing.
 pub const OLDEST_SCHEMA_VERSION: i64 = 6;
-
-/// The newest schema above [`SCHEMA_VERSION`] this build opens as it finds it, and writes nothing
-/// of.
-///
-/// Version 11 is version 10 without the `signed_authority_object` payload type of a sealed
-/// envelope, which nothing produces, and nothing else: its tables, columns and rows are version
-/// 10's. The release that writes it can be rolled back to this one, which opens the journal as it
-/// stands, and a journal this build opens at 11 is written only with the rows version 10 writes. A
-/// change to what the journal keeps beyond that takes version 12, and is read ahead by the release
-/// before the one that writes it.
-pub const READS_THROUGH: i64 = 11;
 
 /// The binding a notification is given when its destination is removed while an attempt is on the
 /// wire. A destination's digest is 64 hexadecimal characters, so no destination configured under
@@ -763,13 +755,6 @@ impl DeliveryJournal {
             }
             Some(version) if (OLDEST_SCHEMA_VERSION..SCHEMA_VERSION).contains(&version) => {
                 migrate_forward(&mut connection)?;
-                let journal = Self { connection };
-                journal.check_schema()?;
-                Ok(journal)
-            }
-            // A store of the next version, which a later release writes: opened as it stands, with
-            // its version left as it is.
-            Some(version) if (SCHEMA_VERSION + 1..=READS_THROUGH).contains(&version) => {
                 let journal = Self { connection };
                 journal.check_schema()?;
                 Ok(journal)
@@ -4111,12 +4096,14 @@ fn insert_notification(
 /// when it is lifted. Version 9 adds the table of revocations this host owes a gateway, which no
 /// earlier journal can hold one of: an earlier build revoked nothing at unpairing. Version 10 adds
 /// the mark on a notification whose detail may have been placed in a device's mailbox; no earlier
-/// build placed one, so every row gets none.
+/// build placed one, so every row gets none. Version 11 changes no table, column or row: it
+/// records that the payload type a sealed envelope no longer names is gone, so the step from 10
+/// records the version only.
 /// The version is read again inside the transaction, so two openers cannot both add a column.
 ///
 /// Remove this upgrade, with the arm of the open that calls it, once no supported upgrade starts
-/// from a journal written under version 6, 7, 8 or 9; `OLDEST_SCHEMA_VERSION` then moves up with
-/// it.
+/// from a journal written under version 6, 7, 8, 9 or 10; `OLDEST_SCHEMA_VERSION` then moves up
+/// with it.
 fn migrate_forward(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -7263,7 +7250,7 @@ mod tests {
     /// the versions this build brings forward.
     #[test]
     fn a_journal_written_under_another_schema_version_is_refused() {
-        for version in [OLDEST_SCHEMA_VERSION - 1, READS_THROUGH + 1] {
+        for version in [OLDEST_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("delivery.sqlite3");
             drop(DeliveryJournal::open(&path).expect("a journal"));
@@ -7282,12 +7269,11 @@ mod tests {
         }
     }
 
-    /// A journal of the next version, which a later release writes, is opened as it stands: the
-    /// record it holds is read, a request is recorded in it beside that one, and its version is left
-    /// as it was, through a reopen.
+    /// A version 10 journal, which the release before wrote, is brought forward to 11 when it is
+    /// opened: the version is the only thing that changes, and the destination, the event and the
+    /// queued notification it holds are read as they were.
     #[test]
-    fn a_journal_of_the_next_version_is_opened_as_it_stands_and_its_version_is_left_alone() {
-        assert_eq!(READS_THROUGH, SCHEMA_VERSION + 1, "the next version only");
+    fn a_version_10_journal_is_brought_forward_to_11_and_keeps_what_it_holds() {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("delivery.sqlite3");
         {
@@ -7299,7 +7285,7 @@ mod tests {
                 .configure_destination(&destination("hook"))
                 .expect("a destination");
             journal
-                .take_events(&consumer(), &[taken(1, 1), taken(2, 2)], 1)
+                .take_events(&consumer(), &[taken(1, 1)], 1)
                 .expect("a page");
             journal
                 .admit(&delivery(1, event(1), "hook"))
@@ -7313,42 +7299,29 @@ mod tests {
         };
         rusqlite::Connection::open(&path)
             .expect("a connection")
-            .execute(
-                "UPDATE delivery_schema SET version = ?1",
-                params![SCHEMA_VERSION + 1],
-            )
+            .execute("UPDATE delivery_schema SET version = 10", [])
             .expect("the version changes");
+        assert_eq!(version_of(&path), 10);
 
-        let mut journal = DeliveryJournal::open(&path).expect("the next version is opened");
-        assert!(
-            journal
-                .delivery(NotificationId::new(uuid(1)))
-                .expect("a read")
-                .is_some(),
-            "the record the later release wrote is read"
-        );
-        journal
-            .admit(&delivery(2, event(2), "hook"))
-            .expect("a request is recorded in it");
-        drop(journal);
+        let mut journal = DeliveryJournal::open(&path).expect("brought forward");
+        assert_eq!(version_of(&path), 11, "and only the version changed");
+        assert_eq!(SCHEMA_VERSION, 11);
         assert_eq!(
-            version_of(&path),
-            SCHEMA_VERSION + 1,
-            "this build wrote nothing of it"
+            journal
+                .destination(&DestinationId::new("hook").expect("an identifier"))
+                .expect("a read")
+                .expect("the destination is still configured"),
+            destination("hook")
         );
-
-        let journal = DeliveryJournal::open(&path).expect("it opens again");
-        for byte in [1, 2] {
-            assert!(
+        assert!(
+            matches!(
                 journal
-                    .delivery(NotificationId::new(uuid(byte)))
-                    .expect("a read")
-                    .is_some(),
-                "record {byte} survives the reopen"
-            );
-        }
-        drop(journal);
-        assert_eq!(version_of(&path), SCHEMA_VERSION + 1);
+                    .claim(NotificationId::new(uuid(1)), 2_000)
+                    .expect("a claim"),
+                Claim::Taken(_)
+            ),
+            "the notification admitted under version 10 is claimed under version 11"
+        );
     }
 
     /// Makes the journal at `path` look exactly as version 6 wrote it: no credential column, and
