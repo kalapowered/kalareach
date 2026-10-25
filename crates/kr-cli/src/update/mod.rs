@@ -2334,18 +2334,8 @@ fn restart_by_task(
              hand",
         )));
     }
-    // Spelled as the starter spells them: the verbatim prefix is not part of a place's name.
     let same = |one: &str, other: &std::path::Path| {
-        let plain = |text: &str| {
-            text.strip_prefix(r"\\?\")
-                .unwrap_or(text)
-                .replace('/', "\\")
-                .trim_end_matches('\\')
-                .to_lowercase()
-        };
-        other
-            .to_str()
-            .is_some_and(|other| plain(one) == plain(other))
+        other.to_str().is_some_and(|other| same_place(one, other))
     };
     let arguments_match = matches!(
         started_as.arguments.as_slice(),
@@ -2374,27 +2364,131 @@ fn restart_by_task(
             Shown::io(&error)
         ))
     })?;
-    for name in ["HOME", "USERPROFILE", "LOCALAPPDATA"] {
-        let stated = started_as
-            .environment
-            .iter()
-            .find(|variable| variable.name == name)
-            .and_then(|variable| variable.value.0.as_deref());
-        let given = account.get(name).map(String::as_str);
-        let alike = match (stated, given) {
-            (None, None) => true,
-            (Some(stated), Some(given)) => same(stated, std::path::Path::new(given)),
-            _ => false,
-        };
-        if !alike {
-            return Err(deferred(shown!(
-                "its {} is not the one the account gives a daemon, so the task would start its \
-                 replacement with another",
-                name
-            )));
-        }
+    if let Some(name) = variable_not_the_accounts(&started_as.environment, &account) {
+        return Err(deferred(shown!(
+            "its {} is not the one the account gives a daemon, so the task would start its \
+             replacement with another",
+            name
+        )));
     }
     crate::startup::task_is_this_installation_s(&environment.paths).map_err(deferred)
+}
+
+/// Whether two spellings name one place, as the starter spells them: the verbatim prefix is not part
+/// of a place's name, `/` is `\\`, a trailing separator is nothing, and capitals are not told apart.
+#[cfg(windows)]
+fn same_place(one: &str, other: &str) -> bool {
+    let plain = |text: &str| {
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(text)
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    plain(one) == plain(other)
+}
+
+/// The first of the variables a daemon states as deciding where it keeps something, `HOME`,
+/// `USERPROFILE` and `LOCALAPPDATA`, that the account does not give as the daemon has it: absent in
+/// one and present in the other, or naming another place. `account` is the account's environment
+/// with its names in capitals.
+#[cfg(windows)]
+fn variable_not_the_accounts(
+    stated: &[kr_protocol::update::PathVariable],
+    account: &std::collections::BTreeMap<String, String>,
+) -> Option<&'static str> {
+    ["HOME", "USERPROFILE", "LOCALAPPDATA"]
+        .into_iter()
+        .find(|name| {
+            let stated = stated
+                .iter()
+                .find(|variable| variable.name == *name)
+                .and_then(|variable| variable.value.0.as_deref());
+            let given = account.get(*name).map(String::as_str);
+            match (stated, given) {
+                (None, None) => false,
+                (Some(stated), Some(given)) => !same_place(stated, given),
+                _ => true,
+            }
+        })
+}
+
+#[cfg(all(test, windows))]
+mod account_tests {
+    use super::*;
+    use kr_protocol::scalars::Nullable;
+    use kr_protocol::update::PathVariable;
+    use std::collections::BTreeMap;
+
+    fn stated(pairs: &[(&str, Option<&str>)]) -> Vec<PathVariable> {
+        pairs
+            .iter()
+            .map(|(name, value)| PathVariable {
+                name: (*name).to_owned(),
+                value: Nullable(value.map(str::to_owned)),
+            })
+            .collect()
+    }
+
+    fn account(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// KR-REQ-26.10: a replacement the task starts has the account's home and application data, so
+    /// the daemon it replaces must state those: the same place however it is spelled, absent where
+    /// the account has none, and present where the account has it. A `HOME` the account sets (in its
+    /// own environment, which the task gives every program) is held to as much as a profile.
+    #[test]
+    fn a_daemon_is_held_to_the_variables_the_account_gives() {
+        let given = account(&[
+            ("USERPROFILE", r"C:\Users\kr"),
+            ("LOCALAPPDATA", r"C:\Users\kr\AppData\Local"),
+            ("HOME", r"D:\home\kr"),
+        ]);
+        let like_the_account = stated(&[
+            ("HOME", Some("D:/home/kr/")),
+            ("USERPROFILE", Some(r"\\?\c:\users\KR")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+            ("TMPDIR", None),
+        ]);
+        assert_eq!(variable_not_the_accounts(&like_the_account, &given), None);
+
+        let without_home = stated(&[
+            ("USERPROFILE", Some(r"C:\Users\kr")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+        ]);
+        assert_eq!(
+            variable_not_the_accounts(&without_home, &given),
+            Some("HOME"),
+            "an account that sets a home gives it to the replacement"
+        );
+
+        let plain = account(&[
+            ("USERPROFILE", r"C:\Users\kr"),
+            ("LOCALAPPDATA", r"C:\Users\kr\AppData\Local"),
+        ]);
+        let with_home = stated(&[
+            ("HOME", Some(r"C:\elsewhere")),
+            ("USERPROFILE", Some(r"C:\Users\kr")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+        ]);
+        assert_eq!(
+            variable_not_the_accounts(&with_home, &plain),
+            Some("HOME"),
+            "a home the account does not give is not kept by the replacement"
+        );
+        let moved = stated(&[
+            ("USERPROFILE", Some(r"C:\Users\other")),
+            ("LOCALAPPDATA", Some(r"C:\Users\kr\AppData\Local")),
+        ]);
+        assert_eq!(
+            variable_not_the_accounts(&moved, &plain),
+            Some("USERPROFILE")
+        );
+    }
 }
 
 /// What an update an earlier run left part way came to.
