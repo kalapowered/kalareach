@@ -118,6 +118,11 @@ const TOKEN_WITHIN: Duration = Duration::from_secs(20);
 /// other host from registering.
 const CHALLENGE_WAIT: Duration = Duration::from_millis(CHALLENGE_WITHIN_MS + 30_000);
 
+/// How long the receivers are given to take a set of preview keys. A native call that never
+/// answers must not hold every choice of previews and every filing for every host for ever.
+const KEYS_WITHIN: Duration = Duration::from_secs(10);
+
+
 /// The soonest the same host is tried again after a try that needed the person: asking the system
 /// or the gateway again at every foreground would be a loop with a person in it.
 const RETRY_AFTER_MS: u64 = 60 * 1000;
@@ -442,6 +447,8 @@ pub struct Wiring {
     pub http: Arc<HttpFor>,
     /// The time, in UTC milliseconds.
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// How long the receivers are given to take a set of preview keys.
+    pub keys_within: Duration,
 }
 
 impl Wiring {
@@ -459,6 +466,7 @@ impl Wiring {
                 .map_err(|error| error.to_string())
             }),
             clock: Arc::new(|| kr_ipc::now_ms().get()),
+            keys_within: KEYS_WITHIN,
         }
     }
 }
@@ -1739,11 +1747,13 @@ impl PushDesk {
         if filed.as_ref() == Some(&keys) {
             return Ok(());
         }
-        // Whatever the receivers hold is not known until this filing is known to have been made.
+        // Whatever the receivers hold is not known until this filing is known to have been made,
+        // and a filing that was not answered in time leaves it unknown: it may still be made, so
+        // the next filing is made whatever it holds.
         *filed = None;
-        self.native
-            .preview_keys(&keys)
+        tokio::time::timeout(self.wiring.keys_within, self.native.preview_keys(&keys))
             .await
+            .map_err(|_| "This phone's preview key was not filed in time.".to_owned())?
             .map_err(|_| "This phone could not file its preview key.".to_owned())?;
         *filed = Some(keys);
         Ok(())
