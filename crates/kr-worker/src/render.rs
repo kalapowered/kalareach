@@ -934,6 +934,12 @@ impl Writer {
                 }
             }
         }
+        // Origin mode was set for the save and is the session's own again only through `cursor`,
+        // which turns it on when the session has it on. A terminal left in origin mode here would
+        // read every absolute address after the restoration relative to the scroll region.
+        if cursor.origin_mode {
+            self.csi(b"?6l");
+        }
     }
 
     fn cursor(&mut self, cursor: CursorState) {
