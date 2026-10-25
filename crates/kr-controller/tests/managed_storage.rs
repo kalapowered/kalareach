@@ -6929,10 +6929,12 @@ async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_p
 
     rig.until("a new generation is published", |rig| rig.published(2))
         .await;
+    // Privacy mode removed the closed session's output meanwhile, so the new generation holds the
+    // configuration the deleted one held and not the output.
     assert_eq!(
-        opened_members(&rig, 2),
-        before,
-        "the new generation holds what the deleted one held"
+        opened_members(&rig, 2)["host/configuration.json"],
+        before["host/configuration.json"],
+        "the new generation holds the configuration the deleted one held"
     );
     rig.until("the deletion is confirmed", |rig| {
         rig.objects_of(1)
