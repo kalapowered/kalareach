@@ -338,3 +338,24 @@ fn key_records_have_no_counterpart_at_a_retained_worker_and_a_malformed_write_is
         Err(CodecError::Cbor(_))
     ));
 }
+
+/// A retained level that reads the union is sent the write as it was given: the rewrite is for the
+/// levels below it, and a key-record write reaches a worker of such a level whole.
+#[test]
+fn a_write_for_a_retained_level_that_reads_the_union_is_sent_as_it_is() {
+    use kr_protocol::retained::RetainedLevel;
+    use kr_protocol::update::CompatibilityLevel;
+
+    let level = Level::retained(Box::leak(Box::new(RetainedLevel::new(
+        CompatibilityLevel::of(PackageVersion::new(0, 78, 0)),
+        "",
+        "",
+        "",
+        &[],
+        &[],
+    ))));
+    assert!(!level.is_this());
+    for write in [write_with(keys_input()), write_with(bytes_input())] {
+        assert_eq!(level.encode_input_write(&write).expect("unchanged"), write);
+    }
+}

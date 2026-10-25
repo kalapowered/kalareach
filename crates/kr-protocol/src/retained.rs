@@ -935,8 +935,10 @@ impl Level {
     ///
     /// This code goes once no retained level is below 0.78: it is a compatibility path for the
     /// workers of a level below that, which outlive an update, and from the cut that retains 0.78
-    /// every worker reads the union. The removal takes the paragraph of `docs/host/updates.md` that
-    /// describes it ("A session that runs the release before") with it.
+    /// every worker reads the union. The removal takes with it the two paragraphs of
+    /// `docs/host/updates.md` that follow "A session that runs the release before": the one that
+    /// begins "`input.write` is the one passed-through method" and the one that begins "A companion
+    /// of the release before".
     ///
     /// # Errors
     ///
