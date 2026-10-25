@@ -933,9 +933,10 @@ impl Level {
     /// refused and nothing is sent. A worker at the daemon's own level gets the parameters as they
     /// were given, unread.
     ///
-    /// This code goes once no retained level is below 0.78. It is a compatibility path for the
-    /// workers of a retained level that outlive an update, and from the cut that retains 0.78
-    /// every worker reads the union.
+    /// This code goes once no retained level is below 0.78: it is a compatibility path for the
+    /// workers of a level below that, which outlive an update, and from the cut that retains 0.78
+    /// every worker reads the union. The removal takes the paragraph of `docs/host/updates.md` that
+    /// describes it ("A session that runs the release before") with it.
     ///
     /// # Errors
     ///
@@ -945,6 +946,10 @@ impl Level {
         let Which::Retained(retained) = self.0 else {
             return Ok(params.clone());
         };
+        // A level that reads the union is sent the write as it is.
+        if retained.level >= CompatibilityLevel::of(crate::hello::PackageVersion::new(0, 78, 0)) {
+            return Ok(params.clone());
+        }
         // The whole current type first, so a malformed write is refused as a worker of this level
         // would refuse it.
         let typed: InputWriteParams = params.to_typed()?;

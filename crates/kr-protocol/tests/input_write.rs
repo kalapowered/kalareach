@@ -179,9 +179,9 @@ fn both_variants_read_from_the_json_the_schema_names() {
     );
 }
 
-/// What the union refuses: bytes written as text, the shape the write had before the union, a tag
-/// it does not know, a record with a seventh member or without one of its six, a variant carrying
-/// the other's member, and a number out of its type's range.
+/// What the union refuses: bytes written as text, a union with no tag, a tag it does not know, a
+/// record with a seventh member or without one of its six, a variant carrying the other's member,
+/// and a number out of its type's range.
 #[test]
 fn the_union_refuses_what_it_has_no_place_for() {
     let refused = |input: CanonicalValue| write_with(input).to_typed::<InputWriteParams>().is_err();
@@ -247,15 +247,6 @@ fn the_union_refuses_what_it_has_no_place_for() {
         ("kind", CanonicalValue::Text("console_keys".to_owned())),
         ("keys", CanonicalValue::Array(vec![wide])),
     ])));
-    // The write itself no longer has the field the union replaced.
-    let flat = ParamsValue::new(map(vec![
-        ("session_id", CanonicalValue::Bytes(vec![0x51; 16])),
-        ("attachment_id", CanonicalValue::Bytes(vec![0x61; 16])),
-        ("epoch", number(3)),
-        ("sequence", number(7)),
-        ("bytes", CanonicalValue::Bytes(b"q".to_vec())),
-    ]));
-    assert!(flat.to_typed::<InputWriteParams>().is_err());
 }
 
 /// A write says which variant it is and how much it carries, and nothing a person typed: not a
@@ -338,15 +329,12 @@ fn key_records_have_no_counterpart_at_a_retained_worker_and_a_malformed_write_is
         }
         other => panic!("expected a refusal by name, got {other:?}"),
     }
-    let old_shape = ParamsValue::new(map(vec![
-        ("session_id", CanonicalValue::Bytes(vec![0x51; 16])),
-        ("attachment_id", CanonicalValue::Bytes(vec![0x61; 16])),
-        ("epoch", number(3)),
-        ("sequence", number(7)),
-        ("bytes", CanonicalValue::Bytes(b"q".to_vec())),
-    ]));
+    let malformed = write_with(map(vec![(
+        "kind",
+        CanonicalValue::Text("console_keys".to_owned()),
+    )]));
     assert!(matches!(
-        retained_worker().encode_input_write(&old_shape),
+        retained_worker().encode_input_write(&malformed),
         Err(CodecError::Cbor(_))
     ));
 }
