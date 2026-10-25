@@ -1098,6 +1098,27 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "what a view of the agents shows is narrowed to the grant's history"
     );
 
+    // The launch surface is a read under session.view, so a viewer who may not type reads the same
+    // state as one who may. It shows what the live screen shows and no more.
+    let launch_surface = lookup("shell.launch.surface").expect("listed");
+    assert_eq!(launch_surface.effect, EffectClass::Read);
+    assert_eq!(launch_surface.group, MethodGroup::ShellLaunch);
+    assert_eq!(
+        launch_surface.required_rights,
+        &[RequiredRight::right(ActionRight::SessionView)],
+        "the launch surface is read under session.view and nothing else"
+    );
+    assert_eq!(
+        launch_surface.ingress,
+        &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+        "the launch surface is read at the local door and by a paired device"
+    );
+    assert_eq!(
+        launch_surface.history_filter,
+        HistoryFilter::LiveViewOnly,
+        "the launch surface shows what the live screen shows"
+    );
+
     assert_eq!(
         REGISTRY.len(),
         required.len()
@@ -1124,7 +1145,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + automation.len()
             + 1
             + inspection.len()
-            + phone.len(),
+            + phone.len()
+            + 1,
         "the registry holds the required methods and the named additions"
     );
 }

@@ -2522,6 +2522,10 @@ export type SessionOpenResult =
       state: 'ended'
     }
 /**
+ * The shell a session runs, where the host knows how to quote for it.
+ */
+export type LaunchShell = 'sh' | 'zsh' | 'bash' | 'fish' | 'powershell'
+/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -3218,6 +3222,8 @@ export interface KalaReachProtocol {
   shell_command_params?: ShellCommandParams
   shell_launch_params?: ShellLaunchParams
   shell_launch_result?: ShellLaunchResult
+  shell_launch_surface_params?: ShellLaunchSurfaceParams
+  shell_launch_surface_result?: ShellLaunchSurfaceResult
   signed_archive_manifest?: SignedArchiveManifest
   signed_client_bundle?: SignedClientBundle
   signed_host_bundle?: SignedHostBundle
@@ -19180,6 +19186,7 @@ export interface MethodEntry {
     | 'root.eof.detach'
     | 'root.command.accepted'
     | 'shell.launch'
+    | 'shell.launch.surface'
     | 'agent.capabilities'
     | 'agent.snapshot'
     | 'agent.commands'
@@ -28287,6 +28294,7 @@ export interface ServiceRequestPayload {
     | 'root.eof.detach'
     | 'root.command.accepted'
     | 'shell.launch'
+    | 'shell.launch.surface'
     | 'agent.capabilities'
     | 'agent.snapshot'
     | 'agent.commands'
@@ -29471,6 +29479,112 @@ export interface ShellLaunchResult {
    * The prompt generation it was accepted at.
    */
   prompt_generation: string
+}
+/**
+ * Parameters of `shell.launch.surface`.
+ */
+export interface ShellLaunchSurfaceParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `shell.launch.surface`: what a launch from this connection could do now.
+ *
+ * It is advice, not a lease. A launch quotes the prompt generation and the buffer revision it
+ * names, and the worker and the reader refuse a quote that has gone stale before anything is
+ * typed.
+ *
+ * Read-only metadata: a member added later is explicitly optional, and a reader whose schema
+ * predates it ignores it rather than refusing the answer.
+ */
+export interface ShellLaunchSurfaceResult {
+  /**
+   * Whether the root editor is at an empty prompt a launch can be installed in.
+   */
+  editor:
+    | {
+        /**
+         * The buffer revision the reader acknowledged as empty, which a launch quotes.
+         */
+        buffer_revision: string
+        /**
+         * The shell's working-directory revision. It shows where the shell is; a launch does not
+         * quote it.
+         */
+        cwd_revision: string
+        /**
+         * The prompt the fence was proved at, which a launch quotes.
+         */
+        prompt_generation: string
+        state: 'verified'
+      }
+    | {
+        /**
+         * The first reason that holds.
+         */
+        reason:
+          | 'closing'
+          | 'not_a_shell'
+          | 'stock_shell'
+          | 'profile_forbids'
+          | 'not_shown'
+          | 'starting'
+          | 'integration_lost'
+          | 'not_at_prompt'
+          | 'not_primary_prompt'
+          | 'launch_in_progress'
+          | 'no_fence'
+          | 'buffer_not_empty'
+          | 'reader_pending'
+          | 'changed_since_fence'
+        state: 'unverified'
+      }
+  /**
+   * How the asking connection stands to the session's input.
+   */
+  input: 'held_here' | 'held_elsewhere' | 'free' | 'withheld'
+  /**
+   * What the host has an agent package for, by command.
+   */
+  offers: LaunchOffer[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The shell the session runs, where the host knows how to quote for it. Null otherwise.
+   */
+  shell: LaunchShell | null
+}
+/**
+ * One agent the host has a package for, and the command that starts it.
+ *
+ * Whether the executable is on the shell's path is the shell's to say when the command runs.
+ *
+ * Read-only metadata: a member added later is explicitly optional, and a reader whose schema
+ * predates it ignores it rather than refusing the answer.
+ */
+export interface LaunchOffer {
+  /**
+   * What a launch sends to start the agent: the command alone, with no flags.
+   */
+  command:
+    | {
+        arguments: string[]
+      }
+    | {
+        quoted_command: string
+      }
+  /**
+   * The package's display name.
+   */
+  label: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
 }
 /**
  * A manifest and the backup writer's signature over it.

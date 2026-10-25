@@ -177,6 +177,7 @@ document.
 | Method | Effect | Ingress | Summary | Described in |
 | --- | --- | --- | --- | --- |
 | `shell.launch` | write | `local_ipc`, `paired_device` | Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT. | [Protocol: The root integration](README.md) |
+| `shell.launch.surface` | read | `local_ipc`, `paired_device` | Whether the root editor is at an empty prompt a launch can be installed in, how the asking connection stands to the session's input, the shell's name, and the agents the host has a package for. | [Protocol: The root integration](README.md) |
 
 ## Agent state
 

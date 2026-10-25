@@ -152,6 +152,7 @@ impl DeviceRead {
             | Method::AgentCommands
             | Method::AgentApprovalInspect
             | Method::AgentInstances
+            | Method::ShellLaunchSurface
             | Method::QuestionRead => Self::Worker,
             Method::WorkflowRead => Self::Workflow,
             Method::VoiceContext | Method::VoicePrepare => Self::Voice,
