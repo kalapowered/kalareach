@@ -751,8 +751,7 @@ impl Controller {
     }
 
     /// Returns the reason a worker that is confirmed gone ended, where this host can establish
-    /// one, apart from the host's restart, which [`Self::crash_flight_alone`] decides when the
-    /// session is owned.
+    /// one, apart from the host's restart, which [`Self::crash_flight_alone`] decides.
     ///
     /// A desktop-bound worker whose desktop has gone went with it: the platform ended the job with
     /// the login session it was in, which is what a logout does, and the worker had no chance to
