@@ -167,7 +167,9 @@ impl Case {
 
     fn staging(&self) -> PathBuf {
         let staging = self.root.path().join("staging");
-        std::fs::create_dir_all(&staging).expect("a staging directory");
+        // Owner-only, as the store's own staging directory is: the reader refuses to make a
+        // directory under one that is not.
+        kr_ipc::paths::create_private_directory(&staging).expect("a staging directory");
         staging
     }
 
@@ -444,7 +446,7 @@ fn nothing_is_written_beside_the_staging_directory() {
     let escape = case.root.path().join("escape.exe");
     for name in [
         format!("{TOP}/../../escape.exe"),
-        format!("../escape.exe"),
+        "../escape.exe".to_owned(),
         format!("{TOP}/..\\..\\escape.exe"),
     ] {
         let _ = case.read(
