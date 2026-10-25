@@ -659,6 +659,11 @@ mod tests {
             .expect("the launch runs");
         assert_eq!(store.owner_of("thread-7"), Some(instance(2)));
 
+        // The stream names the conversation the launch asked for, which makes it an identifier
+        // like any other: it is held while the instance is in it.
+        store
+            .select_conversation(instance(2), "thread-7")
+            .expect("the instance selected the conversation it was launched in");
         store
             .select_conversation(instance(2), "thread-8")
             .expect("the instance selected another conversation");
@@ -677,6 +682,39 @@ mod tests {
 
         store.leave_conversation(instance(2));
         assert_eq!(store.owner_of("thread-8"), None);
+    }
+
+    #[test]
+    fn a_word_the_launch_named_stays_held_until_the_stream_names_it() {
+        let mut store = ProfileStore::new();
+        let intent = store
+            .prepare(
+                profile(IntegrationMode::Gateway),
+                ForegroundMark::idle(4),
+                Some("my-chat".to_owned()),
+            )
+            .expect("prepared");
+        store
+            .execute(&intent, &ForegroundMark::idle(4), instance(2))
+            .expect("the launch runs");
+
+        // The application resolved the name to a conversation of its own. Which one a name stands
+        // for is the application's to say, so the name stays held beside the identifier.
+        store
+            .select_conversation(instance(2), "thread-8")
+            .expect("the stream named a conversation");
+        assert_eq!(store.owner_of("my-chat"), Some(instance(2)));
+        assert_eq!(store.owner_of("thread-8"), Some(instance(2)));
+        store.leave_conversation(instance(2));
+        assert_eq!(
+            store.owner_of("my-chat"),
+            Some(instance(2)),
+            "leaving the conversation does not free the word the launch named"
+        );
+        assert_eq!(store.owner_of("thread-8"), None);
+
+        store.release(instance(2));
+        assert_eq!(store.owner_of("my-chat"), None);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, BrokerBindingId,
     CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, LaunchProfileId,
     MethodTableVersion, PendingResourceId, PluginId, PublisherId, SessionId, SourceEventHandle,
-    StreamCursor, UpstreamMethod, UpstreamRequestId,
+    UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable, TimestampMs, U64, Uuid};
@@ -2387,7 +2387,8 @@ fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
 }
 
 /// KR-REQ-12.05 and KR-REQ-02.10: no second agent process runs against one saved conversation,
-/// and selecting another conversation moves the reservation rather than leaving both taken.
+/// and once the stream has named the conversation a launch asked for, selecting another one moves
+/// the reservation rather than leaving both taken.
 #[test]
 fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
@@ -2423,13 +2424,20 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
         }) if application_instance_id == instance(2)
     ));
 
-    // The running instance selects another conversation. The one it left is free; the one it took
-    // is not, and neither is stale.
+    // The stream names the conversation the launch asked for, and the running instance then
+    // selects another one. The one it left is free; the one it took is not, and neither is stale.
+    broker
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(5),
+        )
+        .expect("the stream names the conversation the launch asked for");
     broker
         .advance_binding(
             instance(2),
             Some(AgentThreadId::new("thread-8").expect("valid")),
-            TimestampMs::new(5),
+            TimestampMs::new(6),
         )
         .expect("the selection changes");
     assert_eq!(broker.conversation_owner("thread-7"), None);

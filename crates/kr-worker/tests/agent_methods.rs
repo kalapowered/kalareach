@@ -934,13 +934,13 @@ async fn an_observation_names_the_owner_and_the_turn_it_was_made_under() {
         .iter()
         .map(|entry| (entry.binding_revision, entry.turn_id.0.clone()))
         .collect();
+    let turn = Some(AgentTurnId::new("turn-1").expect("valid"));
     assert_eq!(
         observed,
         [
-            (
-                AgentBindingRevision::new(1),
-                Some(AgentTurnId::new("turn-1").expect("valid"))
-            ),
+            (AgentBindingRevision::new(1), turn.clone()),
+            // The turn the owner was leaving is recorded as dropped, under the owner it ran in.
+            (AgentBindingRevision::new(1), turn),
             (AgentBindingRevision::new(2), None),
         ],
         "the first was said in the first owner's turn, and the second under the owner that followed"
@@ -1395,9 +1395,10 @@ fn kr_req_24_24_the_text_of_a_retained_entry_is_bounded_and_says_what_it_left_ou
     let [long, short] = replay.entries.as_slice() else {
         panic!("two entries were observed: {:?}", replay.entries.len());
     };
+    let bound = kr_worker::broker::semantic::MAX_ENTRY_TEXT_BYTES;
     assert!(
-        long.text.len() <= 4096,
-        "the retained text is {} bytes",
+        (bound - 3..=bound).contains(&long.text.len()),
+        "the retained text is {} bytes, cut at a character boundary within {bound}",
         long.text.len()
     );
     assert!(
