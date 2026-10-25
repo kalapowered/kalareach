@@ -7301,16 +7301,58 @@ the application has resolved it, since a name and the identifier it resolves to 
 conversation that the host cannot tell apart. The exception is a word that the stream itself names
 as the execution's conversation, as it does an identifier: that word is held only while the
 execution is in that conversation, and is free once the execution selects another or none.
-A second launch of a held conversation is not served a second server: its program runs as typed and
-nothing of the launch is left published. The launcher prints its own reason for the refusal, and the
-host keeps the one that names the execution that holds the conversation for its own diagnostics.
 
-This holds within one session only. A second session's worker cannot see the first's executions, so
-two sessions can run a second process against one saved conversation, and so can a program the host
-adopted from the terminal, which holds no conversation until its stream names one. If a bridge or
-a stream reports that an instance selected a conversation another live instance of the same session
-holds, the host refuses the selection: the instance is left with no thread vouched for, and rich
-mutations stay suspended until the binding is verified again.
+The holding is host-wide. Every worker of the user takes an operating-system lock on a file that
+names the conversation, in the directory `conversation-claims-1` of the state root, and keeps it
+for as long as it holds the conversation. The file is empty and is named by the SHA-256 of the
+word, in lower-case hexadecimal, and `.lock`. The control daemon plays no part: a worker that
+cannot take the lock refuses the launch before it starts anything, and the kernel lets go of the
+locks of a worker that ends, whichever way it ends. A second launch of a held conversation, in this
+session or another, is not served a second server: its program runs as typed and nothing of the
+launch is left published. The launcher prints its own reason for the refusal. Within the session
+the host keeps the reason that names the execution that holds the conversation for its own
+diagnostics; across sessions it can say only that another session holds it.
+
+A claim lasts until what runs against the conversation is gone. When the program ends, its
+instance ends with it and its server is retired: the input is closed, the server is asked to
+terminate and, after the grace period, ended by force. The conversation is free for another session
+once that retirement is over, and not before. A retirement that leaves a process running keeps the
+claim until the worker ends. A person who quits the agent and starts the same conversation again
+within the retirement has the second launch run as typed.
+
+A directory of claims that cannot be made or used refuses the launch of a saved conversation and
+the selection of a thread by a stream, because nothing then says that no one holds it. The launch
+runs as typed and the instance has no thread vouched for, so rich mutations stay suspended; a launch
+that names no conversation is not affected. The worker writes the reason to its log.
+
+What the claim does not do:
+
+* It holds between workers of builds that carry it. A worker of an earlier build, such as a session
+  that was running when the host was updated, takes no claim and sees none, so between it and a new
+  session neither refuses the other. The window is the age of the oldest such session.
+* A worker killed with no goodbye lets go of its claims at once, and a server that ignores the end
+  of its input can run on until the daemon ends it.
+* A program the host adopted from the terminal, or one started outside the managed shell, holds no
+  claim until a stream or a bridge names its conversation; the selection is then checked across
+  sessions. If it is refused, the instance has no thread vouched for and rich mutations stay
+  suspended until the binding is verified again.
+* A name and the identifier it resolves to are one conversation that the host cannot tell apart
+  until the stream names the thread: a second session that launches by the identifier first is
+  refused only when its own stream names the thread.
+* The key is the word alone. Two applications that give one name to different conversations, a
+  `fork` of a held conversation, two directories that use one name, and different data directories
+  for one identifier are refused: the program runs as typed and loses the integration, nothing else.
+* It reaches the operating-system user and the state root. Environments with different state roots
+  and other users do not see each other.
+* The files are never removed, so there is one empty file for each distinct word the user has
+  claimed.
+* The directory, the file name and the lock are what workers of different builds must agree on. A
+  later build that changes any of them takes both forms for as long as the workers of an earlier
+  build can run.
+
+If a bridge or a stream reports that an instance selected a conversation another live instance of
+this session or another session holds, the host refuses the selection: the instance is left with no
+thread vouched for, and rich mutations stay suspended until the binding is verified again.
 
 ### What a launch reads of its application's mode
 

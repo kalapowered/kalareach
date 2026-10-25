@@ -234,8 +234,9 @@ checks the declaration and runs each invocation as typed, and `kr doctor` says w
   one that copies a conversation as well as one that resumes it. The host holds that word for as
   long as the execution lives, except that a word the stream itself names as the execution's
   conversation (an identifier) is held only while the execution is in it, and a second launch of
-  the same conversation in the session runs as typed. A word that is an option, empty or longer than 256
-  bytes names none. SDK code reads the rule through `IntegrationBackend::saved_conversation`.
+  the same conversation on the host runs as typed, whether it is typed in the same session or in
+  another session of the same user. A word that is an option, empty or longer than 256 bytes names
+  none. SDK code reads the rule through `IntegrationBackend::saved_conversation`.
 - The package must provide a connector table the gateway can read, which the validator checks:
   `stdio`, line-delimited JSON, a matching identifier, the request identifier, the method and the
   response identifier each one top-level member, between one and 256 classified methods, a wire name
