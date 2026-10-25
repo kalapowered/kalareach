@@ -603,6 +603,43 @@ fn a_host_a_package_cannot_name_is_refused_by_name() {
     );
 }
 
+/// A publish that is refused for its host writes nothing: the prefix it was given is as it was.
+///
+/// The publish runs from this tree's module, as a person's does, and the host it qualifies is
+/// stood in for by one no package can name, since the one these cases run in is the one that can
+/// be named.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_publish_refused_for_its_host_leaves_nothing_in_the_prefix() {
+    let package = shellpkg::Package::built(PWSH);
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../shells/psreadline/module/KalaReach.ShellBridge.psd1");
+    let prefix = tempfile::tempdir().expect("a directory on the internal disk");
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'; Import-Module '{module}';
+           & (Get-Module KalaReach.ShellBridge) {{
+               function script:Get-KrQualifiedHost {{ [pscustomobject]@{{ executable = '/bin/sh' }} }} }};
+           try {{ Publish-KalaReachQualification -Prefix '{prefix}' | Out-Null }}
+           catch {{ Write-Output "kr-key[refused]=[$($_.Exception.Message)]" }}"#,
+        module = module.display(),
+        prefix = prefix.path().display()
+    );
+    let asked = package.ask(&script);
+    let refused = String::from_utf8_lossy(&asked.stdout).into_owned();
+    assert!(
+        said(&refused, "refused").contains("powershell_host_not_pwsh"),
+        "the publish was not refused for its host: {refused}\n{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(prefix.path())
+            .expect("the prefix is there")
+            .count(),
+        0,
+        "a refused publish left something in the prefix"
+    );
+}
+
 /// KR-REQ-07.73: the module binds only a chord the editor stores under the spelling it was given,
 /// so a key of the person's is never taken over by a chord that means the same key.
 ///
