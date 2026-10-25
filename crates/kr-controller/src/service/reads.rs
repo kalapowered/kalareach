@@ -517,14 +517,9 @@ impl Controller {
         });
         // A closure that lists a worker it never saw end is a claim made when the session closed,
         // and the kernel's later answer about the process the launch ran is the proof that the
-        // claim no longer holds. Without that proof, or with a launch that names no process, the
-        // worker may remain.
+        // claim no longer holds. The offline import asks the same question of the same proof.
         if let Some(closure) = closure
-            && closure
-                .surviving
-                .iter()
-                .any(|resource| resource.kind == UNACCOUNTED_WORKER)
-            && !launch_ended
+            && crate::archive::closure_leaves_a_worker(closure, launched)
         {
             return true;
         }

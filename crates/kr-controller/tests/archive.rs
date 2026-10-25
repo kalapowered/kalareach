@@ -2217,6 +2217,120 @@ fn a_journal_a_worker_may_still_own_is_not_imported() {
     }
 }
 
+/// A session whose version 1 journal is on disk and whose registry closure lists a worker whose end
+/// was never confirmed, with a reservation that records `launcher` as the process the launch ran
+/// (`None` records none), as an environment is left by a daemon that closed it over a worker it
+/// could not see end.
+fn unconfirmed_session(
+    archive: &ArchiveService,
+    launcher: Option<&kr_protocol::identity::ProcessStartIdentity>,
+) -> SessionId {
+    let mut registry = registry(archive);
+    let reservation = registry
+        .reserve(
+            &ActorId::new("local:501").expect("a principal"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+            &[0xa0],
+            TimestampMs::new(1),
+        )
+        .expect("a reservation")
+        .reservation;
+    if let Some(launcher) = launcher {
+        registry
+            .record_launch(reservation.reservation_id, launcher)
+            .expect("records the process the launch ran");
+    }
+    let session_id = reservation.session_id;
+    write_version_one_journal(archive, session_id);
+    let mut record = closure(session_id, ClosureReason::WorkerCrash);
+    record.surviving = vec![SurvivingResource {
+        kind: "unaccounted_worker".to_owned(),
+        detail: "its end was never confirmed".to_owned(),
+    }];
+    registry
+        .record_closure(&record)
+        .expect("records the closure");
+    session_id
+}
+
+#[test]
+fn a_closures_unconfirmed_worker_no_longer_blocks_the_import_once_the_process_its_launch_ran_has_ended()
+ {
+    // KR-REQ-24.30. A closure that lists a worker whose end was never confirmed is a claim made when
+    // the session closed. The kernel's later answer about the process the session's launch ran, read
+    // from its reservation, lifts it; the same proof lifts the daemon's. What is left of the worker
+    // is fenced before the journal is opened. Anything short of that answer keeps the refusal.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let ended = kr_ipc::identity::ended_process_identity(5);
+    let running = kr_ipc::identity::current_process_start_identity().expect("an identity");
+
+    let lifted = unconfirmed_session(&archive, Some(&ended));
+    publish_descriptor(&archive, lifted, &ended);
+    let still_running = unconfirmed_session(&archive, Some(&running));
+    let no_launch = unconfirmed_session(&archive, None);
+
+    let imported = archive.import_journals().expect("imports");
+    assert_eq!(
+        outcome_of(&imported, lifted),
+        ImportOutcome::Imported {
+            from: 1,
+            to: kr_worker::persistence::migration::CURRENT,
+            receipts: 1,
+        },
+        "the launch's process ended, so nothing says a worker may remain"
+    );
+    assert!(
+        !archive.paths().descriptor_file(lifted).exists(),
+        "and what was left of its worker was fenced before the journal was opened"
+    );
+    // A launch whose process runs, and a reservation that records no launch.
+    for session_id in [still_running, no_launch] {
+        refused_as_owned(
+            &archive,
+            &outcome_of(&imported, session_id),
+            session_id,
+            "never confirmed",
+        );
+    }
+}
+
+#[test]
+fn a_reservation_that_cannot_be_read_only_keeps_the_refusal_it_was_read_to_lift() {
+    // The reservation is evidence to lift a closure's claim, never a blocker of its own: a registry
+    // without its reservations keeps the refusal for a closure that lists an unconfirmed worker and
+    // imports the journal of one that lists none.
+    use kr_controller::archive::ImportOutcome;
+    let (_temp, archive) = host();
+    let ended = kr_ipc::identity::ended_process_identity(6);
+    let unconfirmed = unconfirmed_session(&archive, Some(&ended));
+    let plain = session();
+    write_version_one_journal(&archive, plain);
+    registry(&archive)
+        .record_closure(&closure(plain, ClosureReason::RootExit))
+        .expect("records the closure");
+    rusqlite::Connection::open(archive.paths().registry_database())
+        .expect("a second connection")
+        .execute_batch("DROP TABLE reservations;")
+        .expect("the table goes");
+
+    let imported = archive.import_journals().expect("imports");
+    refused_as_owned(
+        &archive,
+        &outcome_of(&imported, unconfirmed),
+        unconfirmed,
+        "reservation could not be read",
+    );
+    assert!(
+        matches!(
+            outcome_of(&imported, plain),
+            ImportOutcome::Imported { from: 1, .. }
+        ),
+        "a closure that lists no such worker needs no reservation"
+    );
+}
+
 /// What the import did with one session's journal.
 fn outcome_of(
     imported: &[kr_controller::archive::JournalImport],

@@ -67,6 +67,7 @@ mod fence;
 mod import;
 
 pub use fence::{Ended, Fenced};
+pub(crate) use import::closure_leaves_a_worker;
 pub use import::{ImportOutcome, JournalImport, RefusalCause, UNACCOUNTED_WORKER};
 
 /// The most bytes one archive history page carries.
