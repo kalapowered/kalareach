@@ -38,7 +38,7 @@ mod scripted_worker;
 #[cfg(any(target_os = "macos", windows))]
 mod window {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use kr_protocol::envelope::ParamsValue;
@@ -49,6 +49,18 @@ mod window {
 
     /// The window the interface's own capability names.
     const INTERFACE_WINDOW: &str = "main";
+
+    /// How long the window loop is given to become ready before the check calls it never so.
+    ///
+    /// Becoming ready is the window system's own work, and a session with no desktop to show a
+    /// window on can leave the loop waiting for ever, with nothing to say so.
+    const READY_BOUND: Duration = Duration::from_secs(300);
+
+    /// How long the application is given to end once the check has its verdict.
+    ///
+    /// The check is over by then. A web view that is torn down in a session with no desktop can
+    /// hold the process open for ever, and the verdict is what the run reports.
+    const END_BOUND: Duration = Duration::from_secs(30);
 
     /// Panics heard on any thread of the check, the application's own tasks included.
     static PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -64,6 +76,16 @@ mod window {
                 .push(info.to_string());
             default(info);
         }));
+        // A window loop that never becomes ready is a failed check, not one that waits for ever.
+        let ready = Arc::new(AtomicBool::new(false));
+        let readiness = Arc::clone(&ready);
+        std::thread::spawn(move || {
+            std::thread::sleep(READY_BOUND);
+            if !readiness.load(Ordering::SeqCst) {
+                eprintln!("host_events: the window loop was not ready within {READY_BOUND:?}");
+                std::process::exit(1);
+            }
+        });
         // The scripted worker answers on a runtime of the check's own: the application's own
         // runtime is where the publisher runs.
         let runtime = Arc::new(tokio::runtime::Runtime::new().expect("a runtime for the worker"));
@@ -91,6 +113,7 @@ mod window {
             let Some(worker) = worker.take() else {
                 return;
             };
+            ready.store(true, Ordering::SeqCst);
             let handle = handle.clone();
             let runtime = Arc::clone(&runtime);
             let recorded = Arc::clone(&recorded);
@@ -112,6 +135,16 @@ mod window {
                     }
                 };
                 recorded.store(code, Ordering::SeqCst);
+                // If the application does not end, the process ends with the verdict.
+                std::thread::spawn(move || {
+                    std::thread::sleep(END_BOUND);
+                    eprintln!("host_events: the application did not end within {END_BOUND:?}");
+                    let panicked = !PANICS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty();
+                    std::process::exit(if panicked { 1 } else { code });
+                });
                 handle.exit(code);
             });
         });
