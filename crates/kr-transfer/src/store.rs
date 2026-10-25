@@ -1513,18 +1513,6 @@ impl Store {
                 "this draft targets another session, so it cannot be sent to this one",
             ));
         }
-        // The application a draft is for is fixed when it is made, so this read stands for the
-        // transaction below.
-        if draft
-            .application_instance_id
-            .is_some_and(|written_for| written_for != application_instance_id)
-        {
-            return Err(TransferError::DraftConflict {
-                detail: "this draft was written for another application, so it is not sent to \
-                         this one"
-                    .to_owned(),
-            });
-        }
         let transaction = self.begin()?;
         let sent_to: Option<Uuid> = transaction
             .query_row(
@@ -1584,6 +1572,19 @@ impl Store {
                 "an attachment of this draft belongs to another session, and an attachment is \
                  held by one session",
             ));
+        }
+        // Last of the refusals and before the first write, so a draft that is wrong in its session
+        // is refused as that whichever application the prompt is for. The application a draft is
+        // for is fixed when it is made, so the read at the top stands for the transaction.
+        if draft
+            .application_instance_id
+            .is_some_and(|written_for| written_for != application_instance_id)
+        {
+            return Err(TransferError::DraftConflict {
+                detail: "this draft was written for another application, so it is not sent to \
+                         this one"
+                    .to_owned(),
+            });
         }
         transaction
             .execute(
