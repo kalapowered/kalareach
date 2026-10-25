@@ -9163,7 +9163,6 @@ fn observed_stores(host: &Host) -> Vec<stored_formats::Observed> {
 /// to the version the code writes and a digest of what the version stands for: the tables a real
 /// daemon made, the types it keeps and the words it matches by hand. A change to any of them moves
 /// the digest, and this fails until the version has been raised and the lock written.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     let host = a_host_whose_daemon_has_run().await;
@@ -9607,7 +9606,6 @@ pub struct Made {
 /// made and closed, every entry of the state root and of the environment's directory is a store's or
 /// is named in the lock with the reason it has no version, and a file that nothing names is found,
 /// whether it is beside the stores or inside a directory a store owns.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn no_file_of_a_state_root_goes_unnamed() {
     let host = a_host_whose_daemon_has_run().await;
