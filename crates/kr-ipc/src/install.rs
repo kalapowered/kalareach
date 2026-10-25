@@ -77,7 +77,6 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use kr_protocol::update::{MANIFEST_FILE, ReleaseManifest, ReleaseName};
@@ -525,13 +524,22 @@ pub fn open_regular_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// Opens a file of a release for reading.
+///
+/// # Errors
+///
+/// Returns the operating system's error.
+#[cfg(windows)]
+pub fn open_regular_file(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
 /// Reads a file of a release whole, refusing what [`open_regular_file`] refuses and one longer
 /// than `limit`.
 ///
 /// # Errors
 ///
 /// Returns the failure to open or read it, and `InvalidData` for a file longer than `limit`.
-#[cfg(unix)]
 pub fn read_regular_file(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
@@ -593,12 +601,7 @@ fn hold_opened_within(
 ) -> Result<(File, ReleaseManifest)> {
     use std::os::unix::fs::MetadataExt as _;
 
-    if !lock_within(
-        &file,
-        &path,
-        rustix::fs::FlockOperation::NonBlockingLockShared,
-        within,
-    )? {
+    if !lock_within(&file, &path, Locking::Shared, within)? {
         return Err(InstallError::Replaced {
             path,
             reason: "is being removed or replaced, and that has not finished: this program of it \
@@ -621,7 +624,6 @@ fn hold_opened_within(
 }
 
 /// Reads the manifest from an open file at `path`, and checks that it names `release`.
-#[cfg(unix)]
 fn read_manifest(file: &File, path: &Path, release: &ReleaseName) -> Result<ReleaseManifest> {
     use std::io::Read as _;
 
@@ -657,46 +659,116 @@ fn hold(_store: &Store, _release: &ReleaseName) -> Result<(File, ReleaseManifest
     Err(InstallError::Unsupported)
 }
 
-/// Takes a lock on an open file without blocking, trying again for as long as `within` and when a
-/// signal interrupts it, and says whether it was taken. `operation` is a non-blocking one.
-#[cfg(unix)]
-fn lock_within(
-    file: &File,
-    path: &Path,
-    operation: rustix::fs::FlockOperation,
-    within: Duration,
-) -> Result<bool> {
+/// How a lock file is locked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Locking {
+    /// Any number of holders at once.
+    Shared,
+    /// One holder, and no shared holder beside it.
+    Exclusive,
+}
+
+/// The file locks of a store's lock files: advisory `flock` on Unix, and on Windows a lock of the
+/// whole file by the open handle, which the standard library asks of the system. Either belongs to
+/// the open file and goes when the last handle to it is closed.
+mod filelock {
+    use std::fs::File;
+
+    use super::Locking;
+
+    /// Takes the lock without waiting, and says whether it was taken.
+    #[cfg(unix)]
+    pub(super) fn try_take(file: &File, locking: Locking) -> std::io::Result<bool> {
+        let operation = match locking {
+            Locking::Shared => rustix::fs::FlockOperation::NonBlockingLockShared,
+            Locking::Exclusive => rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        };
+        loop {
+            match rustix::fs::flock(file, operation) {
+                Ok(()) => return Ok(true),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
+                Err(error) => return Err(std::io::Error::from(error)),
+            }
+        }
+    }
+
+    /// Takes the lock without waiting, and says whether it was taken.
+    #[cfg(windows)]
+    pub(super) fn try_take(file: &File, locking: Locking) -> std::io::Result<bool> {
+        use std::fs::TryLockError;
+
+        let taken = match locking {
+            Locking::Shared => file.try_lock_shared(),
+            Locking::Exclusive => file.try_lock(),
+        };
+        match taken {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Takes the lock, waiting for it.
+    #[cfg(unix)]
+    pub(super) fn take(file: &File, locking: Locking) -> std::io::Result<()> {
+        let operation = match locking {
+            Locking::Shared => rustix::fs::FlockOperation::LockShared,
+            Locking::Exclusive => rustix::fs::FlockOperation::LockExclusive,
+        };
+        loop {
+            match rustix::fs::flock(file, operation) {
+                Ok(()) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(std::io::Error::from(error)),
+            }
+        }
+    }
+
+    /// Takes the lock, waiting for it.
+    #[cfg(windows)]
+    pub(super) fn take(file: &File, locking: Locking) -> std::io::Result<()> {
+        match locking {
+            Locking::Shared => file.lock_shared(),
+            Locking::Exclusive => file.lock(),
+        }
+    }
+
+    /// Lets go of the lock at once, without waiting for the file to be closed.
+    #[cfg(unix)]
+    pub(super) fn release(file: &File) -> std::io::Result<()> {
+        rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock).map_err(std::io::Error::from)
+    }
+
+    /// Lets go of the lock at once, without waiting for the file to be closed.
+    #[cfg(windows)]
+    pub(super) fn release(file: &File) -> std::io::Result<()> {
+        file.unlock()
+    }
+}
+
+/// Takes a lock on an open file without blocking, trying again for as long as `within`, and says
+/// whether it was taken.
+fn lock_within(file: &File, path: &Path, locking: Locking, within: Duration) -> Result<bool> {
     let deadline = Instant::now() + within;
     loop {
-        match rustix::fs::flock(file, operation) {
-            Ok(()) => return Ok(true),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+        match filelock::try_take(file, locking) {
+            Ok(true) => return Ok(true),
+            Ok(false) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(false),
-            Err(error) => {
-                return Err(InstallError::io("lock", path, std::io::Error::from(error)));
-            }
+            Ok(false) => return Ok(false),
+            Err(error) => return Err(InstallError::io("lock", path, error)),
         }
     }
 }
 
-/// Takes a lock on an open file, waiting for it, and again if a signal interrupts the wait.
+/// Takes a lock on an open file, waiting for it.
 ///
 /// Only what waits for a bounded section of an update takes a lock this way, a control daemon's
 /// start lock; a release's manifest is locked by [`lock_within`].
-#[cfg(unix)]
-fn lock(file: &File, path: &Path, operation: rustix::fs::FlockOperation) -> Result<()> {
-    loop {
-        match rustix::fs::flock(file, operation) {
-            Ok(()) => return Ok(()),
-            Err(rustix::io::Errno::INTR) => {}
-            Err(error) => {
-                return Err(InstallError::io("lock", path, std::io::Error::from(error)));
-            }
-        }
-    }
+fn lock(file: &File, path: &Path, locking: Locking) -> Result<()> {
+    filelock::take(file, locking).map_err(|error| InstallError::io("lock", path, error))
 }
 
 /// Whether nothing holds the release whose manifest is `file`: the exclusive lock is taken to find
@@ -705,13 +777,11 @@ fn lock(file: &File, path: &Path, operation: rustix::fs::FlockOperation) -> Resu
 /// leave the lock to that program and the question would hold what it asked about.
 #[cfg(unix)]
 fn probe_is_free(file: &File) -> std::io::Result<bool> {
-    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {
-            rustix::fs::flock(file, rustix::fs::FlockOperation::Unlock)?;
-            Ok(true)
-        }
-        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
-        Err(error) => Err(std::io::Error::from(error)),
+    if filelock::try_take(file, Locking::Exclusive)? {
+        filelock::release(file)?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -908,7 +978,6 @@ impl Store {
     }
 }
 
-#[cfg(unix)]
 impl Store {
     /// Takes the update lock, which one update holds from its first look at the host to its last
     /// start, when no other update holds it. A first install holds it too, and `current` changes
@@ -919,10 +988,7 @@ impl Store {
     /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
     /// but another holder.
     pub fn try_lock_update(&self) -> Result<Option<StoreLock>> {
-        StoreLock::try_take(
-            &self.root.join("update.lock"),
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
+        StoreLock::try_take(&self.root.join("update.lock"), Locking::Exclusive)
     }
 
     /// Takes the install lock exclusively when nothing holds it, without waiting: nothing starts
@@ -937,11 +1003,8 @@ impl Store {
     /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
     /// but a holder.
     pub fn try_lock_install(&self) -> Result<Option<ExclusiveInstall>> {
-        StoreLock::try_take(
-            &self.root.join("install.lock"),
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
-        .map(|taken| taken.map(ExclusiveInstall))
+        StoreLock::try_take(&self.root.join("install.lock"), Locking::Exclusive)
+            .map(|taken| taken.map(ExclusiveInstall))
     }
 
     /// Takes the writers' lock exclusively when no command holds it, without waiting. An update
@@ -953,11 +1016,8 @@ impl Store {
     /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked for any reason
     /// but a holder.
     pub fn try_lock_writers(&self) -> Result<Option<ExclusiveWriters>> {
-        StoreLock::try_take(
-            &self.root.join(WRITERS_LOCK),
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
-        .map(|taken| taken.map(ExclusiveWriters))
+        StoreLock::try_take(&self.root.join(WRITERS_LOCK), Locking::Exclusive)
+            .map(|taken| taken.map(ExclusiveWriters))
     }
 
     /// Registers what a command works in, then holds the writers' lock shared, for a command that
@@ -1036,12 +1096,12 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the lock file cannot be opened or locked.
     pub fn lock_start(&self) -> Result<StoreLock> {
-        StoreLock::take(
-            &self.root.join("install.lock"),
-            rustix::fs::FlockOperation::LockShared,
-        )
+        StoreLock::take(&self.root.join("install.lock"), Locking::Shared)
     }
+}
 
+#[cfg(unix)]
+impl Store {
     /// Makes `release` current: one new link, renamed over `current`, and the store's directory
     /// flushed so the rename survives a crash. Nothing else changes.
     ///
@@ -1185,7 +1245,9 @@ impl Store {
         remove_tree(&removed)?;
         Ok(true)
     }
+}
 
+impl Store {
     /// Records the runtime and state roots a control daemon of this store serves, so an update
     /// finds every environment this store's daemons have run.
     ///
@@ -1193,13 +1255,11 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when the record cannot be written.
     pub fn record_roots(&self, runtime_root: &Path, state_root: &Path) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let state = state_root.as_os_str().as_bytes();
-        let mut contents = runtime_root.as_os_str().as_bytes().to_vec();
+        let state = path_bytes(state_root)?;
+        let mut contents = path_bytes(runtime_root)?.into_owned();
         contents.push(0);
-        contents.extend_from_slice(state);
-        self.write_record(state, &contents, ROOT_RECORD)
+        contents.extend_from_slice(&state);
+        self.write_record(&state, &contents, ROOT_RECORD)
     }
 
     /// Every pair of roots a control daemon of this store has served, in record order.
@@ -1309,25 +1369,21 @@ impl Store {
         environment: kr_protocol::ids::EnvironmentId,
         path: &Path,
     ) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt as _;
-
         let path =
             std::path::absolute(path).map_err(|error| InstallError::io("resolve", path, error))?;
         let mut contents = environment.to_string().into_bytes();
         contents.push(0);
-        contents.extend_from_slice(path.as_os_str().as_bytes());
+        contents.extend_from_slice(&path_bytes(&path)?);
         self.write_record(&contents, &contents, DOCUMENT_RECORD)
     }
 
     /// Registers what a command works in: its roots, and the configuration document it writes.
     fn register(&self, writing: &Writing) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let state = writing.state_root.as_os_str().as_bytes();
-        let mut contents = writing.runtime_root.as_os_str().as_bytes().to_vec();
+        let state = path_bytes(&writing.state_root)?;
+        let mut contents = path_bytes(&writing.runtime_root)?.into_owned();
         contents.push(0);
-        contents.extend_from_slice(state);
-        self.write_record(state, &contents, REGISTERED_RECORD)?;
+        contents.extend_from_slice(&state);
+        self.write_record(&state, &contents, REGISTERED_RECORD)?;
         if let Some((environment, path)) = &writing.document {
             self.record_document(*environment, path)?;
         }
@@ -1382,7 +1438,33 @@ impl Store {
     }
 }
 
-/// The bytes of a path a record holds.
+/// The bytes a record holds for a path: the path's own bytes on Unix, and its text in UTF-8 on
+/// Windows, where a path that is not valid Unicode cannot be recorded in a form that reads back.
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Result<std::borrow::Cow<'_, [u8]>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    Ok(std::borrow::Cow::Borrowed(path.as_os_str().as_bytes()))
+}
+
+/// The bytes a record holds for a path: the path's own bytes on Unix, and its text in UTF-8 on
+/// Windows, where a path that is not valid Unicode cannot be recorded in a form that reads back.
+#[cfg(windows)]
+fn path_bytes(path: &Path) -> Result<std::borrow::Cow<'_, [u8]>> {
+    path.to_str()
+        .map(|text| std::borrow::Cow::Borrowed(text.as_bytes()))
+        .ok_or_else(|| {
+            InstallError::io(
+                "record",
+                path,
+                std::io::Error::other(
+                    "it is not valid Unicode, so a record of it would not read back",
+                ),
+            )
+        })
+}
+
+/// The path a record holds.
 #[cfg(unix)]
 fn bytes_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt as _;
@@ -1390,15 +1472,18 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
+/// The path a record holds.
+#[cfg(windows)]
+fn bytes_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Why a path a record holds cannot be looked at, or `None` when it can: a record names where a
 /// command worked, and an empty or relative path names nowhere an update can look.
-#[cfg(unix)]
 fn unusable_path(path: &Path) -> Option<&'static str> {
-    use std::os::unix::ffi::OsStrExt as _;
-
     if path.as_os_str().is_empty() {
         Some("is empty")
-    } else if path.as_os_str().as_bytes().contains(&0) {
+    } else if path_bytes(path).is_ok_and(|bytes| bytes.contains(&0)) {
         Some("holds a byte no path holds")
     } else if !path.is_absolute() {
         Some("is not an absolute path")
@@ -1408,15 +1493,12 @@ fn unusable_path(path: &Path) -> Option<&'static str> {
 }
 
 /// The extension of the record of the roots a control daemon served.
-#[cfg(unix)]
 const ROOT_RECORD: &str = "root";
 
 /// The extension of the record of the roots a command worked in.
-#[cfg(unix)]
 const REGISTERED_RECORD: &str = "registered";
 
 /// The extension of the record of a configuration document.
-#[cfg(unix)]
 const DOCUMENT_RECORD: &str = "document";
 
 /// What a command works in, which it registers with the store before it writes a record
@@ -1478,15 +1560,13 @@ pub struct RecordedDocument {
 }
 
 /// A shared hold on a release of a store, taken for a program that is about to start from it.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct Pin {
-    /// The release's manifest, opened and locked shared.
+    /// The release's manifest, opened and held.
     file: File,
     manifest: ReleaseManifest,
 }
 
-#[cfg(unix)]
 impl Pin {
     /// The manifest of the release pinned.
     #[must_use]
@@ -1500,6 +1580,7 @@ impl Pin {
     /// program that takes this process's place holds the release from its first instruction and
     /// still holds it while it takes a hold of its own. Returns only when the replacement failed,
     /// with the reason, and the hold ends with the pin.
+    #[cfg(unix)]
     pub fn exec(self, command: &mut std::process::Command) -> std::io::Error {
         use std::os::unix::process::CommandExt as _;
 
@@ -1511,31 +1592,32 @@ impl Pin {
 }
 
 /// A lock on one of a store's lock files, released when this is dropped.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct StoreLock {
     file: File,
     path: PathBuf,
 }
 
-#[cfg(unix)]
 impl StoreLock {
     fn open(path: &Path) -> Result<File> {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // A lock file is the owner's alone: by mode here, and on Windows by the list the store's
+        // directory gives every file made in it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
 
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(crate::paths::OWNER_ONLY_FILE_MODE)
+            options.mode(crate::paths::OWNER_ONLY_FILE_MODE);
+        }
+        options
             .open(path)
             .map_err(|error| InstallError::io("open the lock", path, error))
     }
 
-    fn take(path: &Path, operation: rustix::fs::FlockOperation) -> Result<Self> {
+    fn take(path: &Path, locking: Locking) -> Result<Self> {
         let file = Self::open(path)?;
-        lock(&file, path, operation)?;
+        lock(&file, path, locking)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -1550,10 +1632,9 @@ impl StoreLock {
         on_wait: &mut dyn FnMut(),
     ) -> Result<Option<Self>> {
         let file = Self::open(path)?;
-        let shared = rustix::fs::FlockOperation::NonBlockingLockShared;
-        if !lock_within(&file, path, shared, Duration::ZERO)? {
+        if !lock_within(&file, path, Locking::Shared, Duration::ZERO)? {
             on_wait();
-            if !lock_within(&file, path, shared, within)? {
+            if !lock_within(&file, path, Locking::Shared, within)? {
                 return Ok(None);
             }
         }
@@ -1563,20 +1644,19 @@ impl StoreLock {
         }))
     }
 
-    fn try_take(path: &Path, operation: rustix::fs::FlockOperation) -> Result<Option<Self>> {
+    fn try_take(path: &Path, locking: Locking) -> Result<Option<Self>> {
         let file = Self::open(path)?;
-        match rustix::fs::flock(&file, operation) {
-            Ok(()) => Ok(Some(Self {
+        match filelock::try_take(&file, locking) {
+            Ok(true) => Ok(Some(Self {
                 file,
                 path: path.to_path_buf(),
             })),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(error) => Err(InstallError::io("lock", path, std::io::Error::from(error))),
+            Ok(false) => Ok(None),
+            Err(error) => Err(InstallError::io("lock", path, error)),
         }
     }
 }
 
-#[cfg(unix)]
 impl StoreLock {
     /// The lock file.
     #[must_use]
@@ -1585,26 +1665,23 @@ impl StoreLock {
     }
 }
 
-#[cfg(unix)]
 impl Drop for StoreLock {
     fn drop(&mut self) {
         // The lock belongs to the open file. A process started while it was held may still hold a
         // descriptor onto that file until its own program takes over, so the lock is let go of
         // here rather than left to the close.
-        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        let _ = filelock::release(&self.file);
     }
 }
 
 /// The install lock held exclusively: no control daemon of this store starts, and no command
 /// registers what it works in, while it is held. An update takes it before it stops anything and
 /// holds it until it has switched, and [`Store::switch`] asks for it by type.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct ExclusiveInstall(StoreLock);
 
 /// The writers' lock held exclusively: no command writes a stored record of this store while it is
 /// held. An update takes it before it checks the stores and holds it until it has switched.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct ExclusiveWriters(StoreLock);
 
@@ -1677,11 +1754,9 @@ pub enum WriteRefused {
 /// the manifest of the release `current` names, which cannot change while the lock is held.
 #[derive(Debug)]
 pub struct Writers {
-    #[cfg(unix)]
     shared: Option<Shared>,
 }
 
-#[cfg(unix)]
 #[derive(Debug)]
 struct Shared {
     _lock: StoreLock,
@@ -1698,10 +1773,7 @@ impl Writers {
     /// store's lock or refuses to write.
     #[must_use]
     pub(crate) const fn outside_a_store() -> Self {
-        Self {
-            #[cfg(unix)]
-            shared: None,
-        }
+        Self { shared: None }
     }
 
     /// Permits the write of `record`, when the release `current` names does not list it at another
@@ -1711,7 +1783,6 @@ impl Writers {
     ///
     /// Returns [`WriteRefused::NotWhatCurrentReads`] when it does.
     pub fn permit(&self, record: &Written) -> std::result::Result<Permit<'_>, WriteRefused> {
-        #[cfg(unix)]
         if let Some(shared) = &self.shared
             && let Some(listed) = shared
                 .manifest
@@ -1772,7 +1843,6 @@ impl Permit<'_> {
 ///
 /// Returns what [`Store::hold_writers`] returns, and [`WriteRefused::Process`] when this process
 /// could not establish the release it runs.
-#[cfg(unix)]
 pub fn hold_writers(
     writing: &Writing,
     on_wait: &mut dyn FnMut(),
@@ -1789,17 +1859,58 @@ pub fn hold_writers(
     }
 }
 
-/// Holds nothing: a Windows host keeps no store, and its programs run outside one.
-///
-/// # Errors
-///
-/// Never.
-#[cfg(not(unix))]
-pub fn hold_writers(
-    _writing: &Writing,
-    _on_wait: &mut dyn FnMut(),
-) -> std::result::Result<Writers, WriteRefused> {
-    Ok(Writers::outside_a_store())
+/// The part of a store a Windows host does not keep yet.
+#[cfg(windows)]
+impl Store {
+    /// Makes `release` current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Unsupported`].
+    pub fn switch(
+        &self,
+        _release: &ReleaseName,
+        _update: &StoreLock,
+        _install: &ExclusiveInstall,
+        _writers: &ExclusiveWriters,
+    ) -> Result<()> {
+        Err(InstallError::Unsupported)
+    }
+
+    /// Whether a running process holds `release`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Unsupported`].
+    pub fn held(&self, _release: &ReleaseName) -> Result<bool> {
+        Err(InstallError::Unsupported)
+    }
+
+    /// Holds `release` for a program that is about to start from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Unsupported`].
+    pub fn pin(&self, _release: &ReleaseName) -> Result<Option<Pin>> {
+        Err(InstallError::Unsupported)
+    }
+
+    /// Removes a release no running process holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Unsupported`].
+    pub fn retire(&self, _release: &ReleaseName, _held: &StoreLock) -> Result<bool> {
+        Err(InstallError::Unsupported)
+    }
+}
+
+#[cfg(windows)]
+impl Pin {
+    /// Runs `command` with the release held until it ends.
+    pub fn run(self, _command: &mut std::process::Command) -> std::io::Error {
+        std::io::Error::other(InstallError::Unsupported)
+    }
 }
 
 /// Flushes a directory, so a name just added to it or taken out of it survives a crash.
