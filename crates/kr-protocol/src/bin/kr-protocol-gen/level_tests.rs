@@ -22,6 +22,21 @@ struct Tree {
     majors: &'static str,
     /// The roots of the retained surface the release's own source declares.
     roots: Vec<&'static str>,
+    /// The plugin SDK schema the release committed, when it had one.
+    sdk: Option<Value>,
+}
+
+fn sdk_schema(description: &str, extra_member: bool) -> Value {
+    let mut manifest = json!({
+        "description": description,
+        "type": "object",
+        "properties": { "name": { "type": "string" } },
+        "required": ["name"],
+    });
+    if extra_member {
+        manifest["properties"]["added"] = json!({ "type": "string" });
+    }
+    json!({ "$defs": { "Manifest": manifest } })
 }
 
 fn schema(lease: bool, peer_member: &str, outside_member: &str) -> Value {
@@ -74,6 +89,7 @@ impl Tree {
             host: "kr-plugin-host/3",
             majors: "major=1 versions=1.0 replaced=- supported_until=- retired=false\n",
             roots: vec!["ControlFrame"],
+            sdk: Some(sdk_schema("The manifest.", false)),
         }
     }
 
@@ -157,6 +173,16 @@ impl Repo {
             "packages/protocol/schema/kalareach-protocol.schema.json",
             &serde_json::to_string_pretty(&tree.schema).expect("text"),
         );
+        let sdk = "packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json";
+        match &tree.sdk {
+            Some(sdk_schema) => self.write(
+                sdk,
+                &serde_json::to_string_pretty(sdk_schema).expect("text"),
+            ),
+            None => {
+                let _ = std::fs::remove_file(self.directory.join(sdk));
+            }
+        }
         self.write(
             "crates/kr-protocol/src/hello.rs",
             "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);\n",
@@ -207,6 +233,10 @@ impl Repo {
             commit: commit.to_owned(),
             level: CompatibilityLevel::of(PackageVersion::new(0, 76, 0)),
             schema: tree.schema.clone(),
+            sdk_schema: tree
+                .sdk
+                .clone()
+                .unwrap_or_else(|| sdk_schema("The manifest.", false)),
             worker: WorkerSurface::parse(
                 &tree
                     .worker
@@ -288,9 +318,10 @@ fn a_level_released_before_its_last_change_fails_naming_the_early_releases() {
 }
 
 /// A change inside a root a worker's peers read is a difference, and the same change to a type no
-/// root reaches is not.
+/// root reaches is one as well: it is a change to the public contract. A difference both
+/// comparisons see is one line.
 #[test]
-fn a_change_to_a_widened_root_fails_and_a_change_outside_every_root_does_not() {
+fn a_change_to_a_type_fails_whether_or_not_a_root_reaches_it_and_is_named_once() {
     let now = Tree::the_level();
     let level = whole_level("widened", &now);
     let widened = Tree {
@@ -304,7 +335,212 @@ fn a_change_to_a_widened_root_fails_and_a_change_outside_every_root_does_not() {
         schema: schema(true, "string", "integer"),
         ..now.clone()
     };
-    run(&level, &outside).expect("no root reaches that type");
+    let error = run(&level, &outside).expect_err("the public contract changed");
+    assert!(error.contains("OutsideEveryRoot.member"), "{error}");
+
+    let repo = Repo::new("named-once");
+    let commit = repo.commit(&now, "the level");
+    repo.release("0.76.0", &commit);
+    let head = repo.commit(&widened, "after");
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let error =
+        check(&repo.directory, &repo.head(&widened, &head), &releases).expect_err("a root changed");
+    assert_eq!(
+        error.matches("PeerParams.member changed").count(),
+        1,
+        "{error}"
+    );
+}
+
+/// A member added to an existing type fails, optional or not, and names the type and the member.
+/// A definition that is new passes, and so does a variant added to `Method`; a variant removed from
+/// it does not.
+#[test]
+fn a_member_added_to_a_type_fails_and_a_new_definition_and_a_new_method_pass() {
+    let now = Tree::the_level();
+    let level = whole_level("members", &now);
+
+    let mut with_member = now.clone();
+    with_member.schema["$defs"]["OutsideEveryRoot"]["properties"]["added"] =
+        json!({ "type": "string" });
+    let error = run(&level, &with_member).expect_err("a member was added");
+    assert!(
+        error.contains("OutsideEveryRoot.added added: a member"),
+        "{error}"
+    );
+
+    let mut with_definition = now.clone();
+    with_definition.schema["$defs"]["Brand"] = json!({
+        "type": "object",
+        "properties": { "name": { "type": "string" } },
+        "required": ["name"],
+    });
+    run(&level, &with_definition).expect("a new definition keeps the level");
+
+    let methods = |names: &[&str]| -> Value {
+        json!({ "oneOf": names
+            .iter()
+            .map(|name| json!({ "const": name, "type": "string" }))
+            .collect::<Vec<_>>() })
+    };
+    let repo = Repo::new("methods");
+    let mut before = now.clone();
+    before.schema["$defs"]["Method"] = methods(&["host.info", "session.read"]);
+    let commit = repo.commit(&before, "the level");
+    repo.release("0.76.0", &commit);
+    let releases = inventory(&repo.directory).expect("an inventory");
+
+    let mut with_method = now.clone();
+    with_method.schema["$defs"]["Method"] =
+        methods(&["host.info", "session.read", "history.times"]);
+    let head = repo.commit(&with_method, "a method");
+    check(&repo.directory, &repo.head(&with_method, &head), &releases)
+        .expect("a method a daemon serves keeps the level");
+
+    // Only a new name passes. A name the earlier schema already had, a branch that says more than
+    // its name and a member added inside a branch are not new methods.
+    let mut again = now.clone();
+    again.schema["$defs"]["Method"] = methods(&["host.info", "session.read", "host.info"]);
+    let head = repo.commit(&again, "a name twice");
+    let error = check(&repo.directory, &repo.head(&again, &head), &releases)
+        .expect_err("a name the level already had is not a new method");
+    assert!(error.contains("Method#const:host.info@"), "{error}");
+
+    let mut wider = now.clone();
+    wider.schema["$defs"]["Method"] = methods(&["host.info", "session.read"]);
+    wider.schema["$defs"]["Method"]["oneOf"]
+        .as_array_mut()
+        .expect("a list")
+        .push(json!({ "const": "history.times", "type": "string", "pattern": "^x$" }));
+    let head = repo.commit(&wider, "a branch with more than its name");
+    let error = check(&repo.directory, &repo.head(&wider, &head), &releases)
+        .expect_err("a branch that says more than its name is not a new method");
+    assert!(error.contains("Method#const:history.times"), "{error}");
+
+    let mut inside = now.clone();
+    inside.schema["$defs"]["Method"] = methods(&["host.info", "session.read"]);
+    inside.schema["$defs"]["Method"]["oneOf"][0]["properties"] =
+        json!({ "added": { "type": "string" } });
+    let head = repo.commit(&inside, "a member inside a branch");
+    let error = check(&repo.directory, &repo.head(&inside, &head), &releases)
+        .expect_err("a member inside a branch is not a new method");
+    assert!(error.contains("Method#const:host.info.added"), "{error}");
+
+    let mut without_method = now.clone();
+    without_method.schema["$defs"]["Method"] = methods(&["host.info"]);
+    let head = repo.commit(&without_method, "a method fewer");
+    let error = check(
+        &repo.directory,
+        &repo.head(&without_method, &head),
+        &releases,
+    )
+    .expect_err("a method went");
+    assert!(
+        error.contains("Method#const:session.read removed"),
+        "{error}"
+    );
+}
+
+/// An optional member added to an object the release marked read-only metadata passes, a required
+/// one fails, and so does an optional member added to an object that is not marked.
+#[test]
+fn an_optional_member_of_read_only_metadata_passes_and_a_required_one_fails() {
+    let now = Tree::the_level();
+    let marked = |members: &[(&str, bool)]| -> Value {
+        let mut object = json!({
+            "x-kalareach-read-only-metadata": true,
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+        });
+        for (name, required) in members {
+            object["properties"][*name] = json!({ "type": "string" });
+            if *required {
+                object["required"]
+                    .as_array_mut()
+                    .expect("a list")
+                    .push(json!(name));
+            }
+        }
+        object
+    };
+    let repo = Repo::new("metadata");
+    let mut before = now.clone();
+    before.schema["$defs"]["Metadata"] = marked(&[]);
+    let commit = repo.commit(&before, "the level");
+    repo.release("0.76.0", &commit);
+    let releases = inventory(&repo.directory).expect("an inventory");
+
+    let mut optional = now.clone();
+    optional.schema["$defs"]["Metadata"] = marked(&[("note", false)]);
+    let head = repo.commit(&optional, "an optional member");
+    check(&repo.directory, &repo.head(&optional, &head), &releases)
+        .expect("a reader of read-only metadata drops a member it does not know");
+
+    let mut required = now.clone();
+    required.schema["$defs"]["Metadata"] = marked(&[("note", true)]);
+    let head = repo.commit(&required, "a required member");
+    let error = check(&repo.directory, &repo.head(&required, &head), &releases)
+        .expect_err("a required member is read by no earlier release");
+    assert!(error.contains("Metadata.note"), "{error}");
+
+    let mut unmarked = before.clone();
+    unmarked.schema["$defs"]["Metadata"]
+        .as_object_mut()
+        .expect("an object")
+        .remove("x-kalareach-read-only-metadata");
+    let repo = Repo::new("unmarked");
+    let commit = repo.commit(&unmarked, "the level");
+    repo.release("0.76.0", &commit);
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let mut grown = unmarked.clone();
+    grown.schema["$defs"]["Metadata"]["properties"]["note"] = json!({ "type": "string" });
+    let head = repo.commit(&grown, "an optional member");
+    let error = check(&repo.directory, &repo.head(&grown, &head), &releases)
+        .expect_err("the earlier release's object was not marked");
+    assert!(error.contains("Metadata.note added"), "{error}");
+}
+
+/// The plugin SDK schema is held to the level too: a member added to a definition fails, a changed
+/// description passes, and a release of the level without the file fails the check.
+#[test]
+fn the_plugin_sdk_schema_is_held_and_a_description_is_not() {
+    let now = Tree::the_level();
+    let level = whole_level("sdk", &now);
+
+    let grown = Tree {
+        sdk: Some(sdk_schema("The manifest.", true)),
+        ..now.clone()
+    };
+    let error = run(&level, &grown).expect_err("a member was added to the SDK schema");
+    assert!(
+        error.contains("the plugin SDK schema: Manifest.added added: a member"),
+        "{error}"
+    );
+
+    let reworded = Tree {
+        sdk: Some(sdk_schema("What a plugin states about itself.", false)),
+        ..now.clone()
+    };
+    run(&level, &reworded).expect("a description is not part of the schema's meaning");
+
+    // A release of the level that committed no SDK schema cannot be compared, and the check says
+    // so: it is not read as a release with nothing in it.
+    let repo = Repo::new("sdk-absent");
+    let early = Tree {
+        sdk: None,
+        ..now.clone()
+    };
+    let commit = repo.commit(&early, "a release without the SDK schema");
+    let tag = repo.release("0.76.0", &commit);
+    let head = repo.commit(&now, "after");
+    let releases = inventory(&repo.directory).expect("an inventory");
+    let error = check(&repo.directory, &repo.head(&now, &head), &releases)
+        .expect_err("the SDK schema of the release is missing");
+    assert!(
+        error.contains(&tag) && error.contains("plugin SDK schema"),
+        "{error}"
+    );
 }
 
 /// A root the head no longer has cannot hide the difference: the release's own list is cut too, and
