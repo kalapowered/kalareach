@@ -407,7 +407,9 @@ impl ChangeSetModule {
             }
             // An apply that refused before its claim wrote nothing at all, and there is nothing to
             // settle or to give back: the action is untouched and the caller can ask again with
-            // what it now knows is there. That is every `DRAFT_CONFLICT` an apply returns.
+            // what it now knows is there. That is every `DRAFT_CONFLICT` an apply returns before
+            // its claim. A reference that moved between the comparison and the move is a conflict
+            // after the claim, and is recorded with the action like any other error after it.
             if matches!(method, Method::DiffApply | Method::DiffRevert) && !deferred.taken() {
                 return outcome;
             }

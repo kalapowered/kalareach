@@ -450,6 +450,41 @@ async fn repositories_workspaces_change_sets_and_diffs_are_managed_through_the_d
         "a proposal writes to no working tree"
     );
 
+    // A reference moves to the object the command names, while it holds the value the command
+    // says it holds.
+    let held_by_main = |directory: &Path| {
+        std::fs::read_to_string(directory.join(".git/refs/heads/main"))
+            .expect("the branch is a loose reference")
+            .trim()
+            .to_owned()
+    };
+    let first = held_by_main(&source);
+    git(
+        &source,
+        ["commit", "--allow-empty", "-m", "the second commit"],
+    );
+    let second = held_by_main(&source);
+    assert_ne!(first, second);
+    let moved = host.kr_json(&[
+        "diff",
+        "apply",
+        &change_set,
+        "1",
+        "--to",
+        "reference",
+        "--workspace",
+        &workspace,
+        "--reference",
+        "refs/heads/main",
+        "--reference-at",
+        &second,
+        "--reference-to",
+        &first,
+    ]);
+    assert_eq!(moved["outcome"], "applied", "{moved}");
+    assert_eq!(moved["reference"]["updated"], Value::Bool(true), "{moved}");
+    assert_eq!(held_by_main(&source), first, "the reference moved");
+
     // A preflight of the working tree that finds it as expected writes nothing and succeeds.
     let checked = host.kr_json(&[
         "diff",

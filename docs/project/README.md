@@ -965,8 +965,9 @@ its holder does.
 While a reservation stands the host's own writers of that repository are turned away with
 `RESOURCE_UNAVAILABLE`, before they have written anything:
 
-* `diff.apply` and `diff.revert` into any working tree of the repository (a preflight writes
-  nothing and is not turned away; a proposal and a reference compare-and-swap write no tree);
+* `diff.apply` and `diff.revert` into any working tree of the repository, and the move of a
+  reference, which writes the repository's Git directory (a preflight writes nothing and is not
+  turned away; a proposal writes no tree);
 * `workspace.create` of a linked worktree (it writes the repository's own administration), and of
   any isolated workspace or `project.init` or `project.clone` whose directory is inside a working
   tree the reservation covers;
@@ -1205,7 +1206,7 @@ work is the one a caller gets by asking for it plainly.
 | Class | What it is |
 | --- | --- |
 | `proposal` | Two immutable versions and no write to any working tree: what the destination holds now, and what it would hold. A person decides |
-| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. A preflight returns the comparison and that statement; an apply of this class returns `UNSUPPORTED` rather than moving the reference. The project service's restricted profile is what runs an expected-old-value update, and this apply path does not call it |
+| `versioned_reference` | Reference compare-and-swap. The apply reads the reference and compares it with the value the request expects; a value that differs is `DRAFT_CONFLICT`, and nothing is written. The move is the expected-old-value update described under the restricted profile above, performed under a write grant for the repository's Git common directory and nothing wider. It does **not** atomically update a dirty working tree: what moves is the reference, and a tree with uncommitted work in it is unchanged by one. A preflight returns the comparison and that statement and moves nothing. An apply also names the object the reference moves to, one the repository already holds, because the host makes no commit; it moves the reference from the value the request expects to that object in one update. A reference that has moved since the comparison is `DRAFT_CONFLICT`, and so is one that Git refused to move because its value changed; a reference Git would not move for another reason, one that no longer reads, and one another writer deleted are the Git failure, since a read that finds no value is not taken as absence; and a symbolic reference is refused. A writer that turns the reference into a symbolic one after that check and before the move is not excluded. A conflict found by the comparison leaves the action free, and every error after the claim, a conflict at the move included, spends it. The host asks whether the caller's authority still stands once more immediately before the move, and a withdrawal that lands after that, in the time Git takes to start, does not stop it. The host records no apply row for it: the action's claim, its answer and one evidence row are the record, and an apply the host stopped during answers `OUTCOME_UNKNOWN` to the same action. Moving the reference back is another apply that names the earlier value. Windows refuses every repository operation, so this destination is not available there |
 | `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
@@ -1220,7 +1221,7 @@ deletion reads as that change rather than as an empty diff. What the base held h
 content either way: a deleted link or submodule is a revert this host refuses rather than writing
 out as a regular file. A
 request that names no paths carries every one of them, and one that names paths carries exactly
-those.
+those. A `versioned_reference` apply carries no path: it moves a reference, whatever paths it names.
 
 A direct apply to `shared_existing` cannot be chosen until the request carries back the limitations
 this host returns for it, and a preflight is how a caller obtains them: it needs no acknowledgement

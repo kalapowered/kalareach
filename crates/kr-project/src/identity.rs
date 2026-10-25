@@ -29,7 +29,9 @@ use kr_transfer::{AuthorisedDirectory, ObjectIdentity, RecordedIdentity, Relativ
 
 use crate::discovery::Discovered;
 use crate::error::{ProjectError, Result};
-use crate::git::{ConfigurationAudit, GitRequest, ObjectFormat, ReadAdmission, RestrictedProfile};
+use crate::git::{
+    ConfigurationAudit, GitOutput, GitRequest, ObjectFormat, ReadAdmission, RestrictedProfile,
+};
 
 /// Returns the wire form of one filesystem identity.
 #[must_use]
@@ -281,6 +283,10 @@ pub struct OpenedRepository {
     /// The location the repository was reached through and its working tree's name beneath it,
     /// so a confirmation finds it again the same way rather than by a path.
     through: Option<(AuthorisedDirectory, RelativeName)>,
+    /// What [`Self::object_format`] read, kept for the life of this handle. A repository names its
+    /// objects one way for its whole life, and a repository replaced under this handle is refused
+    /// by the identity every invocation expects.
+    format: std::sync::OnceLock<ObjectFormat>,
 }
 
 impl OpenedRepository {
@@ -484,6 +490,7 @@ impl OpenedRepository {
                 ceiling,
                 admission: None,
                 through: None,
+                format: std::sync::OnceLock::new(),
             },
             Decided {
                 tree: settled_tree,
@@ -564,6 +571,7 @@ impl OpenedRepository {
                 ceiling,
                 admission,
                 through: Some(through),
+                format: std::sync::OnceLock::new(),
             },
             settled_git_dir,
         ))
@@ -959,6 +967,9 @@ impl OpenedRepository {
 
     /// Returns the object format this repository names its objects in.
     ///
+    /// Read once, and the answer is kept for the life of this handle, so a reference update that
+    /// follows a caller's own read of it runs one Git invocation and not two.
+    ///
     /// Asked of the **Git common directory**, under the identity this record holds for it, rather
     /// than of the working tree. A working tree names its repository through an indirection it
     /// holds itself — a linked worktree's `.git` is a file saying where the repository is — and
@@ -975,6 +986,9 @@ impl OpenedRepository {
     /// Returns [`ProjectError::GitFailed`] when the repository will not say, and
     /// [`ProjectError::InvalidArgument`] for a format this service does not know.
     pub fn object_format(&self, profile: &RestrictedProfile) -> Result<ObjectFormat> {
+        if let Some(known) = self.format.get() {
+            return Ok(*known);
+        }
         let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-object-format")];
         let request = self.bounded(
             GitRequest::read(&self.git_dir_path, &arguments)
@@ -985,7 +999,8 @@ impl OpenedRepository {
         );
         let output = profile.run(&request)?;
         output.require_success()?;
-        ObjectFormat::parse(output.text().trim())
+        let format = ObjectFormat::parse(output.text().trim())?;
+        Ok(*self.format.get_or_init(|| format))
     }
 
     /// Performs a reference update via `update-ref` with expected old value.
@@ -1002,8 +1017,11 @@ impl OpenedRepository {
     /// # Errors
     ///
     /// Returns [`ProjectError::InvalidArgument`] when either name is not full in this
-    /// repository's format, and [`ProjectError::GitFailed`] when the reference cannot be updated
-    /// or the old value does not match.
+    /// repository's format, [`ProjectError::GitFailed`] when Git ran to completion and refused:
+    /// the reference cannot be updated or the old value does not match, and Git wrote nothing.
+    /// Returns [`ProjectError::OutcomeUnknown`] when the update started and Git did not report an
+    /// exit status, because it was stopped at its deadline, could not be waited on, ended on a
+    /// signal or could not be confirmed: it may have written the reference before that.
     pub fn update_ref(
         &self,
         profile: &RestrictedProfile,
@@ -1029,9 +1047,36 @@ impl OpenedRepository {
                 .expecting(self.identity.git_dir)
                 .admitted(self.admission.clone()),
         );
-        let output = profile.run(&request)?;
-        output.require_success()?;
-        Ok(())
+        let mut started = false;
+        let outcome = profile.run_noting_the_start(&request, &mut started);
+        settled_update(reference, outcome, started)
+    }
+}
+
+/// Decides what a reference update came to from what its Git invocation did.
+///
+/// A non-zero exit from a process that ran to completion is a refusal, and Git writes nothing when
+/// it exits that way. Every other failure after the process started leaves the reference where
+/// this host cannot say it is: Git may have written it before it was stopped, could not be waited
+/// on, ended on a signal, or finished before what it ran in could be confirmed. A failure before
+/// the process started wrote nothing and is passed on as it was.
+fn settled_update(reference: &str, outcome: Result<GitOutput>, started: bool) -> Result<()> {
+    let unestablished = |why: &str| ProjectError::OutcomeUnknown {
+        detail: format!(
+            "whether the update of the reference {} was made is not established: {why}",
+            crate::git::redact(reference)
+        )
+        .into(),
+    };
+    match outcome {
+        Ok(output) if output.success => Ok(()),
+        Ok(output) if output.status.is_none() => Err(unestablished(&format!(
+            "{} ended on a signal",
+            output.command
+        ))),
+        Ok(output) => output.require_success(),
+        Err(error) if started => Err(unestablished(&error.to_string())),
+        Err(error) => Err(error),
     }
 }
 
@@ -1434,5 +1479,77 @@ mod tests {
         assert_eq!(wire.device.get(), 16_777_234);
         assert_eq!(wire.file_id.get(), 92_143_887);
         assert_eq!(object_identity(wire), identity);
+    }
+
+    /// KR-REQ-14.27: a reference update that Git may have made is not reported as one it refused.
+    ///
+    /// Git cannot be made to stop after it commits, so the cases are what its invocation can end
+    /// in: an exit, a signal, and a failure before or after the process existed.
+    #[test]
+    fn a_reference_update_stopped_after_it_started_is_not_established() {
+        use kr_protocol::error::ErrorCode;
+
+        let ended = |status: Option<i32>| GitOutput {
+            status,
+            success: status == Some(0),
+            stdout: Vec::new(),
+            stdout_truncated: false,
+            stderr: "fatal: cannot lock ref".to_owned(),
+            command: "git update-ref".to_owned(),
+        };
+        let stopped = || ProjectError::GitFailed {
+            detail: "git update-ref ran longer than its deadline and was stopped".into(),
+        };
+
+        settled_update("refs/heads/main", Ok(ended(Some(0))), true)
+            .expect("an exit of zero is an update that was made");
+        let mut noisy = ended(Some(0));
+        noisy.stdout_truncated = true;
+        settled_update("refs/heads/main", Ok(noisy), true)
+            .expect("so is an exit of zero that said more than this host reads");
+        for (outcome, started, code, why) in [
+            (
+                Ok(ended(Some(128))),
+                true,
+                ErrorCode::UpstreamUnavailable,
+                "Git ran to completion and refused, and wrote nothing",
+            ),
+            (
+                Ok(ended(None)),
+                true,
+                ErrorCode::OutcomeUnknown,
+                "a signal gives no exit status",
+            ),
+            (
+                Err(stopped()),
+                true,
+                ErrorCode::OutcomeUnknown,
+                "a process stopped at its deadline may have written first",
+            ),
+            (
+                Err(ProjectError::Cancelled {
+                    detail: "stopped by its owner".into(),
+                }),
+                true,
+                ErrorCode::OutcomeUnknown,
+                "a process its owner stopped may have written first",
+            ),
+            (
+                Err(stopped()),
+                false,
+                ErrorCode::UpstreamUnavailable,
+                "a failure before the process existed wrote nothing",
+            ),
+            (
+                Err(ProjectError::InvalidArgument("a refused argument".into())),
+                false,
+                ErrorCode::InvalidArgument,
+                "a refusal before the process existed is passed on",
+            ),
+        ] {
+            let failure = settled_update("refs/heads/main", outcome, started)
+                .expect_err("the update did not come to an update that was made");
+            assert_eq!(failure.code(), code, "{why}: {failure}");
+        }
     }
 }

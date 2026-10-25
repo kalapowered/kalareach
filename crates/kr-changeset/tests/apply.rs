@@ -321,88 +321,398 @@ fn a_proposal_records_versions_and_writes_no_working_tree() {
     );
 }
 
-/// KR-REQ-14.27: an apply to a versioned Git reference is compare-and-swap on the reference; a
-/// value that does not match is `DRAFT_CONFLICT`, and what this host does not do it says.
+/// A repository with three commits on `main`, and a dirty file the reference apply must not touch.
+///
+/// Returns the path and the three commits, oldest first. `main` holds the newest.
+#[cfg(not(windows))]
+fn repository_with_three_commits(
+    fixture: &Fixture,
+    name: &str,
+) -> (std::path::PathBuf, [String; 3]) {
+    let path = ordinary_repository(fixture.work(), name);
+    let first = git_raw(&path, ["rev-parse", "HEAD"]).trim().to_owned();
+    write(&path, "second.txt", "a second commit\n");
+    git_raw(&path, ["add", "second.txt"]);
+    git_raw(&path, ["commit", "-m", "the second commit"]);
+    let second = git_raw(&path, ["rev-parse", "HEAD"]).trim().to_owned();
+    write(&path, "third.txt", "a third commit\n");
+    git_raw(&path, ["add", "third.txt"]);
+    git_raw(&path, ["commit", "-m", "the third commit"]);
+    let third = git_raw(&path, ["rev-parse", "HEAD"]).trim().to_owned();
+    write(&path, "README.md", "work that is not committed\n");
+    (path, [first, second, third])
+}
+
+/// The request to move `main` from `old` to `new`.
+fn moving(old: &str, new: &str) -> ExpectedReference {
+    ExpectedReference {
+        name: "refs/heads/main".to_owned(),
+        expected_old_value: Nullable::some(old.to_owned()),
+        new_value: Nullable::some(new.to_owned()),
+    }
+}
+
+/// KR-REQ-14.27: an apply to a versioned Git reference moves it to the object the request names
+/// while it holds the expected value, writes no working tree, records the version it applied, and
+/// is undone by the same apply naming the values the other way.
 #[cfg(not(windows))]
 #[test]
-fn a_versioned_reference_is_compare_and_swap_and_states_what_it_does_not_do() {
+fn a_versioned_reference_moves_to_the_named_object_while_it_holds_the_expected_value() {
     let fixture = Fixture::create();
-    let path = ordinary_repository(fixture.work(), "reference");
-    let head = git_raw(&path, ["rev-parse", "HEAD"]).trim().to_owned();
-    write(&path, "README.md", "a change\n");
-    let workspace = fixture.workspace("reference");
+    let (path, [first, _second, third]) = repository_with_three_commits(&fixture, "moves");
+    let workspace = fixture.workspace("moves");
     let record = fixture.capture(workspace, &include_everything());
-    let affected = expectations(&path, &["README.md"]);
+    let claim = RecordingClaim::default();
 
-    // The value the request expects is not the value the reference holds.
-    let wrong = ExpectedReference {
-        name: "refs/heads/main".to_owned(),
-        expected_old_value: Nullable(Some("0".repeat(40))),
-        new_value: Nullable::null(),
-    };
+    let request = moving(&third, &first);
     let order = ApplyOrder {
-        expected_reference: Some(&wrong),
+        expected_reference: Some(&request),
+        claim: Some(&claim),
         ..support::apply_order(
             reference(&record),
             DestinationClass::VersionedReference,
             workspace,
-            &affected,
+            &[],
+            &[],
+        )
+    };
+    let applied = apply::apply(fixture.service(), &order).expect("the reference moves");
+    assert_eq!(applied.outcome, Nullable::some(ApplyOutcomeClass::Applied));
+    let Nullable(Some(outcome)) = applied.reference else {
+        panic!("an apply of this class names the reference");
+    };
+    assert!(outcome.compare_and_swap_held && outcome.updated);
+    assert_eq!(outcome.observed_old_value, Nullable::some(third.clone()));
+    assert!(applied.changed_paths.is_empty());
+    assert_eq!(
+        git_raw(&path, ["rev-parse", "refs/heads/main"]).trim(),
+        first,
+        "the reference holds the object the request named"
+    );
+    assert_eq!(
+        support::read_bytes(&path, "README.md"),
+        b"work that is not committed\n",
+        "no working tree was written"
+    );
+    assert!(claim.taken(), "the claim was asked for before the move");
+    let evidence = fixture
+        .service()
+        .evidence(record.change_set_id, record.version)
+        .expect("the evidence is readable");
+    assert!(
+        evidence
+            .iter()
+            .any(|entry| entry.kind == EvidenceKind::AppliedChange
+                && entry.detail.contains("refs/heads/main")),
+        "the version is named by an applied change: {evidence:?}"
+    );
+
+    // Moving it back is another apply that names the values the other way.
+    let back = moving(&first, &third);
+    let order = ApplyOrder {
+        expected_reference: Some(&back),
+        revert: true,
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::VersionedReference,
+            workspace,
+            &[],
+            &[],
+        )
+    };
+    apply::apply(fixture.service(), &order).expect("a revert moves it back");
+    assert_eq!(
+        git_raw(&path, ["rev-parse", "refs/heads/main"]).trim(),
+        third
+    );
+}
+
+/// KR-REQ-14.27: a reference that another writer moved after the comparison is a conflict, and it
+/// stays as that writer set it, whether the writer put another value there or the very object the
+/// request names.
+#[cfg(not(windows))]
+#[test]
+fn a_reference_that_moves_after_the_comparison_is_a_conflict_and_stays_as_the_other_writer_set_it()
+{
+    let fixture = Fixture::create();
+    let (path, [first, second, third]) = repository_with_three_commits(&fixture, "races");
+    let workspace = fixture.workspace("races");
+    let record = fixture.capture(workspace, &include_everything());
+
+    // The request moves `main` from the third commit to the first, and the other writer gets there
+    // between the comparison and the move: to the second commit, and then to the first.
+    for other in [&second, &first] {
+        git_raw(&path, ["update-ref", "refs/heads/main", third.as_str()]);
+        let racing = path.clone();
+        let wrote = other.clone();
+        fixture.service().inject(Some(Fault {
+            after_paths: usize::MAX,
+            act: None,
+            before_rename: None,
+            after_claim: Some(std::sync::Arc::new(move || {
+                git_raw(&racing, ["update-ref", "refs/heads/main", wrote.as_str()]);
+            })),
+            refuse_staging_record: false,
+            stop: false,
+            detail: String::new(),
+        }));
+        let claim = RecordingClaim::default();
+        let request = moving(&third, &first);
+        let order = ApplyOrder {
+            expected_reference: Some(&request),
+            claim: Some(&claim),
+            ..support::apply_order(
+                reference(&record),
+                DestinationClass::VersionedReference,
+                workspace,
+                &[],
+                &[],
+            )
+        };
+        let failure = apply::apply(fixture.service(), &order)
+            .expect_err("the reference no longer holds the expected value");
+        fixture.service().inject(None);
+        assert_eq!(failure.code(), ErrorCode::DraftConflict, "{failure}");
+        assert!(claim.taken(), "the comparison held and the claim was taken");
+        assert_eq!(
+            git_raw(&path, ["rev-parse", "refs/heads/main"]).trim(),
+            *other,
+            "the reference is as the other writer left it"
+        );
+    }
+}
+
+/// KR-REQ-14.27: a reference Git would not move, here one whose lock is held, is the Git failure
+/// and not a conflict, and it still holds what it held.
+#[cfg(not(windows))]
+#[test]
+fn a_reference_git_would_not_move_is_the_git_failure_and_not_a_conflict() {
+    let fixture = Fixture::create();
+    let (path, [first, _second, third]) = repository_with_three_commits(&fixture, "locked");
+    let workspace = fixture.workspace("locked");
+    let record = fixture.capture(workspace, &include_everything());
+    std::fs::write(path.join(".git/refs/heads/main.lock"), b"")
+        .expect("a lock another writer holds");
+
+    let request = moving(&third, &first);
+    let order = ApplyOrder {
+        expected_reference: Some(&request),
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::VersionedReference,
+            workspace,
+            &[],
+            &[],
+        )
+    };
+    let failure =
+        apply::apply(fixture.service(), &order).expect_err("Git cannot lock the reference");
+    assert_eq!(
+        failure.code(),
+        ErrorCode::UpstreamUnavailable,
+        "Git ran, refused and wrote nothing, so the code is its own: {failure}"
+    );
+    assert_eq!(
+        git_raw(&path, ["rev-parse", "refs/heads/main"]).trim(),
+        third,
+        "the reference holds what it held"
+    );
+    // The apply was recorded before the move was tried, in words that hold whatever the move came
+    // to, so a version a refused move named is not one a deletion forgets.
+    let evidence = fixture
+        .service()
+        .evidence(record.change_set_id, record.version)
+        .expect("the evidence is readable");
+    assert!(
+        evidence
+            .iter()
+            .any(|entry| entry.kind == EvidenceKind::AppliedChange),
+        "{evidence:?}"
+    );
+}
+
+/// KR-REQ-14.27: a request that cannot move a reference is refused before the claim, and the
+/// reference does not move. Each leg names what is wrong with it.
+#[cfg(not(windows))]
+#[test]
+fn a_request_that_cannot_move_a_reference_is_refused_before_anything_is_claimed() {
+    let fixture = Fixture::create();
+    let (path, [first, second, third]) = repository_with_three_commits(&fixture, "refused");
+    git_raw(
+        &path,
+        ["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    let tree = git_raw(&path, ["rev-parse", "HEAD^{tree}"])
+        .trim()
+        .to_owned();
+    let workspace = fixture.workspace("refused");
+    let record = fixture.capture(workspace, &include_everything());
+
+    let named = |name: &str, old: Option<&String>, new: Option<&String>| ExpectedReference {
+        name: name.to_owned(),
+        expected_old_value: Nullable(old.cloned()),
+        new_value: Nullable(new.cloned()),
+    };
+    let main = "refs/heads/main";
+    let legs = [
+        (
+            "no object on an apply",
+            named(main, Some(&third), None),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a malformed object",
+            named(main, Some(&third), Some(&"z".repeat(40))),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "an uppercase object",
+            named(main, Some(&third), Some(&first.to_uppercase())),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "the null object",
+            named(main, Some(&third), Some(&"0".repeat(40))),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "the other width",
+            named(main, Some(&third), Some(&"a".repeat(64))),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "an object no repository holds",
+            named(main, Some(&third), Some(&"d".repeat(40))),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a tree under a branch",
+            named(main, Some(&third), Some(&tree)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "the expected value itself",
+            named(main, Some(&third), Some(&third)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a malformed expected value",
+            named(main, Some(&"nonsense".to_owned()), Some(&first)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a name that is not a full reference",
+            named("HEAD", Some(&third), Some(&first)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a name under refs/bisect",
+            named("refs/bisect/bad", Some(&third), Some(&first)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a name under refs/worktree",
+            named("refs/worktree/x", Some(&third), Some(&first)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a name under refs/rewritten",
+            named("refs/rewritten/x", Some(&third), Some(&first)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "a symbolic reference",
+            named("refs/heads/alias", Some(&third), Some(&first)),
+            ErrorCode::InvalidArgument,
+        ),
+        (
+            "an absent expected value with an object",
+            named(main, None, Some(&second)),
+            ErrorCode::UnsupportedCapability,
+        ),
+    ];
+    for (why, request, code) in &legs {
+        let claim = RecordingClaim::default();
+        let order = ApplyOrder {
+            expected_reference: Some(request),
+            claim: Some(&claim),
+            ..support::apply_order(
+                reference(&record),
+                DestinationClass::VersionedReference,
+                workspace,
+                &[],
+                &[],
+            )
+        };
+        let failure = apply::apply(fixture.service(), &order).expect_err(why);
+        assert_eq!(failure.code(), *code, "{why}: {failure}");
+        assert!(!claim.taken(), "{why}: nothing is claimed");
+        assert_eq!(
+            git_raw(&path, ["rev-parse", "refs/heads/main"]).trim(),
+            third,
+            "{why}: the reference did not move"
+        );
+    }
+}
+
+/// KR-REQ-14.27: an apply to a versioned Git reference is compare-and-swap on the reference; a
+/// value that does not match is `DRAFT_CONFLICT` and claims nothing, and a preflight returns the
+/// comparison and moves nothing, with or without the object it would move to.
+#[cfg(not(windows))]
+#[test]
+fn a_versioned_reference_is_compare_and_swap_and_a_preflight_moves_nothing() {
+    let fixture = Fixture::create();
+    let (path, [first, second, third]) = repository_with_three_commits(&fixture, "compares");
+    let workspace = fixture.workspace("compares");
+    let record = fixture.capture(workspace, &include_everything());
+
+    // The value the request expects is an older commit, not the value the reference holds.
+    let claim = RecordingClaim::default();
+    let stale = moving(&second, &first);
+    let order = ApplyOrder {
+        expected_reference: Some(&stale),
+        claim: Some(&claim),
+        ..support::apply_order(
+            reference(&record),
+            DestinationClass::VersionedReference,
+            workspace,
+            &[],
             &[],
         )
     };
     let failure = apply::apply(fixture.service(), &order).expect_err("the swap does not hold");
     assert_eq!(failure.code(), ErrorCode::DraftConflict);
+    assert!(!claim.taken(), "a swap that does not hold claims nothing");
+    assert_eq!(git_raw(&path, ["rev-parse", "HEAD"]).trim(), third);
 
-    // The value it expects is the value the reference holds, and this host says what it will not
-    // do rather than doing it under a read-only grant.
-    let right = ExpectedReference {
-        name: "refs/heads/main".to_owned(),
-        expected_old_value: Nullable(Some(head.clone())),
-        new_value: Nullable::null(),
-    };
-    let order = ApplyOrder {
-        expected_reference: Some(&right),
-        ..support::apply_order(
-            reference(&record),
-            DestinationClass::VersionedReference,
-            workspace,
-            &affected,
-            &[],
-        )
-    };
-    let refusal = apply::apply(fixture.service(), &order).expect_err("the limitation is stated");
-    assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
-    let message = refusal.to_string();
-    assert!(
-        message.contains("does not move it"),
-        "it says what it does not do: {message}"
-    );
-    assert!(
-        message.contains("does not atomically update a dirty working tree"),
-        "and what a reference update is not: {message}"
-    );
-    // The reference is where it was.
-    assert_eq!(git_raw(&path, ["rev-parse", "HEAD"]).trim(), head);
-
-    // A preflight returns the outcome of the comparison before the class is acted on.
-    let order = ApplyOrder {
-        expected_reference: Some(&right),
-        preflight_only: true,
-        ..support::apply_order(
-            reference(&record),
-            DestinationClass::VersionedReference,
-            workspace,
-            &affected,
-            &[],
-        )
-    };
-    let previewed = apply::apply(fixture.service(), &order).expect("the preflight passes");
-    let Nullable(Some(outcome)) = previewed.reference else {
-        panic!("a preflight of this class names the reference");
-    };
-    assert!(outcome.compare_and_swap_held);
-    assert!(!outcome.updated);
-    assert_eq!(outcome.observed_old_value, Nullable(Some(head)));
+    // A preflight returns the outcome of the comparison and moves nothing, whether or not it names
+    // the object.
+    for new_value in [None, Some(first.as_str())] {
+        let request = ExpectedReference {
+            name: "refs/heads/main".to_owned(),
+            expected_old_value: Nullable::some(third.clone()),
+            new_value: Nullable(new_value.map(str::to_owned)),
+        };
+        let order = ApplyOrder {
+            expected_reference: Some(&request),
+            preflight_only: true,
+            ..support::apply_order(
+                reference(&record),
+                DestinationClass::VersionedReference,
+                workspace,
+                &[],
+                &[],
+            )
+        };
+        let previewed = apply::apply(fixture.service(), &order).expect("the preflight passes");
+        let Nullable(Some(outcome)) = previewed.reference else {
+            panic!("a preflight of this class names the reference");
+        };
+        assert!(outcome.compare_and_swap_held);
+        assert!(!outcome.updated);
+        assert_eq!(outcome.observed_old_value, Nullable::some(third.clone()));
+        assert_eq!(git_raw(&path, ["rev-parse", "HEAD"]).trim(), third);
+    }
 }
 
 /// KR-REQ-14.28 and 14.29: a direct apply installs the content, preserves the destination's
