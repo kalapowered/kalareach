@@ -1510,12 +1510,23 @@ impl PushDesk {
         // sent nothing until the run is asked about again: before the connection, after it, and
         // before each of the changes.
         let wanted = || self.wanted(host.host_device_id, run);
-        let not_taken = |stop: LineStop| -> Stop {
+        let not_taken = |stop: LineStop, issued: bool| -> Stop {
             if !wanted() {
                 return forgotten_host();
             }
             match stop {
                 LineStop::Phone(words) => words.into(),
+                // The gateway issued before the host was asked, and an issue retires the credential
+                // the host holds: a host that refuses what follows holds one the gateway no longer
+                // takes, and cannot notify this phone until a registration is taken.
+                LineStop::Host(words) if !full && issued => format!(
+                    "The host did not take this choice of previews, and it cannot notify this \
+                     phone until it takes a registration: {words}"
+                )
+                .into(),
+                LineStop::Host(words) if !full => {
+                    format!("The host did not take this choice of previews: {words}").into()
+                }
                 LineStop::Host(words) => {
                     format!("The host did not take this phone as a destination: {words}").into()
                 }
@@ -1528,7 +1539,7 @@ impl PushDesk {
             .registrar
             .connect(host, reach)
             .await
-            .map_err(|words| not_taken(LineStop::Host(words)))?;
+            .map_err(|words| not_taken(LineStop::Host(words), false))?;
         if !wanted() {
             return Err(forgotten_host());
         }
@@ -1552,7 +1563,7 @@ impl PushDesk {
             previews_enabled: previews,
         })
         .await
-        .map_err(not_taken)?;
+        .map_err(|stop| not_taken(stop, true))?;
         if !wanted() {
             return Err(forgotten_host());
         }
@@ -1572,7 +1583,7 @@ impl PushDesk {
                 revision,
             )
             .await
-            .map_err(not_taken)?;
+            .map_err(|stop| not_taken(stop, true))?;
         }
         // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);
