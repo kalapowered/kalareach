@@ -1911,7 +1911,8 @@ worker spells them, under the lock that accepts the write, as its own backend as
 backend has asked for records, each goes out in the encoding above. While it has not, the worker
 sends what a terminal doing the translation would have sent: the text, the control code the console
 made for a key held with Control, and the key's own sequence otherwise, with the arrows in the form
-the application's DEC mode 1 asks for. That spelling comes from the one encoder every client uses.
+the application's DEC mode 1 asks for, for Home and End as well. That spelling comes from the one
+encoder every client uses.
 It sends nothing for a key coming up, since legacy input cannot say so, and nothing for a key it has
 no spelling for, such as a function key past F12, because another key would be wrong. A batch of
 key-ups alone is accepted and forwards no bytes.
@@ -1933,11 +1934,13 @@ words, and that is what a detach writes back.
 
 **What the console path does not do.** The Windows attach client sends bytes. It reads the console as
 a byte stream, and it declares a terminal profile only from `TERM`, which a Windows console does not
-set, so it asks for no input lease on its own. The record reader is in the client and is tested, and
-the attach loop does not call it. A session attached from a Windows console therefore runs on the
-legacy VT path whatever its backend asked for. Nothing reports the fidelity at run time: the engine
-tracks which one the backend asked for and the worker spells records accordingly, but no receipt,
-diagnostic or client message carries the answer, so this page is where the limit is stated.
+set. It asks for the input lease all the same, and the worker gives the lease to no attachment that
+declared no profile, so a session attached from a Windows console is watched and not typed into
+until `TERM` names a profile. With one, the client sends bytes on the legacy VT path, whatever the
+backend asked for. The record reader is in the client and is not called by the attach loop; only its
+console mode is tested. Nothing reports the fidelity at run time: the engine tracks which one the
+backend asked for and the worker spells records accordingly, but no receipt, diagnostic or client
+message carries the answer, so this page is where the limit is stated.
 
 **The standalone start, and signing out.** The standalone start on Windows is one scheduled task
 per environment, `KalaReach-` and the first eight digits of the environment's identifier, in the
