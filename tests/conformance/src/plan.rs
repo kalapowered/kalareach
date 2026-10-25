@@ -1566,6 +1566,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "how a session's closure reaches its attachments",
+            &["test", "--locked", "-p", "kr-worker", "--test", "closure"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the real-worker host tests, through the environment's scheduled task",
             &["test", "--locked", "-p", "kr-worker", "--test", "host"],
         ),

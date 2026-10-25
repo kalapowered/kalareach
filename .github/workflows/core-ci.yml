@@ -656,6 +656,9 @@ jobs:
       #     store (`kr-attention`) and the loopback listener of a sign-in (`kr-loopback`);
       #   - the repository boundary on its own, the change set's apply (`kr-changeset`'s `apply`)
       #     and the filesystem authority (`kr-transfer`'s library and `authority`);
+      #   - how a session's closure reaches its attachments, `kr-worker`'s `closure`: a shell that
+      #     exits, one ended from outside, and a close that is ignored until the five seconds are
+      #     over;
       #   - the ARM64 compile of `kr-ipc`, `kr-worker`, `kr-controller`, `kr-cli`, `kr-term` and
       #     `kr-project`, which runs nothing, and the documentation of this platform's own code.
       # "The attach client" means the part of it that runs here - `crates/kr-cli/tests/attach.rs`
@@ -1270,6 +1273,13 @@ jobs:
       - name: Test the descriptions suite
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test descriptions
+
+      # How a session's closure reaches its attachments, on this platform's console: a shell that
+      # exits, a shell ended from outside, and a close that a shell ignores until the five seconds
+      # are over. Each attachment is sent how its session ended, after the output it was owed.
+      - name: Test how a session's closure reaches its attachments
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-worker --test closure
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
       # each daemon starts its workers through the environment's scheduled task, as the shipping
