@@ -693,4 +693,100 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
     expect(await screen.findByText(/asks for input this view cannot take yet/)).toBeTruthy()
     expect(calls).toHaveLength(0)
   })
+  it('does not call an action for a control whose newer revision was kept over a late older one', async () => {
+    const { port, controls } = fakeHost()
+    const calls: PluginActionInvokeParams[] = []
+    openConversation({
+      ...port,
+      pluginActionInvoke: (params, opening) => {
+        calls.push(params)
+        return port.pluginActionInvoke(params, opening)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    act(() => {
+      controls.appendNode(controlsNode('2'))
+    })
+    await nextFrame()
+    const person = userEvent.setup()
+    await screen.findByRole('button', { name: 'Refresh' })
+
+    // The agent is replaced by another, and the new one's package draws a node with the same
+    // identity at its first revision. The view keeps the revision it has, drawn for the old agent.
+    const next = controls.records.restartAgent(SESSION_MAIN)
+    await shownAgain()
+    await waitFor(() => {
+      expect(shown()).toContain(`${next}:1`)
+    })
+    act(() => {
+      controls.appendNode(controlsNode('1'))
+    })
+    await nextFrame()
+    await person.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText(/conversation moved since this was shown/)).toBeTruthy()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('keeps the conversation a control was drawn under when the person leaves the view and comes back', async () => {
+    const { port, controls } = fakeHost()
+    const calls: PluginActionInvokeParams[] = []
+    openConversation({
+      ...port,
+      pluginActionInvoke: (params, opening) => {
+        calls.push(params)
+        return port.pluginActionInvoke(params, opening)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    act(() => {
+      controls.appendNode(controlsNode())
+    })
+    await nextFrame()
+    const person = userEvent.setup()
+    await screen.findByRole('button', { name: 'Refresh' })
+
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await person.click(await screen.findByRole('tab', { name: 'Conversation' }))
+    await person.click(await screen.findByRole('button', { name: 'Refresh' }))
+    await waitFor(() => {
+      expect(calls).toHaveLength(1)
+    })
+  })
+
+  it('does not call an action for a control that arrived before the agent was read, until it is drawn again', async () => {
+    const { port, controls } = fakeHost()
+    const calls: PluginActionInvokeParams[] = []
+    const held = controls.hold('agentSnapshot')
+    openConversation({
+      ...port,
+      pluginActionInvoke: (params, opening) => {
+        calls.push(params)
+        return port.pluginActionInvoke(params, opening)
+      }
+    })
+    await made(held, 1)
+    act(() => {
+      controls.appendNode(controlsNode())
+    })
+    await nextFrame()
+    await answer(held, 0)
+    const person = userEvent.setup()
+    await person.click(await screen.findByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByText(/shown before the agent was read/)).toBeTruthy()
+    expect(calls).toHaveLength(0)
+
+    act(() => {
+      controls.appendNode(controlsNode('2'))
+    })
+    await nextFrame()
+    await person.click(await screen.findByRole('button', { name: 'Refresh' }))
+    await waitFor(() => {
+      expect(calls).toHaveLength(1)
+    })
+  })
+
 })
