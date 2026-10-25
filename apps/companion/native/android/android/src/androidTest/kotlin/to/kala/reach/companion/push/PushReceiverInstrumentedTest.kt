@@ -203,7 +203,11 @@ class PushReceiverInstrumentedTest {
         // The alert goes up before the receiver decides about the preview, so the alert alone shows
         // nothing: the assertion waits for the receiver to say it has finished.
         assertTrue("the receiver finished with the generic alert", receiverFinished("sender_unknown"))
-        assertEquals("the generic alert stands", golden.getString("alert"), shownText(tag))
+        // The system lists a post a moment after the receiver has made it.
+        assertTrue(
+            "the generic alert is up",
+            until(30) { shownText(tag) == golden.getString("alert") }
+        )
         assertTrue(shownText(tag) != golden.getString("summary"))
     }
 
