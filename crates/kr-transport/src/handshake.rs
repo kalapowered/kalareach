@@ -594,10 +594,7 @@ pub async fn connect(
         HelloReply::Selected(selection) => *selection,
         HelloReply::Refused(error) => return Err(TransportError::Refused(error)),
     };
-    check_extensions(&offer, &selection)?;
-    // The host is expected to have refused this itself; a client that took the selection anyway
-    // would hold a connection whose transfers could never be admitted.
-    crate::scheduler::check_negotiated(selection.limits).map_err(TransportError::Handshake)?;
+    check_selection(&offer, &selection)?;
 
     let client_signature = sign_connect(
         &identity.authorisation,
@@ -736,10 +733,14 @@ impl CandidateConnection {
 /// # Errors
 ///
 /// Returns [`TransportError::Refused`] with the host's refusal, for example when no offered version
-/// is supported; [`TransportError::Handshake`] when no reply came or the selection names an
-/// extension this side did not offer; or a stream failure. A host that answers with an acceptance
-/// is refused here: a connection with no paired record must not be treated as authorised however
-/// the host replied.
+/// is supported; [`TransportError::Handshake`] when no reply came, the selection names an
+/// extension this side did not offer, or its limits are below what a connection needs;
+/// [`TransportError::Crypto`] when the selection does not answer the offer (a version, a capability
+/// or a limit the offer did not name, or a nonce it does not echo); or a stream failure. The
+/// selection is checked as the paired [`connect`] checks it, so a candidate never talks to a host
+/// whose answer it would refuse on a paired connection. A host that answers with an acceptance is
+/// refused here: a connection with no paired record must not be treated as authorised however the
+/// host replied.
 pub async fn connect_unpaired(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -764,7 +765,7 @@ pub async fn connect_unpaired(
         HelloReply::Selected(selection) => *selection,
         HelloReply::Refused(error) => return Err(TransportError::Refused(error)),
     };
-    check_extensions(&offer, &selection)?;
+    check_selection(&offer, &selection)?;
     Ok(CandidateConnection {
         connection_id: selection.connection_id,
         selection,
@@ -788,13 +789,24 @@ fn client_offer(identity: &LocalIdentity) -> Result<ClientOffer> {
     })
 }
 
-/// Refuses a selection that names an extension this client did not offer with that hash.
+/// Refuses a selection the client cannot use, before anything is used under it.
 ///
-/// Both client paths check it, the paired one and the candidate one, before anything is used
-/// under the selection: an extension neither side agreed on the schema of is not in force.
-fn check_extensions(offer: &ClientOffer, selection: &HostSelection) -> Result<()> {
-    extension::check_selection(&offer.extensions, &selection.extensions)
-        .map_err(|error| TransportError::handshake(ErrorCode::UnsupportedSchema, error.to_string()))
+/// Both client paths run it on the host's selection, the paired one and the candidate one, since
+/// neither has anything to verify the host's word against but its own offer:
+///
+/// * an extension the offer did not carry with that hash is not in force, because neither side
+///   agreed on its schema;
+/// * the selection has to answer the offer: a version, capabilities and limits within what the
+///   offer named, and the client nonce echoed;
+/// * the negotiated limits have to leave a connection able to carry its own traffic. The host is
+///   expected to have refused limits below that floor itself; a client that took them anyway would
+///   hold a connection whose transfers could never be admitted.
+fn check_selection(offer: &ClientOffer, selection: &HostSelection) -> Result<()> {
+    extension::check_selection(&offer.extensions, &selection.extensions).map_err(|error| {
+        TransportError::handshake(ErrorCode::UnsupportedSchema, error.to_string())
+    })?;
+    kr_crypto::connect::check_selection_against_offer(offer, selection)?;
+    crate::scheduler::check_negotiated(selection.limits).map_err(TransportError::Handshake)
 }
 
 /// Returns the peer's endpoint identity as iroh authenticated it.
