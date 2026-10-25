@@ -565,7 +565,7 @@ const PINNING: &str = "KR_INSTALL_TEST_PINNING";
 /// hold until it ends.
 #[cfg(windows)]
 #[test]
-fn launcher() {
+fn launcher_on_windows() {
     let Some(text) = std::env::var_os(PINNING) else {
         return;
     };
@@ -625,7 +625,7 @@ fn stored_child() {
 /// the release's removal and does not start work in a release that is gone.
 #[cfg(windows)]
 #[test]
-fn a_pinned_release_stays_held_by_the_program_that_takes_over() {
+fn a_pinned_release_stays_held_by_the_program_it_runs() {
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
     test.install(&one);
@@ -633,7 +633,13 @@ fn a_pinned_release_stays_held_by_the_program_that_takes_over() {
     std::fs::create_dir(&talk).expect("a directory to talk through");
     let mut launcher =
         std::process::Command::new(std::env::current_exe().expect("this test binary"))
-            .args(["--exact", "launcher", "--nocapture", "--test-threads", "1"])
+            .args([
+                "--exact",
+                "launcher_on_windows",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
             .env(
                 PINNING,
                 format!(
