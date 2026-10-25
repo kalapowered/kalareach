@@ -510,6 +510,26 @@ impl Rig {
         set_privacy_at(&self.client_endpoint, self.host.environment_id(), enabled).await
     }
 
+    /// Turns privacy mode on or off, as [`Self::set_privacy`] does, and returns the report the
+    /// daemon answered with.
+    async fn set_privacy_answered(&self, enabled: bool) -> PrivacyReport {
+        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .mutate(
+                Method::PrivacySet,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(self.host.environment_id()),
+                &PrivacySetParams { enabled },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("privacy mode changes")
+            .to_typed()
+            .expect("decodes")
+    }
+
     /// Asks the daemon to delete the copy `privacy.status` lists under `reference`, as a person at
     /// this machine does.
     async fn delete_retained(
@@ -4040,25 +4060,34 @@ async fn privacy_mode_turned_on_settles_a_closed_session_a_generation_holds() {
     );
     let segments = || {
         std::fs::read_dir(rig.host.environment().session_spool(session))
-            .map(|entries| entries.flatten().count())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "out"))
+                    .count()
+            })
             .unwrap_or(0)
     };
-    assert!(segments() > 0, "the control: the session's output is on the disk");
+    assert!(
+        segments() > 0,
+        "the control: the session's output is on the disk"
+    );
 
-    assert!(rig.set_privacy(true).await, "privacy mode is turned on");
+    // The answer to the change is where the person is told what is left to do, so it says the
+    // session is settled, and not that it is owed.
+    let answer = rig.set_privacy_answered(true).await;
+    assert!(
+        answer.sessions.is_empty(),
+        "the session is settled when the change is answered: {:?}",
+        answer.sessions
+    );
+    assert_eq!(segments(), 0, "the output is gone");
     within("the change taking effect", async {
         while !rig.privacy_complete().await {
             tokio::task::yield_now().await;
         }
     })
     .await;
-    let report = rig.privacy_report().await;
-    assert!(
-        report.sessions.is_empty(),
-        "nothing is owed once the output is removed: {:?}",
-        report.sessions
-    );
-    assert_eq!(segments(), 0, "the output is gone");
 }
 
 /// The members together never pass the total a restore accepts, the configuration among them: it
