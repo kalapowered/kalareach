@@ -4242,7 +4242,7 @@ mod native_bridges {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_busy_catalogue_holds_a_round_no_longer_than_its_bound() {
         let site = Site::new();
-        let host = host(&site);
+        let host = Arc::new(host(&site));
         let digest = synchronised(&host).await;
         let _: wire::PluginInstallResult = ok(install(&host, &digest, true).await);
         let (entered, entering) = std::sync::mpsc::channel::<()>();
@@ -4279,8 +4279,14 @@ mod native_bridges {
             drop(release);
             (snapshot.map(|_| ()), revision)
         };
-        let (enabled, (snapshot, revision)) =
-            tokio::join!(plugin_change(&host, Method::PluginEnable), asking);
+        // The change runs in a task of its own, as the daemon runs one: it holds its thread for as
+        // long as it runs, and a round beside it in one task could not ask until it was done.
+        let enabling = tokio::spawn({
+            let host = Arc::clone(&host);
+            async move { plugin_change(&host, Method::PluginEnable).await }
+        });
+        let (snapshot, revision) = asking.await;
+        let enabled = enabling.await.expect("the change ran to its end");
         let _: wire::PluginEnableResult = ok(enabled);
         assert_eq!(
             snapshot.map_err(|error| error.code),
@@ -5730,6 +5736,378 @@ mod native_bridges {
                 ("deny".to_owned(), "Decline in Claude Code".to_owned()),
             ],
             "the decisions the table maps are offered under the vendor's labels"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-11.14 and KR-ACC-017: a change under the catalogue lock leaves the executor
+// ---------------------------------------------------------------------------------------------
+
+/// A sync, an installation and the reads of a catalogue of ten thousand entries, as the daemon
+/// serves them, hold no thread the daemon's other tasks run on.
+///
+/// The daemon runs a change in a task of its own beside the tasks of every terminal, on a runtime
+/// with a few worker threads. A change that does its blocking work on its worker keeps the tasks
+/// queued on that worker waiting until it is done. These cases run the change on a runtime with
+/// one worker thread, beside a task that stands for a terminal's input task, and make the change
+/// ask that task for a run of turns at the point under test and wait for them: only a change that
+/// has handed the worker's other tasks on can be answered, so the cases decide by what the input
+/// task did and never by how long anything took.
+mod off_the_executor {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::generations::{Generation, GenerationSpec, synthetic_index};
+    use super::*;
+
+    /// How many turns the input task makes for each request.
+    const TURNS: usize = 200;
+
+    /// What ends a run in which the input task never got a turn. A run that passes never reaches
+    /// it.
+    const BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// A task that stands for a terminal's input task: for each request it makes `TURNS` turns on
+    /// the runtime it shares with the change, and then answers.
+    struct Input {
+        ask: tokio::sync::mpsc::UnboundedSender<std::sync::mpsc::Sender<()>>,
+        answered: AtomicUsize,
+    }
+
+    impl Input {
+        fn start() -> Arc<Self> {
+            let (ask, mut asked) =
+                tokio::sync::mpsc::unbounded_channel::<std::sync::mpsc::Sender<()>>();
+            tokio::spawn(async move {
+                while let Some(answer) = asked.recv().await {
+                    for _ in 0..TURNS {
+                        tokio::task::yield_now().await;
+                    }
+                    let _ = answer.send(());
+                }
+            });
+            Arc::new(Self {
+                ask,
+                answered: AtomicUsize::new(0),
+            })
+        }
+
+        /// Asks the task for a fresh run of turns and waits, on the calling thread, for its
+        /// answer. A turn that began before this request cannot answer it.
+        fn turns(&self) -> CatalogueResult<()> {
+            let (answer, answered) = std::sync::mpsc::channel();
+            self.ask
+                .send(answer)
+                .map_err(|_| CatalogueError::StorageUnavailable {
+                    detail: "the input task ended".to_owned(),
+                })?;
+            answered
+                .recv_timeout(BOUND)
+                .map_err(|_| CatalogueError::StorageUnavailable {
+                    detail: "the input task made no turn while the catalogue held its thread"
+                        .to_owned(),
+                })?;
+            self.answered.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn answers(&self) -> usize {
+            self.answered.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The daemon's admission as far as the catalogue sees it, with a run of the input task's
+    /// turns asked for where the change asks whether it may go on and at each commit.
+    struct Handshaking {
+        input: Arc<Input>,
+    }
+
+    impl Authority for Handshaking {
+        fn check(&self) -> CatalogueResult<()> {
+            self.input.turns()
+        }
+
+        fn commit(
+            &self,
+            _effect: &Effect,
+            commit: &mut dyn FnMut() -> CatalogueResult<()>,
+        ) -> CatalogueResult<()> {
+            self.input.turns()?;
+            commit()
+        }
+
+        fn owner_confirmed(&self) -> bool {
+            false
+        }
+    }
+
+    impl Admission for Handshaking {
+        fn accepted_deadline_ms(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A host whose catalogue has a repository of ten thousand entries enrolled, and the
+    /// generation behind it.
+    async fn crowded() -> (Arc<Host>, Generation, tempfile::TempDir) {
+        let host = Arc::new(host());
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(
+            home.path(),
+            GenerationSpec {
+                listed_only: synthetic_index(9_999).entries,
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let enrolment = Enrolment::new(
+            RepositoryId::new("crowded").expect("a repository identifier"),
+            RepositoryKind::Community,
+            generation.metadata_url(),
+            generation.targets_url(),
+            generation.root_bytes(),
+            kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .expect("an enrollable repository");
+        host.module
+            .catalogue()
+            .lock()
+            .await
+            .enrol(enrolment, true)
+            .expect("the owner adopted the root");
+        (host, generation, home)
+    }
+
+    /// One change, run in a task of its own on the runtime as both routes run it.
+    async fn changed<P: serde::Serialize>(
+        host: &Arc<Host>,
+        method: Method,
+        params: &P,
+        admission: Arc<dyn Admission>,
+    ) -> Result<ParamsValue, kr_protocol::error::ProtocolError> {
+        let host = Arc::clone(host);
+        let request = mutation(method, host.environment_id, params);
+        tokio::spawn(async move {
+            host.module
+                .write(
+                    &ActorId::new("kr:local").expect("an actor"),
+                    &request,
+                    method,
+                    None,
+                    admission,
+                    None,
+                )
+                .await
+        })
+        .await
+        .expect("the change ran to its end")
+    }
+
+    /// One read, run in a task of its own.
+    async fn read<P: serde::Serialize>(
+        host: &Arc<Host>,
+        method: Method,
+        params: &P,
+    ) -> Result<ParamsValue, kr_protocol::error::ProtocolError> {
+        let host = Arc::clone(host);
+        let request = request(method, params);
+        tokio::spawn(async move {
+            host.module
+                .read(ActorIngress::LocalIpc, &request, None)
+                .await
+        })
+        .await
+        .expect("the read ran to its end")
+    }
+
+    /// The daemon builds its runtime with `Builder::new_multi_thread().enable_all()` and runs the
+    /// seed on the main thread inside that runtime's `block_on`, where `block_in_place` is allowed
+    /// but there is no worker queue to hand on; every other change runs in a task on a worker.
+    /// Both places run a change, and a suite whose tests build a current-thread runtime (where
+    /// `block_in_place` panics) runs the same changes inline.
+    #[test]
+    fn a_change_runs_on_the_daemons_own_runtime_from_its_main_thread_and_from_a_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime built as the daemon builds its own");
+        let host = Arc::new(host());
+        let sync = |host: &Host| {
+            mutation(
+                Method::CatalogueSync,
+                host.environment_id,
+                &wire::CatalogueSyncParams {
+                    environment_id: host.environment_id,
+                    catalogue_id: "development".to_owned(),
+                },
+            )
+        };
+        runtime.block_on(async {
+            let _: wire::CatalogueAddResult = ok(host
+                .module
+                .write_frame_admitted(
+                    &mutation(
+                        Method::CatalogueAdd,
+                        host.environment_id,
+                        &add_params(&host),
+                    ),
+                    Method::CatalogueAdd,
+                    Some(host.confirmations()),
+                )
+                .await);
+            let _: wire::CatalogueSyncResult = ok(host
+                .module
+                .write_frame_admitted(&sync(&host), Method::CatalogueSync, None)
+                .await);
+        });
+        let again = Arc::clone(&host);
+        let synced: wire::CatalogueSyncResult = runtime.block_on(async move {
+            let task = tokio::spawn(async move {
+                ok(again
+                    .module
+                    .write_frame_admitted(&sync(&again), Method::CatalogueSync, None)
+                    .await)
+            });
+            task.await.expect("the change ran to its end")
+        });
+        assert_eq!(synced.generation.get(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn kr_ac_017_a_sync_and_an_installation_of_ten_thousand_entries_leave_the_input_task_running()
+     {
+        let (host, generation, _home) = crowded().await;
+        let input = Input::start();
+        let admission: Arc<dyn Admission> = Arc::new(Handshaking {
+            input: Arc::clone(&input),
+        });
+
+        let synced: wire::CatalogueSyncResult = changed(
+            &host,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id: host.environment_id,
+                catalogue_id: "crowded".to_owned(),
+            },
+            Arc::clone(&admission),
+        )
+        .await
+        .expect("the sync was answered while the input task ran")
+        .to_typed()
+        .expect("a result");
+        assert_eq!(synced.entries, U64::new(10_000));
+        assert!(
+            input.answers() > 2,
+            "the input task was asked at the sync's checks and commits, not only once"
+        );
+
+        let before = input.answers();
+        let installed: wire::PluginInstallResult = changed(
+            &host,
+            Method::PluginInstall,
+            &wire::PluginInstallParams {
+                environment_id: host.environment_id,
+                catalogue_id: "crowded".to_owned(),
+                plugin_id: plugin(),
+                version: "0.1.0".to_owned(),
+                package_digest: generation.manifest_digest().to_string(),
+                grant: Vec::new(),
+                owner_confirmation: Nullable::null(),
+            },
+            admission,
+        )
+        .await
+        .expect("the installation was answered while the input task ran")
+        .to_typed()
+        .expect("a result");
+        assert_eq!(installed.plugin.plugin_id, plugin());
+        assert!(
+            input.answers() > before + 2,
+            "the input task was asked at the installation's checks and commits too"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn kr_ac_017_the_reads_of_a_catalogue_of_ten_thousand_entries_leave_the_input_task_running()
+     {
+        let (host, generation, _home) = crowded().await;
+        let installing: Arc<dyn Admission> = Arc::new(Owner::acting());
+        let _: wire::CatalogueSyncResult = changed(
+            &host,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id: host.environment_id,
+                catalogue_id: "crowded".to_owned(),
+            },
+            Arc::clone(&installing),
+        )
+        .await
+        .expect("synced")
+        .to_typed()
+        .expect("a result");
+        let _: wire::PluginInstallResult = changed(
+            &host,
+            Method::PluginInstall,
+            &wire::PluginInstallParams {
+                environment_id: host.environment_id,
+                catalogue_id: "crowded".to_owned(),
+                plugin_id: plugin(),
+                version: "0.1.0".to_owned(),
+                package_digest: generation.manifest_digest().to_string(),
+                grant: Vec::new(),
+                owner_confirmation: Nullable::null(),
+            },
+            installing,
+        )
+        .await
+        .expect("installed")
+        .to_typed()
+        .expect("a result");
+
+        let input = Input::start();
+        let held = Arc::new(AtomicUsize::new(0));
+        let (asking, counting) = (Arc::clone(&input), Arc::clone(&held));
+        host.module.at_testing_point(move |point| {
+            if point == TestingPoint::Held {
+                asking
+                    .turns()
+                    .expect("the input task ran while the read held its thread");
+                counting.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let _: wire::PluginCapabilitiesResult = read(
+            &host,
+            Method::PluginCapabilities,
+            &wire::PluginCapabilitiesParams {
+                environment_id: host.environment_id,
+                plugin_id: plugin(),
+            },
+        )
+        .await
+        .expect("the capabilities were answered while the input task ran")
+        .to_typed()
+        .expect("a result");
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            1,
+            "the read ran off the executor"
+        );
+        let _: wire::PluginListResult = read(
+            &host,
+            Method::PluginList,
+            &wire::PluginListParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .expect("the list was answered while the input task ran")
+        .to_typed()
+        .expect("a result");
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            2,
+            "the list ran off the executor"
         );
     }
 }

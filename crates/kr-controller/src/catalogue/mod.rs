@@ -281,12 +281,53 @@ pub enum TestingPoint {
     Records,
     /// A snapshot's package checks, once the catalogue is let go.
     PackageChecks,
+    /// The start of a change, a read or a seed that holds the catalogue, once it holds a thread
+    /// of its own and the executor's other tasks have been handed on.
+    Held,
+    /// Each commit a change of the catalogue makes, just before the admission it runs under is
+    /// asked to let it through.
+    Commit,
 }
 
 /// A hook a test runs at each [`TestingPoint`].
 #[cfg(feature = "testing")]
 #[derive(Clone)]
 struct TestingHook(Arc<dyn Fn(TestingPoint) + Send + Sync>);
+
+/// A change's admission with the module's hook run at each of its commits, so that a test can hold
+/// a change in the middle of its durable work, beside the admission and not inside it.
+#[cfg(feature = "testing")]
+struct Committing {
+    inner: Arc<dyn Admission>,
+    hook: TestingHook,
+}
+
+#[cfg(feature = "testing")]
+impl Authority for Committing {
+    fn check(&self) -> CatalogueResult<()> {
+        self.inner.check()
+    }
+
+    fn commit(
+        &self,
+        effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
+        (self.hook.0)(TestingPoint::Commit);
+        self.inner.commit(effect, commit)
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        self.inner.owner_confirmed()
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Admission for Committing {
+    fn accepted_deadline_ms(&self) -> Option<u64> {
+        self.inner.accepted_deadline_ms()
+    }
+}
 
 #[cfg(feature = "testing")]
 impl std::fmt::Debug for TestingHook {
@@ -575,6 +616,59 @@ impl CatalogueModule {
             .clone()
     }
 
+    /// Runs `work`, which reads or changes the catalogue the caller holds, without holding a
+    /// thread the daemon's other tasks run on.
+    ///
+    /// The catalogue's work between its awaits is blocking: a wait for the repository's file lock,
+    /// a flush, a transaction, the parse of an index that lists ten thousand entries. On the
+    /// worker that polls the task it keeps every task queued on that worker waiting, a terminal's
+    /// input among them. On a multi-thread runtime the worker hands what it was running to another
+    /// thread before it blocks; on any other runtime, which no daemon here is, there is no thread
+    /// to hand it to and the work runs where it is. The lock is waited for before this, never
+    /// inside it, so no thread is held for a wait.
+    fn off_the_executor<R>(&self, work: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "testing")]
+        let hook = self.testing_hook();
+        let held = move || {
+            #[cfg(feature = "testing")]
+            if let Some(hook) = hook {
+                (hook.0)(TestingPoint::Held);
+            }
+            work()
+        };
+        if on_a_multi_thread_runtime() {
+            tokio::task::block_in_place(held)
+        } else {
+            held()
+        }
+    }
+
+    /// Runs `work`, which awaits what a change of the catalogue awaits, without holding a thread
+    /// the daemon's other tasks run on: as [`Self::off_the_executor`], on the thread the worker
+    /// leaves to the future.
+    ///
+    /// The future is driven to its end on that one thread, a synchronisation's waits for the
+    /// network included, so a change holds one thread for as long as it runs. It cannot be
+    /// abandoned part way: a task that holds it is stopped only by the runtime ending, which waits
+    /// for it. Both routes that reach a change run it in a task of its own and wait for that task
+    /// with a bound, which leaves it running past the bound, so nothing aborts it.
+    async fn off_the_executor_async<W: std::future::Future>(&self, work: W) -> W::Output {
+        #[cfg(feature = "testing")]
+        let hook = self.testing_hook();
+        let held = async move {
+            #[cfg(feature = "testing")]
+            if let Some(hook) = hook {
+                (hook.0)(TestingPoint::Held);
+            }
+            work.await
+        };
+        if on_a_multi_thread_runtime() {
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(held))
+        } else {
+            held.await
+        }
+    }
+
     /// Returns the admission revision now, waiting for the catalogue no later than `deadline`.
     ///
     /// # Errors
@@ -722,47 +816,52 @@ impl CatalogueModule {
             .await
             .map_err(|_| ProtocolError::new(ErrorCode::ResourceUnavailable, BUSY_FOR_ADAPTERS))?;
         let _setting = SettingAdapters::begin(&self.setting_adapters);
-        // The list is read again once it is in force: a change that was made while this one held
-        // the catalogue is not answered from the list in force (see above), and one that is
-        // made after this read is found by this check, so the loop ends only on a list that the
-        // policy still states.
-        let mut moved = false;
-        let mut refused = None;
-        loop {
-            let wanted = allowed();
-            #[cfg(feature = "testing")]
-            if self
-                .raise_fault
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                refused = Some(ProtocolError::new(
-                    ErrorCode::StorageUnavailable,
-                    "the admission revision could not be written",
-                ));
-                break;
-            }
-            match catalogue.set_allowed_adapters(wanted.clone(), &Owner::acting()) {
-                Ok(changed) => moved |= changed,
-                Err(error) => {
-                    refused = Some(ProtocolError::from(error));
+        let (moved, refused, followed) = self.off_the_executor(|| {
+            // The list is read again once it is in force: a change that was made while this one
+            // held the catalogue is not answered from the list in force (see above), and one that
+            // is made after this read is found by this check, so the loop ends only on a list
+            // that the policy still states.
+            let mut moved = false;
+            let mut refused = None;
+            loop {
+                let wanted = allowed();
+                #[cfg(feature = "testing")]
+                if self
+                    .raise_fault
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    refused = Some(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "the admission revision could not be written",
+                    ));
+                    break;
+                }
+                match catalogue.set_allowed_adapters(wanted.clone(), &Owner::acting()) {
+                    Ok(changed) => moved |= changed,
+                    Err(error) => {
+                        refused = Some(ProtocolError::from(error));
+                        break;
+                    }
+                }
+                *self
+                    .adapters_in_force
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = wanted.clone();
+                if allowed() == wanted {
                     break;
                 }
             }
-            *self
-                .adapters_in_force
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = wanted.clone();
-            if allowed() == wanted {
-                break;
-            }
-        }
-        if moved {
             // The list changed which packages may run in an application's name, so each bridge
-            // follows what its installation now wants, under the same lock and after the change's
-            // commit, as a plugin change's bridge does. A list put in force before a refusal is
-            // followed too: the packages it leaves out do not keep a registration.
-            let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
-            let wanted = self.wanted_bridges(&catalogue, subjects);
+            // follows what its installation now wants, under the same lock and after the
+            // change's commit, as a plugin change's bridge does. A list put in force before a
+            // refusal is followed too: the packages it leaves out do not keep a registration.
+            let followed = moved.then(|| {
+                let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
+                self.wanted_bridges(&catalogue, subjects)
+            });
+            (moved, refused, followed)
+        });
+        if let Some(wanted) = followed {
             self.follow_bridges(wanted).await;
         }
         match refused {
@@ -855,8 +954,11 @@ impl CatalogueModule {
                 }
                 self.check_environment(params.environment_id)?;
                 let mut catalogue = self.catalogue.lock().await;
-                let (plan, _) = install_plan(&mut catalogue, params).await?;
+                let planned = self
+                    .off_the_executor_async(install_plan(&mut catalogue, params))
+                    .await;
                 drop(catalogue);
+                let (plan, _) = planned?;
                 let digest = plan.action_digest().map_err(plan_error)?;
                 Ok(crate::service::net::owner::Resolved {
                     action: kr_protocol::confirmation::PluginInstallPlan::sensitive_action(),
@@ -1103,6 +1205,18 @@ impl CatalogueModule {
             }
         }
         let catalogue = self.catalogue.lock().await;
+        self.off_the_executor(|| self.read_locked(method, request, view, &catalogue))
+    }
+
+    /// Serves one catalogue or plugin read from the catalogue the caller holds, which reads
+    /// records, indexes and packages and does not await.
+    fn read_locked(
+        &self,
+        method: Method,
+        request: &Request,
+        view: Option<&bridge::LiveView>,
+        catalogue: &Catalogue,
+    ) -> Answer<ParamsValue> {
         match method {
             Method::CatalogueList => {
                 let params: wire::CatalogueListParams = typed(&request.params)?;
@@ -1160,7 +1274,7 @@ impl CatalogueModule {
                     .map(|(_, (release, _))| release.clone())
                     .collect();
                 let states = admissions::release_states(
-                    &catalogue,
+                    catalogue,
                     self.environment_id,
                     &left,
                     &kr_plugin_catalogue::this_host(),
@@ -1359,6 +1473,41 @@ impl CatalogueModule {
         removal: Option<(u64, u64)>,
     ) -> Answer<ParamsValue> {
         let mut catalogue = self.catalogue.lock().await;
+        self.off_the_executor_async(self.write_locked(
+            &mut catalogue,
+            actor_id,
+            mutation,
+            method,
+            confirmations,
+            admission,
+            removal,
+        ))
+        .await
+    }
+
+    /// Serves one catalogue or plugin mutation under the catalogue's lock: the claim, the change,
+    /// what its failure settles and the bridges that follow it, all of which block.
+    // Each argument is one part of the change: who asked, what, by which method, under whose
+    // confirmation and admission, and what the workers reported about a package a removal ends.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_locked(
+        &self,
+        catalogue: &mut Catalogue,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        confirmations: Option<&dyn OwnerConfirmations>,
+        admission: Arc<dyn Admission>,
+        removal: Option<(u64, u64)>,
+    ) -> Answer<ParamsValue> {
+        #[cfg(feature = "testing")]
+        let admission: Arc<dyn Admission> = match self.testing_hook() {
+            Some(hook) => Arc::new(Committing {
+                inner: admission,
+                hook,
+            }),
+            None => admission,
+        };
         admission.check().map_err(ProtocolError::from)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
@@ -1384,7 +1533,7 @@ impl CatalogueModule {
         let recording = Recording::new(&*admission);
         let outcome = self
             .perform_write(
-                &mut catalogue,
+                catalogue,
                 mutation,
                 method,
                 confirmations,
@@ -1420,11 +1569,11 @@ impl CatalogueModule {
                 Method::CatalogueSync | Method::CataloguePin | Method::CatalogueRemove
             ) =>
             {
-                bridge_subjects(&catalogue, &self.bridges, self.environment_id)
+                bridge_subjects(catalogue, &self.bridges, self.environment_id)
             }
             None => Vec::new(),
         };
-        self.follow_after_commit(&mut catalogue, subjects, &*admission)
+        self.follow_after_commit(catalogue, subjects, &*admission)
             .await;
         answer
     }
@@ -1476,15 +1625,20 @@ impl CatalogueModule {
         bundle: &kr_plugin_catalogue::SeedBundle,
     ) -> kr_plugin_catalogue::SeedOutcome {
         let mut catalogue = self.catalogue.lock().await;
-        let budgets = seed_budgets(&self.budgets_in_force());
-        let outcome = catalogue.seed(bundle, self.environment_id, budgets).await;
-        if outcome.activated.is_some() || !outcome.installed.is_empty() || outcome.failure.is_some()
-        {
-            let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
-            self.follow_after_commit(&mut catalogue, subjects, &Owner::acting())
-                .await;
-        }
-        outcome
+        self.off_the_executor_async(async {
+            let budgets = seed_budgets(&self.budgets_in_force());
+            let outcome = catalogue.seed(bundle, self.environment_id, budgets).await;
+            if outcome.activated.is_some()
+                || !outcome.installed.is_empty()
+                || outcome.failure.is_some()
+            {
+                let subjects = bridge_subjects(&catalogue, &self.bridges, self.environment_id);
+                self.follow_after_commit(&mut catalogue, subjects, &Owner::acting())
+                    .await;
+            }
+            outcome
+        })
+        .await
     }
 
     // Each argument is one part of the change: what was asked, by whom, under which admission,
@@ -1876,6 +2030,13 @@ impl CatalogueModule {
             format!("this daemon owns environment {}", self.environment_id),
         ))
     }
+}
+
+/// True when the task runs on a multi-thread runtime, where a worker that is about to block can
+/// hand its queue to another thread. `block_in_place` panics on any other runtime.
+fn on_a_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
 }
 
 /// The refusal of a read that ran past its bound, waiting for a busy catalogue or reading a slow

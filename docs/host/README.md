@@ -1345,7 +1345,13 @@ admission travels into the catalogue and is asked again where the change becomes
 catalogue's transaction, and every file it publishes or reclaims, runs while the daemon holds its
 table of admitted connections, so a revocation or a withdrawn connection is ordered wholly before
 the change or wholly after it, and a request whose deadline or authority ran out while it waited
-behind a sync or a download changes nothing. A mutation is claimed durably before it is performed,
+behind a sync or a download changes nothing. Everything the daemon does while it holds the
+catalogue (a mutation, a read, the seed, a change of the adapters an organisation allows) runs on
+a thread the runtime has handed its other tasks away from, because a sync of a catalogue of ten
+thousand entries flushes files, commits records and parses an index of that size without awaiting.
+A session's input is therefore answered while a synchronisation or an installation runs; the
+change holds that one thread for as long as it runs, a sync's waits for the network included. A
+runtime with one thread has no thread to hand them to, and runs the work where it is. A mutation is claimed durably before it is performed,
 under the caller and the action identifier, and the transaction that makes its change also records
 the answer it gave. A retry of an applied action is answered with that answer and a refused one
 with its refusal, without performing anything again. An action a stopped daemon left mid-way is

@@ -96,19 +96,29 @@ impl Rig {
     /// A device paired with the rights to view and to type over any session, attached and holding
     /// the lease.
     async fn start() -> Self {
-        Self::start_reaching(false).await
+        Self::start_reaching(false, &[]).await
+    }
+
+    /// As [`Self::start`], for a device that may also manage the host, which the catalogue's
+    /// methods ask for.
+    async fn start_managing() -> Self {
+        Self::start_reaching(false, &[ActionRight::HostManage]).await
     }
 
     /// As [`Self::start`], for a device whose pairing grant reaches the attached session only, and
     /// which holds a viewer's share of a session no worker serves.
     async fn start_shared() -> Self {
-        Self::start_reaching(true).await
+        Self::start_reaching(true, &[]).await
     }
 
-    async fn start_reaching(only_here: bool) -> Self {
+    async fn start_reaching(only_here: bool, also: &[ActionRight]) -> Self {
         let (host, worker, owner, kept) = environment().await;
         let device = Device::create().await;
-        let mut grant = proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]);
+        let rights: Vec<ActionRight> = [ActionRight::SessionView, ActionRight::TerminalInput]
+            .into_iter()
+            .chain(also.iter().copied())
+            .collect();
+        let mut grant = proposal(&rights);
         if only_here {
             grant.session_selector = SessionSelector::These {
                 session_ids: [worker.session_id].into_iter().collect(),
@@ -981,4 +991,215 @@ async fn remote_input_forwarding_latency() {
         &echoed,
     );
     rig.close().await;
+}
+
+/// The catalogue's own builder of signed generations, for a repository of ten thousand entries.
+#[allow(dead_code)]
+#[path = "../../kr-plugin-catalogue/tests/support/mod.rs"]
+mod generations;
+
+/// How many of a change's commits the case holds, and types a key at each.
+const HELD_COMMITS: usize = 2;
+
+/// KR-REQ-11.14 and KR-ACC-017: a key typed in a session reaches its application while a sync and
+/// an installation of a repository of ten thousand entries hold the catalogue, each held in the
+/// middle of its durable work.
+///
+/// The daemon runs a catalogue change in a task of its own beside every session's tasks. A change
+/// that did its blocking work on its worker thread kept the tasks queued on that worker waiting,
+/// and the runtime here has one worker, so a key could not reach the application until the change
+/// was done. The case holds the change at two of its commits, types a key at each and waits for
+/// the application to have it, and only then lets the change go on; a change that held the worker
+/// is let go by the watchdog five seconds later, which fails the case. It decides by what reached
+/// the application, never by how long anything took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_key_reaches_the_application_while_a_sync_and_an_installation_of_ten_thousand_entries_hold_the_catalogue()
+ {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use kr_controller::catalogue::TestingPoint;
+    use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
+    use kr_protocol::catalogue as wire;
+    use kr_protocol::scalars::U64;
+
+    let mut rig = Rig::start_managing().await;
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = generations::Generation::build(
+        home.path(),
+        generations::GenerationSpec {
+            listed_only: generations::synthetic_index(9_999).entries,
+            ..generations::GenerationSpec::default()
+        },
+    )
+    .await;
+    let package = kr_protocol::ids::PluginId::new("kalareach/example-declarative")
+        .expect("a plugin identifier");
+    let catalogue = rig.host.controller().catalogue();
+    catalogue
+        .catalogue()
+        .lock()
+        .await
+        .enrol(
+            Enrolment::new(
+                RepositoryId::new("crowded").expect("a repository identifier"),
+                RepositoryKind::Community,
+                generation.metadata_url(),
+                generation.targets_url(),
+                generation.root_bytes(),
+                kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+
+    // The change stops at its commits while the budget lasts, says so, and waits to be let go.
+    let (reached, waiting) = std::sync::mpsc::channel::<()>();
+    let (go, going) = std::sync::mpsc::channel::<()>();
+    let (reached, going) = (Mutex::new(reached), Mutex::new(going));
+    let waiting = Arc::new(Mutex::new(waiting));
+    let budget = Arc::new(AtomicUsize::new(0));
+    let let_go_by_the_watchdog = Arc::new(AtomicBool::new(false));
+    {
+        let (budget, let_go) = (Arc::clone(&budget), Arc::clone(&let_go_by_the_watchdog));
+        catalogue.at_testing_point(move |point| {
+            let holding = point == TestingPoint::Commit
+                && budget
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok();
+            if holding {
+                let _ = reached.lock().expect("the signal").send(());
+                if going
+                    .lock()
+                    .expect("the release")
+                    .recv_timeout(WATCHDOG)
+                    .is_err()
+                {
+                    let_go.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+    }
+
+    // The catalogue's changes go on a second connection of the device. A key never goes ahead of a
+    // catalogue mutation sent before it on its own connection, which is the protocol's order, and
+    // a person at a terminal does not wait for a synchronisation that another connection runs.
+    let (device, record) = &rig.paired;
+    let other = RawDevice::connect(&rig.host, device, record).await;
+    let mut answers = Answers::default();
+    let environment_id = rig.host.environment_id;
+    let holds = Holds {
+        budget,
+        waiting,
+        go,
+        let_go: let_go_by_the_watchdog,
+    };
+    let synced: wire::CatalogueSyncResult = holds
+        .change(
+            &mut rig,
+            &other,
+            &mut answers,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id,
+                catalogue_id: "crowded".to_owned(),
+            },
+        )
+        .await
+        .to_typed()
+        .expect("a sync result");
+    assert_eq!(synced.entries, U64::new(10_000));
+    let _: wire::PluginInstallResult = holds
+        .change(
+            &mut rig,
+            &other,
+            &mut answers,
+            Method::PluginInstall,
+            &wire::PluginInstallParams {
+                environment_id,
+                catalogue_id: "crowded".to_owned(),
+                plugin_id: package,
+                version: "0.1.0".to_owned(),
+                package_digest: generation.manifest_digest().to_string(),
+                grant: Vec::new(),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .to_typed()
+        .expect("an installation result");
+    other.close();
+    rig.close().await;
+}
+
+/// Where a catalogue change is held, and what lets it go.
+struct Holds {
+    /// How many more commits are held.
+    budget: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Says that the change is held at a commit.
+    waiting: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+    /// Lets the change go on.
+    go: std::sync::mpsc::Sender<()>,
+    /// Whether the watchdog, and not the case, let a change go.
+    let_go: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Holds {
+    /// Sends one catalogue change on `via`, a connection of the device, and at each of its first
+    /// `HELD_COMMITS` commits types a key on the connection the device attached on and waits for
+    /// the application to have it before the change goes on. Returns the change's result.
+    async fn change<P: serde::Serialize>(
+        &self,
+        rig: &mut Rig,
+        via: &RawDevice,
+        answers: &mut Answers,
+        method: Method,
+        params: &P,
+    ) -> kr_protocol::envelope::ParamsValue {
+        use std::sync::atomic::Ordering;
+
+        self.budget.store(HELD_COMMITS, Ordering::SeqCst);
+        let change = via
+            .submit(
+                method,
+                ActionId::new(kr_ipc::new_uuid()),
+                on_the_host(&rig.host),
+                params,
+            )
+            .await;
+        for held in 1..=HELD_COMMITS {
+            let signal = std::sync::Arc::clone(&self.waiting);
+            let reached = tokio::task::spawn_blocking(move || {
+                signal
+                    .lock()
+                    .expect("the signal")
+                    .recv_timeout(LIVENESS_DEADLINE)
+            })
+            .await
+            .expect("the wait ended");
+            if reached.is_err() {
+                let answer = answers.until(via, change, Duration::from_secs(1)).await;
+                panic!(
+                    "{method:?}: the change never reached commit {held}; its answer: {answer:?}"
+                );
+            }
+            rig.send_key(b"k").await;
+            let arrived = rig.until_everything_typed_arrived().await;
+            assert!(
+                arrived.is_some() && !self.let_go.load(Ordering::SeqCst),
+                "{method:?}: the key typed while the change was held at commit {held} did not \
+                 reach the application until the watchdog let the change go"
+            );
+            self.go.send(()).expect("the change is waiting");
+        }
+        let answer = answers.until(via, change, LIVENESS_DEADLINE).await;
+        let Some(Outcome::Ok(result)) = answer else {
+            panic!("{method:?} was answered {answer:?}");
+        };
+        result
+    }
 }
