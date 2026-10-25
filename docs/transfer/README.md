@@ -81,7 +81,12 @@ own socket. A draft is sent to one session, and an attachment belongs to one. Th
 attachments the draft holds, and any it gets later, can only be held by the session it was sent to.
 An attachment uploaded without a session takes that session. A prompt that names a draft for another
 session, or a draft that holds an attachment belonging to another session, is refused before
-anything is sent. A prompt the worker takes and then refuses was still sent to its session, so the
+anything is sent. So is a prompt for one application when the draft was written for another: it is
+refused as `DRAFT_CONFLICT`, the draft is left as it was and nothing is recorded. A draft that names
+no application can be sent to any. The prompt's own binding revision is the worker's to check; the
+host's draft records no binding revision, so a draft prepared at an earlier revision of the same
+application is not told apart from one prepared at the current revision. A prompt the worker takes
+and then refuses was still sent to its session, so the
 attachments stay with it. A prompt made under an identifier already used for another prompt is
 refused before the draft is recorded. The host tells the service which sessions its retention still
 covers; the service never guesses.
@@ -815,7 +820,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `SOURCE_CHANGED` | a declaration changed, a source moved under a snapshot, or a snapshot is gone |
 | `QUOTA_EXCEEDED` | a per-file or per-environment byte limit |
 | `RESOURCE_UNAVAILABLE` | the device's concurrency ceiling, or a transfer in a state that admits no more |
-| `DRAFT_CONFLICT` | the draft's revision is not the one the caller expected |
+| `DRAFT_CONFLICT` | the draft's revision is not the one the caller expected, or a prompt names a draft written for another application |
 | `PERMISSION_DENIED` | a name that leaves an authorised directory, or a revoked scope or grant |
 | `ENVIRONMENT_UNAVAILABLE` | the request names an environment this service does not own |
 | `ID_CONFLICT` | one action identifier used for two different payloads |
