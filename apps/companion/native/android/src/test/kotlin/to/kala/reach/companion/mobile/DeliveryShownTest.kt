@@ -27,11 +27,12 @@ class DeliveryShownTest {
         )
 
     /** What was posted: the tag, the words and how. */
-    private class Posts {
+    private class Posts(private val takesReplacements: Boolean = true) {
         val all = mutableListOf<Triple<String, String, Posting>>()
 
-        fun show(plan: NotificationPlan, posting: Posting) {
+        fun show(plan: NotificationPlan, posting: Posting): Boolean {
             all += Triple(plan.tag, plan.body, posting)
+            return takesReplacements || posting != Posting.REPLACEMENT
         }
     }
 
@@ -57,6 +58,20 @@ class DeliveryShownTest {
             posts.all
         )
         assertEquals("", plan.reason)
+    }
+
+    @Test
+    fun aPreviewThatOpenedOverAnAlertThePersonActedOnIsReportedAsNotPosted() {
+        val posts = Posts(takesReplacements = false)
+
+        val plan =
+            showDelivery(
+                sealed,
+                decide = { PreviewDecision.Reveal("Allow scripts/release.sh?") },
+                show = posts::show
+            )
+
+        assertEquals(ALERT_GONE, plan.reason)
     }
 
     @Test
