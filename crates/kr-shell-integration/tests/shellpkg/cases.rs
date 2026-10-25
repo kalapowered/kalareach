@@ -3792,14 +3792,13 @@ pub fn the_powershell_bootstrap_secret_is_cleared_once_the_handshake_is_accepted
 #[cfg(target_os = "linux")]
 pub fn a_mapping_that_goes_while_the_scan_reads_is_not_memory_left_unread() {
     // A region the map lists and the process no longer has: nothing is mapped at this address,
-    // which is what a region unmapped after the listing looks like to the read.
-    let gone = "200000000000-200000002000 rw-p 00000000 00:00 0\n";
+    // which is what a region unmapped after the listing looks like to the read. The address is
+    // below the lowest one a process may map, so it is inside every address space, the small ones
+    // of some Arm kernels included, and no thread of the test can come to map it.
+    let gone = "10000-12000 rw-p 00000000 00:00 0\n";
     let scan = scan_memory_listing(std::process::id(), b"a needle of no consequence", gone);
     assert!(
-        !scan
-            .unread
-            .iter()
-            .any(|line| line.starts_with("200000000000-")),
+        !scan.unread.iter().any(|line| line.starts_with("10000-")),
         "the scan reports a region that was unmapped before it was read as unread memory: {:?}",
         scan.unread
     );
@@ -3988,6 +3987,110 @@ fn native_files(directory: &Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// The directories a native file asks the loader to search besides the system's: the `LC_RPATH`
+/// commands of a Mach-O file and the `RPATH` and `RUNPATH` entries of an ELF file, one per path.
+///
+/// # Panics
+///
+/// Panics when the platform's tool for reading them is missing or fails.
+fn search_paths(file: &Path) -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        let output = std::process::Command::new("otool")
+            .args(["-arch", "all", "-l"])
+            .arg(file)
+            .output()
+            .expect("otool to run");
+        assert!(
+            output.status.success(),
+            "otool could not read {}",
+            file.display()
+        );
+        let mut rpath = false;
+        let mut paths = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let line = line.trim();
+            if let Some(command) = line.strip_prefix("cmd ") {
+                rpath = command == "LC_RPATH";
+            } else if let (true, Some(path)) = (rpath, line.strip_prefix("path ")) {
+                paths.push(path.split(" (offset").next().unwrap_or(path).to_owned());
+                rpath = false;
+            }
+        }
+        paths
+    } else {
+        let output = std::process::Command::new("readelf")
+            .arg("-d")
+            .arg(file)
+            .output()
+            .expect("readelf to run");
+        assert!(
+            output.status.success(),
+            "readelf could not read {}",
+            file.display()
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.contains("(RPATH)") || line.contains("(RUNPATH)"))
+            .filter_map(|line| line.split('[').nth(1))
+            .filter_map(|rest| rest.split(']').next())
+            .flat_map(|list| list.split(':'))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// The dynamic loader an ELF file asks for, which is a path and not a library name, or nothing for
+/// a Mach-O file and for an ELF file that asks for none.
+///
+/// # Panics
+///
+/// Panics when `readelf` is missing or fails.
+fn interpreter(file: &Path) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("readelf")
+        .arg("-l")
+        .arg(file)
+        .output()
+        .expect("readelf to run");
+    assert!(
+        output.status.success(),
+        "readelf could not read {}",
+        file.display()
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.split("Requesting program interpreter: ").nth(1))
+        .and_then(|rest| rest.split(']').next())
+        .map(str::to_owned)
+}
+
+/// Whether a path has a `..` in it, which leaves the directory it starts in.
+fn leaves_its_directory(path: &str) -> bool {
+    path.split('/').any(|part| part == "..")
+}
+
+/// Whether a macOS library name is the system's own: under `/usr/lib` or `/System/Library`, with no
+/// `..` in it. `/System/Volumes/Data` is where the firmlinks of `/opt` and `/usr/local` lead, so a
+/// name under it is a library of the build machine's own volume.
+fn is_a_macos_system_library(name: &str) -> bool {
+    (name.starts_with("/usr/lib/") || name.starts_with("/System/Library/"))
+        && !leaves_its_directory(name)
+}
+
+/// Whether a search path stays in the package: it is relative to the file that names it.
+fn is_relative_to_the_file(path: &str) -> bool {
+    ["$ORIGIN", "${ORIGIN}", "@loader_path", "@executable_path"]
+        .iter()
+        .any(|base| path == *base || path.starts_with(&format!("{base}/")))
+        && !leaves_its_directory(path)
+}
+
+/// The dynamic loaders a Linux package may ask for: the standard path of the C library's loader on
+/// x86-64 and on Arm.
+const LINUX_INTERPRETERS: [&str; 2] = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"];
+
 /// The libraries a Linux package may need of the machine it runs on: the C library and its
 /// companions, the compiler's runtime and the terminal-information library. A shell is built where
 /// it is built and run where it is installed, so a name outside this list is a library the build
@@ -4015,8 +4118,10 @@ const LINUX_LIBRARIES: [&str; 12] = [
 /// of Bash on a runner whose package manager keeps it beside the compiler's default paths) names
 /// it in the executable or in a module, and the package then fails to start, or to load a module,
 /// where there is none. The case reads the load commands or dynamic section of every native file
-/// of the package: on macOS each library is one of the system's (`/usr/lib` or `/System`), and on
-/// Linux each is one of a short list of names.
+/// of the package: on macOS each library is one of the system's (`/usr/lib` or `/System/Library`,
+/// with no `..`), and on Linux each is one of a short list of names. A directory the loader is
+/// asked to search is relative to the file, and the dynamic loader of a Linux file is the standard
+/// one.
 ///
 /// # Panics
 ///
@@ -4043,7 +4148,7 @@ pub fn the_shell_links_no_library_of_the_machine_that_built_it(kind: ShellKind) 
     for file in files {
         for library in linked_libraries(&file) {
             let system = if cfg!(target_os = "macos") {
-                library.starts_with("/usr/lib/") || library.starts_with("/System/")
+                is_a_macos_system_library(&library)
             } else {
                 LINUX_LIBRARIES.contains(&library.as_str())
             };
@@ -4051,6 +4156,20 @@ pub fn the_shell_links_no_library_of_the_machine_that_built_it(kind: ShellKind) 
                 system,
                 "{} depends on {library}, a library the build machine had and the machine the \
                  package is installed on may not",
+                file.display()
+            );
+        }
+        for path in search_paths(&file) {
+            assert!(
+                is_relative_to_the_file(&path),
+                "{} asks the loader to search {path}, a directory of the build machine",
+                file.display()
+            );
+        }
+        if let Some(loader) = interpreter(&file) {
+            assert!(
+                LINUX_INTERPRETERS.contains(&loader.as_str()),
+                "{} asks for the loader {loader}, which is not the standard one of the C library",
                 file.display()
             );
         }
@@ -4083,5 +4202,53 @@ mod pages {
             !entry_holds_nothing((1 << 63) | (1 << 61)),
             "a page that is in memory and file-backed or shared"
         );
+    }
+}
+
+#[cfg(test)]
+mod dependency_guards {
+    use super::{is_a_macos_system_library, is_relative_to_the_file};
+
+    /// KR-REQ-07.88: the names the dependency case lets through are the system's alone, and the
+    /// ways round it that a path allows are refused.
+    #[test]
+    fn the_dependency_case_refuses_a_path_into_the_build_machines_volume_or_out_of_the_package() {
+        for name in [
+            "/usr/lib/libSystem.B.dylib",
+            "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation",
+        ] {
+            assert!(is_a_macos_system_library(name), "{name} is the system's");
+        }
+        for name in [
+            "/usr/local/opt/gettext/lib/libintl.8.dylib",
+            "/System/Volumes/Data/opt/homebrew/opt/gettext/lib/libintl.8.dylib",
+            "/usr/lib/../local/lib/libintl.8.dylib",
+            "@rpath/libintl.8.dylib",
+        ] {
+            assert!(
+                !is_a_macos_system_library(name),
+                "{name} is not the system's"
+            );
+        }
+        for path in [
+            "$ORIGIN",
+            "$ORIGIN/lib",
+            "@loader_path/lib",
+            "@executable_path/../lib",
+        ] {
+            let expected = !path.contains("..");
+            assert_eq!(is_relative_to_the_file(path), expected, "{path}");
+        }
+        for path in [
+            "/opt/homebrew/lib",
+            "/usr/local/lib",
+            "lib",
+            "$ORIGINAL/lib",
+        ] {
+            assert!(
+                !is_relative_to_the_file(path),
+                "{path} is a directory of the build machine"
+            );
+        }
     }
 }
