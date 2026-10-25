@@ -7532,11 +7532,15 @@ async fn the_client_is_told_the_editor_was_busy_after_the_hosts_answer_released_
     .expect("an attachment event")
     .expect("the stream stayed open");
     assert_eq!(busy.attachment_id, holder);
+    assert_eq!(
+        busy.input_epoch, fence.input_epoch,
+        "the event names the lease the keys were typed under"
+    );
     assert_eq!(busy.reason, EditorBusyReason::QueuesNotDrained);
     assert_eq!(
         busy.released_input_bytes.get(),
         b"held-keys\n".len() as u64,
-        "the event counts the keys the answer released"
+        "the event counts the keys the answer released, and not the answer's own bytes"
     );
 
     let _ = request;

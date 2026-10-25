@@ -559,7 +559,7 @@ Each place the worker attributes input says what a reply does there:
 | The lease's byte count and the count a takeover discards | Is in neither, and is not discarded | `reply_lane.rs`, `a_takeover_counts_the_holders_keystrokes_and_leaves_the_hosts_answer_alone` |
 | The receipt of `input.write` | Is in neither `forwarded_bytes` nor `held_prefix_bytes`: they count what the recogniser returned for that write | None; no state shows a reply in a receipt |
 | The writer's check of a lease epoch and an authority deadline | Has none to be checked against, so it is written | The batch has no such field |
-| Input held for a reader transition, and the `editor_busy` event's `released_input_bytes` | Revokes a reserved launch and releases the person's held keys; the count is those keys, under the holder's attachment and epoch | `fence.rs`, `a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused` |
+| Input held for a reader transition, and the `editor_busy` event's `released_input_bytes` | Revokes a reserved launch and releases the person's held keys; the count is those keys, under the holder's attachment and epoch | `fence.rs`, `the_client_is_told_the_editor_was_busy_after_the_hosts_answer_released_its_keys` |
 | The root editor's launch and fence | Revokes the launch and invalidates the fence | `fence.rs`, KR-REQ-08.49 |
 | The origin of an accepted line | A line accepted on a fence the answer took away is unverifiable; one accepted on a fence proved again after the answer is judged on that fence | `fence/driver.rs`, `a_line_accepted_after_an_answer_is_attributed_only_on_a_fence_proved_after_it` |
 | The process-activity mark | Is a hint to process supervision, set once for each look, and not a record of a person's activity, so there is nothing to attribute | None |
@@ -1685,7 +1685,7 @@ with queries in the tail, and a flood of 70,000 queries.
 | --- | --- |
 | 1. The forwarded bytes lie only in events the lexer calls display or mode with the disposition forward | Yes |
 | 2. The forwarded stream, lexed again, gives only forwardable events, and a new engine forwards all of it and asks and does nothing | Yes |
-| 3. The forwarded bytes are valid UTF-8, hold no C1 scalar, hold no ENQ, BEL or `ESC Z` outside a string and no question a control sequence can ask (a device or status report, a mode report, `CSI > q`, `CSI ? u`, `CSI ? m`, a window report), and a forwarded control string is an operating system command that neither acts (OSC 9, 52, 99, 777) nor asks (a bare `?` part) and holds no control byte but its terminator, by a scan that reads neither the lexer nor the class table | Yes |
+| 3. The forwarded bytes are valid UTF-8, hold no C1 scalar, hold no ENQ, BEL or `ESC Z` outside a string and none of the questions the class table's query rows list that a control sequence can ask (a device or status report, a mode report, `CSI > q`, `CSI ? u`, `CSI ? m`, a window report, and the parameter, checksum, colour and graphics reports), and a forwarded control string is an operating system command that neither acts (OSC 9, 52, 99, 777) nor asks (a bare `?` part of a palette, colour or key query; a title or link may carry one as text) and holds no control byte but its terminator, by a scan that reads neither the lexer nor the class table | Yes |
 | 4. A tagged atom the lexer frames as one event is never forwarded, a query is answered where it stood, a side effect happens or is refused, and graphics produce nothing | Yes |
 | 5. Where a read is cut changes nothing: the screen, the forwarded bytes, the side effects, the replies and the first projection | No |
 | 6. The events cover the stream once, an event of the outer stream counted as it is and a tmux envelope's inner events counted once; only an empty envelope, which makes no event, leaves bytes unclaimed | No |
@@ -1719,7 +1719,7 @@ The class table approves some sequences that the grid library does not implement
 designations with finals the library lacks (`ESC ( j`, `ESC ( w`) and control sequences with extra
 parameters (`CSI 99;0; A`). The engine consumes them as unclassified sequences and none is
 forwarded, so no invariant breaks, and the corpus fixtures' check that nothing is unrecognised holds
-for the corpus only. In the first 1,000 streams 93 events are such sequences; the test prints the
+for the corpus only. In the first 1,000 streams 90 events are such sequences; the test prints the
 count.
 
 ## Building and checking
