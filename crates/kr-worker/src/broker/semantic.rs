@@ -59,7 +59,7 @@ pub const MAX_RETAINED_ENTRIES: usize = 4096;
 /// The two bounds together are 256 MiB of text for one instance at the most. Every producer that
 /// records an entry keeps far less: a gateway frame records an identifier, and a bridge
 /// report is cut at 4,096 bytes before it gets here, so only a producer that offers an entry
-/// through [`Broker::observe`] can reach this one. It is the ceiling for such a producer, set so
+/// through [`Broker::observe`](crate::broker::Broker::observe) can reach this one. It is the ceiling for such a producer, set so
 /// that an entry is long enough to be worth reading and a snapshot still carries several of them
 /// in a part.
 pub const MAX_ENTRY_TEXT_BYTES: usize = 64 * 1024;
