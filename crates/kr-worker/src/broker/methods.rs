@@ -1366,7 +1366,29 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
         let mut state = self.state();
-        state.admit_answer_in(caller, params, now)
+        state.admit_answer_in(caller, params, None, now)
+    }
+
+    /// Admits `agent.approval.respond` with the bytes a component encoded as the answer.
+    ///
+    /// Everything [`Self::admit_approval`] checks is checked again here, under the one lock, now:
+    /// the encoding took time, and a native answer that arrived meanwhile has resolved the request,
+    /// the thread may have changed and the grant or the decoder's trust may be gone. The bytes are
+    /// adopted only if they pass the connection's checks of any response ([`Gateway::adopt_encoded`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_approval`], and [`BrokerError::InvalidArgument`] for bytes that are not an
+    /// answer to the request.
+    pub fn admit_encoded_approval(
+        &self,
+        caller: &Caller,
+        params: &AgentApprovalRespondParams,
+        encoded: &[u8],
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let mut state = self.state();
+        state.admit_answer_in(caller, params, Some(encoded), now)
     }
 
     /// Applies `agent.approval.respond`.
@@ -1654,57 +1676,8 @@ impl Broker {
         params: &PluginActionInvokeParams,
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
-        let resource_id = params.resource_id.as_ref().copied().ok_or_else(|| {
-            BrokerError::invalid(format!(
-                "{} answers a pending request, and this call names none",
-                params.action
-            ))
-        })?;
-        let arguments: serde_json::Value =
-            serde_json::from_slice(&Self::executable_arguments(params)?).map_err(|error| {
-                BrokerError::invalid(format!(
-                    "{}'s parameters will not read: {error}",
-                    params.action
-                ))
-            })?;
         let mut state = self.state();
-        let registered = state.check_action_in(binding_id, params)?;
-        let decision = registered.decision.as_ref().ok_or_else(|| {
-            BrokerError::invalid(format!(
-                "{} is not registered as an answer to a pending request",
-                params.action
-            ))
-        })?;
-        let binding = state
-            .bindings
-            .get(&binding_id)
-            .ok_or_else(|| crate::broker::unknown_binding(binding_id))?;
-        if registered.grant != BrokerGrant::ApprovalInterpreter
-            || !binding.grants.holds(registered.grant)
-        {
-            return Err(BrokerError::Grant(
-                kr_protocol::broker::GrantError::NotHeld {
-                    grant: BrokerGrant::ApprovalInterpreter,
-                },
-            ));
-        }
-        if state.decoder_of(resource_id)? != Some(binding_id) {
-            return Err(BrokerError::denied(format!(
-                "{resource_id} was not interpreted by {}, so an answer from it would not carry \
-                 the meaning a person was shown",
-                params.plugin_id
-            )));
-        }
-        let option_id = arguments
-            .get(decision.as_str())
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                BrokerError::invalid(format!(
-                    "{}'s parameters carry no {decision} to answer with",
-                    params.action
-                ))
-            })?
-            .to_owned();
+        let (resource_id, option_id) = state.read_plugin_answer(binding_id, params)?;
         state.admit_answer_in(
             caller,
             &AgentApprovalRespondParams {
@@ -1712,8 +1685,59 @@ impl Broker {
                 resource_id,
                 option_id,
             },
+            None,
             now,
         )
+    }
+
+    /// Admits `plugin.action.invoke` for an answering action with the bytes the binding's component
+    /// encoded as the answer.
+    ///
+    /// Everything [`Self::admit_plugin_answer`] checks is checked again here, now, and the bytes
+    /// are adopted only if they are an answer to the request.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_plugin_answer`], and [`BrokerError::InvalidArgument`] for bytes that are
+    /// not an answer to the request.
+    pub fn admit_encoded_plugin_answer(
+        &self,
+        caller: &Caller,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+        encoded: &[u8],
+        now: TimestampMs,
+    ) -> Result<MutationAdmission> {
+        let mut state = self.state();
+        let (resource_id, option_id) = state.read_plugin_answer(binding_id, params)?;
+        state.admit_answer_in(
+            caller,
+            &AgentApprovalRespondParams {
+                target: params.target,
+                resource_id,
+                option_id,
+            },
+            Some(encoded),
+            now,
+        )
+    }
+
+    /// The first pass of `plugin.action.invoke` for an answering action: says whether the
+    /// binding's component writes the answer, and if it does, checks what can be checked before it
+    /// is asked and returns what it is asked.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_plugin_answer`].
+    pub fn plugin_answer_encoding(
+        &self,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+        now: TimestampMs,
+    ) -> Result<Option<crate::broker::encode::EncodeRequest>> {
+        let state = self.state();
+        let (resource_id, option_id) = state.read_plugin_answer(binding_id, params)?;
+        state.answer_encoding_in(&params.target, resource_id, &option_id, now)
     }
 
     /// Takes an admitted plugin action's permit without handing it to the transport, so the caller
@@ -2299,6 +2323,73 @@ impl Broker {
 }
 
 impl crate::broker::BrokerState {
+    /// Reads an answering action's call under the broker's lock: the resource it answers and the
+    /// decision it carries.
+    ///
+    /// The plugin half comes first: the action is registered for this binding as an answer, and the
+    /// binding holds the grant it needs; the call names the resource it answers; this binding is the
+    /// resource's decoder, because the answer carries the decoder's meaning; and the decision is read
+    /// from the call's parameters by the name the declaration gives it.
+    fn read_plugin_answer(
+        &self,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+    ) -> Result<(kr_protocol::ids::PendingResourceId, String)> {
+        let resource_id = params.resource_id.as_ref().copied().ok_or_else(|| {
+            BrokerError::invalid(format!(
+                "{} answers a pending request, and this call names none",
+                params.action
+            ))
+        })?;
+        let arguments: serde_json::Value = serde_json::from_slice(
+            &crate::broker::Broker::executable_arguments(params)?,
+        )
+        .map_err(|error| {
+            BrokerError::invalid(format!(
+                "{}'s parameters will not read: {error}",
+                params.action
+            ))
+        })?;
+        let registered = self.check_action_in(binding_id, params)?;
+        let decision = registered.decision.as_ref().ok_or_else(|| {
+            BrokerError::invalid(format!(
+                "{} is not registered as an answer to a pending request",
+                params.action
+            ))
+        })?;
+        let binding = self
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| crate::broker::unknown_binding(binding_id))?;
+        if registered.grant != BrokerGrant::ApprovalInterpreter
+            || !binding.grants.holds(registered.grant)
+        {
+            return Err(BrokerError::Grant(
+                kr_protocol::broker::GrantError::NotHeld {
+                    grant: BrokerGrant::ApprovalInterpreter,
+                },
+            ));
+        }
+        if self.decoder_of(resource_id)? != Some(binding_id) {
+            return Err(BrokerError::denied(format!(
+                "{resource_id} was not interpreted by {}, so an answer from it would not carry \
+                 the meaning a person was shown",
+                params.plugin_id
+            )));
+        }
+        let option_id = arguments
+            .get(decision.as_str())
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                BrokerError::invalid(format!(
+                    "{}'s parameters carry no {decision} to answer with",
+                    params.action
+                ))
+            })?
+            .to_owned();
+        Ok((resource_id, option_id))
+    }
+
     /// Admits one presentation action under the broker's lock. See [`Broker::admit_presentation`].
     fn admit_presentation_in(
         &self,
@@ -2361,7 +2452,7 @@ impl crate::broker::BrokerState {
     /// One hold, because every step reads a resource that can change: a resource settled and
     /// forgotten between two steps would be refused by the later one as unknown rather than as
     /// ended.
-    fn check_answerable_in(
+    pub(crate) fn check_answerable_in(
         &self,
         target: &AgentMutationTarget,
         resource_id: kr_protocol::ids::PendingResourceId,
@@ -2425,6 +2516,7 @@ impl crate::broker::BrokerState {
         &mut self,
         caller: &Caller,
         params: &AgentApprovalRespondParams,
+        encoded: Option<&[u8]>,
         now: TimestampMs,
     ) -> Result<MutationAdmission> {
         let resource = self.resource(params.resource_id)?;
@@ -2454,6 +2546,28 @@ impl crate::broker::BrokerState {
                     deadline.get()
                 ),
             });
+        }
+        // The answer is written by whoever read the request: the component that read it, which
+        // writes it before this and hands the bytes in, or the connector's table, which writes it
+        // here. The table does not stand in for a component, and a component's bytes are not
+        // adopted for a request it did not read.
+        match (self.encoder_of(params.resource_id)?, encoded) {
+            (Some(_), None) => {
+                return Err(BrokerError::PreconditionFailed {
+                    detail: format!(
+                        "{} was read by a component, which writes its answer, and this call \
+                         carries none",
+                        params.resource_id
+                    ),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(BrokerError::invalid(format!(
+                    "{} was not read by a component, so no component's bytes answer it",
+                    params.resource_id
+                )));
+            }
+            _ => {}
         }
         // The component answerable for an approval is the decoder that interpreted it: it is the
         // one whose meaning the answer carries, and a fault in it disables this dispatch whatever
@@ -2491,7 +2605,7 @@ impl crate::broker::BrokerState {
         let claim = self.claim_in(params.resource_id, &caller.actor_id, now)?;
         // From here the claim is held, so anything that fails before the marker gives it back
         // rather than leaving the resource stuck behind a claim nobody will spend.
-        let dispatch = match self.admit_dispatch_in(&claim, &params.option_id) {
+        let dispatch = match self.admit_dispatch_in(&claim, &params.option_id, encoded) {
             Ok(dispatch) => dispatch,
             Err(error) => {
                 crate::broker::settled(self.release_claim_in(&claim, now));

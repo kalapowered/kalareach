@@ -65,6 +65,7 @@ pub mod component;
 pub mod connectors;
 pub mod decoding;
 pub mod duplex;
+pub mod encode;
 pub mod endpoint;
 pub mod error;
 pub mod framing;
@@ -4691,7 +4692,12 @@ impl BrokerState {
     /// this claim, that the decision is one the upstream actually offered, and that no answer has
     /// been admitted already. The durable marker is not written here: it goes in immediately
     /// before the bytes, in [`Broker::commit_dispatch`].
-    fn admit_dispatch_in(&mut self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
+    fn admit_dispatch_in(
+        &mut self,
+        claim: &Claim,
+        option_id: &str,
+        encoded: Option<&[u8]>,
+    ) -> Result<DispatchAdmission> {
         // Fenced rich work is fenced here too. Without this a claim taken before the journal
         // faulted could dispatch inside the gap, with no durable marker to stop a second answer.
         self.volatile.require_rich_work()?;
@@ -4715,12 +4721,35 @@ impl BrokerState {
         // admission and the bytes it authorises are one object. The marker is not written yet:
         // this reserves the resource's one transmission, and the marker goes in immediately
         // before the bytes, so an admission that is abandoned leaves the resource answerable.
-        let response = self.gateway.prepare_response(
-            connection,
-            &entry.upstream_request_id,
-            &entry.method,
-            option_id,
-        )?;
+        // The bytes a component encoded are adopted only if they pass the checks any response on
+        // the connection passes; without them the answer is the connection's table's.
+        let response = match encoded {
+            Some(bytes) => self
+                .gateway
+                .adopt_encoded(
+                    connection,
+                    &entry.upstream_request_id,
+                    &entry.method,
+                    option_id,
+                    bytes,
+                )
+                .inspect_err(|_| {
+                    // A person is told that the component's bytes were refused, in a fixed word
+                    // and never in the component's own.
+                    self.note_component_in(
+                        entry.binding_id,
+                        crate::broker::component::ComponentNote::Encoding(
+                            crate::broker::encode::NotEncoded::NotAnAnswer,
+                        ),
+                    );
+                })?,
+            None => self.gateway.prepare_response(
+                connection,
+                &entry.upstream_request_id,
+                &entry.method,
+                option_id,
+            )?,
+        };
         let resource = self.arbitration.commit(transition)?;
         let provenance = self
             .gateway

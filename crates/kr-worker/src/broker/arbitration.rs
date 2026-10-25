@@ -57,6 +57,9 @@ pub struct Pending {
     /// request from another's bytes, and the ledger would record the wrong original beside the
     /// wrong identifier.
     pub source: Option<kr_protocol::ids::SourceEventHandle>,
+    /// True when privacy mode stood when this request was made and its component decoded it: what
+    /// the component is handed of it again, to encode the answer, is made in privacy mode too.
+    pub made_in_privacy: bool,
 }
 
 /// Which writer holds the one admission to transmit an answer for a pending resource.
@@ -218,6 +221,7 @@ impl Arbitration {
                 transmitter: None,
                 decoder,
                 source,
+                made_in_privacy: false,
             },
         );
         Ok(())
@@ -244,6 +248,13 @@ impl Arbitration {
         pending.resource = interpreted;
         pending.decoder = Some(decoder);
         Ok(())
+    }
+
+    /// Records that the request was made in privacy mode, for the component that decoded it.
+    pub fn set_made_in_privacy(&mut self, resource_id: PendingResourceId, private: bool) {
+        if let Some(pending) = self.by_id.get_mut(&resource_id) {
+            pending.made_in_privacy = private;
+        }
     }
 
     /// Returns the source event one request was recorded from.
@@ -289,6 +300,7 @@ impl Arbitration {
                 transmitter: dispatched.then_some(Transmitter::Spent),
                 decoder,
                 source: None,
+                made_in_privacy: false,
             },
         );
     }

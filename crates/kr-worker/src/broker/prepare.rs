@@ -65,12 +65,15 @@ pub struct ComponentCalls {
     client: Mutex<Option<Arc<PluginClient>>>,
     /// Woken when the connection is published, replaced or withdrawn.
     changed: tokio::sync::Notify,
-    /// The preparations inside a component now.
-    running: Arc<tokio::sync::Semaphore>,
+    /// The calls inside a component now: preparations and encodings together.
+    pub(super) running: Arc<tokio::sync::Semaphore>,
     /// The pause a preparation takes between the component's reply and what is made of it, for this
     /// host's own tests.
     #[cfg(feature = "testing")]
     hold: Arc<kr_plugin_service::hold::Hold>,
+    /// The same pause for an encoding.
+    #[cfg(feature = "testing")]
+    pub(super) encode_hold: Arc<kr_plugin_service::hold::Hold>,
 }
 
 impl ComponentCalls {
@@ -81,6 +84,8 @@ impl ComponentCalls {
             running: Arc::new(tokio::sync::Semaphore::new(MAX_PREPARATIONS)),
             #[cfg(feature = "testing")]
             hold: Arc::default(),
+            #[cfg(feature = "testing")]
+            encode_hold: Arc::default(),
         }
     }
 
@@ -90,6 +95,14 @@ impl ComponentCalls {
     #[must_use]
     pub fn hold_replies(&self) -> kr_plugin_service::hold::HoldHandle {
         self.hold.set()
+    }
+
+    /// Holds the next encoding after the component has replied and before its reply is read, and
+    /// returns the handle that lets it go. For this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_encodings(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.encode_hold.set()
     }
 
     /// Publishes the runtime's connection, or withdraws it.

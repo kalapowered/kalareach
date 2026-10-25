@@ -64,6 +64,7 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant, SystemContinuousCl
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
 use crate::broker::MAX_SNAPSHOT_RESOURCES;
+use crate::broker::encode::{EncodeRequest, Encoded};
 use crate::broker::prepare::{Preparation, PreparationRequest};
 use crate::error::{Result, WorkerError};
 use crate::history_filter::retained::{Disclosure, Occasion};
@@ -4966,7 +4967,7 @@ impl WorkerService {
     /// Prepares one accepted action's effect, holding nothing of this worker.
     ///
     /// The preparation is bounded by what is left of the action's accepted deadline.
-    async fn prepare(&self, pending: &PendingPreparation) -> Preparation {
+    async fn prepare(&self, pending: &PendingPreparation) -> Made {
         #[cfg(feature = "testing")]
         self.preparation_stall.stand();
         let within = pending.deadline.saturating_duration_since(self.clock.now());
@@ -4986,9 +4987,12 @@ impl WorkerService {
                     receipt.state == kr_protocol::receipt::ReceiptState::Accepted
                 })
         };
-        self.broker
-            .prepare(&pending.request, within, &accepted)
-            .await
+        match &pending.request {
+            Asked::Prepare(request) => Made::Prepared(Box::new(
+                self.broker.prepare(request, within, &accepted).await,
+            )),
+            Asked::Encode(request) => Made::Encoded(self.broker.encode(request, within).await),
+        }
     }
 
     /// Finishes an accepted action whose effect has been prepared: the revalidation inside the
@@ -5030,11 +5034,15 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         pending: &PendingPreparation,
-        preparation: Preparation,
+        preparation: Made,
     ) -> Result<Answered> {
         let mutation = &pending.mutation;
         let caller = &pending.caller;
-        let method = Method::PluginActionInvoke;
+        let method = mutation.method.method().ok_or_else(|| {
+            WorkerError::InvalidArgument(
+                "this action's method is not one this worker serves".to_owned(),
+            )
+        })?;
         let _barrier = self
             .dispatch
             .lock()
@@ -5927,7 +5935,7 @@ impl WorkerService {
         deadline: ContinuousInstant,
         admitted: bool,
         volatile_permitted: bool,
-        preparation: Option<Preparation>,
+        preparation: Option<Made>,
     ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
         let second_pass = preparation.is_some();
@@ -5995,10 +6003,10 @@ impl WorkerService {
         };
         // An action whose effect is prepared outside the boundary stops here, with its receipt
         // still `accepted` and no marker written. It comes back through `dispatch_prepared`.
-        if let Some(Prepared::NeedsPreparation(request)) = prepared {
+        if let Some(Prepared::NeedsPreparation(asked)) = prepared {
             return if admitted {
                 Ok(Answered::Prepare(Box::new(PendingPreparation {
-                    request: *request,
+                    request: *asked,
                     mutation: mutation.clone(),
                     caller: caller.clone(),
                     deadline,
@@ -6975,6 +6983,43 @@ impl WorkerService {
         }))
     }
 
+    /// Takes the bytes a component wrote as the answer to an approval, or says why there are none.
+    ///
+    /// A component that could not write them has not answered the request, and the table does not
+    /// stand in for it. If the request was resolved while the component worked, the caller is told
+    /// that instead: a native answer that came first has won, and nothing is lost by the component's
+    /// failure.
+    fn encoded_bytes(
+        &self,
+        encoded: Encoded,
+        expected: Option<kr_protocol::ids::BrokerBindingId>,
+        target: &kr_protocol::agent::AgentMutationTarget,
+        resource_id: kr_protocol::ids::PendingResourceId,
+        now: kr_protocol::scalars::TimestampMs,
+    ) -> Result<Vec<u8>> {
+        if expected.is_some_and(|binding_id| binding_id != encoded.binding_id) {
+            return Err(crate::broker::BrokerError::PreconditionFailed {
+                detail: "the answer was written by another binding than the one this call names"
+                    .to_owned(),
+            }
+            .into());
+        }
+        match encoded.bytes {
+            Ok(bytes) => Ok(bytes),
+            Err(why) => {
+                self.broker
+                    .check_resource_answerable(target, resource_id, now)?;
+                Err(crate::broker::BrokerError::ResourceUnavailable {
+                    detail: format!(
+                        "the component that read this request could not write its answer: {}",
+                        why.words()
+                    ),
+                }
+                .into())
+            }
+        }
+    }
+
     /// Refuses, before the dispatch marker, everything the effect itself would refuse.
     ///
     /// Section 9 makes a refusal this host can decide a rejection rather than an outcome nobody
@@ -6988,7 +7033,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
-        preparation: Option<Preparation>,
+        preparation: Option<Made>,
     ) -> Result<Option<Prepared>> {
         // Whether this session is still running, for the methods that need it to be. Each of those
         // effects asks this first, so this does too.
@@ -7106,11 +7151,43 @@ impl WorkerService {
                 let params: kr_protocol::agent::AgentApprovalRespondParams =
                     parse(&mutation.params)?;
                 self.wait_before_admission();
-                let admitted = self.broker.admit_approval(
-                    &Self::broker_caller(caller),
-                    &params,
-                    kr_ipc::now_ms(),
-                )?;
+                let now = kr_ipc::now_ms();
+                let caller = Self::broker_caller(caller);
+                let admitted = match preparation {
+                    // The component that read the request has written its answer: the broker
+                    // checks all of it again, and adopts the bytes only if they answer the request.
+                    Some(Made::Encoded(encoded)) => {
+                        let bytes = self.encoded_bytes(
+                            encoded,
+                            None,
+                            &params.target,
+                            params.resource_id,
+                            now,
+                        )?;
+                        self.broker
+                            .admit_encoded_approval(&caller, &params, &bytes, now)?
+                    }
+                    Some(Made::Prepared(_)) => {
+                        return Err(WorkerError::InvalidArgument(
+                            "an approval's answer is not an action's prepared effect".to_owned(),
+                        ));
+                    }
+                    None => {
+                        // A request a component read is answered by that component, which is asked
+                        // outside the boundary; the receipt stays `accepted` while it is.
+                        if let Some(request) = self.broker.answer_encoding(
+                            &params.target,
+                            params.resource_id,
+                            &params.option_id,
+                            now,
+                        )? {
+                            return Ok(Some(Prepared::NeedsPreparation(Box::new(Asked::Encode(
+                                Box::new(request),
+                            )))));
+                        }
+                        self.broker.admit_approval(&caller, &params, now)?
+                    }
+                };
                 Ok(Some(self.handoff(admitted, UpstreamKind::Approval)))
             }
             Method::PluginActionInvoke => {
@@ -7120,6 +7197,11 @@ impl WorkerService {
                     params.target.subject.application_instance_id,
                 )?;
                 let registered = self.broker.registered_action(binding_id, &params.action)?;
+                let (preparation, encoded) = match preparation {
+                    Some(Made::Prepared(prepared)) => (Some(*prepared), None),
+                    Some(Made::Encoded(encoded)) => (None, Some(encoded)),
+                    None => (None, None),
+                };
                 // What was prepared is what the first pass checked: the same binding, under the
                 // same declaration, whichever route the declaration names now. A package replaced
                 // while its action was prepared is a different action, and the plan prepared for
@@ -7164,12 +7246,54 @@ impl WorkerService {
                     .is_some_and(|registered| registered.decision.is_some());
                 if answers {
                     self.wait_before_admission();
-                    let admitted = self.broker.admit_plugin_answer(
-                        &Self::broker_caller(caller),
-                        binding_id,
-                        &params,
-                        kr_ipc::now_ms(),
-                    )?;
+                    let now = kr_ipc::now_ms();
+                    let broker_caller = Self::broker_caller(caller);
+                    let admitted = match encoded {
+                        // The binding's component has written the answer to the request it read:
+                        // the broker checks everything again, and adopts the bytes only if they
+                        // answer the request.
+                        Some(encoded) => {
+                            let resource_id =
+                                params.resource_id.as_ref().copied().ok_or_else(|| {
+                                    crate::broker::BrokerError::invalid(format!(
+                                        "{} answers a pending request, and this call names none",
+                                        params.action
+                                    ))
+                                })?;
+                            let bytes = self.encoded_bytes(
+                                encoded,
+                                Some(binding_id),
+                                &params.target,
+                                resource_id,
+                                now,
+                            )?;
+                            self.broker.admit_encoded_plugin_answer(
+                                &broker_caller,
+                                binding_id,
+                                &params,
+                                &bytes,
+                                now,
+                            )?
+                        }
+                        None => {
+                            // A request the binding's component read is answered by that
+                            // component, which is asked outside the boundary.
+                            if let Some(request) = self
+                                .broker
+                                .plugin_answer_encoding(binding_id, &params, now)?
+                            {
+                                return Ok(Some(Prepared::NeedsPreparation(Box::new(
+                                    Asked::Encode(Box::new(request)),
+                                ))));
+                            }
+                            self.broker.admit_plugin_answer(
+                                &broker_caller,
+                                binding_id,
+                                &params,
+                                now,
+                            )?
+                        }
+                    };
                     return Ok(Some(self.handoff(
                         admitted,
                         UpstreamKind::PluginAnswer {
@@ -7227,7 +7351,9 @@ impl WorkerService {
                             binding_id,
                             &params,
                         )?;
-                        return Ok(Some(Prepared::NeedsPreparation(Box::new(request))));
+                        return Ok(Some(Prepared::NeedsPreparation(Box::new(Asked::Prepare(
+                            Box::new(request),
+                        )))));
                     };
                     let effect = prepared.effect?;
                     // Held through the admission and the validation: whatever refuses the action
@@ -10838,11 +10964,29 @@ enum Next {
     Held(Box<ReadyPreparation>),
 }
 
-/// An accepted action and what its preparation came to.
+/// What the first pass of an accepted action asks of a component, outside the boundary.
+#[derive(Debug)]
+pub enum Asked {
+    /// The package's component prepares the effect of an action.
+    Prepare(Box<PreparationRequest>),
+    /// The component that read an approval writes the answer to it.
+    Encode(Box<EncodeRequest>),
+}
+
+/// What asking a component came to.
+#[derive(Debug)]
+pub enum Made {
+    /// An action's prepared effect, or why there is none.
+    Prepared(Box<Preparation>),
+    /// An approval's answer, or why there is none.
+    Encoded(Encoded),
+}
+
+/// An accepted action and what asking a component for it came to.
 #[derive(Debug)]
 pub struct ReadyPreparation {
     pending: PendingPreparation,
-    preparation: Preparation,
+    preparation: Made,
 }
 
 /// One accepted action whose effect is being prepared outside the boundary.
@@ -10851,8 +10995,8 @@ pub struct ReadyPreparation {
 /// holds nothing up.
 #[derive(Debug)]
 pub struct PendingPreparation {
-    /// What preparing it needs.
-    request: PreparationRequest,
+    /// What the component is asked.
+    request: Asked,
     /// The request as it arrived, for the request identifier and the action.
     mutation: MutationRequest,
     /// Who asked, with the rights the control daemon decided the request under.
@@ -10941,12 +11085,13 @@ enum UpstreamKind {
 pub enum Prepared {
     /// An admitted operation whose transport work happens once the session boundary ends.
     Upstream(Box<UpstreamHandoff>),
-    /// An action whose effect the package's component prepares, which has passed every check that
-    /// can be made before it is prepared.
+    /// An action whose effect the package's component prepares, or an approval whose answer the
+    /// component that read it writes, which has passed every check that can be made before the
+    /// component is asked.
     ///
-    /// Preparing it is a call to another process, so it happens outside the boundary, with the
-    /// receipt still `accepted`; the action comes back with the preparation attached.
-    NeedsPreparation(Box<PreparationRequest>),
+    /// Asking it is a call to another process, so it happens outside the boundary, with the
+    /// receipt still `accepted`; the action comes back with what the component made attached.
+    NeedsPreparation(Box<Asked>),
     /// An action the host carries out itself by redrawing the package's own document, admitted on
     /// its class's right: its receipt is all it is answered with, and nothing leaves the host.
     Presentation(kr_protocol::broker::ActionName),

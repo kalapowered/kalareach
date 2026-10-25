@@ -27,7 +27,8 @@ use kr_protocol::metrics::{Adapter, MetricOutcome};
 use kr_protocol::scalars::{Digest256, Nullable};
 
 use super::decoding::NotDecoded;
-use super::{Binding, Broker};
+use super::encode::NotEncoded;
+use super::{Binding, Broker, BrokerState};
 
 /// The component a binding's package ships, as the admissions named it when the binding was made.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +102,8 @@ pub struct ComponentNotes {
     pub fault: Option<FaultNote>,
     /// The requests it was not asked to decode, or whose decoding was not taken.
     pub decoding: Option<DecodingNote>,
+    /// The answers it was not asked to write, or whose bytes were not taken.
+    pub encoding: Option<EncodingNote>,
 }
 
 /// The requests a binding's component did not turn into approvals, as a person is told of them:
@@ -117,6 +120,27 @@ impl DecodingNote {
     fn text(self) -> String {
         format!(
             "{} request{} not decoded; the last: {}",
+            self.count,
+            if self.count == 1 { " was" } else { "s were" },
+            self.last.words()
+        )
+    }
+}
+
+/// The answers a binding's component did not write, as a person is told of them: how many, and
+/// why the last was not. Never a word the component chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodingNote {
+    /// How many answers were not written since the binding was registered.
+    pub count: u64,
+    /// Why the last was not.
+    pub last: NotEncoded,
+}
+
+impl EncodingNote {
+    fn text(self) -> String {
+        format!(
+            "{} answer{} not written; the last: {}",
             self.count,
             if self.count == 1 { " was" } else { "s were" },
             self.last.words()
@@ -159,11 +183,13 @@ impl ComponentNotes {
     fn text(&self, private: bool) -> Option<String> {
         let fault = self.fault.as_ref().map(|fault| fault.text(private));
         let decoding = self.decoding.map(DecodingNote::text);
+        let encoding = self.encoding.map(EncodingNote::text);
         let parts: Vec<&str> = [
             self.registration.as_deref(),
             self.loss.as_deref(),
             fault.as_deref(),
             decoding.as_deref(),
+            encoding.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -183,6 +209,8 @@ pub enum ComponentNote {
     Fault(FaultNote),
     /// A request that was not decoded.
     Decoding(NotDecoded),
+    /// An answer that was not written.
+    Encoding(NotEncoded),
     /// None of them: the binding is registered again, or gone.
     Clear,
 }
@@ -314,6 +342,39 @@ impl ComponentChanges {
     /// Waits for a change, as the link does.
     pub async fn notified(&self) {
         self.link.notified().await;
+    }
+}
+
+impl BrokerState {
+    /// Records one thing a person is told about a binding's component, under the broker's lock. A
+    /// binding the broker no longer holds is ignored.
+    pub(crate) fn note_component_in(&mut self, binding_id: BrokerBindingId, note: ComponentNote) {
+        if !self.bindings.contains_key(&binding_id) {
+            return;
+        }
+        let notes = self.component_notes.entry(binding_id).or_default();
+        match note {
+            ComponentNote::Registration(text) => notes.registration = Some(text),
+            ComponentNote::Loss(text) => notes.loss = Some(text),
+            ComponentNote::Fault(text) => notes.fault = Some(text),
+            ComponentNote::Decoding(last) => {
+                let count = notes
+                    .decoding
+                    .map_or(0, |held| held.count)
+                    .saturating_add(1);
+                notes.decoding = Some(DecodingNote { count, last });
+            }
+            ComponentNote::Encoding(last) => {
+                let count = notes
+                    .encoding
+                    .map_or(0, |held| held.count)
+                    .saturating_add(1);
+                notes.encoding = Some(EncodingNote { count, last });
+            }
+            ComponentNote::Clear => {
+                self.component_notes.remove(&binding_id);
+            }
+        }
     }
 }
 
@@ -452,26 +513,7 @@ impl Broker {
     /// Records one thing a person is told about a binding's component. A binding the broker no
     /// longer holds is ignored, as in [`Self::set_component_state`].
     pub fn note_component(&self, binding_id: BrokerBindingId, note: ComponentNote) {
-        let mut held = self.state();
-        if !held.bindings.contains_key(&binding_id) {
-            return;
-        }
-        let notes = held.component_notes.entry(binding_id).or_default();
-        match note {
-            ComponentNote::Registration(text) => notes.registration = Some(text),
-            ComponentNote::Loss(text) => notes.loss = Some(text),
-            ComponentNote::Fault(text) => notes.fault = Some(text),
-            ComponentNote::Decoding(last) => {
-                let count = notes
-                    .decoding
-                    .map_or(0, |held| held.count)
-                    .saturating_add(1);
-                notes.decoding = Some(DecodingNote { count, last });
-            }
-            ComponentNote::Clear => {
-                held.component_notes.remove(&binding_id);
-            }
-        }
+        self.state().note_component_in(binding_id, note);
     }
 
     /// Counts one failure of a bundled adapter, for the metrics this host reports about itself.

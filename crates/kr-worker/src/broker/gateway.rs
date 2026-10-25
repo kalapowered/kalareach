@@ -30,7 +30,7 @@ use kr_protocol::broker::ActionProvenance;
 #[cfg(test)]
 use kr_protocol::gateway::RichOperation;
 use kr_protocol::gateway::{
-    DeclarativeTable, DownstreamRequestId, NativeClassification, NativeMethodClass,
+    DeclarativeTable, DownstreamRequestId, NativeClassification, NativeFraming, NativeMethodClass,
     ReverseExecutionSite, ReverseOperation, RichMethodEntry, RichMethodTable,
 };
 use kr_protocol::identity::ProcessStartIdentity;
@@ -667,6 +667,90 @@ impl Gateway {
             method: method.clone(),
             option_id: option_id.to_owned(),
             frame,
+        })
+    }
+
+    /// Adopts the bytes a component encoded as the answer to a pending request, if they are one.
+    ///
+    /// The component's bytes are data, and nothing about them is believed: they become an answer
+    /// only by passing the checks this host makes of any response on the connection, with the
+    /// connection's own table. They are one JSON object within the frame bound that names no
+    /// member twice and names no method, so they are a response and not a request. They carry the
+    /// table's result member and not its error member, because a failure is not a decision. They
+    /// hold no line break where the connection's framing forbids one. And the identifier at the
+    /// table's response correlation member is the pending request's, as a JSON value of the same
+    /// type: `"11"` is not `11`. The bytes that pass are the bytes that go.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when the connection is unknown,
+    /// [`BrokerError::PermissionDenied`] for a bridge channel's connection, whose answers the host
+    /// encodes from the validated decision alone, and [`BrokerError::InvalidArgument`] when the
+    /// bytes fail a check above.
+    pub fn adopt_encoded(
+        &self,
+        connection: GatewayConnectionId,
+        upstream_request_id: &UpstreamRequestId,
+        method: &UpstreamMethod,
+        option_id: &str,
+        bytes: &[u8],
+    ) -> Result<PreparedResponse> {
+        if self.channels.contains_key(&connection) {
+            return Err(BrokerError::denied(
+                "a bridge channel's answer is encoded by the host from the validated decision, and a \
+                 component's bytes are never adopted for it",
+            ));
+        }
+        let held = self
+            .connections
+            .get(&connection)
+            .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
+        let body = read_frame(bytes)?;
+        if held.table.framing == NativeFraming::JsonLines
+            && bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            return Err(BrokerError::invalid(
+                "this connection frames one object to a line, and the encoded answer holds a line \
+                 break",
+            ));
+        }
+        if body.contains_key(&held.table.method_field) {
+            return Err(BrokerError::invalid(format!(
+                "the encoded answer names a {} member, so it is a request and not a response",
+                held.table.method_field
+            )));
+        }
+        if body.contains_key(&held.table.error_field) {
+            return Err(BrokerError::invalid(format!(
+                "the encoded answer names a {} member, and a failure is not a decision",
+                held.table.error_field
+            )));
+        }
+        if !body.contains_key(&held.table.result_field) {
+            return Err(BrokerError::invalid(format!(
+                "the encoded answer names no {} member",
+                held.table.result_field
+            )));
+        }
+        let answered =
+            read_identifier(&body, &held.table.response_id_field).ok_or_else(|| {
+                BrokerError::invalid(format!(
+                    "the encoded answer carries no {} member",
+                    held.table.response_id_field
+                ))
+            })??;
+        if &answered != upstream_request_id {
+            return Err(BrokerError::invalid(format!(
+                "the encoded answer is to {answered}, and the request it was asked for is \
+                 {upstream_request_id}"
+            )));
+        }
+        Ok(PreparedResponse {
+            request: DownstreamRequestId::new(connection, upstream_request_id.clone()),
+            upstream_request_id: upstream_request_id.clone(),
+            method: method.clone(),
+            option_id: option_id.to_owned(),
+            frame: bytes.to_vec(),
         })
     }
 
@@ -1582,6 +1666,36 @@ mod tests {
             )
             .expect_err("no answer shape is declared for it");
         assert!(matches!(refusal, BrokerError::UnsupportedCapability { .. }));
+    }
+
+    #[test]
+    fn the_bytes_a_component_encoded_go_only_if_they_answer_the_request() {
+        let gateway = native_gateway();
+        let adopt = |id: &str, bytes: &[u8]| {
+            gateway.adopt_encoded(
+                GatewayConnectionId::new(1),
+                &UpstreamRequestId::new(id).expect("valid"),
+                &method("session/request_permission"),
+                "allow",
+                bytes,
+            )
+        };
+        let bytes = br#"{"id":11,"result":{"option_id":"allow"}}"#;
+        let adopted = adopt("11", bytes).expect("an answer to the request is adopted");
+        assert_eq!(
+            adopted.frame, bytes,
+            "the bytes that pass are the bytes that go"
+        );
+
+        // What no world can produce: a result that carries no identifier member, one that carries
+        // no result member, and a frame larger than a native frame may be.
+        adopt("11", br#"{"result":{}}"#).expect_err("an answer names the request it answers");
+        adopt("11", br#"{"id":11}"#).expect_err("an answer carries a result");
+        let padded = format!(
+            r#"{{"id":11,"result":"{}"}}"#,
+            "x".repeat(MAX_NATIVE_FRAME_BYTES)
+        );
+        adopt("11", padded.as_bytes()).expect_err("a frame over the bound is refused");
     }
 
     #[test]
