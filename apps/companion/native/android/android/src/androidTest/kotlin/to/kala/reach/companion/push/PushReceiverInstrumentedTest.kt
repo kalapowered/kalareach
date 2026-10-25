@@ -4,6 +4,7 @@ import android.app.Instrumentation
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.os.ParcelFileDescriptor
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.work.WorkInfo
@@ -147,6 +148,27 @@ class PushReceiverInstrumentedTest {
             )
         )
 
+    /** Runs a shell command as the instrumentation does and reads what it printed, to its end. */
+    private fun shell(command: String): String =
+        ParcelFileDescriptor.AutoCloseInputStream(instrumentation.uiAutomation.executeShellCommand(command))
+            .use { String(it.readBytes(), Charsets.UTF_8) }
+
+    /** What the receiver has said of the deliveries it finished, by reason and never by content. */
+    private fun receiverLog(): String = shell("logcat -d -s KalaReachPush:I")
+
+    /**
+     * Waits until the receiver has finished the delivery that began after the log was emptied and
+     * says it ended in `reason`: the receiver says so after it has decided and posted, so what the
+     * shade holds then is what the delivery came to.
+     */
+    private fun receiverFinished(reason: String): Boolean =
+        until(30) { "delivery: shown ($reason)" in receiverLog() }
+
+    /** Empties the log, and returns once it is empty: the delivery that follows is the one waited for. */
+    private fun forgetWhatTheReceiverSaid() {
+        shell("logcat -c")
+    }
+
     private fun shownText(tag: String): String? =
         notifications.activeNotifications
             .firstOrNull { it.tag == tag }
@@ -176,11 +198,12 @@ class PushReceiverInstrumentedTest {
         val golden = sealedPreview()
         fileKeys(golden, senderFiled = false)
         val tag = "instrumented-" + UUID.randomUUID()
+        forgetWhatTheReceiverSaid()
         deliverGolden(golden, tag)
-        assertTrue(
-            "the receiver showed the generic alert",
-            until(30) { shownText(tag) == golden.getString("alert") }
-        )
+        // The alert goes up before the receiver decides about the preview, so the alert alone shows
+        // nothing: the assertion waits for the receiver to say it has finished.
+        assertTrue("the receiver finished with the generic alert", receiverFinished("sender_unknown"))
+        assertEquals("the generic alert stands", golden.getString("alert"), shownText(tag))
         assertTrue(shownText(tag) != golden.getString("summary"))
     }
 
