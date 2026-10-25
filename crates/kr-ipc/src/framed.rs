@@ -906,6 +906,11 @@ mod tests {
         assert_eq!(server.await.expect("server task"), request(9));
     }
 
+    /// KR-REQ-09.23, the frame writer's half of a slow client: a peer that stops reading holds
+    /// neither the writer nor the frame. The attempt reports at once that the transport would take
+    /// no more, what it could not send is retained rather than dropped, and a new frame is refused
+    /// while one is part way to the peer. On a socket the report is the socket being full; on a
+    /// named pipe it is the pipe taking no further bytes once a write is outstanding.
     #[tokio::test]
     async fn a_peer_that_stops_reading_blocks_the_attempt_rather_than_holding_the_writer() {
         // What a boundary needs: an attempt that answers now, whatever the peer is doing, and a
