@@ -91,6 +91,43 @@ fn plant(host: &Host, spool: bool) -> SessionId {
     session_id
 }
 
+/// A closed session as a daemon records the end of a worker it proved dead: a reservation that
+/// closed and the closure the registry holds, with sixteen bytes of retained output in its spool
+/// and no journal, since the worker never wrote one.
+fn plant_recorded(host: &Host) -> SessionId {
+    use kr_controller::registry::{LaunchPhase, Registry};
+    use kr_protocol::scalars::Digest256;
+
+    let mut registry = Registry::open(host.registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let admission = registry
+        .reserve(
+            &actor(),
+            kr_ipc::new_uuid(),
+            Digest256::from_bytes([1; 32]),
+            &[0xa0],
+            TimestampMs::new(1),
+        )
+        .expect("a reservation");
+    let session_id = admission.reservation.session_id;
+    registry
+        .set_phase(admission.reservation.reservation_id, LaunchPhase::Closed)
+        .expect("the session closes");
+    registry
+        .record_closure(&closure(session_id))
+        .expect("the closure");
+    let mut history = kr_worker::history::OutputHistory::with_spool(
+        8,
+        ArchiveService::new(host.tree().environment())
+            .paths()
+            .session_spool(session_id),
+        kr_worker::history::SpoolLayout::new(8, 1 << 20),
+    )
+    .expect("a spool");
+    history.append(OUTPUT);
+    session_id
+}
+
 fn closure(session_id: SessionId) -> ClosureRecord {
     ClosureRecord {
         session_id,
@@ -375,5 +412,39 @@ async fn a_removal_the_archive_cannot_finish_is_owed_and_not_served_until_it_has
     let page = page(&mut client, session_id).await.expect("a page");
     assert!(page.bytes.as_slice().is_empty());
     assert!(page.gap.0.is_some());
+    host.stop().await;
+}
+
+/// KR-REQ-24.27 and KR-REQ-24.28: a session whose worker left no journal, and whose end only the
+/// registry records, is settled as well. Its output is removed, a reader is told the range is gone,
+/// and the change reports complete; the control is the same read before privacy mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_privacy_mode_on_removes_what_a_session_only_the_registry_closed_retained() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let session_id = plant_recorded(&host);
+
+    let before = page(&mut client, session_id).await.expect("a page");
+    assert_eq!(
+        before.bytes.as_slice(),
+        OUTPUT,
+        "the control serves the output"
+    );
+    assert!(!segments(&host, session_id).is_empty());
+
+    set(&mut client, &host, true).await;
+    let report = until("the change taking effect", &mut client, |report| {
+        matches!(report.completion, PrivacyCompletion::Complete)
+    })
+    .await;
+    assert!(
+        report.sessions.is_empty(),
+        "nothing is owed once the archive has removed what the session retained: {:?}",
+        report.sessions
+    );
+    assert!(segments(&host, session_id).is_empty(), "the output is gone");
+    let after = page(&mut client, session_id).await.expect("a page");
+    assert!(after.bytes.as_slice().is_empty(), "no byte is served");
+    assert!(after.gap.0.is_some(), "and the range is said to be gone");
     host.stop().await;
 }
