@@ -437,6 +437,34 @@ pub struct Instance {
     host_files: Option<std::sync::Arc<HostFiles>>,
 }
 
+/// A server that is being started for an instance, and has not been recorded yet.
+///
+/// Dropping it before [`ServerStart::recorded`] gives the start up: no server exists, and the
+/// conversations the instance holds are no longer held for one.
+#[derive(Debug)]
+#[must_use = "dropping it gives the start up"]
+pub struct ServerStart<'a> {
+    broker: &'a Broker,
+    application_instance_id: ApplicationInstanceId,
+    recorded: bool,
+}
+
+impl ServerStart<'_> {
+    /// Says the server exists and is where its ending finds it, which retires it and settles the
+    /// hold on the conversations from here.
+    pub fn recorded(mut self) {
+        self.recorded = true;
+    }
+}
+
+impl Drop for ServerStart<'_> {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.broker.server_not_started(self.application_instance_id);
+        }
+    }
+}
+
 /// The host's claims of an instance that has ended while a server started for it was still to be
 /// retired.
 #[derive(Debug)]
@@ -845,7 +873,7 @@ struct BrokerState {
     tokens: TokenStore,
     profiles: ProfileStore,
     /// The host's claims on the conversations of instances that have ended and whose servers are
-    /// still being retired, by instance.
+    /// still being retired, or still being started, by instance and server.
     ///
     /// A conversation is free for another session when what runs against it is gone, and an
     /// instance's end comes first: a server that ignores the end of its input runs on for the
@@ -2791,27 +2819,35 @@ impl Broker {
 
     /// Records that a server is about to be started for one instance.
     ///
-    /// From here until the server is recorded ([`Broker::set_instance_backend`]) or given up
-    /// ([`Broker::server_not_started`]), an instance that ends keeps the host's claims on its
-    /// conversations, since a process may be running against them that the broker has no record
-    /// of yet.
+    /// From here until the server is recorded ([`ServerStart::recorded`] and
+    /// [`Broker::set_instance_backend`]) or the returned guard is dropped without that, an
+    /// instance that ends keeps the host's claims on its conversations, since a process may be
+    /// running against them that the broker has no record of yet. Dropping the guard gives the
+    /// start up, as a start that fails or is cancelled with its admission must.
     ///
     /// # Errors
     ///
     /// Returns the refusal for an identifier no instance has: the instance ended, and no server
     /// is started for it.
-    pub fn server_starting(&self, application_instance_id: ApplicationInstanceId) -> Result<()> {
+    pub fn server_starting(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<ServerStart<'_>> {
         let mut state = self.state();
         let instance = state
             .instances
             .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance.server_starting = true;
-        Ok(())
+        Ok(ServerStart {
+            broker: self,
+            application_instance_id,
+            recorded: false,
+        })
     }
 
     /// Records that no server was started after all: the start failed before a process existed.
-    pub fn server_not_started(&self, application_instance_id: ApplicationInstanceId) {
+    fn server_not_started(&self, application_instance_id: ApplicationInstanceId) {
         let mut state = self.state();
         if let Some(instance) = state.instances.get_mut(&application_instance_id) {
             instance.server_starting = false;

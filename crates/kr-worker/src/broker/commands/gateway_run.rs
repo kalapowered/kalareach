@@ -265,7 +265,8 @@ impl Backend {
 ///
 /// Returns why the launch cannot go on: the launcher presented no environment, the server could
 /// not be started or does not run the executable that was hashed, its record is not on disk in
-/// time, or the socket could not be bound. The server, if it started, is ended.
+/// time, the socket could not be bound, or the instance has ended and no server is started for it.
+/// The server, if it started, is ended.
 pub(super) async fn start(
     backend: &Arc<Backend>,
     identity: &ExecutableIdentity,
@@ -285,8 +286,10 @@ pub(super) async fn start(
         drop(environment);
         // The conversations the instance holds stay held from here, whether or not the instance
         // ends before the server is recorded, and no server is started for an instance that has
-        // ended.
-        run.broker
+        // ended. A start that is given up, by an error or by being cancelled with the admission
+        // it is part of, gives the hold up with it.
+        let starting = run
+            .broker
             .server_starting(backend.application_instance_id)?;
         let (server, unshown) = Server::spawn(
             &ServerSpec {
@@ -305,9 +308,17 @@ pub(super) async fn start(
         // from, and it is recorded before it is shown to run what was hashed, which takes as long
         // as the executable is large.
         let server = Arc::new(server);
-        *run.server.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&server));
-        run.broker
-            .set_instance_backend(backend.application_instance_id, server.identity().clone())?;
+        // The server is put where the ending finds it and made known to the broker in one step,
+        // so that an ending that takes it at once settles the hold on the conversations by the
+        // identity the broker has by then.
+        let recorded = {
+            let mut slot = run.server.lock().unwrap_or_else(PoisonError::into_inner);
+            *slot = Some(Arc::clone(&server));
+            starting.recorded();
+            run.broker
+                .set_instance_backend(backend.application_instance_id, server.identity().clone())
+        };
+        recorded?;
         // The record is handed over under the session's lock and waited for outside it.
         let written = {
             let runtime = backend
@@ -346,18 +357,7 @@ pub(super) async fn start(
             })
         });
     if started.is_err() {
-        // A server that was recorded is retired by the ending, which settles the hold on the
-        // conversations. One that never existed is given up here.
-        let recorded = run
-            .server
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some();
         backend.end_gateway();
-        if !recorded {
-            run.broker
-                .server_not_started(backend.application_instance_id);
-        }
     }
     started
 }
