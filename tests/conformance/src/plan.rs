@@ -2078,14 +2078,6 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
             why: "it needs the real description process and weights that KR_DESCRIBE_INFERENCE names, which no step of this repository has",
         },
     },
-    IgnoredRun {
-        package: "kr-controller",
-        target: "--test native_bridge",
-        cases: &[],
-        runs: Runs::Nowhere {
-            why: "a parked case: the recipe format has no removal step that waits until nothing else is left",
-        },
-    },
 ];
 
 /// A set of files whose tests another toolchain builds. The report reads their keys. It runs and
