@@ -3046,8 +3046,9 @@ What the grant decides, for every request:
   for any reader. A grant that reaches no interval yet is served an empty page at the end of the
   output, and reads on from there as intervals begin. Output is dated when the worker records it,
   which can be later than when the application wrote it, and output that continues an interval
-  begun before the grant's start is served from the next interval, which begins within two seconds
-  and later as the index fills (see "When output was produced"). A grant that reaches every moment
+  begun before the grant's start is served from the next interval, which starts with the first
+  output written after that interval's time limits pass (see "When output was produced" for the
+  limits and for a full index). A grant that reaches every moment
   is served what the owner is. The page comes from the same retained window as the owner's, so
   what privacy mode removes is gone from both. A closed session has no worker to cut its output,
   and a paired device is refused it, with that reason. The session's live screen and the stream
@@ -5864,7 +5865,8 @@ not a cursor of any session's output, so the record of when output was produced 
 That is why it serves a device no item's text. A history page is different: it is a byte range of
 one session's output, and the session's worker holds the record of when each part was written, so
 the worker cuts a live session's page to the grant (see "When output was produced"). An attention
-item has no such record, so it is narrowed rather than refused: a caller that did not arrive over the local socket is served the host's own record of a condition (which
+item has no such record, so it is narrowed rather than refused: a caller that did not arrive
+over the local socket is served the host's own record of a condition (which
 rule, at what level, how often and when) with the text left out and said to be left out, and no
 model summary either. The changed-since-last-visit view holds only the changes the host recorded
 at or after the moment the caller's history reaches back to. Its cursors end after the last change
@@ -6114,15 +6116,16 @@ A grant is the authority a request is decided against. It names its issuer and i
 authority revision it was issued under, the environments and sessions it covers, the actions it
 permits, how far back it may see, when it stops and which organisation membership it requires.
 
-How far back a grant sees is a reading of the host's wall clock, and unlike expiry it is not held
-against a clock that cannot go backwards. A grant with no history cursor reaches from its own
-start, the moment the host committed a pairing or issued a share, and each reader compares that
-number with the moments it holds for its own content: the times recorded for a session's output,
-when an attention item was first seen, when a session's last command ran. If the wall clock is
-stepped backwards after content was recorded, a grant begun after the step has a start earlier
-than the readings of that content, and reaches what was recorded before the grant began. The host
-marks no row as written before such a step, so nothing withholds that content. Every reader that
-decides by the grant's first moment has this limit.
+A grant's history reaches back to the cursor it names. A pairing that names none reaches from its
+own start, the moment the host committed it, and a share that names none is given the moment it was
+issued. Both are readings of the host's wall clock, and unlike expiry they are not held against a
+clock that cannot go backwards. Each reader compares that number with the moments it holds for its
+own content: the times recorded for a session's output, when an attention item was first seen, when
+a session's last command ran. If the wall clock is stepped backwards after content was recorded, a
+grant begun within the size of the step has a start earlier than the readings of that content, and
+can reach what was recorded before the grant began. The host marks no row as written before such a
+step, so the history check does not withhold that content. Every reader that decides by the grant's
+first moment has this limit.
 
 Two stores hold grants. A pairing writes its grant into the device record.
 `crates/kr-controller/src/grants/` holds the grants this daemon issues through the sharing method
