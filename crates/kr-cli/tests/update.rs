@@ -211,7 +211,6 @@ fn no_program_of_a_release_being_removed_starts() {
 /// KR-REQ-26.06: a daemon of a release states it, records the roots it serves, holds its release,
 /// and starts its own release's worker, which states the release too; the release stays for as
 /// long as either runs.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_of_a_release_starts_its_own_release_s_worker_and_holds_the_release() {
     let mut host = Host::create();
@@ -247,7 +246,6 @@ async fn a_daemon_of_a_release_starts_its_own_release_s_worker_and_holds_the_rel
 
 /// A daemon of a release starts its own release's worker with its own release's packages, and
 /// takes no other: a session it launched with another would run what the store does not hold.
-#[cfg(unix)]
 #[test]
 fn a_daemon_of_a_release_takes_no_other_worker_and_no_other_packages() {
     let host = Host::create();
@@ -257,7 +255,8 @@ fn a_daemon_of_a_release_takes_no_other_worker_and_no_other_packages() {
     let controller = host.program(one.name(), Program::Controller);
     let arguments = host.daemon_arguments();
     let mut with_worker: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    with_worker.extend(["--worker", "/bin/sh"]);
+    let worker = default_shell();
+    with_worker.extend(["--worker", worker.as_str()]);
     let refused = host.run(&controller, &with_worker);
     assert!(!refused.status.success());
     assert!(
@@ -1926,7 +1925,6 @@ async fn a_refused_stop_leaves_every_daemon_serving_and_the_update_waits() {
 /// current is finished by the next install of the same release, and no daemon of the release
 /// starts meanwhile; another release under the same name is refused, and an install waits while
 /// another install or update of the store runs.
-#[cfg(unix)]
 #[test]
 fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
     let host = Host::create();
@@ -1995,14 +1993,17 @@ fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
         kept.join("bin"),
         kept.join(module_tree()[0].0),
     ] {
-        assert!(
+        // A directory of a sealed release is read-only by its access list on Windows, which takes
+        // no new name; the attribute of a directory there means nothing.
+        let sealed = if cfg!(windows) && path.is_dir() {
+            std::fs::File::create(path.join("added")).is_err()
+        } else {
             std::fs::metadata(&path)
                 .expect("installed")
                 .permissions()
-                .readonly(),
-            "{} is read-only",
-            path.display()
-        );
+                .readonly()
+        };
+        assert!(sealed, "{} is read-only", path.display());
     }
 }
 
@@ -2371,6 +2372,8 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
             // The store's file is a file of its own: a change to the other name does not reach it.
             let elsewhere = outside.join("root.json");
             let mut permissions = std::fs::metadata(&elsewhere).expect("there").permissions();
+            // On Windows the attribute is all this clears.
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             std::fs::set_permissions(&elsewhere, permissions).expect("writable");
             std::fs::write(&elsewhere, b"changed through the other name").expect("changed");
