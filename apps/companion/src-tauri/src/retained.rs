@@ -390,6 +390,34 @@ fn shown(text: &str) -> String {
     kept
 }
 
+/// The labels of the deletion dialog's three buttons, in the order the platform adds them.
+///
+/// The first button is the one a press of Return answers on macOS and the one a Windows task
+/// dialog starts on, and the last is the one Escape answers and the one a dialog that could not be
+/// shown is taken to have. Deleting is neither: a second press of Return on the page's button, or a
+/// dialog that was dismissed, answers no.
+///
+/// The three-button layout is the platform's own only where the dialog library draws custom labels:
+/// on Windows that is a task dialog, which the library builds with version 6 of the common controls
+/// (the dialog plugin turns that feature on). A message box would show Yes, No and Cancel and give
+/// the middle label for No, so a build without the feature must not use this layout.
+const BUTTONS: [&str; 3] = ["Don't delete", DELETE, "Cancel"];
+
+/// The label of the one button that deletes.
+const DELETE: &str = "Delete";
+
+/// The buttons of the deletion dialog.
+fn buttons() -> tauri_plugin_dialog::MessageDialogButtons {
+    let [first, second, last] = BUTTONS.map(str::to_owned);
+    tauri_plugin_dialog::MessageDialogButtons::YesNoCancelCustom(first, second, last)
+}
+
+/// Whether the dialog's answer is the person choosing to delete: the delete button's own label,
+/// and nothing else the platform can answer with.
+fn is_deletion(answer: &tauri_plugin_dialog::MessageDialogResult) -> bool {
+    matches!(answer, tauri_plugin_dialog::MessageDialogResult::Custom(label) if label == DELETE)
+}
+
 /// The dialog this application shows: the platform's own alert, modal to the application's window.
 #[derive(Debug)]
 pub struct NativeConfirm<R: tauri::Runtime> {
@@ -406,7 +434,7 @@ impl<R: tauri::Runtime> NativeConfirm<R> {
 
 impl<R: tauri::Runtime> Confirm for NativeConfirm<R> {
     fn confirm(&self, question: Question) -> BoxFuture<'_, bool> {
-        use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
+        use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
 
         Box::pin(async move {
             let (answered, answer) = tokio::sync::oneshot::channel();
@@ -419,10 +447,7 @@ impl<R: tauri::Runtime> Confirm for NativeConfirm<R> {
                 ))
                 .title("Delete this copy?")
                 .kind(MessageDialogKind::Warning)
-                .buttons(MessageDialogButtons::OkCancelCustom(
-                    "Delete".to_owned(),
-                    "Cancel".to_owned(),
-                ));
+                .buttons(buttons());
             // The alert belongs to the application's window and is modal to it, so the question is
             // answered before anything else is done there.
             #[cfg(desktop)]
@@ -430,10 +455,40 @@ impl<R: tauri::Runtime> Confirm for NativeConfirm<R> {
                 Some(window) => dialog.parent(&window),
                 None => dialog,
             };
-            dialog.show(move |accepted| {
-                let _ = answered.send(accepted);
+            dialog.show_with_result(move |answer| {
+                let _ = answered.send(is_deletion(&answer));
             });
             answer.await.unwrap_or(false)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogResult};
+
+    use super::{BUTTONS, DELETE, buttons, is_deletion};
+
+    /// The dialog's default and its dismissal are safe: the button Return answers, and the one
+    /// Escape and a dialog that could not be shown answer, do not delete, and only the delete
+    /// button's own label does.
+    #[test]
+    fn only_the_delete_button_deletes_and_it_is_neither_the_default_nor_the_dismissal() {
+        let MessageDialogButtons::YesNoCancelCustom(first, second, last) = buttons() else {
+            panic!("the dialog has three buttons");
+        };
+        assert_eq!([first.as_str(), second.as_str(), last.as_str()], BUTTONS);
+        assert_eq!(second, DELETE, "the delete button is the middle one");
+        for answered in [
+            MessageDialogResult::Custom(first),
+            MessageDialogResult::Custom(last),
+            MessageDialogResult::Cancel,
+            MessageDialogResult::Ok,
+            MessageDialogResult::Yes,
+            MessageDialogResult::No,
+        ] {
+            assert!(!is_deletion(&answered), "{answered:?} does not delete");
+        }
+        assert!(is_deletion(&MessageDialogResult::Custom(second)));
     }
 }

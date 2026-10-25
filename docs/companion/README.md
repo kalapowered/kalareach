@@ -329,8 +329,10 @@ that means, and each rule is a fact about a file here rather than a convention:
   token is bound to the reference and, for a copy the host lists, to the host's environment and its
   privacy generation, and it runs out after two minutes. `privacy.retained.delete` is a method only
   native code calls, and only for the host on this computer. A native dialog is the owner's
-  confirmation at this computer and no proof that a person is present. `src-tauri/tests/retained_delete.rs`
-  holds this one.
+  confirmation at this computer and no proof that a person is present. The dialog has three buttons,
+  "Don't delete", "Delete" and "Cancel", so the button that Return answers and the one that Escape
+  answers do not delete. `src-tauri/tests/retained_delete.rs` holds the rest of this one, and a case
+  in `src-tauri/src/retained.rs` the order of the buttons.
 
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
