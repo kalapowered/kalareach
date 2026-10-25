@@ -2917,9 +2917,9 @@ transaction. A daemon that starts cancels every invitation it left unfinished be
 anything; the consumed state and the failed-confirmation count stay.
 
 **The security outbox.** `pairing_events` holds one immutable row per completed pairing, ordered by
-a stable sequence. A row is removed only after every registered consumer has read past it, and none
-is removed while no consumer is registered. The environment's attention store is the consumer that
-delivers the event to the owner's devices.
+a stable sequence. No row is removed, and the outbox registers no reader: a reader keeps its own
+cursor. The delivery journal reads it that way, under a consumer of its own, and tells the owner's
+devices (see *Notification delivery*).
 
 Its own network device keys are a separate key set from the environment's controller identity. The
 controller identity signs generation tokens to this host's workers; these are the keys a *device*
@@ -6022,6 +6022,17 @@ nothing, and the store offers the same announcements again. Notifications are th
 notices the journal holds, one for each destination whose recipient's grant reaches what the notice
 is about.
 
+The host's pairing outbox is the journal's other source. Every completed pairing is a notification
+to the owner's devices: the devices whose grant carries `host.manage` and whose history reaches the
+moment the pairing committed, which leaves out the device that paired. Each pass reads the outbox
+past the cursor the journal holds for it under a consumer of its own, commits the events and that
+cursor in one transaction, and the outbox keeps nothing for the journal. A pairing is dated and
+expires from the moment it committed, so one read again from the start of the outbox after the
+journal was lost has expired and sends nothing. The alert is the generic one for a session that
+needs attention, because the fixed vocabulary has no sentence for a pairing. The name the new device
+chose is a display text a person typed, so it travels only inside a push preview's seal and is in
+no external message.
+
 What travels to a device is an opaque identifier, a preview sealed to that device's own
 notification-preview key, an expiry, and a collapse identifier that is a keyed digest. The alert a
 locked screen shows is one of six fixed sentences. There is no field for text a producer supplies.
@@ -6067,7 +6078,8 @@ under the old one, and removing the destination deletes the credential with it.
 Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
 queued content, and does not report complete while a send of content from before the boundary is
 still on the wire. A pending question or approval still alerts a paired device, with no preview and
-none of its words, and nothing else decided while privacy mode is on is ever sent. Notifications
+none of its words, and so does a completed pairing; nothing else decided while privacy mode is on is
+ever sent. Notifications
 that already reached a provider are shown as retained artifacts, each saying that this host holds no
 way to recall it: there is no deletion action for a copy that is on somebody else's device or in
 somebody else's service, and the listing says so rather than offering one that would do nothing.

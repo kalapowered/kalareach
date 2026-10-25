@@ -34,10 +34,9 @@
 //! Every completed pairing writes one row to `pairing_events` in the transaction that commits the
 //! device, so no device exists without its event. The sequence is the outbox's stable cursor and a
 //! row never changes after its transaction commits. A consumer reads forward from a cursor with
-//! [`InvitationRows::events_after`]. The contract is the one every retained outbox of this host
-//! keeps: a row is removed only after every registered consumer has passed it, and none is removed
-//! while no consumer is registered, which is the case today. Delivering the event to the owner's
-//! devices is the environment attention store's work; this is the source it reads.
+//! [`InvitationRows::events_after`] and keeps that cursor itself: no row is removed, and the outbox
+//! registers no reader. The delivery journal reads it under a consumer of its own and tells the
+//! owner's devices of each pairing.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

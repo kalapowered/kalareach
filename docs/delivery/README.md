@@ -27,6 +27,16 @@ and the settlement, it is offered the same announcements when it restarts, and t
 them: one announcement is one event and one set of notifications. If the daemon stops before the
 commit, nothing is lost, because the store still holds what was never settled.
 
+The host's pairing outbox feeds the journal the same way. A completed pairing is an event of its own
+kind, named by the invitation the device paired through, and its cursor is the outbox row's
+sequence, kept in this journal under a consumer of its own. The outbox removes nothing and holds no
+registration for it. Each pass reads the rows past the journal's cursor, commits the events and the
+cursor in one transaction, and produces from them at once for every destination except the device
+that paired; a pass that stops between the two is finished by the next one for every destination the
+notice's audience admits. The event is dated and expires from the moment the pairing committed, not
+from the moment it is produced, so a journal that starts again at the outbox's first row takes the
+old pairings and sends none of them.
+
 Producing is a separate step that reads the notice the journal holds for each event. A pass that
 fails while it produces is finished by the next pass, without a restart.
 
@@ -321,7 +331,7 @@ journal, out of service and with no rule, as the name of what was sent to it.
 A notification is built for a destination only when the recipient's grant reaches what the notice is
 about, and the grant is read as it stands. A notice about sessions needs `session.view` over every
 one of them. A notice about a workflow needs `automation.manage` under the grant the workflow itself
-acts under. A notice about the environment needs `host.manage`. Earlier history is opt-in: a grant
+acts under. A notice about the environment needs `host.manage`; a completed pairing is one. Earlier history is opt-in: a grant
 reaches what was first seen at or after its history cursor, or at or after the moment it began when
 it has none. A notice outside a destination's reach writes no record, because it is not a refusal. A
 destination with no rule, or one whose grant no longer stands, gets a refused record that says why.
@@ -685,7 +695,8 @@ it, so the wait would never end, and it is listed as a copy that may have left. 
 under an earlier generation is refused rather than published.
 
 A pending question or approval still alerts a paired device while privacy mode is on, under the
-grant the device holds, but with no preview and none of its words. The notification is the generic
+grant the device holds, but with no preview and none of its words. A completed pairing does too, to
+push destinations only and not to the device that paired. The notification is the generic
 alert, grouped on the device by its rule and the privacy generation and by nothing that names the
 session. It is the only thing the outbox takes under the fence, and it is admitted in the same
 transaction as its event. Every other announcement decided while privacy mode is on is taken from
