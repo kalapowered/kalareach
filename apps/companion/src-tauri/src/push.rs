@@ -214,6 +214,9 @@ const TELLING_THE_HOST: &str = "Telling the host.";
 const TOKEN_UNREADABLE: &str = "This phone could not check its notification token. It will check \
                                 again the next time you open the app.";
 
+/// What follows the words for a filing of the preview keys that failed.
+const KEYS_RETRY: &str = "It will try again the next time you open the app.";
+
 /// What a token the gateway does not take is shown as.
 const TOKEN_REFUSED: &str =
     "The notification token this phone was given is not one the gateway takes.";
@@ -517,6 +520,11 @@ struct State {
     /// token, each with the words that say so. Kept in memory only: the record still says on, and
     /// the next look that reads a token takes the mark away, as does a run that ends.
     unconfirmed: BTreeMap<DeviceId, &'static str>,
+    /// Why the receivers may not hold the keys the record asks for, in words, while the last
+    /// filing failed. It belongs to the phone and not to a host, and to the receivers' store and not
+    /// to any registration: a host that is on stays registered, and the next filing that succeeds
+    /// takes the mark away. Kept in memory only, since a start files again.
+    keys_unfiled: Option<String>,
     /// The number the next claim is given.
     next_run: u64,
 }
@@ -668,6 +676,7 @@ impl PushDesk {
                 asking: BTreeSet::new(),
                 observed: BTreeMap::new(),
                 unconfirmed: BTreeMap::new(),
+                keys_unfiled: None,
                 next_run: 0,
             }),
             registering: tokio::sync::Mutex::new(()),
@@ -699,8 +708,14 @@ impl PushDesk {
             .rev()
             .map(|host| {
                 let kept = state.record.hosts.get(&host.host_device_id.to_string());
-                let unconfirmed = state.unconfirmed.get(&host.host_device_id);
-                let (shown, words) = match (kept, unconfirmed) {
+                // What keeps a host that is on from being shown as on: a token a look could not
+                // confirm, or keys the receivers could not be handed.
+                let unsettled = state
+                    .unconfirmed
+                    .get(&host.host_device_id)
+                    .map(|why| (*why).to_owned())
+                    .or_else(|| state.keys_unfiled.clone());
+                let (shown, words) = match (kept, unsettled) {
                     // A record that could not be written knows no host the list now has, and a host
                     // turned on would be one this phone could not remember.
                     (None, _) if self.write_blocked => {
@@ -708,7 +723,7 @@ impl PushDesk {
                     }
                     (None, _) => (PushState::Off, String::new()),
                     (Some(kept), Some(why)) if kept.phase == Phase::On => {
-                        (PushState::NeedsAttention, (*why).to_owned())
+                        (PushState::NeedsAttention, why)
                     }
                     (Some(kept), _) => (
                         match kept.phase {
@@ -749,6 +764,25 @@ impl PushDesk {
             .ok_or_else(crate::hosts::unknown_host)?;
         if self.write_blocked {
             // A host started now would be one this phone could not remember.
+            return Ok(self.view());
+        }
+        // A host that is on, and is shown as needing the person only because the receivers could not
+        // be handed the keys, has nothing to register again: a sequence would spend the gateway's
+        // issues and retire the credential the host holds, and the store would refuse the keys
+        // again. Try again files the keys, alone.
+        let only_the_keys = {
+            let state = lock(&self.state);
+            state.keys_unfiled.is_some()
+                && !state.unconfirmed.contains_key(&host.host_device_id)
+                && state
+                    .record
+                    .hosts
+                    .get(&host.host_device_id.to_string())
+                    .is_some_and(|kept| kept.phase == Phase::On && !kept.lost)
+        };
+        if only_the_keys {
+            let desk = Arc::clone(self);
+            tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
             return Ok(self.view());
         }
         let now = (self.wiring.clock)();
@@ -834,7 +868,7 @@ impl PushDesk {
             }
             before
         };
-        if let Err(words) = self.file_keys().await {
+        if let (Err(words), _) = self.file_keys_quietly().await {
             // The choice is let go with the record: Off that left the host's key with the receivers
             // would be Off in name only.
             let undone = {
@@ -847,7 +881,10 @@ impl PushDesk {
             // A filing that failed part way may have left the receivers holding some of the new
             // set: the set the record says now is filed again at once, and the next look files it
             // again if this fails too.
-            let restored = self.file_keys().await.is_ok();
+            let restored = self.file_keys_quietly().await.0.is_ok();
+            // The page is told once, with the choice as it stands again: neither filing reported
+            // while the choice was in the record, which the page would have kept.
+            (self.changed)();
             return Err(CommandError::local_failure(if undone && restored {
                 format!("{words} Your choice of previews was not made. Try again.")
             } else {
@@ -1460,15 +1497,15 @@ impl PushDesk {
         // The choice the host is told is read once, before the keys are filed, so what the receivers
         // hold is never older than it: a choice made after this is told by a run that goes round
         // again, and one that turns previews off is told after the receivers were asked to let the
-        // key go, whether or not they did (a filing that failed is said at the end of the run).
+        // key go, whether or not they did.
         let Some(previews) = self.previews_wanted(host.host_device_id, run) else {
             return Err(forgotten_host());
         };
-        let filed = self.file_keys().await;
-        if let (Err(words), true) = (&filed, previews) {
-            // The host is not asked to seal to a key the receivers do not hold.
-            return Err(Stop::from(words.clone()));
-        }
+        // A filing that fails does not stop the run. The registration does not depend on the
+        // receivers' store: a preview sealed to a key they do not hold shows the generic alert, and
+        // one turned off is no longer sealed once the host is told. The rows say what is wrong until
+        // a look files the keys again, which retries the filing alone.
+        self.file_keys_logged().await;
         // The person can forget the host during any of the waits that follow, so the host is
         // sent nothing until the run is asked about again: before the connection, after it, and
         // before each of the changes.
@@ -1539,9 +1576,7 @@ impl PushDesk {
         }
         // The line is not needed any more, and the hold on the host's endpoint goes with it.
         drop(line);
-        // Previews turned off reach the host even when the key could not be taken out of the
-        // receivers' hands, which is then said, and the next look files again.
-        filed.map_err(Stop::from)
+        Ok(())
     }
 
     /// The choice of previews the host is to be told, while `run` holds it.
@@ -1634,13 +1669,34 @@ impl PushDesk {
     /// Makes the receivers hold the keys the record and the paired hosts say, and nothing else.
     ///
     /// The set is built and handed over under one hold, so a set built before a newer one is never
-    /// filed after it. A set the receivers already hold is not filed again.
+    /// filed after it. A set the receivers already hold is not filed again. A filing that fails
+    /// leaves a mark, which every row that is on shows until a filing succeeds; no registration is
+    /// touched by it. Says nothing to the page: the answer's second member is whether the mark
+    /// moved, for the caller to report when it has settled what the page is to be shown.
     ///
     /// # Errors
     ///
-    /// Returns the words for what stopped it.
-    async fn file_keys(&self) -> std::result::Result<(), String> {
+    /// The first member holds the words for what stopped it.
+    async fn file_keys_quietly(&self) -> (std::result::Result<(), String>, bool) {
         let mut filed = self.filed.lock().await;
+        let outcome = self.hand_over_keys(&mut filed).await;
+        // The mark follows the last filing, and is made under the hold that orders them.
+        let unfiled = outcome
+            .as_ref()
+            .err()
+            .map(|words| format!("{words} {KEYS_RETRY}"));
+        let mut state = lock(&self.state);
+        let moved = state.keys_unfiled != unfiled;
+        state.keys_unfiled = unfiled;
+        (outcome, moved)
+    }
+
+    /// The filing itself, over the hold of [`Self::file_keys_quietly`]: the keys the record asks
+    /// for, unless the receivers already hold them.
+    async fn hand_over_keys(
+        &self,
+        filed: &mut Option<PreviewKeys>,
+    ) -> std::result::Result<(), String> {
         let keys = self.wanted_keys()?;
         if filed.as_ref() == Some(&keys) {
             return Ok(());
@@ -1655,10 +1711,15 @@ impl PushDesk {
         Ok(())
     }
 
-    /// [`Self::file_keys`], for the callers that have nobody to tell: a failure is logged, and the
-    /// next look files again.
+    /// [`Self::file_keys_quietly`], for the callers that have nobody to tell: a failure is logged
+    /// and left as the mark the rows show, the page is told when the mark moved, and the next look
+    /// files again.
     async fn file_keys_logged(&self) {
-        if let Err(words) = self.file_keys().await {
+        let (outcome, moved) = self.file_keys_quietly().await;
+        if moved {
+            (self.changed)();
+        }
+        if let Err(words) = outcome {
             tracing::warn!(%words, "the preview keys could not be filed for the receivers");
         }
     }
