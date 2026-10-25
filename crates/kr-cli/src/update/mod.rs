@@ -2351,11 +2351,14 @@ fn restart_of(
 /// starts its replacement with; and the task is this installation's own, as it registers it, so
 /// that the task, run after the switch, starts the daemon of the release `current` then names.
 ///
-/// The daemon states those variables and no others, so they are the only ones that can be held to
-/// the account's. The rest of its environment (`PATH`, `APPDATA`, the proxy variables, `SystemRoot`
-/// and the session variables) is the account's in a replacement, as it is the starting command's on
-/// the other platforms, and it moves what a capability probe finds, where a relay check goes and
-/// what a session starts with, not what the daemon serves or where it keeps it. A shell package
+/// Of the variables a daemon states, those are the three that decide where a Windows daemon keeps
+/// something: its roots are its arguments, and the others it states (`TMPDIR` and the `XDG_`
+/// variables) are read by the paths code on Unix only. Nothing else of its environment is stated,
+/// so nothing else can be held to the account's. The rest of it (`PATH`, `APPDATA`, the proxy
+/// variables, `SystemRoot` and the session variables) is the account's in a replacement, as it is
+/// the starting command's on the other platforms, and it moves what a capability probe finds, where
+/// a relay check goes and what a session starts with, not what the daemon serves or where it keeps
+/// it. A shell package
 /// root named in the environment makes a daemon of an installed release refuse to start, so a
 /// daemon an update replaces never has one.
 #[cfg(windows)]
