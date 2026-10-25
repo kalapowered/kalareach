@@ -124,6 +124,15 @@ const THIRD_MARKER: &str = "kalareach-lastly";
 /// The command that produces it.
 const THIRD_MARKER_COMMAND: &str = "printf 'kala%s-lastly\n' reach\n";
 
+/// Output the session writes before a device is paired, and what is typed to write it. Its marker
+/// never appears in the command's own echo.
+const BEFORE_MARKER: &str = "kalareach-before";
+const BEFORE_COMMAND: &str = "printf 'kala%s-before\n' reach\n";
+
+/// Output the session writes after the pairing, and what is typed to write it.
+const AFTER_MARKER: &str = "kalareach-after";
+const AFTER_COMMAND: &str = "printf 'kala%s-after\n' reach\n";
+
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes, and is kept
@@ -983,6 +992,115 @@ async fn type_and_wait_for(
         "the bytes reached the application"
     );
     observe(session, &mut events, wanted).await
+}
+
+/// Types `text` into the session as the person at this machine does, on the worker's own socket,
+/// and returns once the worker has taken it.
+async fn the_owner_types(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment_id: EnvironmentId,
+    session_id: SessionId,
+    text: &str,
+) {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("the local client reaches the worker");
+    let target = ActionTarget {
+        environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let attached: SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions {
+                    rows: U64::new(24),
+                    columns: U64::new(80),
+                }),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input,
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attachment is admitted")
+        .to_typed()
+        .expect("an attachment");
+    let attachment_id = attached.attachment.attachment_id;
+    let acquired: InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the lease is acquired")
+        .to_typed()
+        .expect("a lease");
+    client
+        .request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch: acquired.lease.epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner's input reaches the terminal");
+}
+
+/// Reads the session's retained output as the owner does, on the worker's own socket, until it
+/// carries `wanted`, and returns the cursor after what it read.
+async fn the_owner_reads_until(
+    client: &mut LocalClient,
+    session_id: SessionId,
+    wanted: &str,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while tokio::time::Instant::now() < deadline {
+        let page: kr_protocol::recovery::HistoryPageResult = client
+            .request(
+                Method::HistoryPage,
+                &kr_protocol::recovery::HistoryPageParams {
+                    session_id,
+                    from_cursor: U64::ZERO,
+                    max_bytes: U64::new(64 * 1024),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the owner is served the page")
+            .to_typed()
+            .expect("decodes");
+        if String::from_utf8_lossy(page.bytes.as_slice()).contains(wanted) {
+            return page.next_cursor.get();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the session's retained output never carried {wanted:?}");
 }
 
 /// Closes a session and waits for the daemon to record that its worker has gone.
@@ -3632,6 +3750,16 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
         .to_typed()
         .expect("an attachment");
 
+    // The session writes before the device is paired, and the owner reads that.
+    the_owner_types(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        BEFORE_COMMAND,
+    )
+    .await;
+    let before_ends = the_owner_reads_until(&mut attached_locally, session_id, BEFORE_MARKER).await;
+
     let device = Device::create(&loopback()).await;
     let record = pair_with(
         &daemon,
@@ -3678,18 +3806,44 @@ async fn a_devices_grant_bounds_what_it_can_reach() {
         .expect_err("a grant with no geometry right claims no geometry");
     assert_eq!(claimed.code(), ErrorCode::PermissionDenied);
 
-    // Retained output is served to the grant, narrowed to its lower bound, which this grant
-    // leaves at its pairing. What the session wrote before then, if it wrote anything, depends on
-    // the shell, so this holds only that the page is served; the narrowing itself is decided in
-    // `network_history`.
-    session
+    // Retained output is served to the grant, narrowed to its lower bound, which this grant leaves
+    // at its pairing. What the session wrote before then is not in the page, whatever the page
+    // begins at; and where the page begins at or before the output written after the pairing, it
+    // carries it.
+    let after_starts =
+        the_owner_reads_until(&mut attached_locally, session_id, BEFORE_MARKER).await;
+    the_owner_types(
+        &worker_endpoint,
+        host.environment_id,
+        session_id,
+        AFTER_COMMAND,
+    )
+    .await;
+    the_owner_reads_until(&mut attached_locally, session_id, AFTER_MARKER).await;
+    let history = session
         .history_page(&kr_protocol::recovery::HistoryPageParams {
             session_id,
             from_cursor: U64::ZERO,
-            max_bytes: U64::new(4_096),
+            max_bytes: U64::new(64 * 1024),
         })
         .await
         .expect("the grant reaches the output written after its pairing");
+    let served = String::from_utf8_lossy(history.bytes.as_slice()).into_owned();
+    assert!(
+        !served.contains(BEFORE_MARKER),
+        "what the session wrote before the pairing is not served: {served:?}"
+    );
+    assert!(
+        history.from_cursor.get() >= before_ends,
+        "the page begins no earlier than the pairing: {} before {before_ends}",
+        history.from_cursor.get()
+    );
+    if history.from_cursor.get() <= after_starts {
+        assert!(
+            served.contains(AFTER_MARKER),
+            "what the session wrote after the pairing is served: {served:?}"
+        );
+    }
 
     // An attachment identifier is not permission: the device may detach its own and nothing else.
     let attached = attach(&session, host.environment_id, session_id).await;
