@@ -66,9 +66,10 @@ binary that is worth what a signature is normally worth. Against the built-in do
 less: the anchor ships beside them, so replacing one means rebuilding, and a rebuild can carry a new
 anchor. What it buys is one code path instead of two.
 
-The profile-signing key is per build: it is generated, used, and not kept. Changing a shipped
-profile means generating a key, signing both documents again and committing the anchor with them,
-in one change.
+The profile-signing key is generated when a shipped profile changes: it signs both documents and is
+not kept, and the build carries its public half until the next change. Changing a shipped profile
+means generating a key, signing both documents again and committing the anchor with them, in one
+change.
 
 Assets are downloaded once, for the selected profile only, under a policy that states the exact byte
 count before anything is fetched. A fetch is *admitted*; only a fetch whose files have been verified
