@@ -41,8 +41,8 @@ use kr_plugin_sdk::text::Label;
 use kr_protocol::agent::{
     AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState,
     AgentCapabilitiesParams, AgentCapabilitiesResult, AgentMutationResult, AgentMutationTarget,
-    AgentPromptParams, AgentSteerParams, AgentSubject, PluginActionInvokeParams,
-    PluginActionInvokeResult, PromptText,
+    AgentPromptParams, AgentSnapshotParams, AgentSnapshotResult, AgentSteerParams, AgentSubject,
+    PluginActionInvokeParams, PluginActionInvokeResult, PromptText,
 };
 use kr_protocol::broker::{ActionName, InstanceCapabilityState, IntegrationMode};
 use kr_protocol::envelope::ActionTarget;
@@ -449,6 +449,24 @@ impl Context {
             ))
             .unwrap_or_else(|why| panic!("agent.capabilities: {why}"));
         read.binding
+    }
+
+    /// Reads the history the host keeps of an instance, from its first entry.
+    fn history(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+    ) -> AgentSnapshotResult {
+        self.runtime
+            .block_on(remote.read(
+                Method::AgentSnapshot,
+                &AgentSnapshotParams {
+                    subject: subject(session_id, instance),
+                    from_node: Nullable::null(),
+                },
+            ))
+            .unwrap_or_else(|why| panic!("agent.snapshot: {why}"))
     }
 
     /// Reads the binding until `holds` is true of it, within the liveness bound.
@@ -1736,6 +1754,66 @@ fn kr_req_11_33_a_device_answers_an_approval_the_terminal_holds_and_the_late_ter
     assert_eq!(
         done.agent_resources.resources[0].resource_id,
         pending.resource_id
+    );
+    ctx.close(&host);
+}
+
+/// KR-REQ-12.04: a paired device reads, as history of the instance, the conversation and the turn
+/// the server's stream named, each entry under the binding revision and the turn it was seen
+/// under.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[test]
+fn kr_req_12_04_a_device_reads_the_conversation_and_the_turn_the_stream_named_as_history() {
+    let Some(ctx) = Context::start_released("gateway-history") else {
+        return;
+    };
+    let host = ctx.host();
+    let (_device, _paired, remote) = ctx.pair(&host);
+    let person = Person::enters(&ctx, &host);
+    person.exports(
+        &ctx,
+        "answer-when-released,keep-reading,ping-when-released,stay",
+    );
+    let _ = person.types_until_it_shows(
+        "codex",
+        ASKED,
+        "the terminal reaches the server through the gateway",
+    );
+    let instance = first_instance(&ctx, &remote, person.session_id).application_instance_id;
+    let binding = ctx.binding_until(
+        &remote,
+        person.session_id,
+        instance,
+        "the stream names the thread and the turn",
+        |binding| names(binding, "thread-1", Some("turn-1")),
+    );
+    let read = ctx.history(&remote, person.session_id, instance);
+    let entries: Vec<_> = read
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.kind.as_str(),
+                entry.text.as_str(),
+                entry.binding_revision,
+                entry.turn_id.0.as_ref().map(ToString::to_string),
+            )
+        })
+        .collect();
+    assert!(
+        entries.contains(&("thread.started", "thread-1", binding.binding_revision, None)),
+        "the conversation the stream named is history under the revision it was named at: \
+         {entries:?}"
+    );
+    assert!(
+        entries.contains(&(
+            "turn.started",
+            "turn-1",
+            binding.binding_revision,
+            Some("turn-1".to_owned())
+        )),
+        "the turn it started is history under that turn: {entries:?}"
     );
     ctx.close(&host);
 }
