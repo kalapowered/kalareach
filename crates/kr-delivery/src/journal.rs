@@ -49,7 +49,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use kr_protocol::ids::{
-    EnvelopeId, GrantId, InstallationId, NotificationId, PushSenderRecordId, SessionId,
+    EnvelopeId, GrantId, InstallationId, InvitationId, NotificationId, PushSenderRecordId,
+    SessionId,
 };
 use kr_protocol::push::{PushSuppression, PushSuppressionReason};
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
@@ -144,7 +145,8 @@ pub const ATTENTION_CONSUMER: &str = "kr-delivery/attention";
 )]
 #[serde(rename_all = "snake_case")]
 pub enum EventSource {
-    /// An attention announcement, taken through `Attention::take_announcements`.
+    /// An attention announcement, taken through `Attention::take_announcements`, and a completed
+    /// pairing, taken from the host's pairing outbox under a consumer scope of its own.
     Attention,
 }
 
@@ -205,6 +207,17 @@ impl EventKey {
         Self {
             source: EventSource::Attention,
             identity: format!("{session}/{number}/{item}"),
+        }
+    }
+
+    /// Names one completed pairing, by the invitation the device paired through.
+    ///
+    /// The identity cannot be an announcement's: it holds a separator no announcement's does.
+    #[must_use]
+    pub fn pairing(invitation: InvitationId) -> Self {
+        Self {
+            source: EventSource::Attention,
+            identity: format!("pairing|{invitation}"),
         }
     }
 

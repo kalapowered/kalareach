@@ -971,6 +971,13 @@ impl Controller {
         // and every announcement it decides is stamped with the privacy state the delivery module
         // publishes its send gate from.
         delivery_runtime.attach_attention(Arc::clone(&attention));
+        // And the completed pairings the host's security outbox holds are taken the same way, under
+        // a cursor of their own.
+        delivery_runtime.attach_pairings(net::invitations::InvitationRows::new(
+            Arc::clone(&devices),
+            Arc::clone(&lifetimes),
+            Arc::clone(&feed_refusal),
+        ));
         attention.attach_privacy(delivery.privacy_state().clone());
         // Privacy mode's record comes before anything the subsystems it drives do. It is read and
         // published into the delivery module's send gate here, and whatever it asks for is taken

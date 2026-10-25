@@ -57,6 +57,12 @@ use super::{Clock, DeliveryModule, SystemClock};
 /// The scope the attention store's announcements are taken under: one store, so one cursor.
 pub const ATTENTION_SCOPE: &str = "environment";
 
+/// The scope the host's pairing outbox is taken under: a store of its own, so a cursor of its own.
+pub const PAIRING_SCOPE: &str = "pairings";
+
+/// The completed pairings one pass reads from the outbox.
+const PAIRINGS_PER_PASS: usize = 64;
+
 /// How often the runtime works, and how often each loop may ask a gateway what became of a
 /// notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +176,8 @@ pub struct DeliveryRuntime {
     signer: Arc<dyn ServiceSigner>,
     adapters: OnceLock<Adapters>,
     attention: OnceLock<Arc<crate::attention::AttentionModule>>,
+    /// The host's pairing outbox, which every pass takes the completed pairings of.
+    pairings: OnceLock<crate::service::net::invitations::InvitationRows>,
     /// The mailbox service this host places the objects of its previews in, when its configuration
     /// document selects one.
     mailbox: OnceLock<kr_protocol::service::GatewayOrigin>,
@@ -214,6 +222,7 @@ impl DeliveryRuntime {
             signer,
             adapters: OnceLock::new(),
             attention: OnceLock::new(),
+            pairings: OnceLock::new(),
             mailbox: OnceLock::new(),
             recovered: AtomicBool::new(false),
             confirmations: Mutex::new(std::collections::BTreeMap::new()),
@@ -354,6 +363,14 @@ impl DeliveryRuntime {
         self.attention.set(attention).is_ok()
     }
 
+    /// Hands the runtime the host's pairing outbox, whose completed pairings every pass takes and
+    /// tells the owner's devices of.
+    ///
+    /// Once, like the attention store. Returns false when one was already attached.
+    pub fn attach_pairings(&self, rows: crate::service::net::invitations::InvitationRows) -> bool {
+        self.pairings.set(rows).is_ok()
+    }
+
     /// Returns true once recovery has succeeded.
     #[must_use]
     pub fn is_recovered(&self) -> bool {
@@ -477,8 +494,67 @@ impl DeliveryRuntime {
                 eprintln!("kr-controller: the attention store could not be taken from: {refusal}");
             }
         }
+        self.take_pairings(view, now_ms);
         if let Err(error) = self.module.finish_pending(self.authority.as_ref(), now_ms) {
             eprintln!("kr-controller: taken announcements were not produced from: {error}");
+        }
+    }
+
+    /// Takes the completed pairings the outbox holds past this journal's cursor into it.
+    ///
+    /// The outbox keeps every row, so the cursor is the one this journal holds under its own
+    /// consumer: a row is read again after a stop until the journal has committed it with its
+    /// cursor, and the event key absorbs a repeat.
+    fn take_pairings(&self, view: kr_delivery::producer::PrivacyView, now_ms: u64) {
+        let Some(rows) = self.pairings.get() else {
+            return;
+        };
+        let consumer = kr_delivery::journal::EventSource::Attention.consumer(PAIRING_SCOPE);
+        let cursor = match self.module.with(|producer| {
+            producer
+                .journal()
+                .consumer_cursor(&consumer)
+                .map_err(storage)
+        }) {
+            Ok(held) => held.map_or(0, |held| held.cursor),
+            Err(error) => {
+                eprintln!("kr-controller: the pairing cursor could not be read: {error}");
+                return;
+            }
+        };
+        let events = match rows.events_after(
+            Some(kr_protocol::ids::PairingEventSequence::new(cursor)),
+            PAIRINGS_PER_PASS,
+        ) {
+            Ok(events) if events.is_empty() => return,
+            Ok(events) => events,
+            Err(error) => {
+                eprintln!("kr-controller: completed pairings could not be read: {error}");
+                return;
+            }
+        };
+        let pairings: Vec<kr_delivery::producer::PairingEvent> = events
+            .iter()
+            .map(|event| kr_delivery::producer::PairingEvent {
+                sequence: event.sequence.get(),
+                invitation_id: event.invitation_id,
+                device_id: event.device_id,
+                device_name: event.device_name.as_str().to_owned(),
+                committed_at_ms: event.committed_at_ms.get(),
+            })
+            .collect();
+        if let Err(error) = self.module.with(|producer| {
+            producer
+                .take_from_pairings(
+                    &pairings,
+                    self.authority.as_ref(),
+                    PAIRING_SCOPE,
+                    view,
+                    now_ms,
+                )
+                .map_err(storage)
+        }) {
+            eprintln!("kr-controller: completed pairings were not taken: {error}");
         }
     }
 

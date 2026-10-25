@@ -1208,6 +1208,18 @@ impl Environment {
             .await
     }
 
+    /// The host's first owner, connected: its grant carries `host.manage`.
+    async fn owner_phone(&self) -> Phone {
+        let device = Device::with_keys(self.owner.clone()).await;
+        let record = self.host.owner.clone().expect("the host's first owner");
+        let connection = RawDevice::connect(&self.host, &device, &record).await;
+        Phone {
+            device,
+            record,
+            connection,
+        }
+    }
+
     /// Pairs a device whose grant reaches only `sessions`, and connects it.
     async fn phone_for_sessions(&self, sessions: kr_protocol::grant::SessionSelector) -> Phone {
         let keys = DeviceKeys::generate().expect("device keys");
@@ -1668,6 +1680,86 @@ async fn a_paired_device_that_registers_is_told_of_the_next_question_and_still_i
     })
     .await;
     assert_eq!(environment.gateway.state().bearers_refused, 0);
+}
+
+/// KR-REQ-10.08: every completed pairing is a notification to the owner's devices that may manage
+/// the host, through the gateway, in the closed vocabulary's generic words: the name the new device
+/// chose is inside the seal of the preview and nowhere the gateway can read. A device whose grant
+/// may only see sessions is told nothing of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_completed_pairing_reaches_the_owners_device_and_no_device_that_may_not_manage_the_host()
+{
+    const NAME: &str = "A test phone";
+    let environment = Environment::start().await;
+    let owner = environment.owner_phone().await;
+    let owner_sender = PushSenderRecordId::new(uuid(0x61));
+    let credential = environment.gateway.issue(
+        owner_sender,
+        owner.installation(),
+        environment.host_signing_key(),
+    );
+    owner
+        .register(&environment, &credential)
+        .await
+        .expect("the owner's device registers");
+
+    // A device that may only see sessions pairs, and registers: the owner's device is told of its
+    // pairing.
+    let viewer = environment.phone().await;
+    let viewer_sender = PushSenderRecordId::new(uuid(0x62));
+    let viewer_credential = environment.gateway.issue(
+        viewer_sender,
+        viewer.installation(),
+        environment.host_signing_key(),
+    );
+    viewer
+        .register(&environment, &viewer_credential)
+        .await
+        .expect("the viewer registers");
+    until("the owner's device being told of the pairing", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    let request = environment.gateway.delivered().remove(0);
+    assert_eq!(request.sender_record_id, owner_sender);
+    assert_eq!(request.hints.alert, PushAlert::SessionNeedsAttention);
+    let host_preview = environment
+        .controller()
+        .delivery()
+        .with(|producer| Ok(*producer.preview_public()))
+        .expect("the host's preview key");
+    let opened = kr_delivery::preview::open_preview(
+        &owner.device.keys().notification_preview,
+        &host_preview,
+        request.preview.as_ref().expect("a preview"),
+        now(),
+    )
+    .expect("the device opens its own preview");
+    assert_eq!(opened.rule, "pairing.completed");
+    assert!(opened.summary.contains(NAME), "{}", opened.summary);
+    let wire = serde_json::to_string(&request).expect("the request");
+    assert!(!wire.contains(NAME), "the gateway is not given the name");
+
+    // Another device pairs: the owner's device is told again, and the one that may only see
+    // sessions is told of neither.
+    let _third = environment.phone().await;
+    until("the owner's device being told of the next pairing", || {
+        environment.gateway.delivered().len() == 2
+    })
+    .await;
+    assert!(
+        environment
+            .gateway
+            .delivered()
+            .iter()
+            .all(|request| request.sender_record_id == owner_sender),
+        "only a device that may manage the host is told"
+    );
+    assert!(
+        environment
+            .deliveries_to(&viewer.device_id().to_string())
+            .is_empty()
+    );
 }
 
 /// KR-REQ-16.08: a daemon takes a credential only from the gateway its managed service stands at.
