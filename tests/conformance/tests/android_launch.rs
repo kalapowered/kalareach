@@ -9,7 +9,8 @@
 //! renderer, and two from an emulator, where the application crashed, so what the script says of
 //! how a process ended is held to the real thing. Every case decides by what the script says and
 //! keeps, never by how long it took: the deadline is long, so a script that waits out a process
-//! that is gone fails on its message.
+//! that is gone fails on its message. The two cases about the deadline itself decide by the call
+//! that was ended and by how many questions the device was asked, on a clock the case moves by hand.
 
 #![cfg(unix)]
 
@@ -39,15 +40,28 @@ impl Drop for Endpoint {
     }
 }
 
+/// How long a case lets the script run before it calls it hung and ends it. Only a script that does
+/// not end by itself reaches it; nothing is decided by it.
+const RUN_LIMIT: Duration = Duration::from_secs(180);
+
 /// What a run of the script said and kept.
 struct Launch {
     output: String,
     status: Option<i32>,
     screenshot: PathBuf,
+    state: PathBuf,
     _directory: TempDir,
 }
 
 impl Launch {
+    /// The number a state file of the stand-in device holds when the run ended.
+    fn count(&self, name: &str) -> u32 {
+        fs::read_to_string(self.state.join(name))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     /// The width and height the screenshot's PNG header states, when it is a PNG.
     fn picture(&self) -> Option<(u32, u32)> {
         let bytes = fs::read(&self.screenshot).ok()?;
@@ -72,6 +86,20 @@ fn launch(pid: &str, ending_log: &str, ends: &str) -> Launch {
 /// The same, on a device with the further state files `state_files` name, each with its contents
 /// (see `device.py`).
 fn launch_with(pid: &str, ending_log: &str, ends: &str, state_files: &[(&str, &str)]) -> Launch {
+    launch_with_deadline(pid, ending_log, ends, state_files, 60, false)
+}
+
+/// The same, with the script's deadline `deadline` seconds. On a clock that the case moves by hand
+/// when `moved_by_hand`: the script's `date` reads it and its `sleep` moves it, so that a wait of
+/// seconds takes no time.
+fn launch_with_deadline(
+    pid: &str,
+    ending_log: &str,
+    ends: &str,
+    state_files: &[(&str, &str)],
+    deadline: u32,
+    moved_by_hand: bool,
+) -> Launch {
     let directory = TempDir::new().expect("a directory");
     let root = directory.path();
     let state = root.join("state");
@@ -94,6 +122,23 @@ fn launch_with(pid: &str, ending_log: &str, ends: &str, state_files: &[(&str, &s
     )
     .expect("a stand-in");
     fs::set_permissions(&adb, fs::Permissions::from_mode(0o755)).expect("executable");
+    if moved_by_hand {
+        for (name, body) in [
+            (
+                "date",
+                "#!/bin/sh\ncat \"$KR_FAKE_DEVICE_DIR/clock\" 2> /dev/null || echo 1000000\n",
+            ),
+            (
+                "sleep",
+                "#!/bin/sh\nnow=$(cat \"$KR_FAKE_DEVICE_DIR/clock\" 2> /dev/null || echo 1000000)\n\
+                 echo $((now + $1)) > \"$KR_FAKE_DEVICE_DIR/clock\"\n",
+            ),
+        ] {
+            let tool = tools.join(name);
+            fs::write(&tool, body).expect("a stand-in");
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("executable");
+        }
+    }
 
     let _endpoint = Endpoint(
         Command::new("python3")
@@ -115,24 +160,43 @@ fn launch_with(pid: &str, ending_log: &str, ends: &str, state_files: &[(&str, &s
 
     let screenshot = root.join("evidence/launch.png");
     let inherited = std::env::var("PATH").unwrap_or_default();
-    let output = Command::new("bash")
+    let written = root.join("run.log");
+    let sink = fs::File::create(&written).expect("a log");
+    let mut script = Command::new("bash")
         .arg(repository().join("scripts/android-app-launch.sh"))
         .arg(root.join("application.apk"))
         .arg(&screenshot)
         .args(["--serial", "emulator-5554"])
         .env("PATH", format!("{}:{inherited}", tools.display()))
         .env("KR_FAKE_DEVICE_DIR", &state)
-        .env("KR_LAUNCH_DEADLINE", "60")
+        .env("KR_LAUNCH_DEADLINE", deadline.to_string())
         .env("NO_PROXY", "*")
         .env_remove("ANDROID_SERIAL")
-        .output()
+        .stdout(sink.try_clone().expect("a log"))
+        .stderr(sink)
+        .spawn()
         .expect("the script runs");
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let began = Instant::now();
+    let status = loop {
+        if let Some(status) = script.try_wait().expect("the script is waited for") {
+            break status.code();
+        }
+        if began.elapsed() > RUN_LIMIT {
+            let _ = script.kill();
+            let _ = script.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut text = fs::read_to_string(&written).unwrap_or_default();
+    if status.is_none() {
+        text.push_str("\nthe script did not end by itself and was ended by the case\n");
+    }
     Launch {
         output: text,
-        status: output.status.code(),
+        status,
         screenshot,
+        state,
         _directory: directory,
     }
 }
@@ -295,5 +359,58 @@ fn a_process_that_ends_after_an_unanswered_query_is_still_named() {
             .contains("low-memory killer of the system ended the application"),
         "{}",
         run.output
+    );
+}
+
+/// A call of `adb` that never returns is ended by the deadline of the wait it is made in, and the
+/// run fails naming that wait; it is not waited for until the call is done. The device does not
+/// answer the first read of whether it finished starting.
+#[test]
+fn a_call_of_adb_that_never_returns_is_ended_at_the_deadline_of_its_wait() {
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[("hangs-on-boot", "")],
+        3,
+        false,
+    );
+    assert_eq!(run.status, Some(1), "{}", run.output);
+    assert!(
+        run.output
+            .contains("gave up waiting for the device to finish starting"),
+        "{}",
+        run.output
+    );
+}
+
+/// The two looks at the application's process that follow the last wait are held to one deadline
+/// between them. The device does not answer five questions after the log was read, answers the
+/// sixth that the process is gone, and answers none after that: a deadline for each look would ask
+/// it five questions more than the deadline allows.
+#[test]
+fn the_looks_after_the_log_was_read_share_one_deadline() {
+    const DEADLINE: u32 = 20;
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "log",
+        &[("silent-after-the-log", "5")],
+        DEADLINE,
+        true,
+    );
+    assert_eq!(run.status, Some(1), "{}", run.output);
+    assert!(
+        run.output
+            .contains("the device gave no answer about the application's process (7072)"),
+        "{}",
+        run.output
+    );
+    // One window of the deadline holds a question at each of its DEADLINE + 1 whole seconds; a
+    // window for each look holds twenty-one more (the previous script asks 26 in all).
+    assert!(
+        run.count("unanswered-after-the-log") <= DEADLINE + 1,
+        "the device was asked {} questions it did not answer, in a deadline of {DEADLINE} seconds",
+        run.count("unanswered-after-the-log")
     );
 }
