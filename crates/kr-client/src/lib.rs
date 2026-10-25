@@ -79,7 +79,7 @@ pub mod viewport;
 mod wss;
 
 pub use error::{ClientError, Result};
-pub use session::{Session, Settled};
+pub use session::{LaunchSurfaceRead, Session, Settled};
 pub use shown::{IoFault, Plain, Said, Shown};
 
 #[cfg(test)]

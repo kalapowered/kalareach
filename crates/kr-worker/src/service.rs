@@ -291,6 +291,11 @@ pub struct WorkerService {
     build_id: kr_protocol::ids::BuildId,
     /// How often a connection a process bridge made is sent a keepalive.
     keepalive: std::time::Duration,
+    /// Capabilities this worker leaves out of its answer to the hello, as a worker of an earlier
+    /// release does by serving nothing they name, which this host's own tests use. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    withheld_capabilities: Mutex<Vec<&'static str>>,
     /// A pause between a durable receipt acceptance and the broker's admission of the same
     /// mutation, which this host's own tests arm to stand inside that interval. It is compiled
     /// away in every shipped build.
@@ -697,6 +702,8 @@ impl WorkerService {
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
             keepalive: LOCAL_KEEPALIVE,
+            #[cfg(feature = "testing")]
+            withheld_capabilities: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             admission_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -3082,6 +3089,15 @@ impl WorkerService {
         }))
     }
 
+    /// Leaves `capability` out of what this worker states in its answer to a hello from now on.
+    #[cfg(feature = "testing")]
+    pub fn withhold_capability(&self, capability: &'static str) {
+        self.withheld_capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(capability);
+    }
+
     /// What this worker states about itself in its answer to a hello.
     ///
     /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
@@ -3094,7 +3110,8 @@ impl WorkerService {
     /// these before it sends the frames, so they are stated for as long as such a daemon can be
     /// brought back by a rollback.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
-        self.time
+        let stated: CanonicalSet<kr_protocol::ids::CapabilityId> = self
+            .time
             .floor_identity()
             .map(|identity| kr_protocol::local::utc_floor_capability(identity.as_bytes()))
             .into_iter()
@@ -3112,7 +3129,35 @@ impl WorkerService {
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
             )
+            .collect();
+        self.without_the_withheld(stated)
+    }
+
+    /// Takes the capabilities this host's tests withheld out of what the worker states.
+    #[cfg(feature = "testing")]
+    fn without_the_withheld(
+        &self,
+        stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
+    ) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+        let withheld = self
+            .withheld_capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stated
+            .iter()
+            .filter(|capability| !withheld.iter().any(|name| capability.as_str() == *name))
+            .cloned()
             .collect()
+    }
+
+    /// Every capability is stated: nothing is withheld in a shipped build.
+    #[cfg(not(feature = "testing"))]
+    #[allow(clippy::unused_self)]
+    const fn without_the_withheld(
+        &self,
+        stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
+    ) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
+        stated
     }
 
     /// Issues an action window for one authenticated connection.
