@@ -1614,7 +1614,7 @@ mod windows {
     use std::time::Duration;
 
     use kr_client::shown;
-    use kr_client::shown::Shown;
+    use kr_client::shown::{Said as _, Shown};
     use kr_controller::supervision;
     use kr_controller::supervision::windows::{
         Registration, Standing, TaskChange, TaskDefinition, TaskError,

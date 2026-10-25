@@ -1079,6 +1079,7 @@ mod tests {
 
     /// A path inside one top directory is split into it and the parts below; anything that could
     /// leave it, or is not text, is not.
+    #[cfg(unix)]
     #[test]
     fn an_archive_entry_stays_inside_its_top_directory() {
         assert_eq!(
@@ -1110,6 +1111,7 @@ mod tests {
     }
 
     /// A tool that does not end is given a bound and ended, and one that ends is read.
+    #[cfg(unix)]
     #[test]
     fn the_system_s_tool_is_given_a_bound_and_no_more() {
         let began = std::time::Instant::now();
@@ -1141,6 +1143,7 @@ mod tests {
 
     /// A tool that writes without end is given up on at once, not read for as long as it writes:
     /// with a bound far beyond the watchdog, only the limit on what it may print ends the run.
+    #[cfg(unix)]
     #[test]
     fn a_tool_that_never_stops_writing_is_given_up_on() {
         // On a thread of its own, so that a run that reads for ever fails the test and does not
@@ -1161,6 +1164,7 @@ mod tests {
     /// ends. The descendant says what it finds when it writes: the pipe closed, or, as the control,
     /// open while the run still reads it. It says so in a file, which is waited for, and writes
     /// ten seconds after a bound of one, so that only a stall of nine seconds could reorder them.
+    #[cfg(unix)]
     #[test]
     fn a_tool_s_pipe_is_closed_when_its_bound_ends() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -1221,6 +1225,7 @@ mod tests {
 
     /// A release's manifest that is a pipe is refused at once, and one that is a link is not
     /// followed, where the update reads it.
+    #[cfg(unix)]
     #[test]
     fn a_manifest_that_is_a_pipe_or_a_link_is_refused_at_once() {
         let directory = tempfile::tempdir().expect("a directory");

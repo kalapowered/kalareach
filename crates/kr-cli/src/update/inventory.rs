@@ -76,7 +76,7 @@ const WHAT_IS_GONE: [i32; 4] = [libc::ENOTDIR, libc::ESTALE, libc::ENODEV, libc:
 const WHAT_IS_GONE: [i32; 7] = {
     use windows_sys::Win32::Foundation::{
         ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST, ERROR_DIRECTORY,
-        ERROR_INVALID_DRIVE, ERROR_NOT_READY, ERROR_NETNAME_DELETED,
+        ERROR_INVALID_DRIVE, ERROR_NETNAME_DELETED, ERROR_NOT_READY,
     };
     [
         ERROR_DIRECTORY.cast_signed(),
@@ -553,7 +553,7 @@ async fn challenge(
     .ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -2359,7 +2359,7 @@ fn restart_by_task(
     let ours = crate::doctor::configuration::document_path(&environment.paths);
     let theirs = started_as
         .configuration_directory
-        .as_deref()
+        .as_ref()
         .map(|directory| {
             std::path::Path::new(directory).join(kr_protocol::hostinfo::configuration::FILE_NAME)
         });
