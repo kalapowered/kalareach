@@ -86,6 +86,10 @@ struct ReceiverState {
     keys_released: bool,
     /// How many filings of the preview keys have been asked.
     keys_asked: usize,
+    /// Whether a filing of the preview keys is never answered, and how long the desk is given to
+    /// wait for one.
+    keys_hangs: bool,
+    keys_patience: Duration,
     /// Whether a filing of the preview keys fails, and how many have been refused so far.
     keys_fail: bool,
     keys_refused: usize,
@@ -132,6 +136,8 @@ impl Receiver {
                 keys_hold: None,
                 keys_released: false,
                 keys_asked: 0,
+                keys_hangs: false,
+                keys_patience: Duration::from_secs(20),
                 keys_fail: false,
                 keys_refused: 0,
                 keys_fail_next: 0,
@@ -270,11 +276,14 @@ impl Native for Receiver {
 
     fn preview_keys<'a>(&'a self, keys: &'a PreviewKeys) -> PushFuture<'a, ()> {
         Box::pin(async move {
-            let held = {
+            let (held, hangs) = {
                 let mut state = self.state.lock().expect("the receiver");
                 state.keys_asked += 1;
-                state.keys_hold == Some(state.keys_asked)
+                (state.keys_hold == Some(state.keys_asked), state.keys_hangs)
             };
+            if hangs {
+                std::future::pending::<()>().await;
+            }
             // A held filing is handed over when the test lets it go, and not before.
             while held && !self.state.lock().expect("the receiver").keys_released {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -727,6 +736,7 @@ fn open_with(
         Wiring {
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
+            keys_within: receiver.state.lock().expect("the receiver").keys_patience,
         },
         move |view| {
             counted.fetch_add(1, Ordering::SeqCst);
@@ -3657,6 +3667,67 @@ async fn a_choice_whose_key_cannot_be_filed_is_not_made() {
     assert!(asked(&phone) > before, "the look filed the set again");
     assert_eq!(held_keys(&phone).expect("keys").senders.len(), 1);
     assert_eq!(phone.view().hosts[0].state, PushState::On);
+}
+
+/// KR-REQ-16.11: a filing the receivers never answer ends in words after the time the desk gives it,
+/// and holds nothing after that. The choice that asked for it is let go, the rows say the keys are
+/// not filed, what the receivers hold is not taken to be known (the next look files the set again,
+/// even a set the receivers held before), and the next choice is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filing_the_receivers_never_answer_does_not_hold_the_choices_and_filings_after_it() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let receiver = Receiver::new(FIRST_TOKEN);
+    // How long the desk waits is shortened here; what it waits for never comes.
+    receiver.with(|state| state.keys_patience = Duration::from_millis(100));
+    let phone = desk(&[&host], &owner, receiver).await;
+    let reference = phone.references().remove(0);
+    phone.desk.enable(&reference).expect("the person asks");
+    phone.until(|states| states == [PushState::On]).await;
+    let asked = |phone: &Desk| {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_asked
+    };
+    phone.receiver.with(|state| state.keys_hangs = true);
+
+    let refused = tokio::time::timeout(WATCHDOG, phone.desk.set_previews(&reference, false))
+        .await
+        .expect("the choice ends")
+        .expect_err("the choice is not made");
+
+    assert!(
+        refused.message.contains("not filed in time"),
+        "{:?}",
+        refused.message
+    );
+    assert!(phone.view().hosts[0].previews, "the choice was let go");
+    let row = &phone.view().hosts[0];
+    assert_eq!(row.state, PushState::NeedsAttention);
+    assert!(
+        row.words.contains("not filed in time"),
+        "the row says the keys are not filed: {:?}",
+        row.words
+    );
+
+    // Nothing holds: a look files the set the record says, though the receivers held it before the
+    // choice, since a filing nobody answered leaves them unknown.
+    phone.receiver.with(|state| state.keys_hangs = false);
+    let before = asked(&phone);
+    tokio::time::timeout(WATCHDOG, look(&phone.desk))
+        .await
+        .expect("the look ends");
+    assert!(asked(&phone) > before, "the look filed the set again");
+    assert_eq!(phone.view().hosts[0].state, PushState::On);
+    tokio::time::timeout(WATCHDOG, phone.desk.set_previews(&reference, false))
+        .await
+        .expect("the next choice ends")
+        .expect("the next choice is made");
+    assert!(!phone.view().hosts[0].previews);
+    assert!(held_keys(&phone).expect("keys").senders.is_empty());
 }
 
 /// KR-REQ-16.11: a filing that failed part way may have left the receivers holding some of the new
