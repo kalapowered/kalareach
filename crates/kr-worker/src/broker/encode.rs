@@ -187,6 +187,21 @@ impl BrokerState {
             .ok_or_else(|| {
                 crate::broker::unknown_instance(pending.resource.application_instance_id)
             })?;
+        // The component is not asked for an answer the second pass would refuse for these two
+        // reasons; that pass checks both again.
+        if let Some(reason) = instance.suspension_reason() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("rich mutations are suspended: {reason}"),
+            });
+        }
+        if instance.binding_revision != target.binding_revision {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "the answer was prepared at binding revision {} and the binding is at {}",
+                    target.binding_revision, instance.binding_revision
+                ),
+            });
+        }
         let received_at = pending.resource.recorded_at.get();
         let request_id = entry.upstream_request_id.as_str().to_owned();
         let snapshot = WireRequestSnapshot {
