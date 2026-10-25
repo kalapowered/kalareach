@@ -627,8 +627,8 @@ jobs:
       #     `desktop`, `performance` and `host`, whose daemons start each worker as the shipping
       #     daemon does, through the environment's scheduled task;
       #   - the local endpoint, descriptors and process identity the host rests on: `kr-ipc`'s
-      #     `windows`, `stop` and `peer_gone` suites and its library, and all of `kr-flush`, the
-      #     directory flush of every local store;
+      #     `windows`, `stop`, `peer_gone` and `install` (the store of releases) suites and its
+      #     library, and all of `kr-flush`, the directory flush of every local store;
       #   - the control daemon over the environment's scheduled task and the starter it runs:
       #     `supervision::windows`, the `task_supervisor` suite (with a daemon refused in a login
       #     session other than the one its work runs in), the `plugin_runtime_service` suite over
@@ -929,6 +929,15 @@ jobs:
       - name: Test the local endpoint, the descriptors and the process identity
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-ipc --test windows
+
+      # The store of releases on this platform. `current` is a junction that one rename replaces, so
+      # a program that reads it at any moment finds a whole release; a program started through it
+      # keeps the release its image is in; the open manifest holds a release, and `held` and the
+      # removal of a release agree about it from both sides of a start; a release is sealed read-only,
+      # also against its owner; and removing a release follows no link and touches no file outside it.
+      - name: Test the store of releases
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-ipc --test install
 
       # Stopping a process that was recorded by its identifier and start, and no other: through an
       # open handle, with the creation time compared on that handle, so a number that has passed to

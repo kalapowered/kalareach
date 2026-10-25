@@ -1079,6 +1079,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the store of releases",
+            &["test", "--locked", "-p", "kr-ipc", "--test", "install"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "stopping a recorded process by its identity",
             &["test", "--locked", "-p", "kr-ipc", "--test", "stop"],
         ),
