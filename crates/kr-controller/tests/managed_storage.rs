@@ -5612,6 +5612,15 @@ async fn a_replacement_under_another_account_sends_nothing_for_the_earlier_archi
     rig.until("the third generation is published", |rig| rig.published(3))
         .await;
 
+    // The new archive's first generation is the test's, sealed below. The replacement wakes the
+    // daemon's own producer, and a producer with content to pack would admit that same generation
+    // first: it has nothing it may pack, so there is no order to win.
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            configuration_member_bytes: 0,
+            members: 0,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
     // Another account signs in and replaces the setup; its snapshots would delete the oldest.
     rig.sign_in_with("account-two", "the-second-token").await;
     let second = rig.prepared_setup(archive_two(), true);
