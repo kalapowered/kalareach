@@ -495,7 +495,7 @@ itself:
 
 | Key | Held by | Signs | Checked against |
 | --- | --- | --- | --- |
-| Service admission key | the managed service | leases and revocations | the issuer keys the relay pins in its configuration |
+| Service admission key | the managed service | leases, pairing admissions and revocations | the issuer keys the relay pins in its configuration, when it installs a lease or an admission or applies a revocation (a restored lease is not checked again) |
 | Relay instance key | one relay host, generated there | consumption receipts and its own registration | the key recorded in the service's relay registry |
 | Endpoint keys | the two peers | nothing here | the relay's own authenticated handshake |
 
