@@ -24,11 +24,11 @@ mod stored_formats;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
-// The release tags: the same selection that `kr-protocol-gen` makes, so the suite updates from the
-// release the check holds this commit to.
 // The one reader of Rust source the release tooling has, which the tags' roots are read with.
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/public_majors.rs"]
 mod public_majors;
+// The release tags: the same selection that `kr-protocol-gen` makes, so the suite updates from the
+// release the check holds this commit to.
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/releases.rs"]
 mod releases;
 // A device pairs with the installed host's daemon over the network. The pairing calls are the ones
