@@ -429,7 +429,9 @@ pub struct ObservationLane {
     /// Wakes the task that tells the plugin runtime whether privacy mode is on when that changes.
     privacy_wake: tokio::sync::Notify,
     /// What the plugin runtime was last told and acknowledged on the connection the link holds:
-    /// nought for nothing, one for off, two for on.
+    /// nought for nothing, one for off, two for on. For this host's own tests: nothing in the
+    /// product reads it.
+    #[cfg(feature = "testing")]
     runtime_told: std::sync::atomic::AtomicU8,
     /// The highest document number the link has read from the plugin runtime for each binding on
     /// the connection it holds, for this host's own tests: the worker reads a document and drops
@@ -492,6 +494,7 @@ impl ObservationLane {
             privacy_epoch: AtomicU64::new(0),
             checkpoint_wake: tokio::sync::Notify::new(),
             privacy_wake: tokio::sync::Notify::new(),
+            #[cfg(feature = "testing")]
             runtime_told: std::sync::atomic::AtomicU8::new(0),
             #[cfg(feature = "testing")]
             documents_read: Mutex::new(BTreeMap::new()),
@@ -1090,7 +1093,8 @@ impl ObservationLane {
     }
 
     /// Records what the plugin runtime has acknowledged being told about privacy mode on the
-    /// connection the link holds, or that it has been told nothing.
+    /// connection the link holds, or that it has been told nothing. For this host's own tests.
+    #[cfg(feature = "testing")]
     pub fn runtime_was_told(&self, private: Option<bool>) {
         self.runtime_told.store(
             private.map_or(0, |private| if private { 2 } else { 1 }),
@@ -1099,7 +1103,8 @@ impl ObservationLane {
     }
 
     /// Returns what the plugin runtime has acknowledged being told about privacy mode on the
-    /// connection the link holds, where it has acknowledged anything.
+    /// connection the link holds, where it has acknowledged anything. For this host's own tests.
+    #[cfg(feature = "testing")]
     #[must_use]
     pub fn runtime_told(&self) -> Option<bool> {
         match self.runtime_told.load(Ordering::Acquire) {
