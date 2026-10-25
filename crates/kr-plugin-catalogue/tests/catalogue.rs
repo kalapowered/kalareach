@@ -10376,3 +10376,269 @@ async fn kr_req_11_08_an_installation_waits_for_a_repository_that_has_not_follow
         .await
         .expect("and is installed from once it shares the new root");
 }
+
+/// Runs one step of the test's own at the first index document a sync of the repository writes,
+/// after the sync has made its early checks and before the generation is activated: where another
+/// process can synchronise a repository in between.
+struct BeforeTheIndex {
+    then: std::sync::Mutex<Option<Step>>,
+}
+
+impl Authority for BeforeTheIndex {
+    fn check(&self) -> CatalogueResult<()> {
+        Ok(())
+    }
+
+    fn commit(
+        &self,
+        effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
+        if matches!(effect, Effect::Index(_)) {
+            let then = self.then.lock().expect("the step").take();
+            if let Some(then) = then {
+                then();
+            }
+        }
+        commit()
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        false
+    }
+}
+
+/// Synchronises `id` in a catalogue of its own on `home`, as another process would.
+fn sync_elsewhere(home: &std::path::Path, id: RepositoryId) -> Step {
+    let directory = home.join("catalogue");
+    Box::new(move || {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let mut other = Catalogue::open(&directory, local()).expect("a second catalogue");
+            runtime
+                .block_on(other.sync(&id))
+                .expect("the other process synchronises");
+        })
+        .join()
+        .expect("the other process finished");
+    })
+}
+
+/// A publisher's name that no repository holds when a sync makes its early check is held, by the
+/// time the sync commits, by another root that synchronised in between: the commit refuses, and
+/// nothing is activated.
+#[tokio::test]
+async fn kr_req_11_08_a_sync_refuses_a_name_another_root_took_before_its_commit() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let official = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &official,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let vendor = Generation::build(&home.path().join("vendor"), GenerationSpec::default()).await;
+    enrol_as(&mut catalogue, "vendor", RepositoryKind::Vendor, &vendor);
+
+    let racing = BeforeTheIndex {
+        then: std::sync::Mutex::new(Some(sync_elsewhere(home.path(), repository()))),
+    };
+    let refusal = catalogue
+        .sync_with(&named("vendor"), &mut Change::new(&racing))
+        .await
+        .expect_err("the official root came to hold the name while this sync ran");
+    refused_for_a_held_name(&refusal, "kalareach", "official");
+    assert_eq!(
+        catalogue.active(&named("vendor")).expect("enrolled"),
+        None,
+        "nothing of it was activated"
+    );
+    assert!(
+        catalogue.active(&repository()).expect("enrolled").is_some(),
+        "the repository that held the name is as it synchronised"
+    );
+}
+
+/// The directory of a package `name` published by `publisher`.
+fn package_named(publisher: &str, name: &str, directory: &std::path::Path) -> std::path::PathBuf {
+    let presentation = kr_plugin_sdk::example::example_presentation_json();
+    let mut manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
+    manifest.publisher_id =
+        kr_plugin_sdk::ids::PublisherId::new(publisher).expect("a publisher identifier");
+    manifest.plugin_name = kr_plugin_sdk::ids::PluginName::new(name).expect("a plugin name");
+    std::fs::create_dir_all(directory).expect("a directory");
+    let mut text = serde_json::to_string_pretty(&manifest).expect("a manifest");
+    text.push('\n');
+    std::fs::write(directory.join(kr_plugin_sdk::package::MANIFEST_FILE), text).expect("writable");
+    std::fs::write(
+        directory.join(kr_plugin_sdk::package::PRESENTATION_FILE),
+        presentation,
+    )
+    .expect("writable");
+    directory.to_path_buf()
+}
+
+/// A package's publisher name that no repository holds when an installation makes its early check
+/// is held, by the time the installation commits, by another root: the build's own repository,
+/// which the seed enrols whatever else holds the name, was seeded while the package was fetched.
+/// The commit refuses, and nothing is installed.
+#[tokio::test]
+async fn kr_req_11_08_an_installation_refuses_a_name_another_root_took_before_its_commit() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let mut catalogue =
+        Catalogue::open(&home.path().join("catalogue"), local()).expect("a catalogue");
+    let vendor = Generation::build(
+        &home.path().join("vendor"),
+        GenerationSpec {
+            package: Some(package_named(
+                "kalareach",
+                "vendored",
+                &home.path().join("vendor-package"),
+            )),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    enrol_as(&mut catalogue, "vendor", RepositoryKind::Vendor, &vendor);
+    catalogue
+        .sync(&named("vendor"))
+        .await
+        .expect("no other root holds the name yet");
+
+    let official =
+        Generation::build(&home.path().join("official"), GenerationSpec::default()).await;
+    let bundle = support::seed_bundle(&official);
+    let directory = home.path().join("catalogue");
+    let seeding: Step = Box::new(move || {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let mut other = Catalogue::open(&directory, local()).expect("a second catalogue");
+            other.set_fetches_network(false);
+            let outcome =
+                runtime.block_on(other.seed(&bundle, environment(), RepositoryBudgets::defaults()));
+            assert!(outcome.enrolled, "{}", outcome.report());
+        })
+        .join()
+        .expect("the other process finished");
+    });
+    catalogue.set_transport(Arc::new(Interrupting {
+        at: "/packages/",
+        then: Arc::new(std::sync::Mutex::new(Some(seeding))),
+    }));
+    let vendored = PluginId::new("kalareach/vendored").expect("a plugin identifier");
+    let refusal = catalogue
+        .install(
+            &named("vendor"),
+            environment(),
+            &vendored,
+            &version(),
+            vendor.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the build's repository came to hold the name while the package was fetched");
+    refused_for_a_held_name(&refusal, "kalareach", "official");
+    assert!(
+        catalogue
+            .installation(environment(), &vendored)
+            .expect("readable")
+            .is_none(),
+        "nothing was installed"
+    );
+}
+
+/// A name held by a removed repository whose installation stays is held against every root, the
+/// repository's own included, when the checkpoint it left is gone: a record that cannot be read
+/// does not release the name. Removing the installation releases it.
+#[tokio::test]
+async fn kr_req_11_08_a_name_whose_removed_repository_left_no_checkpoint_stays_held() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let official = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &official).await;
+    let checkpoint = catalogue
+        .store(&repository())
+        .expect("a store")
+        .datastore()
+        .join("root.json");
+    catalogue.remove_repository(&repository()).expect("removed");
+    std::fs::remove_file(&checkpoint).expect("the checkpoint is removable");
+
+    enrol_as(&mut catalogue, "again", RepositoryKind::Mirror, &official);
+    let refusal = catalogue
+        .sync(&named("again"))
+        .await
+        .expect_err("the name is held by a repository whose root is not known");
+    refused_for_a_held_name(&refusal, "kalareach", "official");
+    let vendor = Generation::build(&home.path().join("vendor"), GenerationSpec::default()).await;
+    enrol_as(&mut catalogue, "vendor", RepositoryKind::Vendor, &vendor);
+    let refusal = catalogue
+        .sync(&named("vendor"))
+        .await
+        .expect_err("and against another root");
+    refused_for_a_held_name(&refusal, "kalareach", "official");
+
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("the installation is removed");
+    catalogue
+        .sync(&named("again"))
+        .await
+        .expect("nothing holds the name now");
+}
+
+/// A repository that follows a verified rotation is not held back by a repository still on the
+/// root it left, for as long as that one has not followed: each of its syncs after the rotation,
+/// not only the one that made it, is accepted, and the repository that stayed follows when it
+/// synchronises.
+#[tokio::test]
+async fn kr_req_11_08_syncs_after_a_rotation_are_not_held_by_a_repository_on_the_old_root() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let official = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &official,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    enrol_as(&mut catalogue, "mirror", RepositoryKind::Mirror, &official);
+    catalogue.sync(&repository()).await.expect("official");
+    catalogue.sync(&named("mirror")).await.expect("mirror");
+
+    let renewed = KeySet::generate();
+    for generation in [2, 3] {
+        official
+            .rotate_to(GenerationSpec {
+                generation,
+                root_version: 2,
+                keys: Some(renewed.clone()),
+                ..GenerationSpec::default()
+            })
+            .await;
+        catalogue
+            .sync(&repository())
+            .await
+            .unwrap_or_else(|refusal| {
+                panic!("generation {generation}, the mirror is still on the old root: {refusal}")
+            });
+    }
+    assert_eq!(
+        catalogue
+            .active(&repository())
+            .expect("enrolled")
+            .map(|active| active.generation),
+        Some(3)
+    );
+
+    catalogue
+        .sync(&named("mirror"))
+        .await
+        .expect("the mirror follows the rotation and shares the new root");
+}
