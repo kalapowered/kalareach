@@ -6729,8 +6729,8 @@ async fn a_host_that_backed_up_twice(timer: Arc<HeldTimer>) -> Rig {
     rig
 }
 
-/// KR-REQ-24.29, stage B: privacy mode lists a published generation of the host's own archive as a
-/// copy the person can have deleted. (Before, the list said the host had no way to ask.)
+/// KR-REQ-24.29: privacy mode lists a published generation of the host's own archive as a copy the
+/// person can have deleted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_lists_each_published_generation_as_one_the_person_can_have_deleted() {
     let rig = a_host_that_backed_up_twice(HeldTimer::held()).await;
@@ -6745,7 +6745,7 @@ async fn privacy_mode_lists_each_published_generation_as_one_the_person_can_have
     }
 }
 
-/// KR-REQ-24.29, stage B, and KR-ACC-033: under privacy mode, the person's deletion of one
+/// KR-REQ-24.29 and KR-ACC-033: under privacy mode, the person's deletion of one
 /// generation asks the service to delete every object of that generation, and no object of another
 /// generation or of another collection of the account. Privacy mode stays on and the report says
 /// what became of the copy.
@@ -6801,7 +6801,7 @@ async fn a_generation_the_person_deletes_under_privacy_mode_goes_from_the_servic
     assert!(kept.deletable);
 }
 
-/// KR-REQ-24.29, stage B: a copy the host cannot ask the service to delete, and a reference the
+/// KR-REQ-24.29: a copy the host cannot ask the service to delete, and a reference the
 /// list does not hold, are refused by their codes and send nothing. The control is the same call
 /// once the host has its setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6859,7 +6859,7 @@ async fn a_deletion_the_host_cannot_make_is_refused_and_sends_nothing() {
     assert_eq!(web.requests_to(DELETE), first_objects().len());
 }
 
-/// KR-REQ-24.29, stage B: an answer the service did not give leaves the deletion asked and not
+/// KR-REQ-24.29: an answer the service did not give leaves the deletion asked and not
 /// confirmed; the list says so, and asking again under privacy mode sends what is still unanswered
 /// and confirms it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6906,7 +6906,7 @@ async fn a_deletion_whose_answer_was_lost_is_shown_as_asked_and_completes_when_a
     }
 }
 
-/// KR-REQ-24.29, stage B: a deletion asked under privacy mode and not confirmed survives a restart
+/// KR-REQ-24.29: a deletion asked under privacy mode and not confirmed survives a restart
 /// as its written-down request. While privacy mode stays on the restarted host sends nothing the
 /// person has not just asked for; once it is off the host sends what was asked, with no second ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6972,16 +6972,13 @@ async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privac
     }
 }
 
-/// KR-REQ-24.29, stage B: a generation the person is deleting does not count as the backup the
+/// KR-REQ-24.29: a generation the person is deleting does not count as the backup the
 /// host has. When it is the newest, the first pass after privacy mode goes off makes a new
 /// generation although nothing changed and a day has not passed, and the service holds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_person() {
     let timer = HeldTimer::held();
-    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
-        closed_session(host, b"first line\r\nsecond line\r\n", 9_000);
-    })
-    .await;
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
     rig.set_up();
@@ -7003,8 +7000,7 @@ async fn the_next_backup_is_made_when_the_newest_generation_was_deleted_by_the_p
 
     rig.until("a new generation is published", |rig| rig.published(2))
         .await;
-    // Privacy mode removed the closed session's output meanwhile, so the new generation holds the
-    // configuration the deleted one held and not the output.
+    // Nothing the host holds changed, so the new generation holds what the deleted one held.
     assert_eq!(
         opened_members(&rig, 2)["host/configuration.json"],
         before["host/configuration.json"],

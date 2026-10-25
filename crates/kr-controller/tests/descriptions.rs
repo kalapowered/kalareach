@@ -1607,9 +1607,8 @@ async fn pressure_and_bad_output_never_replace_a_title_and_describe_says_why() {
 }
 
 /// KR-REQ-24.11, KR-REQ-22.05, KR-REQ-22.17, KR-REQ-24.27: privacy mode removes the generated
-/// description and shows the
-/// metadata title at once, nothing captured while it is on is described, and turning it off lets
-/// the session be described again under the new generation.
+/// description and shows the metadata title at once, nothing captured while it is on is described,
+/// and turning it off lets the session be described again under the new generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_removes_the_description_and_describes_nothing_captured_while_it_is_on() {
     let environment = Environment::start(Setup::new()).await;
@@ -2542,8 +2541,8 @@ async fn a_summary_is_served_to_a_device_that_reaches_every_moment_and_to_none_w
 }
 
 /// KR-REQ-18.02, KR-REQ-24.11, KR-REQ-22.17 and KR-REQ-24.27: privacy mode removes the summaries
-/// with the descriptions: none is
-/// answered while it is on, and none that was written before it is answered after it.
+/// with the descriptions: none is answered while it is on, and none that was written before it is
+/// answered after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_removes_the_summaries_and_none_returns_after_it() {
     let environment = Environment::start(Setup::new()).await;
@@ -2917,9 +2916,9 @@ async fn a_daemon_replaced_while_the_old_process_lives_loads_nothing_until_it_ha
 }
 
 /// KR-REQ-24.11, KR-REQ-22.17 and KR-REQ-24.28: a load in flight when privacy mode is enabled is
-/// cancelled, and privacy mode's
-/// change is not complete until it has answered; nothing is loaded for a session captured before.
-/// The stub holds the load until it is cancelled, so nothing but the cancellation ends it.
+/// cancelled, and privacy mode's change is not complete until it has answered; nothing is loaded
+/// for a session captured before. The stub holds the load until it is cancelled, so nothing but the
+/// cancellation ends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_load_in_flight_is_cancelled_when_privacy_mode_is_enabled() {
     let environment = Environment::start(Setup {
