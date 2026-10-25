@@ -716,6 +716,76 @@ async fn kr_req_14_11_a_prompt_naming_a_draft_is_refused_on_the_workers_own_sock
     assert_eq!(error.code, ErrorCode::UnsupportedCapability);
 }
 
+/// KR-REQ-12.06: a prompt that names a draft is held to the instance's binding as one that carries
+/// its text is. A binding that moved after the prompt was prepared is `STALE_SESSION`, an instance
+/// whose rich mutations are suspended is `DRAFT_CONFLICT`, and neither reaches the upstream; the
+/// same prompt at the binding's revision is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_prompt_naming_a_draft_is_held_to_the_instances_binding() {
+    for (cause, expected) in [
+        ("a moved binding", Some(ErrorCode::StaleSession)),
+        ("a suspended instance", Some(ErrorCode::DraftConflict)),
+        ("neither", None),
+    ] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(
+            &host,
+            Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+        );
+        let client = cli(&host).await;
+        let mut daemon = daemon(&host).await;
+        let mut mutation = prompt_mutation(&client, &host, 31);
+        mutation.params = ParamsValue::from_typed(&AgentPromptParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            draft_id: Nullable::some(DraftId::new(kr_ipc::new_uuid())),
+            text: Nullable::null(),
+        })
+        .expect("encodes");
+        match cause {
+            "a moved binding" => {
+                host.service
+                    .broker()
+                    .advance_binding(
+                        instance(),
+                        Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                        TimestampMs::new(5),
+                    )
+                    .expect("the binding moves");
+            }
+            "a suspended instance" => host
+                .service
+                .broker()
+                .suspend_rich_mutations(instance(), "a frame the table does not classify arrived")
+                .expect("the instance is held"),
+            _ => {}
+        }
+        let answer = forward_as_device(&mut daemon, &mutation, &[]).await;
+        match expected {
+            Some(code) => {
+                let error = answer.expect_err(cause);
+                assert_eq!(error.code, code, "{cause}");
+                assert_eq!(
+                    upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{cause}: nothing reached the upstream"
+                );
+            }
+            None => {
+                answer.expect("a prompt at the binding's revision is carried");
+                assert_eq!(
+                    upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "and reaches the upstream"
+                );
+            }
+        }
+    }
+}
+
 /// KR-REQ-14.11: a prompt the control daemon forwards for a local caller with no lifetime left is
 /// answered only from a receipt the worker holds, which is how the daemon learns whether a draft
 /// the prompt names was recorded for an earlier attempt: the receipt as it stands for the same
