@@ -337,8 +337,8 @@ const GENERAL_STEMS: [&str; 7] = [
 fn first_general_command<'a>(
     table: &[(&'a str, Option<kr_protocol::method::Method>)],
 ) -> Option<(&'a str, &'static str)> {
-    for (command, _method) in table {
-        if *command == "shell_launch" || *command == "plugin_action_invoke" {
+    for (command, method) in table {
+        if method.is_some_and(|method| method.as_str().replace('.', "_") == *command) {
             continue;
         }
         let lowered = command.to_ascii_lowercase();
