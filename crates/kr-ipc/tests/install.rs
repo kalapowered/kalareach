@@ -833,6 +833,62 @@ fn a_sealed_release_is_removed_whole() {
     assert!(left.is_empty(), "and neither has the trash: {left:?}");
 }
 
+#[cfg(windows)]
+#[test]
+fn probe_how_a_sealed_file_is_removed() {
+    use std::process::{Command, Stdio};
+    let test = TestStore::create();
+    let directory = test.root.join("probe");
+    std::fs::create_dir_all(&directory).expect("a directory");
+    let run = |program: &str, args: &[&str]| {
+        let status = Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("runs");
+        assert!(status.success(), "{program} {args:?}");
+    };
+    // (name, read-only attribute, rights denied to the owner)
+    for (name, readonly, denies) in [
+        ("plain", false, ""),
+        ("ro", true, ""),
+        ("deny-wd", false, "WD,AD"),
+        ("deny-wa", false, "WA"),
+        ("ro-deny-wd", true, "WD,AD"),
+        ("ro-deny-wa", true, "WA"),
+        ("ro-deny-wd-wa", true, "WD,AD,WEA,WA"),
+        ("deny-d", false, "D"),
+    ] {
+        let file = directory.join(name);
+        std::fs::write(&file, b"data").expect("a file");
+        let path = file.display().to_string();
+        if readonly {
+            run("attrib", &["+r", &path]);
+        }
+        run(
+            "icacls",
+            &[
+                &path,
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-3-4:(RC,WDAC,REA,RA,RX,S)",
+            ],
+        );
+        if !denies.is_empty() {
+            run("icacls", &[&path, "/deny", &format!("*S-1-3-4:({denies})")]);
+        }
+        eprintln!(
+            "PROBE {name}: remove_file {:?}",
+            std::fs::remove_file(&file).map_err(|e| e.raw_os_error())
+        );
+    }
+    eprintln!(
+        "PROBE remove_dir_all {:?}",
+        std::fs::remove_dir_all(&directory).map_err(|e| e.raw_os_error())
+    );
+}
+
 /// KR-REQ-26.06: a read of a file of a release is not refused by the question whether the release
 /// is held, which opens the manifest with no sharing for an instant: `kr host versions` asks it of
 /// every release while another command reads a manifest. A manifest is read two thousand times while
