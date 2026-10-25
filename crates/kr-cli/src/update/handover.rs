@@ -342,7 +342,8 @@ pub async fn writers_lock(
 /// The command that ends a process on this platform, for a message that tells a person how to stop
 /// a daemon that does not answer; the process identifier follows it.
 const STOP_COMMAND: &str = if cfg!(windows) {
-    "taskkill /PID"
+    // Forced: a daemon has no window to ask to close, and `taskkill` without `/F` refuses it.
+    "taskkill /F /PID"
 } else {
     "kill"
 };
