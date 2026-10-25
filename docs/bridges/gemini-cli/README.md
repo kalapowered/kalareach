@@ -1,5 +1,13 @@
 # The Gemini CLI bridge
 
+This host refuses the Gemini CLI recipe. It names an application directory for Claude Code only, so
+nothing of what follows is installed, the worker admits no Gemini CLI hook, and a Gemini CLI session
+gets no hook observation (see "Native bridge recipes" in [the plugin reference](../plugins/README.md#one-contract-for-every-application)).
+The guide describes the extension the package declares and what its hooks would report, as read from
+Gemini CLI 0.60.0. The command integration is separate and still applies when the owner turns it on:
+`GEMINI_CLI_NO_RELAUNCH` is set in the launch, with the effects under "Limits", and there is no hook
+to start.
+
 Gemini CLI runs a hook for an event and reads what the hook answers. The Gemini CLI connector
 package installs a small extension that makes Gemini CLI start `kr-hook`, the core forwarder, for
 three of its events, and the forwarder carries each event to the worker that owns the launch. The
