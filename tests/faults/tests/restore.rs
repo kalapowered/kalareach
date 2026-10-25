@@ -85,6 +85,13 @@ fn a_client_arriving_around_a_reset_of_the_alternate_buffer_holds_the_screen() {
     restored("alternate-resets");
 }
 
+/// KR-REQ-27.06: a client that arrives after the application saved a cursor in origin mode and left
+/// origin mode holds the session's screen, with origin mode off and the saved cursor as it was.
+#[test]
+fn a_client_arriving_after_a_cursor_was_saved_in_origin_mode_holds_the_screen() {
+    restored("saved-origin");
+}
+
 /// KR-REQ-27.06: a clipboard write, a bell, a notification or a query that happened before a
 /// client arrived never happens to that client, whatever point it arrived at; one that happens
 /// after it arrived reaches the client holding the input lease once and no other client. That
@@ -150,6 +157,7 @@ fn every_kept_corpus_is_run() {
         "alternate-47-1047",
         "alternate-resets",
         "mid-output",
+        "saved-origin",
         "sequences",
         "side-effects",
     ];

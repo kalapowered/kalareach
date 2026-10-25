@@ -1,0 +1,14 @@
+{
+  "format": "kalareach.restore-corpus/1",
+  "name": "saved-origin",
+  "about": "a cursor saved in origin mode inside a scroll region and left and right margins, origin mode left afterwards, and a second save made with origin mode off",
+  "columns": 20,
+  "rows": 6,
+  "writes": [
+    { "text": "plain line\r\n" },
+    { "text": "\u001b[?69h\u001b[3;15s\u001b[2;5r\u001b[?6h\u001b[2;3Hin origin\u001b7" },
+    { "text": "\u001b[?6l\u001b[6;1Hout again" },
+    { "text": "\u001b8 restored" },
+    { "text": "\u001b[?6l\u001b[1;1Hhome\u001b7\u001b[?6h\u001b[1;1Hregion" }
+  ]
+}
