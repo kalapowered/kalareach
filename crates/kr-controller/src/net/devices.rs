@@ -382,7 +382,7 @@ pub struct DeviceDirectory {
 }
 
 /// Why the registry database could not take its write lock, when another write holding it is not
-/// the reason ([`DeviceDirectory::write_lock_is_free`]).
+/// the reason ([`LockProbe::write_lock_is_free`]).
 #[derive(Debug)]
 pub(crate) struct Unwritable {
     /// What a person who reads `kr doctor` is told, from a closed set this build writes: the
@@ -416,6 +416,78 @@ impl Unwritable {
         Self {
             kind,
             detail: error.to_string(),
+        }
+    }
+}
+
+/// A connection of its own to the registry database, for one question: whether a write to it is
+/// under way.
+///
+/// The daemon's handles on the pairing records are shared, and an ask that waits for the lock
+/// through one holds it for every other user of that handle, readers included. This connection is
+/// the question's alone. A write holds the database's write lock from its first statement, through
+/// whichever handle it runs, so an immediate transaction here waits for each write that began
+/// before it, whichever handle that was.
+pub(crate) struct LockProbe(Connection);
+
+impl LockProbe {
+    /// Opens the registry database for writing, and does not create it: a database file that is
+    /// gone is a failure to take the lock and not an empty database to take it on.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the database could not be opened.
+    pub(crate) fn open(path: impl AsRef<Path>) -> std::result::Result<Self, Unwritable> {
+        use rusqlite::OpenFlags;
+
+        let connection = kr_flush::release::open_connection(
+            path.as_ref(),
+            Some(
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ),
+        )
+        .map_err(Unwritable::of)?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(Unwritable::of)?;
+        Ok(Self(connection))
+    }
+
+    /// The connection, for this crate's own tests to set up what a case needs of it.
+    #[cfg(test)]
+    pub(crate) const fn connection(&self) -> &Connection {
+        &self.0
+    }
+
+    /// Takes the registry database's write lock and gives it back at once, to learn that no write
+    /// is under way on any handle on the database.
+    ///
+    /// A write that holds the lock makes this wait for the busy timeout. `Ok(false)` says that the
+    /// wait ended with the lock still held, so a caller that needs every write that began earlier
+    /// to have ended asks again. A failure to take the lock for another reason, such as a table
+    /// that is locked, is an [`Unwritable`]: SQLite does not wait out the busy timeout for it, and
+    /// it says nothing of a write on another handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the database could not take the lock, when another write holding it is not the
+    /// reason.
+    pub(crate) fn write_lock_is_free(&mut self) -> std::result::Result<bool, Unwritable> {
+        use rusqlite::ErrorCode;
+
+        match self
+            .0
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        {
+            Ok(transaction) => transaction.commit().map(|()| true).map_err(Unwritable::of),
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == ErrorCode::DatabaseBusy =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(Unwritable::of(error)),
         }
     }
 }
@@ -685,37 +757,6 @@ impl DeviceDirectory {
         let value = body(&transaction)?;
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(value)
-    }
-
-    /// Takes the registry database's write lock and gives it back at once, to learn that no write
-    /// is under way on any handle on the database.
-    ///
-    /// A write that holds the lock makes this wait for the handle's busy timeout. `Ok(false)` says
-    /// that the wait ended with the lock still held, so a caller that needs every write that began
-    /// earlier to have ended asks again. A failure to take the lock for another reason, such as a
-    /// table that is locked, is an [`Unwritable`]: SQLite does not wait out the busy timeout for
-    /// it, and it says nothing of a write on another handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the database could not take the lock, when another write holding it is not the
-    /// reason.
-    pub(crate) fn write_lock_is_free(&self) -> std::result::Result<bool, Unwritable> {
-        use rusqlite::ErrorCode;
-
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
-            Ok(transaction) => transaction.commit().map(|()| true).map_err(Unwritable::of),
-            Err(rusqlite::Error::SqliteFailure(failure, _))
-                if failure.code == ErrorCode::DatabaseBusy =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(Unwritable::of(error)),
-        }
     }
 
     /// Runs `body` inside one immediate transaction on this directory's connection, and commits

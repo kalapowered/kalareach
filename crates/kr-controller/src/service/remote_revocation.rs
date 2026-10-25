@@ -24,7 +24,7 @@ use super::{Controller, FeedStanding};
 use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
 use crate::grants::{AccessRequest, GrantRecord, Refusal, RemoteRefusal, StoredRemoval};
-use crate::service::net::devices::DeviceRecord;
+use crate::service::net::devices::{DeviceRecord, LockProbe, Unwritable};
 
 /// The method whose decision stands for "this device holds `host.manage` at the paired-device
 /// door". It is not asked for to list devices.
@@ -44,9 +44,13 @@ const DRAIN_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// How long one ask of the wait for the pairing records' write lock may go on before the wait is
 /// said to be stuck. The database's busy timeout is five seconds, so an ask that is held up by a
-/// write is answered before this; one that is still going is waiting for the daemon's handle on
-/// the pairing records, which a user of it holds.
+/// write is answered before this; one that is still going has not been answered by the database
+/// at all, as a stalled disk or a runtime with no thread free for it leaves it.
 const DRAIN_ASK_DUE: std::time::Duration = std::time::Duration::from_secs(7);
+
+/// One ask of the wait for the pairing records' write lock: whether no write is under way, or why
+/// the registry could not say.
+pub(crate) type LockAsk = dyn Fn() -> std::result::Result<bool, Unwritable> + Send + Sync;
 
 /// A wait for the pairing records' write lock that has gone on past the database's busy timeout,
 /// which `kr doctor` says while it goes on.
@@ -54,8 +58,26 @@ const DRAIN_ASK_DUE: std::time::Duration = std::time::Duration::from_secs(7);
 pub(crate) struct StuckDrain {
     /// When the wait first failed to take the lock, in wall-clock milliseconds.
     pub(crate) since_ms: u64,
+    /// When the reason that stands now was first found, in wall-clock milliseconds. The wait can
+    /// have gone on for longer than its reason has.
+    pub(crate) why_since_ms: u64,
     /// Why it has not taken it.
     pub(crate) why: DrainWhy,
+}
+
+impl StuckDrain {
+    /// What the wait is at `now_ms` for a failed attempt that found `why`, when it was `before`:
+    /// the wait keeps the time of its first failed attempt, and a reason keeps its own time for as
+    /// long as it stands.
+    pub(crate) fn found(before: Option<Self>, why: DrainWhy, now_ms: u64) -> Self {
+        Self {
+            since_ms: before.map_or(now_ms, |before| before.since_ms),
+            why_since_ms: before
+                .filter(|before| before.why == why)
+                .map_or(now_ms, |before| before.why_since_ms),
+            why,
+        }
+    }
 }
 
 /// Why a wait for the pairing records' write lock has not taken it.
@@ -63,8 +85,8 @@ pub(crate) struct StuckDrain {
 pub(crate) enum DrainWhy {
     /// A write has held the lock for longer than the database's busy timeout.
     Held,
-    /// The ask has not been answered within the bound, which a user of the daemon's handle on the
-    /// pairing records can bring about without any write.
+    /// The ask has not been answered within the bound, which a stalled disk or a runtime with no
+    /// thread free for it can bring about without any write.
     Unanswered,
     /// The database could not take the lock, for the reason given in words this build writes.
     Failed(&'static str),
@@ -926,6 +948,7 @@ impl Controller {
     ///
     /// Returns an error when the device directory cannot be read. The refusal is raised all the
     /// same.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) async fn note_unverified_withdrawal(&self, found: &Unverified) -> Result<()> {
         let (wait_owed, keys) = self.refuse_for_an_unverified_withdrawal(found).await;
         if wait_owed {
@@ -934,14 +957,18 @@ impl Controller {
         keys
     }
 
-    /// As [`Self::note_unverified_withdrawal`], without the wait, for a caller that has more to do
-    /// before it waits: the keys of the devices the withdrawal names are known here, and the
-    /// caller sends the feed the shorter list before it waits for the registry.
+    /// Records that the feed shows complete a withdrawal this host cannot verify, which names what
+    /// `found` holds, and refuses every remote grant from this moment, without the wait for the
+    /// writes to the pairing records that were under way. The keys of the devices the withdrawal
+    /// names are known here, and the caller sends the feed the shorter list before it waits for the
+    /// registry. What a scan found so far is added to what the host holds, so a device is not
+    /// given its standing back while the scan goes on to the request that names it.
     ///
     /// Returns whether a refusal rose, which owes the wait
     /// ([`Self::wait_for_the_confirmations_being_spent`]), and whether the device directory could
     /// be read for the keys. A caller that goes on to anything else waits all the same: a refusal
-    /// that already stands owes no wait to a later scan.
+    /// that already stands owes no wait to a later scan. The refusal is raised when the directory
+    /// cannot be read, and the error is returned beside it.
     pub(crate) async fn refuse_for_an_unverified_withdrawal(
         &self,
         found: &Unverified,
@@ -1184,18 +1211,36 @@ impl Controller {
     /// the lock and nowhere else, since a failure to take the lock says nothing of a write on
     /// another handle. The refusal is in force while this waits, and so is the wait of whatever
     /// called it: the carrier makes no request meanwhile, and `kr doctor` and the log say that
-    /// the wait goes on, and why ([`Self::stuck_drain`]). Each ask holds the connection of the
-    /// daemon's own handle on the pairing records, so other users of that handle wait as long.
+    /// the wait goes on, and why ([`Self::stuck_drain`]). Each ask is made on a connection of its
+    /// own, so no other user of the daemon's handle on the pairing records waits for it.
     ///
     /// The only caller is the carrier's one pass at a time, so two waits do not overlap. The
     /// removal of the host does not wait, whether the carrier raises it or a start restores it.
     pub(crate) async fn wait_for_the_confirmations_being_spent(&self) {
+        let path = self.paths.registry_database();
+        let ask: Arc<LockAsk> = Arc::new(move || {
+            LockProbe::open(&path).and_then(|mut probe| probe.write_lock_is_free())
+        });
+        #[cfg(test)]
+        let ask = self
+            .lock_ask
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or(ask);
+        self.wait_for_the_registry_to_take_a_write(ask).await;
+    }
+
+    /// The wait of [`Self::wait_for_the_confirmations_being_spent`], over `ask`, which opens a
+    /// connection of its own to the registry and asks it whether a write is under way. Each ask runs
+    /// on a thread that may block, and is made again at once for as long as a write holds the lock.
+    async fn wait_for_the_registry_to_take_a_write(&self, ask: Arc<LockAsk>) {
         loop {
-            let devices = Arc::clone(&self.devices);
-            let mut ask = tokio::task::spawn_blocking(move || devices.write_lock_is_free());
-            // An ask still going after the busy timeout has not been answered by the database,
-            // which a user of the handle holds up without any write, and the wait is said to be
-            // stuck all the same. The ask is not given up: the lock is what ends the wait.
+            let ask = Arc::clone(&ask);
+            let mut ask = tokio::task::spawn_blocking(move || ask());
+            // An ask still going after the busy timeout has not been answered by the database, and
+            // the wait is said to be stuck all the same. The ask is not given up: the lock is what
+            // ends the wait.
             let answered = match tokio::time::timeout(DRAIN_ASK_DUE, &mut ask).await {
                 Ok(answered) => answered,
                 Err(_) => {
@@ -1227,10 +1272,7 @@ impl Controller {
         let said = {
             let mut stuck = self.feed_drain();
             let before = *stuck;
-            *stuck = Some(StuckDrain {
-                since_ms: before.map_or(now, |stuck| stuck.since_ms),
-                why,
-            });
+            *stuck = Some(StuckDrain::found(before, why, now));
             before.is_none_or(|before| before.why != why)
         };
         if said {
@@ -1887,57 +1929,21 @@ mod tests {
         );
     }
 
-    /// KR-REQ-24.15: a refusal that rises returns only when every write to the pairing records
-    /// that was under way has ended. An owner confirmation reads the refusal inside its write, so
-    /// one that read it before it rose has been committed by the time the rise returns, and one
-    /// that begins after reads it raised: no confirmation is spent under a standing that a raise
-    /// that has returned took away. The write is held open here through a second handle on the
-    /// database, as the network's rows are, and the daemon's handle gives up on the lock at once
-    /// whenever it is asked, as it does when the database's busy timeout has run out: the rise has
-    /// asked more times than any bound on its asks would allow, and has not returned, and it
-    /// returns once the write has ended.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refusal_that_rises_waits_for_a_write_to_the_pairing_records_that_is_under_way() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    /// A refusal on every remote grant that rises as a scan raises it, with the wait that follows
+    /// its rise made over `ask`, as the cases below arrange. Returns the task that is in the rise,
+    /// once the refusal stands.
+    async fn waiting(
+        controller: &std::sync::Arc<super::Controller>,
+        ask: std::sync::Arc<super::LockAsk>,
+    ) -> tokio::task::JoinHandle<()> {
+        use super::RemoteRefusal;
 
-        use super::{DrainWhy, RemoteRefusal, StuckDrain};
-        use crate::service::a_transfer_left_unanswered::daemon;
-        use crate::service::net::devices::DeviceDirectory;
-
-        /// How many times the daemon's handle has been told the database is busy.
-        static BUSY: AtomicUsize = AtomicUsize::new(0);
-        fn busy(_: i32) -> bool {
-            BUSY.fetch_add(1, Ordering::SeqCst);
-            false
-        }
-        /// More asks than a bound of a dozen would allow.
-        const MANY_ASKS: usize = 30;
-
-        let (temp, controller) = daemon().await;
-        controller
-            .devices()
-            .with(|connection| connection.busy_handler(Some(busy)))
-            .expect("the daemon's handle gives up on a held lock at once");
-        let beside = DeviceDirectory::open_beside(
-            temp.environment().registry_database(),
-            controller.devices(),
-        )
-        .expect("a second handle on the registry");
-        let (inside, under_way) = tokio::sync::oneshot::channel();
-        let (go, held_open) = std::sync::mpsc::channel::<()>();
-        let write = std::thread::spawn({
-            move || {
-                beside.transaction(|_| {
-                    inside.send(()).expect("the case waits for the write");
-                    held_open.recv().expect("the case lets the write go on");
-                    Ok(())
-                })
-            }
-        });
-        under_way.await.expect("the write is under way");
-
+        *controller
+            .lock_ask
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ask);
         let rise = tokio::spawn({
-            let controller = std::sync::Arc::clone(&controller);
+            let controller = std::sync::Arc::clone(controller);
             async move {
                 controller
                     .move_a_feed_refusal(
@@ -1952,13 +1958,103 @@ mod tests {
         while controller.remote_refusal().standing().is_none() {
             tokio::task::yield_now().await;
         }
-        while BUSY.load(Ordering::SeqCst) < MANY_ASKS && !rise.is_finished() {
+        rise
+    }
+
+    /// A write to the pairing records, held open on a handle beside the daemon's until the case lets
+    /// it go.
+    fn a_write_held_open(
+        temp: &kr_ipc::testing::TempHost,
+        controller: &std::sync::Arc<super::Controller>,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<crate::error::Result<()>>,
+    ) {
+        use crate::service::net::devices::DeviceDirectory;
+
+        let beside = DeviceDirectory::open_beside(
+            temp.environment().registry_database(),
+            controller.devices(),
+        )
+        .expect("a second handle on the registry");
+        let (inside, under_way) = std::sync::mpsc::channel::<()>();
+        let (go, held_open) = std::sync::mpsc::channel::<()>();
+        let write = std::thread::spawn(move || {
+            beside.transaction(|_| {
+                inside.send(()).expect("the case waits for the write");
+                held_open.recv().expect("the case lets the write go on");
+                Ok(())
+            })
+        });
+        under_way.recv().expect("the write is under way");
+        (go, write)
+    }
+
+    /// Waits until the wait of a raise has said it goes on, or it has returned. The bound only
+    /// keeps a case that went wrong from hanging.
+    async fn until_the_wait_says_it_goes_on(
+        controller: &std::sync::Arc<super::Controller>,
+        waiting: &tokio::task::JoinHandle<()>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while controller.stuck_drain().is_none() && !waiting.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the wait says that it goes on");
+    }
+
+    /// KR-REQ-24.15: a refusal that rises returns only when every write to the pairing records
+    /// that was under way has ended. An owner confirmation reads the refusal inside its write, so
+    /// one that read it before it rose has been committed by the time the rise returns, and one
+    /// that begins after reads it raised: no confirmation is spent under a standing that a raise
+    /// that has returned took away. The write is held open here on a handle beside the daemon's, as
+    /// the network's rows are, and the wait's connection gives up on the lock at once whenever it
+    /// is asked, as it does when the database's busy timeout has run out: the wait has asked more
+    /// times than any bound on its asks would allow, and has not returned, and it returns once the
+    /// write has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_that_rises_waits_for_a_write_to_the_pairing_records_that_is_under_way() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::{DrainWhy, LockProbe, StuckDrain};
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        /// How many times the wait's connection has been told the database is busy.
+        static BUSY: AtomicUsize = AtomicUsize::new(0);
+        fn busy(_: i32) -> bool {
+            BUSY.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+        /// More asks than a bound of a dozen would allow.
+        const MANY_ASKS: usize = 30;
+
+        let (temp, controller) = daemon().await;
+        let (go, write) = a_write_held_open(&temp, &controller);
+        let path = temp.environment().registry_database();
+        let waiting = waiting(
+            &controller,
+            std::sync::Arc::new(move || {
+                let mut probe = LockProbe::open(&path)?;
+                probe
+                    .connection()
+                    .busy_handler(Some(busy))
+                    .expect("the wait's connection gives up on a held lock at once");
+                probe.write_lock_is_free()
+            }),
+        )
+        .await;
+        assert!(
+            controller.remote_refusal().standing().is_some(),
+            "the refusal stands"
+        );
+        while BUSY.load(Ordering::SeqCst) < MANY_ASKS && !waiting.is_finished() {
             tokio::task::yield_now().await;
         }
         assert!(
-            !rise.is_finished(),
-            "the refusal stands, and its rise has not returned while a write is under way, \
-             however many times it asked"
+            !waiting.is_finished(),
+            "the rise has not returned while a write is under way, however many times it asked"
         );
         assert!(
             matches!(
@@ -1976,7 +2072,8 @@ mod tests {
             .join()
             .expect("the write ends")
             .expect("the write commits");
-        rise.await
+        waiting
+            .await
             .expect("the rise returns once the write has ended");
         assert!(
             controller.stuck_drain().is_none(),
@@ -1984,49 +2081,135 @@ mod tests {
         );
     }
 
-    /// A raise of the refusal that waits for the pairing records, started while the daemon's own
-    /// handle keeps the registry from taking a write, as the cases below arrange.
-    fn rising(controller: &std::sync::Arc<super::Controller>) -> tokio::task::JoinHandle<()> {
-        use super::RemoteRefusal;
-
-        tokio::spawn({
-            let controller = std::sync::Arc::clone(controller);
-            async move {
-                controller
-                    .move_a_feed_refusal(
-                        RemoteRefusal::WITHDRAWAL_UNVERIFIED,
-                        true,
-                        crate::grants::HostPolicy::withdrawal_unverified,
-                        crate::grants::HostPolicy::set_withdrawal_unverified,
-                    )
-                    .await;
-            }
-        })
-    }
-
-    /// Waits until the wait of a raise has said it goes on, or the raise has returned. The bound
-    /// only keeps a case that went wrong from hanging.
-    async fn until_the_wait_says_it_goes_on(
-        controller: &std::sync::Arc<super::Controller>,
-        rise: &tokio::task::JoinHandle<()>,
-    ) {
-        tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            while controller.stuck_drain().is_none() && !rise.is_finished() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the wait says that it goes on");
-    }
-
-    /// KR-REQ-24.15: a refusal that rises waits for the daemon's own handle on the pairing records
-    /// as it waits for a write, and says that the wait goes on once an ask has gone past the
-    /// database's busy timeout without an answer, without saying that a write holds the lock. A
-    /// user of the handle holds it here and starts no transaction; nothing is asked of the database
-    /// meanwhile. The wait ends when the handle is let go.
+    /// KR-REQ-24.15: a refusal that rises waits for an ask the database does not answer as it waits
+    /// for a write, and says that the wait goes on once an ask has gone past the database's busy
+    /// timeout without an answer, without saying that a write holds the lock. The ask is parked
+    /// here, in the busy handler of the connection it is made on, while a write holds the lock. The
+    /// wait ends when the write does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wait_held_up_by_a_user_of_the_pairing_records_handle_is_said_to_go_on() {
-        use super::{DrainWhy, StuckDrain};
+        use super::{DrainWhy, LockProbe, StuckDrain};
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        /// What parks the first ask: it takes the receiver and waits for the case to let it go.
+        static PARK: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+            std::sync::Mutex::new(None);
+        fn parked(_: i32) -> bool {
+            let parking = PARK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(parking) = parking {
+                let _ = parking.recv();
+            }
+            false
+        }
+
+        let (temp, controller) = daemon().await;
+        let (go, write) = a_write_held_open(&temp, &controller);
+        let (let_go, parking) = std::sync::mpsc::channel::<()>();
+        *PARK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parking);
+        let path = temp.environment().registry_database();
+        let waiting = waiting(
+            &controller,
+            std::sync::Arc::new(move || {
+                let mut probe = LockProbe::open(&path)?;
+                probe
+                    .connection()
+                    .busy_handler(Some(parked))
+                    .expect("the first ask is parked");
+                probe.write_lock_is_free()
+            }),
+        )
+        .await;
+        until_the_wait_says_it_goes_on(&controller, &waiting).await;
+        assert!(
+            !waiting.is_finished(),
+            "the rise has not returned while the ask is not answered"
+        );
+        assert!(
+            matches!(
+                controller.stuck_drain(),
+                Some(StuckDrain {
+                    why: DrainWhy::Unanswered,
+                    ..
+                })
+            ),
+            "and it says that the wait goes on, and that the ask is not answered"
+        );
+
+        let_go.send(()).expect("the ask is let go");
+        go.send(()).expect("the write goes on");
+        write
+            .join()
+            .expect("the write ends")
+            .expect("the write commits");
+        waiting.await.expect("the rise returns once the write ends");
+        assert!(controller.stuck_drain().is_none());
+    }
+
+    /// KR-REQ-24.15: a refusal that rises waits when the registry cannot take a write for a reason
+    /// other than another write, asks again after a pause, and says that the wait goes on and why.
+    /// A transaction left open on the wait's own connection is such a failure: the connection cannot
+    /// begin another. The wait ends when the transaction does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_for_a_registry_that_cannot_take_a_write_asks_again_and_says_why() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::{DrainWhy, LockProbe, StuckDrain};
+        use crate::service::a_transfer_left_unanswered::daemon;
+
+        /// Whether the ask leaves a transaction open on its connection.
+        static LEFT_OPEN: AtomicBool = AtomicBool::new(true);
+
+        let (temp, controller) = daemon().await;
+        let path = temp.environment().registry_database();
+        let waiting = waiting(
+            &controller,
+            std::sync::Arc::new(move || {
+                let mut probe = LockProbe::open(&path)?;
+                if LEFT_OPEN.load(Ordering::SeqCst) {
+                    probe
+                        .connection()
+                        .execute_batch("BEGIN")
+                        .expect("a transaction is left open");
+                }
+                probe.write_lock_is_free()
+            }),
+        )
+        .await;
+        until_the_wait_says_it_goes_on(&controller, &waiting).await;
+        assert!(
+            !waiting.is_finished(),
+            "the rise has not returned while the registry cannot take a write"
+        );
+        assert!(
+            matches!(
+                controller.stuck_drain(),
+                Some(StuckDrain {
+                    why: DrainWhy::Failed(_),
+                    ..
+                })
+            ),
+            "and it says that the registry could not take the write"
+        );
+
+        LEFT_OPEN.store(false, Ordering::SeqCst);
+        waiting
+            .await
+            .expect("the rise returns once the registry takes a write");
+        assert!(controller.stuck_drain().is_none());
+    }
+
+    /// KR-REQ-24.15: the wait of a refusal that rises asks on a connection of its own, and does not
+    /// share the daemon's handle on the pairing records with the users of that handle. A user holds
+    /// the handle here for as long as the case lets it, and no write is under way: the wait ends,
+    /// where a wait that asked through the handle would wait for the user, and so would every other
+    /// user of the handle wait for the wait while a write holds the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_for_the_registry_is_not_held_up_by_a_user_of_the_daemons_handle() {
         use crate::service::a_transfer_left_unanswered::daemon;
 
         let (_temp, controller) = daemon().await;
@@ -2042,72 +2225,19 @@ mod tests {
         });
         holding.await.expect("the handle is held");
 
-        let rise = rising(&controller);
-        until_the_wait_says_it_goes_on(&controller, &rise).await;
-        assert!(
-            !rise.is_finished(),
-            "the rise has not returned while the handle is held"
-        );
-        assert!(
-            matches!(
-                controller.stuck_drain(),
-                Some(StuckDrain {
-                    why: DrainWhy::Unanswered,
-                    ..
-                })
-            ),
-            "and it says that the wait goes on, and that the ask is not answered"
-        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            controller.wait_for_the_confirmations_being_spent(),
+        )
+        .await
+        .expect("the wait ends while a user holds the daemon's handle");
+        assert!(controller.stuck_drain().is_none());
 
         go.send(()).expect("the handle goes");
         holder
             .join()
             .expect("the holder ends")
             .expect("the handle is let go");
-        rise.await
-            .expect("the rise returns once the handle is free");
-        assert!(controller.stuck_drain().is_none());
-    }
-
-    /// KR-REQ-24.15: a refusal that rises waits when the registry cannot take a write for a reason
-    /// other than another write, asks again after a pause, and says that the wait goes on and why.
-    /// A transaction left open on the daemon's own handle is such a failure: the handle cannot begin
-    /// another. The wait ends when the transaction does.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_wait_for_a_registry_that_cannot_take_a_write_asks_again_and_says_why() {
-        use super::{DrainWhy, StuckDrain};
-        use crate::service::a_transfer_left_unanswered::daemon;
-
-        let (_temp, controller) = daemon().await;
-        controller
-            .devices()
-            .with(|connection| connection.execute_batch("BEGIN"))
-            .expect("a transaction is left open");
-
-        let rise = rising(&controller);
-        until_the_wait_says_it_goes_on(&controller, &rise).await;
-        assert!(
-            !rise.is_finished(),
-            "the rise has not returned while the registry cannot take a write"
-        );
-        assert!(
-            matches!(
-                controller.stuck_drain(),
-                Some(StuckDrain {
-                    why: DrainWhy::Failed(_),
-                    ..
-                })
-            ),
-            "and it says that the registry could not take the write"
-        );
-
-        controller
-            .devices()
-            .with(|connection| connection.execute_batch("ROLLBACK"))
-            .expect("the transaction ends");
-        rise.await
-            .expect("the rise returns once the registry takes a write");
-        assert!(controller.stuck_drain().is_none());
     }
 
     /// KR-REQ-24.15: the feed's removal of this host rises at once while a write to the pairing

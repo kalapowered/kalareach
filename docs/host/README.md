@@ -6724,7 +6724,9 @@ nothing of the refusal and reads no feed, so the refusal ends and a device the w
 confirms again. The owner pairs a new owner device, revokes the devices and grants the withdrawal
 names, sets `authority.origin` back and starts the daemon again. The cost is that the host serves the
 named devices until the owner has revoked them, and learns no remote revocation while it reads no
-feed. A feed that shows a revocation complete that no owner made cannot revive a device. It keeps
+feed. A host that bounds offline validity needs the route finished inside the bound: it synchronises
+with no feed meanwhile, and once the bound ends it refuses every remote request under a personal
+grant, a named owner device's among them. A feed that shows a revocation complete that no owner made cannot revive a device. It keeps
 remote access refused until the owner at the machine revokes what the request names or takes this
 route. While
 the refusal stands, the devices the request names keep no standing over the feed, and neither does a
@@ -6774,7 +6776,8 @@ the device, and the next scan then refuses the request, because the registry hol
 revoked; what the request named is not withdrawn. `kr doctor` names each such device and says so.
 Establishing the clock does not end the wait, because an owner device's confirmation is refused while
 the refusal stands. A reboot of the machine ends a lost continuity, and the host then judges the
-request at its place and carries it out.
+request again with the authority its issuer holds then. It can still refuse the request: the issuer's
+grant may have run out while the request waited.
 When the host has read the feed through it raises the registry to the feed's revision in one barrier
 that fences the workers and withdraws every connection admitted under the earlier state. The next
 revision it issues is then above everything it issued, and it decides again. A pass that stops
@@ -6820,7 +6823,9 @@ a standing the refusal took away. The wait asks for the pairing records' write l
 for as long as a write holds it. It ends when it has the lock and at no other point, so a refusal
 that has risen has returned only when every write to the pairing records that began before it has
 ended. A spend holds the lock for a few milliseconds; the wait goes on past that only for a write
-that does not end, or a registry that cannot take a write at all. The refusal stands meanwhile, the
+that does not end, a registry that cannot take a write at all, or an ask that the database does not
+answer. It asks on a connection of its own, so no other user of the daemon's handle on the pairing
+records waits for it. The refusal stands meanwhile, the
 carrier reads no more of the feed, and `kr doctor` shows the check as a warning that says the
 refusal waits for the registry to take a write, since when, and why; the log says it when the
 wait is first found stuck and when its reason changes. The
@@ -6858,7 +6863,11 @@ removed feed, and the terminal does not open. The terminal confirms the pairing 
 the host's clock only while the host has no owner, and the end of exclusive organisation management
 only while the host is exclusive and no device that could confirm for it is left, which it counts
 without asking the removal. The owner then points `authority.origin` at another feed or at none and
-starts the daemon again, which ends the removal.
+starts the daemon again, which ends the removal. A host that bounds offline validity adds a condition:
+the host reads no feed after the removal, so the bound runs from its last synchronisation, and once it
+ends the host refuses every remote request under a personal grant, an owner device's included. The
+owner then points `authority.origin` at a feed the host can synchronise with, or finishes the route
+inside the bound.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says
