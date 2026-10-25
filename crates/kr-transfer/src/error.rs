@@ -87,7 +87,8 @@ pub enum TransferError {
         /// Which limit, and what it is.
         detail: String,
     },
-    /// The draft's revision is not the one the caller expected.
+    /// The draft is not what the caller expected: its revision moved, an attachment is being
+    /// offered to the agent, or it was written for another application than the prompt's.
     #[error("{detail}")]
     DraftConflict {
         /// What the caller expected and what is current.

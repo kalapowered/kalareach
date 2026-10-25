@@ -312,13 +312,13 @@ impl Harness {
 
 /// Returns the SHA-256 digest of these bytes.
 #[must_use]
+pub fn digest(bytes: &[u8]) -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(bytes))
+}
+
 /// The application the drafts of these suites that name one are written for.
 pub fn an_application() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([10; 16]))
-}
-
-pub fn digest(bytes: &[u8]) -> Digest256 {
-    Digest256::from_bytes(kr_cbor::sha256(bytes))
 }
 
 /// Returns one chunk's descriptor and payload under the protocol's chunk size.
