@@ -1993,14 +1993,17 @@ fn an_install_stopped_before_its_switch_is_finished_by_the_next() {
         kept.join("bin"),
         kept.join(module_tree()[0].0),
     ] {
-        assert!(
+        // A directory of a sealed release is read-only by its access list on Windows, which takes
+        // no new name; the attribute of a directory there means nothing.
+        let sealed = if cfg!(windows) && path.is_dir() {
+            std::fs::File::create(path.join("added")).is_err()
+        } else {
             std::fs::metadata(&path)
                 .expect("installed")
                 .permissions()
-                .readonly(),
-            "{} is read-only",
-            path.display()
-        );
+                .readonly()
+        };
+        assert!(sealed, "{} is read-only", path.display());
     }
 }
 
