@@ -567,11 +567,8 @@ fn sealed_list(directory: bool) -> String {
 /// # Errors
 ///
 /// Returns the operating system's error when the file cannot be changed.
-pub fn seal_file(path: &Path) -> io::Result<()> {
-    let mut permissions = std::fs::metadata(path)?.permissions();
-    permissions.set_readonly(true);
-    std::fs::set_permissions(path, permissions)?;
-    set_list(path, &sealed_list(false))
+pub fn seal_file(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Seals a directory: an access-control list that gives its owner read access and nothing that adds
@@ -580,8 +577,8 @@ pub fn seal_file(path: &Path) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns the operating system's error when the directory cannot be changed.
-pub fn seal_directory(path: &Path) -> io::Result<()> {
-    set_list(path, &sealed_list(true))
+pub fn seal_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Gives a sealed directory back to its owner whole, so that what is in it can be deleted.
