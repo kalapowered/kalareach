@@ -15,6 +15,8 @@
 //! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words; a request that waits for its decode is not given to a component whose binding loses the trust to decode it meanwhile |
 //! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
 //! | KR-REQ-11.21 and KR-REQ-11.33 | the answer to an approval a component read is the bytes that component encoded, written to the upstream once; an approval the connector's table read is answered with the table's bytes, and no component is asked to encode it |
+//! | KR-REQ-11.33 | a native answer that comes while the component encodes wins, and the component's answer is not sent; the thread changing, the grant or the decoder's trust being withdrawn while it encodes each refuse the answer before the marker, and nothing is sent |
+//! | KR-REQ-11.21 and KR-ACC-016 | bytes that name another request, the right one as another JSON type, a method, an error in place of a result, a member twice or a line break are refused by the core and nothing is sent; a component that traps, declines or never returns makes no answer, the terminal answers, and the third fault disables the binding |
 
 #![cfg(unix)]
 
@@ -22,11 +24,12 @@ mod plugin_world;
 
 use kr_protocol::broker::BrokerGrant;
 use kr_protocol::envelope::Outcome;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{PendingResource, PendingState};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_worker::broker::decoding::NotDecoded;
 use plugin_world::observing::{
-    Observing, Options, Spec, binding, digest, package, request, request_noting,
+    Observing, Options, Spec, binding, digest, instance, package, request, request_noting,
 };
 use plugin_world::{PATIENCE, until};
 
@@ -464,4 +467,281 @@ async fn kr_req_11_21_an_approval_the_table_read_is_answered_with_the_tables_byt
         account.starts_with("decode=0;encode=0;"),
         "no component was asked about a request the table read: {account}"
     );
+}
+
+/// Asks `world` to answer request `id` with its component's bytes, runs `disturb` while the
+/// encoding is held after the component has replied, and returns what the answer came to.
+async fn answered_while(
+    world: &Observing,
+    id: u64,
+    disturb: impl AsyncFnOnce(&Observing, &PendingResource),
+) -> Outcome {
+    world.send(&request_noting(id, "!answer"));
+    let approval = approved(world, &id.to_string()).await;
+    let hold = world.broker().component_calls().hold_encodings();
+    let mut owner = world.owner().await;
+    let responding = world.respond(&mut owner, approval.resource_id, "allow");
+    let disturbing = async {
+        until("the encoding to be held", || async {
+            hold.parked().then_some(())
+        })
+        .await;
+        disturb(world, &approval).await;
+        hold.release();
+    };
+    let (outcome, ()) = tokio::join!(responding, disturbing);
+    outcome
+}
+
+/// What a failed call says it failed with.
+fn failed_with(outcome: &Outcome) -> ErrorCode {
+    match outcome {
+        Outcome::Error(error) => error.code,
+        Outcome::Ok(_) => panic!("the answer was accepted"),
+    }
+}
+
+/// KR-REQ-11.33: a native answer that arrives while the component encodes wins. The request is
+/// resolved by it, the component's answer is refused as the answer to a resolved request, and the
+/// upstream is written one answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_33_a_native_answer_that_comes_while_the_component_encodes_wins() {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let outcome = answered_while(&world, 30, async |world, _| {
+        world.terminal.write(&answer(30)).await;
+        until_answered(world, 30).await;
+        until("the request to be resolved", || async {
+            resource_for(world, "30").filter(|resource| resource.state == PendingState::Resolved)
+        })
+        .await;
+    })
+    .await;
+    assert_eq!(failed_with(&outcome), ErrorCode::QuestionResolved);
+    let answers = answers_to(&world, 30);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert!(
+        !answers[0].contains("via"),
+        "the one answer upstream is the terminal's: {}",
+        answers[0]
+    );
+}
+
+/// KR-REQ-11.33: the conversation the terminal is in changing while the component encodes leaves the
+/// answer unsent. The answer was written for a request of the conversation that has been left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_33_a_thread_that_changes_while_the_component_encodes_leaves_the_answer_unsent() {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let outcome = answered_while(&world, 31, async |world, _| {
+        world
+            .broker()
+            .advance_binding(
+                instance(),
+                Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                kr_protocol::scalars::TimestampMs::new(9),
+            )
+            .expect("the terminal selects another conversation");
+    })
+    .await;
+    failed_with(&outcome);
+    assert!(answers_to(&world, 31).is_empty());
+}
+
+/// KR-REQ-11.33: the grant to interpret approvals being withdrawn while the component encodes
+/// leaves the answer unsent, and the terminal answers the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_33_a_grant_withdrawn_while_the_component_encodes_leaves_the_answer_unsent() {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let outcome = answered_while(&world, 32, async |world, _| {
+        world
+            .broker()
+            .withdraw_grant(binding(1), BrokerGrant::ApprovalInterpreter)
+            .expect("the grant is withdrawn");
+    })
+    .await;
+    failed_with(&outcome);
+    assert!(answers_to(&world, 32).is_empty());
+    world.terminal.write(&answer(32)).await;
+    until_answered(&world, 32).await;
+}
+
+/// KR-REQ-11.33: the decoder's trust to answer being withdrawn while the component encodes leaves
+/// the answer unsent, and the terminal answers the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_33_a_trust_withdrawn_while_the_component_encodes_leaves_the_answer_unsent() {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let outcome = answered_while(&world, 33, async |world, _| {
+        world
+            .broker()
+            .withdraw_answering(binding(1))
+            .expect("the trust to answer is withdrawn");
+    })
+    .await;
+    failed_with(&outcome);
+    assert!(answers_to(&world, 33).is_empty());
+    world.terminal.write(&answer(33)).await;
+    until_answered(&world, 33).await;
+}
+
+/// KR-REQ-11.21: bytes a component returns are data, and become an answer only if they are one. Each
+/// of these is refused by the core with nothing sent: an answer to another request, to the right
+/// one with its identifier as another JSON type, one that is a request, one that is an error, one
+/// that names a member twice and one that holds a line break. The request stays the opaque one it
+/// was, the terminal answers it, and the binding's report says only that the bytes were not an
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_and_nothing_is_sent()
+{
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let mut owner = world.owner().await;
+    let spoilt = [
+        "!answer-other-id",
+        "!answer-retyped-id",
+        "!answer-method",
+        "!answer-error",
+        "!answer-twice",
+        "!answer-newline",
+    ];
+    for (number, marker) in (50_u64..).zip(spoilt) {
+        world.send(&request_noting(number, marker));
+        let approval = approved(&world, &number.to_string()).await;
+        let outcome = world
+            .respond(&mut owner, approval.resource_id, "allow")
+            .await;
+        failed_with(&outcome);
+        assert!(
+            answers_to(&world, number).is_empty(),
+            "{marker} was sent: {:?}",
+            answers_to(&world, number)
+        );
+        world.terminal.write(&answer(number)).await;
+        until_answered(&world, number).await;
+    }
+    let reason = world.reason(1);
+    assert!(
+        reason.contains(kr_worker::broker::encode::NotEncoded::NotAnAnswer.words()),
+        "{reason}"
+    );
+    assert!(reason.contains("6 answers were not written"), "{reason}");
+
+    // The same request, answered by a component that returns a true answer, is sent.
+    world.send(&request_noting(60, "!answer"));
+    let approval = approved(&world, "60").await;
+    let outcome = world
+        .respond(&mut owner, approval.resource_id, "allow")
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+}
+
+/// KR-REQ-11.21 and KR-ACC-016: a component that traps, declines or never returns writes no
+/// answer. Nothing is sent, the receipt does not say the answer was refused, the terminal answers
+/// the request, and the third fault within a minute disables the binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_acc_016_a_component_that_faults_while_it_encodes_writes_no_answer_and_is_disabled_at_the_third()
+ {
+    let Some(world) =
+        Observing::start(Options::with(vec![Spec::decoder(1, "hostile-decoder")])).await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let mut owner = world.owner().await;
+    for (number, marker) in (70_u64..).zip(["!encode-trap", "!encode-decline", "!encode-spin"]) {
+        world.send(&request_noting(number, marker));
+        let approval = approved(&world, &number.to_string()).await;
+        let outcome = world
+            .respond(&mut owner, approval.resource_id, "allow")
+            .await;
+        failed_with(&outcome);
+        assert!(
+            answers_to(&world, number).is_empty(),
+            "{marker} sent an answer"
+        );
+        world.terminal.write(&answer(number)).await;
+        until_answered(&world, number).await;
+    }
+    until("the third fault to disable the binding", || async {
+        (world.report(1)?.state == kr_protocol::admission::ComponentState::Disabled).then_some(())
+    })
+    .await;
+}
+
+/// KR-REQ-11.21 and KR-REQ-11.33: the action a package declares to answer an approval is answered
+/// by the component that read the request, as the approval method is. The upstream is written the
+/// component's bytes once, and a native answer that comes while the component encodes wins here
+/// too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_33_the_action_that_answers_an_approval_is_answered_by_the_component_that_read_it()
+ {
+    let Some(world) = Observing::start(Options::with(vec![
+        Spec::decoder(1, "hostile-decoder").answering(),
+    ]))
+    .await
+    else {
+        return;
+    };
+    world.until_ready(1).await;
+    let mut owner = world.owner().await;
+
+    world.send(&request_noting(80, "!answer"));
+    let approval = approved(&world, "80").await;
+    let outcome = world
+        .invoke_answer(&mut owner, approval.resource_id, "allow")
+        .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    until_answered(&world, 80).await;
+    let answers = answers_to(&world, 80);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert!(
+        answers[0].contains(r#""via":"component""#),
+        "{}",
+        answers[0]
+    );
+
+    world.send(&request_noting(81, "!answer"));
+    let approval = approved(&world, "81").await;
+    let hold = world.broker().component_calls().hold_encodings();
+    let responding = world.invoke_answer(&mut owner, approval.resource_id, "allow");
+    let natively = async {
+        until("the encoding to be held", || async {
+            hold.parked().then_some(())
+        })
+        .await;
+        world.terminal.write(&answer(81)).await;
+        until_answered(&world, 81).await;
+        until("the request to be resolved", || async {
+            resource_for(&world, "81").filter(|resource| resource.state == PendingState::Resolved)
+        })
+        .await;
+        hold.release();
+    };
+    let (outcome, ()) = tokio::join!(responding, natively);
+    assert_eq!(failed_with(&outcome), ErrorCode::QuestionResolved);
+    let answers = answers_to(&world, 81);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert!(!answers[0].contains("via"), "{}", answers[0]);
 }
