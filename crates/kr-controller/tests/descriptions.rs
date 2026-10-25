@@ -1606,7 +1606,8 @@ async fn pressure_and_bad_output_never_replace_a_title_and_describe_says_why() {
     environment.stop().await;
 }
 
-/// KR-REQ-24.11, KR-REQ-22.05: privacy mode removes the generated description and shows the
+/// KR-REQ-24.11, KR-REQ-22.05, KR-REQ-22.17, KR-REQ-24.27: privacy mode removes the generated
+/// description and shows the
 /// metadata title at once, nothing captured while it is on is described, and turning it off lets
 /// the session be described again under the new generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1638,7 +1639,7 @@ async fn privacy_mode_removes_the_description_and_describes_nothing_captured_whi
     environment.privacy(false).await;
     environment.until_privacy_settled().await;
     environment.workers[0].report("make", "/home/a/after", None);
-    environment
+    let after = environment
         .describe_until(
             "a description after privacy mode",
             session_id,
@@ -1649,6 +1650,10 @@ async fn privacy_mode_removes_the_description_and_describes_nothing_captured_whi
         environment.figures().jobs.published,
         2,
         "one before privacy mode and one after, none for what was captured in between"
+    );
+    assert_eq!(
+        after.title, "after",
+        "and what it says is of the change after privacy mode, not of the one captured in between"
     );
     environment.stop().await;
 }
@@ -2536,7 +2541,8 @@ async fn a_summary_is_served_to_a_device_that_reaches_every_moment_and_to_none_w
     environment.stop().await;
 }
 
-/// KR-REQ-18.02 and KR-REQ-24.11: privacy mode removes the summaries with the descriptions: none is
+/// KR-REQ-18.02, KR-REQ-24.11, KR-REQ-22.17 and KR-REQ-24.27: privacy mode removes the summaries
+/// with the descriptions: none is
 /// answered while it is on, and none that was written before it is answered after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_removes_the_summaries_and_none_returns_after_it() {
@@ -2910,7 +2916,8 @@ async fn a_daemon_replaced_while_the_old_process_lives_loads_nothing_until_it_ha
     environment.stop().await;
 }
 
-/// KR-REQ-24.11: a load in flight when privacy mode is enabled is cancelled, and privacy mode's
+/// KR-REQ-24.11, KR-REQ-22.17 and KR-REQ-24.28: a load in flight when privacy mode is enabled is
+/// cancelled, and privacy mode's
 /// change is not complete until it has answered; nothing is loaded for a session captured before.
 /// The stub holds the load until it is cancelled, so nothing but the cancellation ends it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2936,7 +2943,8 @@ async fn a_load_in_flight_is_cancelled_when_privacy_mode_is_enabled() {
     environment.stop().await;
 }
 
-/// KR-REQ-24.11: a refused removal of the stored descriptions does not keep the memory the service
+/// KR-REQ-24.11, KR-REQ-22.17 and KR-REQ-24.28: a refused removal of the stored descriptions does
+/// not keep the memory the service
 /// holds: the queue is forgotten and the load in flight is cancelled while the store still
 /// refuses, privacy mode's change is not complete while the removal is owed, and it completes once
 /// the store takes the removal. The control is the load before privacy mode, which goes on.
@@ -2977,7 +2985,8 @@ async fn a_load_is_cancelled_by_privacy_mode_though_the_stored_rows_cannot_be_re
     environment.stop().await;
 }
 
-/// KR-REQ-24.11: a result that arrives after privacy mode was enabled is never published, though
+/// KR-REQ-24.11, KR-REQ-22.17 and KR-REQ-24.28: a result that arrives after privacy mode was
+/// enabled is never published, though
 /// the process was in the middle of the job and did not look at its cancellation: privacy mode's
 /// change is not complete until the job has answered, nothing was published, and turning privacy
 /// mode off brings back nothing from before. The control is the same job left alone, which

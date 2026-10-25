@@ -1647,8 +1647,9 @@ async fn a_token_that_is_not_usable_never_leaves_the_host() {
     );
 }
 
-/// A privacy fence raised while a part is on its way ends the upload at the service and publishes
-/// nothing, and the daemon does not wait out a delay to do it.
+/// KR-REQ-24.28 and KR-ACC-033: a privacy fence raised while a part is on its way ends the upload
+/// at the service and publishes nothing, and the daemon does not wait out a delay to do it. The
+/// part already on the wire is awaited and not recalled: the upload is abandoned when it answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn privacy_mode_turned_on_while_a_part_is_on_its_way_abandons_the_upload_and_publishes_nothing()
  {
@@ -2168,8 +2169,8 @@ async fn a_restarted_daemon_finds_the_publication_the_service_holds_whatever_its
     }
 }
 
-/// Privacy mode ends the work in hand and can be turned off again, whatever account token the host
-/// holds when the fence comes: a request the host cannot sign in for is not sent, and the work it
+/// KR-REQ-24.28 and KR-ACC-033: privacy mode ends the work in hand and can be turned off again,
+/// whatever account token the host holds when the fence comes: a request the host cannot sign in for is not sent, and the work it
 /// would have ended ends without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_cleanup_privacy_mode_owes_ends_the_work_in_hand_whatever_the_token_is() {
@@ -3930,8 +3931,8 @@ async fn the_sessions_past_the_member_bound_are_left_out_and_the_doctor_says_so(
     );
 }
 
-/// Nothing is read or made while privacy mode is on, whatever the setup says, and a generation
-/// follows when it is off again. A setup made while it is on is allowed.
+/// KR-REQ-24.27: nothing is read or made while privacy mode is on, whatever the setup says, and a
+/// generation follows when it is off again. A setup made while it is on is allowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_it_is_off() {
     let timer = HeldTimer::held();
@@ -4176,7 +4177,7 @@ async fn no_generation_is_staged_while_a_finished_ones_ciphertext_is_still_on_th
         .await;
 }
 
-/// Privacy mode turned on while a pass is between two writes waits for the pass: the backup part
+/// KR-REQ-24.28: privacy mode turned on while a pass is between two writes waits for the pass: the backup part
 /// of the cleanup is reported outstanding and privacy mode is not turned off until the pass has
 /// stopped and taken away what it wrote, and the generation that follows holds nothing from the
 /// private time.

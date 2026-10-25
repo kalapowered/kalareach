@@ -4068,7 +4068,7 @@ async fn a_refusal_whose_other_content_never_came_down_is_still_dropped_on_reque
 }
 
 // ---------------------------------------------------------------------------
-// KR-REQ-24.28: privacy mode reaches draft publications
+// KR-REQ-24.27 and KR-REQ-24.28: privacy mode reaches draft publications
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

@@ -866,6 +866,8 @@ fn releasing_the_fence_admits_backup_production_again_under_the_new_generation()
 // The privacy hook, under the privacy generation contract.
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-24.27: privacy mode fences the backup service, takes back what was not sent and removes
+/// the ciphertext this host staged.
 #[test]
 fn privacy_mode_fences_cancels_and_removes_what_this_host_still_holds() {
     let environment = Environment::open();
@@ -1888,6 +1890,8 @@ fn a_late_upload_acknowledgement_while_fenced_does_not_enqueue_publication() {
     );
 }
 
+/// KR-REQ-24.28: an upload that finishes after privacy mode stopped it enqueues no publication,
+/// and the reconciliation completes.
 #[test]
 fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and_completes_reconciliation()
  {
@@ -8345,6 +8349,8 @@ async fn an_upload_the_service_completed_is_reported_unknown_when_it_will_not_be
     host.web.stored_once();
 }
 
+/// KR-REQ-24.28: a privacy fence raised in the middle of an upload sends no further part, object or
+/// publication, and abandons the upload at the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_raised_mid_upload_stops_everything_not_yet_sent() {
     let host = Host::open();
@@ -8586,7 +8592,8 @@ async fn a_pass_that_ends_an_attempt_without_abandoning_its_upload_says_the_aban
     assert_eq!(host.web.count(|asked| matches!(asked, Asked::Abort(_))), 1);
 }
 
-/// Ending work in flight under privacy mode does not wait out a delay the service asked for.
+/// KR-REQ-24.28: ending work in flight under privacy mode does not wait out a delay the service
+/// asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_fence_ends_the_work_in_flight_inside_a_delay_the_service_asked_for() {
     let host = Host::open();

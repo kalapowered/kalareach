@@ -5069,7 +5069,8 @@ async fn privacy_read_by(phone: &Phone) -> kr_protocol::hostinfo::HostPrivacySta
         .expect("host.info says where privacy mode stands")
 }
 
-/// KR-REQ-24.27: a privacy change that waits for a message on the wire does not hold up `host.info`,
+/// KR-REQ-24.27 and KR-REQ-24.28: a privacy change that waits for a message on the wire does not
+/// hold up `host.info`,
 /// and `host.info` says the host is changing privacy mode for as long as it waits. The message is
 /// held at the destination's end; the change is asked for on a connection of its own and is proved
 /// queued by the state refusing a new reading; a paired device then reads `host.info` and is
