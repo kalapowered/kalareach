@@ -983,7 +983,7 @@ Before it reads a request, `kr agent-tools --stdio` will search for a session to
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
-| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, a release an earlier install or update left in the store is held by a running program, or a command that writes a stored record holds the writers' lock for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again. A command that waits that long for an update's switch or for the install lock it holds exits with 9 as well, and does not make the write it waited for |
+| 9 | An update of this host waits: a live session runs at a level the new release does not retain, something does not answer, another install or update is running, a control daemon of the store has been starting for more than thirty seconds, a control daemon answers that it does not stop, a control daemon on Windows is not one the environment's scheduled task would start again as it is (it was started by hand, with another key store, in another directory or with another home, or the task is missing or is not this installation's), a release an earlier install or update left in the store is held by a running program, or a command that writes a stored record holds the writers' lock for more than thirty seconds. Nothing was replaced, and whatever the update stopped runs again. A command that waits that long for an update's switch or for the install lock it holds exits with 9 as well, and does not make the write it waited for |
 
 `kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
 any other way, and 3 when the connection ended before a whole closure record arrived. [When the
@@ -2162,6 +2162,11 @@ kr host update --archive kalareach-<target>-<release>.tar.gz
 kr host update --archive <archive> --check          # checks, and changes nothing
 kr host versions
 ```
+
+On Windows the archive is a `.zip`, `kr host update --archive kalareach-<target>-<release>.zip`, the
+store is `%LOCALAPPDATA%\KalaReach\host` on an NTFS volume, and each control daemon is started again
+by the environment's scheduled task (`kr host startup --set standalone` registers it); see
+`docs/host/updates.md`, "Windows".
 
 Only the current release's `kr` updates the host, and a `kr` of another release, or one outside a
 store, says so and exits with 3. An update checks the release, hands each control daemon over,
