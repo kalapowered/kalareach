@@ -2271,7 +2271,7 @@ fn restart_of(
         None => crate::startup::Chosen::read(&environment.paths),
     };
     #[cfg(windows)]
-    restart_by_task(environment, started_as, &chosen)?;
+    let _ = restart_by_task;
     #[cfg(unix)]
     let service =
         chosen.controller == Some(kr_protocol::hostinfo::configuration::ControllerStartup::Service);
