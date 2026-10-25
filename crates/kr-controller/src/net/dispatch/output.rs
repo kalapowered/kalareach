@@ -104,6 +104,48 @@ impl FrameSink for ControlStream {
     }
 }
 
+/// The privacy state a page of retained output was read under.
+///
+/// The page is released only while that state stands: privacy mode off, in the generation it was
+/// read in. Output a worker read before privacy mode started is not sent after it, however long
+/// the answer waited to be written.
+#[derive(Clone, Debug)]
+pub(super) struct ReadUnder {
+    state: crate::privacy::PrivacyState,
+    decided: crate::privacy::Published,
+}
+
+impl ReadUnder {
+    /// Takes the privacy state as it stands, before the worker is asked.
+    ///
+    /// It is read under the state's read side, which waits behind a change of privacy mode, so on
+    /// a thread that may wait.
+    pub(super) async fn now(
+        controller: &Controller,
+    ) -> Result<Self, kr_protocol::error::ProtocolError> {
+        let state = controller.privacy.state().clone();
+        let read = state.clone();
+        let decided = tokio::task::spawn_blocking(move || read.now())
+            .await
+            .map_err(|_| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    "privacy mode's state could not be read",
+                )
+            })?;
+        Ok(Self { state, decided })
+    }
+
+    /// Answers whether the state the page was read under still stands. It waits for nothing, so it
+    /// can be asked in the poll that hands bytes to the stream: a change of state being made, or
+    /// waiting to be, counts as the state having moved.
+    pub(super) fn stands(&self) -> bool {
+        self.state
+            .try_reading()
+            .is_some_and(|reading| reading.published() == self.decided)
+    }
+}
+
 /// The decision a batch a subscription carries is written under, for as long as it holds.
 ///
 /// Every part is read in the poll that hands bytes to the stream, so each is an atomic or a clock
@@ -412,7 +454,7 @@ impl RemoteOutput {
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
     ) -> Written {
-        self.write_held(frame, under, relaying, false).await
+        self.write_held(frame, under, relaying, false, None).await
     }
 
     /// As [`Self::write`], and, for an answer to a request decided before this write, held to the
@@ -425,12 +467,17 @@ impl RemoteOutput {
     /// once bytes are moving the connection ends. Not the epoch: it moves at every change of the
     /// policy, and an answer cut for one that touched nothing the decision stood on would end a
     /// connection for no refusal. A failure frame is not held, so the device is told why.
+    ///
+    /// A page of retained output is held to the privacy state it was read under, `read_under`, in
+    /// the same places: a page that no longer stands before any of it went is decided again, and
+    /// the connection ends once bytes are moving.
     pub(super) async fn write_held(
         &self,
         frame: &ControlFrame,
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
         answer: bool,
+        read_under: Option<&ReadUnder>,
     ) -> Written {
         #[cfg(test)]
         self.queued.fetch_add(1, Ordering::SeqCst);
@@ -455,6 +502,7 @@ impl RemoteOutput {
                     .controller
                     .feed_refusal_on(self.authority.connection_id)
                     .is_some())
+                && read_under.is_none_or(ReadUnder::stands)
                 && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()

@@ -404,7 +404,23 @@ impl RemoteConnection {
                     None => self.proxied_read(request, entry, validated, &decided).await,
                 }
             }
-            DeviceRead::Worker => self.proxied_read(request, entry, validated, &decided).await,
+            DeviceRead::Worker => {
+                // A page of retained output is released only under the privacy state it was read
+                // under, which is taken before the worker is asked.
+                let read_under = if entry.method == Method::HistoryPage {
+                    match super::output::ReadUnder::now(&self.controller).await {
+                        Ok(read_under) => Some(read_under),
+                        Err(error) => return failure(request.request_id, error),
+                    }
+                } else {
+                    None
+                };
+                let answer = self.proxied_read(request, entry, validated, &decided).await;
+                if let Some(asked) = asked.as_mut() {
+                    asked.read_under = read_under;
+                }
+                answer
+            }
             DeviceRead::Workflow => {
                 self.controller
                     .automation()

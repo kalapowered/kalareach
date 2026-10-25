@@ -854,7 +854,7 @@ fn closed_summary(
 
 /// A page of a closed session's output with its bytes withheld, as the reader is told: the range
 /// the page covered is gone.
-fn withheld_page(
+pub(crate) fn withheld_page(
     page: &kr_protocol::recovery::HistoryPageResult,
 ) -> kr_protocol::recovery::HistoryPageResult {
     let gap = match page.gap.0 {

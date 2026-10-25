@@ -2813,7 +2813,7 @@ async fn a_connection_that_decided_a_request_under_a_share_resting_on_the_feed_i
         ] {
             let written = connection
                 .output()
-                .write_held(&batch(), &asked.decision.bounds(), None, true)
+                .write_held(&batch(), &asked.decision.bounds(), None, true, None)
                 .await;
             assert_eq!(written, written_after_the_removal);
         }

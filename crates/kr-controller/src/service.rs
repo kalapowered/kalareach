@@ -95,6 +95,7 @@ pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub use local::{
     LOCAL_KEEPALIVE, RETAINED_AUTHORITY_ANSWERS, RETAINED_MACHINE_ANSWERS, WINDOW_RENEWAL,
 };
+pub(crate) use reads::withheld_page;
 pub use rendezvous::LAUNCH_IDENTITY_TIMEOUT;
 pub use revocation::Audience;
 pub use routes::local_actor;
