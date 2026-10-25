@@ -284,8 +284,8 @@ pub enum TestingPoint {
     /// The start of a change, a read or a seed that holds the catalogue, once it holds a thread
     /// of its own and the executor's other tasks have been handed on.
     Held,
-    /// Each commit a change of the catalogue makes, just before the admission it runs under is
-    /// asked to let it through.
+    /// Each commit a change of the catalogue makes, inside the admission it runs under, which
+    /// holds the change's registration standing until the commit is over.
     Commit,
 }
 
@@ -294,8 +294,9 @@ pub enum TestingPoint {
 #[derive(Clone)]
 struct TestingHook(Arc<dyn Fn(TestingPoint) + Send + Sync>);
 
-/// A change's admission with the module's hook run at each of its commits, so that a test can hold
-/// a change in the middle of its durable work, beside the admission and not inside it.
+/// A change's admission with the module's hook run inside each of its commits, so that a test can
+/// hold a change in the middle of its durable work, with the admission's hold on the change's
+/// registration in place.
 #[cfg(feature = "testing")]
 struct Committing {
     inner: Arc<dyn Admission>,
@@ -313,8 +314,11 @@ impl Authority for Committing {
         effect: &Effect,
         commit: &mut dyn FnMut() -> CatalogueResult<()>,
     ) -> CatalogueResult<()> {
-        (self.hook.0)(TestingPoint::Commit);
-        self.inner.commit(effect, commit)
+        let hook = &self.hook;
+        self.inner.commit(effect, &mut || {
+            (hook.0)(TestingPoint::Commit);
+            commit()
+        })
     }
 
     fn owner_confirmed(&self) -> bool {
