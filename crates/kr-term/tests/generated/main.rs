@@ -289,3 +289,59 @@ fn the_checks_name_a_query_in_the_tail_of_an_oversized_string_that_acts() {
         &[Invariant::Oversized],
     );
 }
+
+/// KR-ACC-024: the scan of the forwarded bytes names what a terminal would answer or do on its own:
+/// a string kr-vt/1 forwards none of, an operating system command that acts or asks, ENQ and BEL
+/// outside a string, `ESC Z`, and each question a control sequence can ask. The engine's own run of
+/// each stream passes.
+#[test]
+fn the_scan_names_a_forwarded_question_or_action_the_class_table_would_have_to_catch() {
+    let cases: [&[u8]; 14] = [
+        b"ok\x1bPq~\x1b\\",
+        b"ok\x1b_Gi=1;\x1b\\",
+        b"ok\x1b]52;c;aGk=\x07",
+        b"ok\x1b]9;done\x07",
+        b"ok\x1b]4;1;?\x07",
+        b"ok\x05",
+        b"ok\x07",
+        b"ok\x1bZ",
+        b"ok\x1b[c",
+        b"ok\x1b[6n",
+        b"ok\x1b[?7$p",
+        b"ok\x1b[>0q",
+        b"ok\x1b[?u",
+        b"ok\x1b[18t",
+    ];
+    for input in cases {
+        names(
+            &forged(input, Vec::new(), &[(0, input.len() as u64)]),
+            &[Invariant::ByteSafety],
+        );
+    }
+}
+
+/// KR-ACC-024: the check that the events cover the stream counts an event of the outer stream as it
+/// is, so two events for the same bytes overlap, and lets bytes go unclaimed only when they are an
+/// empty tmux envelope, which makes no event.
+#[test]
+fn the_coverage_check_names_a_duplicated_event_and_a_stream_with_nothing_for_its_bytes() {
+    let input: &[u8] = b"a\x1bPtmux;\x1b\\b\x1b[31mc";
+    let events = lex(input);
+    assert!(
+        events_cover_the_stream(input, &events).is_empty(),
+        "the lexer's own events cover it, an empty envelope included"
+    );
+
+    let mut doubled = events.clone();
+    doubled.push(events[0].clone());
+    doubled.sort_by_key(|event| event.span.start());
+    names(
+        &events_cover_the_stream(input, &doubled),
+        &[Invariant::Coverage],
+    );
+
+    names(
+        &events_cover_the_stream(b"\x1bPtmux;\x1b\\LOST", &[]),
+        &[Invariant::Coverage],
+    );
+}

@@ -194,6 +194,9 @@ const OSC_BODIES: &[&str] = &[
     "8;;https://example.com/a",
     "8;id=1;http://x.example/",
     "8;;",
+    "52;c;aGVsbG8=",
+    "52;p;?",
+    "52;c;!!not base64",
     "10;rgb:ff/00/00",
     "11;rgb:00/00/ff",
     "12;rgb:00/ff/00",
@@ -515,16 +518,18 @@ pub enum Family {
     Dcs,
     Apc,
     Pm,
+    Sos,
     Tmux,
 }
 
 impl Family {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Osc52,
         Self::Osc,
         Self::Dcs,
         Self::Apc,
         Self::Pm,
+        Self::Sos,
         Self::Tmux,
     ];
 
@@ -547,6 +552,7 @@ impl Family {
             Self::Dcs => b"\x1bP1|",
             Self::Apc => b"\x1b_G",
             Self::Pm => b"\x1b^",
+            Self::Sos => b"\x1bX",
             Self::Tmux => b"\x1bPtmux;",
         }
     }

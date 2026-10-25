@@ -150,48 +150,151 @@ pub fn forward_is_safe_for_a_terminal(forward: &[u8]) -> Vec<Violation> {
             }
         }
     }
-    // A control string runs from its introducer to its terminator and holds no control byte but the
-    // terminator, so that a terminal ends it where this engine did.
+    // What a terminal would answer, do or end differently, found by a scan that reads neither the
+    // lexer nor the class table. A control string runs from its introducer to its terminator and
+    // holds no control byte but the terminator, so that a terminal ends it where this engine did.
+    // kr-vt/1 forwards no control string but an operating system command, and of those none that
+    // acts (a clipboard, a notification, a progress report) or asks (a part that is a bare `?`).
     let mut at = 0;
     while at < forward.len() {
-        let introduces = forward[at] == 0x1b
-            && matches!(forward.get(at + 1), Some(b']' | b'P' | b'_' | b'^' | b'X'));
-        if !introduces {
+        let byte = forward[at];
+        if byte == 0x05 || byte == 0x07 {
+            found.push(violation(
+                Invariant::ByteSafety,
+                format!("the control byte {byte:#04x} at {at} outside a string"),
+            ));
             at += 1;
             continue;
         }
-        let osc = forward[at + 1] == b']';
-        let mut end = at + 2;
-        loop {
-            match forward.get(end) {
-                None => {
-                    found.push(violation(
-                        Invariant::ByteSafety,
-                        format!("the control string at byte {at} is not ended"),
-                    ));
-                    break;
-                }
-                Some(0x07) if osc => {
-                    end += 1;
-                    break;
-                }
-                Some(0x1b) if forward.get(end + 1) == Some(&b'\\') => {
-                    end += 2;
-                    break;
-                }
-                Some(byte) if *byte < 0x20 => {
-                    found.push(violation(
-                        Invariant::ByteSafety,
-                        format!("the control string at byte {at} holds the control byte {byte:#04x} at {end}"),
-                    ));
-                    break;
-                }
-                Some(_) => end += 1,
-            }
+        if byte != 0x1b {
+            at += 1;
+            continue;
         }
-        at = end.max(at + 2);
+        match forward.get(at + 1) {
+            Some(b'Z') => {
+                found.push(violation(
+                    Invariant::ByteSafety,
+                    format!("ESC Z, which asks the terminal to identify itself, at {at}"),
+                ));
+                at += 2;
+            }
+            Some(b'[') => at = scan_csi(forward, at, &mut found),
+            Some(b']' | b'P' | b'_' | b'^' | b'X') => at = scan_string(forward, at, &mut found),
+            _ => at += 1,
+        }
     }
     found
+}
+
+/// Checks one control sequence for a question, and returns where it ends.
+fn scan_csi(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
+    let mut end = at + 2;
+    while forward
+        .get(end)
+        .is_some_and(|byte| (0x30..=0x3f).contains(byte))
+    {
+        end += 1;
+    }
+    let parameters = &forward[at + 2..end];
+    let intermediates_from = end;
+    while forward
+        .get(end)
+        .is_some_and(|byte| (0x20..=0x2f).contains(byte))
+    {
+        end += 1;
+    }
+    let intermediates = &forward[intermediates_from..end];
+    let Some(&last) = forward
+        .get(end)
+        .filter(|byte| (0x40..=0x7e).contains(*byte))
+    else {
+        return end.max(at + 2);
+    };
+    let first_number = parameters
+        .split(|byte| *byte == b';')
+        .next()
+        .and_then(|part| std::str::from_utf8(part).ok())
+        .and_then(|part| {
+            part.trim_start_matches(['?', '>', '=', '<'])
+                .parse::<u32>()
+                .ok()
+        });
+    let asks = match last {
+        b'c' | b'n' => true,
+        b'p' => intermediates.contains(&b'$'),
+        b'q' => parameters.first() == Some(&b'>'),
+        b'u' | b'm' => parameters.first() == Some(&b'?'),
+        b't' => first_number.is_some_and(|number| (11..=21).contains(&number)),
+        _ => false,
+    };
+    if asks {
+        found.push(violation(
+            Invariant::ByteSafety,
+            format!(
+                "the control sequence ending {:?} at {at} asks the terminal a question",
+                char::from(last)
+            ),
+        ));
+    }
+    end + 1
+}
+
+/// Checks one control string, and returns where it ends.
+fn scan_string(forward: &[u8], at: usize, found: &mut Vec<Violation>) -> usize {
+    let family = forward[at + 1];
+    let osc = family == b']';
+    if !osc {
+        found.push(violation(
+            Invariant::ByteSafety,
+            format!(
+                "the {} string at byte {at}, which kr-vt/1 forwards none of",
+                char::from(family)
+            ),
+        ));
+    }
+    let mut end = at + 2;
+    loop {
+        match forward.get(end) {
+            None => {
+                found.push(violation(
+                    Invariant::ByteSafety,
+                    format!("the control string at byte {at} is not ended"),
+                ));
+                return end;
+            }
+            Some(0x07) if osc => break,
+            Some(0x1b) if forward.get(end + 1) == Some(&b'\\') => break,
+            Some(byte) if *byte < 0x20 => {
+                found.push(violation(
+                    Invariant::ByteSafety,
+                    format!(
+                        "the control string at byte {at} holds the control byte {byte:#04x} at {end}"
+                    ),
+                ));
+                return end;
+            }
+            Some(_) => end += 1,
+        }
+    }
+    if osc {
+        let payload = &forward[at + 2..end];
+        let parts: Vec<&[u8]> = payload.split(|byte| *byte == b';').collect();
+        let selector = parts
+            .first()
+            .and_then(|part| std::str::from_utf8(part).ok())
+            .and_then(|part| part.parse::<u32>().ok());
+        if matches!(selector, Some(9 | 52 | 99 | 777)) || parts.contains(&&b"?"[..]) {
+            found.push(violation(
+                Invariant::ByteSafety,
+                format!("the operating system command at byte {at} acts or asks"),
+            ));
+        }
+    }
+    if forward[end] == 0x07 {
+        end + 1
+    } else {
+        end + 2
+    }
 }
 
 /// How many tagged atoms the lexer framed as one event at ground, by what they were.
@@ -357,16 +460,50 @@ pub fn read_split_changes_nothing(whole: &Seen, split: &Seen, how: u64) -> Vec<V
     found
 }
 
-/// Invariant 6: the events, a tmux envelope's inner events counted once, cover the stream without
-/// overlap. An envelope that decodes to nothing makes no event.
+/// An empty tmux envelope, which makes no event.
+const EMPTY_ENVELOPES: [&[u8]; 4] = [
+    b"\x1bPtmux;\x1b\\",
+    b"\x90tmux;\x1b\\",
+    b"\x1bPtmux;\x07",
+    b"\x90tmux;\x07",
+];
+
+/// Whether `gap` is empty envelopes and nothing else.
+fn is_empty_envelopes(mut gap: &[u8]) -> bool {
+    'next: while !gap.is_empty() {
+        for envelope in EMPTY_ENVELOPES {
+            if let Some(rest) = gap.strip_prefix(envelope) {
+                gap = rest;
+                continue 'next;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// Invariant 6: the events cover the stream once. An event of the outer stream is counted as it is,
+/// so two events for the same bytes overlap; the inner events of a tmux envelope all carry the
+/// envelope's span and are counted once for it. Bytes in no event are only those of an envelope that
+/// decodes to nothing.
 pub fn events_cover_the_stream(bytes: &[u8], events: &[Event]) -> Vec<Violation> {
-    let spans: BTreeSet<(u64, u64)> = events
-        .iter()
-        .map(|event| (event.span.start(), event.span.end()))
-        .filter(|(start, end)| start != end)
-        .collect();
+    let mut spans: Vec<(u64, u64, u8)> = Vec::new();
+    for event in events {
+        let (start, end) = (event.span.start(), event.span.end());
+        if start == end {
+            continue;
+        }
+        if event.passthrough_depth > 0
+            && spans
+                .last()
+                .is_some_and(|last| (last.0, last.1) == (start, end))
+        {
+            continue;
+        }
+        spans.push((start, end, event.passthrough_depth));
+    }
     let mut next = 0u64;
-    for (start, end) in spans {
+    for (start, end, _) in spans {
         if start < next {
             return vec![violation(
                 Invariant::Coverage,
@@ -375,26 +512,19 @@ pub fn events_cover_the_stream(bytes: &[u8], events: &[Event]) -> Vec<Violation>
                 ),
             )];
         }
-        if start > next {
-            let gap = &bytes[index(next)..index(start)];
-            let envelope = gap.starts_with(b"\x1bPtmux;") || gap.starts_with(b"\x90tmux;");
-            if !envelope {
-                return vec![violation(
-                    Invariant::Coverage,
-                    format!("bytes {next}..{start} are in no event"),
-                )];
-            }
+        if start > next && !is_empty_envelopes(&bytes[index(next)..index(start)]) {
+            return vec![violation(
+                Invariant::Coverage,
+                format!("bytes {next}..{start} are in no event"),
+            )];
         }
         next = end;
     }
-    if (next as usize) < bytes.len() {
-        let gap = &bytes[index(next)..];
-        if !(gap.starts_with(b"\x1bPtmux;") || gap.starts_with(b"\x90tmux;")) {
-            return vec![violation(
-                Invariant::Coverage,
-                format!("bytes {next}.. are in no event"),
-            )];
-        }
+    if index(next) < bytes.len() && !is_empty_envelopes(&bytes[index(next)..]) {
+        return vec![violation(
+            Invariant::Coverage,
+            format!("bytes {next}.. are in no event"),
+        )];
     }
     Vec::new()
 }
