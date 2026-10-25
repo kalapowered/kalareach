@@ -366,6 +366,13 @@ pub fn known() -> Vec<Known> {
             "ErrorCode",
             "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
         ),
+        // The code a refused workflow action keeps in `action_records.error_code`, read back as the
+        // code it names.
+        known_protocol::<error::ErrorCode>(
+            "workflows",
+            "ErrorCode",
+            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+        ),
         // The parameters of the nodes a stored workflow holds, which admission decodes at each
         // admission. The store declares the rest of them.
         known_protocol::<changeset::ChangesetMaterializeParams>(
@@ -420,6 +427,7 @@ pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
         ("changesets", "ChangesetMaterializeResult"),
         ("changesets", "DiffApplyResult"),
         ("changesets", "ErrorCode"),
+        ("workflows", "ErrorCode"),
         // The parameters of a stored workflow's node, which admission decodes at each admission.
         ("workflows", "ChangesetMaterializeParams"),
         ("workflows", "DiffApplyParams"),
@@ -723,8 +731,13 @@ pub fn table() -> Vec<Store> {
                 Kept::Source("crates/kr-delivery/src/preview.rs", &["PreviewBody"]),
                 Kept::Source(
                     "crates/kr-delivery/src/journal.rs",
-                    &["EventKey", "EventSource"],
+                    &["EventKey", "EventSource", "DeliveryState"],
                 ),
+                Kept::Source(
+                    "crates/kr-delivery/src/destination.rs",
+                    &["DestinationKind"],
+                ),
+                Kept::Source("crates/kr-delivery/src/push.rs", &["NextAction"]),
                 Kept::Source("crates/kr-delivery/src/external.rs", &["ContentLine"]),
                 // The document a queued external message is stored as, and its interval.
                 Kept::Source(
@@ -732,9 +745,9 @@ pub fn table() -> Vec<Store> {
                     &["StoredMessage", "StoredInterval"],
                 ),
                 // The words the code matches stored text against. The enums that name them are kept
-                // beside them, so a variant added to one moves the digest; the count of how often
-                // each word is spelt in the file that writes it, which the pinned digest held, is
-                // not part of it.
+                // beside them, so a variant added to one moves the digest even when its `ALL` is
+                // not changed; the count of how often each word is spelt in the file that writes
+                // it, which the pinned digest held, is not part of it.
                 Kept::Words(
                     "push suppression reasons",
                     vec!["burst".to_owned(), "sustained".to_owned()],
