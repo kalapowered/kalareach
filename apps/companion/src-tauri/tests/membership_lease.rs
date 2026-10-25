@@ -32,6 +32,7 @@
 //! | KR-REQ-17.53 | `a_kept_visit_is_given_the_lease_again_when_the_one_it_holds_has_ended` |
 //! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_chain_for_its_new_lease_cannot_be_read` |
 //! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_finds_its_new_lease_not_yet_valid` |
+//! | KR-REQ-17.53 | `a_kept_visit_presents_a_lease_the_host_refused_no_oftener_than_it_asks_the_service` |
 //! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_finds_its_new_lease_issued_before_its_key_took_over` |
 //! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_distrusts_its_clock_at_the_new_lease` |
 //! | KR-REQ-17.53 | `a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact` |
@@ -1669,6 +1670,34 @@ async fn a_kept_visit_goes_on_when_the_host_finds_its_new_lease_not_yet_valid() 
         "nothing more was asked for"
     );
     rig.host_holds_the_newest_lease().await;
+}
+
+/// KR-REQ-17.53: a kept visit does not present again a new lease the host refused until what is
+/// held against the service is over, however often the inbox passes: the host records each
+/// presentation, refused or not, and never removes the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_presents_a_lease_the_host_refused_no_oftener_than_it_asks_the_service() {
+    let (rig, _elsewhere, desk) = visit_kept_with_its_lease_due().await;
+    rig.signing.runs_ahead(Duration::from_secs(2 * 60));
+    let renewing = rig.inbox_of(&desk).await;
+    assert_eq!(
+        renewing.state,
+        HostInboxState::Read,
+        "{:?}",
+        renewing.refusal
+    );
+    let (rows, requests) = (rig.recorded_actions(), rig.lease_requests());
+
+    for _ in 0..4 {
+        let pass = rig.inbox_of(&desk).await;
+        assert_eq!(pass.state, HostInboxState::Read, "{:?}", pass.refusal);
+    }
+    assert_eq!(
+        rig.recorded_actions(),
+        rows,
+        "a pass while the renewal is waited out writes no row"
+    );
+    assert_eq!(rig.lease_requests(), requests);
 }
 
 /// KR-REQ-17.53: a kept visit goes on when the host refuses its new lease as issued before the
