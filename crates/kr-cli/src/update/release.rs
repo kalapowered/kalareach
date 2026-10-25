@@ -902,9 +902,9 @@ pub fn seal(release: &Path, manifest: &ReleaseManifest) -> Result<()> {
 /// Makes every file of the release at `release` read-only and unwritable by its owner, and every
 /// directory under it unable to take a new name or lose one, then flushes each.
 ///
-/// A file is sealed by attribute and by a list that denies its owner every right that writes it. A
-/// directory is flushed before it is sealed, since a flush asks for the right to add a name, which
-/// sealing takes away; the release's own directory is flushed and left open: it is renamed into
+/// A file is flushed and then sealed by attribute and by a list that denies its owner every right
+/// that writes it, since a flush asks for the right to write. A directory is flushed before it is
+/// sealed, since a flush asks for the right to add a name, which sealing takes away; the release's own directory is flushed and left open: it is renamed into
 /// `versions/` next, and [`admit`] seals it there. A program's mode is not a thing here: a file is
 /// run when its name says it is a program.
 ///
@@ -928,8 +928,13 @@ pub fn seal(release: &Path, _manifest: &ReleaseManifest) -> Result<()> {
                 continue;
             }
             let file = entry.path();
-            kr_ipc::install::seal_file(&file)
-                .and_then(|()| std::fs::File::open(&file).and_then(|opened| opened.sync_all()))
+            // Flushed before it is sealed: a flush asks for the right to write, which sealing
+            // takes away.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .and_then(|opened| opened.sync_all())
+                .and_then(|()| kr_ipc::install::seal_file(&file))
                 .map_err(|error| sealing(&file, &error))?;
         }
     }
