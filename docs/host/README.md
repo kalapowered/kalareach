@@ -1082,8 +1082,9 @@ so a recycled identifier reads as a different process. Neither carries a boot. O
 value counts clock ticks since boot, so a process of a later boot that repeats a recorded worker's
 identifier and tick reads as that worker for as long as it runs: a start that finds the sessions of
 an earlier boot leaves such a session open, and it closes later with the reason a worker found
-gone has, unless the worker's own record of its processes names the earlier boot, which closes it as
-the host's restart when that process ends. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
+gone has, not as the host's restart. The exception is a worker whose own record of its processes
+names the earlier boot: that session closes as the host's restart once the process that repeated
+the identifier has ended. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
 A process query answers one of three things: the process and its start identity, gone, or cannot
@@ -3875,13 +3876,13 @@ registry's worker rows and closures, with the registry read as it is (`Registry:
 which reads the file alone as immutable, writes nothing, not even beside it, and refuses a registry
 whose write-ahead log still holds writes or that is reached through a link), and from the
 descriptor; a source it cannot read, the registry included, refuses the journal. A closure that
-lists a worker whose end was never confirmed refuses it too, unless the registry's reservation for
-the session records the process its launch ran and the kernel says that process has ended: the
-reservation is read only to lift that refusal (its display number then names the endpoint to
-fence before the journal is opened), and a reservation that is missing, records no launch, names
-a process that runs or cannot be established, or cannot be read keeps it. The daemon
-asks the same question of the same proof before it collects or migrates a closed session's stores.
-It checks the
+lists a worker whose end was never confirmed refuses it too. The refusal is lifted when the
+registry's reservation for the session records the process its launch ran and the kernel says that
+process has ended. The reservation is read only to lift that refusal, and its display number then
+names the endpoint to fence before the journal is opened. A reservation that is missing, records no
+launch, names a process that runs or cannot be established, or cannot be read keeps the refusal.
+Before the daemon collects or migrates a closed session's stores, it asks the same question and
+takes the same proof. The importer checks the
 version and every object against the statement one of those builds ran to make it, reads every row
 as the running host reads it, names anything it cannot read, and leaves a refused journal exactly as
 it was; a failure after it has begun changing the journal goes back with its transaction.
@@ -4109,19 +4110,22 @@ It looks again after five seconds, then after ten, and so on, doubling up to fiv
 looks for as long as the hold lasts. Until the store reads the journal the session stays closing,
 so the announcements about its pending questions and approvals are held back from delivery, as
 they are while any closure is under way. While the hold lasts none of the session's text is
-served; a read that finds the journal can be brought forward serves it at once, and ends the wait
-the session had, so the store finishes it on its next pass and its items are delivered then, not
-at the end of that wait. A migration that was made and failed (the store was busy or full, or
-damaged) is not a hold for a worker, and it is not an unreadable journal either: the session is
-tried the same way, the items held and no text served, but only so often. After ten tries that
-found the migration failing the store finishes the session with gaps, as it does for a journal it
-cannot read, and a migration made later does not repair them. The count is kept in memory and
-starts again when the daemon does; a try that finds the journal held back (for a worker, a busy
-registry or another recovery) is not one of the ten. If the store cannot take the gaps at the tenth
-failure, the next failing look ends the session with them, and the ten do not begin again. A summary of the session's changes is not asked for while the store still tries it. On
-Linux a process of a later boot that repeats the launch process's identifier and start tick reads
-as the worker for as long as it runs, because an identity carries no boot; the reads and the
-collection leave the session alone until it ends.
+served; a read that finds the journal can be brought forward serves it at once. Such a read also
+ends the wait the session had: the store finishes the session on its next pass and delivers its
+items then, not at the end of that wait. On Linux a process of a later boot that repeats the launch
+process's identifier and start tick reads as the worker for as long as it runs, because an identity
+carries no boot; the reads and the collection leave the session alone until it ends.
+
+A migration that was made and failed (the journal's database was busy or full, or damaged) is not
+a hold for a worker, and the journal is not unreadable either. The store tries the session the same
+way, with its items held back and no text served, but only so often. After ten tries that found
+the migration failing, the store finishes the session with gaps, as it does for a journal it cannot
+read, and a migration made later does not repair them. The daemon keeps the count in memory, so it
+starts again when the daemon does. A try that finds the journal held back (for a worker, a busy
+registry or another recovery) is not one of the ten. If the store cannot write the gaps at the
+tenth failure, the next look that finds the migration failing ends the session with them, and the
+ten tries do not begin again. A summary of the session's changes is not asked for while the store
+still tries the session.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
@@ -4151,12 +4155,12 @@ fact that puts it in the session's tree (its parent, its session, its terminal, 
 session's job), so an identifier the kernel gave to a stranger after the process it listed ended is
 not recorded. A process stays in the record until the kernel says it has ended, so one that left
 the tree after it was seen is still stopped, unless it left for a control daemon's own scope.
-The record belongs to one boot. One that names an earlier boot of the kind this host reads, with a
-value of the same length, says the worker went with that boot: nothing is stopped, since no process
-of one boot runs in another, nothing is listed as surviving, and the closure gives the host's restart
-as its reason, whatever this daemon remembers of the session. One that names a boot this host cannot
-compare with its own (another kind of identity or another length), one from an earlier build that
-names no boot, and a missing one are not acted on, and the closure says why. A recorded process is stopped only
+The record belongs to one boot. A record that names an earlier boot, of the same kind and length as
+this host's own, says the worker went with that boot. Nothing is stopped, since no process of one
+boot runs in another, and nothing is listed as surviving. The closure gives the host's restart as
+its reason, whatever this daemon remembers of the session. A record that names a boot this host
+cannot compare with its own (another kind of identity or another length), a record from an earlier
+build that names no boot, and a missing record are not acted on, and the closure says why. A recorded process is stopped only
 through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
 process on macOS (which the kernel checks again as it signals), an open handle on Windows. A
 platform that offers none of these does not signal the process by its number. On Unix the cleanup
@@ -4476,7 +4480,7 @@ The call is held to the account that was signed in when it began. A sign-in as a
 
 Once the owner has used `kr backup setup` to set backups up, a task on the daemon's reactor runs each day and makes one full backup when what it would pack has changed. A backup is a generation of the archive, and each generation holds every member in full, so nothing is incremental. The daemon holds no seed. From the kit it keeps only the public half of the recovery key and a fingerprint of it, and every generation wraps its keys for that public half.
 
-Each generation holds `sessions/<session uuid>.json` for each closed session, with the most recently closed session first, and, if the daemon accepts it, the host's configuration document as `host/configuration.json`. Each session document is the one `kr export` writes. A session is packed when its closure is recorded, its worker is confirmed ended, it owes privacy mode no cleanup, and the archive holds output for it. A session that is still open is in no backup until it closes, and `kr doctor` counts the sessions that have not closed. A session whose output cannot be read is left out and counted by `kr doctor`, and the daemon tries it again once a day. A session whose journal is there and gave no summary when a pass read it is packed with a summary built from its closure alone, which has no shell path, directory, creation time or dimensions. That is a journal of an earlier build that could not be brought forward (the registry was busy or unreadable, another recovery held the session, the migration failed, or the journal is older than the migration ladder and waits for `kr host import-journals`), a journal that holds no record of the session, and one that cannot be read. Such a session counts as changed once its journal gives a summary, so a later pass makes the generation again with the session's own record; it does not count as changed when one of those reasons gives way to another, because the summary packed is the same. After an upgrade to this release, a session that was not marked before and is in this state counts as changed once, so the next pass makes one more generation; a session marked before keeps its digest, and one whose journal is read or is not there is not affected. A generation an earlier release made for such a session is not made again for this alone; the next generation that anything else causes holds the session as it then reads. The members follow the restore's limits: a session at most 192 MiB, the configuration at most 1 MiB, all members together at most 1.5 GiB, and at most 4,096 members. A session that would take the total past its limit is left out of that generation whole, a smaller one after it may still fit, and `kr doctor` counts what was left out. With nothing to pack, there is no generation.
+Each generation holds `sessions/<session uuid>.json` for each closed session, with the most recently closed session first, and, if the daemon accepts it, the host's configuration document as `host/configuration.json`. Each session document is the one `kr export` writes. A session is packed when its closure is recorded, its worker is confirmed ended, it owes privacy mode no cleanup, and the archive holds output for it. A session that is still open is in no backup until it closes, and `kr doctor` counts the sessions that have not closed. A session whose output cannot be read is left out and counted by `kr doctor`, and the daemon tries it again once a day. A session whose journal file is there but gave no summary when a pass read it is packed with a summary built from its closure alone. That summary has no shell path or directory, takes the closing time for the creation time, and has default dimensions. A journal gives no summary when an earlier build wrote it and it could not be brought forward (the registry was busy or unreadable, another recovery held the session, the migration failed, or the journal is older than the migration ladder and waits for `kr host import-journals`), when it holds no record of the session, and when it cannot be read. Such a session counts as changed once its journal gives a summary, so a later pass makes the generation again with the session's own record. It does not count as changed when one of those reasons gives way to another, because the summary packed is the same. After an upgrade to this release, a session that was not marked before and whose journal gives no summary counts as changed once, so the next pass makes one more generation. A session marked before keeps its digest while its journal still gives no summary. A session whose journal is read, or is not there, digests as it always has. A generation an earlier release made for such a session is not made again for this alone; the next generation that anything else causes holds the session as it then reads. The members follow the restore's limits: a session at most 192 MiB, the configuration at most 1 MiB, all members together at most 1.5 GiB, and at most 4,096 members. A session that would take the total past its limit is left out of that generation whole, a smaller one after it may still fit, and `kr doctor` counts what was left out. With nothing to pack, there is no generation.
 
 A pass makes a generation only when all of these hold:
 
