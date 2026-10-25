@@ -54,20 +54,27 @@ records above.
 "The same root" is the same set of keys the root names for its own role, so a mirror and a vendor
 repository beneath the official root share their publishers, and a renewed root keeps them. A
 repository on a root that a holder's root signed over, the rotation a client follows, is under the
-holder's root: each sync of the repository that followed the rotation is accepted, not only the one
-that made it, while the holder has not followed yet. The host reads that from the signatures the
-repository's root carries, so it reaches one rotation. A holder two rotations behind is not
-recognised until it synchronises and follows, and a removed repository whose installation stays
-cannot, so it holds the name until what it installed is removed. A sync also accepts a holder under
-the root the repository was on, since the client verified the chain between them. For an
-installation a mirror that has not followed a rotation counts as another root until it
-synchronises.
+holder's root: each sync and each installation of the repository that followed the rotation is
+accepted, not only the sync that made it, while the holder has not followed yet. The host reads
+that from the signatures the repository's root carries, and keeps no record of the rotation, so it
+reaches the signatures of the older keys on the root the repository holds now. A root renewed
+again, signed only by the keys that replaced the older ones, carries none of them, and neither
+does a root two rotations on. A holder behind such a root is recognised again when it synchronises
+and follows; a removed repository whose installation stays cannot, and holds the name until what
+it installed is removed. A sync also accepts a holder under the root the repository was on, since
+the client verified the chain between them. A repository on the old root whose source has not
+published the rotation is refused when it synchronises and when it installs, until the source
+has.
 
 The limits of the rule:
 
-- A refused sync or installation changes nothing. The repository keeps its generation and what it
-  installed, and each sync and installation under that name is refused until the holder is removed
-  with what was installed from it.
+- A refused sync or installation activates and installs nothing. What it did before the refusal
+  stays: a root the client verified a rotation to is kept, a sync refused as its generation was to
+  be activated has already published the trust checkpoint it accepted and its index document, and
+  an installation has cached its package. The repository keeps its generation and what it
+  installed. Each sync and installation under that name is refused until the holder stops holding
+  it: it is removed with what was installed from it, it follows the rotation that put it behind,
+  or its generation stops listing the name.
 - A removed repository whose installation stays and whose checkpoint cannot be read holds its name
   against every root, its own included.
 - Two repositories under different roots that both listed one name before the rule applied are
@@ -76,7 +83,7 @@ The limits of the rule:
   whichever repository was enrolled first. A host whose build seeded nothing has no such
   repository, and the official one is held to the rule like any other: a repository that held a
   shipped name before stops the official repository's syncs, and the revocations they carry, until
-  the owner removes it.
+  the owner removes it with what was installed from it.
 - A delegation that lists no package holds no name.
 
 A root gives each of its four roles a key of its own. A root that names one key for two roles, or
@@ -85,9 +92,10 @@ to adopt it, when the build is asked to trust the bundled generation's, and for 
 ends on, before that root is kept (a root a sync rotates to is not kept, and the repository stays
 on the root and the generation it was on). What a person can do depends on where the root is met.
 For a root offered for adoption, the repository's publisher gives a root with a key for each role
-and the owner enrols the repository with it. A bundled root is replaced by a later release of the
-product. A root a sync moves to or ends on is replaced by the publisher's next root, signed over
-it, which the host follows. The check compares the keys as the client parsed them, within a family
+and the owner enrols the repository with it. A bundled root is not seeded by this build, and a
+release whose bundled root gives each role a key of its own seeds it. A root a sync moves to or
+ends on is replaced by the publisher's next root, signed over the refused one, which the host
+follows. The check compares the keys as the client parsed them, within a family
 of keys (Ed25519, RSA, ECDSA). It does not find one key written two ways, an Ed25519 key and its
 negation or its sum with a small-order point, or two RSA keys of one modulus; those are the key
 ceremony's. A root this host already holds is refused when a sync ends on it, not before the

@@ -10368,6 +10368,10 @@ async fn kr_req_11_08_an_installation_waits_for_a_repository_that_has_not_follow
         .await
         .expect_err("the mirror is still on the old root");
     refused_for_a_held_name(&refusal, "kalareach", "official");
+    assert!(
+        refusal.to_string().contains("synchronise it"),
+        "a repository that lags is told to catch up, not to remove the one ahead: {refusal}"
+    );
     catalogue
         .sync(&named("mirror"))
         .await
@@ -10636,6 +10640,9 @@ async fn kr_req_11_08_syncs_after_a_rotation_are_not_held_by_a_repository_on_the
             .map(|active| active.generation),
         Some(3)
     );
+    install_from(&mut catalogue, &repository(), official.manifest_digest())
+        .await
+        .expect("an installation from the repository that followed is accepted too");
 
     catalogue
         .sync(&named("mirror"))
