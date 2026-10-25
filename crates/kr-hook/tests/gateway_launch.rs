@@ -803,6 +803,49 @@ fn kr_req_12_05_a_launch_of_a_saved_conversation_the_session_already_holds_runs_
 ///
 /// Section 11: such a connector cannot be advertised as a resilient managed gateway, and its
 /// unchanged terminal integration remains the supported path. Not claimed: Windows, where no
+/// KR-REQ-12.05: a conversation resumed by a name stays held under that name for as long as its
+/// execution lives, after the stream has named the thread the name stands for, and the thread's
+/// identifier is held too: a second launch of either runs as typed.
+#[test]
+fn kr_req_12_05_a_name_a_launch_resumed_by_is_held_after_the_stream_names_the_thread() {
+    let shell = answering();
+    let saved = "my-work=thread-7";
+    let held = [
+        ("KR_STAND_IN", "stay"),
+        ("KR_STAND_IN_SAVED", saved),
+        ("KR_STAND_IN_COMMAND", COMMAND),
+    ];
+    let first = shell
+        .establish(&["codex", "resume", "my-work"])
+        .expect("a backend is established");
+    let mut running = shell.launch_typed(&first, "first", &held, &["resume", "my-work"]);
+    running.prints("TUI: a turn is running");
+    // The stream named the thread the name stands for: it is held by its identifier, and the name
+    // the launch used is held still.
+    eventually("the stream's thread is held", || {
+        shell.broker.conversation_owner("thread-7").is_some()
+    });
+    let owner = shell.broker.conversation_owner("thread-7").expect("held");
+    assert_eq!(shell.broker.conversation_owner("my-work"), Some(owner));
+    for (name, word) in [("by-name", "my-work"), ("by-id", "thread-7")] {
+        let answer = shell
+            .establish(&["codex", "resume", word])
+            .expect("a backend is established");
+        let mut again = shell.launch_typed(&answer, name, &held, &["resume", word]);
+        eventually("the launch ran as typed or was served", || {
+            again.child.try_wait().ok().flatten().is_some()
+                || again.printed().contains("TUI: a turn is running")
+        });
+        assert!(
+            !again.printed().contains("TUI:"),
+            "{name}: the launch was served a server: {}",
+            again.printed()
+        );
+        assert_eq!(again.ends().code(), Some(2), "{name}: {}", again.said());
+        assert_eq!(shell.servers().len(), 1, "{name}: no second server");
+    }
+}
+
 /// gateway runs.
 #[test]
 fn kr_req_11_35_a_connector_without_a_tested_volatile_forwarding_mode_runs_the_program_as_typed() {

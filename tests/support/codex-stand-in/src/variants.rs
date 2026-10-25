@@ -33,8 +33,9 @@ pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
 /// method, and the method of a request.
 pub const RECEIVED_VARIABLE: &str = "KR_STAND_IN_RECEIVED";
 
-/// The saved conversations the server holds when it starts, as thread identifiers separated by
-/// commas, which a terminal started with `resume <id>` can resume.
+/// The saved conversations the server holds when it starts, separated by commas: a thread
+/// identifier, or `name=identifier` for one that has a name too. A terminal started with
+/// `resume <word>` can resume one by either.
 pub const SAVED_VARIABLE: &str = "KR_STAND_IN_SAVED";
 
 /// The ways a run can differ from the default.
