@@ -2156,12 +2156,12 @@ fn kr_req_11_13_rows_go_with_the_process_that_held_them_and_with_a_native_exit()
 }
 
 /// Section 5: a package that ships a component binds for its declarative parts, whose actions it
-/// registers and whose rich admissions it makes, and the worker's report on its admissions says
-/// what this host does with the component, and what it does not. The same package with no
-/// component is reported for nothing.
+/// registers and whose rich admissions it makes, and the worker's report on its admissions names
+/// nothing of the component as left unused: the host asks it to prepare an action, to read a
+/// request and to write its answer. The same package with no component is reported for nothing too.
 #[test]
-fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_reports_what_is_done_with_the_component()
- {
+fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_is_reported_for_nothing()
+{
     let reported = |worker: &Worker, package: Digest256| {
         worker
             .admissions
@@ -2203,12 +2203,7 @@ fn kr_req_11_13_a_package_with_a_component_binds_its_declarative_parts_and_repor
         .rich_admission(1, 1)
         .expect("a declared action is admitted");
     let details = reported(&worker, source.package_digest);
-    assert_eq!(details.len(), 1, "{details:?}");
-    assert!(
-        details[0].contains("encode-response") && details[0].contains("writes every answer"),
-        "{}",
-        details[0]
-    );
+    assert!(details.is_empty(), "{details:?}");
 
     let worker = Worker::open();
     let source = worker.claude_code();

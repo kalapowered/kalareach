@@ -62,17 +62,6 @@ impl ReadPackage {
     }
 }
 
-/// What this host leaves undone with a package's component, whatever a binding stands at: it
-/// registers the component with the plugin runtime for a binding, offers it what the binding may
-/// observe, takes and restores its state, asks it to prepare an action a person invokes and, where
-/// the package is trusted to decode, to read a request the connector's table asks a decision for,
-/// and never calls its encode-response export: the connector's table writes every answer.
-///
-/// The words are always true of the package, whether or not a binding holds it now; where each
-/// binding's component stands is in that binding's own report.
-pub const COMPONENT_CALLS: &str = "this host never calls its component's encode-response export, because the connector's table \
-     writes every answer";
-
 /// Whether a snapshot was applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
@@ -391,14 +380,10 @@ impl Admissions {
             .iter()
             .filter_map(|(digest, read)| match read {
                 Err(why) => Some((*digest, why.clone())),
-                // A package read is named too for the parts of it this worker does not use: a
-                // component's encoding export, which nothing here calls, and each declared action
-                // that could not be registered.
-                Ok(read) => {
+                // A package read is named too for the parts of it this worker does not use: each
+                // declared action that could not be registered.
+                Ok(_) => {
                     let mut unused = Vec::new();
-                    if read.manifest().has_component() {
-                        unused.push(COMPONENT_CALLS.to_owned());
-                    }
                     if let Some(refused) = action_refusals
                         .get(digest)
                         .filter(|refused| !refused.is_empty())
