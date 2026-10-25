@@ -16,7 +16,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import type { DocumentNode } from '@kalareach/plugin-sdk'
-import type { AgentSnapshotParams } from '@kalareach/protocol'
+import type { AgentSnapshotParams, PluginActionInvokeParams } from '@kalareach/protocol'
 
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
@@ -540,5 +540,70 @@ describe('the conversation names each kind of entry in words (KR-REQ-13.19)', ()
     expect(
       document.querySelector(`[data-node-id="${entry(7)}"]`)?.getAttribute('data-kind')
     ).toBe('plan.revised')
+  })
+})
+
+describe("a package's control invokes its action on the session's worker (KR-REQ-13.14)", () => {
+  /** A group of two controls: one whose action takes nothing, and one that asks for a name. */
+  function controlsNode(): DocumentNode {
+    const control = (id: string, label: string, action: string, parameters: unknown[]) => ({
+      id,
+      revision: '1',
+      label,
+      accessible_description: label,
+      action_id: action,
+      parameters: { parameters }
+    })
+    return {
+      id: 'g-1',
+      revision: '1',
+      body: {
+        kind: 'action_group',
+        label: 'Thread',
+        controls: [
+          control('refresh', 'Refresh', 'thread.refresh', []),
+          control('rename', 'Rename', 'thread.rename', [{ name: 'to' }])
+        ]
+      }
+    } as unknown as DocumentNode
+  }
+
+  it('sends the typed call for an action that takes nothing, and asks the host nothing for one that takes input', async () => {
+    const { port, controls } = fakeHost()
+    const calls: PluginActionInvokeParams[] = []
+    openConversation({
+      ...port,
+      pluginActionInvoke: (params, opening) => {
+        calls.push(params)
+        return port.pluginActionInvoke(params, opening)
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    act(() => {
+      controls.appendNode(controlsNode())
+    })
+    await nextFrame()
+    const subject = { session_id: SESSION_MAIN, application_instance_id: INSTANCE_MAIN }
+    const read = await port.agentCapabilities({ subject })
+    const person = userEvent.setup()
+
+    await person.click(await screen.findByRole('button', { name: 'Refresh' }))
+    await waitFor(() => {
+      expect(calls).toHaveLength(1)
+    })
+    expect(calls[0]).toEqual({
+      target: { subject, binding_revision: read.binding.binding_revision },
+      plugin_id: 'openai.codex',
+      action: 'thread.refresh',
+      draft_id: null,
+      resource_id: null,
+      parameters: 'e30'
+    })
+
+    await person.click(screen.getByRole('button', { name: 'Rename' }))
+    expect(await screen.findByText(/asks for input this view cannot take yet/)).toBeTruthy()
+    expect(calls).toHaveLength(1)
   })
 })

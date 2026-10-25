@@ -151,6 +151,14 @@ describe('the desktop port and the published methods', () => {
     const steer = { target, text: 'Stop after the tests', turn_id: 'turn-2' }
     const cancel = { target, turn_id: 'turn-2' }
     const answer = { target, resource_id: 'resource-1', option_id: 'approve' }
+    const invocation = {
+      target,
+      plugin_id: 'openai.codex',
+      action: 'thread.refresh',
+      draft_id: null,
+      resource_id: null,
+      parameters: 'e30'
+    }
     await port.sessionAgents(SESSION)
     await port.agentCapabilities({ subject })
     await port.agentSnapshot({ subject, from_node: '5' })
@@ -161,6 +169,7 @@ describe('the desktop port and the published methods', () => {
     await port.composerSteer(steer)
     await port.composerInterrupt(cancel)
     await port.approvalRespond(answer)
+    await port.pluginActionInvoke(invocation)
     await port.historyPage({ session_id: SESSION, from_cursor: '0', max_bytes: '65536' })
     expect(shell.invoked).toEqual([
       { command: 'session_agents', args: { sessionId: SESSION } },
@@ -176,6 +185,7 @@ describe('the desktop port and the published methods', () => {
       { command: 'agent_turn_steer', args: { params: steer } },
       { command: 'agent_turn_cancel', args: { params: cancel } },
       { command: 'agent_approval_respond', args: { params: answer } },
+      { command: 'plugin_action_invoke', args: { params: invocation } },
       {
         command: 'history_page',
         args: { params: { session_id: SESSION, from_cursor: '0', max_bytes: '65536' } }
