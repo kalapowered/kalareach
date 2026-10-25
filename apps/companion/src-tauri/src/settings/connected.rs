@@ -18,7 +18,6 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::ids::{EnvironmentId, SessionId};
 use kr_protocol::method::Method;
-use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult};
@@ -129,46 +128,26 @@ fn unreadable(reason: impl Into<String>) -> HostPrivacy {
 /// otherwise.
 const HOST_IS_CHANGING: &str = "the host is changing its privacy mode";
 
-/// Why a host of an earlier build cannot be read by a device that does not manage it, and what to
-/// do about it.
-const EARLIER_BUILD: &str =
-    "the host is of an earlier build that answers only a device that manages it; update the host";
-
-/// What the seam does with the answer to `host.info`.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Choice {
-    /// The host said where its privacy mode stands.
-    Known(HostPrivacy),
-    /// The host of an earlier build said nothing of it in `host.info`, and this device may ask
-    /// `privacy.status`.
-    AskStatus,
-    /// This device cannot read it, and the host's drafts are treated as private.
-    Unreadable(String),
-}
+/// Why a host that says nothing of its privacy mode cannot be read.
+const NOT_SAID: &str = "the host did not say where its privacy mode stands";
 
 /// Decides, from what `host.info` came to, how this device reads a host's privacy mode.
 ///
-/// `told` is the host's answer, or why there was none. `manages` says whether this device holds
-/// the right to manage the host, which `privacy.status` asks for and `host.info` does not. A
-/// branch that reads a host as off where it is not lets drafts leave this device, so each of the
-/// others stays closed: a host that is changing, one that did not answer, and one that tells
-/// nothing to a device that cannot ask.
-///
-/// Goes once no retained level is below 0.77: every host then sends the `privacy` member, and the
-/// branch for an answer without it, with the request it leads to, is removed.
-pub(crate) fn choose(told: Result<HostInfoResult, String>, manages: bool) -> Choice {
+/// `told` is the host's answer, or why there was none. A branch that reads a host as off where it
+/// is not lets drafts leave this device, so each of the others stays closed: a host that is
+/// changing, one that did not answer, and one that tells nothing.
+pub(crate) fn read_privacy(told: Result<HostInfoResult, String>) -> HostPrivacy {
     match told {
-        Err(reason) => Choice::Unreadable(reason),
+        Err(reason) => unreadable(reason),
         Ok(info) => match info.privacy {
-            Some(state) if state.changing => Choice::Unreadable(HOST_IS_CHANGING.to_owned()),
-            Some(state) if state.enabled => Choice::Known(HostPrivacy::On {
+            Some(state) if state.changing => unreadable(HOST_IS_CHANGING),
+            Some(state) if state.enabled => HostPrivacy::On {
                 generation: state.generation.get(),
-            }),
-            Some(state) => Choice::Known(HostPrivacy::Off {
+            },
+            Some(state) => HostPrivacy::Off {
                 generation: state.generation.get(),
-            }),
-            None if manages => Choice::AskStatus,
-            None => Choice::Unreadable(EARLIER_BUILD.to_owned()),
+            },
+            None => unreadable(NOT_SAID),
         },
     }
 }
@@ -411,10 +390,6 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
             if connection.environment_id() != environment {
                 return unreadable("this computer is not connected to that host");
             }
-            let manages = match connection.standing() {
-                Standing::Owner => true,
-                Standing::Paired { rights, .. } => rights.contains(&ActionRight::HostManage),
-            };
             let told = match tokio::time::timeout(
                 ANSWER_WITHIN,
                 connection
@@ -427,41 +402,8 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                 Ok(Err(error)) => Err(CommandError::from(error).message),
                 Ok(Ok(info)) => Ok(info),
             };
-            match choose(told, manages) {
-                Choice::Known(state) => state,
-                Choice::Unreadable(reason) => unreadable(reason),
-                Choice::AskStatus => status_of(&connection).await,
-            }
+            read_privacy(told)
         })
-    }
-}
-
-/// Where a host of an earlier build says its privacy mode stands, in the answer to
-/// `privacy.status`, which it gives only a device it gave the right to manage it.
-async fn status_of(connection: &Connection) -> HostPrivacy {
-    let asked = tokio::time::timeout(
-        ANSWER_WITHIN,
-        connection
-            .session()
-            .read::<_, PrivacyReport>(Method::PrivacyStatus, &PrivacyStatusParams {}),
-    )
-    .await;
-    match asked {
-        Err(_) => unreadable("the host did not say where privacy mode stands in time"),
-        Ok(Err(error)) => {
-            let error = CommandError::from(error);
-            if error.code == ErrorCode::PermissionDenied {
-                unreadable("the host does not let this device read its privacy mode")
-            } else {
-                unreadable(error.message)
-            }
-        }
-        Ok(Ok(report)) if report.enabled => HostPrivacy::On {
-            generation: report.generation.get(),
-        },
-        Ok(Ok(report)) => HostPrivacy::Off {
-            generation: report.generation.get(),
-        },
     }
 }
 
@@ -507,51 +449,48 @@ mod tests {
         })
     }
 
-    /// A host that says where its privacy mode stands is read as it says, whatever right this
-    /// device holds, and a host that says it is changing is read as private, because an answer
-    /// that reads a host as off where it is not lets drafts leave this device.
+    /// A host that says where its privacy mode stands is read as it says, and a host that says it
+    /// is changing is read as private, because an answer that reads a host as off where it is not
+    /// lets drafts leave this device.
     #[test]
     fn a_host_that_says_where_its_privacy_mode_stands_is_read_as_it_says() {
-        for manages in [false, true] {
-            assert_eq!(
-                choose(Ok(info(says(false, 4, false))), manages),
-                Choice::Known(HostPrivacy::Off { generation: 4 }),
-                "the control"
-            );
-            assert_eq!(
-                choose(Ok(info(says(true, 5, false))), manages),
-                Choice::Known(HostPrivacy::On { generation: 5 })
-            );
-            assert!(
-                matches!(
-                    choose(Ok(info(says(false, 4, true))), manages),
-                    Choice::Unreadable(_)
-                ),
-                "a host that is changing is not read as off"
-            );
-        }
+        assert_eq!(
+            read_privacy(Ok(info(says(false, 4, false)))),
+            HostPrivacy::Off { generation: 4 },
+            "the control"
+        );
+        assert_eq!(
+            read_privacy(Ok(info(says(true, 5, false)))),
+            HostPrivacy::On { generation: 5 }
+        );
+        assert!(
+            matches!(
+                read_privacy(Ok(info(says(false, 4, true)))),
+                HostPrivacy::Unreadable { .. }
+            ),
+            "a host that is changing is not read as off"
+        );
     }
 
-    /// A host of an earlier build says nothing in `host.info`: a device that manages it asks
-    /// `privacy.status`, and one that does not cannot read it. Neither reads it as off.
+    /// A host that says nothing in `host.info` is unread, whatever right this device holds: it is
+    /// not read as off.
     #[test]
-    fn a_host_that_says_nothing_is_asked_where_the_right_allows_and_otherwise_unread() {
-        assert_eq!(choose(Ok(info(None)), true), Choice::AskStatus);
+    fn a_host_that_says_nothing_is_unread() {
         assert!(matches!(
-            choose(Ok(info(None)), false),
-            Choice::Unreadable(_)
+            read_privacy(Ok(info(None))),
+            HostPrivacy::Unreadable { .. }
         ));
     }
 
-    /// A host that did not answer, or refused, is unread, whatever right this device holds.
+    /// A host that did not answer, or refused, is unread.
     #[test]
     fn a_host_that_did_not_answer_is_unread() {
-        for manages in [false, true] {
-            assert_eq!(
-                choose(Err("it did not answer".to_owned()), manages),
-                Choice::Unreadable("it did not answer".to_owned())
-            );
-        }
+        assert_eq!(
+            read_privacy(Err("it did not answer".to_owned())),
+            HostPrivacy::Unreadable {
+                reason: "it did not answer".to_owned()
+            }
+        );
     }
 
     /// A session whose worker cannot be reached is refused as unavailable, and that says nothing of

@@ -1,6 +1,5 @@
-//! The record of excluded releases and the in-level check, against repositories with the history
-//! the real one has: a level released more than once, a bare origin, and a surface that changes
-//! between two releases of one level.
+//! The in-level check, against repositories with the history the real one has: a level released
+//! more than once, a bare origin, and a surface that changes between two releases of one level.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,9 +9,8 @@ use serde_json::{Value, json};
 use kr_protocol::hello::PackageVersion;
 use kr_protocol::update::CompatibilityLevel;
 
-use crate::excluded::{Exclusions, kept, surface_digest};
 use crate::in_level::{Head, Outcome, WorkerSurface, check};
-use crate::releases::{agree_with_origin, inventory};
+use crate::releases::{agree_with_origin, inventory, kept};
 
 /// What one commit of the fixture repository holds: the files the checks read.
 #[derive(Clone)]
@@ -73,7 +71,7 @@ impl Tree {
             version: "0.76.0",
             schema: schema(false, "string", "string"),
             worker: None,
-            host: "kr-plugin-host/2",
+            host: "kr-plugin-host/3",
             majors: "major=1 versions=1.0 replaced=- supported_until=- retired=false\n",
             roots: vec!["ControlFrame"],
         }
@@ -221,18 +219,6 @@ impl Repo {
             public_majors: tree.majors.to_owned(),
         }
     }
-
-    /// The record of excluded releases for `releases`, as the repository's own digests give them.
-    fn record(&self, releases: &[(&str, &str)]) -> Exclusions {
-        let mut text = String::new();
-        for (tag, commit) in releases {
-            text.push_str(&format!(
-                "tag={tag}\ncommit={commit}\nlevel=0.76\nsurface={}\nwhy=made before the level was whole\n\n",
-                surface_digest(&self.directory, commit).expect("a digest")
-            ));
-        }
-        Exclusions::parse(&text).expect("a record")
-    }
 }
 
 impl Drop for Repo {
@@ -241,74 +227,64 @@ impl Drop for Repo {
     }
 }
 
-/// A level released twice before its last change, then once with it, and a commit after.
-struct Split {
+/// A level released three times, the first two from `first_two` and the last from the level's own
+/// tree, and a commit after.
+struct Released {
     repo: Repo,
-    early: (String, String),
+    first: (String, String),
     second: (String, String),
-    whole: (String, String),
+    last: (String, String),
     head: String,
 }
 
-fn split(name: &str, head_tree: &Tree) -> Split {
+fn released(name: &str, head_tree: &Tree, first_two: &Tree) -> Released {
     let repo = Repo::new(name);
-    let old = Tree::before_the_lease();
-    let first = repo.commit(&old, "first of the level");
-    let early = (repo.release("0.76.0", &first), first);
-    let next = repo.commit(&old, "second of the level");
+    let first_commit = repo.commit(first_two, "first of the level");
+    let first = (repo.release("0.76.0", &first_commit), first_commit);
+    let next = repo.commit(first_two, "second of the level");
     let second = (repo.release("0.76.0", &next), next);
-    let whole_commit = repo.commit(&Tree::the_level(), "the level with the lease");
-    let whole = (repo.release("0.76.0", &whole_commit), whole_commit);
+    let last_commit = repo.commit(&Tree::the_level(), "the level with the lease");
+    let last = (repo.release("0.76.0", &last_commit), last_commit);
     let head = repo.commit(head_tree, "after");
-    Split {
+    Released {
         repo,
-        early,
+        first,
         second,
-        whole,
+        last,
         head,
     }
 }
 
-fn run(split: &Split, tree: &Tree, exclusions: &Exclusions) -> Result<Outcome, String> {
-    let releases = inventory(&split.repo.directory).expect("an inventory");
+/// A level whose first two releases were made before its last change: they have no `lease`.
+fn split(name: &str, head_tree: &Tree) -> Released {
+    released(name, head_tree, &Tree::before_the_lease())
+}
+
+/// A level whose releases all have the surface the level has.
+fn whole_level(name: &str, head_tree: &Tree) -> Released {
+    released(name, head_tree, &Tree::the_level())
+}
+
+fn run(level: &Released, tree: &Tree) -> Result<Outcome, String> {
+    let releases = inventory(&level.repo.directory).expect("an inventory");
     check(
-        &split.repo.directory,
-        &split.repo.head(tree, &split.head),
+        &level.repo.directory,
+        &level.repo.head(tree, &level.head),
         &releases,
-        exclusions,
     )
 }
 
-/// The split of train 2026-10-31: two releases of a level without a member the level has. Without
-/// the record the check names both and the member; with it the level is the release that has it.
+/// Two releases of a level made before a member the level has: the check names both and the
+/// member, and not the release that has it.
 #[test]
-fn the_split_of_a_level_fails_without_the_exclusion_and_holds_with_it() {
+fn a_level_released_before_its_last_change_fails_naming_the_early_releases() {
     let now = Tree::the_level();
-    let split = split("split", &now);
-    let error = run(&split, &now, &Exclusions::none()).expect_err("the early releases differ");
-    assert!(error.contains(&split.early.0), "{error}");
-    assert!(error.contains(&split.second.0), "{error}");
+    let level = split("split", &now);
+    let error = run(&level, &now).expect_err("the early releases differ");
+    assert!(error.contains(&level.first.0), "{error}");
+    assert!(error.contains(&level.second.0), "{error}");
     assert!(error.contains("ForwardedMutation.lease"), "{error}");
-    assert!(!error.contains(&split.whole.0), "{error}");
-
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
-    record
-        .validate(
-            &split.repo.directory,
-            &inventory(&split.repo.directory).expect("an inventory"),
-        )
-        .expect("the record holds");
-    let outcome = run(&split, &now, &record).expect("the level holds with the record");
-    assert_eq!(
-        outcome,
-        Outcome::Held {
-            releases: vec![split.whole.0.clone()],
-            notes: vec![],
-        }
-    );
+    assert!(!error.contains(&level.last.0), "{error}");
 }
 
 /// A change inside a root a worker's peers read is a difference, and the same change to a type no
@@ -316,23 +292,19 @@ fn the_split_of_a_level_fails_without_the_exclusion_and_holds_with_it() {
 #[test]
 fn a_change_to_a_widened_root_fails_and_a_change_outside_every_root_does_not() {
     let now = Tree::the_level();
-    let split = split("widened", &now);
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
+    let level = whole_level("widened", &now);
     let widened = Tree {
         schema: schema(true, "integer", "string"),
         ..now.clone()
     };
-    let error = run(&split, &widened, &record).expect_err("a root changed");
-    assert!(error.contains(&split.whole.0), "{error}");
+    let error = run(&level, &widened).expect_err("a root changed");
+    assert!(error.contains(&level.last.0), "{error}");
     assert!(error.contains("PeerParams.member"), "{error}");
     let outside = Tree {
         schema: schema(true, "string", "integer"),
         ..now.clone()
     };
-    run(&split, &outside, &record).expect("no root reaches that type");
+    run(&level, &outside).expect("no root reaches that type");
 }
 
 /// A root the head no longer has cannot hide the difference: the release's own list is cut too, and
@@ -340,11 +312,7 @@ fn a_change_to_a_widened_root_fails_and_a_change_outside_every_root_does_not() {
 #[test]
 fn a_root_the_head_dropped_is_a_difference() {
     let now = Tree::the_level();
-    let split = split("dropped", &now);
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
+    let level = whole_level("dropped", &now);
     // A release of the level, made later, that reads a root of its own.
     let mut with_root = now.clone();
     with_root.schema["$defs"]["OnlyThere"] = json!({
@@ -355,15 +323,14 @@ fn a_root_the_head_dropped_is_a_difference() {
     let mut table = worker("session.read", "session.output");
     table["peer_roots"] = json!(["OnlyThere", "PeerParams", "PeerResult"]);
     with_root.worker = Some(table);
-    let commit = split.repo.commit(&with_root, "a root of its own");
-    let tag = split.repo.release("0.76.0", &commit);
-    let head = split.repo.commit(&now, "the head without it");
-    let releases = inventory(&split.repo.directory).expect("an inventory");
+    let commit = level.repo.commit(&with_root, "a root of its own");
+    let tag = level.repo.release("0.76.0", &commit);
+    let head = level.repo.commit(&now, "the head without it");
+    let releases = inventory(&level.repo.directory).expect("an inventory");
     let error = check(
-        &split.repo.directory,
-        &split.repo.head(&now, &head),
+        &level.repo.directory,
+        &level.repo.head(&now, &head),
         &releases,
-        &record,
     )
     .expect_err("a root went");
     assert!(error.contains(&tag), "{error}");
@@ -379,22 +346,18 @@ fn a_root_the_head_dropped_is_a_difference() {
 #[test]
 fn a_renamed_event_and_a_method_no_longer_served_are_differences() {
     let now = Tree::the_level();
-    let split = split("tables", &now);
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
+    let level = whole_level("tables", &now);
     let renamed = Tree {
         worker: Some(worker("session.read", "session.output.v2")),
         ..now.clone()
     };
-    let error = run(&split, &renamed, &record).expect_err("an event was renamed");
+    let error = run(&level, &renamed).expect_err("an event was renamed");
     assert!(error.contains("session.output was sent there"), "{error}");
     let unserved = Tree {
         worker: Some(worker("session.close", "session.output")),
         ..now.clone()
     };
-    let error = run(&split, &unserved, &record).expect_err("a method went");
+    let error = run(&level, &unserved).expect_err("a method went");
     assert!(error.contains("session.read was served there"), "{error}");
     assert!(error.contains("session.close is served here"), "{error}");
 }
@@ -412,7 +375,6 @@ fn a_release_before_the_tables_is_compared_by_schema_and_the_run_says_so() {
         &repo.directory,
         &repo.head(&old, &head),
         &releases,
-        &Exclusions::none(),
     )
     .expect("the schema is the same");
     let Outcome::Held { releases, notes } = outcome else {
@@ -431,7 +393,6 @@ fn a_release_before_the_tables_is_compared_by_schema_and_the_run_says_so() {
         &repo.directory,
         &repo.head(&widened, &head),
         &releases,
-        &Exclusions::none(),
     )
     .expect_err("a root the release had no list for changed");
     assert!(error.contains("PeerParams.member"), "{error}");
@@ -441,27 +402,22 @@ fn a_release_before_the_tables_is_compared_by_schema_and_the_run_says_so() {
 #[test]
 fn the_plugin_host_protocol_and_the_public_majors_are_held() {
     let now = Tree::the_level();
-    let split = split("host", &now);
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
+    let level = whole_level("host", &now);
     let host = Tree {
-        host: "kr-plugin-host/3",
+        host: "kr-plugin-host/4",
         ..now.clone()
     };
-    let error = run(&split, &host, &record).expect_err("the host protocol moved");
-    assert!(error.contains("kr-plugin-host/2"), "{error}");
+    let error = run(&level, &host).expect_err("the host protocol moved");
+    assert!(error.contains("kr-plugin-host/3"), "{error}");
     let majors = Tree {
         majors: "major=1 versions=1.0,1.1 replaced=- supported_until=- retired=false\n",
         ..now.clone()
     };
-    let error = run(&split, &majors, &record).expect_err("the public majors moved");
+    let error = run(&level, &majors).expect_err("the public majors moved");
     assert!(error.contains("public majors"), "{error}");
 }
 
-/// With no release at the commit's level the commit moves it, and a level none of whose releases
-/// is kept is refused by the record.
+/// With no release at the commit's level the commit moves it.
 #[test]
 fn a_commit_with_no_release_at_its_level_moves_it() {
     let repo = Repo::new("moves");
@@ -478,189 +434,33 @@ fn a_commit_with_no_release_at_its_level_moves_it() {
         &repo.directory,
         &repo.head(&now, &head),
         &releases,
-        &Exclusions::none(),
     );
     assert_eq!(outcome, Ok(Outcome::MovesTheLevel));
 }
 
-fn record_text(tag: &str, commit: &str, surface: &str, level: &str) -> String {
-    format!("tag={tag}\ncommit={commit}\nlevel={level}\nsurface={surface}\nwhy=a reason\n")
-}
-
-const TAG: &str = "packages/v0.76.0+53a2e0be5111";
-const COMMIT: &str = "53a2e0be511158180ff0e1654681b96ff90d97c2";
-
-/// A record that is not well formed is refused, each shape by its own message.
+/// The releases of a level are the level's without the commit being checked.
 #[test]
-fn a_malformed_record_is_refused() {
-    let surface = "0".repeat(64);
-    let good = record_text(TAG, COMMIT, &surface, "0.76");
-    Exclusions::parse(&good).expect("a record");
-    for (what, text) in [
-        ("a line that is no field", format!("{good}a line\n")),
-        ("an unknown field", format!("{good}extra=1\n")),
-        ("a field twice", format!("{good}why=again\n")),
-        ("a missing field", good.replace("why=a reason\n", "")),
-        (
-            "a commit that is short",
-            record_text(TAG, &COMMIT[..39], &surface, "0.76"),
-        ),
-        (
-            "a commit in capitals",
-            record_text(TAG, &COMMIT.to_uppercase(), &surface, "0.76"),
-        ),
-        (
-            "a surface that is short",
-            record_text(TAG, COMMIT, &surface[..63], "0.76"),
-        ),
-        (
-            "a level that is not one",
-            record_text(TAG, COMMIT, &surface, "0.x"),
-        ),
-        (
-            "a tag that is not a release",
-            record_text("v0.76.0", COMMIT, &surface, "0.76"),
-        ),
-        ("a tag twice", format!("{good}\n{good}")),
-        ("a record of nothing", "# only a comment\n".to_owned()),
-    ] {
-        assert!(Exclusions::parse(&text).is_err(), "{what} is refused");
-    }
-}
-
-/// The record is closed: it names the two tags and no others, and the file is read as a checkout
-/// has it.
-#[test]
-fn the_record_names_the_two_closed_tags_and_no_others() {
-    let directory =
-        std::env::temp_dir().join(format!("kr-protocol-gen-closed-{}", std::process::id()));
-    let path = directory.join(crate::excluded::RECORD);
-    std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
-    let surface = "0".repeat(64);
-    let one = record_text(TAG, COMMIT, &surface, "0.76");
-    std::fs::write(&path, &one).expect("a record");
-    let error = Exclusions::read(&directory).expect_err("one of two");
-    assert!(error.contains("closed"), "{error}");
-    let other = record_text("packages/v0.76.0+0123456789ab", COMMIT, &surface, "0.76");
-    std::fs::write(&path, format!("{one}\n{other}")).expect("a record");
-    assert!(
-        Exclusions::read(&directory).is_err(),
-        "a third tag is refused"
-    );
-    let both = format!(
-        "{one}\n{}",
-        record_text(
-            "packages/v0.76.0+d3a552aa2ea6",
-            "d3a552aa2ea66b5e175962eaa436d4a6f852405a",
-            &surface,
-            "0.76"
-        )
-    );
-    std::fs::write(&path, both).expect("a record");
-    Exclusions::read(&directory).expect("the closed set");
-    let _ = std::fs::remove_dir_all(&directory);
-}
-
-/// A record that does not match the repository is refused: an unknown tag, a commit the tag does
-/// not point at, a level that is not the tag's, a digest that is not its own schema's, a level with
-/// no release that is kept, and an excluded release that is newer than one that is kept.
-#[test]
-fn a_record_that_does_not_match_the_repository_is_refused() {
+fn the_releases_of_a_level_leave_out_the_commit_under_test() {
     let now = Tree::the_level();
-    let split = split("refused", &now);
-    let inventory = inventory(&split.repo.directory).expect("an inventory");
-    let digest = surface_digest(&split.repo.directory, &split.early.1).expect("a digest");
-    let validate = |text: String| {
-        Exclusions::parse(&text)
-            .expect("a record")
-            .validate(&split.repo.directory, &inventory)
-    };
-    let good = record_text(&split.early.0, &split.early.1, &digest, "0.76");
-    validate(good.clone()).expect("the record holds");
-
-    let unknown = validate(record_text(
-        "packages/v0.76.0+0123456789ab",
-        &split.early.1,
-        &digest,
-        "0.76",
-    ));
-    assert!(
-        unknown
-            .expect_err("an unknown tag")
-            .contains("not a release tag")
-    );
-    let other = validate(record_text(
-        &split.early.0,
-        &split.second.1,
-        &digest,
-        "0.76",
-    ));
-    assert!(other.expect_err("another commit").contains("points at"));
-    let level = validate(record_text(&split.early.0, &split.early.1, &digest, "0.75"));
-    assert!(level.expect_err("another level").contains("level"));
-    let wrong = validate(record_text(
-        &split.early.0,
-        &split.early.1,
-        &"1".repeat(64),
-        "0.76",
-    ));
-    assert!(
-        wrong
-            .expect_err("another digest")
-            .contains("own schema gives")
-    );
-
-    // The release that has the member is not the schema of the excluded one.
-    let newer = validate(record_text(
-        &split.whole.0,
-        &split.whole.1,
-        &surface_digest(&split.repo.directory, &split.whole.1).expect("a digest"),
-        "0.76",
-    ));
-    assert!(
-        newer
-            .expect_err("the newest is excluded")
-            .contains("is not in the history of"),
-        "an excluded release is older than every kept one"
-    );
-
-    // Every release of the level excluded leaves nothing that says what it is.
-    let mut all = String::new();
-    for (tag, commit) in [&split.early, &split.second, &split.whole] {
-        all.push_str(&record_text(
-            tag,
-            commit,
-            &surface_digest(&split.repo.directory, commit).expect("a digest"),
-            "0.76",
-        ));
-        all.push('\n');
-    }
-    assert!(
-        validate(all)
-            .expect_err("nothing kept")
-            .contains("no release that is not excluded")
-    );
-}
-
-/// The kept releases of a level are the level's without the excluded ones and without the commit
-/// being checked.
-#[test]
-fn the_kept_releases_leave_out_the_excluded_and_the_commit_under_test() {
-    let now = Tree::the_level();
-    let split = split("kept", &now);
-    let inventory = inventory(&split.repo.directory).expect("an inventory");
-    let level = CompatibilityLevel::of(PackageVersion::new(0, 76, 0));
-    let record = split.repo.record(&[(&split.early.0, &split.early.1)]);
+    let level = whole_level("kept", &now);
+    let inventory = inventory(&level.repo.directory).expect("an inventory");
+    let wanted = CompatibilityLevel::of(PackageVersion::new(0, 76, 0));
     let tags = |except: &str| -> Vec<String> {
-        kept(&inventory, level, &record, except)
+        kept(&inventory, wanted, except)
             .into_iter()
             .map(|release| release.tag)
             .collect()
     };
-    let mut both = [split.second.0.clone(), split.whole.0.clone()];
-    both.sort();
-    assert_eq!(tags(""), both);
-    assert_eq!(tags(&split.whole.1), std::slice::from_ref(&split.second.0));
+    let mut all = [
+        level.first.0.clone(),
+        level.second.0.clone(),
+        level.last.0.clone(),
+    ];
+    all.sort();
+    assert_eq!(tags(""), all);
+    let mut without_last = [level.first.0.clone(), level.second.0.clone()];
+    without_last.sort();
+    assert_eq!(tags(&level.last.1), without_last);
 }
 
 /// A checkout whose tags are not origin's is refused with its own message, and a tag at the commit
@@ -668,56 +468,56 @@ fn the_kept_releases_leave_out_the_excluded_and_the_commit_under_test() {
 #[test]
 fn tags_that_are_not_origins_are_refused() {
     let now = Tree::the_level();
-    let split = split("origin", &now);
-    let directory = &split.repo.directory;
+    let level = whole_level("origin", &now);
+    let directory = &level.repo.directory;
     let here = inventory(directory).expect("an inventory");
-    agree_with_origin(directory, &here, &split.head).expect("the tags agree");
+    agree_with_origin(directory, &here, &level.head).expect("the tags agree");
 
     // A tag origin has and this checkout lacks, and one only this checkout has.
-    split.repo.git(&["tag", "-d", &split.second.0]);
+    level.repo.git(&["tag", "-d", &level.second.0]);
     let error = agree_with_origin(
         directory,
         &inventory(directory).expect("an inventory"),
-        &split.head,
+        &level.head,
     )
     .expect_err("a tag is missing here");
     assert!(error.contains(&format!(
         "{} is on origin and not in this checkout",
-        split.second.0
+        level.second.0
     )));
     assert!(error.contains("git fetch --force --prune"), "{error}");
-    split.repo.git(&["tag", &split.second.0, &split.second.1]);
-    let local_only = split.repo.tag_here("0.76.1", &split.head);
+    level.repo.git(&["tag", &level.second.0, &level.second.1]);
+    let local_only = level.repo.tag_here("0.76.1", &level.head);
     // At the commit under test: left out on its own side.
     agree_with_origin(
         directory,
         &inventory(directory).expect("an inventory"),
-        &split.head,
+        &level.head,
     )
     .expect("a tag at the commit under test may be on one side");
     // At any other commit it is a difference.
     let error = agree_with_origin(
         directory,
         &inventory(directory).expect("an inventory"),
-        &split.whole.1,
+        &level.last.1,
     )
     .expect_err("a tag only here");
     assert!(error.contains(&format!(
         "{local_only} is in this checkout and not on origin"
     )));
-    split.repo.git(&["tag", "-d", &local_only]);
+    level.repo.git(&["tag", "-d", &local_only]);
 
     // The same name at another commit.
-    split.repo.git(&["tag", "-d", &split.second.0]);
-    split.repo.git(&["tag", &split.second.0, &split.early.1]);
+    level.repo.git(&["tag", "-d", &level.second.0]);
+    level.repo.git(&["tag", &level.second.0, &level.first.1]);
     let error = agree_with_origin(
         directory,
         &[crate::releases::Release {
-            tag: split.second.0.clone(),
+            tag: level.second.0.clone(),
             version: PackageVersion::new(0, 76, 0),
-            commit: split.early.1.clone(),
+            commit: level.first.1.clone(),
         }],
-        &split.head,
+        &level.head,
     )
     .expect_err("another commit");
     assert!(error.contains("on origin"), "{error}");
@@ -727,51 +527,46 @@ fn tags_that_are_not_origins_are_refused() {
 #[test]
 fn an_origin_that_cannot_be_listed_fails_closed() {
     let now = Tree::the_level();
-    let split = split("closed", &now);
-    split
+    let level = whole_level("closed", &now);
+    level
         .repo
         .git(&["remote", "set-url", "origin", "/nonexistent/origin.git"]);
     let error = agree_with_origin(
-        &split.repo.directory,
-        &inventory(&split.repo.directory).expect("an inventory"),
-        &split.head,
+        &level.repo.directory,
+        &inventory(&level.repo.directory).expect("an inventory"),
+        &level.head,
     )
     .expect_err("an origin that does not answer");
     assert!(error.contains("cannot be listed"), "{error}");
-    let _ = split.repo.origin.exists();
+    let _ = level.repo.origin.exists();
 }
 
 /// A release whose tree cannot be read fails the check and is not left out of it.
 #[test]
 fn a_release_whose_schema_cannot_be_read_fails_the_check() {
     let now = Tree::the_level();
-    let split = split("unreadable", &now);
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
+    let level = whole_level("unreadable", &now);
     // A release tag whose commit holds no schema: made from an empty commit on a branch.
-    split.repo.git(&["checkout", "-q", "--orphan", "bare"]);
-    split.repo.git(&["rm", "-rfq", "--cached", "."]);
-    split.repo.write("empty", "nothing");
-    split.repo.write(
+    level.repo.git(&["checkout", "-q", "--orphan", "bare"]);
+    level.repo.git(&["rm", "-rfq", "--cached", "."]);
+    level.repo.write("empty", "nothing");
+    level.repo.write(
         "packages/protocol/package.json",
         "{\"version\": \"0.76.0\"}\n",
     );
-    split
+    level
         .repo
         .git(&["add", "empty", "packages/protocol/package.json"]);
-    split
+    level
         .repo
         .git(&["commit", "-q", "-m", "a release without a schema"]);
-    let bare = split.repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
-    split.repo.release("0.76.0", &bare);
-    let releases = inventory(&split.repo.directory).expect("an inventory");
+    let bare = level.repo.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    level.repo.release("0.76.0", &bare);
+    let releases = inventory(&level.repo.directory).expect("an inventory");
     let error = check(
-        &split.repo.directory,
-        &split.repo.head(&now, &split.head),
+        &level.repo.directory,
+        &level.repo.head(&now, &level.head),
         &releases,
-        &record,
     )
     .expect_err("no schema to read");
     assert!(error.contains("cannot be read"), "{error}");
@@ -947,7 +742,6 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         &repo.directory,
         &data,
         &releases,
-        &Exclusions::none(),
         true,
         &cut,
     )
@@ -961,7 +755,6 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         &repo.directory,
         &data,
         &releases,
-        &Exclusions::none(),
         false,
         &cut,
     )
@@ -972,7 +765,6 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         &repo.directory,
         &data,
         &releases,
-        &Exclusions::none(),
         true,
         &failing,
     )
@@ -994,7 +786,6 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         &level.directory,
         &level.head(&now, &after),
         &tags,
-        &Exclusions::none(),
         true,
         &cut,
     )
@@ -1031,7 +822,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     // The same: nothing differs.
     let same = release_of(&kept_tree, "the same", false);
     assert!(
-        kept_release_differences(&repo.directory, &same, &kept, majors, "kr-plugin-host/2")
+        kept_release_differences(&repo.directory, &same, &kept, majors, "kr-plugin-host/3")
             .expect("compared")
             .is_empty()
     );
@@ -1041,7 +832,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     more.roots = vec!["ControlFrame", "PeerParams"];
     let extra = release_of(&more, "a root of its own", false);
     let found =
-        kept_release_differences(&repo.directory, &extra, &kept, majors, "kr-plugin-host/2")
+        kept_release_differences(&repo.directory, &extra, &kept, majors, "kr-plugin-host/3")
             .expect("compared");
     assert!(
         found.iter().any(|line| line.contains("PeerParams")),
@@ -1052,7 +843,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     let mut misspelled = kept_tree.clone();
     misspelled.roots = vec!["ControlFrame", "ControlFrme"];
     let bad = release_of(&misspelled, "a misspelled root", false);
-    let error = kept_release_differences(&repo.directory, &bad, &kept, majors, "kr-plugin-host/2")
+    let error = kept_release_differences(&repo.directory, &bad, &kept, majors, "kr-plugin-host/3")
         .expect_err("refused");
     assert!(error.contains("ControlFrme"), "{error}");
 
@@ -1070,7 +861,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         &lacking,
         &kept_wide,
         majors,
-        "kr-plugin-host/2",
+        "kr-plugin-host/3",
     )
     .expect("compared");
     assert!(
@@ -1083,7 +874,7 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
     // A release on a branch the history does not reach, whose plugin host protocol differs, held
     // against a table of public majors that is not the one it has.
     let aside = Tree {
-        host: "kr-plugin-host/3",
+        host: "kr-plugin-host/4",
         ..kept_tree.clone()
     };
     let beside = release_of(&aside, "on a branch", true);
@@ -1094,12 +885,12 @@ fn a_kept_release_of_a_retained_level_is_compared_over_both_root_lists_and_both_
         &beside,
         &kept,
         other_majors,
-        "kr-plugin-host/2",
+        "kr-plugin-host/3",
     )
     .expect("compared");
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(found.iter().any(|line| line.contains("public majors")));
-    assert!(found.iter().any(|line| line.contains("kr-plugin-host/3")));
+    assert!(found.iter().any(|line| line.contains("kr-plugin-host/4")));
 }
 
 /// The list of roots is read by the one reader of Rust source the tooling has: in whatever layout
@@ -1188,10 +979,10 @@ fn the_list_of_surface_roots_is_read_strictly() {
 fn the_plugin_host_protocol_is_read_from_the_code() {
     use crate::public_majors::string_const;
     let source = "// pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/1\";\n\
-                  pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n";
+                  pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/3\";\n";
     assert_eq!(
         string_const(source, "PLUGIN_HOST_PROTOCOL").expect("read"),
-        Some("kr-plugin-host/2".to_owned())
+        Some("kr-plugin-host/3".to_owned())
     );
     assert_eq!(
         string_const("fn f() {}", "PLUGIN_HOST_PROTOCOL").expect("none"),
@@ -1236,36 +1027,31 @@ fn the_plugin_host_protocol_is_read_from_the_code() {
 #[test]
 fn a_declared_root_that_is_no_definition_is_refused() {
     let now = Tree::the_level();
-    let split = split("misspelled", &now);
-    let record = split.repo.record(&[
-        (&split.early.0, &split.early.1),
-        (&split.second.0, &split.second.1),
-    ]);
+    let level = whole_level("misspelled", &now);
     let mut bad = now.clone();
     let mut table = worker("session.read", "session.output");
     table["peer_roots"] = json!(["PeerParams", "PeerResult", "PeerParamz"]);
     bad.worker = Some(table);
-    let commit = split
+    let commit = level
         .repo
         .commit(&bad, "a release that lists a root it lacks");
-    split.repo.release("0.76.0", &commit);
-    let head = split.repo.commit(&now, "after");
-    let releases = inventory(&split.repo.directory).expect("an inventory");
+    level.repo.release("0.76.0", &commit);
+    let head = level.repo.commit(&now, "after");
+    let releases = inventory(&level.repo.directory).expect("an inventory");
     let error = check(
-        &split.repo.directory,
-        &split.repo.head(&now, &head),
+        &level.repo.directory,
+        &level.repo.head(&now, &head),
         &releases,
-        &record,
     )
     .expect_err("a release lists a root its schema lacks");
     assert!(error.contains("PeerParamz"), "{error}");
 
     let mut table = worker("session.read", "session.output");
     table["peer_roots"] = json!(["PeerParams", "PeerResult", "PeerParamz"]);
-    let mut head_data = split.repo.head(&now, &head);
+    let mut head_data = level.repo.head(&now, &head);
     head_data.worker = WorkerSurface::parse(&table.to_string()).expect("a table");
-    let only_whole = inventory(&split.repo.directory).expect("an inventory");
-    let error = check(&split.repo.directory, &head_data, &only_whole, &record)
+    let only_whole = inventory(&level.repo.directory).expect("an inventory");
+    let error = check(&level.repo.directory, &head_data, &only_whole)
         .expect_err("the head lists a root its schema lacks");
     assert!(error.contains("this commit declares"), "{error}");
 }
@@ -1293,7 +1079,7 @@ fn a_roots_file_that_cannot_be_read_is_not_an_absent_one() {
     repo.git(&["reset", "-q", "--hard", &commit]);
     repo.write(
         "crates/kr-protocol/src/retained.rs",
-        "pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n",
+        "pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/3\";\n",
     );
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "a file without the list"]);
@@ -1380,12 +1166,12 @@ fn literals_that_look_like_code_do_not_change_what_is_read() {
     ] {
         let source = format!(
             "const C: char = {literal};\n// pub const SURFACE_ROOTS: &[&str] = &[\"Decoy\"];\n\
-             pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/2\";\n\
+             pub const PLUGIN_HOST_PROTOCOL: &str = \"kr-plugin-host/3\";\n\
              pub const SURFACE_ROOTS: &[&str] = &[\"A\"];\n"
         );
         assert_eq!(
             string_const(&source, "PLUGIN_HOST_PROTOCOL").expect(what),
-            Some("kr-plugin-host/2".to_owned()),
+            Some("kr-plugin-host/3".to_owned()),
             "{what}"
         );
         assert_eq!(

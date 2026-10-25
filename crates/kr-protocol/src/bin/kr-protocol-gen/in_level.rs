@@ -8,8 +8,8 @@
 //! meets workers of any of them, across an update and a rollback. The first release of a level
 //! therefore fixes what the level is, and a change to it after that moves the level, in the train
 //! that makes it, with its cut. This compares the commit being released with every release at its
-//! level that is not excluded, taken from the complete list of `packages/v*` tags on origin and not
-//! from the history of the commit, and fails naming the release and each difference:
+//! level, taken from the complete list of `packages/v*` tags on origin and not from the history of
+//! the commit, and fails naming the release and each difference:
 //!
 //! * the schema, cut over the roots of the retained surface (`SURFACE_ROOTS`) and the types the
 //!   peers of a worker exchange with it directly (`worker_surface::peer_roots`), with both
@@ -34,9 +34,9 @@ use kr_protocol::update::CompatibilityLevel;
 use kr_protocol::worker_surface;
 use serde_json::Value;
 
-use crate::excluded::{Exclusions, kept};
 use crate::releases::{
-    Release, agree_with_origin, file_at, git_in, inventory, package_version_at, surface_roots_at,
+    Release, agree_with_origin, file_at, git_in, inventory, kept, package_version_at,
+    surface_roots_at,
 };
 use crate::retained::{expected_public_majors_in, plugin_host_in};
 
@@ -209,7 +209,7 @@ pub fn declared_in(schema: &Value, roots: &BTreeSet<String>, whose: &str) -> Res
     }
 }
 
-/// Compares `head` with every release at its level that is not excluded.
+/// Compares `head` with every release at its level.
 ///
 /// # Errors
 ///
@@ -218,7 +218,6 @@ pub fn check(
     repository: &Path,
     head: &Head,
     inventory: &[Release],
-    exclusions: &Exclusions,
 ) -> Result<Outcome, String> {
     let at_level = inventory
         .iter()
@@ -226,14 +225,13 @@ pub fn check(
     if at_level.count() == 0 {
         return Ok(Outcome::MovesTheLevel);
     }
-    let peers = kept(inventory, head.level, exclusions, &head.commit);
+    let peers = kept(inventory, head.level, &head.commit);
     if peers.is_empty() {
-        // The record refuses a level none of whose releases is kept, so the commit's own tag is the
-        // level's only kept release: nothing else says what the level is.
+        // The commit's own tag is the level's only release: nothing else says what the level is.
         return Ok(Outcome::Held {
             releases: Vec::new(),
             notes: vec![format!(
-                "this commit is the only release of level {} that is not excluded",
+                "this commit is the only release of level {}",
                 head.level
             )],
         });
@@ -380,8 +378,8 @@ fn table_differences(old: &WorkerSurface, new: &WorkerSurface) -> Vec<String> {
 }
 
 /// Runs the check for the commit at `HEAD` of the checkout at `repository`: origin's tags are
-/// listed and held to this checkout's, the record of exclusions is read and held to them, and the
-/// commit is compared, or when it moves the level the cut's own check is run (`cut`).
+/// listed and held to this checkout's, and the commit is compared, or when it moves the level the
+/// cut's own check is run (`cut`).
 ///
 /// # Errors
 ///
@@ -392,17 +390,8 @@ pub fn run(repository: &Path, cut: bool) -> Result<(), String> {
         .to_owned();
     let release_tags = inventory(repository)?;
     agree_with_origin(repository, &release_tags, &commit)?;
-    let exclusions = Exclusions::read(repository)?;
-    exclusions.validate(repository, &release_tags)?;
     let head = Head::of_this_build(repository, &commit)?;
-    conclude(
-        repository,
-        &head,
-        &release_tags,
-        &exclusions,
-        cut,
-        &run_cut_check,
-    )
+    conclude(repository, &head, &release_tags, cut, &run_cut_check)
 }
 
 /// Compares `head` and prints what it found; a commit that moves the level has its cut checked by
@@ -415,12 +404,11 @@ pub fn conclude(
     repository: &Path,
     head: &Head,
     release_tags: &[Release],
-    exclusions: &Exclusions,
     cut: bool,
     cut_check: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let commit = &head.commit;
-    match check(repository, head, release_tags, exclusions)? {
+    match check(repository, head, release_tags)? {
         Outcome::MovesTheLevel if !cut => {
             println!(
                 "no release is at level {}, so {commit} moves it; its cut is not checked in this run",
