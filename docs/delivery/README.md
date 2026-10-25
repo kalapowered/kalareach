@@ -28,14 +28,14 @@ them: one announcement is one event and one set of notifications. If the daemon 
 commit, nothing is lost, because the store still holds what was never settled.
 
 The host's pairing outbox feeds the journal the same way. A completed pairing is an event of its own
-kind, named by the invitation the device paired through, and its cursor is the outbox row's
-sequence, kept in this journal under a consumer of its own. The outbox removes nothing and holds no
-registration for it. Each pass reads the rows past the journal's cursor, commits the events and the
-cursor in one transaction, and produces from them at once for every destination except the device
-that paired; a pass that stops between the two is finished by the next one for every destination the
-notice's audience admits. The event is dated and expires from the moment the pairing committed, not
-from the moment it is produced, so a journal that starts again at the outbox's first row takes the
-old pairings and sends none of them.
+kind, named by the invitation the device paired through and by the device it created, and its cursor
+is the outbox row's sequence, kept in this journal under a consumer of its own. The outbox removes
+nothing and holds no registration for it. Each pass reads the rows past the journal's cursor,
+commits the events and the cursor in one transaction, and produces from them at once. Every
+destination except the device that paired is told, by this pass or by the next one after a stop,
+because the event's key names that device. The event is dated and expires from the moment the
+pairing committed, not from the moment it is produced, so a journal that starts again at the
+outbox's first row takes the old pairings and sends none that is more than four hours old.
 
 Producing is a separate step that reads the notice the journal holds for each event. A pass that
 fails while it produces is finished by the next pass, without a restart.

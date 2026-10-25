@@ -5472,8 +5472,9 @@ reading of the host time contract from the daemon.
 
 ### Where its events come from
 
-Three sources in each session's journal reach it, and the environment has two of its own beside
-them, the workflow journal's alerts and the change-set store's versions, which come below: the question ledger, whose events carry the moment
+Three sources in each session's journal reach it. The environment has sources of its own beside
+them: the workflow journal's alerts and the change-set store's versions, which come below, and its
+notices about its authority feed. The three of a session are: the question ledger, whose events carry the moment
 a request became pending; the transitions the session's broker records for the requests an
 application makes of a person, which is how an approval an application raises comes to be
 pending; and the journal's host events, which are the terminal side effects that had no
@@ -6024,11 +6025,13 @@ is about.
 
 The host's pairing outbox is the journal's other source. Every completed pairing is a notification
 to the owner's devices: the devices whose grant carries `host.manage` and whose history reaches the
-moment the pairing committed, which leaves out the device that paired. Each pass reads the outbox
-past the cursor the journal holds for it under a consumer of its own, commits the events and that
-cursor in one transaction, and the outbox keeps nothing for the journal. A pairing is dated and
-expires from the moment it committed, so one read again from the start of the outbox after the
-journal was lost has expired and sends nothing. The alert is the generic one for a session that
+moment the pairing committed. The device that paired is left out by name: the event's key holds its
+identifier, so a pass that finishes a pairing after a stop leaves it out too. Each pass reads the
+outbox past the cursor the journal holds for it under a consumer of its own, commits the events and
+that cursor in one transaction, and the outbox keeps nothing for the journal. A pairing is dated and
+expires from the moment it committed, so one more than four hours old, read again from the start of
+the outbox after the journal was lost, has expired and sends nothing; a younger one is sent again,
+because the journal that remembered it is gone. The alert is the generic one for a session that
 needs attention, because the fixed vocabulary has no sentence for a pairing. The name the new device
 chose is a display text a person typed, so it travels only inside a push preview's seal and is in
 no external message.
