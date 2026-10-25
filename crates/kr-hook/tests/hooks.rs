@@ -10,6 +10,7 @@
 //! | KR-REQ-11.42 | `kr_req_12_18_each_registered_hook_observes_and_answers_neutrally` |
 //! | KR-REQ-12.18 | `kr_req_12_18_each_registered_hook_observes_and_answers_neutrally` |
 //! | KR-REQ-11.62 | `kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread` |
+//! | KR-ACC-018 | `kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread` |
 
 mod common;
 
@@ -19,10 +20,10 @@ use std::time::Duration;
 use common::Placed;
 use common::launched::{self, Launch};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActorId, ConnectionId, SessionEpoch, SessionId};
+use kr_protocol::ids::{ActorId, AgentBindingRevision, ConnectionId, SessionEpoch, SessionId};
 use kr_protocol::question::{
-    QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind, QuestionReadParams,
-    QuestionState,
+    Question, QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
+    QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use kr_worker::broker::{BridgeSurface, HookReport, ObservedEvent, ThreadChange};
@@ -199,11 +200,11 @@ fn ask(request_id: &str) -> QuestionCreateParams {
     }
 }
 
-fn state_of(
+fn question_of(
     questions: &Questions,
     question_id: kr_protocol::ids::QuestionId,
     at: u64,
-) -> QuestionState {
+) -> Question {
     questions
         .read(
             &QuestionReadParams {
@@ -219,19 +220,40 @@ fn state_of(
         .into_iter()
         .find(|question| question.question_id == question_id)
         .expect("the question")
-        .state
 }
 
-/// KR-REQ-11.62: a question is asked in the thread the application's bridge last reported
-/// selected, and the application's own hook later says which thread ran the `ask_user` call that
-/// asked it. When the two agree, the question is bound to the revision it was asked under; a later
-/// `SessionStart` hook reporting another thread advances the binding in production code, and the
-/// question from the old thread is invalidated for every client, with a person's answer refused.
-/// A question asked in the new thread stays open, and one no hook placed in a thread stays
-/// application-scoped. A report of the call that arrives after the thread was left and selected
-/// again still binds the question to the revision it was asked under, not to the later one; a
-/// question asked again under the same request is bound to nothing, whichever reports follow; and a
-/// compaction leaves a bound question open while a resume of its thread invalidates it.
+fn state_of(
+    questions: &Questions,
+    question_id: kr_protocol::ids::QuestionId,
+    at: u64,
+) -> QuestionState {
+    question_of(questions, question_id, at).state
+}
+
+/// The binding revision a question's header carries, if any.
+fn revision_of(
+    questions: &Questions,
+    question_id: kr_protocol::ids::QuestionId,
+    at: u64,
+) -> Option<AgentBindingRevision> {
+    question_of(questions, question_id, at)
+        .source
+        .agent_binding_revision
+        .0
+}
+
+/// KR-REQ-11.62, KR-ACC-018: a question is asked in the thread the application's bridge last
+/// reported selected, and the application's own hook later says which thread ran the `ask_user`
+/// call that asked it. When the two agree, the question is bound to the revision it was asked
+/// under; a later `SessionStart` hook reporting another thread advances the binding in production
+/// code, and the question from the old thread is invalidated for every client, with a person's
+/// answer refused. A question asked in the new thread stays open, and one no hook placed in a
+/// thread stays application-scoped. A report of the call that arrives after the thread was left
+/// and selected again still binds the question to the revision it was asked under, not to the
+/// later one; a question asked again under the same request is bound to nothing, whichever reports
+/// follow; and a compaction leaves a bound question open while a resume of its thread invalidates
+/// it. A question the hook placed in a thread reads, for every client, with the binding revision it
+/// was asked under, also after the switch that invalidated it; one no hook placed reads with none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread()
  {
@@ -259,6 +281,12 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         started.thread
     );
 
+    let asked_under = launch
+        .broker
+        .binding_state(launched::instance())
+        .expect("the instance")
+        .binding_revision;
+
     let (old, _) = questions
         .create(&helper, &ask("asked-in-the-first-thread"), now(1_000))
         .expect("asked");
@@ -284,6 +312,16 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         state_of(&questions, old.question.question_id, 1_200),
         QuestionState::Pending,
         "the thread it was asked in is still selected"
+    );
+    assert_eq!(
+        revision_of(&questions, old.question.question_id, 1_200),
+        Some(asked_under),
+        "the report placed the question in the thread, so it reads the revision it was asked under"
+    );
+    assert_eq!(
+        revision_of(&questions, unplaced.question.question_id, 1_200),
+        None,
+        "no report placed this question in a thread"
     );
 
     // The person runs `/clear`: Claude Code ends the first thread and starts another.
@@ -330,6 +368,25 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         state_of(&questions, unplaced.question.question_id, 2_100),
         QuestionState::Pending,
         "a question no hook placed in a thread claims no thread-switch detection"
+    );
+    assert_eq!(
+        revision_of(&questions, old.question.question_id, 2_100),
+        Some(asked_under),
+        "the invalidated question still reads the revision it was asked under"
+    );
+    assert!(
+        launch
+            .broker
+            .binding_state(launched::instance())
+            .expect("the instance")
+            .binding_revision
+            .get()
+            > asked_under.get(),
+        "the binding has moved past the revision the question was asked under"
+    );
+    assert_eq!(
+        revision_of(&questions, unplaced.question.question_id, 2_100),
+        None
     );
     let refused = questions
         .answer(
@@ -399,6 +456,7 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
     hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
     for unbound in [retried.question.question_id, elsewhere.question.question_id] {
         assert_eq!(state_of(&questions, unbound, 4_100), QuestionState::Pending);
+        assert_eq!(revision_of(&questions, unbound, 4_100), None);
     }
 
     // Bound in the second thread: a compaction goes on in that thread and leaves the question
