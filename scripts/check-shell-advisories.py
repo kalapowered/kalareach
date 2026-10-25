@@ -134,9 +134,13 @@ def numbers(text):
     return tuple(int(part) for part in re.findall(r"\d+", text))
 
 
+KEY_NUMBERS = 8
+
+
 def padded(version):
-    """The numbers of a version as four, so that `7.7` and `7.7.0` are the same version."""
-    return tuple(version) + (0,) * max(0, 4 - len(version))
+    """The numbers of a version as eight, so that `7.7` and `7.7.0` are the same version and every
+    key has one shape, whatever the number of parts a version is written with."""
+    return (tuple(version) + (0,) * KEY_NUMBERS)[:KEY_NUMBERS]
 
 
 def version_key(text):
@@ -173,16 +177,16 @@ def series_start(version):
 def in_range(range_text, version):
     """Whether a version is inside a range such as '>= 10.32, <= 10.47' or '3.1.0-3.3.1'. A range
     that cannot be read in full counts as inside it, because the safe mistake is a row too many."""
-    wanted = numbers(version)
+    wanted = padded(numbers(version))
     span = re.match(r"\s*([0-9][0-9.]*)\s*-\s*([0-9][0-9.]*)\s*$", range_text)
     if span:
-        return numbers(span.group(1)) <= wanted <= numbers(span.group(2))
+        return padded(numbers(span.group(1))) <= wanted <= padded(numbers(span.group(2)))
     tests = []
     for comparator in range_text.split(","):
         match = re.match(r"\s*(<=|>=|<|>|=)?\s*([0-9][0-9.]*)\s*$", comparator)
         if not match:
             return True
-        tests.append((match.group(1) or "=", numbers(match.group(2))))
+        tests.append((match.group(1) or "=", padded(numbers(match.group(2)))))
     for operator, bound in tests:
         held = {
             "<=": wanted <= bound,
@@ -402,18 +406,20 @@ def dotnet_announcements(api, token, labels):
 
 def powershell_releases(api, token, floors):
     """Stable PowerShell releases above the first fixed release of their series, and every stable
-    release of a series above the newest series the register's advisories list."""
+    release of a series above the newest series the register's advisories list. `floors` holds a
+    version key for each series (see `version_key`), so a first fixed release written as a
+    pre-release sorts below the final one."""
     found = []
     newest = max(floors) if floors else (0, 0)
     for item in fetch_pages("%s/repos/PowerShell/PowerShell/releases" % api, token):
         if item.get("prerelease") or item.get("draft"):
             continue
         tag = item["tag_name"]
-        version = numbers(tag)
-        if len(version) < 3:
+        version, key = numbers(tag), version_key(tag)
+        if len(version) < 3 or key is None:
             continue
         series = version[:2]
-        newer = (series in floors and version > floors[series]) or series > newest
+        newer = (series in floors and key > floors[series]) or series > newest
         if newer:
             found.append(
                 finding(
@@ -692,7 +698,7 @@ def pinned_versions(root):
         runtime_labels.update(".NET " + series for series in advisory.get("runtime_first_fixed", {}))
         for series, fixed in advisory["first_fixed"].items():
             key = numbers(series)
-            floors[key] = max(floors.get(key, ()), numbers(fixed))
+            floors[key] = max(floors.get(key, ()), version_key(fixed))
             # An advisory against the .NET runtime is judged by the runtime the host reports, on its
             # platforms, and the module does not hold the PowerShell version to it, so only the
             # advisories against PowerShell itself bound the versions the module accepts.
@@ -998,6 +1004,21 @@ def run_self_test():
             and in_range("3.1.0-3.3.1", "3.2")
             and in_range(">= 10.44, < 10.48 || <= 10.43", "10.43"),
         )
+        # Versions of two parts and of three are one version, and a version of many parts has a key of
+        # the same shape as any other, so comparing them raises nothing.
+        expect(
+            "two numbers are three in a pinned version's range",
+            in_range(">= 10.43.0, < 10.44", "10.43") and not in_range(">= 10.43.1, < 10.44", "10.43"),
+        )
+        expect(
+            "a version of five numbers has a key of the same shape",
+            version_key("1.2.3.4") < version_key("1.2.3.4.1") < version_key("1.2.3.4.2-rc.1") < version_key("1.2.3.4.2")
+            and reaches(">= 1.2.3.4.5, < 1.2.3.4.6", [(version_key("1.2.3.4.0"), None)]),
+        )
+        # A first fixed release written as a pre-release does not hide the final release.
+        with Server(routes()) as base:
+            found = powershell_releases(base, None, {(7, 6): version_key("7.6.8-rc.1")})
+        expect("a floor written as a pre-release", "v7.6.8" in [item["id"] for item in found], str(found))
         expect("the start day is the register's", date_after(register, "published from ") == STARTED)
 
         # The control: the committed register covers every change the recorded sources hold.
