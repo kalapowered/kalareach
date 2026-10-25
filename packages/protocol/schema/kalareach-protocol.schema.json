@@ -13591,7 +13591,7 @@
           "type": "array"
         },
         "affected": {
-          "description": "What the request expects each affected path to hold now.\n\nThe preflight compares every one of these with what is there. A path the request does not\nname is a path the preflight cannot check, so a request that names none is refused for a\ndestination that writes.",
+          "description": "What the request expects each affected path to hold now.\n\nThe preflight compares every one of these with what is there. A path the request does not\nname is a path the preflight cannot check, so a request that names none is refused for a\ndestination that writes files. A versioned reference reads none of them.",
           "items": {
             "$ref": "#/$defs/AffectedVersion"
           },
@@ -13617,7 +13617,7 @@
           "description": "The reference and its expected old value, for a versioned Git reference."
         },
         "paths": {
-          "description": "Which of the version's changed paths to apply. Empty means all of them.",
+          "description": "Which of the version's changed paths to apply. Empty means all of them. A versioned\nreference moves as one and is not limited by them.",
           "items": {
             "type": "string"
           },
@@ -16991,6 +16991,17 @@
         "name": {
           "description": "The full reference name, such as `refs/heads/main`.",
           "type": "string"
+        },
+        "new_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The object the reference moves to: a full object name in the repository's format.\n\nThe host makes no commit, so this is an object the repository already holds. A preflight\nmoves nothing and needs none; an apply or a revert names one.\n\nIt is absent from the wire when there is none, so a preflight that names no object is byte\nfor byte the request a host built before this member expects, and the text of a request\nfrom such a host reads back with none. A host built before this member refuses a request\nthat carries it."
         }
       },
       "required": [

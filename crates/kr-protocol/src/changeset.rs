@@ -754,6 +754,22 @@ pub struct ExpectedReference {
     pub name: String,
     /// The value it is expected to hold, or nothing when it is expected not to exist.
     pub expected_old_value: Nullable<String>,
+    /// The object the reference moves to: a full object name in the repository's format.
+    ///
+    /// The host makes no commit, so this is an object the repository already holds. A preflight
+    /// moves nothing and needs none; an apply or a revert names one.
+    ///
+    /// It is absent from the wire when there is none, so a preflight that names no object is byte
+    /// for byte the request a host built before this member expects, and the text of a request
+    /// from such a host reads back with none. A host built before this member refuses a request
+    /// that carries it.
+    #[serde(default, skip_serializing_if = "no_object")]
+    pub new_value: Nullable<String>,
+}
+
+/// Returns whether an expected reference names no object to move to.
+fn no_object(new_value: &Nullable<String>) -> bool {
+    !new_value.is_present()
 }
 
 /// What became of a versioned Git reference.
@@ -1100,9 +1116,10 @@ pub struct DiffApplyParams {
     ///
     /// The preflight compares every one of these with what is there. A path the request does not
     /// name is a path the preflight cannot check, so a request that names none is refused for a
-    /// destination that writes.
+    /// destination that writes files. A versioned reference reads none of them.
     pub affected: Vec<AffectedVersion>,
-    /// Which of the version's changed paths to apply. Empty means all of them.
+    /// Which of the version's changed paths to apply. Empty means all of them. A versioned
+    /// reference moves as one and is not limited by them.
     pub paths: Vec<String>,
     /// Run the preflight and stop, whatever it finds.
     pub preflight_only: bool,
@@ -1279,6 +1296,73 @@ mod tests {
         assert_eq!(
             fields,
             ["excluded_paths", "included_paths", "secret_rules_applied"]
+        );
+    }
+
+    /// The expected reference as a build before `new_value` wrote it: closed, with two members.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct EarlierExpectedReference {
+        name: String,
+        expected_old_value: Nullable<String>,
+    }
+
+    /// A request that names no object to move to is the request a build before the member
+    /// expects, and one that names an object carries the member.
+    ///
+    /// Both directions of the update window are here: the bytes an earlier build wrote read back
+    /// with no object and encode again to the same bytes, and a request with an object is one an
+    /// earlier build refuses, because its type is closed.
+    #[test]
+    fn an_expected_reference_without_an_object_is_the_request_an_earlier_build_speaks() {
+        let limits = kr_cbor::Limits::DEFAULT;
+        let earlier = EarlierExpectedReference {
+            name: "refs/heads/main".to_owned(),
+            expected_old_value: Nullable::some("a".repeat(40)),
+        };
+        let earlier_bytes = kr_cbor::to_canonical_vec(&earlier).expect("an earlier request");
+
+        let read: ExpectedReference = crate::wire::decode(&earlier_bytes, &limits)
+            .expect("what a build before the member wrote still reads");
+        assert!(!read.new_value.is_present());
+        assert_eq!(
+            kr_cbor::to_canonical_vec(&read).expect("it encodes again"),
+            earlier_bytes,
+            "and a request with no object is those bytes, with no member added"
+        );
+
+        let moving = ExpectedReference {
+            new_value: Nullable::some("b".repeat(40)),
+            ..read
+        };
+        let moving_bytes = kr_cbor::to_canonical_vec(&moving).expect("a request with an object");
+        assert!(
+            moving_bytes
+                .windows(b"new_value".len())
+                .any(|window| window == b"new_value"),
+            "a request that names an object carries the member"
+        );
+        let refused = crate::wire::decode::<EarlierExpectedReference>(&moving_bytes, &limits);
+        assert!(
+            refused.is_err(),
+            "a build before the member refuses a request that carries it"
+        );
+        assert_eq!(
+            crate::wire::decode::<ExpectedReference>(&moving_bytes, &limits).expect("it reads"),
+            moving
+        );
+
+        let stated_as_null = kr_cbor::encode(
+            &kr_cbor::to_canonical_value(&serde_json::json!({
+                "name": "refs/heads/main",
+                "expected_old_value": serde_json::Value::Null,
+                "new_value": serde_json::Value::Null,
+            }))
+            .expect("a document that states the default"),
+        );
+        assert!(
+            crate::wire::decode::<ExpectedReference>(&stated_as_null, &limits).is_err(),
+            "a sender that writes the default is refused, as it would re-encode to other bytes"
         );
     }
 }

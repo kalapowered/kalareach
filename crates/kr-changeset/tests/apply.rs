@@ -338,6 +338,7 @@ fn a_versioned_reference_is_compare_and_swap_and_states_what_it_does_not_do() {
     let wrong = ExpectedReference {
         name: "refs/heads/main".to_owned(),
         expected_old_value: Nullable(Some("0".repeat(40))),
+        new_value: Nullable::null(),
     };
     let order = ApplyOrder {
         expected_reference: Some(&wrong),
@@ -357,6 +358,7 @@ fn a_versioned_reference_is_compare_and_swap_and_states_what_it_does_not_do() {
     let right = ExpectedReference {
         name: "refs/heads/main".to_owned(),
         expected_old_value: Nullable(Some(head.clone())),
+        new_value: Nullable::null(),
     };
     let order = ApplyOrder {
         expected_reference: Some(&right),

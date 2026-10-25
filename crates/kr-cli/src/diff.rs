@@ -145,6 +145,7 @@ async fn apply(
             } else {
                 Nullable::some(value.clone())
             },
+            new_value: Nullable::null(),
         }),
         _ => Nullable::null(),
     };

@@ -62,8 +62,9 @@ Three rules are easy to get wrong:
   member at its default is refused as non-canonical, because it would re-encode to different bytes: a
   sender that writes `"link_fenced": false` or `"line_token": null` is refused, and one that leaves
   the member out is not. The members are `presentation_reason` of an attachment summary,
-  `line_token` of a detach, `link_fenced` of an error, `machine`, `privacy`, `default_shell_mode`
-  and `metrics` of the host reads, `cause` of a history gap, `error_withheld` of a receipt,
+  `line_token` of a detach, `new_value` of an expected reference, `link_fenced` of an error,
+  `machine`, `privacy`, `default_shell_mode` and `metrics` of the host reads, `cause` of a history
+  gap, `error_withheld` of a receipt,
   `session_id` of an action read, `environment_sources`, `root` and `application` of a session
   summary, `metrics` of a session read, `session` of a close result, `origin` and `build` of the
   local hello and its acknowledgement and `build` of the bridge hello acknowledgement, `history`,

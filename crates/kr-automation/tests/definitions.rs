@@ -467,7 +467,10 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
     }
 
     // What a kind's method refuses on the request alone is refused at install too, and nothing
-    // the method would refuse only against the host's live state is.
+    // the method would refuse only against the host's live state is. An apply node is held to
+    // the checks its stored shape allows: it names no object for a reference to move to, so a
+    // reference node the method would now refuse for naming none is admitted, and the case at
+    // the end of this file holds that.
     let apply = |edit: &dyn Fn(&mut DiffApplyParams)| {
         let mut params = DiffApplyParams {
             change_set_id: version.change_set_id,
@@ -510,30 +513,6 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
                 params.paths = vec!["src/lib.rs".to_owned()];
             }),
         ),
-        // A versioned reference reads no affected path, so the method takes one it could not read.
-        (
-            WorkflowActionKind::ApplyDiff,
-            apply(&|params| {
-                params.destination = DestinationClass::VersionedReference;
-                params.expected_reference =
-                    Nullable::some(kr_protocol::changeset::ExpectedReference {
-                        name: "refs/heads/main".to_owned(),
-                        expected_old_value: Nullable::null(),
-                    });
-                params.affected = vec![affected("../outside")];
-            }),
-        ),
-        (
-            WorkflowActionKind::ApplyDiff,
-            apply(&|params| {
-                params.destination = DestinationClass::VersionedReference;
-                params.expected_reference =
-                    Nullable::some(kr_protocol::changeset::ExpectedReference {
-                        name: "refs/heads/main".to_owned(),
-                        expected_old_value: Nullable::null(),
-                    });
-            }),
-        ),
         (
             WorkflowActionKind::ApplyDiff,
             apply(&|params| {
@@ -560,6 +539,18 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
         validate_definition(&one_node_with(*kind, params.clone()), &grant)
             .unwrap_or_else(|error| panic!("{kind} takes {params}: {error}"));
     }
+    let a_null_object = {
+        let mut stated = apply(&|params| {
+            params.destination = DestinationClass::VersionedReference;
+            params.expected_reference = Nullable::some(kr_protocol::changeset::ExpectedReference {
+                name: "refs/heads/main".to_owned(),
+                expected_old_value: Nullable::some("a".repeat(40)),
+                new_value: Nullable::null(),
+            });
+        });
+        stated["expected_reference"]["new_value"] = serde_json::Value::Null;
+        stated
+    };
     let refused_by_the_method = [
         (
             WorkflowActionKind::ApplyDiff,
@@ -579,10 +570,27 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
                     Nullable::some(kr_protocol::changeset::ExpectedReference {
                         name: "--upload-pack=true".to_owned(),
                         expected_old_value: Nullable::null(),
+                        new_value: Nullable::null(),
                     });
             }),
             "reference",
         ),
+        // A stored apply node does not carry the object a reference moves to, whatever the member
+        // holds, and the refusal names the member.
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::VersionedReference;
+                params.expected_reference =
+                    Nullable::some(kr_protocol::changeset::ExpectedReference {
+                        name: "refs/heads/main".to_owned(),
+                        expected_old_value: Nullable::some("a".repeat(40)),
+                        new_value: Nullable::some("b".repeat(40)),
+                    });
+            }),
+            "new_value",
+        ),
+        (WorkflowActionKind::ApplyDiff, a_null_object, "new_value"),
         (
             WorkflowActionKind::ApplyDiff,
             apply(&|params| params.destination = DestinationClass::SharedExisting),
@@ -1091,4 +1099,108 @@ fn a_definition_is_a_versioned_json_document_whose_installed_revisions_never_cha
     assert_eq!(installed(2), None);
     assert_eq!(installed(1).as_ref(), Some(&first));
     assert_eq!(installed(3).as_ref(), Some(&third));
+}
+
+/// KR-REQ-25.13: a definition an earlier release stored is admitted, whatever its apply nodes say.
+///
+/// A stored apply node is read again at every admission, and by the earlier release after a
+/// rollback, in the shape that release decodes. Each text below is the parameters of an apply node
+/// as that release stored them, with no object for a reference to move to: a reference node that
+/// the method would now refuse for naming none, a preflight and a proposal among them. Every one
+/// is admitted, and the workspace it acts on is read from it.
+#[test]
+fn a_stored_apply_node_of_the_release_before_is_admitted() {
+    use kr_protocol::changeset::{
+        AffectedVersion, DestinationClass, DiffApplyParams, ExpectedReference,
+    };
+    use kr_protocol::ids::{ChangeSetId, ChangeSetVersion, WorkspaceId};
+
+    let grant = make_dummy_grant(test_grant_id(9), true);
+    let workspace_id = WorkspaceId::new(Uuid::from_bytes([0x34; 16]));
+    let params = |edit: &dyn Fn(&mut DiffApplyParams)| {
+        let mut params = DiffApplyParams {
+            change_set_id: ChangeSetId::new(Uuid::from_bytes([0x33; 16])),
+            version: ChangeSetVersion::new(1),
+            destination: DestinationClass::Proposal,
+            workspace_id: Nullable::some(workspace_id),
+            expected_reference: Nullable::null(),
+            affected: Vec::new(),
+            paths: Vec::new(),
+            preflight_only: false,
+            acknowledged_limitations: Vec::new(),
+        };
+        edit(&mut params);
+        params
+    };
+    let reference = |expected: Nullable<String>| {
+        Nullable::some(ExpectedReference {
+            name: "refs/heads/main".to_owned(),
+            expected_old_value: expected,
+            new_value: Nullable::null(),
+        })
+    };
+    let affected = |path: &str| AffectedVersion {
+        path: path.to_owned(),
+        expected_worktree_digest: Nullable::null(),
+        expected_index_object_id: Nullable::null(),
+        expected_index_mode: Nullable::null(),
+        check_index: false,
+    };
+    let stored = [
+        params(&|params| {
+            params.affected = vec![affected("src/lib.rs")];
+            params.paths = vec!["src/lib.rs".to_owned()];
+        }),
+        params(&|params| {
+            params.destination = DestinationClass::VersionedReference;
+            params.expected_reference = reference(Nullable::some("a".repeat(40)));
+        }),
+        params(&|params| {
+            params.destination = DestinationClass::VersionedReference;
+            params.expected_reference = reference(Nullable::some("a".repeat(40)));
+            params.preflight_only = true;
+        }),
+        // A reference that is expected not to exist, and a path it could not read: the node holds
+        // no object, and it is never dispatched.
+        params(&|params| {
+            params.destination = DestinationClass::VersionedReference;
+            params.expected_reference = reference(Nullable::null());
+            params.affected = vec![affected("../outside")];
+        }),
+        params(&|params| {
+            params.destination = DestinationClass::SharedExisting;
+            params.acknowledged_limitations =
+                kr_changeset::apply::limitations(DestinationClass::SharedExisting);
+        }),
+    ];
+    for stored in &stored {
+        let text = serde_json::to_string(stored).expect("the node's parameters");
+        assert!(
+            !text.contains("new_value"),
+            "the text is what the release before wrote: {text}"
+        );
+        let node = WorkflowNode {
+            node_id: "only".to_owned(),
+            action_kind: WorkflowActionKind::ApplyDiff,
+            action_params: text.clone(),
+            declared_environment: Nullable::null(),
+        };
+        validate_definition(
+            &create_workflow_definition(
+                test_wf_id(9),
+                1,
+                "stored-apply",
+                test_grant_id(9),
+                vec![node.clone()],
+                vec![],
+            ),
+            &grant,
+        )
+        .unwrap_or_else(|error| panic!("a stored apply node is admitted: {text}: {error}"));
+        assert_eq!(
+            kr_automation::definition::node_workspace(&node),
+            Some(workspace_id),
+            "and its workspace is read from it: {text}"
+        );
+    }
 }

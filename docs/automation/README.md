@@ -315,7 +315,10 @@ Install-time validation enforces:
   apply to a shared working tree that has not acknowledged each of that destination's
   limitations, or an atomic snapshot of a policy that includes uncommitted work is refused when
   it is installed. What the method checks against the host's live state, such as whether a
-  version exists or a path is in it, is checked when the node runs. A `create_session` node
+  version exists or a path is in it, is checked when the node runs. An `apply_diff` node is held
+  to the checks its stored shape allows. That shape is the one earlier releases read, so a node
+  names no object for a versioned reference to move to, and a node whose expected reference has a
+  `new_value` member is refused when it is installed. A `create_session` node
   carries no environment variables: its session takes this host's environment, and a stored
   definition would keep them. A journal an earlier build wrote comes forward without any it held.
 * **Typed outputs.** Each kind produces one output type, named by the kind, and a receipt holds
@@ -330,7 +333,7 @@ Install-time validation enforces:
 | `create_session` | `session.create`'s own parameters, naming this host's environment | the session |
 | `attention_notice` | `summary`, 1 to 1024 bytes | none beyond its kind |
 | `materialize_changeset` | `changeset.materialize`'s own parameters | the version and the materialisation that holds it |
-| `apply_diff` | `diff.apply`'s own parameters | the version applied, its destination, the class it came to and any proposal version |
+| `apply_diff` | `diff.apply`'s parameters as earlier releases stored them: an expected reference has no `new_value` | the version applied, its destination, the class it came to and any proposal version |
 | `capture_changeset` | `changeset.capture`'s own parameters | the version captured |
 * **No template evaluation.** Parameter values are inspected after JSON decoding, so a marker such
   as `{{ ... }}`, `${ ... }` or `$( ... )` is rejected however it was written. Nothing in a
