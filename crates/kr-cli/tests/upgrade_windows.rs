@@ -208,6 +208,15 @@ async fn an_update_hands_the_daemon_of_the_release_before_over_and_its_worker_go
     // This build's release goes into a store beside the daemon, which keeps running; the task is
     // repaired to name it; and an update hands the daemon of the release before over.
     host.install(&one);
+    // A daemon of a store records the roots it serves there, which is how an update finds the
+    // environment. The release before keeps no store on Windows and records nothing, so the roots
+    // are recorded here as a daemon of the store would have recorded them.
+    host.store
+        .record_roots(
+            host.tree.paths().runtime_root(),
+            host.tree.paths().state_root(),
+        )
+        .expect("the roots are recorded");
     host.register_the_standalone_start();
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.zip");
