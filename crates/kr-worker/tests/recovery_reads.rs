@@ -1123,6 +1123,67 @@ async fn kr_req_23_48_retained_history_is_served_to_the_owner_and_a_device_withi
     );
 }
 
+/// A worker goes on answering for a while after its session is closed, while its closure is
+/// delivered. The daemon serves a device nothing of a closed session, and a read that reaches the
+/// worker in that interval is refused by the worker in the same way, while the owner reads on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_48_a_device_is_not_served_the_output_of_a_closed_session_its_worker_still_answers_for()
+ {
+    let host = host().await;
+    {
+        let mut session = host.runtime.session();
+        session.ingest_output(b"kr-retained-output");
+    }
+    let params = kr_protocol::recovery::HistoryPageParams {
+        session_id: host.session_id,
+        from_cursor: U64::new(0),
+        max_bytes: U64::new(4096),
+    };
+    let mut daemon = daemon(&host).await;
+    forwarded(
+        &mut daemon,
+        Some(reaching_back_to(0)),
+        Method::HistoryPage,
+        &params,
+    )
+    .await
+    .expect("a device is served the page while the session is live");
+
+    {
+        let mut session = host.runtime.session();
+        session.begin_close(kr_protocol::session::ClosureReason::CloseRequested);
+        session.finish_close();
+        assert_eq!(
+            session.state(),
+            kr_protocol::session::SessionState::Closed,
+            "the session is closed and its worker is still serving"
+        );
+    }
+    let refused = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(0)),
+        Method::HistoryPage,
+        &params,
+    )
+    .await
+    .expect_err("a device is not served the page of a closed session");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::SessionClosed,
+        "{refused:?}"
+    );
+
+    let mut window = owner(&host, ReceiveLimits::default()).await;
+    let page: kr_protocol::recovery::HistoryPageResult =
+        within("the page", window.request(Method::HistoryPage, &params))
+            .await
+            .expect("the call reaches the worker")
+            .expect("the owner is served the page of the closed session")
+            .to_typed()
+            .expect("decodes");
+    assert!(!page.bytes.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_48_a_receipt_read_names_its_own_session_and_fits_its_readers_frame() {
     // `action.read` is a state recovery read like the others: one that names a session names its
