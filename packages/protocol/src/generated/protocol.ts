@@ -13900,7 +13900,7 @@ export interface DiffApplyParams {
    *
    * The preflight compares every one of these with what is there. A path the request does not
    * name is a path the preflight cannot check, so a request that names none is refused for a
-   * destination that writes.
+   * destination that writes files. A versioned reference reads none of them.
    */
   affected: AffectedVersion[]
   /**
@@ -13916,7 +13916,8 @@ export interface DiffApplyParams {
    */
   expected_reference: ExpectedReference | null
   /**
-   * Which of the version's changed paths to apply. Empty means all of them.
+   * Which of the version's changed paths to apply. Empty means all of them. A versioned
+   * reference moves as one and is not limited by them.
    */
   paths: string[]
   /**
@@ -13983,6 +13984,18 @@ export interface ExpectedReference {
    * The full reference name, such as `refs/heads/main`.
    */
   name: string
+  /**
+   * The object the reference moves to: a full object name in the repository's format.
+   *
+   * The host makes no commit, so this is an object the repository already holds. A preflight
+   * moves nothing and needs none; an apply or a revert names one.
+   *
+   * It is absent from the wire when there is none, so a preflight that names no object is byte
+   * for byte the request a host built before this member expects, and the text of a request
+   * from such a host reads back with none. A host built before this member refuses a request
+   * that carries it.
+   */
+  new_value?: string | null
 }
 /**
  * Result of `diff.apply` and `diff.revert`.

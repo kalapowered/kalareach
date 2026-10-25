@@ -421,6 +421,18 @@ fn validate_typed_action_params(
             typed_params::<ChangesetMaterializeParams>(node_id, action_kind, &parsed)?;
         }
         WorkflowActionKind::ApplyDiff => {
+            // Before the parameters are decoded, and whatever the member holds, a null included:
+            // the refusal names the member rather than quoting a decoder's complaint about it.
+            if parsed
+                .get("expected_reference")
+                .is_some_and(|reference| reference.get("new_value").is_some())
+            {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {node_id} names the object a versioned reference moves to (new_value): \
+                     an apply_diff node does not carry that object in this release, and a stored \
+                     node keeps the parameters earlier releases read"
+                )));
+            }
             let params: StoredApplyParams = typed_params(node_id, action_kind, &parsed)?;
             apply_request_refusal(node_id, &params)?;
         }
