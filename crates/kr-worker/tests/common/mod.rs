@@ -342,6 +342,24 @@ impl Keys {
         runtime.flush_input();
     }
 
+    /// Offers `bytes` through the lease as [`Keys::type_bytes`] does, and says whether the session
+    /// took them.
+    pub fn offer_bytes(&mut self, runtime: &SessionRuntime, bytes: &[u8]) -> bool {
+        let accepted = runtime
+            .session()
+            .write_input(
+                self.attachment_id,
+                self.epoch.get(),
+                self.sequence,
+                bytes,
+                None,
+                Instant::now(),
+            )
+            .is_ok();
+        self.sequence += 1;
+        accepted
+    }
+
     /// Releases the next step of an application that is waiting for a line.
     pub fn release(&mut self, runtime: &SessionRuntime) {
         self.type_bytes(runtime, b"\n");
