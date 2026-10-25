@@ -389,11 +389,9 @@ waits to be told its claim was accepted before it serves anybody: a host answeri
 daemon had accepted it would be serving as a process the daemon might still refuse.
 
 On success the launcher publishes an owner-only descriptor in the environment's runtime directory,
-in the file the host's protocol names: `plugin-host-3.json` for `kr-plugin-host/3`, and
-`plugin-host.json` for `kr-plugin-host/2`, the protocol the release before speaks. A worker reads
-the descriptor of its own protocol, challenges the process behind the endpoint, and talks to that
-process directly. Nothing in the descriptor is acted on before the challenge: a filename and a
-process identifier are hints.
+in `plugin-host-3.json`, the file `kr-plugin-host/3` names. A worker reads the descriptor,
+challenges the process behind the endpoint, and talks to that process directly. Nothing in the
+descriptor is acted on before the challenge: a filename and a process identifier are hints.
 
 ### What a worker sends
 
@@ -499,52 +497,31 @@ rules are these.
   disabled is refused as a disabled binding's, and the worker stops offering it anything.
 - A frame, an answer and a document node each fit one frame of a mebibyte, the envelope included.
 
-### One host for each protocol
+### One host for every level
 
-A host process speaks one protocol, fixed by the program that runs. Each protocol has an endpoint
-and a descriptor of its own: `kr-plugin-host/2` keeps `p.sock` and `plugin-host.json`, and
-`kr-plugin-host/3` uses `p3.sock` and `plugin-host-3.json`. A later protocol `/N` uses `p<N>.sock`
-and `plugin-host-<N>.json`. Hosts of two protocols run side by side, and a client reads only the
-descriptor of its own protocol, so it never opens a connection to the other's host.
+A host process speaks one protocol, fixed by the program that runs, and publishes under the names
+the protocol has: `kr-plugin-host/3` uses `p3.sock` and `plugin-host-3.json`. This release and the
+release before speak it, so both find a host under the same names, and the control daemon holds one
+plugin runtime for the workers of every level it speaks to. A worker asks the daemon for the
+runtime, and the daemon answers the same way for a worker of either release.
 
-The control daemon holds one plugin runtime for each protocol it serves: the protocol of its own
-release, and each protocol a retained level recorded. A worker asks the daemon for the runtime, and
-the daemon answers with the runtime of the protocol the worker's level speaks.
+- When a host runs, the daemon adopts it. A host that a daemon of the other release started
+  outlives an update and a rollback, because a host ends only with the login session, a restart of
+  the machine or a crash.
+- When none runs, which is the case after the host's crash and when a worker first needs a runtime
+  after an update, the daemon starts the `kr-plugin-host` beside it, as a job of its own. It needs
+  no release store, so a host on Windows, and a tree that is not installed in one, start a host in
+  the same way. A host takes no hold on its release: after the store retires a release, a host that
+  was started from it runs on from its open program.
+- A host that survives an update or a rollback serves the sessions of both releases until it ends,
+  so a change to the plugin host (a fix, its engine, its bounds or its component interface) reaches
+  the sessions of the other release only after that.
+- A host that a daemon or a rollback leaves behind stays until it ends, and costs memory only. An
+  update or a rollback adopts the host that is still there.
 
-- A worker of the daemon's own release is served by a host of this release's protocol, started
-  from the program beside the daemon.
-- A worker of a retained level is served by a host of the protocol that level recorded. The daemon
-  adopts such a host when one runs: a host that a daemon of that release started outlives an update
-  and a rollback, because a host ends only with the login session, a restart of the machine or a
-  crash. When none runs, which is the case after the host's crash and when a worker of that level
-  first needs a runtime after the update, the daemon starts the `kr-plugin-host` of the release
-  that worker runs, from the release store, as a job of its own beside the host of the daemon's own
-  protocol. A host takes no hold on its release: after the store retires a release, a host that was
-  started from it runs on from its open program. A new launch takes the program of the release the
-  asking worker runs, so that worker is served by a host of its own release. A host that was
-  adopted, or that the daemon started for an earlier worker, may be of another release of the same
-  level, and it serves every worker of that level, since they speak one surface; the pinning of a
-  worker to the release it was started with holds for the launch and not for a host that is shared.
-- A host keeps no release store on Windows, and neither does a tree that is not installed in one.
-  Where there is none, and no host of the retained protocol runs, the daemon starts none and answers
-  that the runtime cannot be reached, with the reason, and answers the same each time it is asked.
-  The terminal and every other binding of that worker carry on, and the worker's rich
-  bindings are unavailable until its session ends, as they are after a crash of the runtime. This is
-  the case of a worker of the release before that first needs a runtime after an update, or whose
-  host has been lost; a host that runs is adopted wherever it is.
-- A host that a daemon or a rollback leaves behind stays until it ends, and costs memory only. A
-  rollback to the release before leaves the host of this release's protocol running, in a file the
-  release before does not read, and the release before's daemon starts or adopts a host of its own
-  protocol for its workers. An update again adopts the host that is still there.
-
-The protocol a retained level recorded is one this build has a route for
-(`RETAINED_PLUGIN_HOST_PROTOCOLS` in `kr-protocol`), and `kr-protocol-gen --check` fails when a
-level recorded another, or when a route is listed for a protocol no retained level records. The
-release that stops retaining a level removes the route of the protocol that level alone recorded.
-
-The frames this release reads from or writes to a host of a retained protocol are the claim it
-presents to its launcher, the acknowledgement, the descriptor file, and the `hello` and `verify`
-requests and their answers. They are recorded from the real program, under
+The frames this release reads from or writes to a host that another release started are the claim
+it presents to its launcher, the acknowledgement, the descriptor file, and the `hello` and `verify`
+requests and their answers. They are recorded from the real program of the release before, under
 `crates/kr-protocol/retained/<level>/plugin-host-frames.json`, and the protocol keeps no other
 reader of an earlier version. A change to a released protocol takes a new name: a request, a
 response or notice variant, or a member added to any record of it after a release exists would meet

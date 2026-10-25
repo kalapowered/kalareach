@@ -1216,7 +1216,7 @@ file is the only place its diagnosis can go.
 ### The plugin runtime
 
 A worker is not the only thing whose lifetime belongs to the platform. Components run in
-`kr-plugin-host`, one process for each protocol and environment, started through the same
+`kr-plugin-host`, one process for each environment, started through the same
 supervisor as its own job outside the daemon's kill tree, and started only when a worker first
 needs one: a binding whose package ships a component. An environment whose shells never run such a
 program has no plugin process at all, and the daemon does not start one when it starts.
@@ -1232,16 +1232,15 @@ for this release's, beside the worker descriptors. The worker reads it, challeng
 behind the endpoint, and registers its bindings with it directly; the daemon is not in that path
 again.
 
-A worker of a retained level speaks the protocol that level recorded, and a host of that protocol
-has an endpoint and a descriptor of its own (`p.sock` and `plugin-host.json` for the release before's
-`kr-plugin-host/2`). The daemon holds one runtime for each protocol it serves, answers a worker with
-the runtime of the protocol its level speaks, and adopts a host of a retained protocol that a daemon
-of that release started and that outlived the update. Where none runs it starts the
-`kr-plugin-host` of the release the worker runs, from the release store; a host that keeps no
-store, and a release the store no longer holds, leave the worker's rich bindings unavailable with the
-reason, and its terminal untouched. `docs/plugins/runtime.md` has the details.
+A worker of the release before speaks the same protocol, `kr-plugin-host/3`, and finds its host
+under the same names. The daemon answers it as it answers a worker of this release: it adopts a
+host that a daemon of the other release started and that outlived an update or a rollback, and
+otherwise starts the `kr-plugin-host` beside it, on a host with a release store and on one with
+none. A host that survives serves the sessions of both releases until it ends, so a change to the
+plugin host reaches the sessions of the other release only after that.
+`docs/plugins/runtime.md` has the details.
 
-The daemon starts at most five runtimes of each protocol in ten minutes. A runtime that ends is
+The daemon starts at most five runtimes in ten minutes. A runtime that ends is
 started again by the next request, which a worker makes at once for the first loss of a run and
 after a wait that doubles from half a second to thirty for the ones after, and past the bound the
 answer is that the runtime is not started again yet, with the time the window next admits one. When the
