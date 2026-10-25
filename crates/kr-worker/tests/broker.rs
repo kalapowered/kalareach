@@ -2479,6 +2479,310 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
         .expect("the conversation it left is free for another execution");
 }
 
+/// Two brokers over one directory of claims, as two session workers of one user have: each knows
+/// only the instances of its own session, and the claims are what they share.
+fn two_sessions() -> (tempfile::TempDir, Broker, Broker) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let paths =
+        kr_ipc::paths::HostPaths::new(directory.path().join("run"), directory.path().join("state"))
+            .expect("the roots");
+    let open = || {
+        let broker =
+            Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+        broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&paths));
+        broker
+    };
+    let (first, second) = (open(), open());
+    (directory, first, second)
+}
+
+/// Launches `word` as `id` in `broker` and keeps the instance, as a committed launch does.
+fn launched_on(broker: &Broker, word: &str, id: ApplicationInstanceId) -> Result<(), BrokerError> {
+    let intent = broker.prepare_launch(
+        profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+        ForegroundMark::idle(4),
+        Some(word.to_owned()),
+    )?;
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), id)?
+        .register(IntegrationMode::Gateway, Some(managed(id)))
+        .map_err(|refused| refused.error)?
+        .commit();
+    Ok(())
+}
+
+/// KR-REQ-12.05 and KR-REQ-02.10: a saved conversation another session's execution holds is not
+/// launched against, and the claim lasts until what runs against it is gone: the instance's end
+/// is not that, the end of its server's retirement is. Nothing of a refused launch is left, and
+/// another conversation is served.
+#[test]
+fn kr_req_12_05_a_conversation_another_session_holds_is_not_launched_against() {
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("the first session launches it");
+    first
+        .set_instance_backend(instance(2), process_identity(77, 1_000))
+        .expect("the instance has a server");
+
+    let refusal = launched_on(&second, "thread-7", instance(3))
+        .expect_err("a second session's execution of the same conversation is refused");
+    assert!(
+        matches!(refusal, BrokerError::ConversationHeldElsewhere),
+        "{refusal:?}"
+    );
+    assert!(
+        second.profile_of(instance(3)).is_none() && second.binding_state(instance(3)).is_err(),
+        "a refused launch leaves no instance behind"
+    );
+    launched_on(&second, "thread-8", instance(4)).expect("another conversation is served");
+
+    // The program ends, and its server is still being retired: the conversation is still held.
+    assert!(first.end(instance(2)));
+    assert!(matches!(
+        launched_on(&second, "thread-7", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    // The retirement is over with nothing left running: the conversation is free.
+    first.server_retired(instance(2), true);
+    launched_on(&second, "thread-7", instance(3)).expect("the conversation is free once it is");
+}
+
+/// KR-REQ-12.05: a server whose retirement left something running keeps its conversation held for
+/// as long as the worker lives, and one that ended cleanly before its instance did frees it at the
+/// instance's end.
+#[test]
+fn kr_req_12_05_a_server_that_left_a_process_running_keeps_its_conversation_held() {
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("launched");
+    first
+        .set_instance_backend(instance(2), process_identity(77, 1_000))
+        .expect("the instance has a server");
+    first.server_retired(instance(2), false);
+    assert!(first.end(instance(2)));
+    assert!(matches!(
+        launched_on(&second, "thread-7", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    drop(first);
+    launched_on(&second, "thread-7", instance(3)).expect("a worker that has ended holds nothing");
+
+    // The retirement ended before the instance did: nothing waits for it.
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("launched");
+    first
+        .set_instance_backend(instance(2), process_identity(77, 1_000))
+        .expect("the instance has a server");
+    first.server_retired(instance(2), true);
+    assert!(first.end(instance(2)));
+    launched_on(&second, "thread-7", instance(3)).expect("free at once");
+}
+
+/// A hook the instance's application started, as the kernel recorded it starting at `kernel`.
+fn hook(kernel: u64) -> BridgeProcess {
+    BridgeProcess {
+        identity: process_identity(4_000 + kernel, kernel),
+        starter: Some(process_identity(41, 900)),
+        started: Some(kernel),
+    }
+}
+
+/// What the application's hook reports when it starts `thread`.
+fn selects(thread: &str) -> kr_worker::broker::bridge::Observation {
+    kr_worker::broker::bridge::Observation::from_frame(
+        format!(r#"{{"kr_observation":{{"event":"thread_started","thread":"{thread}"}}}}"#)
+            .as_bytes(),
+    )
+    .expect("an observation")
+}
+
+/// Registers an instance of a native bridge in `broker`, whose application the hooks name.
+fn bridged(broker: &Broker, id: ApplicationInstanceId) {
+    broker
+        .register_instance(id, IntegrationMode::NativeBridge, None, Some(managed(id)))
+        .expect("the instance is registered");
+}
+
+fn selected_by(
+    broker: &Broker,
+    id: ApplicationInstanceId,
+    kernel: u64,
+    thread: &str,
+) -> kr_worker::broker::bridge::ThreadChange {
+    broker
+        .observe_bridge(id, &hook(kernel), &selects(thread), TimestampMs::new(1))
+        .expect("the observation is applied")
+        .0
+}
+
+/// KR-REQ-11.62 and KR-REQ-12.05: a thread another session's execution has selected is not
+/// selected. The thread the binding had is left and no thread is vouched for. The thread an
+/// execution leaves is free for the other session, and so is the one it ends in, a repeated
+/// selection keeps the thread held, and an adopted program that cannot have its conversation owns
+/// none.
+#[test]
+fn kr_req_11_62_a_thread_another_session_owns_leaves_no_thread_vouched_for() {
+    use kr_worker::broker::bridge::ThreadChange;
+
+    let (_directory, first, second) = two_sessions();
+    bridged(&first, instance(2));
+    bridged(&second, instance(3));
+    assert!(matches!(
+        selected_by(&first, instance(2), 10, "shared"),
+        ThreadChange::Selected(_)
+    ));
+    assert!(matches!(
+        selected_by(&second, instance(3), 10, "own"),
+        ThreadChange::Selected(_)
+    ));
+
+    let change = selected_by(&second, instance(3), 11, "shared");
+    assert!(matches!(change, ThreadChange::Refused(_)), "{change:?}");
+    assert_eq!(
+        second.binding_state(instance(3)).expect("known").thread_id,
+        Nullable::null(),
+        "the thread it had is left"
+    );
+    assert!(second.verified_selection(instance(3)).is_none());
+    assert!(
+        second
+            .binding_state(instance(3))
+            .expect("known")
+            .rich_mutations_suspended
+    );
+
+    // A selection repeated keeps the thread held, with no moment another session could take it.
+    assert!(matches!(
+        selected_by(&first, instance(2), 12, "shared"),
+        ThreadChange::Selected(_)
+    ));
+    assert!(matches!(
+        selected_by(&second, instance(3), 12, "shared"),
+        ThreadChange::Refused(_)
+    ));
+
+    // The execution leaves the thread: the other session can have it.
+    assert!(matches!(
+        selected_by(&first, instance(2), 13, "other"),
+        ThreadChange::Selected(_)
+    ));
+    assert!(matches!(
+        selected_by(&second, instance(3), 13, "shared"),
+        ThreadChange::Selected(_)
+    ));
+
+    // An adopted program that is running against a conversation the other session holds owns
+    // none, and its stream selecting it is refused.
+    second
+        .adopt_instance(
+            profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0"),
+            instance(5),
+            process_identity(44, 903),
+            Some("other".to_owned()),
+        )
+        .expect("a program that runs is adopted");
+    assert_eq!(second.conversation_owner("other"), None);
+    assert!(matches!(
+        second.advance_binding(
+            instance(5),
+            Some(AgentThreadId::new("other").expect("valid")),
+            TimestampMs::new(2),
+        ),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+
+    // The execution ends: the thread it was in is free.
+    assert!(first.end(instance(2)));
+    second
+        .advance_binding(
+            instance(5),
+            Some(AgentThreadId::new("other").expect("valid")),
+            TimestampMs::new(3),
+        )
+        .expect("the thread is free once its execution has ended");
+}
+
+/// KR-REQ-12.05: a launch resumed by a word is held under that word across sessions, and the
+/// thread the stream names for it is held too, as the thread's identifier, while the execution is
+/// in it.
+#[test]
+fn kr_req_12_05_the_word_a_launch_resumed_by_is_held_across_sessions_until_the_stream_leaves_it() {
+    let (_directory, first, second) = two_sessions();
+    launched_on(&first, "thread-7", instance(2)).expect("launched");
+    first
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(2),
+        )
+        .expect("the stream names the conversation the launch asked for");
+    assert!(matches!(
+        launched_on(&second, "thread-7", instance(3)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+    first
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-8").expect("valid")),
+            TimestampMs::new(3),
+        )
+        .expect("the execution moves to another conversation");
+    launched_on(&second, "thread-7", instance(3)).expect("the conversation it left is free");
+    assert!(matches!(
+        launched_on(&second, "thread-8", instance(4)),
+        Err(BrokerError::ConversationHeldElsewhere)
+    ));
+}
+
+/// KR-REQ-12.05: a directory of claims that cannot be used refuses the launch of a saved
+/// conversation and a stream's selection of a thread, because nothing then says that no one holds
+/// it. The launch leaves no instance behind, and a launch that names no conversation needs no
+/// claim.
+#[test]
+fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_the_selection() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let paths =
+        kr_ipc::paths::HostPaths::new(directory.path().join("run"), directory.path().join("state"))
+            .expect("the roots");
+    std::fs::create_dir_all(paths.state_root()).expect("the state root");
+    std::fs::write(paths.conversation_claims_dir(), b"").expect("a file where the directory is");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&paths));
+
+    let refusal = launched_on(&broker, "thread-7", instance(2)).expect_err("refused");
+    assert!(
+        matches!(refusal, BrokerError::ResourceUnavailable { .. }),
+        "{refusal:?}"
+    );
+    assert!(broker.profile_of(instance(2)).is_none() && broker.binding_state(instance(2)).is_err());
+    assert_eq!(broker.conversation_owner("thread-7"), None);
+
+    // A launch that names no conversation claims nothing, and its stream's selection is refused.
+    let intent = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(4),
+            None,
+        )
+        .expect("prepared");
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(3))
+        .expect("a launch that names no conversation is served")
+        .register(IntegrationMode::Gateway, Some(managed(instance(3))))
+        .expect("registered")
+        .commit();
+    assert!(matches!(
+        broker.advance_binding(
+            instance(3),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(2),
+        ),
+        Err(BrokerError::ResourceUnavailable { .. })
+    ));
+    assert_eq!(
+        broker.binding_state(instance(3)).expect("known").thread_id,
+        Nullable::null()
+    );
+}
+
 /// One identifier names one instance, and the path that holds it owns it: an executed launch's
 /// reservation, a registration or an adoption. No other path can take it, so no path can later
 /// give back what another one took.

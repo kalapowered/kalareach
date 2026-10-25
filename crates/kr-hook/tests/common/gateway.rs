@@ -192,6 +192,24 @@ impl Gateway {
         shape: &fixture::Shape,
         table: Option<String>,
     ) -> Self {
+        Self::assembled(qualified, runtime_name, ledger, shape, table, None)
+    }
+
+    /// A session of the shape given that claims the saved conversations it runs against in
+    /// `claims`, a directory every session built on it shares, as the sessions of one user share
+    /// the state root their workers claim in.
+    pub fn claiming(shape: &fixture::Shape, claims: &Path) -> Self {
+        Self::assembled(true, "", Ledger::Memory, shape, None, Some(claims))
+    }
+
+    fn assembled(
+        qualified: bool,
+        runtime_name: &str,
+        ledger: Ledger,
+        shape: &fixture::Shape,
+        table: Option<String>,
+        claims: Option<&Path>,
+    ) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -248,6 +266,11 @@ impl Gateway {
                 None,
             ),
         };
+        if let Some(claims) = claims {
+            let roots = kr_ipc::paths::HostPaths::new(claims.join("run"), claims.join("state"))
+                .expect("the roots the sessions share");
+            broker.set_host_claims(kr_worker::broker::host_claims::HostClaims::new(&roots));
+        }
         let sources = Arc::new(ConnectorSources::new());
         let admissions = kr_worker::broker::catalogue::Admissions::new();
         let _ = kr_worker::broker::catalogue::testing::admit(
