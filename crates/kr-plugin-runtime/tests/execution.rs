@@ -1292,6 +1292,95 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     assert_eq!(cached.origin, CompileOrigin::Cached);
 }
 
+// KR-REQ-11.41: a compile is queued at background priority and the caller goes on, never blocking
+// on it.
+//
+// The pool is held, so the component cannot be compiled while the case looks: a compile that
+// waited for its result would never return, and the case would end at its liveness bound; one that
+// returns has the compile still undone, and the caller is given the result once the hold is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_a_compile_is_queued_and_the_caller_goes_on_while_it_is_not_done() {
+    let Some(wasm) = components::component("slow-compile") else {
+        return;
+    };
+    let host = host();
+    let hold = host.runtime.hold_compiles();
+
+    // The call is made on a thread of its own, so that one that blocks fails the case rather than
+    // holding it.
+    let (returned, queued) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn({
+        let runtime = Arc::clone(&host.runtime);
+        move || {
+            let compilation = runtime.compile(wasm);
+            let _ = returned.send(());
+            compilation
+        }
+    });
+    queued
+        .recv_timeout(LIVENESS)
+        .expect("the compile returned while its work was held");
+    let mut compilation = caller
+        .join()
+        .expect("the caller finished")
+        .expect("a compile is queued");
+    assert!(
+        compilation.poll().is_none(),
+        "the compile has a result although the pool was held"
+    );
+
+    drop(hold);
+    let compiled = compilation
+        .wait(COMPILE_WAIT)
+        .await
+        .expect("the held compile finishes once it is let go");
+    assert_eq!(compiled.origin, CompileOrigin::Compiled);
+}
+
+// KR-REQ-11.41: a compile that takes longer than the compile time bound is refused with the bound
+// named, and its result is discarded rather than filed.
+//
+// The bound is nothing, so the component is past it however fast the machine is: compiling a
+// component of this size takes at least a millisecond. What follows is the same component compiled
+// again, because the refused one was not filed in the cache that the next preparation reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_a_compile_past_the_compile_time_bound_is_refused_and_not_filed() {
+    let Some(wasm) = components::component("slow-compile") else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut config = RuntimeConfig::new(directory.path().join("plugin-cache"));
+    config.compile = CompileBudget {
+        deadline_ms: 0,
+        ..CompileBudget::defaults()
+    };
+    let runtime = Runtime::new(config).expect("a runtime");
+
+    let error = runtime
+        .compile(Arc::clone(&wasm))
+        .expect("a compile")
+        .wait(COMPILE_WAIT)
+        .await
+        .expect_err("a compile past the bound is refused");
+    let RuntimeError::CompilationTooSlow { budget_ms, .. } = error else {
+        panic!("the refusal was {error:?}");
+    };
+    assert_eq!(budget_ms, 0, "the refusal names the bound it was held to");
+
+    let again = compile_or_load(
+        runtime.engine(),
+        runtime.cache(),
+        &wasm,
+        no_compile_time_bound(),
+    )
+    .expect("the component compiles");
+    assert_eq!(
+        again.origin,
+        CompileOrigin::Compiled,
+        "the refused compile was filed all the same"
+    );
+}
+
 // KR-REQ-11.38: three faults within a minute disable the binding, with a named reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
