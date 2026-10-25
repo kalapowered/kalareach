@@ -3099,8 +3099,9 @@ impl WorkerService {
     /// scope of a forwarded read, holds a question read and what it retains to that scope, reads
     /// which grant a `session.attach` was decided under, reads which grants and devices an
     /// authority revision withdrew, holds a local caller to the local owner's statement and serves
-    /// `agent.instances`. A control daemon of an earlier release reads these before it sends the
-    /// frames, so they are stated for as long as such a daemon can be brought back by a rollback.
+    /// `agent.instances` and `shell.launch.surface`. A control daemon of an earlier release reads
+    /// these before it sends the frames, so they are stated for as long as such a daemon can be
+    /// brought back by a rollback.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()
@@ -3115,6 +3116,7 @@ impl WorkerService {
                     kr_protocol::local::AUTHORITY_REVISION_REACH,
                     kr_protocol::local::LOCAL_ACCESS,
                     kr_protocol::local::AGENT_INSTANCES_READ,
+                    kr_protocol::local::SHELL_LAUNCH_SURFACE_READ,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -4732,6 +4734,7 @@ impl WorkerService {
             Method::SessionScreenPreview => self.session_screen_preview(&request.params, caller),
             Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
             Method::AgentInstances => self.agent_instances(state, &request.params, caller),
+            Method::ShellLaunchSurface => self.shell_launch_surface(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
             Method::ActionRead => self.action_read(state, caller, &request.params),
@@ -7782,6 +7785,40 @@ impl WorkerService {
             );
         }
         Ok(encoded)
+    }
+
+    /// Serves `shell.launch.surface`: whether a launch could be made at the root editor now, who
+    /// holds the session's input, the shell's name and the agents the host has a package for.
+    ///
+    /// The editor and the input lease are what the live screen shows, so a caller whose grant does
+    /// not reach it is told neither. The read touches no disk and starts no process.
+    fn shell_launch_surface(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+        caller: &Caller,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::root::ShellLaunchSurfaceParams = parse(params)?;
+        let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        let shown = caller
+            .history_filter(Method::ShellLaunchSurface.entry())
+            .is_some_and(|filter| {
+                filter
+                    .admit_at(
+                        crate::history_filter::Surface::TerminalSnapshot,
+                        kr_ipc::now_ms().get(),
+                    )
+                    .is_ok()
+            });
+        let answer = crate::launch_surface::answer(
+            &session,
+            shown,
+            |attachment_id| state.facts.holds_attachment(attachment_id),
+            self.connector_sources.launch_offers(),
+        );
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
     }
 
     /// Serves `agent.instances`: the session's live agent instances and one page of the agent

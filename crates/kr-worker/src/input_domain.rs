@@ -60,7 +60,7 @@ use kr_protocol::ids::{AttachmentId, AuthorityRevision, ConnectionId, InputLease
 use kr_protocol::input::InputLeaseState;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::session::SessionState;
-use kr_shell_integration::contract::fence::LeaseView;
+use kr_shell_integration::contract::fence::{LaunchStanding, LeaseView};
 use kr_shell_integration::contract::requests::LaunchTransactionId;
 use kr_term::win32::{Fidelity, KeyRecord, Keyboard, Refused};
 
@@ -1431,6 +1431,23 @@ impl InputDomain {
     #[must_use]
     pub fn outstanding_launches(&self) -> Option<u64> {
         self.fence.as_ref().map(|_| self.launches.len() as u64)
+    }
+
+    /// Says what stands between a caller and a launch at the root editor, for a managed session.
+    ///
+    /// `None` for a session with no managed root editor. Bytes the paste recogniser has accepted
+    /// from a client and still holds, a lone Escape that may begin a paste delimiter among them,
+    /// have not reached the machine, so they are counted here: the editor will see them.
+    #[must_use]
+    pub fn launch_standing(&self) -> Option<LaunchStanding> {
+        let standing = self.fence.as_ref()?.launch_standing();
+        Some(match standing {
+            LaunchStanding::Fenced(mut editor) => {
+                editor.changed |= !self.gate_is_open();
+                LaunchStanding::Fenced(editor)
+            }
+            other => other,
+        })
     }
 
     /// Returns the commands a reader installed after their transaction had been revoked.

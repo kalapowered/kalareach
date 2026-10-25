@@ -47,8 +47,8 @@ use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, SessionId};
 use kr_protocol::input::InterruptAction;
 use kr_protocol::root::{
     AcceptedOrigin, CwdRevision, EditorBufferRevision, EditorBusyEvent, EditorBusyReason,
-    EditorFence, FENCE_EXCHANGE_TIMEOUT, FenceAcknowledgement, FenceCause, FenceId, FenceRefusal,
-    FenceState, LAUNCH_READER_BUDGET, LaunchCommand, PromptGeneration, ReaderContext,
+    EditorFence, EditorState, FENCE_EXCHANGE_TIMEOUT, FenceAcknowledgement, FenceCause, FenceId,
+    FenceRefusal, FenceState, LAUNCH_READER_BUDGET, LaunchCommand, PromptGeneration, ReaderContext,
     ReaderRevision, RootCommandAcceptedParams, RootEditorEnterParams, RootEditorFenceParams,
     RootEditorLeaveParams, RootEofDetachParams, RootEofDetachResult, ShellLaunchParams,
     ShellLaunchResult, WithheldReason,
@@ -844,6 +844,49 @@ struct InstalledLaunch {
     requester: AttachmentId,
 }
 
+/// What stands between a caller and a launch at the root editor: the first thing that does, or the
+/// editor a launch could be installed in.
+///
+/// The variants are in the order they are tested. The machine answers all but
+/// [`Self::Starting`] and [`Self::IntegrationLost`], which belong to the phase of the integration
+/// the driver holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchStanding {
+    /// The session is closing.
+    Closing,
+    /// The root integration has not qualified: the bridge has not connected, or the user's startup
+    /// files still run.
+    Starting,
+    /// The root integration was refused, or lost after it qualified.
+    IntegrationLost,
+    /// No root editor is registered.
+    NotAtPrompt,
+    /// The registered reader is not the primary prompt.
+    NotPrimaryPrompt,
+    /// A launch is reserved, one the worker revoked may still be installed, or one was installed
+    /// at this prompt.
+    LaunchInProgress,
+    /// A root editor is registered and no fence stands.
+    NoFence,
+    /// A fence stands, with what the reader acknowledged under it.
+    Fenced(FencedEditor),
+}
+
+/// A standing fence, with the reader's own account of its buffer when the fence was proved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FencedEditor {
+    /// The prompt the fence was proved at.
+    pub prompt_generation: PromptGeneration,
+    /// The buffer revision the reader acknowledged.
+    pub buffer_revision: EditorBufferRevision,
+    /// The shell's working-directory revision, as the reader last said it.
+    pub cwd_revision: CwdRevision,
+    /// The reader's buffer state in the acknowledgement.
+    pub acknowledged: EditorState,
+    /// Whether the worker has admitted or learned anything since that changes the picture.
+    pub changed: bool,
+}
+
 /// The worker's side of the root-editor contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceMachine {
@@ -875,6 +918,18 @@ pub struct FenceMachine {
     awaiting_confirmation: Vec<LaunchTransaction>,
     lease: LeaseView,
     acceptance: Option<AcceptedOrigin>,
+    /// What the reader said of its edit buffer in the acknowledgement the standing fence rests on.
+    ///
+    /// It is the one proof the contract gives that the buffer was empty with nothing pending at an
+    /// instant the worker can place: the acknowledgement carries the drained queues and the buffer
+    /// state together. It goes with the fence.
+    acknowledged: Option<EditorState>,
+    /// Whether anything has changed the worker's picture of the buffer since that acknowledgement:
+    /// a key admitted or held, an interrupt, a launch the reader refused because the editor had
+    /// moved, or a report of the reader that differs from the acknowledged state. A report can
+    /// only make this true. A report and a forwarded key can cross, so no report proves the buffer
+    /// is still empty.
+    changed: bool,
 }
 
 impl FenceMachine {
@@ -898,6 +953,8 @@ impl FenceMachine {
             awaiting_confirmation: Vec::new(),
             lease,
             acceptance: None,
+            acknowledged: None,
+            changed: false,
         }
     }
 
@@ -928,6 +985,46 @@ impl FenceMachine {
             .into_iter()
             .flatten()
             .min()
+    }
+
+    /// Says what stands between a caller and a launch at the root editor, or that nothing does.
+    ///
+    /// The first thing that holds, in the order of [`LaunchStanding`]. A session whose integration
+    /// has not qualified, or has been lost, is not the machine's to say: the driver that owns the
+    /// phase answers [`LaunchStanding::Starting`] and [`LaunchStanding::IntegrationLost`] before it
+    /// asks the machine.
+    #[must_use]
+    pub fn launch_standing(&self) -> LaunchStanding {
+        if self.state == FenceState::Closing {
+            return LaunchStanding::Closing;
+        }
+        let Some(editor) = self.editor.as_ref() else {
+            return LaunchStanding::NotAtPrompt;
+        };
+        if editor.reader_context != ReaderContext::Primary {
+            return LaunchStanding::NotPrimaryPrompt;
+        }
+        // A launch the reader is deciding, one the worker revoked that the reader may still
+        // install, and one it installed at this prompt, which leaves the machine fenced again
+        // while the editor holds the command: the acknowledged empty buffer describes none of them.
+        if self.launch.is_some()
+            || !self.awaiting_confirmation.is_empty()
+            || self.installed.is_some()
+        {
+            return LaunchStanding::LaunchInProgress;
+        }
+        let (FenceState::Fenced, Some(fence), Some(acknowledged)) =
+            (self.state, self.fence.as_ref(), self.acknowledged)
+        else {
+            return LaunchStanding::NoFence;
+        };
+        LaunchStanding::Fenced(FencedEditor {
+            prompt_generation: fence.prompt_generation,
+            buffer_revision: acknowledged.buffer_revision,
+            cwd_revision: editor.cwd_revision,
+            acknowledged,
+            changed: self.changed,
+        })
     }
 
     /// Returns what `kr detach` without an attachment identifier targets.
@@ -1185,6 +1282,10 @@ impl FenceMachine {
             registered.cwd_revision = ack.cwd_revision;
         }
         self.fence = Some(fence.clone());
+        self.acknowledged = Some(ack.editor);
+        // Keys held through the exchange never reached the reader, so its snapshot does not
+        // account for them, and they go to the terminal as soon as the fence is published.
+        self.changed = !self.hold.is_empty();
         self.state = FenceState::Fenced;
         actions.push(Action::PublishFence(fence));
         self.release_hold(actions);
@@ -1265,6 +1366,14 @@ impl FenceMachine {
                 actions.push(Action::WithholdFence(WithheldReason::ReaderMoved));
             }
             self.state = FenceState::Unfenced;
+        } else if self
+            .acknowledged
+            .is_some_and(|acknowledged| acknowledged != idled.idle.editor)
+        {
+            // The reader reports a buffer other than the one it acknowledged. The report may lag
+            // a key it has not read yet, which is why it never proves the buffer unchanged, but a
+            // different state is a different state.
+            self.changed = true;
         }
         if self.state != FenceState::Unfenced || self.exchange.is_some() {
             return;
@@ -1293,6 +1402,7 @@ impl FenceMachine {
             });
             return;
         }
+        self.changed = true;
         if self.exchange.is_some() || self.launch.is_some() {
             self.hold.push(Held {
                 input: arrival.input.clone(),
@@ -1349,6 +1459,7 @@ impl FenceMachine {
             actions.push(Action::RefuseInterrupt(LeaseFault::NotHolder));
             return;
         }
+        self.changed = true;
         actions.push(Action::Interrupt(request.action));
     }
 
@@ -1592,7 +1703,10 @@ impl FenceMachine {
                         buffer_revision: accepted.buffer_revision,
                     }));
                 }
-                LaunchDecision::Rejected(rejected) => refuse_launch(rejected.reason, actions),
+                LaunchDecision::Rejected(rejected) => {
+                    self.note_refusal(rejected.reason);
+                    refuse_launch(rejected.reason, actions);
+                }
             }
             return;
         }
@@ -1648,6 +1762,7 @@ impl FenceMachine {
                 }));
             }
             LaunchDecision::Rejected(rejected) => {
+                self.note_refusal(rejected.reason);
                 refuse_launch(rejected.reason, actions);
             }
         }
@@ -1955,8 +2070,18 @@ impl FenceMachine {
         }
     }
 
+    /// Records that the reader refused a launch because the editor had moved: whatever the worker
+    /// believed of the buffer was wrong, and the fence still stands.
+    fn note_refusal(&mut self, reason: LaunchRejectionReason) {
+        if reason.code() == ErrorCode::DraftConflict {
+            self.changed = true;
+        }
+    }
+
     fn invalidate_fence(&mut self, reason: FenceInvalidation, actions: &mut Vec<Action>) {
         if self.fence.take().is_some() {
+            self.acknowledged = None;
+            self.changed = false;
             actions.push(Action::InvalidateFence(reason));
         }
     }
