@@ -2046,7 +2046,7 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
     let marks = host.scratch("typed");
     // A line that makes the file `<name>-42`, named by an expansion the shell has to run.
     let typed = |name: &str| InputContent::Bytes {
-        bytes: Bytes::new(format!(": > \"{}/{name}-$((6*7))\"\n", marks.display()).into_bytes()),
+        bytes: Bytes::new(format!(": > '{}'/{name}-$((6*7))\n", marks.display()).into_bytes()),
     };
 
     owner
@@ -2055,9 +2055,9 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         .await
         .expect("the worker of the release before takes the bytes of a paired device");
 
-    // Key records spelling a line the session must not show. The refusal is the daemon's: a
-    // worker of the release before would answer with an invalid argument.
-    let keys = format!(": > \"{}/refused-$((6*7))\"\n", marks.display())
+    // Key records spelling a line the shell must not run. The refusal is the daemon's: a worker of
+    // the release before would answer with an invalid argument.
+    let keys = format!(": > '{}'/refused-$((6*7))\n", marks.display())
         .chars()
         .map(|character| ConsoleKey {
             virtual_key: 0,
