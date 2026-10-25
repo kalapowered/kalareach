@@ -211,7 +211,7 @@ impl Mailboxes {
                 .read_as(keys, None)
                 .await
                 .map_err(|error| format!("a mailbox could not be read: {error}"))?;
-            if page.items.is_empty() {
+            if page.last_sequence().is_none() {
                 return Ok(());
             }
             self.reading
@@ -412,7 +412,7 @@ async fn kr_req_20_04_an_envelope_is_delivered_read_opened_and_acknowledged() {
             .await
             .expect("the recipient reads again");
         assert!(
-            after.items.is_empty(),
+            after.last_sequence().is_none(),
             "an acknowledgement removes what it covers"
         );
 

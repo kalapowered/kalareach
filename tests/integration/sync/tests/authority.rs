@@ -409,7 +409,7 @@ impl Feed {
             .read_as(&self.host_mailbox, None)
             .await
             .map_err(|error| format!("the announcement mailbox could not be read: {error}"))?;
-        if page.items.is_empty() {
+        if page.last_sequence().is_none() {
             return Ok(());
         }
         reading

@@ -392,31 +392,57 @@ async fn kr_req_20_05_an_item_accepted_once_is_refused_when_it_is_offered_again(
 
 /// KR-REQ-20.05: the routing record the service stores beside a ciphertext is untrusted, and one
 /// that names a payload kind this build does not know is an item the reader cannot open. It is
-/// dropped and the service is told it may remove it, and the paired sender's item beside it, which
-/// the service holds after it, is taken in the same pass.
+/// dropped and the service is told it may remove it, whether it comes first or last on its page,
+/// and the paired sender's item between two of them, which the service holds after the first, is
+/// taken in the same pass.
 #[tokio::test]
 async fn kr_req_20_05_an_item_whose_routing_names_an_unknown_kind_is_dropped_and_the_next_is_taken()
 {
     let rig = Rig::start();
     let friend = a_sender();
     rig.reader.pairs_with(&friend);
-    rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, 1))
-        .await;
-    rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, 2))
-        .await;
-    assert!(
-        rig.web
-            .relabel_mailbox_item(rig.me.public(), 1, "signed_authority_object"),
-        "the service holds the first item"
-    );
+    for number in 1..=3 {
+        rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, number))
+            .await;
+    }
+    for number in [1, 3] {
+        assert!(
+            rig.web
+                .relabel_mailbox_item(rig.me.public(), number, "signed_authority_object"),
+            "the service holds item {number}"
+        );
+    }
 
     let outcome = rig.pass().await.expect("the pass reads through");
 
     assert_eq!(outcome, Outcome::ReadThrough);
     assert_eq!(rig.reader.accepted_numbers(), [2]);
-    assert_eq!(rig.reader.dropped(), 1);
+    assert_eq!(rig.reader.dropped(), 2);
     assert_eq!(rig.reader.written().len(), 1);
-    assert_eq!(rig.held(), 0, "the service may remove both");
+    assert_eq!(rig.held(), 0, "the service may remove all three");
+}
+
+/// KR-REQ-20.05: a page whose every item the reader cannot open is dropped and acknowledged, so
+/// the items the service holds after it are not kept behind it.
+#[tokio::test]
+async fn kr_req_20_05_a_page_of_items_the_reader_cannot_open_is_dropped_and_acknowledged() {
+    let rig = Rig::start();
+    let friend = a_sender();
+    rig.reader.pairs_with(&friend);
+    rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, 1))
+        .await;
+    assert!(
+        rig.web
+            .relabel_mailbox_item(rig.me.public(), 1, "signed_authority_object"),
+        "the service holds the item"
+    );
+
+    let outcome = rig.pass().await.expect("the pass reads through");
+
+    assert_eq!(outcome, Outcome::ReadThrough);
+    assert!(rig.reader.accepted_numbers().is_empty());
+    assert_eq!(rig.reader.dropped(), 1);
+    assert_eq!(rig.held(), 0, "the service may remove the item");
 }
 
 /// KR-REQ-20.05: an item whose identifier was written down is never accepted again, even when the
