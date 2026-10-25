@@ -31,7 +31,8 @@ use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::PendingResource;
 use kr_protocol::ids::{
-    AgentBindingRevision, ApplicationInstanceId, EnvironmentId, GrantId, SessionEpoch, SessionId,
+    AgentBindingRevision, ApplicationInstanceId, CapabilityId, EnvironmentId, GrantId,
+    SessionEpoch, SessionId,
 };
 use kr_protocol::local::LocalBuild;
 use kr_protocol::method::Method;
@@ -39,7 +40,7 @@ use kr_protocol::projection::{AgentInstanceList, AgentResourceSnapshotContinuati
 use kr_protocol::recovery::{
     AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSnapshotResult,
 };
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::worker::WorkerDescriptor;
 use serde::Serialize;
 
@@ -75,13 +76,22 @@ pub(crate) struct Link {
     pub(crate) grant_id: Option<GrantId>,
     /// The build the worker stated when the link was made, when it stated one.
     pub(crate) build: Option<kr_protocol::local::LocalBuild>,
+    /// What the worker stated it serves when the link was made. None for a link to a host this
+    /// device is paired with, where no worker answered the hello and the host's own daemon says
+    /// what it serves.
+    pub(crate) capabilities: Option<CanonicalSet<CapabilityId>>,
     /// The mutations in flight on this link.
     pub(crate) flight: Flight,
 }
 
 impl Link {
     /// A link to a worker on this machine, which proved the descriptor's key.
-    fn local(session: Session, descriptor: &WorkerDescriptor, build: Option<LocalBuild>) -> Self {
+    fn local(
+        session: Session,
+        descriptor: &WorkerDescriptor,
+        build: Option<LocalBuild>,
+        capabilities: CanonicalSet<CapabilityId>,
+    ) -> Self {
         Self {
             session,
             ids: crate::standing::LinkIds {
@@ -91,6 +101,7 @@ impl Link {
             },
             grant_id: None,
             build,
+            capabilities: Some(capabilities),
             flight: Flight::default(),
         }
     }
@@ -113,8 +124,18 @@ impl Link {
             },
             grant_id,
             build: None,
+            capabilities: None,
             flight: Flight::default(),
         }
+    }
+
+    /// Whether the worker this link reaches stated that it serves `capability`, or None when no
+    /// worker answered the hello on this link.
+    pub(crate) fn states(&self, capability: &str) -> Option<bool> {
+        let capability = CapabilityId::new(capability).ok()?;
+        self.capabilities
+            .as_ref()
+            .map(|stated| stated.contains(&capability))
     }
 
     /// The target of a mutation on this link about `instance` at the binding revision `binding`.
@@ -399,6 +420,40 @@ impl WorkerLinks {
         }
     }
 
+    /// Reads `session_id`'s launch surface: whether a launch could be made at its root editor now.
+    ///
+    /// A link to a worker on this machine knows what the worker stated, so a worker that does not
+    /// state that it serves the read is not asked, and the host does not take its refusal of a
+    /// method it does not list for a missing right. On a host this device is paired with, no worker
+    /// answered the hello: the host's daemon refuses the read for a worker that does not state it,
+    /// and a daemon of an earlier release refuses it as unlisted, which the client library tells
+    /// from a withdrawn right by asking for what the same right reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the worker could not be reached, or the host's own refusal.
+    pub async fn launch_surface(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+    ) -> Result<kr_client::LaunchSurfaceRead> {
+        let link = self.link(state, session_id, opening).await?;
+        let answer = match link.states(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ) {
+            Some(false) => return Ok(kr_client::LaunchSurfaceRead::NotServed),
+            Some(true) => link
+                .session
+                .read::<_, kr_protocol::root::ShellLaunchSurfaceResult>(
+                    Method::ShellLaunchSurface,
+                    &kr_protocol::root::ShellLaunchSurfaceParams { session_id },
+                )
+                .await
+                .map(kr_client::LaunchSurfaceRead::Served),
+            None => link.session.read_launch_surface(session_id).await,
+        };
+        self.settle(state, session_id, link.link(), answer)
+    }
+
     /// Whether `session_id`'s worker on this machine is the one that serves it: whether it has
     /// published a descriptor here, rather than having ended, when the host's archive serves it.
     ///
@@ -469,7 +524,12 @@ impl WorkerLinks {
             })?;
         let transport = kr_client::ipc::IpcTransport::over(reached.client);
         let session = Session::start(transport.shared())?;
-        let link = Arc::new(Link::local(session, &reached.descriptor, reached.build));
+        let link = Arc::new(Link::local(
+            session,
+            &reached.descriptor,
+            reached.build,
+            reached.capabilities,
+        ));
         *held = Some(Arc::clone(&link));
         Ok(link)
     }

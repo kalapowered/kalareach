@@ -221,6 +221,23 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return failure(request.request_id, error),
         };
+        // A worker of an earlier release has no row for a read that is new in this one, and
+        // refuses it as it refuses any method it does not serve, which reads as a missing right.
+        // It states what it serves, so the read is not sent to one that does not state it.
+        if let Some(capability) = worker_capability(entry.method)
+            && !proxy.states(capability)
+        {
+            return failure(
+                request.request_id,
+                ProtocolError::new(
+                    ErrorCode::UnsupportedCapability,
+                    format!(
+                        "this session's worker is of an earlier release and does not serve {}",
+                        entry.name
+                    ),
+                ),
+            );
+        }
         // A write for a worker of a retained level is written in the shape that level reads, or
         // refused here when that level has no counterpart for it. A worker of this level gets the
         // request as it came, unread.
@@ -907,5 +924,14 @@ impl RemoteConnection {
             lapses_at_ms: decision.decided.lapses_at_ms,
             under: decision.bounds(),
         })
+    }
+}
+
+/// The capability a worker states when it serves `method`, for a read that a worker of an earlier
+/// release does not serve at all.
+const fn worker_capability(method: Method) -> Option<&'static str> {
+    match method {
+        Method::ShellLaunchSurface => Some(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ),
+        _ => None,
     }
 }

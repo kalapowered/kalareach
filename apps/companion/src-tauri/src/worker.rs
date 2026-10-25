@@ -8,8 +8,9 @@
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::EnvironmentPaths;
-use kr_protocol::ids::SessionId;
+use kr_protocol::ids::{CapabilityId, SessionId};
 use kr_protocol::local::LocalClientKind;
+use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::worker::WorkerDescriptor;
 
 use kr_client::shown::Shown;
@@ -22,6 +23,8 @@ pub struct Reached {
     pub descriptor: WorkerDescriptor,
     /// The build the worker stated in its answer to the hello, when it stated one.
     pub build: Option<kr_protocol::local::LocalBuild>,
+    /// What the worker stated it serves in its answer to the hello.
+    pub capabilities: CanonicalSet<CapabilityId>,
 }
 
 /// Why a worker was not reached.
@@ -96,10 +99,12 @@ pub async fn reach(paths: &EnvironmentPaths, session_id: SessionId) -> Result<Re
         ))
     })?;
     let build = client.acknowledgement().build.clone();
+    let capabilities = client.acknowledgement().capabilities.clone();
     Ok(Reached {
         client,
         descriptor,
         build,
+        capabilities,
     })
 }
 

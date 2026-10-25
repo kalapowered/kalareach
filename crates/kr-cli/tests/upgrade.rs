@@ -1813,6 +1813,19 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
         .expect("the device reads the attention inbox");
     assert!(attention.gaps.is_empty(), "{attention:?}");
 
+    // The launch surface is read of the worker, and the worker of the release before has no row for
+    // it: it would refuse it as it refuses any method it does not serve, which reads as a missing
+    // right. It states what it serves, so the daemon refuses the read itself and sends it nothing.
+    let refused = session
+        .read_launch_surface(session_id)
+        .await
+        .expect_err("the worker of the release before does not serve the launch surface");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UnsupportedCapability,
+        "{refused:?}"
+    );
+
     // The worker is the process it was, and runs the release before.
     updated.the_worker_is_as_it_was().await;
 
@@ -1863,6 +1876,40 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     )
     .await;
     assert!(closed.closure.0.is_some(), "{closed:?}");
+}
+
+/// KR-REQ-13.11, KR-REQ-26.06: a device of this release that meets a host still on the release
+/// before is told that the host does not serve the launch surface, and is not told it lacks a right.
+/// That daemon does not list the method and refuses it as it refuses any method it does not list,
+/// `PERMISSION_DENIED`; the client asks for what the same right reads, which is answered, and asks
+/// again, which is refused as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_of_this_release_is_told_the_host_before_it_does_not_serve_the_launch_surface() {
+    let prepared = Updated::prepare(Setup {
+        network: true,
+        ..Setup::default()
+    })
+    .await;
+    let host = &prepared.host;
+    let door = door::Door::pair_the_first_owner(
+        &host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        host.tree.environment_id(),
+    )
+    .await;
+
+    let read = door
+        .session
+        .read_launch_surface(prepared.session_id)
+        .await
+        .expect("a host that does not serve the read is not one that refuses the device");
+    assert_eq!(read, kr_client::LaunchSurfaceRead::NotServed);
+    drop(door);
+    host.close(&prepared.kr_before(), &prepared.display);
+    host.worker_ended(&prepared.worker).await;
 }
 
 /// KR-REQ-09.10, KR-REQ-26.06, KR-REQ-20.23: a mutation a paired device makes, which the daemon of

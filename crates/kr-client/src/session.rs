@@ -24,11 +24,14 @@ use kr_protocol::envelope::{
     ActionTarget, ControlEvent, ControlFrame, MutationRequest, Notification, Outcome, ParamsValue,
     Request, Response,
 };
+use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::ActionWindow;
-use kr_protocol::ids::{ActionId, GrantId, RequestId, StreamId};
+use kr_protocol::ids::{ActionId, GrantId, RequestId, SessionId, StreamId};
 use kr_protocol::method::Method;
 use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt};
+use kr_protocol::root::{ShellLaunchSurfaceParams, ShellLaunchSurfaceResult};
 use kr_protocol::scalars::{DurationMs, Nullable};
+use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use serde::Serialize;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
@@ -64,6 +67,15 @@ impl std::fmt::Debug for Answer {
                 .finish_non_exhaustive(),
         }
     }
+}
+
+/// What a read of a session's launch surface came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchSurfaceRead {
+    /// The host served the read.
+    Served(ShellLaunchSurfaceResult),
+    /// The host is of a release that does not serve the read.
+    NotServed,
 }
 
 /// How the host settled one mutation.
@@ -615,6 +627,46 @@ impl Session {
         R: kr_protocol::wire::WireMessage,
     {
         self.read_signalling(method, params, false).await
+    }
+
+    /// Reads a session's launch surface from a host that may be of a release that does not serve
+    /// it.
+    ///
+    /// A host that does not list a method refuses it as it refuses any method it does not list,
+    /// `PERMISSION_DENIED`, and a grant that has lost its right is refused the same way. The two
+    /// are told apart by asking for what the same right reads, `session.read`: where that is
+    /// refused too, the refusal is the grant's and is returned as it is, and that second call, which
+    /// signals, is what raises [`Self::denied`]; where it is answered, the first read is asked once
+    /// more, in case the host refused it for a reason that has passed, and a second refusal means
+    /// the host does not serve the read. The first reads do not signal, since a host too old for
+    /// the method is not one that withdrew the connection. Any other failure is returned as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when it refuses the read for a reason other than not serving it,
+    /// and any other failure of the connection.
+    pub async fn read_launch_surface(&self, session_id: SessionId) -> Result<LaunchSurfaceRead> {
+        let params = ShellLaunchSurfaceParams { session_id };
+        let refused_as_unlisted = |error: &ClientError| matches!(error, ClientError::Host(refusal) if refusal.code == ErrorCode::PermissionDenied);
+        match self
+            .read_unsignalled(Method::ShellLaunchSurface, &params)
+            .await
+        {
+            Ok(surface) => return Ok(LaunchSurfaceRead::Served(surface)),
+            Err(error) if refused_as_unlisted(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let _: SessionReadResult = self
+            .read(Method::SessionRead, &SessionReadParams { session_id })
+            .await?;
+        match self
+            .read_unsignalled(Method::ShellLaunchSurface, &params)
+            .await
+        {
+            Ok(surface) => Ok(LaunchSurfaceRead::Served(surface)),
+            Err(error) if refused_as_unlisted(&error) => Ok(LaunchSurfaceRead::NotServed),
+            Err(error) => Err(error),
+        }
     }
 
     async fn read_signalling<P, R>(&self, method: Method, params: &P, signalling: bool) -> Result<R>
