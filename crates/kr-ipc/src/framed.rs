@@ -1034,14 +1034,31 @@ mod tests {
         let (_reader, mut writer) = split(client, StreamKind::Control);
 
         let frame = FrameWriter::encode(StreamKind::Control, &big).expect("encodes");
-        let mut asked = 0_u32;
-        let outcome = writer
-            .write_frame_while(&frame, || {
-                asked += 1;
-                asked == 1
-            })
-            .await
-            .expect("the peer is there");
+        // The check allows the first write and refuses the second. A Windows named pipe that is new
+        // to the runtime reports no room until the runtime has seen its first readiness, so the
+        // first write can be answered as blocked before a byte goes: the check then refuses the
+        // attempt that follows the wait, and the frame is taken back whole. That is the right
+        // answer for a frame the peer has none of, and the next try finds the room. Every other
+        // outcome ends the loop.
+        let mut tries = 0_u32;
+        let (outcome, asked) = loop {
+            tries += 1;
+            let mut asked = 0_u32;
+            let outcome = writer
+                .write_frame_while(&frame, || {
+                    asked += 1;
+                    asked == 1
+                })
+                .await
+                .expect("the peer is there");
+            if outcome != FrameWhile::Withdrawn || tries == 3 {
+                break (outcome, asked);
+            }
+            assert!(
+                !writer.has_sent_any() && !writer.is_mid_frame(),
+                "a frame taken back leaves nothing of it in hand or with the peer"
+            );
+        };
         assert_eq!(
             outcome,
             FrameWhile::Cut,
