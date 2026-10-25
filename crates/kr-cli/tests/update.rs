@@ -352,8 +352,9 @@ fn kr_host_install_puts_a_first_release_in_a_store_and_makes_it_current() {
     );
     assert!(host.store.is_store(), "the store's record is written");
     let installed = host.store.release_directory(one.name());
+    let program = format!("bin/{}", Program::Kr.file_name());
     for file in [
-        "bin/kr",
+        program.as_str(),
         module_tree()[0].0,
         kr_protocol::update::MANIFEST_FILE,
     ] {
@@ -875,11 +876,7 @@ async fn an_update_left_after_its_switch_is_finished_by_the_next_run() {
     host.start_daemon(&started_through_current).await;
     // What a run that stopped after its switch leaves: the daemon stopped, `current` on the
     // target, and the update recorded as switched.
-    for mut daemon in host.daemons.drain(..) {
-        daemon.kill().expect("stops");
-        daemon.wait().expect("ends");
-    }
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
 
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
@@ -931,7 +928,7 @@ async fn a_transaction_with_no_root_settles_on_the_release_roots_that_can_be_rea
     host.put(&two);
     let started_through_current = host.store.stable(Program::Controller);
     host.start_daemon(&started_through_current).await;
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     assert!(
         host.record()["update"]["trusted_root"].is_null(),
         "the transaction is one an earlier build began"
@@ -1024,7 +1021,7 @@ async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
     host.put(&two);
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     let scratch = host.scratch("archives");
     let archive = scratch.join("two.tar.gz");
     two.archive(&archive);
@@ -1066,8 +1063,94 @@ async fn an_update_left_after_its_switch_waits_for_a_daemon_on_its_way_out() {
 }
 
 /// KR-REQ-26.09: a daemon the update stopped that does not start from the new release keeps the
+/// update recorded, as switched, through every run that meets the same failure; an update to a
+/// release without the fault starts it from the release `current` names, and settles the update. On
+/// Windows the new release's daemon is a program the environment's task cannot run.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_next_run() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)
+        .with_program("kr-controller", b"this is not a program");
+    let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let scratch = host.scratch("archives");
+    let archive_two = scratch.join("two.zip");
+    two.archive(&archive_two);
+    let archive_two = archive_two.display().to_string();
+    let archive_three = scratch.join("three.zip");
+    three.archive(&archive_three);
+    let archive_three = archive_three.display().to_string();
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive_two, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "this host's current release is {} now, and a control daemon the update stopped did \
+             not start from it",
+            two.name()
+        )),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    let record = host.record();
+    assert_eq!(record["update"]["state"], "switched", "{record}");
+    assert_eq!(
+        record["update"]["restarts"].as_array().map(Vec::len),
+        Some(1),
+        "the daemon's restart is kept: {record}"
+    );
+
+    // A second run that meets the same failure keeps the update as well.
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive_two, "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("an update an earlier run left part way is not settled yet"),
+        "{said}"
+    );
+    assert_eq!(host.record()["update"]["state"], "switched");
+
+    // The control: an update to a release whose daemon starts goes on past the failed one, starts
+    // the daemon recorded from the release `current` then names, and settles the update.
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive_three, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        said["restarted"],
+        serde_json::json!([host.tree.environment_id().to_string()]),
+        "it says which daemon it started: {said}"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", three.name())
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{record}");
+    assert_eq!(record["previous"], two.name().as_str(), "{record}");
+}
+
+/// KR-REQ-26.09: a daemon the update stopped that does not start from the new release keeps the
 /// update recorded, as switched, through every run that meets the same failure; the run after the
 /// failure has gone starts it from the release `current` names and settles the update.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_that_does_not_start_after_the_switch_keeps_the_update_for_the_next_run() {
     let mut host = Host::bare();
@@ -1250,17 +1333,7 @@ async fn a_daemon_an_update_prepared_is_taken_back_only_once_no_stop_of_it_can_e
         .attempt
         .0
         .expect("it answers the attempt it began");
-    let restart = serde_json::json!({
-        "environment": host.tree.environment_id(),
-        "runtime_root": host.tree.paths().runtime_root(),
-        "state_root": host.tree.paths().state_root(),
-        "start": {
-            "arguments": {
-                "arguments": host.daemon_arguments(),
-                "working_directory": host.tree.root(),
-            }
-        },
-    });
+    let restart = host.restart();
     let record = serde_json::json!({
         "format": EARLIER_RECORD_FORMAT,
         "update": {
@@ -1587,12 +1660,17 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
             && message.contains("run kr host update again"),
         "{said}"
     );
+    // Where the lock file can be read while it is held, the process that holds the environment
+    // is named; a Windows daemon holds it with no sharing at all, so there none can be.
+    if cfg!(unix) {
+        assert!(
+            message.contains(&stop_command(std::process::id())),
+            "the process that holds the environment nothing answers for is named: {said}"
+        );
+    }
+    let daemon = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
     assert!(
-        message.contains(&format!("kill {}", std::process::id())),
-        "the process that holds the environment nothing answers for is named: {said}"
-    );
-    assert!(
-        !message.contains(&format!("kill {}", host.daemons[0].id())),
+        !message.contains(&stop_command(daemon)),
         "and the daemon that made way is not: {said}"
     );
     drop(hanging);
@@ -2001,11 +2079,32 @@ fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
     );
 }
 
-/// What is under `root`, as a comparison shows it: each entry's path, kind, mode and length, the
-/// links as links.
-fn what_is_under(root: &Path) -> Vec<(String, &'static str, u32, u64)> {
+/// The command a message names to end the process `pid` on this platform.
+fn stop_command(pid: u32) -> String {
+    if cfg!(windows) {
+        format!("taskkill /PID {pid}")
+    } else {
+        format!("kill {pid}")
+    }
+}
+
+/// What a comparison shows of an entry's permissions: its mode, or on Windows whether it is read-only.
+#[cfg(unix)]
+fn permissions_shown(about: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
 
+    about.permissions().mode() & 0o7777
+}
+
+/// What a comparison shows of an entry's permissions: its mode, or on Windows whether it is read-only.
+#[cfg(windows)]
+fn permissions_shown(about: &std::fs::Metadata) -> u32 {
+    u32::from(about.permissions().readonly())
+}
+
+/// What is under `root`, as a comparison shows it: each entry's path, kind, permissions and length,
+/// the links (a junction is one) as links.
+fn what_is_under(root: &Path) -> Vec<(String, &'static str, u32, u64)> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -2027,7 +2126,7 @@ fn what_is_under(root: &Path) -> Vec<(String, &'static str, u32, u64)> {
                     .display()
                     .to_string(),
                 kind,
-                about.permissions().mode() & 0o7777,
+                permissions_shown(&about),
                 about.len(),
             ));
         }
@@ -2040,6 +2139,7 @@ fn what_is_under(root: &Path) -> Vec<(String, &'static str, u32, u64)> {
 /// this install checked takes its place, so nothing the kept one was short of, changed in, linked
 /// to or left writable survives, and nothing outside the store is touched; a release a running
 /// program holds is not replaced, and the install waits.
+#[cfg(unix)]
 #[test]
 fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2171,6 +2271,158 @@ fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
     );
 }
 
+/// KR-REQ-26.09: a release an earlier install left in the store is never used as it is: the copy
+/// this install checked takes its place, so nothing the kept one was short of, changed in, linked
+/// to or left writable survives, and nothing outside the store is touched; a release a running
+/// program holds is not replaced, and the install waits.
+#[cfg(windows)]
+#[test]
+fn a_release_kept_in_the_store_is_replaced_by_the_copy_checked_in_this_run() {
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let program = format!("bin/{}", Program::Kr.file_name());
+    // What is done to the kept release, given its directory, a directory outside the store and the
+    // program's path in the release.
+    type Tampering = fn(&Path, &Path, &str);
+    let tamperings: [(&str, Tampering); 5] = [
+        ("a missing file", |kept, _, program| {
+            std::fs::remove_file(kept.join(program)).expect("removed");
+        }),
+        ("a changed file", |kept, _, program| {
+            std::fs::write(kept.join(program), b"MZ changed").expect("changed");
+        }),
+        ("a file it does not list", |kept, _, _| {
+            std::fs::write(kept.join("share").join("extra"), b"x").expect("written");
+        }),
+        (
+            "a file that is a hard link to one elsewhere",
+            |kept, outside, _| {
+                let file = kept.join(kr_cli::update::release::CHANNEL_ROOT);
+                let elsewhere = outside.join("root.json");
+                std::fs::copy(&file, &elsewhere).expect("copied");
+                let mut permissions = std::fs::metadata(&elsewhere).expect("there").permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&elsewhere, permissions).expect("read-only");
+                std::fs::remove_file(&file).expect("removed");
+                std::fs::hard_link(&elsewhere, &file).expect("linked");
+            },
+        ),
+        (
+            "a name that is a junction to a whole release elsewhere",
+            |kept, outside, _| {
+                std::fs::rename(kept, outside.join("release")).expect("moved");
+                let made = Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(kept)
+                    .arg(outside.join("release"))
+                    .stdout(Stdio::null())
+                    .status()
+                    .expect("mklink runs");
+                assert!(made.success(), "a junction under the release's name");
+            },
+        ),
+    ];
+    for (what, tamper) in tamperings {
+        let host = Host::bare();
+        host.store
+            .create_directories()
+            .expect("the store's directories");
+        std::fs::write(host.store.record(), an_empty_record()).expect("the store's record");
+        let kept = host.store.release_directory(one.name());
+        one.write(&kept);
+        let outside = host.scratch("outside");
+        tamper(&kept, &outside, &program);
+        let elsewhere = what_is_under(&outside);
+
+        host.install(&one);
+
+        assert_eq!(
+            host.store.current().expect("reads"),
+            Some(one.name().clone()),
+            "{what}"
+        );
+        // A directory of the store's own, holding every file the manifest lists as it lists it,
+        // each read-only, and nothing else.
+        let release = host.store.release_directory(one.name());
+        let about = std::fs::symlink_metadata(&release).expect("there");
+        assert!(about.is_dir() && !about.file_type().is_symlink(), "{what}");
+        for file in &one.manifest.files {
+            let path = release.join(file.path.as_str());
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("{what}: {}: {error}", path.display()));
+            assert_eq!(
+                Digest256::from_bytes(kr_cbor::sha256(&bytes)),
+                file.sha256,
+                "{what}: {}",
+                path.display()
+            );
+            let about = std::fs::symlink_metadata(&path).expect("there");
+            assert!(about.permissions().readonly(), "{what}: {}", path.display());
+        }
+        assert!(!release.join("share").join("extra").exists(), "{what}");
+        // The release is sealed: not even its owner makes a file in it or in a directory of it.
+        assert!(
+            std::fs::write(release.join("added"), b"x").is_err(),
+            "{what}: a file is made in a sealed release"
+        );
+        // Nothing outside the store was changed, or removed: the hard link's other name and the
+        // release a junction led to are as they were, read-only attributes included.
+        assert_eq!(what_is_under(&outside), elsewhere, "{what}");
+        if what.contains("hard link") {
+            // The store's file is a file of its own: a change to the other name does not reach it.
+            let elsewhere = outside.join("root.json");
+            let mut permissions = std::fs::metadata(&elsewhere).expect("there").permissions();
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&elsewhere, permissions).expect("writable");
+            std::fs::write(&elsewhere, b"changed through the other name").expect("changed");
+            let own = release.join(kr_cli::update::release::CHANNEL_ROOT);
+            let listed = one
+                .manifest
+                .files
+                .iter()
+                .find(|file| file.path.as_str() == kr_cli::update::release::CHANNEL_ROOT)
+                .expect("the manifest lists the channel root");
+            assert_eq!(
+                Digest256::from_bytes(kr_cbor::sha256(&std::fs::read(&own).expect("reads"))),
+                listed.sha256,
+                "{what}: the store's file is its own"
+            );
+        }
+    }
+
+    // A release a running program holds is not replaced: the install waits, exit 9, and once the
+    // program has gone, replaces it.
+    let host = Host::bare();
+    host.store
+        .create_directories()
+        .expect("the store's directories");
+    std::fs::write(host.store.record(), an_empty_record()).expect("the store's record");
+    let kept = host.store.release_directory(one.name());
+    one.write(&kept);
+    let store = host.store.root().display().to_string();
+    let unpacked = host.scratch("unpacked").join(one.name().as_str());
+    one.write(&unpacked);
+    let program = unpacked.join("bin").join(Program::Kr.file_name());
+    let running = host
+        .store
+        .pin(one.name())
+        .expect("asks")
+        .expect("held as a running program holds it");
+    let waited = host.run(&program, &["host", "install", "--store", &store]);
+    assert_eq!(waited.status.code(), Some(9));
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("a running program holds it"),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    assert_eq!(host.store.current().expect("reads"), None);
+    drop(running);
+    host.install(&one);
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone())
+    );
+}
+
 /// KR-REQ-26.09: a release kept in the store whose manifest is a link or a pipe is not trusted and
 /// not read: the install refuses by naming its directory and says what to do, and once the directory
 /// has been removed the install goes through.
@@ -2256,8 +2508,6 @@ fn a_kept_release_whose_manifest_is_not_a_file_is_refused_with_the_way_out() {
 /// starts.
 #[test]
 fn no_program_of_a_release_being_staged_starts() {
-    use std::os::unix::fs::DirBuilderExt as _;
-
     let host = Host::create();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let tree = host.scratch("unpacked").join(one.name().as_str());
@@ -2273,16 +2523,17 @@ fn no_program_of_a_release_being_staged_starts() {
     );
     let private = |name: &str| {
         let path = host.store.staging().join(name);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .expect("a staging directory");
+        kr_ipc::paths::create_private_directory(&path).expect("a staging directory");
         path
     };
     let (copied, _) = kr_cli::update::release::copy_tree(&tree, &private("copied"))
         .unwrap_or_else(|error| panic!("copies: {error}"));
     let archives = host.scratch("archives");
-    let archive = archives.join("one.tar.gz");
+    let archive = archives.join(if cfg!(windows) {
+        "one.zip"
+    } else {
+        "one.tar.gz"
+    });
     one.archive(&archive);
     let (unpacked, _) = kr_cli::update::release::unpack(&archive, &private("unpacked"))
         .unwrap_or_else(|error| panic!("unpacks: {error}"));
@@ -2455,7 +2706,7 @@ fn a_store_s_startup_entry_sources_the_current_release_s_entry() {
 /// A small release: two files, its root and its manifest, signed by `signer`.
 fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, String) {
     let files: BTreeMapFiles = [
-        ("bin/kr".to_owned(), b"#!/bin/sh\n".to_vec()),
+        (format!("bin/{}", exe("kr")), b"#!/bin/sh\n".to_vec()),
         (
             "share/update-root.json".to_owned(),
             the_root().as_bytes().to_vec(),
@@ -2470,7 +2721,11 @@ fn small_release(signer: &Ed25519KeyPair) -> (ReleaseManifest, BTreeMapFiles, St
         commit: CommitId::new("b".repeat(40)).expect("a commit"),
         target: this_target().to_owned(),
         os_floor: OsFloor {
-            system: FloorSystem::Macos,
+            system: if cfg!(windows) {
+                FloorSystem::Windows
+            } else {
+                FloorSystem::Macos
+            },
             version: FloorVersion { major: 1, minor: 0 },
         },
         protocol_version: PACKAGE_VERSION,
@@ -2900,7 +3155,6 @@ fn a_sparse_entry_is_refused_as_one() {
 
 /// KR-REQ-26.09: what was written is checked against the manifest: every listed file with its
 /// length and digest, and nothing unlisted.
-#[cfg(unix)]
 #[test]
 fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
     let (manifest, files, _) = small_release(&keys().targets);
@@ -2925,10 +3179,11 @@ fn a_release_is_every_file_its_manifest_lists_and_nothing_else() {
         (1, Digest256::from_bytes([0; 32])),
     );
     assert!(kr_cli::update::release::check_files(&manifest, &whole).is_ok());
+    let program = format!("bin/{}", exe("kr"));
     let mut changed = files.clone();
-    changed.insert("bin/kr".to_owned(), b"#!/bin/zsh\n".to_vec());
+    changed.insert(program.clone(), b"#!/bin/zsh\n".to_vec());
     let mut missing = files.clone();
-    missing.remove("bin/kr");
+    missing.remove(&program);
     let mut extra = files;
     extra.insert("share/extra".to_owned(), b"x".to_vec());
     for (what, files) in [("changed", changed), ("missing", missing), ("extra", extra)] {
@@ -5366,7 +5621,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
     let three = Assembled::at_this_level("0.3.0+cccccccccccc", 3);
     host.install(&one);
     host.put(&two);
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     host.store
         .record_roots(
             host.tree.paths().runtime_root(),
@@ -6424,7 +6679,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).whose_daemon_cannot_start(&log);
     host.install(&one);
     host.put(&two);
-    host.record_a_switched_update(&one, &two);
+    host.record_a_switched_update(&one, &two).await;
     // The environment a daemon of the store served, as its start records it.
     host.store
         .record_roots(
@@ -7907,6 +8162,7 @@ impl Host {
     }
 
     /// Writes the configuration document with `contents` and `mode`, replacing what is there.
+    #[cfg(unix)]
     fn write_the_configuration_as(&self, contents: &[u8], mode: u32) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -8999,7 +9255,6 @@ fn observed_stores(host: &Host) -> Vec<stored_formats::Observed> {
 /// to the version the code writes and a digest of what the version stands for: the tables a real
 /// daemon made, the types it keeps and the words it matches by hand. A change to any of them moves
 /// the digest, and this fails until the version has been raised and the lock written.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     let host = a_host_whose_daemon_has_run().await;
@@ -9455,7 +9710,6 @@ pub struct Made {
 /// made and closed, every entry of the state root and of the environment's directory is a store's or
 /// is named in the lock with the reason it has no version, and a file that nothing names is found,
 /// whether it is beside the stores or inside a directory a store owns.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn no_file_of_a_state_root_goes_unnamed() {
     let host = a_host_whose_daemon_has_run().await;
@@ -10154,4 +10408,250 @@ fn the_digest_follows_what_a_store_keeps_and_not_how_it_is_written() {
         "string",
         "a property that is called description is a property, not prose"
     );
+}
+
+/* -------------------------------------------------------------------------------------------- */
+/* Windows: the environment's task starts a daemon again                                         */
+/* -------------------------------------------------------------------------------------------- */
+
+/// Runs `kr host update` for `archive` and checks the update refused to go on: exit 9 naming the
+/// task, the daemon the process it was, `one` still current and nothing recorded.
+#[cfg(windows)]
+async fn the_update_stops_nothing(host: &Host, one: &Assembled, archive: &str, what: &str) {
+    let before = host.daemon_process().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{what}: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("so the update stops nothing"),
+        "{what}: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "{what}: nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_process().await,
+        before,
+        "{what}: the daemon it found was never stopped"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "{what}"
+    );
+    let record = host.record();
+    assert!(record["update"].is_null(), "{what}: {record}");
+}
+
+/// KR-REQ-26.10: an update leaves no host without its daemon. A daemon is created by the
+/// environment's task and by nothing else, so an update stops a daemon only when the task starts it
+/// again as it is: one that was started by hand with another key store, in another directory or with
+/// a home elsewhere, is left running and the update waits, exit 9; one the task would start as it is
+/// is stopped and started again by the task, from the new release.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_stops_no_daemon_the_task_would_not_start_again_as_it_is() {
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    for what in [
+        "a key store of its own",
+        "another working directory",
+        "a home elsewhere",
+    ] {
+        let mut host = Host::bare();
+        host.install(&one);
+        host.register_the_standalone_start();
+        let archive = host.scratch("archives").join("two.zip");
+        two.archive(&archive);
+        let archive = archive.display().to_string();
+        let controller = host.store.stable(Program::Controller);
+        let mut arguments = host.arguments_of_the_tasks_daemon();
+        let mut directory = host.tree.environment().state_dir().to_path_buf();
+        let elsewhere = host.scratch("elsewhere");
+        let mut variables: Vec<(&str, &Path)> = Vec::new();
+        match what {
+            "a key store of its own" => {
+                arguments.extend(["--secret-store".to_owned(), "file".to_owned()]);
+            }
+            "another working directory" => directory = host.tree.root().to_path_buf(),
+            _ => variables.push(("HOME", &elsewhere)),
+        }
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        host.start_daemon_by_hand(&controller, &arguments, &directory, &variables)
+            .await;
+        the_update_stops_nothing(&host, &one, &archive, what).await;
+        assert!(
+            host.daemons
+                .iter_mut()
+                .all(|daemon| matches!(daemon.try_wait(), Ok(None))),
+            "{what}: the daemon this test started runs on"
+        );
+    }
+
+    // The control: a daemon started by hand exactly as the task starts one is stopped, and the
+    // task starts the new release's daemon.
+    let mut host = Host::bare();
+    host.install(&one);
+    host.register_the_standalone_start();
+    let archive = host.scratch("archives").join("two.zip");
+    two.archive(&archive);
+    let archive = archive.display().to_string();
+    let controller = host.store.stable(Program::Controller);
+    let arguments = host.arguments_of_the_tasks_daemon();
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let directory = host.tree.environment().state_dir().to_path_buf();
+    host.start_daemon_by_hand(&controller, &arguments, &directory, &[])
+        .await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the task started the new release's daemon"
+    );
+}
+
+/// KR-REQ-26.10: an update stops no daemon when the environment's task is missing or is not the one
+/// this installation registers, and says to register it; once it is registered as this installation
+/// registers it, the same update goes through.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_stops_no_daemon_when_the_task_is_stale_or_missing() {
+    use kr_controller::supervision::windows as scheduled;
+
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    for what in ["a task that names another program", "no task"] {
+        let mut host = Host::bare();
+        host.install(&one);
+        let controller = host.store.stable(Program::Controller);
+        host.start_daemon(&controller).await;
+        let archive = host.scratch("archives").join("two.zip");
+        two.archive(&archive);
+        let archive = archive.display().to_string();
+        if what == "no task" {
+            host.remove_the_standalone_start();
+        } else {
+            let user = kr_ipc::starter::current_user_sid().expect("this account");
+            let definition = scheduled::TaskDefinition::for_setup(
+                user,
+                &host.tree.environment(),
+                &host.program(one.name(), Program::Kr),
+            );
+            scheduled::register(&definition).expect("the task is made to name another program");
+        }
+        the_update_stops_nothing(&host, &one, &archive, what).await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        let message = said["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("kr host startup --set standalone"),
+            "{what}: the way out is named: {said}"
+        );
+        drop(output);
+
+        host.register_the_standalone_start();
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(
+            output.status.success(),
+            "{what}: kr host update: {said} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            host.daemon_build().await,
+            format!("kr-controller/{}", two.name()),
+            "{what}"
+        );
+    }
+}
+
+/// KR-REQ-26.06: the first install over a build that was run in place leaves that build's task
+/// alone. With the build's daemon stopped, the store's `kr` says the task is not this installation's
+/// and how to repair it; with the daemon left running, the task once repaired is not the one that
+/// daemon registers, and it refuses to launch a worker. Once the daemon of the build has been stopped
+/// and the task repaired, a session starts under the store's release.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_install_over_a_build_run_in_place_is_started_by_the_repaired_task() {
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    for left_running in [false, true] {
+        let mut host = Host::bare();
+        let loose = host.scratch("loose");
+        one.write(&loose);
+        let loose_kr = loose.join("bin").join(Program::Kr.file_name());
+        let loose_controller = loose.join("bin").join(Program::Controller.file_name());
+        let started = host.run(&loose_kr, &["host", "startup", "--set", "standalone"]);
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        host.start_daemon_by_task(&loose_controller).await;
+        let (display, session) = host.new_session(&loose_kr);
+        // A build run in place states its version and no commit.
+        let version = one.name().as_str().split('+').next().expect("a version");
+        assert_eq!(
+            host.worker_build(session).await,
+            format!("kr-worker/{version}"),
+            "the build run in place serves"
+        );
+        host.close(&loose_kr, &display);
+        if !left_running {
+            assert!(
+                host.stop_the_daemon().await,
+                "the daemon of the build is stopped through its own door"
+            );
+        }
+
+        host.install(&one);
+        let store_kr = host.store.stable(Program::Kr);
+        let new_session = [
+            "new",
+            "--shell-mode",
+            "native_compat",
+            "--invisible",
+            "--headless",
+        ];
+        let shell = default_shell();
+        let mut arguments = new_session.to_vec();
+        arguments.extend(["--shell", shell.as_str()]);
+        if !left_running {
+            let refused = host.run(&store_kr, &arguments);
+            assert!(!refused.status.success(), "the stale task is refused");
+            let said = String::from_utf8_lossy(&refused.stderr);
+            assert!(
+                said.contains("kr host startup --set standalone"),
+                "the repair is named: {said}"
+            );
+        }
+        host.register_the_standalone_start();
+        if left_running {
+            let refused = host.run(&store_kr, &arguments);
+            assert!(
+                !refused.status.success(),
+                "the daemon of the build launches no worker for a task that is not its own"
+            );
+            assert!(
+                host.stop_the_daemon().await,
+                "the daemon of the build is stopped through its own door"
+            );
+        }
+        let (display, session) = host.new_session(&store_kr);
+        assert_eq!(
+            host.worker_build(session).await,
+            format!("kr-worker/{}", one.name()),
+            "the session runs the store's release"
+        );
+        host.close(&store_kr, &display);
+    }
 }
