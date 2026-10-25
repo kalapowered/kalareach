@@ -7212,7 +7212,7 @@ A binding holds any of three grants, and holding one is never holding another.
 | --- | --- |
 | Observation | Presenting what the upstream is doing, and inferring status from it |
 | Upstream action | Preparing a declared prompt, command, attachment or cancellation |
-| Approval interpreter | Reading a native request and encoding an answer to it |
+| Approval interpreter | Reading a native request; encoding an answer to it takes `approval.respond` as well |
 
 A component that holds observation alone is display-only: it can present a conversation and it
 cannot create an approval, whatever its output says about itself. Withdrawing one grant leaves the
@@ -7232,7 +7232,7 @@ cannot create a request, however accurate they are, so a permission prompt read 
 from a notification is never an approval.
 
 The order of preference is native protocols and hooks, then documented machine output, then
-terminal text. The host does not enforce that order or choose between the sources for a package:
+terminal text where that is the only route. The host does not enforce that order or choose between the sources for a package:
 the grants decide which streams a component is offered, each event carries the provenance it came
 from, and the package decides what it uses. A package gets the broker's semantic events (the
 connector's native frames) within the default ceiling, while `terminal.stream`,
