@@ -3,15 +3,15 @@
 //! The daemon is kr-controller's in-process host with its test support included by path. The device
 //! is this crate's backend on the mock runtime, on a paired connection it holds as the application
 //! holds one, and the seam under test is the one settings sync asks: `ConnectedHosts::privacy`. A
-//! host of an earlier build is the real daemon's answer with the member it does not send taken out,
-//! by a transport the test puts between the device and the daemon; the daemon, its answers and
-//! `privacy.status` are the product's.
+//! host that says nothing of its privacy mode is the real daemon's answer with the member taken
+//! out, by a transport the test puts between the device and the daemon; the daemon, its answers
+//! and `privacy.status` are the product's.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-24.28 | `a_device_that_does_not_manage_the_host_reads_where_its_privacy_mode_stands` |
-//! | KR-REQ-24.28 | `a_host_of_an_earlier_build_is_asked_for_its_report_by_a_device_that_manages_it` |
-//! | KR-REQ-24.28 | `a_host_of_an_earlier_build_is_unread_by_a_device_that_does_not_manage_it` |
+//! | KR-REQ-24.28 | `a_host_that_says_nothing_of_its_privacy_mode_is_unread_by_a_device_that_manages_it` |
+//! | KR-REQ-24.28 | `a_host_that_says_nothing_of_its_privacy_mode_is_unread_by_a_device_that_does_not_manage_it` |
 
 #![cfg(unix)]
 
@@ -51,7 +51,7 @@ use tauri::test::MockRuntime;
 const WATCHDOG: Duration = Duration::from_secs(60);
 
 /// A transport that carries every frame as it is, and takes the `privacy` member out of the
-/// answers to `host.info` when it is told to: what a host of an earlier build answers.
+/// answers to `host.info` when it is told to: a host that says nothing of its privacy mode.
 #[derive(Debug)]
 struct EarlierBuild {
     inner: Arc<dyn ControlTransport>,
@@ -178,8 +178,8 @@ struct Scene {
 
 impl Scene {
     /// Pairs a device that holds `rights` with a new host, connects it as the application does, and
-    /// takes the seam on that connection. `earlier` makes the host answer `host.info` as a host of
-    /// an earlier build does.
+    /// takes the seam on that connection. `earlier` makes the host answer `host.info` without
+    /// its privacy mode.
     async fn start(rights: &[ActionRight], earlier: bool) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = Host::start(&owner).await;
@@ -306,27 +306,28 @@ async fn a_device_that_does_not_manage_the_host_reads_where_its_privacy_mode_sta
     assert_eq!(scene.reads().await, HostPrivacy::Off { generation: 2 });
 }
 
-/// KR-REQ-24.28: a host of an earlier build says nothing of its privacy mode in `host.info`, so a
-/// device that manages it asks `privacy.status`, and reads the report the host gives it. The host's
-/// answer is the daemon's own with the member taken out.
+/// KR-REQ-24.28: a host that says nothing of its privacy mode in `host.info` is unread by a device
+/// that manages it too: the device does not read it as off where it is not told, whether the host's
+/// privacy mode is off or on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_of_an_earlier_build_is_asked_for_its_report_by_a_device_that_manages_it() {
+async fn a_host_that_says_nothing_of_its_privacy_mode_is_unread_by_a_device_that_manages_it() {
     let scene = Scene::start(&[ActionRight::HostManage, ActionRight::SessionView], true).await;
-    assert_eq!(scene.reads().await, HostPrivacy::Off { generation: 0 });
-
+    assert!(
+        matches!(scene.reads().await, HostPrivacy::Unreadable { .. }),
+        "off, and not told"
+    );
     scene.turn(true).await;
-    assert_eq!(scene.reads().await, HostPrivacy::On { generation: 1 });
-
-    scene.until_complete().await;
-    scene.turn(false).await;
-    assert_eq!(scene.reads().await, HostPrivacy::Off { generation: 2 });
+    assert!(
+        matches!(scene.reads().await, HostPrivacy::Unreadable { .. }),
+        "on, and not told"
+    );
 }
 
-/// KR-REQ-24.28: a host of an earlier build tells nothing in `host.info` to a device that does not
-/// manage it, and a device is not read as off where it cannot be told: the host is unread, whether
-/// its privacy mode is off or on.
+/// KR-REQ-24.28: a host that says nothing of its privacy mode in `host.info` is unread by a device
+/// that does not manage it, whether the host's privacy mode is off or on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_of_an_earlier_build_is_unread_by_a_device_that_does_not_manage_it() {
+async fn a_host_that_says_nothing_of_its_privacy_mode_is_unread_by_a_device_that_does_not_manage_it()
+ {
     let scene = Scene::start(&[ActionRight::SessionView], true).await;
     assert!(
         matches!(scene.reads().await, HostPrivacy::Unreadable { .. }),
