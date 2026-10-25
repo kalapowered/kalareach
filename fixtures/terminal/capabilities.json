@@ -60,7 +60,7 @@
         },
         {
           "path": "input-encodings.json",
-          "sha256": "c70008ac999abaa386dd16ea782369af5be156471b339bd14f715ba3637d2d4a"
+          "sha256": "c0c8acd815649a6aec54cacf9c0d526d2f9dc1157ea098dccba980e76edd3da1"
         },
         {
           "path": "client-encodings.json",

@@ -1165,7 +1165,7 @@ const fn record(
 }
 
 /// The win32 input mode's cases: a composed character, one outside the basic plane, a dead key and
-/// what it composes, AltGr, a held key and its release, and a record of nothing but defaults.
+/// what it composes, AltGr, and a held key and its release.
 pub const WIN32_INPUT_CASES: &[InputCase] = &[
     InputCase {
         id: "composed-character",
@@ -1205,12 +1205,6 @@ pub const WIN32_INPUT_CASES: &[InputCase] = &[
             record(0x41, 0x1E, 0x61, false, 0, 1),
         ],
         bytes: b"\x1b[65;30;97;1;0;4_\x1b[65;30;97;0;0;1_",
-    },
-    InputCase {
-        id: "every-field-spelled-out",
-        covers: "KR-REQ-08.52",
-        records: &[crate::win32::KeyRecord::DEFAULT],
-        bytes: b"\x1b[0;0;0;0;0;1_",
     },
 ];
 

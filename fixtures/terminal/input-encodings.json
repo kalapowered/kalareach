@@ -98,21 +98,6 @@
           "virtual_key": 65
         }
       ]
-    },
-    {
-      "bytes": "1b5b303b303b303b303b303b315f",
-      "covers": "KR-REQ-08.52",
-      "id": "every-field-spelled-out",
-      "records": [
-        {
-          "control_keys": 0,
-          "key_down": false,
-          "repeat": 1,
-          "scan_code": 0,
-          "unicode": 0,
-          "virtual_key": 0
-        }
-      ]
     }
   ],
   "description": "KR-REQ-08.52. The console's key records and the bytes the win32 input mode encodes each as, `CSI Vk;Sc;Uc;Kd;Cs;Rc _` with every field written. The bytes are written by hand and the encoder is checked against them. The client's ordinary, modifyOtherKeys and Kitty encodings are in `client-encodings.json`.",

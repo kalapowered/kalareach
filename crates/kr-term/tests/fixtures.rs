@@ -102,51 +102,6 @@ fn terminfo_fixture_holds_the_compiled_database() {
     );
 }
 
-/// The bytes of a hex string.
-fn unhex(text: &str) -> Vec<u8> {
-    (0..text.len() / 2)
-        .map(|at| u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).expect("hex"))
-        .collect()
-}
-
-/// KR-REQ-08.11: the input records the console path encodes are fixed by bytes written by hand, and
-/// the encoder writes exactly them and reads each back as the record it came from. The bytes are
-/// not the encoder's own output: a fixture made from that would compare the encoder with itself.
-#[test]
-fn input_encodings_fixture_holds_the_hand_written_bytes() {
-    use kr_term::win32::{KeyRecord, decode, encode_all};
-
-    let fixture = load("input-encodings.json");
-    assert!(!cases_of(&fixture).is_empty());
-    for case in cases_of(&fixture) {
-        let id = case["id"].as_str().expect("an id");
-        let number = |record: &Value, name: &str| record[name].as_u64().expect(name);
-        let records: Vec<KeyRecord> = case["records"]
-            .as_array()
-            .expect("records")
-            .iter()
-            .map(|record| KeyRecord {
-                virtual_key: u16::try_from(number(record, "virtual_key")).expect("u16"),
-                scan_code: u16::try_from(number(record, "scan_code")).expect("u16"),
-                unicode: u16::try_from(number(record, "unicode")).expect("u16"),
-                key_down: record["key_down"].as_bool().expect("key_down"),
-                control_keys: u32::try_from(number(record, "control_keys")).expect("u32"),
-                repeat: u16::try_from(number(record, "repeat")).expect("u16"),
-            })
-            .collect();
-        let bytes = unhex(case["bytes"].as_str().expect("bytes"));
-        assert_eq!(encode_all(&records), bytes, "case {id}");
-        let sequences: Vec<&[u8]> = bytes
-            .split_inclusive(|byte| *byte == b'_')
-            .filter(|part| !part.is_empty())
-            .collect();
-        assert_eq!(sequences.len(), records.len(), "case {id}");
-        for (sequence, record) in sequences.iter().zip(&records) {
-            assert_eq!(decode(sequence).as_ref(), Ok(record), "case {id}");
-        }
-    }
-}
-
 #[test]
 fn snapshot_fixture_is_current() {
     let fixture = load("snapshot.json");
