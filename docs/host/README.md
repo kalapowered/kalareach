@@ -7089,11 +7089,13 @@ after the command's launching word, whatever follows it: the identifier, or the 
 application resumes the conversation by. The rule is the same for every launching word, `fork`
 included, because the package declares which words launch and the host does not know what an
 application's word means. A launch that types no such word, or an option in its place, names none.
-The word is held for as long as the execution lives, beside the identifier the stream names once
-the application has resolved it, since a name and the identifier it resolves to are one
-conversation that the host cannot tell apart. A second launch of a held conversation is not served
-a second server: its program runs as typed, nothing of the launch is left published, and the
-reason names the execution that holds the conversation.
+A name the application resolves is held for as long as the execution lives, beside the identifier
+the stream names once the application has resolved it, since a name and the identifier it resolves
+to are one conversation that the host cannot tell apart. A word that is already an identifier is
+held while the execution is in that conversation, and is free once the execution selects another.
+A second launch of a held conversation is not served a second server: its program runs as typed and
+nothing of the launch is left published. The launcher prints its own reason for the refusal, and the
+host keeps the one that names the execution that holds the conversation for its own diagnostics.
 
 This holds within one session only. A second session's worker cannot see the first's executions, so
 two sessions can run a second process against one saved conversation, and so can a program the host
@@ -7285,9 +7287,10 @@ never taken from matching prompt text and timestamps.
 
 What the stream says of the conversation and the turn is also history of the instance, which
 `agent.snapshot` serves: a `thread.started` entry when the binding takes a thread, a `thread.ended`
-entry when it leaves one or when the server closes the thread it is in, a `turn.started` entry when
-a turn starts in the bound conversation, a `turn.ended` entry when that turn ends and a
-`turn.dropped` entry when the binding moves while a turn runs. The text of each is the identifier it
+entry when it ends up with none (the terminal leaves the thread, or the server closes it), a
+`turn.started` entry when a turn starts in the bound conversation, a `turn.ended` entry when that
+turn ends and a `turn.dropped` entry when the binding moves while a turn runs, on any route that
+moves a binding. The text of each is the identifier it
 names. Each entry names the binding revision and the turn it was observed under, so what one owner
 said is never read as the words of the owner that followed it. A message about a conversation the
 terminal is not in records nothing. When the instance's history has used every entry number it has,
@@ -8006,6 +8009,6 @@ with its own result, the mutation and the action.
 
 A history belongs to one instance and ends with it. An instance's identifier is its own for good, so
 no cursor of another life of the host is read as one of this instance's, and no number is given
-twice within it. A cursor is the reader's: `agent.snapshot` takes the node a reader has consumed
-and serves what follows, and the host keeps no cursor for a reader. A range that was evicted
+twice within it. A cursor is the reader's: `agent.snapshot` takes the node a reader wants next, the
+last one it consumed plus one, and the host keeps no cursor for a reader. A range that was evicted
 rebuilds from what is verifiably retained and says there is a gap.

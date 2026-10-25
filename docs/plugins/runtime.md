@@ -719,10 +719,10 @@ a minute, and after twice that each time it is refused again, up to ten minutes.
 reach the runtime before a wait the daemon asked for or a backoff has passed, however often the
 broker's set changes meanwhile, except that a link nothing wants the runtime of any more forgets
 the wait, and the next binding that wants a component asks at once; the daemon's bound on starts
-is what holds a runtime that keeps ending. The worker's report on its admissions says that this
-host asks the component to write the answer to a request the component read, and that a request the
-connector's table read is answered from the table, so a package that ships a component and does not
-decode is never asked to encode.
+is what holds a runtime that keeps ending. The host asks a component to write the answer to a
+request the component read, and answers a request the connector's table read from the table, so a
+package that ships a component and does not decode is never asked to encode; the worker's report on
+its admissions names no part of a component as unused.
 
 ### An action a component prepares
 
