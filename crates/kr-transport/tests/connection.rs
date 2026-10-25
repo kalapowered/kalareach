@@ -32,7 +32,7 @@ use kr_protocol::scalars::{CanonicalSet, DurationMs, EndpointKey, Nullable, Time
 use kr_transport::clock::ManualClock;
 use kr_transport::codec::{FrameReader, FrameWriter};
 use kr_transport::config::EndpointConfig;
-use kr_transport::error::TransportError;
+use kr_transport::error::{SelectionRefusal, TransportError};
 use kr_transport::handshake::{self, Admitted, PairedDirectory};
 use kr_transport::preauth::{self, PairingMethod, PairingSurface, PreAuthLimits};
 use kr_transport::random::fresh_nonce;
@@ -2066,12 +2066,19 @@ async fn a_candidate_connects_when_the_selection_answers_its_offer() {
     answering.abort();
 }
 
-/// The binding failure a candidate ends with against a host that plays `script`, and the check it
-/// names.
-async fn candidate_binding_failure(script: HostScript) -> &'static str {
+/// The selection refusal a candidate ends with against a host that plays `script`.
+async fn candidate_refusal(script: HostScript) -> SelectionRefusal {
     let error = candidate_ending(script).await;
-    let TransportError::Crypto(kr_crypto::CryptoError::BindingMismatch { what }) = error else {
-        panic!("a selection that does not answer the offer is a binding failure, not {error}");
+    let TransportError::Selection(refusal) = error else {
+        panic!("a selection the candidate cannot use is a selection refusal, not {error}");
+    };
+    refusal
+}
+
+/// The check a candidate names when a host's selection does not answer its offer.
+async fn candidate_offer_failure(script: HostScript) -> &'static str {
+    let SelectionRefusal::NotTheOffer { what } = candidate_refusal(script).await else {
+        panic!("the selection names the endpoint that answered, and fails the offer");
     };
     what
 }
@@ -2079,28 +2086,28 @@ async fn candidate_binding_failure(script: HostScript) -> &'static str {
 /// KR-REQ-20.24: a candidate refuses a selected version it did not offer.
 #[tokio::test]
 async fn a_candidate_refuses_a_version_outside_its_offer() {
-    let what = candidate_binding_failure(HostScript::SelectUnofferedVersion).await;
+    let what = candidate_offer_failure(HostScript::SelectUnofferedVersion).await;
     assert!(what.contains("version"), "{what}");
 }
 
 /// KR-REQ-20.24: a candidate refuses a selection that does not echo its nonce.
 #[tokio::test]
 async fn a_candidate_refuses_a_selection_that_does_not_echo_its_nonce() {
-    let what = candidate_binding_failure(HostScript::SelectWrongNonce).await;
+    let what = candidate_offer_failure(HostScript::SelectWrongNonce).await;
     assert!(what.contains("nonce"), "{what}");
 }
 
 /// KR-REQ-20.24: a candidate refuses a selected capability it did not offer.
 #[tokio::test]
 async fn a_candidate_refuses_a_capability_it_did_not_offer() {
-    let what = candidate_binding_failure(HostScript::SelectUnofferedCapability).await;
+    let what = candidate_offer_failure(HostScript::SelectUnofferedCapability).await;
     assert!(what.contains("capability"), "{what}");
 }
 
 /// KR-REQ-20.24: a candidate refuses a negotiated limit above what it offered to receive.
 #[tokio::test]
 async fn a_candidate_refuses_a_limit_above_its_offer() {
-    let what = candidate_binding_failure(HostScript::SelectLimitAboveOffer).await;
+    let what = candidate_offer_failure(HostScript::SelectLimitAboveOffer).await;
     assert!(what.contains("limit"), "{what}");
 }
 
@@ -2108,8 +2115,10 @@ async fn a_candidate_refuses_a_limit_above_its_offer() {
 /// answered, which needs no paired record to see.
 #[tokio::test]
 async fn a_candidate_refuses_a_selection_naming_another_endpoint() {
-    let what = candidate_binding_failure(HostScript::SelectOtherEndpoint).await;
-    assert!(what.contains("endpoint"), "{what}");
+    assert_eq!(
+        candidate_refusal(HostScript::SelectOtherEndpoint).await,
+        SelectionRefusal::OtherEndpoint
+    );
 }
 
 /// KR-REQ-20.24: a candidate refuses negotiated limits below the floor a connection needs, as the

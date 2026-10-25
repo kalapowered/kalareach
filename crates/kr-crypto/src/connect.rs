@@ -69,7 +69,7 @@ pub fn sign_connect(
 
 /// Checks that a host's selection answers the offer it claims to answer.
 ///
-/// This is the part of the connection check that needs no paired record, so a client with no
+/// This part of the connection check needs only the offer and the selection, so a client with no
 /// record of the host runs it as well as one that has: a candidate on the pairing surface holds a
 /// selection it can judge against its own offer in exactly the same way. The checks, in order:
 ///

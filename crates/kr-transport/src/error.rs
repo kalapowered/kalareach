@@ -63,6 +63,15 @@ pub enum TransportError {
     /// A cryptographic check failed.
     #[error("the connection proof failed: {0}")]
     Crypto(#[from] kr_crypto::CryptoError),
+    /// This side refused the host's selection before using anything under it: the selection does
+    /// not answer the offer, or names an endpoint other than the one that answered.
+    ///
+    /// It is this side's own conclusion, like [`Self::Handshake`], and the host's own word is not
+    /// in it. It is kept apart from [`Self::Crypto`] because no proof is involved: a candidate on
+    /// the pairing surface exchanges none, and the paired client refuses the same selection before
+    /// it signs one.
+    #[error("the host's selection was refused: {0}")]
+    Selection(#[from] SelectionRefusal),
     /// The peer did not answer inside the inactivity threshold.
     #[error("the peer was silent for longer than the inactivity threshold")]
     Inactive,
@@ -124,6 +133,10 @@ impl TransportError {
                 ErrorCode::PermissionDenied,
                 "the connection proof was refused",
             ),
+            Self::Selection(_) => ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the host's selection was refused",
+            ),
             Self::Inactive => ProtocolError::new(
                 ErrorCode::ResourceUnavailable,
                 "the transport is unavailable",
@@ -133,6 +146,24 @@ impl TransportError {
             }
         }
     }
+}
+
+/// Why a client refused the host's selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SelectionRefusal {
+    /// The selection names an endpoint other than the one iroh authenticated on the connection, so
+    /// the host answered under an identity that is not its own.
+    #[error("it names another endpoint than the one that answered")]
+    OtherEndpoint,
+    /// The selection does not answer the client's offer: a version, a capability or a limit the
+    /// offer did not name, or a nonce it does not echo. `what` says which, in this program's own
+    /// words.
+    #[error("it does not answer the offer: {what}")]
+    NotTheOffer {
+        /// The check that failed.
+        what: &'static str,
+    },
 }
 
 /// What kind of refusal a relay gave, as the relay states it.

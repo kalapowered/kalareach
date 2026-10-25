@@ -393,7 +393,9 @@ async fn present(
             LinkError::Refused(refusal) | LinkError::Membership(refusal) => {
                 Missed::Refused(CommandError::from(refusal))
             }
-            LinkError::Lost(_) | LinkError::Configuration(_) => Missed::Unreached,
+            LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
+                Missed::Unreached
+            }
         })
 }
 

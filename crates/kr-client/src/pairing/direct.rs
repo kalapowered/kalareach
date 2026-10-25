@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use super::candidate::{
     AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, Unpaired, WAIT_STEP, awaiting, ended, within,
 };
-use super::failure::{FailureKind, PairingFailure, refused_by_host};
+use super::failure::{FailureKind, PairingFailure, refused_by_host, selection_refused};
 use super::link::{ConnectionPeer, LinkError};
 use super::paired::{AttemptMode, PairedHost, PendingAttempt};
 use crate::shown::{Said, Shown};
@@ -84,13 +84,9 @@ impl Pairing {
         )
         .await
         .map_err(|error| reached(&error))?;
+        // The transport has refused a selection that names another endpoint than the one that
+        // answered, and that one is the endpoint the invitation pins (checked above).
         let selection = preauth.selection().clone();
-        if selection.endpoint_id != payload.endpoint_id {
-            return Err(PairingFailure::new(
-                FailureKind::HostMismatch,
-                "the host's selection names another endpoint than the invitation pins",
-            ));
-        }
         if self.hosts.by_device(selection.device_id)?.is_some() {
             return Err(PairingFailure::new(
                 FailureKind::AlreadyPaired,
@@ -184,7 +180,12 @@ impl Pairing {
             }
             // Whether the host locked the invitation is unknown; asking is how to find out, on a
             // connection of its own.
-            Err(LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Membership(_)) => {
+            Err(
+                LinkError::Lost(_)
+                | LinkError::Configuration(_)
+                | LinkError::Membership(_)
+                | LinkError::Selection(_),
+            ) => {
                 drop(preauth);
                 drop(connection);
                 return self.await_approval(pending, None, progress).await;
@@ -206,6 +207,7 @@ fn reached(error: &LinkError) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, true),
         LinkError::Lost(_) | LinkError::Membership(_) => FailureKind::HostUnreachable,
+        LinkError::Selection(refusal) => selection_refused(refusal),
         LinkError::Configuration(_) => FailureKind::NotAnInvitation,
     };
     PairingFailure::new(kind, error.said())

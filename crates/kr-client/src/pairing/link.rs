@@ -44,6 +44,7 @@ use kr_protocol::preauth::{
 };
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
 use kr_transport::config::EndpointConfig;
+use kr_transport::error::SelectionRefusal;
 use kr_transport::handshake::{CandidateConnection, LocalIdentity};
 use kr_transport::scheduler::SendLimits;
 use tokio::sync::{Mutex, watch};
@@ -72,6 +73,11 @@ pub enum LinkError {
     Membership(ProtocolError),
     /// The host could not be reached, or the connection to it ended.
     Lost(String),
+    /// The host answered, and this device refused its selection before using anything under it:
+    /// the selection names another endpoint than the one that answered, or does not answer this
+    /// device's offer. The host is reachable and is not who it said, or not speaking the exchange
+    /// that was offered, which a new try does not change.
+    Selection(SelectionRefusal),
     /// The network configuration a host gave could not be used.
     Configuration(String),
 }
@@ -93,6 +99,7 @@ impl Said for LinkError {
             ),
             Self::Membership(error) => Shown::protocol(error),
             Self::Lost(_) => Shown::said("the host could not be reached"),
+            Self::Selection(refusal) => Shown::selection(refusal),
             Self::Configuration(_) => {
                 Shown::said("the host's network configuration cannot be used")
             }
@@ -112,12 +119,15 @@ impl From<kr_transport::TransportError> for LinkError {
     /// from what it concluded itself, such as a response stream that ended without an answer or an
     /// answer to another request; those say nothing about what the host decided, and treating one
     /// as a refusal would end an attempt the host may have accepted, so they are a connection lost.
+    /// A selection this device refused is neither: the host answered, so the connection is not
+    /// lost, and what it answered is why the attempt cannot go on.
     fn from(error: kr_transport::TransportError) -> Self {
         match error {
             kr_transport::TransportError::Refused(refusal) => Self::Refused(refusal),
             kr_transport::TransportError::Configuration { .. } => {
                 Self::Configuration(Shown::transport(&error).into_string())
             }
+            kr_transport::TransportError::Selection(refusal) => Self::Selection(refusal),
             other => Self::lost(Shown::transport(&other)),
         }
     }

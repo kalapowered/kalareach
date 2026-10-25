@@ -50,7 +50,7 @@ use kr_protocol::ids::{
 use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nonce256};
 
 use crate::codec::{FrameReader, FrameWriter};
-use crate::error::{Result, TransportError};
+use crate::error::{Result, SelectionRefusal, TransportError};
 use crate::random::{fresh_connection_id, fresh_nonce};
 use crate::window::ActionWindowIssuer;
 
@@ -565,11 +565,12 @@ impl Drop for WindowGuard<'_> {
 /// Returns the first refusal or mismatch: [`TransportError::Refused`] when the host refused the
 /// offer or the proof itself, and [`TransportError::Handshake`] for what this side concluded, such
 /// as a reply that never came, an extension it did not offer, limits below what a connection needs
-/// or an acceptance it cannot use. [`TransportError::Crypto`] reports a selection that does not
-/// answer the offer (a version, a capability or a limit the offer did not name, or a nonce it does
-/// not echo) or names an endpoint other than the one that answered, and a proof or record binding
-/// that does not hold. A client that cannot verify the host's proof never enables an authorised
-/// stream, whatever the host said.
+/// or an acceptance it cannot use. [`TransportError::Selection`] reports a selection refused
+/// before the proof is signed: one that does not answer the offer (a version, a capability or a
+/// limit the offer did not name, or a nonce it does not echo), or one that names an endpoint other
+/// than the one that answered. [`TransportError::Crypto`] reports a proof or record binding that
+/// does not hold. A client that cannot verify the host's proof never enables an authorised stream,
+/// whatever the host said.
 pub async fn connect(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -739,12 +740,12 @@ impl CandidateConnection {
 /// Returns [`TransportError::Refused`] with the host's refusal, for example when no offered version
 /// is supported; [`TransportError::Handshake`] when no reply came, the selection names an
 /// extension this side did not offer, or its limits are below what a connection needs;
-/// [`TransportError::Crypto`] when the selection does not answer the offer (a version, a capability
-/// or a limit the offer did not name, a nonce it does not echo, or an endpoint identity other than
-/// the one that answered); or a stream failure. The selection is checked as the paired [`connect`]
-/// checks it, against the offer and against the endpoint iroh authenticated. What only a paired
-/// record can confirm (that this is the endpoint the device paired with, and the host's device
-/// identity and key revision) is not checked here and is the caller's to check. A host that
+/// [`TransportError::Selection`] when the selection does not answer the offer (a version, a
+/// capability or a limit the offer did not name, or a nonce it does not echo) or names an endpoint
+/// other than the one that answered; or a stream failure. The selection is checked as the paired
+/// [`connect`] checks it, against the offer and against the endpoint iroh authenticated. What only
+/// a record or a pin can confirm (that this is the endpoint the invitation or the bundle names, and
+/// the host's device identity) is not checked here and is the caller's to check. A host that
 /// answers with an acceptance is refused here: a connection with no paired record must not be
 /// treated as authorised however the host replied.
 pub async fn connect_unpaired(
@@ -818,12 +819,16 @@ fn check_selection(
     extension::check_selection(&offer.extensions, &selection.extensions).map_err(|error| {
         TransportError::handshake(ErrorCode::UnsupportedSchema, error.to_string())
     })?;
-    kr_crypto::connect::check_selection_against_offer(offer, selection)?;
+    kr_crypto::connect::check_selection_against_offer(offer, selection).map_err(
+        |error| match error {
+            kr_crypto::CryptoError::BindingMismatch { what } => {
+                TransportError::Selection(SelectionRefusal::NotTheOffer { what })
+            }
+            other => TransportError::Crypto(other),
+        },
+    )?;
     if &selection.endpoint_id != live_host_endpoint {
-        return Err(kr_crypto::CryptoError::BindingMismatch {
-            what: "the host endpoint identity in the selection, which is not the endpoint that answered",
-        }
-        .into());
+        return Err(TransportError::Selection(SelectionRefusal::OtherEndpoint));
     }
     crate::scheduler::check_negotiated(selection.limits).map_err(TransportError::Handshake)
 }
