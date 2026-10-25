@@ -2768,6 +2768,49 @@ fn a_draft_holding_an_attachment(
     bound_to_a_draft(controller, actor, &draft, &handle).draft_id
 }
 
+/// A new draft written for `application_instance_id` that holds one published attachment.
+fn a_draft_written_for(
+    controller: &crate::service::Controller,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    actor: &kr_protocol::ids::ActorId,
+    application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+    name: &str,
+) -> kr_protocol::ids::DraftId {
+    let handle = a_published_attachment(controller, environment_id, actor, name);
+    let draft = controller
+        .transfer()
+        .service()
+        .draft_create(
+            actor,
+            &kr_protocol::transfer::DraftCreateParams {
+                environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::null(),
+                application_instance_id: Nullable::some(application_instance_id),
+                text: "look at this".to_owned(),
+            },
+            None,
+        )
+        .expect("creates the draft")
+        .draft;
+    bound_to_a_draft(controller, actor, &draft, &handle).draft_id
+}
+
+/// `prompt`, made for `application_instance_id` instead of the application it was built for.
+fn made_for_application(
+    mut prompt: MutationRequest,
+    application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+) -> MutationRequest {
+    let mut params: kr_protocol::agent::AgentPromptParams =
+        prompt.params.to_typed().expect("a prompt's parameters");
+    params.target.subject.application_instance_id = application_instance_id;
+    prompt.params = ParamsValue::from_typed(&params).expect("encodes");
+    if prompt.target.application_instance_id.is_present() {
+        prompt.target.application_instance_id = Nullable::some(application_instance_id);
+    }
+    prompt
+}
+
 /// A prompt a device makes to the scripted session, naming `draft_id`.
 fn a_prompt_naming(
     world: &crate::service::a_close_a_worker_never_answers::Silent,
@@ -3089,6 +3132,127 @@ async fn a_local_prompt_naming_a_draft_is_recorded_before_the_worker_is_asked() 
         sent[0].actor.ingress,
         kr_protocol::actor::ActorIngress::LocalIpc
     );
+    world.serving.abort();
+}
+
+/// KR-REQ-12.06: a draft written for one application is not sent by a prompt for another, whether
+/// the prompt comes from a paired device or from a caller at this machine. It is refused as a
+/// conflict before the draft is recorded as sent and before the worker is asked, and the draft is
+/// left as it was; the prompt for the application the draft was written for goes through.
+///
+/// The paired device's refused prompt is a queued one and the local caller's is a submitted one:
+/// both are the same record, and each method reaches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_draft_written_for_another_application_is_a_conflict_on_either_prompt_route()
+{
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::ApplicationInstanceId;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let written_for = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let elsewhere = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let answered_ok = |frame: &ControlFrame| {
+        matches!(
+            frame,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Ok(_),
+                ..
+            })
+        )
+    };
+
+    // A paired device.
+    let connection =
+        super::RemoteConnection::for_test(controller, prompting_and_viewing(controller, 61));
+    let actor = connection.device.principal();
+    let draft_id = a_draft_written_for(
+        controller,
+        world.environment_id,
+        &actor,
+        written_for,
+        "paired.bin",
+    );
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(made_for_application(
+            a_prompt_naming(&world, &connection, Method::AgentPromptQueue, 1, draft_id),
+            elsewhere,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert_eq!(
+        error_of(answer.frame()).code,
+        ErrorCode::DraftConflict,
+        "{:?}",
+        answer.frame()
+    );
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "nothing was sent"
+    );
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "and the draft was not recorded as sent"
+    );
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(made_for_application(
+            a_prompt_naming(&world, &connection, Method::AgentPromptQueue, 2, draft_id),
+            written_for,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert!(answered_ok(answer.frame()), "{:?}", answer.frame());
+    assert!(is_submitted(controller, &actor, draft_id));
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 1);
+
+    // A caller at this machine.
+    let admission = fake::admission(controller, world.accepted).await;
+    let local = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let draft_id = a_draft_written_for(
+        controller,
+        world.environment_id,
+        &local,
+        written_for,
+        "local.bin",
+    );
+    let prompt = |application| {
+        made_for_application(
+            a_local_prompt(
+                &world,
+                &admission,
+                ActionId::new(kr_ipc::new_uuid()),
+                Nullable::some(draft_id),
+                Nullable::null(),
+            ),
+            application,
+        )
+    };
+    let answer = controller
+        .perform(&local, admission.connection_id, None, prompt(elsewhere))
+        .await;
+    assert_eq!(
+        error_of(&answer).code,
+        ErrorCode::DraftConflict,
+        "{answer:?}"
+    );
+    assert_eq!(
+        prompts_the_worker_was_asked_to_take(&script).len(),
+        1,
+        "nothing more was sent"
+    );
+    assert!(!is_submitted(controller, &local, draft_id));
+    let answer = controller
+        .perform(&local, admission.connection_id, None, prompt(written_for))
+        .await;
+    assert!(answered_ok(&answer), "{answer:?}");
+    assert!(is_submitted(controller, &local, draft_id));
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 2);
     world.serving.abort();
 }
 
