@@ -12,8 +12,8 @@ and the manifest pins each file's digest, so the release tool states them beside
 `shells/<shell>/manifest.json`, and the identity record the build writes beside the binary
 (`kr-shell-identity.json`) carries the archive it actually fetched, its digest, the patches it
 applied and the module tree it installed. The qualification reads all three and refuses a package
-whose record does not agree with the pin, so this page cannot drift from what is installed without
-a test failing.
+whose record does not agree with the pin, so the table of sources below cannot drift from what is
+installed without a test failing.
 
 ## The sources each package tracks
 
@@ -22,8 +22,8 @@ a test failing.
 | --- | --- | --- | --- | --- | --- |
 | zsh | Zsh | zsh-5.9.2 | https://downloads.sourceforge.net/project/zsh/zsh/5.9.2/zsh-5.9.2.tar.xz | 36fa734374b44783582cec09bcd67822e2f992c779ec1624ab5596df078d2f81 | the zsh-announce and zsh-workers lists, and the project's own release notes |
 | bash | GNU Bash | bash-5.3 | https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz | 0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba | the bug-bash list and the official patch series under ftp.gnu.org/gnu/bash/bash-5.3-patches, which the package applies through bash53-020 |
-| fish | fish-shell | fish-4.9.3 | https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz | 20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c | the fish-shell repository's security advisories and its release notes, RustSec advisories published from 2026-09-20 against the crates and repositories in fish's `Cargo.lock`, and, where the build compiles or links PCRE2, PCRE2's own advisories published from that day |
-| psreadline | PSReadLine | psreadline-2.3.4 to 3.0.0 on PowerShell 7.4 or later, except a release below the fixed release of an advisory in the triage record (CVE-2026-62801: 7.4.20, 7.5.11 and 7.6.6), or on Linux and macOS a host on a .NET runtime below the fixed runtime of CVE-2026-96225 (8.0.32, 9.0.21, 10.0.13 and 11.0.0-rc.2, which PowerShell 7.4.21, 7.5.12 and 7.6.7 carry) | https://github.com/PowerShell/PowerShell | qualified rather than fetched | PowerShell/Announcements, and the PSReadLine and PowerShell repositories' security advisories |
+| fish | fish-shell | fish-4.9.3 | https://github.com/fish-shell/fish-shell/releases/download/4.9.3/fish-4.9.3.tar.xz | 20998a25f73217ddcc19f499055fd587e9912d1ad6e7109120fbcf2871f0b98c | the fish-shell repository's security advisories and its release notes; the RustSec advisories against the crates in fish's `Cargo.lock`, which the daily audit reports whatever their date; and PCRE2's own advisories, those published from 2026-09-20 and the earlier ones whose range includes the PCRE2 the package builds |
+| psreadline | PSReadLine | psreadline-2.3.4 to 3.0.0 on PowerShell 7.4 or later, except a release below the fixed release of the advisory the module lists (CVE-2026-62801: 7.4.20, 7.5.11 and 7.6.6), or on Linux and macOS a host on a .NET runtime below the fixed runtime of CVE-2026-96225 (8.0.32, 9.0.21, 10.0.13 and 11.0.0-rc.2, which PowerShell 7.4.21, 7.5.12 and 7.6.7 carry) | https://github.com/PowerShell/PowerShell | qualified rather than fetched | PowerShell/Announcements, the Security issues of dotnet/announcements for the .NET runtime series the module judges, and the PSReadLine and PowerShell repositories' security advisories |
 <!-- /kr:pins -->
 
 The PSReadLine package rebuilds no shell. What it pins is the range of the editor it was qualified
@@ -41,7 +41,8 @@ ranges, and the module does not refuse it, so a preview of a newer series is not
 That range is a statement about the editor this integration works with, not about which releases
 inside it carry which fixes. A person runs the host their machine has, so an advisory against
 PowerShell or PSReadLine is triaged against the versions it names and against the identity the
-qualification recorded, and it gets a row of its own below.
+qualification recorded, and it gets a row of its own below when the rule in "What reads this
+register" asks for one.
 
 ## The crates and repositories the fish build uses
 
@@ -68,14 +69,18 @@ signal zsh and bash give; and a cargo-audit report of fish's lock. That report m
 the lock takes from crates.io. The crates it takes from git (`pcre2` and `pcre2-sys`, the `fluent`
 crates, `intl-memoizer` and `gettext-po-file-parser`) have no RustSec source to match, so no
 advisory against one of them is reported by it; PCRE2 itself is watched through its own
-repository's advisories. A newer series of bash has patches when the listing of bash's releases
+repository's advisories. Nothing reads advisories against `fluent-rs`, `fluent-ftl-tools` or
+`rust-pcre2`, so a row for a change in one of them is made when a person finds it, and the daily
+check cannot fail for the want of one. A newer series of bash has patches when the listing of bash's releases
 names its patch directory or a row of this register names one of its patches, and then the
 directory has to answer.
 
 A change needs a row when it was first published on or after 2026-09-20, when its affected
 range includes what a package pins, or, for the advisories of PowerShell and PSReadLine, which pin
 no release, when it was revised on or after that day and its ranges now reach a version the module
-accepts. Rows are ordered by their date and, within a day, by their place in the table. Of the
+accepts. An issue of PowerShell/Announcements or of dotnet/announcements needs a row when it was
+opened, or dates a revision, on or after that day, whatever it lists, since it states no range the
+check could compare. Rows are ordered by their date and, within a day, by their place in the table. Of the
 rows that name a package and the change by its identifier (a CVE, a GHSA, a RustSec identifier, a
 release tag, a patch name), the last is the assessment that stands for that package, and the rows
 before it are the record of what was thought earlier; a row that names several packages stands for
@@ -89,10 +94,12 @@ dates a revision (the revision list and the "Last Updated" line Microsoft writes
 on it revises nothing; an edit that Microsoft does not date is not seen. A change with no row
 passes for one working day after it was published or last revised and fails after, except that a
 RustSec advisory has no such allowance, because the report carries no date on which it reached the
-database. Each row after the first day names the date the upstream released the change after the
-word `released`, and its target is at most the number of days the update target allows after that
-date, so a late assessment cannot move its own deadline. A row for a RustSec advisory against
-fish's lock carries no release date.
+database. Each row after the first day names after the word `released` the day the change was both public
+and fixed: the day of the advisory or of the release, or, when the fix came out after the advisory,
+the day of the release that carries it. A fix released before its advisory is named in the row's
+change and does not move that day. The row's target is at most the number of days the update target
+allows after that day, so a late assessment cannot move its own deadline. A row for a RustSec advisory against
+fish's lock carries no release date, and its target counts from the day of the row.
 
 PowerShell previews are judged by each advisory's own ranges: the module refuses a pre-release of
 a series the advisory lists when it is below that series' first fixed release, and a series the
@@ -103,23 +110,30 @@ the fix or after it.
 
 <!-- kr:target -->
 A security-relevant upstream change is triaged within one working day of the advisory. A package
-that the change affects is rebuilt against the fixed upstream release, requalified against the
-whole corpus under `tests/shells/`, and published within fourteen days of that release. No binary
-is distributed before its requalification passes, and no package is swapped into a session that is
-already running: a session keeps the package identity it started with until it ends.
+that the change affects is rebuilt against the fixed upstream release, requalified, and published
+within fourteen days of that release, or of the advisory when that came later. A requalification
+runs the corpus under `tests/shells/`; which part of it runs where is set out below. No shell
+binary goes into a macOS or Linux release tree before the contract suites named below pass on the
+bytes that were built, and no package is swapped into a session that is already running: a
+session keeps the package identity it started with until it ends.
 <!-- /kr:target -->
 
-The requalification has parts, and each runs where it can. The patches, the shells' own suites
-(`--require-upstream-tests`) and the fence run of `scripts/e2e-fence.sh` on a real daemon are run
-by hand when a pin changes. The core workflow's `shell-packages` job runs, on x86-64 Linux, the
-contract suites of the packages, the startup customisations, the second Zsh build and the
-PowerShell package. Before a release tree is assembled, each of its four targets builds the Zsh,
-Bash and Fish packages natively and runs the contract suites of the three, the Fish source checks,
-the native-module proof of Zsh and the case that compares each package with its pin, against the
-packages it just built; a failing suite stops the tree before anything is assembled or signed.
-The Developer ID signature is put on the programs after that. The PowerShell package is not part
-of a release tree, and the startup customisations are pinned for two of the four targets, so the
-whole corpus does not run on the other two.
+The requalification has parts, and each runs where it can. Fish's own suite and the fence run of
+`scripts/e2e-fence.sh` on a real daemon are run by hand when a pin changes; no workflow runs
+either. The core workflow's `shell-packages` job runs, on x86-64 Linux, the patch check for all
+three packages, the upstream suites of Zsh and Bash (`--require-upstream-tests`), the contract
+suites of the packages, the startup customisations, the second Zsh build and the PowerShell
+package against a pinned PowerShell. Before a macOS or Linux release tree is assembled, each of
+its four targets builds the Zsh, Bash and Fish packages natively and runs the contract suites of
+the three, the Fish source checks, the native-module proof of Zsh and the case that compares each
+package with its pin, against the packages it just built; a failing suite stops the tree before
+anything is assembled or signed. The Developer ID signature is put on the programs after that. The
+startup customisations are pinned for two of the four targets (Apple silicon macOS and x86-64
+Linux), and they run in no release-tree job. A Windows release tree carries the PowerShell package
+as plain files, which `kr-release` holds to the repository's; no step of the Windows release
+workflow requalifies it, and its qualification runs in the core workflow. No release workflow
+reads the core workflow's result for the commit it builds, so the whole corpus is not a gate of a
+release tree.
 
 ## A package that cannot meet its target
 
@@ -149,7 +163,7 @@ date, with the choices above) or `not-affected`.
 | 2026-09-20 | CVE-2021-45444, prompt expansion in zsh before 5.8.1 | zsh | The pinned release is 5.9, which is after the fix. Nothing to rebuild. | 2026-10-04 | not-affected |
 | 2026-09-20 | The official GNU Bash 5.2 patch series, 001 to 037 | bash | The pinned release is 5.2.37, which carries every patch published for 5.2 at the time of this pin. | 2026-10-04 | not-affected |
 | 2026-09-20 | The fish-shell advisories published against 4.x | fish | The pinned release is 4.9.3, which is the newest 4.x release at the time of this pin and carries every advisory fix published for the series. | 2026-10-04 | not-affected |
-| 2026-09-20 | The editor identity this package was qualified against | psreadline | This package was qualified against PSReadLine 2.4.5 on PowerShell 7.6.6, which is the identity its record names. The range it declares says which editor the integration works with and not which releases inside it carry which fixes, so an advisory against either project is triaged against the versions that advisory names and gets its own row. | 2026-10-04 | not-affected |
+| 2026-09-20 | The editor identity this package was qualified against | psreadline | This package was qualified against PSReadLine 2.4.5 on PowerShell 7.6.6, which is the identity its record names. The range it declares says which editor the integration works with and not which releases inside it carry which fixes, so an advisory against either project is triaged against the versions that advisory names and gets its own row where the register's rule asks for one. | 2026-10-04 | not-affected |
 | 2026-09-20 | CVE-2026-62801, PowerShell, published at github.com/PowerShell/Announcements/issues/98; fixed in 7.4.20, 7.5.11 and 7.6.6 | psreadline | The host this package was qualified against is 7.6.6, which is the fixed release of its own series, so the qualified identity carries the fix. A person on an earlier 7.4, 7.5 or 7.6 release is on an affected host and updates it; this package qualifies the editor against the host the person runs and does not ship one, and the module refuses to bind into a release below 7.4.20, 7.5.11 or 7.6.6, naming this advisory and the first fixed release. | 2026-10-04 | not-affected |
 | 2026-10-24 | CVE-2026-40400, PowerShell, published at github.com/PowerShell/Announcements/issues/99; fixed in 7.4.18, 7.5.11 and 7.6.6; Windows only; released 2026-09-11 | psreadline | The module's bound for CVE-2026-62801 (7.4.20, 7.5.11 and 7.6.6) is at or above every first fixed release of this advisory, so a host this advisory affects is refused. This assessment was made after the one working day the target allows. | 2026-09-25 | not-affected |
 | 2026-10-24 | CVE-2026-69806, a .NET vulnerability in PowerShell, published at github.com/PowerShell/Announcements/issues/101 and updated on 2026-09-23; fixed in 7.5.11 and 7.6.6; Linux only, and 7.4 is not affected; released 2026-09-11 | psreadline | The module's bound for CVE-2026-62801 is at or above the first fixed release of both affected series, so a host this advisory affects is refused. This assessment was made after the one working day the target allows. | 2026-09-25 | not-affected |
@@ -166,7 +180,7 @@ date, with the choices above) or `not-affected`.
 | 2026-10-24 | bash-5.3, the series after the pinned 5.2, and its patches bash53-001 to bash53-020; the first patches are dated 2025-07-23 and the tarball 2025-07-30; released 2025-07-05 | bash | The 5.2 series has no patch after 5.2.37, which is pinned. Of the twenty patches to 5.3, eight apply to the sources of 5.2.37 apart from the version line: a use after free when a mapfile callback unsets its array (011), an exit trap run in a subshell that received a fatal signal (012), an index of -1 into the read builtin's buffer (015), a glob range (006) and display, job and portability fixes (010, 018, 019, 020). The others change code that 5.2.37 does not have. Upstream will not patch 5.2, and no advisory names any of them. A defect that a command triggers in the shell gives the command nothing it does not have, but moving the pin to 5.3 is a requalification of its own that this record does not do, so the package is flagged: keep the pinned package until the pin moves. This assessment was made after the one working day the target allows. | 2025-07-19 | flagged |
 | 2026-10-24 | zsh-5.9.1, the first release after 5.9; released 2026-05-31 | zsh | The pinned release is now 5.9.2, which carries every fix of 5.9.1 that the earlier row lists, and the later ones. The package was rebuilt from the 5.9.2 sources with its ZLE patches rebased; the terminfo patch is dropped because 5.9.2 already holds it. Zsh's own test suite passes on the build, and the package passes the whole qualification corpus on x86-64 Linux. Each target of the release tree builds it natively and runs its contract suites. | 2026-06-14 | not-affected |
 | 2026-10-24 | zsh-5.9.2, the newest release; released 2026-07-12 | zsh | The pinned release is 5.9.2. Its NEWS lists new features and no security fix, and it carries the fixes of 5.9.1. Nothing is left to rebuild. The package's editor ABI is named zle-5.9.2. | 2026-07-26 | not-affected |
-| 2026-10-24 | bash-5.3, the series after 5.2, and its patches bash53-001 to bash53-020; released 2025-07-05 | bash | The pinned release is now 5.3 with all twenty patches published for it at the time of this pin, so it carries the fixes of the earlier row, among them the use after free when a mapfile callback unsets its array (011) and the exit trap run in a subshell that received a fatal signal (012). The package was rebuilt from the 5.3 sources with its four reader patches rebased. Bash's own test suite passes on the build, and the package passes the whole qualification corpus on x86-64 Linux. Each target of the release tree builds it natively and runs its contract suites. | 2025-07-19 | not-affected |
+| 2026-10-24 | bash-5.3, the series after 5.2, and its patches bash53-001 to bash53-020; released 2025-07-05 | bash | The pinned release is now 5.3 with all twenty patches published for it at the time of this pin, so it carries the fixes of the earlier row, among them the use after free when a mapfile callback unsets its array (011) and the exit trap run in a subshell that received a fatal signal (012). The package was rebuilt from the 5.3 sources with its four patches of its own rebased. Bash's own test suite passes on the build, and the package passes the whole qualification corpus on x86-64 Linux. Each target of the release tree builds it natively and runs its contract suites. | 2025-07-19 | not-affected |
 | 2026-10-24 | PCRE2 CVE-2026-103111 (GHSA-r9hj-j2rw-4q3m), an out-of-bounds write in JIT matching with a growable stack, affected `<=10.48`, fixed in 10.49; released 2026-09-28 | fish | The advisory affects only JIT matching with a growable JIT stack, and the bundled PCRE2 is built without JIT (the bindings' jit feature is off), so it does not apply. The fish package now builds the PCRE2 bundled with its Rust bindings (10.43, built without JIT), uses only its 32-bit library, and its executable depends on no PCRE2 library of the machine that built it. Before this, the release trees linked the PCRE2 of the build machine (libpcre2-32.so.0 on Linux and Homebrew's libraries on macOS), which this record did not track, and a Mac without that library could not start the shell. This assessment was made after the one working day the target allows. | 2026-10-12 | not-affected |
 | 2026-10-24 | PCRE2 CVE-2026-89156 (GHSA-2p8c-ff85-vh9x), an out-of-bounds read after a JIT fallback with invalid UTF, affected `<= 10.47`, fixed in 10.48; released 2026-08-31 | fish | The advisory affects the 8-bit library through JIT and Unicode matching, and fish uses only the 32-bit library of a PCRE2 built without JIT, so it does not apply. The fish package now builds the PCRE2 bundled with its Rust bindings (10.43, built without JIT), uses only its 32-bit library, and its executable depends on no PCRE2 library of the machine that built it. This assessment was made after the one working day the target allows. | 2026-09-14 | not-affected |
 | 2026-10-24 | PCRE2 CVE-2026-86145 (GHSA-3r4p-g7gg-ppmf), an out-of-bounds write in pcre2_dfa_match() with recursive patterns, affected `>= 10.32, <= 10.47`, fixed in 10.48; released 2026-08-31 | fish | The advisory affects pcre2_dfa_match() only, which fish never calls: it uses the pcre2 crate's Regex, which compiles with pcre2_compile and matches with pcre2_match. The fish package now builds the PCRE2 bundled with its Rust bindings (10.43, built without JIT), uses only its 32-bit library, and its executable depends on no PCRE2 library of the machine that built it. This assessment was made after the one working day the target allows. | 2026-09-14 | not-affected |
@@ -193,7 +207,7 @@ date, with the choices above) or `not-affected`.
 
 ## The .NET servicing of 2026-10-13
 
-On 2026-10-13 the .NET team published 46 advisories (dotnet/announcements issues 445 to 490) and fixed them in .NET 8.0.32, 9.0.21 and 10.0.13. PowerShell 7.4.21, 7.5.12 and 7.6.7 were released the same day on those runtimes. PowerShell/Announcements names no PowerShell advisory for them as of 2026-10-24, so this account is the register's own. A PowerShell archive is self-contained and carries the runtime it was built with, so a release below those three carries a runtime in the range of each advisory that lists .NET 8, 9 or 10; a framework-dependent host and a preview run on the runtime they find, and the module judges the runtime.
+On 2026-10-13 the .NET team published 46 advisories (dotnet/announcements issues 445 to 490) against several components and fixed them in updates of those components, among them .NET 8.0.32, 9.0.21 and 10.0.13 for the runtime. PowerShell 7.4.21, 7.5.12 and 7.6.7 were released the same day on those runtimes. PowerShell/Announcements names no PowerShell advisory for them as of 2026-10-24, so this account is the register's own. A PowerShell archive is self-contained and carries the runtime it was built with, so a release below those three carries a runtime in the affected range of each advisory against the runtime itself; a framework-dependent host and a preview run on the runtime they find, and the module judges the runtime. The table below says, advisory by advisory, which component a package carries and at which build.
 
 Each advisory is judged by two questions: whether a PowerShell package carries the component it names, and whether the bridge, or the editor it binds into, uses that component without a command from the person. The first was read from the Linux x64, macOS arm64 and Windows x64 archives of 7.4.20 to 7.6.8, each checked against the digest its release notes publish: the runtime packs and packages in `pwsh.deps.json`, the file listing and the file versions of the assemblies. The second was read from the bridge's source and from a system-call trace of an interactive PowerShell on Linux.
 
