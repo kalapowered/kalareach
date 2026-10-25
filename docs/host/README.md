@@ -1348,7 +1348,8 @@ the table for writing, is ordered wholly before the change or wholly after it, a
 whose deadline or authority ran out while it waited behind a sync or a download changes nothing.
 A request, a typed key and an output batch only read that table, so none of them waits for a
 commit. A connection that is registered or withdrawn while a commit runs waits for the commit, and
-the readers that arrive after it wait behind it.
+a reader that arrives after it can wait behind it, because the lock may queue readers behind a
+waiting writer.
 
 The catalogue's work that grows with a catalogue (a mutation, a read, the seed, a change of the
 adapters an organisation allows, and the plan of an installation a person confirms) runs on a
@@ -5041,8 +5042,8 @@ thread, a lock or a transaction. The check is the one every service asks from in
 whether this host owes a fence it could not raise, then whether the connection's registration still
 stands under the revision the mutation was admitted at, then whether its accepted deadline has
 passed. The service asks it under its own lock at each place a mutation starts a new effect, and
-every commit that makes such an effect durable runs while the daemon's connection table is held,
-from the check to the end of the commit. This way any withdrawal of the connection will either be
+every commit that makes such an effect durable runs while the daemon's connection table is held
+against a change, from the check to the end of the commit. This way any withdrawal of the connection will either be
 committed before the check or after the commit of the mutation. If the check fails, nothing the
 action began becomes durable or visible, and the refusal is not kept as its answer: the same action
 sent again under an admission that stands is decided as a first admission. Finishing an effect that

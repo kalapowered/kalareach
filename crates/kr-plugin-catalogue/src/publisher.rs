@@ -11,8 +11,13 @@
 //! an installation whose enrolment was removed holds its publisher by the root in the checkpoint
 //! that enrolment left in its directory. "The same root" is the same set of keys the root names for
 //! its own role: a mirror, and a vendor beneath the official root, share it, and a renewed root
-//! keeps it. The enrolment the seed made is never refused, so a shipped name is the build's
-//! whichever repository was enrolled first.
+//! keeps it. A holder whose root the candidate's root descends from, by the signatures the root
+//! carries, is under the candidate's root too: it has not followed a rotation the candidate has.
+//! The enrolment the seed made is never refused, so a shipped name is the build's whichever
+//! repository was enrolled first.
+//!
+//! The check reads files and scans records, so it is made under the write lock of the change it
+//! guards and before the admission is asked to hold the change's registration for the commit.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -39,7 +44,8 @@ pub(crate) enum Doing {
 ///
 /// `roots` are the roots that count as the candidate's own: the one it was enrolled on or has
 /// kept, and, in a synchronisation, the one the load ended on, because the client verified the
-/// chain between them. A holder whose keys for its own role match none of them is another root.
+/// chain between them. A holder whose keys for its own role match none of them, and whose root
+/// none of them descends from, is another root.
 ///
 /// # Errors
 ///
