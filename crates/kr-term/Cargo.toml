@@ -33,6 +33,8 @@ wezterm-term.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# Copies of the committed fixtures that a test may change.
+tempfile.workspace = true
 
 [lints]
 workspace = true

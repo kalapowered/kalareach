@@ -721,6 +721,59 @@ fn a_windows_tree_carries_the_powershell_package_as_files() {
     );
     assert!(listed("shells/psreadline/startup/kr-profile.ps1").is_some());
 
+    // The terminal the release was qualified against: the manifest of its capabilities, and the
+    // compiled terminfo database under both names a library looks for it by. A release for any
+    // target carries them, Windows included, as the statement of what the release ships.
+    let compiled = kr_term::terminfo::compiled().expect("the pinned database compiles");
+    let database = [
+        "share/terminfo/x/xterm-256color",
+        "share/terminfo/78/xterm-256color",
+    ];
+    for path in database {
+        assert_eq!(
+            listed(path).map(|file| file.mode),
+            Some(FileMode::Regular),
+            "{path} is listed"
+        );
+        assert_eq!(
+            std::fs::read(tree.join(path)).expect("the database"),
+            compiled
+        );
+    }
+    let capabilities = tree.join("share/terminal-capabilities.json");
+    assert!(listed("share/terminal-capabilities.json").is_some());
+    assert_eq!(
+        std::fs::read(&capabilities).expect("the manifest"),
+        std::fs::read(checkout().join("fixtures/terminal/capabilities.json"))
+            .expect("the committed manifest"),
+        "the tree carries the manifest this checkout commits"
+    );
+    // A tree that lacks either, or whose copy is not the checkout's, is refused by name.
+    for (path, named) in [
+        (database[1], "share/terminfo"),
+        (database[0], "share/terminfo"),
+        ("share/terminal-capabilities.json", "terminal-capabilities"),
+    ] {
+        let file = tree.join(path);
+        let original = std::fs::read(&file).expect("a file of the tree");
+        std::fs::remove_file(&file).expect("removed");
+        let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+        assert!(!refused.status.success(), "{path} is gone");
+        assert!(why(&refused).contains(named), "{}", why(&refused));
+        std::fs::write(&file, &original).expect("put back");
+    }
+    for path in [database[0], "share/terminal-capabilities.json"] {
+        let file = tree.join(path);
+        let original = std::fs::read(&file).expect("a file of the tree");
+        let mut edited = original.clone();
+        edited.push(b'\n');
+        std::fs::write(&file, edited).expect("edited");
+        let refused = run(&manifest_arguments_for(&tree, WINDOWS, "windows=10.0"));
+        assert!(!refused.status.success(), "{path} is changed");
+        assert!(why(&refused).contains(path), "{}", why(&refused));
+        std::fs::write(&file, &original).expect("put back");
+    }
+
     // A file of the PowerShell package that is not the checkout's: the module a policy that asks for
     // signed scripts would load, edited after it was copied.
     let module = tree.join("shells/psreadline/module/KrBridge.ps1");

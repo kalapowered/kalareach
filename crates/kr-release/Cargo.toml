@@ -40,6 +40,8 @@ tokio = { workspace = true, features = ["rt"] }
 tough.workspace = true
 
 [dev-dependencies]
+# The database a release tree carries, which a test reads back from the engine that compiles it.
+kr-term.workspace = true
 tempfile.workspace = true
 
 [lints]
