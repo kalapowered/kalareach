@@ -2228,10 +2228,6 @@ pub fn remove_sealed_tree(directory: &Path) -> std::io::Result<()> {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 open_to_removal(&entry.path())?;
-            } else {
-                let mut permissions = std::fs::metadata(entry.path())?.permissions();
-                permissions.set_readonly(false);
-                std::fs::set_permissions(entry.path(), permissions)?;
             }
         }
         Ok(())
