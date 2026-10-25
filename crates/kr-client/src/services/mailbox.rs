@@ -267,17 +267,77 @@ impl fmt::Debug for MailboxItem {
 }
 
 /// What `mailbox.read` answers once the reader has proved the mailbox is its own.
+///
+/// An item whose sealed envelope this build cannot read, such as one whose routing record names a
+/// payload kind it does not know, is not an error of the page: its position is kept in
+/// [`Self::unreadable`], so the reader can drop it and acknowledge it, and the items beside it are
+/// read as they are. A page whose own members are not what the contract says is still an error.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "WirePage")]
 pub struct MailboxPage {
-    /// The items this page carries, oldest first.
+    /// The items this page carries that can be read, oldest first.
     pub items: Vec<MailboxItem>,
+    /// The positions of the items this page carries that cannot be read, oldest first.
+    pub unreadable: Vec<U64>,
     /// The cursor to continue from, which is the position of the last item returned.
     pub next_after_sequence: U64,
     /// Whether more items were waiting than this page carried.
     pub more: bool,
     /// How the mailbox stands.
     pub stored: MailboxUsage,
+}
+
+impl MailboxPage {
+    /// The position of the last item the page carries, readable or not.
+    #[must_use]
+    pub fn last_sequence(&self) -> Option<u64> {
+        let readable = self.items.last().map(|item| item.sequence.get());
+        let unread = self.unreadable.last().map(|sequence| sequence.get());
+        readable.max(unread)
+    }
+}
+
+/// A page as the service sends it, with each envelope still undecoded.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePage {
+    items: Vec<WireItem>,
+    next_after_sequence: U64,
+    more: bool,
+    stored: MailboxUsage,
+}
+
+/// One item as the service sends it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireItem {
+    sequence: U64,
+    stored_at_ms: U64,
+    envelope: serde_json::Value,
+}
+
+impl From<WirePage> for MailboxPage {
+    fn from(wire: WirePage) -> Self {
+        let mut items = Vec::new();
+        let mut unreadable = Vec::new();
+        for item in wire.items {
+            match serde_json::from_value::<SealedEnvelope>(item.envelope) {
+                Ok(envelope) => items.push(MailboxItem {
+                    sequence: item.sequence,
+                    stored_at_ms: item.stored_at_ms,
+                    envelope,
+                }),
+                Err(_) => unreadable.push(item.sequence),
+            }
+        }
+        Self {
+            items,
+            unreadable,
+            next_after_sequence: wire.next_after_sequence,
+            more: wire.more,
+            stored: wire.stored,
+        }
+    }
 }
 
 impl fmt::Debug for MailboxPage {
@@ -287,6 +347,7 @@ impl fmt::Debug for MailboxPage {
         formatter
             .debug_struct("MailboxPage")
             .field("items", &self.items.len())
+            .field("unreadable", &self.unreadable.len())
             .field("next_after_sequence", &self.next_after_sequence)
             .field("more", &self.more)
             .field("stored", &self.stored)
@@ -1048,11 +1109,12 @@ mod tests {
         renders_only(
             &MailboxPage {
                 items: vec![item],
+                unreadable: Vec::new(),
                 next_after_sequence: U64::new(12),
                 more: false,
                 stored,
             },
-            "MailboxPage{items:1,next_after_sequence:U64(12),more:false,\
+            "MailboxPage{items:1,unreadable:0,next_after_sequence:U64(12),more:false,\
              stored:MailboxUsage{items:U64(1),bytes:U64(1304),item_limit:U64(1000),\
              byte_limit:U64(33554432)},..}",
         );
