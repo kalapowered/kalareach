@@ -481,6 +481,22 @@ impl ServiceWeb {
             .unwrap_or_default()
     }
 
+    /// The mailbox of the device whose stored-envelope key is `recipient` serves its item at
+    /// `sequence` with the payload kind `kind` in its routing record from now on, as a service
+    /// serves an item of a kind a reader does not know. False when it holds no such item.
+    pub fn relabel_mailbox_item(
+        &self,
+        recipient: &kr_protocol::scalars::StoredEnvelopeKey,
+        sequence: u64,
+        kind: &str,
+    ) -> bool {
+        let mut state = self.state.lock().expect("the state");
+        state
+            .mailboxes
+            .get_mut(&crate::mailbox::address_of(recipient))
+            .is_some_and(|mailbox| mailbox.relabel(sequence, kind))
+    }
+
     /// The authorisation's validity window ends now: no request names it again, and no lease
     /// issued under it lasts past this moment, as the Worker caps every lease at its
     /// authorisation's end. The lease stays installed until something ends it.

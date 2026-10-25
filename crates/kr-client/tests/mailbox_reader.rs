@@ -9,9 +9,10 @@
 //!
 //! The rules are section 20's. An item opens only against the stored-envelope key of a sender the
 //! reader has paired, the routing record outside it is untrusted and must match the box, an
-//! identifier accepted before is refused until its retention has ended, and a payload that bears
-//! authority is refused whoever sealed it. Each of those drops the item and leaves the service free
-//! to remove it; what is accepted is written down first.
+//! identifier accepted before is refused until its retention has ended, and an item this build
+//! cannot read, such as one that names a payload kind it does not know, cannot be opened. Each of
+//! those drops the item and leaves the service free to remove it; what is accepted is written
+//! down first.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -387,6 +388,35 @@ async fn kr_req_20_05_an_item_accepted_once_is_refused_when_it_is_offered_again(
         Some(&(item.routing.expires_at_ms.get() + REPLAY_ID_RETENTION_MS)),
         "an identifier is kept until the item's expiry and a day more"
     );
+}
+
+/// KR-REQ-20.05: the routing record the service stores beside a ciphertext is untrusted, and one
+/// that names a payload kind this build does not know is an item the reader cannot open. It is
+/// dropped and the service is told it may remove it, and the paired sender's item beside it, which
+/// the service holds after it, is taken in the same pass.
+#[tokio::test]
+async fn kr_req_20_05_an_item_whose_routing_names_an_unknown_kind_is_dropped_and_the_next_is_taken()
+{
+    let rig = Rig::start();
+    let friend = a_sender();
+    rig.reader.pairs_with(&friend);
+    rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, 1))
+        .await;
+    rig.deliver(&rig.item(&friend, MailboxPayloadType::StateReference, 2))
+        .await;
+    assert!(
+        rig.web
+            .relabel_mailbox_item(rig.me.public(), 1, "signed_authority_object"),
+        "the service holds the first item"
+    );
+
+    let outcome = rig.pass().await.expect("the pass reads through");
+
+    assert_eq!(outcome, Outcome::ReadThrough);
+    assert_eq!(rig.reader.accepted_numbers(), [2]);
+    assert_eq!(rig.reader.dropped(), 1);
+    assert_eq!(rig.reader.written().len(), 1);
+    assert_eq!(rig.held(), 0, "the service may remove both");
 }
 
 /// KR-REQ-20.05: an item whose identifier was written down is never accepted again, even when the

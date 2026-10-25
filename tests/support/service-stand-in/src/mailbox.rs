@@ -40,6 +40,9 @@ struct Item {
     writer_key: String,
     stored_bytes: u64,
     stored_at_ms: u64,
+    /// A payload kind the routing record is read back with instead of its own, which a test sets to
+    /// serve an item whose kind this build of the contract does not know.
+    relabelled_kind: Option<String>,
 }
 
 /// What a mailbox remembers of an envelope identifier it has carried: for good, where the Worker
@@ -102,6 +105,18 @@ impl Mailbox {
             .values()
             .map(|item| item.envelope.clone())
             .collect()
+    }
+
+    /// Serves the item at `sequence` with its routing record naming `kind` as its payload kind from
+    /// now on. False when the mailbox holds no such item.
+    pub(crate) fn relabel(&mut self, sequence: u64, kind: &str) -> bool {
+        match self.items.get_mut(&sequence) {
+            Some(item) => {
+                item.relabelled_kind = Some(kind.to_owned());
+                true
+            }
+            None => false,
+        }
     }
 
     /// An item whose expiry has passed is removed before a call reads the mailbox, is never
@@ -397,6 +412,7 @@ fn place(
             writer_key,
             stored_bytes,
             stored_at_ms: now_ms,
+            relabelled_kind: None,
         },
     );
     mailbox
@@ -550,10 +566,14 @@ pub(crate) fn read(
     let items: Vec<Value> = page
         .iter()
         .map(|(sequence, item)| {
+            let mut envelope = json!(item.envelope);
+            if let Some(kind) = &item.relabelled_kind {
+                envelope["routing"]["payload_type"] = json!(kind);
+            }
             json!({
                 "sequence": sequence.to_string(),
                 "stored_at_ms": item.stored_at_ms.to_string(),
-                "envelope": item.envelope,
+                "envelope": envelope,
             })
         })
         .collect();

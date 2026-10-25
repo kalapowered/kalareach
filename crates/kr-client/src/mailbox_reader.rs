@@ -143,11 +143,16 @@ pub async fn read_mailbox<R: Reading>(
 
     for _ in 0..MOST_PAGES {
         let page = client.read_as(key, None).await.map_err(Stop::Service)?;
-        let Some(last) = page.items.last().map(|item| item.sequence.get()) else {
+        let Some(last) = page.last_sequence() else {
             return Ok(Outcome::ReadThrough);
         };
 
-        let mut yielded = Page::default();
+        // An item this build cannot read is dropped like one that does not open, and the service
+        // is told it may remove it with the rest of the page.
+        let mut yielded = Page {
+            dropped: page.unreadable.len(),
+            ..Page::default()
+        };
         let mut unwritten = None;
         for item in &page.items {
             match open_delivered_envelope(
