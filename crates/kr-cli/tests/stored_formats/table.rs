@@ -170,6 +170,17 @@ pub fn known() -> Vec<Known> {
             "OfflineValidityPolicy",
             "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
         ),
+        // What the restored-policy record keeps of the policy it names.
+        known_protocol::<account::PolicyAuthorityLink>(
+            "restored-policy",
+            "PolicyAuthorityLink",
+            "d9aab1ca1f34156f2a5541e55f6bbef63516ea7073ac3ca2f44cc250a20fdc19",
+        ),
+        known_protocol::<sharing::OfflineValidityPolicy>(
+            "restored-policy",
+            "OfflineValidityPolicy",
+            "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
+        ),
         known_protocol::<pairing::RevocationRequest>(
             "registry",
             "RevocationRequest",
@@ -1150,6 +1161,34 @@ pub fn table() -> Vec<Store> {
             owned: Vec::new(),
             kept: vec![
                 Kept::Source("crates/kr-controller/src/grants/mirror.rs", &["Record"]),
+                Kept::Source(
+                    "crates/kr-controller/src/grants/durable.rs",
+                    &[
+                        "StoredPolicy",
+                        "StoredEnrolment",
+                        "StoredBinding",
+                        "StoredLeaseRecord",
+                    ],
+                ),
+            ],
+        },
+        // The record that a restored policy row waits for the person at this machine, kept beside
+        // the registry. An earlier release does not name this store and neither reads nor writes
+        // it; the policy it keeps a digest of is the one the mirror above keeps.
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
+                kr_controller::grants::restored::STORE_NAME,
+                StoreScope::Environment,
+                "restored-policy.cbor",
+                cbor_member("version", 0),
+                kr_controller::grants::restored::RECORD_VERSION,
+                kr_controller::grants::restored::RECORD_VERSION,
+            ),
+            owned: Vec::new(),
+            kept: vec![
+                Kept::Source("crates/kr-controller/src/grants/restored.rs", &["Record"]),
                 Kept::Source(
                     "crates/kr-controller/src/grants/durable.rs",
                     &[
