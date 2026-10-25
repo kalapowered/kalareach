@@ -353,7 +353,8 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
                 other => named.push(other),
             }
         }
-        if named.to_string_lossy().contains(&own) {
+        // Spelled with forward slashes, which is how `own` is written on every platform.
+        if named.to_string_lossy().replace('\\', "/").contains(&own) {
             let there = std::fs::canonicalize(&named).unwrap_or(named);
             if !there.starts_with(&here) {
                 return Some(format!("it was built from the sources at {source}"));
@@ -1145,12 +1146,27 @@ impl StandingIn<'_> {
 }
 
 /// A stand-in for an agent that a session's shell started: a process that runs until the test lets go
-/// of the pipe it reads.
+/// of the pipe it reads, or on Windows until the test removes the file it watches.
 struct Agent {
     /// The identity the kernel gives its process.
     identity: kr_protocol::identity::ProcessStartIdentity,
     /// The pipe it reads, held open for as long as it should run.
+    #[cfg(unix)]
     _life: std::fs::File,
+    /// The file it watches, removed when the test lets go of the agent.
+    #[cfg(windows)]
+    _life: WatchedFile,
+}
+
+/// A file a stand-in agent watches, which is removed when this is dropped.
+#[cfg(windows)]
+struct WatchedFile(PathBuf);
+
+#[cfg(windows)]
+impl Drop for WatchedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// A host tree with a store of releases in it, and the daemons this test started.
@@ -1919,14 +1935,28 @@ impl Host {
     /// `program` is the daemon the task is to start, which has to be the store's `current`.
     #[cfg(windows)]
     async fn start_daemon(&mut self, program: &Path) {
+        let current = self
+            .store
+            .current()
+            .expect("reads")
+            .map(|name| self.program(&name, Program::Controller));
+        assert!(
+            program == self.store.stable(Program::Controller)
+                || Some(program) == current.as_deref(),
+            "the task starts the daemon of the store's current release"
+        );
+        let program = self.store.stable(Program::Controller);
+        let program = program.as_path();
+        self.register_the_standalone_start();
+        self.start_daemon_by_task(program).await;
+    }
+
+    /// Asks the environment's task, whatever program it names, for a daemon, through a request its
+    /// starter takes, and waits for the daemon to answer.
+    #[cfg(windows)]
+    async fn start_daemon_by_task(&mut self, program: &Path) {
         use kr_controller::supervision::windows as scheduled;
 
-        assert_eq!(
-            program,
-            self.store.stable(Program::Controller),
-            "the task starts the daemon through the store's current release"
-        );
-        self.register_the_standalone_start();
         let environment = self.tree.environment();
         let user = kr_ipc::starter::current_user_sid().expect("this account");
         let definition = scheduled::TaskDefinition::for_setup(user, &environment, program);
@@ -1957,6 +1987,36 @@ impl Host {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Starts `program` as this host's daemon by hand, as a person would from a shell and not
+    /// through the environment's task: with `arguments` in `directory`, and with each of `set` added
+    /// to the variables [`Host::command`] gives, and waits for it to answer.
+    #[cfg(windows)]
+    async fn start_daemon_by_hand(
+        &mut self,
+        program: &Path,
+        arguments: &[&str],
+        directory: &Path,
+        set: &[(&str, &Path)],
+    ) {
+        let mut command = self.command(program, arguments);
+        command.current_dir(directory);
+        for (name, value) in set {
+            command.env(name, value);
+        }
+        self.start_daemon_as(command).await;
+    }
+
+    /// The arguments the environment's task gives a daemon: this host's roots, and nothing else.
+    #[cfg(windows)]
+    fn arguments_of_the_tasks_daemon(&self) -> Vec<String> {
+        vec![
+            "--runtime-dir".to_owned(),
+            self.tree.paths().runtime_root().display().to_string(),
+            "--state-dir".to_owned(),
+            self.tree.paths().state_root().display().to_string(),
+        ]
     }
 
     /// Takes this host's task away, as a test that registered one must before it ends.
@@ -2009,7 +2069,6 @@ impl Host {
     }
 
     /// Starts `command` as this host's daemon, in the directory it names, and waits for it to answer.
-    #[cfg(unix)]
     async fn start_daemon_as(&mut self, mut command: Command) {
         let log = self
             .tree
@@ -2120,6 +2179,94 @@ impl Host {
             std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
                 .expect("executable");
         }
+        let cwd = self.tree.root().display().to_string();
+        let output = self.run(
+            kr,
+            &[
+                "new",
+                "--shell-mode",
+                "native_compat",
+                "--invisible",
+                "--headless",
+                "--cwd",
+                &cwd,
+                "--shell",
+                &shell.display().to_string(),
+                "--startup",
+                "interactive",
+                "--json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "kr new: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let created: Value = serde_json::from_slice(&output.stdout).expect("kr printed JSON");
+        let session_id = created["session_id"]
+            .as_str()
+            .expect("a session identifier")
+            .parse()
+            .expect("parses");
+        let started = Instant::now();
+        let pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the session's shell did not start its agent"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let identity = kr_ipc::identity::started_process_identity(pid).expect("the agent runs");
+        (
+            created["display_number"].to_string(),
+            session_id,
+            Agent {
+                identity,
+                _life: hold,
+            },
+        )
+    }
+
+    /// Creates a session with a release's `kr` whose root shell starts a stand-in agent, a process
+    /// of its own that outlasts anything the shell does, and then goes on as the shell.
+    ///
+    /// The agent runs while a file this test made exists, and ends when the test lets go of it,
+    /// however the test ends. Returns the session's display number and identifier, and the agent.
+    #[cfg(windows)]
+    fn new_session_with_an_agent(&self, kr: &Path, name: &str) -> (String, SessionId, Agent) {
+        let directory = self.scratch(&format!("agent-{name}"));
+        let pid_file = directory.join("pid");
+        let life = directory.join("life");
+        std::fs::write(&life, b"").expect("the file the agent watches");
+        let hold = WatchedFile(life.clone());
+        let shell_program = default_shell();
+        // A batch file that starts the agent from the shell's own tree and goes on as the shell. The
+        // worker gives a shell it does not know the arguments of a Bourne shell, which the batch
+        // file ignores.
+        let shell = directory.join("agent-shell.cmd");
+        let agent = format!(
+            "$p = Start-Process -PassThru -WindowStyle Hidden -FilePath '{shell}' \
+             -ArgumentList '-NoProfile','-Command','while (Test-Path ''{life}'') {{ Start-Sleep -Milliseconds 200 }}'; \
+             Set-Content -Path '{pid}.partial' -Value $p.Id; \
+             Move-Item -Path '{pid}.partial' -Destination '{pid}'",
+            shell = shell_program,
+            life = life.display(),
+            pid = pid_file.display()
+        );
+        std::fs::write(
+            &shell,
+            format!(
+                "@echo off\r\n\"{shell_program}\" -NoProfile -Command \"{agent}\"\r\n\
+                 \"{shell_program}\" -NoLogo -NoExit\r\n"
+            ),
+        )
+        .expect("the stand-in agent's shell");
         let cwd = self.tree.root().display().to_string();
         let output = self.run(
             kr,
@@ -2292,29 +2439,55 @@ impl Host {
 
     /// What a run that stopped after its switch leaves: `two` current, no daemon running, and the
     /// update recorded as switched, with the daemon of this host to be started as it was.
-    fn record_a_switched_update(&mut self, one: &Assembled, two: &Assembled) {
+    async fn record_a_switched_update(&mut self, one: &Assembled, two: &Assembled) {
+        self.end_every_daemon().await;
+        self.switch(two.name());
+        self.record_the_update_as_switched(one, two);
+    }
+
+    /// Ends every daemon that serves this host without its leave, as a crash does: each this test
+    /// started, and on Windows the one the environment's task created, which is ended by its process
+    /// identifier. Returns once no daemon holds the environment.
+    async fn end_every_daemon(&mut self) {
         for mut daemon in self.daemons.drain(..) {
             daemon.kill().expect("stops");
             daemon.wait().expect("ends");
         }
-        self.switch(two.name());
-        self.record_the_update_as_switched(one, two);
+        #[cfg(windows)]
+        if connect_to_daemon(&self.tree.environment().controller_endpoint().expect("an endpoint"))
+            .await
+            .is_ok()
+        {
+            let pid = self.daemon_started_like().await.pid.get();
+            let system = std::env::var_os("SystemRoot")
+                .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+            let ended = Command::new(system.join("System32").join("taskkill.exe"))
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("taskkill runs");
+            assert!(ended.success(), "the daemon, process {pid}, is ended");
+            let started = Instant::now();
+            while connect_to_daemon(
+                &self.tree.environment().controller_endpoint().expect("an endpoint"),
+            )
+            .await
+            .is_ok()
+            {
+                assert!(
+                    started.elapsed() < LIVENESS_DEADLINE,
+                    "the daemon, process {pid}, still answers"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 
     /// Records an update from `one` to `two` as switched, with the daemon of this host to be
     /// started as it was, whatever runs and whatever `current` names.
     fn record_the_update_as_switched(&self, one: &Assembled, two: &Assembled) {
-        let restart = serde_json::json!({
-            "environment": self.tree.environment_id(),
-            "runtime_root": self.tree.paths().runtime_root(),
-            "state_root": self.tree.paths().state_root(),
-            "start": {
-                "arguments": {
-                    "arguments": self.daemon_arguments(),
-                    "working_directory": self.tree.root(),
-                }
-            },
-        });
+        let restart = self.restart();
         let record = serde_json::json!({
             "format": EARLIER_RECORD_FORMAT,
             "previous": null,
@@ -2337,16 +2510,22 @@ impl Host {
     /// The restart of this host's daemon an update records, as a released build recorded it: how it
     /// is started again, with the arguments it was started with and none of its variables.
     fn restart(&self) -> Value {
-        serde_json::json!({
-            "environment": self.tree.environment_id(),
-            "runtime_root": self.tree.paths().runtime_root(),
-            "state_root": self.tree.paths().state_root(),
-            "start": {
+        // A daemon on Windows is started again by the environment's task and by nothing else.
+        let start = if cfg!(windows) {
+            serde_json::json!("service")
+        } else {
+            serde_json::json!({
                 "arguments": {
                     "arguments": self.daemon_arguments(),
                     "working_directory": self.tree.root(),
                 }
-            },
+            })
+        };
+        serde_json::json!({
+            "environment": self.tree.environment_id(),
+            "runtime_root": self.tree.paths().runtime_root(),
+            "state_root": self.tree.paths().state_root(),
+            "start": start,
         })
     }
 
