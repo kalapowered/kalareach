@@ -6123,9 +6123,7 @@ pub(crate) mod tests {
         sizes.sort_unstable();
         assert_eq!(sizes, vec![44, 256]);
         let Texts {
-            served: mut served,
-            ticket,
-            ..
+            mut served, ticket, ..
         } = asking.await.expect("the texts are read");
         assert_eq!(
             ticket.entries.len(),
