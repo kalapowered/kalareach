@@ -1,0 +1,607 @@
+//! The store of releases on Windows: what the operating system is asked for where the Unix store
+//! asks for a symbolic link, a file lock and a file mode.
+//!
+//! | Unix | Windows |
+//! | --- | --- |
+//! | `current` is a relative symbolic link, replaced by renaming a new one over it | `current` is a directory junction, replaced by renaming a new junction over it in one step ([`replace_directory`]) |
+//! | a program holds a shared `flock` on its release's manifest | a program holds its release's manifest open for reading with a share mode that allows no write and no delete ([`open_for_hold`]), which keeps the release's directory from being renamed or removed |
+//! | whether a release is held is asked by trying an exclusive `flock` | by trying to open the manifest with a share mode that allows nothing ([`is_held`]) |
+//! | a sealed release is mode `0444`/`0555` | a sealed release is read-only by attribute and carries an access-control list that gives its owner read access and nothing that writes ([`seal_file`], [`seal_directory`]) |
+//!
+//! A program's image is asked from the kernel with `QueryFullProcessImageNameW`, which names the
+//! file the process was created from after a junction on the way was followed, and so is the
+//! release's own file whatever `current` names afterwards. The path the process was started as,
+//! which the standard library reports, is the one through `current`.
+
+#![expect(
+    unsafe_code,
+    reason = "a junction is made and replaced, a process's image is named and a file's identity and \
+              access-control list are read and set through calls that have no safe interface"
+)]
+
+use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::windows::io::AsRawHandle as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, LocalFree,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SetSecurityInfo,
+};
+use windows_sys::Win32::Security::{
+    DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_TYPE_DISK, FileIdInfo, FileRenameInfoEx, GetFileInformationByHandleEx, GetFileType,
+    GetVolumeInformationW, GetVolumePathNameW, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC,
+};
+use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, PROCESS_NAME_WIN32, QueryFullProcessImageNameW,
+};
+use windows_sys::Win32::System::WindowsProgramming::{
+    FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+};
+
+/// The tag of a directory junction, the reparse point `mklink /J` makes.
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+/// The share mode of a handle that lets every other handle read, write and delete.
+const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+/// Reads this process's own image from the kernel: the file the process was created from, with
+/// every junction and link on the way it was started through resolved.
+///
+/// # Errors
+///
+/// Returns the operating system's error when it does not say.
+pub(super) fn image_path() -> io::Result<PathBuf> {
+    let mut capacity = 512_u32;
+    loop {
+        let mut buffer = vec![0_u16; capacity as usize];
+        let mut size = capacity;
+        // SAFETY: the current process pseudo-handle is always valid, `buffer` holds `size` code
+        // units, and `size` is a live in-out parameter the call updates to the length it wrote.
+        let named = unsafe {
+            QueryFullProcessImageNameW(
+                GetCurrentProcess(),
+                PROCESS_NAME_WIN32,
+                buffer.as_mut_ptr(),
+                &raw mut size,
+            )
+        };
+        if named != 0 {
+            buffer.truncate(size as usize);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER.cast_signed())
+            && capacity < 65_536
+        {
+            capacity *= 2;
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// Whether `error` says another handle's share mode, or this one's, keeps the open from being
+/// granted.
+pub(super) fn is_sharing_violation(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed())
+}
+
+/// Whether `error` is what renaming a directory answers while a handle on something inside it
+/// allows no delete, or while nothing of this account lets it be moved. The two are told apart by
+/// nothing the operating system says, so a caller treats both as "not now".
+pub(super) fn is_in_use(error: &io::Error) -> bool {
+    is_sharing_violation(error) || error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed())
+}
+
+/// Opens a file for reading with the given share mode, without following a link, and checks that
+/// it is a regular file on a disk: a junction or a link planted under a release's name would
+/// otherwise turn a read into a read of something else, and a device name would open a device.
+///
+/// # Errors
+///
+/// Returns the operating system's error, [`io::ErrorKind::NotFound`] among them, and an error of
+/// kind `InvalidData` for a link and for anything but a regular file.
+fn open_reading(path: &Path, share: u32) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let about = file.metadata()?;
+    if about.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "it is a link, and no file of a release is",
+        ));
+    }
+    // SAFETY: the handle is the open file's own and stays open for the call.
+    let kind = unsafe { GetFileType(file.as_raw_handle()) };
+    if !about.is_file() || kind != FILE_TYPE_DISK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "it is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Opens a file of a release for reading without following a link, letting every other handle
+/// read, write and delete.
+///
+/// # Errors
+///
+/// As [`open_reading`].
+pub(super) fn open_regular_file(path: &Path) -> io::Result<File> {
+    open_reading(path, SHARE_ALL)
+}
+
+/// Opens a release's manifest to hold the release: for reading, with a share mode that allows other
+/// handles to read and nothing else. While the handle is open the manifest cannot be renamed,
+/// replaced or deleted, nor can the directory it is in or any directory above it up to the store's
+/// `versions`, which is what keeps a release from being removed under a program that runs from it.
+///
+/// A sharing violation is waited out for up to `within`, because it is also what a check of
+/// whether the release is held ([`is_held`]) causes for as long as it lasts, which is an instant.
+///
+/// # Errors
+///
+/// Returns the operating system's error, [`io::ErrorKind::NotFound`] among them, and the sharing
+/// violation itself once `within` has passed.
+pub(super) fn open_for_hold(path: &Path, within: Duration) -> io::Result<File> {
+    let deadline = Instant::now() + within;
+    loop {
+        match open_reading(path, FILE_SHARE_READ) {
+            Err(error) if is_sharing_violation(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            answer => return answer,
+        }
+    }
+}
+
+/// Whether anything holds the release whose manifest is at `path`: whether the manifest can be
+/// opened for reading by a handle that allows no other handle to it at all. Every holder has it
+/// open for reading, so one is a sharing violation.
+///
+/// The handle lives for the length of the call. A holder that opens the manifest in that moment is
+/// refused with a sharing violation and tries again ([`open_for_hold`]).
+///
+/// # Errors
+///
+/// Returns the operating system's error when the manifest cannot be opened for any reason but a
+/// holder.
+pub(super) fn is_held(path: &Path) -> io::Result<bool> {
+    match open_reading(path, 0) {
+        Ok(_) => Ok(false),
+        Err(error) if is_sharing_violation(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// A file's identity: the volume and the number the volume gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileIdentity {
+    volume: u64,
+    file: [u8; 16],
+}
+
+/// Reads the identity of the file or directory a handle is open on.
+///
+/// # Errors
+///
+/// Returns the operating system's error when it does not say.
+pub(super) fn identity(file: &File) -> io::Result<FileIdentity> {
+    let mut information = FILE_ID_INFO {
+        VolumeSerialNumber: 0,
+        FileId: Default::default(),
+    };
+    // SAFETY: the handle is the open file's own, and `information` is a live buffer of exactly the
+    // size of the structure the class asks for.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut information).cast(),
+            u32::try_from(size_of::<FILE_ID_INFO>()).unwrap_or(0),
+        )
+    };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        volume: information.VolumeSerialNumber,
+        file: information.FileId.Identifier,
+    })
+}
+
+/// Opens a file or a directory only to read its identity, without following a link.
+fn open_for_identity(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// Whether two paths name one file or directory, whatever spelling each has: case, a short name,
+/// a verbatim prefix. A path that cannot be opened is none.
+pub(super) fn same_object(one: &Path, other: &Path) -> bool {
+    let (Ok(one), Ok(other)) = (open_for_identity(one), open_for_identity(other)) else {
+        return false;
+    };
+    matches!((identity(&one), identity(&other)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Whether the file system `path` is on is NTFS, the one a store is kept on.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the volume cannot be named or asked.
+pub(super) fn is_ntfs(path: &Path) -> io::Result<bool> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut root = vec![0_u16; 1024];
+    // SAFETY: `wide` is null-terminated, and `root` holds the number of code units the call is
+    // told it may write.
+    let named = unsafe {
+        GetVolumePathNameW(
+            wide.as_ptr(),
+            root.as_mut_ptr(),
+            u32::try_from(root.len()).unwrap_or(0),
+        )
+    };
+    if named == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = [0_u16; 64];
+    // SAFETY: `root` was written null-terminated by the call above, `name` is the file system
+    // name buffer with its length, and the other outputs are not asked for.
+    let asked = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            u32::try_from(name.len()).unwrap_or(0),
+        )
+    };
+    if asked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    Ok(OsString::from_wide(&name[..length]) == OsStr::new("NTFS"))
+}
+
+/// The path as the junction's substitute name spells it: the NT form, `\??\C:\...`.
+fn nt_path(path: &Path) -> io::Result<Vec<u16>> {
+    let absolute = std::path::absolute(path)?;
+    let text: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    let units = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let local_drive = |rest: &[u16]| {
+        rest.get(1) == Some(&u16::from(b':'))
+            && rest.first().is_some_and(|unit| {
+                u8::try_from(*unit).is_ok_and(|byte| byte.is_ascii_alphabetic())
+            })
+    };
+    let rest = text
+        .strip_prefix(units(r"\\?\").as_slice())
+        .unwrap_or(&text);
+    if !local_drive(rest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a junction names a place on a local drive, not a network path",
+        ));
+    }
+    let mut name = units(r"\??\");
+    name.extend_from_slice(rest);
+    while name.last() == Some(&u16::from(b'\\')) && name.len() > 7 {
+        name.pop();
+    }
+    Ok(name)
+}
+
+/// Makes a directory junction at `link` that names the directory `target`.
+///
+/// `link` must not exist. A junction's target is an absolute path, so it names the place it was
+/// made for and no other.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be made or the junction cannot
+/// be set on it, and then leaves no directory behind.
+pub(super) fn create_junction(link: &Path, target: &Path) -> io::Result<()> {
+    let substitute = nt_path(target)?;
+    // The print name is the target as a person reads it, without the NT prefix.
+    let print = substitute[4..].to_vec();
+    let (substitute_bytes, print_bytes) = (substitute.len() * 2, print.len() * 2);
+    // Four 16-bit offsets and lengths, then the two names, each with its own terminator.
+    let data_length = 8 + substitute_bytes + 2 + print_bytes + 2;
+    let Ok(data_length_field) = u16::try_from(data_length) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the target's path is too long for a junction",
+        ));
+    };
+    let mut buffer = Vec::with_capacity(8 + data_length);
+    buffer.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    buffer.extend_from_slice(&data_length_field.to_le_bytes());
+    buffer.extend_from_slice(&0_u16.to_le_bytes());
+    // The sizes below fit the 16-bit fields because the whole data length does.
+    let to_field = |bytes: usize| u16::try_from(bytes).unwrap_or(0).to_le_bytes();
+    buffer.extend_from_slice(&0_u16.to_le_bytes());
+    buffer.extend_from_slice(&to_field(substitute_bytes));
+    buffer.extend_from_slice(&to_field(substitute_bytes + 2));
+    buffer.extend_from_slice(&to_field(print_bytes));
+    for unit in substitute.iter().chain(&[0]).chain(&print).chain(&[0]) {
+        buffer.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    std::fs::create_dir(link)?;
+    let set = (|| {
+        let directory = OpenOptions::new()
+            .write(true)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(link)?;
+        let mut returned = 0_u32;
+        // SAFETY: the handle is the open directory's own, `buffer` holds the reparse data it is
+        // told, and no output buffer is asked for.
+        let done = unsafe {
+            DeviceIoControl(
+                directory.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr().cast(),
+                u32::try_from(buffer.len()).unwrap_or(0),
+                std::ptr::null_mut(),
+                0,
+                &raw mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if done == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if set.is_err() {
+        let _ = std::fs::remove_dir(link);
+    }
+    set
+}
+
+/// Renames the directory or junction `from` to `to`, replacing a directory or junction that is
+/// named `to`, in one step: a program that opens `to` meanwhile finds the old one or the new one
+/// whole and never neither.
+///
+/// The standard library's rename replaces a directory only through a fall-back after the first
+/// attempt fails, so this asks for what is wanted: the file system's own rename with its flags
+/// to replace what is there and to follow the rules a POSIX rename follows.
+///
+/// # Errors
+///
+/// Returns the operating system's error when `from` cannot be opened or the rename is refused.
+pub(super) fn replace_directory(from: &Path, to: &Path) -> io::Result<()> {
+    let source = OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(from)?;
+    let name: Vec<u16> = std::path::absolute(to)?.as_os_str().encode_wide().collect();
+    let name_bytes = u32::try_from(name.len() * 2)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the path is too long"))?;
+    // The record ends in its name, which is not terminated, so the buffer is the record's size up
+    // to the name and the name; a buffer of 64-bit words is aligned for the record.
+    let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let total = name_at + name.len() * 2 + 2;
+    let mut buffer = vec![0_u64; total.div_ceil(8)];
+    let record = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buffer` is zeroed, aligned for the record and at least `total` bytes long, so the
+    // fixed fields are inside it, and the name's bytes end inside it; nothing else reads it until
+    // the call below.
+    unsafe {
+        (*record).Anonymous.Flags =
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*record).RootDirectory = std::ptr::null_mut();
+        (*record).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr().cast::<u8>(),
+            buffer.as_mut_ptr().cast::<u8>().add(name_at),
+            name.len() * 2,
+        );
+    }
+    // SAFETY: the handle is the open source's own, and `buffer` holds a rename record of `total`
+    // bytes with its name inside.
+    let renamed = unsafe {
+        SetFileInformationByHandle(
+            source.as_raw_handle(),
+            FileRenameInfoEx,
+            buffer.as_ptr().cast(),
+            u32::try_from(total).unwrap_or(0),
+        )
+    };
+    if renamed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Runs `body` with this process refusing to be ended by a console interrupt, so that Ctrl+C and
+/// Ctrl+Break reach only a child that shares the console and not the parent that waits for it.
+///
+/// A handler is installed, never the process-wide "ignore" flag, because that flag is inherited by
+/// the children the process starts, which would then ignore the interrupt as well.
+pub(super) fn while_interrupts_go_to_the_child<T>(body: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+
+    unsafe extern "system" fn handler(kind: u32) -> i32 {
+        i32::from(kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT)
+    }
+    // SAFETY: the handler is a function with the signature the call asks for, and lives for the
+    // whole program.
+    let installed = unsafe { SetConsoleCtrlHandler(Some(handler), 1) } != 0;
+    let answer = body();
+    if installed {
+        // SAFETY: removes the handler added above.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 0);
+        }
+    }
+    answer
+}
+
+/// What a sealed file or directory lets its owner do: read it, list it, run it, and change its
+/// access-control list so as to unseal it. Nothing here writes, appends, deletes or adds a name.
+const OWNER_MAY: u32 = 0x0000_0001 // read data, list a directory
+    | 0x0000_0008 // read extended attributes
+    | 0x0000_0020 // execute, traverse a directory
+    | 0x0000_0080 // read attributes
+    | READ_CONTROL
+    | WRITE_DAC
+    | 0x0010_0000; // synchronise
+
+/// What nothing may do to a sealed file or directory: write data or add a file, append or add a
+/// directory, write extended attributes, delete a name in a directory, write attributes, delete.
+const NOTHING_MAY: u32 = 0x0000_0002 // write data, add a file
+    | 0x0000_0004 // append, add a subdirectory
+    | 0x0000_0010 // write extended attributes
+    | 0x0000_0040 // delete a name in a directory
+    | 0x0000_0100 // write attributes
+    | 0x0001_0000; // delete
+
+/// What the system and the administrators may do to a sealed file or directory: read and run it.
+const OTHERS_MAY_READ: u32 =
+    0x0000_0001 | 0x0000_0008 | 0x0000_0020 | 0x0000_0080 | READ_CONTROL | 0x0010_0000;
+
+/// What an unsealed directory is given back: everything, to its owner.
+const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)";
+
+/// Sets an explicit, protected access-control list, written as SDDL, on the file or directory at
+/// `path` itself, never on what a link there leads to.
+fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
+    let handle = OpenOptions::new()
+        .access_mode(WRITE_DAC | READ_CONTROL)
+        .share_mode(SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is null-terminated and outlives the call, and `descriptor` is a live out
+    // parameter; the size is not asked for.
+    let parsed = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if parsed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut present = 0_i32;
+    let mut defaulted = 0_i32;
+    let mut list = std::ptr::null_mut();
+    // SAFETY: `descriptor` was just built, and the three outputs are live.
+    let got = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut list,
+            &raw mut defaulted,
+        )
+    };
+    let result = if got == 0 || present == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: the handle is the open object's own, and `list` points into `descriptor`, which
+        // is freed after the call.
+        let code = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                list,
+                std::ptr::null_mut(),
+            )
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(code.cast_signed()))
+        }
+    };
+    // SAFETY: `descriptor` was allocated by the conversion above and is freed exactly once.
+    unsafe {
+        LocalFree(descriptor.cast());
+    }
+    result
+}
+
+/// The access-control list of a sealed file or directory, as SDDL.
+fn sealed_list(directory: bool) -> String {
+    let nothing = if directory {
+        NOTHING_MAY
+    } else {
+        NOTHING_MAY & !0x40
+    };
+    format!(
+        "D:P(D;;0x{nothing:x};;;OW)(A;;0x{OWNER_MAY:x};;;OW)(A;;0x{OTHERS_MAY_READ:x};;;SY)(A;;0x{OTHERS_MAY_READ:x};;;BA)"
+    )
+}
+
+/// Seals a file: read-only by attribute, and with an access-control list that gives its owner
+/// read access and nothing that writes, appends, deletes or changes its attributes.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the file cannot be changed.
+pub fn seal_file(path: &Path) -> io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions)?;
+    set_list(path, &sealed_list(false))
+}
+
+/// Seals a directory: an access-control list that gives its owner read access and nothing that adds
+/// a name, removes one or changes the directory.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be changed.
+pub fn seal_directory(path: &Path) -> io::Result<()> {
+    set_list(path, &sealed_list(true))
+}
+
+/// Gives a sealed directory back to its owner whole, so that what is in it can be deleted.
+///
+/// # Errors
+///
+/// Returns the operating system's error when the directory cannot be changed.
+pub fn unseal_directory(path: &Path) -> io::Result<()> {
+    set_list(path, OWNER_ONLY)
+}

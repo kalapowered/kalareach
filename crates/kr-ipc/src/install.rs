@@ -9,7 +9,7 @@
 //! | Path | What it is |
 //! | --- | --- |
 //! | `versions/<release>/` | One release: `bin/`, `shells/`, `share/` and `release.json`, read-only once it is there |
-//! | `current` | A relative symbolic link to the release new processes start from |
+//! | `current` | A relative symbolic link to the release new processes start from; on Windows a directory junction to its directory |
 //! | `staging/` | A release being unpacked and checked, before it is renamed into `versions/` |
 //! | `trash/` | A release being removed, renamed out of `versions/` before anything of it goes |
 //! | `roots/` | The runtime and state roots the control daemons of this store have served (`.root`), those a command of this store has worked in (`.registered`), and the configuration documents either has written or read (`.document`) |
@@ -18,30 +18,38 @@
 //! | `writers.lock` | The lock a command that writes a stored record takes, shared, and an update takes, exclusively, from before it checks the stores to after it switches |
 //!
 //! An update puts the new release beside the old ones and renames a new `current` link over the
-//! old one, and nothing else changes: whatever must follow an update names its path through
+//! old one, in one step, and nothing else changes: whatever must follow an update names its path through
 //! `current` ([`Running::stable`]), and whatever starts another process of its own release names
 //! its release's own directory ([`Running::own`]).
 //!
 //! # Which release a process runs
 //!
 //! The kernel's record of the process's own image says, never the path the process was started
-//! through: `proc_pidpath` on macOS, and `/proc/self/exe` on Linux and `GetModuleFileNameW` on
-//! Windows, which is what the standard library reads on those two ([`image_path`]). On macOS the
-//! standard library returns the path as started, so a `kr` started as `current/bin/kr` moments
-//! before an update would resolve `current` afterwards and find the other release's files beside a
-//! program of this one. Nothing else in the host's own crates asks where its program is.
+//! through: `proc_pidpath` on macOS, `/proc/self/exe` on Linux and `QueryFullProcessImageNameW` on
+//! Windows ([`image_path`]). On macOS and on Windows the standard library returns the path as
+//! started, so a `kr` started as `current/bin/kr` moments before an update would resolve `current`
+//! afterwards and find the other release's files beside a program of this one. Nothing else in the
+//! host's own crates asks where its program is.
 //!
 //! # The hold
 //!
 //! Each host executable of a store takes a shared lock on its release's `release.json` when it
 //! starts ([`this_process`]) and keeps it until it exits; the kernel lets go of it however the
 //! process ends. A release is removed only by whoever takes an exclusive lock on that same file
-//! (`Store::retire`, which a Windows build does not have, since it keeps no store), which no
-//! running process of the release lets happen, and it is renamed out of `versions/` while that lock
-//! is held, before anything is deleted. A process that opened the manifest just as its release was
-//! being removed still gets its shared lock once the remover lets go, so after locking it checks
-//! that `versions/<release>/release.json` is still the very file it locked, and refuses to run when
-//! it is not.
+//! (`Store::retire`), which no running process of the release lets happen, and it is renamed out of
+//! `versions/` while that lock is held, before anything is deleted. A process that opened the
+//! manifest just as its release was being removed still gets its shared lock once the remover lets
+//! go, so after locking it checks that `versions/<release>/release.json` is still the very file it
+//! locked, and refuses to run when it is not.
+//!
+//! On Windows the hold is the open manifest itself: it is opened for reading with a share mode that
+//! allows other handles to read and nothing else, and while it is open neither the manifest nor
+//! any directory above it can be renamed or deleted. Whether a release is held is asked by opening
+//! the manifest with a share mode that allows no other handle, which a holder refuses; a holder
+//! that meets that brief handle waits for it. A running image does not hold its release on
+//! Windows, which lets a directory with a program running from it be renamed, so only the
+//! manifest's hold does. A program of a release whose directory was renamed away reads its image
+//! under `trash/` and refuses to run.
 //!
 //! A process that starts another from its own release holds the release for it until the other
 //! has a hold of its own: the control daemon's hold covers the workers it launches, and an update
@@ -70,8 +78,13 @@
 //! A program that runs outside a store holds nothing, registers nothing and is permitted every
 //! record.
 //!
-//! Windows keeps no store here: a directory link there cannot be replaced in one step by a user
-//! who does not administer the machine, so every Windows process runs as a build outside a store.
+//! # Windows
+//!
+//! `current` is a directory junction, which any account can make, and it is replaced by renaming a
+//! new junction over it with the file system's own replacing rename. A junction names an absolute
+//! path, so a store that is moved or copied has a `current` that names the place it was made for,
+//! and [`Store::current`] refuses it. A store is kept on an NTFS volume. A release is sealed by
+//! attribute and by an access-control list that lets its owner read it and nothing that writes it.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -82,6 +95,10 @@ use std::time::{Duration, Instant};
 use kr_protocol::update::{MANIFEST_FILE, ReleaseManifest, ReleaseName};
 
 pub mod names;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{seal_directory, seal_file, unseal_directory};
 
 /// The store's record, whose presence is what makes a directory a store.
 pub const STORE_RECORD: &str = "install.json";
@@ -218,10 +235,14 @@ pub fn image_path() -> std::io::Result<PathBuf> {
             .map(PathBuf::from)
             .map_err(std::io::Error::other)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        // `/proc/self/exe` on Linux and `GetModuleFileNameW` on Windows: the kernel's own record of
-        // the image, which is what this module is for.
+        windows::image_path()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        // `/proc/self/exe` on Linux: the kernel's own record of the image, which is what this
+        // module is for.
         std::env::current_exe()
     }
 }
@@ -458,15 +479,12 @@ impl Placed {
     /// Where `image` is in a store: anywhere under the `versions/`, `staging/` or `trash/` of a
     /// directory that holds a store record. The nearest such directory above the image decides.
     fn of(image: &Path) -> Option<Self> {
-        if cfg!(windows) {
-            return None;
-        }
         let mut below = image;
         for holder in image.ancestors().skip(1) {
             let place = match holder.file_name().and_then(OsStr::to_str) {
-                Some(VERSIONS) => Some(Place::Versions),
-                Some(STAGING) => Some(Place::Staging),
-                Some(TRASH) => Some(Place::Trash),
+                Some(name) if names_alike(name, VERSIONS) => Some(Place::Versions),
+                Some(name) if names_alike(name, STAGING) => Some(Place::Staging),
+                Some(name) if names_alike(name, TRASH) => Some(Place::Trash),
                 _ => None,
             };
             if let (Some(place), Some(root)) = (place, holder.parent()) {
@@ -477,7 +495,13 @@ impl Placed {
                         place,
                         release_directory: below.to_path_buf(),
                         release_directory_name: below.file_name()?.to_os_string(),
-                        in_bin: image.parent() == Some(below.join("bin").as_path()),
+                        in_bin: image.parent().is_some_and(|parent| {
+                            parent.parent() == Some(below)
+                                && parent
+                                    .file_name()
+                                    .and_then(OsStr::to_str)
+                                    .is_some_and(|name| names_alike(name, "bin"))
+                        }),
                     });
                 }
             }
@@ -487,9 +511,18 @@ impl Placed {
     }
 }
 
+/// Whether a directory is named as the store names it. Windows file systems do not tell capitals
+/// from small letters, so a program started through `VERSIONS` is one of `versions`.
+fn names_alike(found: &str, expected: &str) -> bool {
+    if cfg!(windows) {
+        found.eq_ignore_ascii_case(expected)
+    } else {
+        found == expected
+    }
+}
+
 /// How long a starting program waits for a removal or replacement of its release, which holds the
 /// release's manifest exclusively while it moves the release, before it refuses to start.
-#[cfg(unix)]
 const HOLD_WAIT: Duration = Duration::from_secs(30);
 
 /// Opens a file of a release for reading without following a link or waiting for a writer, and
@@ -526,14 +559,16 @@ pub fn open_regular_file(path: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-/// Opens a file of a release for reading.
+/// Opens a file of a release for reading without following a link, and checks that it is a regular
+/// file on a disk.
 ///
 /// # Errors
 ///
-/// Returns the operating system's error.
+/// Returns the operating system's error, [`std::io::ErrorKind::NotFound`] among them, and an error
+/// of kind `InvalidData` for a link and for anything but a regular file.
 #[cfg(windows)]
 pub fn open_regular_file(path: &Path) -> std::io::Result<File> {
-    File::open(path)
+    windows::open_regular_file(path)
 }
 
 /// Reads a file of a release whole, refusing what [`open_regular_file`] refuses and one longer
@@ -656,9 +691,52 @@ fn read_manifest(file: &File, path: &Path, release: &ReleaseName) -> Result<Rele
     Ok(manifest)
 }
 
-#[cfg(not(unix))]
-fn hold(_store: &Store, _release: &ReleaseName) -> Result<(File, ReleaseManifest)> {
-    Err(InstallError::Unsupported)
+/// Opens a release's manifest to hold the release, and checks that the file held is still the
+/// release's manifest.
+#[cfg(windows)]
+fn hold(store: &Store, release: &ReleaseName) -> Result<(File, ReleaseManifest)> {
+    hold_within(store, release, HOLD_WAIT)
+}
+
+/// [`hold`], waiting up to `within` for a brief handle on the manifest, or a removal that has not
+/// finished, to let go.
+#[cfg(windows)]
+fn hold_within(
+    store: &Store,
+    release: &ReleaseName,
+    within: Duration,
+) -> Result<(File, ReleaseManifest)> {
+    let path = store.manifest(release);
+    let file = windows::open_for_hold(&path, within).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InstallError::Replaced {
+                path: path.clone(),
+                reason: "is gone: this release was removed from this host after this program \
+                         started",
+            }
+        } else if windows::is_sharing_violation(&error) {
+            InstallError::Replaced {
+                path: path.clone(),
+                reason: "is being removed or replaced, and that has not finished: this program of \
+                         it does not start",
+            }
+        } else {
+            InstallError::io("open", &path, error)
+        }
+    })?;
+    let named = windows::open_regular_file(&path)
+        .ok()
+        .and_then(|named| windows::identity(&named).ok());
+    let held = windows::identity(&file).map_err(|error| InstallError::io("read", &path, error))?;
+    if named != Some(held) {
+        return Err(InstallError::Replaced {
+            path,
+            reason: "is no longer the file this program locked: its release was removed or \
+                     replaced while it started",
+        });
+    }
+    let manifest = read_manifest(&file, &path, release)?;
+    Ok((file, manifest))
 }
 
 /// How a lock file is locked.
@@ -904,6 +982,8 @@ impl Store {
     ///
     /// Returns [`InstallError::Io`] when a directory cannot be created, or is not owner-only.
     pub fn create_directories(&self) -> Result<()> {
+        #[cfg(windows)]
+        self.require_ntfs()?;
         for directory in [
             self.root.clone(),
             self.versions(),
@@ -922,6 +1002,27 @@ impl Store {
         Ok(())
     }
 
+    /// Refuses a store whose place is not on an NTFS volume: its `current` is a junction replaced
+    /// by the file system's own rename, and the store's files are read-only by access-control
+    /// list, which other file systems do not give the same meaning.
+    #[cfg(windows)]
+    fn require_ntfs(&self) -> Result<()> {
+        // The nearest directory that exists decides, since the store's own may not be made yet.
+        let existing = self
+            .root
+            .ancestors()
+            .find(|directory| directory.is_dir())
+            .unwrap_or(&self.root);
+        match windows::is_ntfs(existing) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(InstallError::Replaced {
+                path: self.root.clone(),
+                reason: "is not on an NTFS volume, which is where a Windows host keeps its store of releases",
+            }),
+            Err(error) => Err(InstallError::io("read the volume of", &self.root, error)),
+        }
+    }
+
     /// The release `current` names, where it names one.
     ///
     /// # Errors
@@ -935,8 +1036,19 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(InstallError::io("read the link", &link, error)),
         };
+        self.release_named_by(&target)
+            .map(Some)
+            .ok_or(InstallError::Replaced {
+                path: link,
+                reason: "names something other than a release of this store",
+            })
+    }
+
+    /// The release a link to `target` names, where it names one of this store.
+    #[cfg(unix)]
+    fn release_named_by(&self, target: &Path) -> Option<ReleaseName> {
         let mut parts = target.components();
-        let release = match (parts.next(), parts.next(), parts.next()) {
+        match (parts.next(), parts.next(), parts.next()) {
             (
                 Some(std::path::Component::Normal(versions)),
                 Some(std::path::Component::Normal(name)),
@@ -945,11 +1057,16 @@ impl Store {
                 name.to_str().and_then(|name| ReleaseName::new(name).ok())
             }
             _ => None,
-        };
-        release.map(Some).ok_or(InstallError::Replaced {
-            path: link,
-            reason: "names something other than a release of this store",
-        })
+        }
+    }
+
+    /// The release a junction to `target` names, where it names one of this store: a directory
+    /// directly inside this store's `versions`, however the two paths are spelled.
+    #[cfg(windows)]
+    fn release_named_by(&self, target: &Path) -> Option<ReleaseName> {
+        let name = target.file_name()?.to_str()?;
+        let release = ReleaseName::new(name).ok()?;
+        windows::same_object(target.parent()?, &self.versions()).then_some(release)
     }
 
     /// Every release in `versions/`, by name, in name order.
@@ -1564,7 +1681,15 @@ pub struct RecordedDocument {
 /// A shared hold on a release of a store, taken for a program that is about to start from it.
 #[derive(Debug)]
 pub struct Pin {
-    /// The release's manifest, opened and held.
+    /// The release's manifest, opened and held. Where a process replaces itself it is passed on to
+    /// the program that takes over; on Windows it is kept open until the program has ended.
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "held and never read: closing it lets the release go"
+        )
+    )]
     file: File,
     manifest: ReleaseManifest,
 }
@@ -1861,57 +1986,196 @@ pub fn hold_writers(
     }
 }
 
-/// The part of a store a Windows host does not keep yet.
 #[cfg(windows)]
 impl Store {
-    /// Makes `release` current.
+    /// Makes `release` current: one new junction, renamed over `current` in one step, and the
+    /// store's directory flushed so the rename survives a crash. Nothing else changes.
+    ///
+    /// `update` is the update lock, so what `current` names stays what an install or an update
+    /// found it to be for as long as that holds it. `install` is the install lock, taken
+    /// exclusively: nothing starts a control daemon of this store while `current` changes.
+    /// `writers` is the writers' lock, taken exclusively: no command writes a stored record
+    /// meanwhile, and the next one to do so is judged by the release this makes current.
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Unsupported`].
+    /// Returns [`InstallError::Io`] when the junction cannot be made, renamed or flushed, and
+    /// [`InstallError::Replaced`] when the release is not in this store or the store is not on an
+    /// NTFS volume.
     pub fn switch(
         &self,
-        _release: &ReleaseName,
-        _update: &StoreLock,
-        _install: &ExclusiveInstall,
-        _writers: &ExclusiveWriters,
+        release: &ReleaseName,
+        update: &StoreLock,
+        install: &ExclusiveInstall,
+        writers: &ExclusiveWriters,
     ) -> Result<()> {
-        Err(InstallError::Unsupported)
+        debug_assert_eq!(update.path, self.root.join("update.lock"));
+        debug_assert_eq!(install.0.path, self.root.join("install.lock"));
+        debug_assert_eq!(writers.0.path, self.root.join(WRITERS_LOCK));
+        if !self.manifest(release).is_file() {
+            return Err(InstallError::Replaced {
+                path: self.release_directory(release),
+                reason: "is not a release of this store",
+            });
+        }
+        self.require_ntfs()?;
+        // A junction a crash left beside `current` is of no use to anyone, and is taken away.
+        if let Ok(entries) = std::fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&format!(".{CURRENT}-")))
+                {
+                    let _ = std::fs::remove_dir(entry.path());
+                }
+            }
+        }
+        let target = std::path::absolute(self.release_directory(release))
+            .map_err(|error| InstallError::io("resolve", self.release_directory(release), error))?;
+        let temporary = self.root.join(format!(".{CURRENT}-{}", crate::new_uuid()));
+        windows::create_junction(&temporary, &target)
+            .map_err(|error| InstallError::io("make the link", &temporary, error))?;
+        if let Err(error) = windows::replace_directory(&temporary, &self.current_link()) {
+            let _ = std::fs::remove_dir(&temporary);
+            return Err(InstallError::io("rename", self.current_link(), error));
+        }
+        sync_directory(&self.root)
     }
 
     /// Whether a running process holds `release`.
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Unsupported`].
-    pub fn held(&self, _release: &ReleaseName) -> Result<bool> {
-        Err(InstallError::Unsupported)
+    /// Returns [`InstallError::Io`] when its manifest cannot be opened for any reason but a
+    /// holder.
+    pub fn held(&self, release: &ReleaseName) -> Result<bool> {
+        let path = self.manifest(release);
+        windows::is_held(&path).map_err(|error| InstallError::io("open", &path, error))
     }
 
-    /// Holds `release` for a program that is about to start from it.
+    /// Holds `release` for a program that is about to start from it, without waiting.
+    ///
+    /// The hold is the one a program of the release takes for itself, so an update that retires
+    /// releases leaves this one while the pin lives. A release that is gone, or that an update is
+    /// removing or replacing, is not pinned: the caller goes on without it, and never waits for it.
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Unsupported`].
-    pub fn pin(&self, _release: &ReleaseName) -> Result<Option<Pin>> {
-        Err(InstallError::Unsupported)
+    /// Returns [`InstallError::Io`] when the manifest cannot be opened for any reason but a holder
+    /// or a missing file, and [`InstallError::Manifest`] for a manifest this build does not read.
+    pub fn pin(&self, release: &ReleaseName) -> Result<Option<Pin>> {
+        match hold_within(self, release, Duration::ZERO) {
+            Ok((file, manifest)) => Ok(Some(Pin { file, manifest })),
+            Err(InstallError::Replaced { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
-    /// Removes a release no running process holds.
+    /// Removes a release no running process holds, and says whether it did. Whatever else is at
+    /// the release's name, a link or a file, is removed as a name only.
+    ///
+    /// A release nothing holds is renamed into `trash/` in one step. The rename is refused while
+    /// any handle on a file inside the release allows no delete, which every hold does, so a hold
+    /// taken after the check that nothing holds the release keeps the release where it is, and a
+    /// program that opens the manifest after the rename finds no release. Only then is anything
+    /// deleted. A program running from the release, or one whose working directory is inside it,
+    /// holds no manifest: the rename is refused while the second is there, and the first, which the
+    /// system lets be renamed, is a program the delete cannot finish removing, so the release stays
+    /// in `trash/` until a later sweep.
+    ///
+    /// `_held` is the update lock: releases are removed by one update at a time.
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Unsupported`].
-    pub fn retire(&self, _release: &ReleaseName, _held: &StoreLock) -> Result<bool> {
-        Err(InstallError::Unsupported)
+    /// Returns [`InstallError::Io`] when the release cannot be moved or deleted for any reason but
+    /// a program that has it open.
+    pub fn retire(&self, release: &ReleaseName, _held: &StoreLock) -> Result<bool> {
+        let directory = self.release_directory(release);
+        // A release is a directory. Anything else under its name, a link above all, is not one:
+        // the name is taken away and whatever it pointed at is left as it was, never followed.
+        let about = std::fs::symlink_metadata(&directory)
+            .map_err(|error| InstallError::io("read", &directory, error))?;
+        if !about.file_type().is_dir() {
+            std::fs::remove_dir(&directory)
+                .or_else(|_| std::fs::remove_file(&directory))
+                .map_err(|error| InstallError::io("remove", &directory, error))?;
+            sync_directory(&self.versions())?;
+            return Ok(true);
+        }
+        if self.held(release)? {
+            return Ok(false);
+        }
+        crate::paths::create_private_directory(&self.trash()).map_err(|error| {
+            InstallError::io(
+                "create the store directory",
+                self.trash(),
+                std::io::Error::other(error),
+            )
+        })?;
+        let removed = self
+            .trash()
+            .join(format!("{release}-{}", crate::new_uuid()));
+        match std::fs::rename(&directory, &removed) {
+            Ok(()) => {}
+            Err(error) if windows::is_in_use(&error) => return Ok(false),
+            Err(error) => return Err(InstallError::io("move", &directory, error)),
+        }
+        sync_directory(&self.versions())?;
+        // What a running program keeps from being deleted stays in the trash for the next sweep.
+        if let Err(InstallError::Io { source, .. }) = remove_tree(&removed)
+            && !windows::is_in_use(&source)
+        {
+            return Err(InstallError::io("remove", &removed, source));
+        }
+        Ok(true)
+    }
+
+    /// Deletes what earlier removals left in `trash/` because a program was running from it, and
+    /// leaves what still is.
+    ///
+    /// `_held` is the update lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstallError::Io`] when the directory cannot be read.
+    pub fn sweep_trash(&self, _held: &StoreLock) -> Result<()> {
+        let trash = self.trash();
+        let entries = match std::fs::read_dir(&trash) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(InstallError::io("read", &trash, error)),
+        };
+        for entry in entries.flatten() {
+            let _ = remove_tree(&entry.path());
+        }
+        Ok(())
     }
 }
 
 #[cfg(windows)]
 impl Pin {
-    /// Runs `command` with the release held until it ends.
-    pub fn run(self, _command: &mut std::process::Command) -> std::io::Error {
-        std::io::Error::other(InstallError::Unsupported)
+    /// Runs `command`, which is a program of the pinned release, with the release held until the
+    /// program ends, and ends this process with its exit code. Returns only when the program could
+    /// not be started, with the reason.
+    ///
+    /// Windows has no call that replaces a process by another, so this process stays and waits,
+    /// and Ctrl+C and Ctrl+Break reach the program and not this process, which has nothing to do
+    /// with them. The release is held from this pin until the program has a hold of its own, as
+    /// where a process replaces itself; and if this process is ended first, the program that is
+    /// left takes its own hold on starting and is refused when the release has been removed.
+    pub fn run(self, command: &mut std::process::Command) -> std::io::Error {
+        let ended = windows::while_interrupts_go_to_the_child(|| -> std::io::Result<i32> {
+            let mut program = command.spawn()?;
+            Ok(program.wait()?.code().unwrap_or(1))
+        });
+        match ended {
+            Ok(code) => {
+                drop(self);
+                std::process::exit(code)
+            }
+            Err(error) => error,
+        }
     }
 }
 
@@ -1921,6 +2185,34 @@ fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)
         .and_then(|opened| opened.sync_all())
         .map_err(|error| InstallError::io("flush", directory, error))
+}
+
+/// Flushes a directory, so a name just added to it or taken out of it survives a crash.
+#[cfg(windows)]
+fn sync_directory(directory: &Path) -> Result<()> {
+    kr_flush::flush_directory(directory, kr_flush::NameKind::Directory)
+        .map_err(|error| InstallError::io("flush", directory, error))
+}
+
+/// Deletes a release that was moved out of `versions/`, its directories given back to their owner
+/// first, since a release is sealed. Only directories are changed: a file inside is never touched
+/// by its path, because a hard link to a file outside the release would carry the change there.
+#[cfg(windows)]
+fn remove_tree(directory: &Path) -> Result<()> {
+    fn unsealed(directory: &Path) -> std::io::Result<()> {
+        windows::unseal_directory(directory)?;
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                unsealed(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    unsealed(directory)
+        .and_then(|()| std::fs::remove_dir_all(directory))
+        .map_err(|error| InstallError::io("remove", directory, error))
 }
 
 /// Deletes a release that was moved out of `versions/`, its directories made writable first, since
