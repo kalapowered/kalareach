@@ -2165,20 +2165,20 @@ pub enum PairingConsumedReason {
     HostRestarted,
 }
 
-/// A stored backup checkpoint a pairing transfers.
+/// A device's checkpoint of the latest backup generation it has seen.
 ///
-/// A fresh client needs a trusted latest-generation checkpoint to detect a service replaying an
-/// older valid backup. Pairing is where that checkpoint moves between devices.
+/// A client that holds a trusted latest-generation checkpoint can detect a service replaying an
+/// older valid backup, and carries the checkpoint with its fetch of a generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationCheckpoint {
     /// The archive the checkpoint describes.
     pub archive_id: ArchiveId,
-    /// The latest generation the sending device has seen.
+    /// The latest generation the device has seen.
     pub backup_generation: BackupGeneration,
     /// The hash of that generation's encrypted manifest.
     pub encrypted_manifest_hash: Digest256,
-    /// When the sending device observed it, in UTC milliseconds.
+    /// When the device observed it, in UTC milliseconds.
     pub observed_at_ms: TimestampMs,
 }
 

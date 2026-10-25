@@ -17718,7 +17718,7 @@
     },
     "GenerationCheckpoint": {
       "additionalProperties": false,
-      "description": "A stored backup checkpoint a pairing transfers.\n\nA fresh client needs a trusted latest-generation checkpoint to detect a service replaying an\nolder valid backup. Pairing is where that checkpoint moves between devices.",
+      "description": "A device's checkpoint of the latest backup generation it has seen.\n\nA client that holds a trusted latest-generation checkpoint can detect a service replaying an\nolder valid backup, and carries the checkpoint with its fetch of a generation.",
       "properties": {
         "archive_id": {
           "$ref": "#/$defs/ArchiveId",
@@ -17726,7 +17726,7 @@
         },
         "backup_generation": {
           "$ref": "#/$defs/BackupGeneration",
-          "description": "The latest generation the sending device has seen."
+          "description": "The latest generation the device has seen."
         },
         "encrypted_manifest_hash": {
           "$ref": "#/$defs/Digest256",
@@ -17734,7 +17734,7 @@
         },
         "observed_at_ms": {
           "$ref": "#/$defs/TimestampMs",
-          "description": "When the sending device observed it, in UTC milliseconds."
+          "description": "When the device observed it, in UTC milliseconds."
         }
       },
       "required": [

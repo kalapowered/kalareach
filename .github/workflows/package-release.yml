@@ -68,8 +68,8 @@ jobs:
           cargo --version
 
       # A level is one surface, so a release is made only of a commit that has the surface of every
-      # release at its level that is not excluded. The generator is built first, so that no tag can
-      # land between fetching the tags and comparing them with origin's while it compiles.
+      # release at its level. The generator is built first, so that no tag can land between
+      # fetching the tags and comparing them with origin's while it compiles.
       - name: Build the release checks
         run: cargo build --locked -p kr-protocol --bin kr-protocol-gen
 

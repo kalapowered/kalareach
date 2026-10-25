@@ -16192,10 +16192,10 @@ export interface BootIdentity6 {
   value: string
 }
 /**
- * A stored backup checkpoint a pairing transfers.
+ * A device's checkpoint of the latest backup generation it has seen.
  *
- * A fresh client needs a trusted latest-generation checkpoint to detect a service replaying an
- * older valid backup. Pairing is where that checkpoint moves between devices.
+ * A client that holds a trusted latest-generation checkpoint can detect a service replaying an
+ * older valid backup, and carries the checkpoint with its fetch of a generation.
  */
 export interface GenerationCheckpoint {
   /**
@@ -16203,7 +16203,7 @@ export interface GenerationCheckpoint {
    */
   archive_id: string
   /**
-   * The latest generation the sending device has seen.
+   * The latest generation the device has seen.
    */
   backup_generation: string
   /**

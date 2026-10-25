@@ -150,8 +150,8 @@ works with a worker of another at the same level; the upgrade suite does not dri
 
 `kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with `git
 ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares the
-commit with every release at its level that the record of exclusions does not name, whether or not
-the commit's history reaches it. It fails naming the release and each difference, in the schema
+commit with every release at its level, whether or not the commit's history reaches it. It fails
+naming the release and each difference, in the schema
 (cut over both revisions' roots, so that a root that was dropped cannot hide a change), in the
 tables of what the worker serves (renaming an event, or serving a method no longer, changes no
 definition of the schema), in the plugin host protocol and in the table of public majors. A release
@@ -172,26 +172,6 @@ again, after a new fetch, just before it publishes. Run it before the tag too, a
 does. A tag the check refuses stays in every list until it is deleted. Delete a refused tag that was
 never published from origin and from every clone, and tag the corrected commit.
 
-### Releases a level's contract does not cover
-
-Level 0.76 was released before its last planned change had landed. `packages/v0.76.0+d3a552aa2ea6`
-and `packages/v0.76.0+53a2e0be5111` each speak a surface without `ForwardedMutation.lease`, which the
-level has. They stay published, since a published release stays where it is, and
-`crates/kr-protocol/retained/EXCLUDED` records them as excluded. The record gives for each the tag,
-its full commit, its level, the digest of the surface its own schema has, and why. It is closed to
-these two tags. It is read and checked: each digest against the tag's own schema, each tag against
-the inventory, and an excluded release against the kept releases of its level, each of which has to
-have it in its history. A level that has no kept release is refused. Release selection, the cut's
-comparison, the in-level check and the upgrade suite skip what it names, and the public-contract
-report does not.
-
-The record is removed with every reader of it at the 0.78 cut, and `kr-protocol-gen --check` fails
-once its level is neither this build's nor a retained one. No host build was released from either
-commit: they carry only the TypeScript archives. A host built at one of them drains its workers before an update
-or a rollback; see [the support window](support-window.md#a-host-built-at-an-excluded-release).
-The npm publish runs for the two tags were cancelled and nobody re-runs or approves them. npm takes
-one archive per version, and the three 0.76.0 plugin SDK archives are the same.
-
 ### The public contract
 
 The package publishes every type of the schema, and a client built from one release meets a host of
@@ -209,7 +189,7 @@ variant added to a closed object, a member, a variant or a definition removed, a
 No client was released, so no shim carries it.
 
 Until `crates/kr-protocol/retained/PUBLIC_FREEZE` exists, the references are the releases at the
-commit's level, the excluded ones included, and the check reports and does not fail. That file,
+commit's level, and the check reports and does not fail. That file,
 `release=<tag>`, is made at the first client release. From then the references are that release and
 every later one that shares a public major that is not retired with the commit, and a difference
 fails the check. It fails at all times when it cannot read what it compares.

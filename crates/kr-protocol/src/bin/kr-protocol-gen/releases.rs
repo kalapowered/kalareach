@@ -147,6 +147,15 @@ pub fn inventory(repository: &Path) -> Result<Vec<Release>, String> {
     Ok(releases)
 }
 
+/// The releases of `level`, leaving out the one at `except`, in the order of their tags.
+pub fn kept(inventory: &[Release], level: CompatibilityLevel, except: &str) -> Vec<Release> {
+    inventory
+        .iter()
+        .filter(|release| release.level() == level && release.commit != except)
+        .cloned()
+        .collect()
+}
+
 /// The text of `path` as `commit` has it; none where the commit has no such file.
 ///
 /// # Errors
