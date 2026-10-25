@@ -362,7 +362,7 @@ impl Host {
 
     /// Turns privacy mode off, which is refused while a live session still owes cleanup, until it
     /// is accepted. Accepted means recorded: the change can still report that it is not finished
-    /// taking effect, as it does for good while a session whose worker ended owes its cleanup.
+    /// taking effect.
     fn privacy_off(&self) {
         let started = Instant::now();
         loop {
@@ -838,53 +838,47 @@ async fn privacy_mode_on_leaves_every_session_out_of_the_content_export() {
     );
 }
 
-/// KR-REQ-29.04: a session whose worker had ended when privacy mode went on stays out after privacy
-/// mode is off, because what it kept is the archive's; a session that ran through the private
-/// interval and owes nothing is in, and so is one created since. The controls are the two that are
-/// in.
+/// KR-REQ-29.04: a session whose worker had ended when privacy mode went on is settled by the
+/// archive, which removes what the worker retained, and owes nothing afterwards: it is in the
+/// content export once privacy mode is off, as a session that ran through the private interval and
+/// one created since are. While its removal was owed it was out, which the privacy cases of the
+/// daemon show; here the export after privacy mode is off leaves nobody out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_session_whose_worker_had_ended_stays_out_after_privacy_mode_is_off() {
+async fn a_session_whose_worker_had_ended_is_settled_by_the_archive_and_is_exported_after_privacy_mode_is_off()
+ {
     let host = Host::start().await;
     let ended = host.create();
     host.close(&ended);
     let through = host.create();
 
     host.privacy_on(&[&through]);
-    // The daemon takes a session whose worker has gone for ended on its own pass, so wait for it
-    // to say so; it keeps saying so for good, which is what the test needs.
-    let owes = |report: &Value| {
-        report["sessions"].as_array().is_some_and(|owing| {
-            owing.iter().any(|owed| {
-                owed["session_id"].as_str() == Some(ended.as_str())
-                    && owed["standing"]["state"] == "worker_ended"
+    // The daemon takes a session whose worker has gone for ended on its own pass, and has the
+    // archive remove what it kept, so wait for the report to stop owing it.
+    host.privacy_until("the closed session's cleanup done", |report| {
+        report["completion"]["state"] == "complete"
+            && report["sessions"].as_array().is_some_and(|owing| {
+                owing
+                    .iter()
+                    .all(|owed| owed["session_id"].as_str() != Some(ended.as_str()))
             })
-        })
-    };
-    host.privacy_until("the closed session's cleanup owed for good", owes);
+    });
     host.privacy_off();
-    let report = host.kr_json(&["privacy", "status"]);
-    assert!(
-        owes(&report),
-        "it outlasts turning privacy mode off: {report}"
-    );
     let since = host.create();
 
     let bundle = host.bundle("after.tar");
     let mut listed = bundle.sessions();
     listed.sort();
-    let mut expected = vec![through, since];
+    let mut expected = vec![ended, through, since];
     expected.sort();
     assert_eq!(listed, expected, "{}", bundle.said());
     assert!(
-        bundle
-            .said()
-            .contains("1 session left out: privacy cleanup is still owed"),
-        "{}",
+        !bundle.said().contains("left out"),
+        "nothing is left out: {}",
         bundle.said()
     );
     assert_eq!(
         left_out(&bundle),
-        serde_json::json!([{"reason": "owes_privacy_cleanup", "sessions": 1}]),
+        serde_json::json!([]),
         "{}",
         bundle.document()
     );
