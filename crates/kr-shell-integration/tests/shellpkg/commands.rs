@@ -1521,6 +1521,65 @@ pub fn a_name_the_person_has_defined_is_never_asked_about(kind: ShellKind) {
     assert_eq!(probes.launches().len(), launches);
 }
 
+/// A handler of the person's own that runs once the engine has found a command, and counts the
+/// commands it is asked about, by name.
+const OWN_AFTER_LOOKUP_HANDLER: &str = r#"
+$global:KrFound = @{}
+$ExecutionContext.InvokeCommand.PostCommandLookupAction = {
+    param($CommandName, $EventArgs)
+    $global:KrFound[$CommandName] = 1 + [int]$global:KrFound[$CommandName]
+}
+"#;
+
+/// KR-REQ-12.07: a handler the person set to run after the engine finds a command is asked about a
+/// command once, however the integration decides what to do with it. The module looks at what the
+/// engine would run for a name before it asks the worker, and that look is the module's own: a
+/// handler asked by it would be asked again by the lookup that runs the command, and one that
+/// does something each time, such as counting or choosing differently, would do it twice.
+///
+/// The program the worker takes no interest in is the case that fails when the look is a lookup of
+/// the person's: nothing is substituted, so the engine's own lookup follows. The control is a
+/// program the worker takes, which the launcher runs in place.
+pub fn a_handler_the_person_runs_after_the_search_is_asked_once_about_a_command_left_alone(
+    kind: ShellKind,
+) {
+    assert_eq!(
+        kind,
+        ShellKind::PowerShell,
+        "only PowerShell looks names up"
+    );
+    let package = Package::built(kind);
+    let probes = Probes::new();
+    let mut session = a_session_with_probes_and(&package, &probes, OWN_AFTER_LOOKUP_HANDLER);
+    let counted = |session: &mut Session, name: &str, times: u32| {
+        let reading = format!("Write-Output ('kr-' + 'found-' + [int]$global:KrFound['{name}'])");
+        assert!(
+            session.run(&reading, &format!("kr-found-{times}")),
+            "the person's handler was asked about {name:?} a number of times other than {times}:\n{}",
+            session.terminal_output()
+        );
+    };
+
+    // The worker has no backend for the program, so the shell runs it as typed.
+    let asked = session.run_asking("kr-probe left-alone", "probe-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    assert_eq!(probes.runs().len(), 1);
+    counted(&mut session, "kr-probe", 1);
+
+    // The worker takes the program, and the launcher runs it in place of the shell's own start.
+    session.commands.policy = ResolvePolicy::Backend {
+        launcher: told(&probes.launcher()),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let asked = session.run_asking("kr-probe taken", "launcher-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    assert_eq!(probes.launches().len(), 1);
+    // The lookup that runs this command is the engine's one, and the module's own look at the
+    // program is not another: the handler has been asked once about each of the two commands.
+    counted(&mut session, "kr-probe", 2);
+}
+
 /// The shell's own `read` reading a line through the editor.
 fn reading_through_the_editor(kind: ShellKind) -> &'static str {
     match kind {

@@ -77,9 +77,12 @@ $script:Hooks = @{
     ReadLineInstalled  = $false
     # The command-lookup handler this module puts in front of the person's own, the person's own
     # (called first, and left standing when this module goes), and the handler as the engine holds
-    # it, to tell whether the person has replaced it since.
+    # it, to tell whether the person has replaced it since. A handler of the person's that was set
+    # after this module's and calls it keeps reaching it when the hooks go, and the person's own
+    # behind it keeps being called: LookupLive says whether it still does anything of its own.
     LookupPrior        = $null
     LookupInstalled    = $null
+    LookupLive         = $false
     # Held while this module asks the engine what a name is, which looks the name up again.
     LookupBusy         = $false
     # What the one substituted command runs: the program, the vector it was asked about, the answer.
@@ -1440,6 +1443,25 @@ function Test-KrApplicationOnPath {
     $false
 }
 
+# What the engine finds first for a name, asked without the person's handler for the commands it has
+# found. Asking is a lookup, and a lookup calls that handler; when nothing is substituted the
+# engine's own lookup follows and calls it again, so a handler that counts, or chooses differently
+# each time, would be called twice for one command. It is asked once, by the lookup that runs the
+# command. The handler for names that are not found is not asked here either, since the caller has
+# found the name on the search path first. The handler for the lookup's start is this module's own,
+# which returns at once while this module is asking.
+function Get-KrFoundCommand {
+    param([string]$Name)
+    $invoke = $ExecutionContext.InvokeCommand
+    $after = $invoke.PostCommandLookupAction
+    $invoke.PostCommandLookupAction = $null
+    try {
+        $invoke.GetCommand($Name, [System.Management.Automation.CommandTypes]::All)
+    } finally {
+        $invoke.PostCommandLookupAction = $after
+    }
+}
+
 # The block that runs one integrated command, or nothing when the command is to run as it was typed.
 #
 # What decides is the line and what the engine would have run for it: the line is one command whose
@@ -1457,7 +1479,7 @@ function Get-KrLookupSubstitute {
     [string[]]$words = @($line.RouteWords)
     if (-not (Test-KrApplicationOnPath $Name)) { return $null }
     $types = [System.Management.Automation.CommandTypes]
-    $found = $ExecutionContext.InvokeCommand.GetCommand($Name, $types::All)
+    $found = Get-KrFoundCommand $Name
     if ($null -eq $found -or $found.CommandType -ne $types::Application) { return $null }
     $program = "$($found.Source)"
     $launch = Resolve-KalaReachCommand -Origin 'Runspace' -Name $Name -Arguments $words -Executable $program
@@ -1509,6 +1531,7 @@ $script:LookupHandler = {
     if ($script:Hooks.LookupBusy) { return }
     $prior = $script:Hooks.LookupPrior
     if ($null -ne $prior) { $prior.Invoke($CommandName, $EventArgs) }
+    if (-not $script:Hooks.LookupLive) { return }
     if ($EventArgs.StopSearch -or $null -ne $EventArgs.Command -or $null -ne $EventArgs.CommandScriptBlock) { return }
     if (-not $script:Line.Running -or "$($EventArgs.CommandOrigin)" -cne 'Runspace') { return }
     $script:Hooks.LookupBusy = $true
@@ -1542,23 +1565,29 @@ function Install-KrLookupHandler {
         if (-not [object]::ReferenceEquals($current, $script:Hooks.LookupInstalled)) {
             Write-KrTrace 'the lookup handler was replaced by the person''s own; commands run as typed unless it calls this one'
         }
+        # Hooks that go live again after a removal that could not take the handler out answer in it.
+        $script:Hooks.LookupLive = $true
         return
     }
     $script:Hooks.LookupPrior = $current
     $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:LookupHandler
     $script:Hooks.LookupInstalled = $ExecutionContext.InvokeCommand.PreCommandLookupAction
+    $script:Hooks.LookupLive = $true
     Write-KrTrace ("lookup handler installed in front of " + $(if ($null -eq $current) { 'nothing' } else { 'the person''s own' }))
 }
 
 # Takes the handler off, and puts back the person's own only if this module's is still the one the
-# engine holds.
+# engine holds. When a handler of the person's that was set after this module's holds the engine, it
+# may call this module's, and this module's then goes on calling the handler that was in front of it
+# and does nothing else, so that the person's chain is as it was before the hooks went in.
 function Remove-KrLookupHandler {
     if ($null -eq $script:Hooks.LookupInstalled) { return }
+    $script:Hooks.LookupLive = $false
     if ([object]::ReferenceEquals($ExecutionContext.InvokeCommand.PreCommandLookupAction, $script:Hooks.LookupInstalled)) {
         $ExecutionContext.InvokeCommand.PreCommandLookupAction = $script:Hooks.LookupPrior
+        $script:Hooks.LookupInstalled = $null
+        $script:Hooks.LookupPrior = $null
     }
-    $script:Hooks.LookupInstalled = $null
-    $script:Hooks.LookupPrior = $null
 }
 
 function Invoke-KalaReachService {
