@@ -1,7 +1,7 @@
 {
   "name": "client-encodings",
   "profile": "kr-vt/1",
-  "description": "KR-REQ-08.59. The bytes the client's input encoder spells a key as under the ordinary encoding, modifyOtherKeys and the Kitty keyboard protocol, written by hand from xterm's control sequence documentation and the Kitty protocol's specification. They are not the encoder's output: kr-client's tests check the encoder against them. A case with `refused` is one the encoder must not spell, and `release` is the key coming up with the modifiers and locks it comes up with.",
+  "description": "KR-REQ-08.59. The bytes the client's input encoder spells a key as under the ordinary encoding, modifyOtherKeys and the Kitty keyboard protocol, written by hand from xterm's control sequence documentation and the Kitty protocol's specification. They are not the encoder's output: the tests of kr-keys check the encoder against them. A case with `refused` is one the encoder must not spell, and `release` is the key coming up with the modifiers and locks it comes up with.",
   "cases": [
     {
       "id": "legacy-letter",

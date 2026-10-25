@@ -53,7 +53,7 @@
       },
       "records": [
         {
-          "virtual_key": 65,
+          "virtual_key": 0,
           "scan_code": 30,
           "unicode": 0,
           "key_down": true,
@@ -310,7 +310,7 @@
       "records": [
         {
           "virtual_key": 40,
-          "scan_code": 72,
+          "scan_code": 80,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,
@@ -330,7 +330,7 @@
       "records": [
         {
           "virtual_key": 40,
-          "scan_code": 72,
+          "scan_code": 80,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,
@@ -350,7 +350,7 @@
       "records": [
         {
           "virtual_key": 39,
-          "scan_code": 72,
+          "scan_code": 77,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,
@@ -370,7 +370,7 @@
       "records": [
         {
           "virtual_key": 39,
-          "scan_code": 72,
+          "scan_code": 77,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,
@@ -390,7 +390,7 @@
       "records": [
         {
           "virtual_key": 37,
-          "scan_code": 72,
+          "scan_code": 75,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,
@@ -410,7 +410,7 @@
       "records": [
         {
           "virtual_key": 37,
-          "scan_code": 72,
+          "scan_code": 75,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,

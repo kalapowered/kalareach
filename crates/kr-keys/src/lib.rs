@@ -2895,27 +2895,32 @@ mod tests {
         );
     }
 
-    /// A refusal says this encoder's fixed words, in its `Display` and in its `Debug`, and holds no
-    /// key.
+    /// A refusal says this encoder's fixed words and nothing it was given, in its `Display` and in
+    /// its `Debug`: the only text it holds is a `&'static str` the encoder itself names, and both
+    /// formatters are held to the exact words.
     #[test]
     fn a_refusal_says_fixed_words() {
-        for refusal in [
-            Unsupported::UnknownKey,
-            Unsupported::NotExpressible {
-                what: "a key release",
-            },
-        ] {
-            assert_eq!(
-                format!("{refusal:?}"),
-                format!("Unsupported({:?})", refusal.to_string())
-            );
-        }
-        assert!(
-            Unsupported::NotExpressible {
-                what: "a key release"
-            }
-            .to_string()
-            .contains("a key release")
+        let unknown = Unsupported::UnknownKey;
+        assert_eq!(
+            unknown.to_string(),
+            "this encoder has no spelling for that key"
+        );
+        assert_eq!(
+            format!("{unknown:?}"),
+            "Unsupported(\"this encoder has no spelling for that key\")"
+        );
+        let release = Unsupported::NotExpressible {
+            what: "a key release",
+        };
+        assert_eq!(
+            release.to_string(),
+            "the negotiated encoding cannot express a key release, and this encoder does not \
+             invent one"
+        );
+        assert_eq!(
+            format!("{release:?}"),
+            "Unsupported(\"the negotiated encoding cannot express a key release, and this \
+             encoder does not invent one\")"
         );
     }
 
