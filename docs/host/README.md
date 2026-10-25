@@ -4073,7 +4073,9 @@ It looks again after five seconds, then after ten, and so on, doubling up to fiv
 looks for as long as the hold lasts. Until the store reads the journal the session stays closing,
 so the announcements about its pending questions and approvals are held back from delivery, as
 they are while any closure is under way. While the hold lasts none of the session's text is
-served; a read that finds the journal can be brought forward serves it at once. On Linux a
+served; a read that finds the journal can be brought forward serves it at once, and ends the wait
+the session had, so the store finishes it on its next pass and its items are delivered then, not
+at the end of that wait. On Linux a
 process of a later boot that repeats the launch process's identifier and start tick reads as the
 worker for as long as it runs, because an identity carries no boot; the reads and the collection
 leave the session alone until it ends.

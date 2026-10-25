@@ -378,6 +378,9 @@ struct Origins {
     unfinished: BTreeSet<SessionId>,
     /// The closed sessions among those whose journal is held back for now, with how long they wait.
     held_back: BTreeMap<SessionId, Held>,
+    /// Closing sessions whose journal a read has opened since their last try began, so that the
+    /// hold on them has lifted and the try in progress must not put a wait back.
+    lifted: BTreeSet<SessionId>,
 }
 
 /// How far the store has read each origin, as a timer pass is told it: the moment up to which it
@@ -1667,8 +1670,12 @@ impl AttentionModule {
             let owner = self.text_owner(session_id);
             let journal = if matches!(owner, TextOwner::Journal) {
                 let closed = reach.closed_journal(session_id);
-                if matches!(closed, ClosedJournal::HeldBack) {
-                    journals_held_back.insert(session_id);
+                match &closed {
+                    ClosedJournal::HeldBack => {
+                        journals_held_back.insert(session_id);
+                    }
+                    ClosedJournal::Open(_) => self.lift_the_wait(session_id),
+                    ClosedJournal::Unreadable => {}
                 }
                 closed.open()
             } else {
@@ -2629,11 +2636,17 @@ impl AttentionModule {
             origins.ended.remove(&session_id);
             origins.unfinished.remove(&session_id);
             origins.held_back.remove(&session_id);
+            origins.lifted.remove(&session_id);
             return;
         }
         // Taken out here and put back only by a try that finds the journal held back again, so a
-        // session whose hold has lifted keeps no wait.
-        let earlier = self.origins().held_back.remove(&session_id);
+        // session whose hold has lifted keeps no wait. A read that opens the journal after this
+        // point lifts the hold too, and is told of by `lifted`.
+        let earlier = {
+            let mut origins = self.origins();
+            origins.lifted.remove(&session_id);
+            origins.held_back.remove(&session_id)
+        };
         let finished = if unaccounted {
             // Marked first, so no text is served for the session from here on.
             self.origins().unaccounted.insert(session_id);
@@ -2655,15 +2668,23 @@ impl AttentionModule {
                 Err(Unfinished::Store(error)) => Err(error),
                 Err(Unfinished::HeldBack) => {
                     let mut origins = self.origins();
-                    let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
-                    let wait = u64::try_from(held_back_wait(holds).as_millis()).unwrap_or(u64::MAX);
-                    origins.held_back.insert(
-                        session_id,
-                        Held {
-                            holds,
-                            not_before_ms: now_ms.saturating_add(wait),
-                        },
-                    );
+                    if origins.lifted.remove(&session_id) {
+                        // A read opened the journal while this try was finding it held back: the
+                        // hold is over, and a wait put back now would outlast it. The session is
+                        // due at once, and the loop is woken for it.
+                        self.wake.notify_one();
+                    } else {
+                        let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
+                        let wait =
+                            u64::try_from(held_back_wait(holds).as_millis()).unwrap_or(u64::MAX);
+                        origins.held_back.insert(
+                            session_id,
+                            Held {
+                                holds,
+                                not_before_ms: now_ms.saturating_add(wait),
+                            },
+                        );
+                    }
                     Err(ProtocolError::new(
                         ErrorCode::StorageUnavailable,
                         "a closed session's journal cannot be brought forward yet",
@@ -2677,6 +2698,7 @@ impl AttentionModule {
                 origins.unfinished.remove(&session_id);
                 origins.closing.remove(&session_id);
                 origins.ended.remove(&session_id);
+                origins.lifted.remove(&session_id);
                 true
             } else {
                 // A session newly left unfinished wakes the loop that retries it. One that failed
@@ -2686,6 +2708,25 @@ impl AttentionModule {
             }
         };
         if changed {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Ends the wait of a closing session whose journal a read has just opened, and wakes the
+    /// loop that tries it again, so the session is finished by the next pass and not at the end of
+    /// a wait that outlasted its hold. A session that is not closing has no wait.
+    fn lift_the_wait(&self, session_id: SessionId) {
+        let lifted = {
+            let mut origins = self.origins();
+            if origins.closing.contains(&session_id) {
+                origins.held_back.remove(&session_id);
+                origins.lifted.insert(session_id);
+                true
+            } else {
+                false
+            }
+        };
+        if lifted {
             self.wake.notify_one();
         }
     }
@@ -4489,6 +4530,122 @@ pub(crate) mod tests {
             module.closure_retry_wait(seconds(115)),
             MAINTENANCE,
             "so the loop has nothing of it to wake for"
+        );
+    }
+
+    /// A text read that opens the journal of a closing session whose journal was held back ends
+    /// the session's wait and wakes the loop that tries it again, so the next pass finishes the
+    /// session and its items are no longer held for the rest of a wait that outlasted the hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_text_read_that_opens_a_held_journal_ends_the_sessions_wait() {
+        let world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let held = HeldBack::default();
+        let readable = Readable {
+            path: world.temp.environment().state_dir().join("closed.sqlite3"),
+        };
+        let seconds = |seconds: u64| seconds * 1_000;
+
+        world
+            .module
+            .session_closed_at(&held, world.session_id, seconds(100))
+            .await;
+        world.module.finish_again_at(&held, seconds(105)).await;
+        assert!(
+            world
+                .module
+                .origins()
+                .held_back
+                .contains_key(&world.session_id),
+            "two tries found it held back, so the next is due ten seconds on"
+        );
+        // Whatever woke the loop before is not the wake the read gives.
+        let _ = tokio::time::timeout(Duration::ZERO, world.module.wake.notified()).await;
+
+        world
+            .changed_through(&readable, &owner(), &Caller::Owner)
+            .await;
+        assert!(
+            world.module.origins().held_back.is_empty(),
+            "the read found the journal open, so the session waits no longer"
+        );
+        assert!(
+            tokio::time::timeout(Duration::ZERO, world.module.wake.notified())
+                .await
+                .is_ok(),
+            "and the loop that tries it again was woken"
+        );
+
+        world.module.finish_again_at(&readable, seconds(106)).await;
+        assert!(
+            world.module.finalised(world.session_id),
+            "so the next pass finishes it, before the wait it had would have ended"
+        );
+    }
+
+    /// A reach whose closed journal is held back for the try that is looking at it, and which a
+    /// text read opens in that moment.
+    struct OpenedByAReadMeanwhile {
+        module: Arc<AttentionModule>,
+    }
+
+    impl Reach for OpenedByAReadMeanwhile {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, session_id: SessionId) -> ClosedJournal {
+            self.module.lift_the_wait(session_id);
+            ClosedJournal::HeldBack
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A try that has found a journal held back does not put a wait back when a read opened the
+    /// journal while it was looking: the hold it found is over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_try_does_not_put_back_a_wait_a_read_has_ended() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = OpenedByAReadMeanwhile {
+            module: Arc::clone(&module),
+        };
+        let readable = Readable {
+            path: temp.environment().state_dir().join("closed.sqlite3"),
+        };
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let seconds = |seconds: u64| seconds * 1_000;
+
+        module
+            .session_closed_at(&reach, session_id, seconds(100))
+            .await;
+        assert!(
+            module.origins().held_back.is_empty(),
+            "the try found the journal held back and a read opened it meanwhile: no wait"
+        );
+        assert!(
+            module.origins().unfinished.contains(&session_id),
+            "the session is still to be finished"
+        );
+
+        module.finish_again_at(&readable, seconds(100)).await;
+        assert!(
+            module.finalised(session_id),
+            "and it is due at once, not after a wait"
         );
     }
 
