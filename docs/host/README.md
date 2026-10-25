@@ -4900,6 +4900,17 @@ than a
 claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
 says the bytes are unrecoverable from the device they were on.
 
+`privacy.retained.delete` is the separately authorised action that asks for one of those copies to be
+deleted. It is its own call, apart from turning privacy mode on, it is served on the owner's socket
+at the host only, no paired device can make it, and it needs `host.manage`. Privacy mode does not
+stop it: privacy mode is why the copy is listed. The call names the copy by the `reference` the
+`exported` list of `privacy.status` shows for it, and the host does not trust the text: it reads the
+list again and acts only when exactly one entry has that reference and the entry is marked
+deletable. Any other reference is refused. The answer is `deleted`, true once the service has said
+it no longer holds the copy and false while the request has been made and not answered, and the
+report as it stands. The call keeps no record of its action, so asking again for the same copy asks
+the service again, which is safe.
+
 Copies held by authorised viewers are listed with the rest of what has left the host, because a device
 that was let see a session may hold what it was shown, on a screen or in its own scrollback, and this
 host cannot recall that: revoking the device ends what it can read from now on and nothing before.

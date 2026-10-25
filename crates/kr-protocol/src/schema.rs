@@ -168,7 +168,8 @@ use crate::preauth::{
 };
 use crate::privacy::{
     PrivacyCompletion, PrivacyDisabled, PrivacyExported, PrivacyGenerationAck,
-    PrivacyGenerationNotice, PrivacyKept, PrivacyOutstanding, PrivacyReport, PrivacySession,
+    PrivacyGenerationNotice, PrivacyKept, PrivacyOutstanding, PrivacyReport,
+    PrivacyRetainedDeleteParams, PrivacyRetainedDeleteResult, PrivacySession,
     PrivacySessionStanding, PrivacySetParams, PrivacyStatusParams, PrivacyUnavailable,
 };
 use crate::project::{
@@ -859,6 +860,8 @@ pub fn protocol_schema() -> Value {
         "privacy_kept" => PrivacyKept,
         "privacy_outstanding" => PrivacyOutstanding,
         "privacy_report" => PrivacyReport,
+        "privacy_retained_delete_params" => PrivacyRetainedDeleteParams,
+        "privacy_retained_delete_result" => PrivacyRetainedDeleteResult,
         "privacy_session" => PrivacySession,
         "privacy_session_standing" => PrivacySessionStanding,
         "privacy_set_params" => PrivacySetParams,

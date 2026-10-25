@@ -3079,6 +3079,8 @@ export interface KalaReachProtocol {
   privacy_kept?: PrivacyKept
   privacy_outstanding?: PrivacyOutstanding
   privacy_report?: PrivacyReport
+  privacy_retained_delete_params?: PrivacyRetainedDeleteParams
+  privacy_retained_delete_result?: PrivacyRetainedDeleteResult
   privacy_session?: PrivacySession
   privacy_session_standing?: PrivacySessionStanding
   privacy_set_params?: PrivacySetParams
@@ -19098,6 +19100,7 @@ export interface MethodEntry {
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
+    | 'privacy.retained.delete'
     | 'account.sign_in'
     | 'account.sign_out'
     | 'account.status'
@@ -22442,6 +22445,92 @@ export interface PrivacySession {
     | {
         state: 'worker_ended'
       }
+}
+/**
+ * Parameters of `privacy.retained.delete`.
+ */
+export interface PrivacyRetainedDeleteParams {
+  /**
+   * The reference of the copy to delete, exactly as the `exported` list of `privacy.status`
+   * shows it. The host acts only on a copy that list shows now with a way to ask for its
+   * removal, and only when exactly one copy has this reference.
+   */
+  reference: string
+}
+/**
+ * The result of `privacy.retained.delete`.
+ */
+export interface PrivacyRetainedDeleteResult {
+  /**
+   * True when the service holding the copy has said it no longer holds it. False while the
+   * request has been made and the service has not answered: the host asks again when it is asked
+   * to delete the same copy again, and the report shows the copy as one whose deletion was asked.
+   */
+  deleted: boolean
+  report: PrivacyReport1
+}
+/**
+ * Where privacy mode stands after the request.
+ */
+export interface PrivacyReport1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  changed_at_ms: string
+  /**
+   * Whether the last change has finished taking effect.
+   */
+  completion:
+    | {
+        state: 'complete'
+      }
+    | {
+        /**
+         * Each subsystem with work outstanding, and how much.
+         */
+        outstanding: PrivacyOutstanding[]
+        state: 'reconciling'
+      }
+    | {
+        /**
+         * Each subsystem with work outstanding, and how much.
+         */
+        outstanding: PrivacyOutstanding[]
+        state: 'unavailable'
+        /**
+         * Each subsystem that could not answer, with its reason.
+         */
+        unavailable: PrivacyUnavailable[]
+      }
+  /**
+   * What privacy mode stops while it is on.
+   */
+  disabled: PrivacyDisabled[]
+  /**
+   * Whether privacy mode is on.
+   */
+  enabled: boolean
+  /**
+   * What has left this host.
+   */
+  exported: PrivacyExported[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  generation: string
+  /**
+   * What this host keeps while privacy mode is on, and why.
+   */
+  kept: PrivacyKept[]
+  /**
+   * Each session whose own cleanup is still owed, and where it stands.
+   */
+  sessions: PrivacySession[]
+  /**
+   * Each subsystem that could not list what had left, and its reason. The list above is then
+   * incomplete, and says so here rather than by being empty.
+   */
+  unlisted: PrivacyUnavailable[]
 }
 /**
  * Parameters of `privacy.set`.
@@ -28119,6 +28208,7 @@ export interface ServiceRequestPayload {
     | 'delivery.destination.secret.set'
     | 'privacy.set'
     | 'privacy.status'
+    | 'privacy.retained.delete'
     | 'account.sign_in'
     | 'account.sign_out'
     | 'account.status'

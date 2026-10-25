@@ -467,6 +467,19 @@ methods! {
     doc: "Where privacy mode stands: its generation, whether its last change has taken effect, \
           what each session still owes, what is kept and what had already left this host.";
 
+    PrivacyRetainedDelete = "privacy.retained.delete", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
+    selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("the reference of the copy"),
+    doc: "Ask the service that holds a copy privacy mode listed as having left this host to \
+          delete it, at the host itself: the copy is named by the reference `privacy.status` \
+          shows for it, and the call is its own action, apart from turning privacy mode on. \
+          Privacy mode does not stop it. A copy the host holds no way to ask the removal of is \
+          refused. The answer says whether the service confirmed the deletion, and where privacy \
+          mode stands; the call keeps no record of its action, and asked again for the same copy \
+          it asks again.";
+
     AccountSignIn = "account.sign_in", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -2096,6 +2109,7 @@ mod tests {
         // Privacy mode: switching this host's retention, and reading what it kept and what left.
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),
+        ("privacy.retained.delete", &[ActionRight::HostManage]),
         // This host's own sign-in to the managed account service: whose balance a phone's call
         // spends is the owner's choice at this machine.
         ("account.sign_in", &[ActionRight::HostManage]),

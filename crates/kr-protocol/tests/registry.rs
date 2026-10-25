@@ -373,9 +373,16 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // the switch changes what this host retains, so it asks for host management, and so does the
     // read, which lists what the environment kept and what had already left it. The switch is
     // served on the local socket only, since a paired device cannot turn privacy mode on or off;
-    // the read is served to a paired device too, whose grant must carry host management.
-    let privacy: [(&str, EffectClass, &[ActorIngress]); 2] = [
+    // the read is served to a paired device too, whose grant must carry host management. The
+    // deletion of a copy that has left the host is a write of its own, served on the local socket
+    // only like the switch.
+    let privacy: [(&str, EffectClass, &[ActorIngress]); 3] = [
         ("privacy.set", EffectClass::Write, &[ActorIngress::LocalIpc]),
+        (
+            "privacy.retained.delete",
+            EffectClass::Write,
+            &[ActorIngress::LocalIpc],
+        ),
         (
             "privacy.status",
             EffectClass::Read,
