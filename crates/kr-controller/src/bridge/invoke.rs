@@ -1297,7 +1297,7 @@ impl BridgeStream {
             tokio::pin!(arrived);
             // Registered before the queue is read, so a frame that arrives in between wakes this.
             arrived.as_mut().enable();
-            let (deadline, waited) = {
+            let deadline = {
                 let mut pending = self.shared.lock();
                 if let Some(index) = pending.frames.iter().position(|(frame, _)| wanted(frame)) {
                     let (frame, charged) = pending
@@ -1314,19 +1314,21 @@ impl BridgeStream {
                 // caller chose how long the answer may take, and a destination that is making a
                 // session says nothing until it has made it. A wait without one is held to the
                 // stream's silence.
-                match limit {
+                let (deadline, waited) = match limit {
                     Some(limit) => (asked + limit, limit),
                     None => (
                         pending.last_heard + self.shared.silence,
                         self.shared.silence,
                     ),
+                };
+                // Judged here, under the lock the reader updates what it heard under, so that a
+                // keepalive that has arrived is never missed, and frames arriving one after another
+                // cannot keep a wait that is already due going.
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Refusal::Silent { waited });
                 }
+                deadline
             };
-            // Read before waiting, so that frames arriving one after another cannot keep a wait
-            // that is already due going.
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Refusal::Silent { waited });
-            }
             let _ = tokio::time::timeout_at(deadline, arrived).await;
         }
     }
