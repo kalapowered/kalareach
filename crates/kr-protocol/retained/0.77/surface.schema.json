@@ -512,6 +512,9 @@
         "publisher_id": {
           "$ref": "#/$defs/PublisherId"
         },
+        "repository_generation": {
+          "$ref": "#/$defs/RepositoryGeneration"
+        },
         "version": {
           "type": "string"
         }
@@ -522,6 +525,7 @@
         "version",
         "package_digest",
         "origin",
+        "repository_generation",
         "package_dir",
         "grants",
         "bridge",
@@ -6091,6 +6095,10 @@
         }
       ]
     },
+    "RepositoryGeneration": {
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
     "Request": {
       "additionalProperties": false,
       "properties": {
@@ -6544,6 +6552,16 @@
             }
           ]
         },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "outstanding_launches": {
           "anyOf": [
             {
@@ -6633,6 +6651,12 @@
     "SessionSummary": {
       "additionalProperties": false,
       "properties": {
+        "application": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "application_state": {
           "anyOf": [
             {
@@ -6868,6 +6892,26 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "WorkerAdapterCount": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "count": {
+          "$ref": "#/$defs/U64"
+        },
+        "outcome": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "outcome",
+        "count"
+      ],
+      "type": "object"
+    },
     "WorkerDescriptor": {
       "additionalProperties": false,
       "properties": {
@@ -6917,6 +6961,22 @@
         "worker_public_key",
         "worker_profile",
         "published_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkerFaultCount": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/U64"
+        },
+        "fault": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "fault",
+        "count"
       ],
       "type": "object"
     },
@@ -7021,6 +7081,26 @@
         "environment_origin",
         "environment_additions"
       ],
+      "type": "object"
+    },
+    "WorkerMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_failure": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorkerAdapterCount"
+          },
+          "type": "array"
+        },
+        "terminal_parse_fault": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorkerFaultCount"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "WorkerProfile": {

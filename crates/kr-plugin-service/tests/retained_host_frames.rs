@@ -3,8 +3,11 @@
 //! `retained/<level>/plugin-host-frames.json` holds what the real `kr-plugin-host` of the level's
 //! release presented and answered when it was run as its launcher runs it, and the descriptor file
 //! its daemon published. This build's control daemon reads the claim, the answers and the
-//! descriptor when it adopts or starts such a host; every one has to decode with this build's
-//! types and encode back to the bytes it came from, and the claim and the proof have to verify.
+//! descriptor when it adopts such a host, which the release before's daemon started and which
+//! outlived an update; every one has to decode with this build's types and encode back to the
+//! bytes it came from, and the claim and the proof have to verify. Only the protocol's name tells
+//! the two releases that their frames agree, and the frames of the protocol have no schema, so
+//! this record is the check that holds them to the bytes of another release.
 //! The upgrade suite's case of the same name makes the record
 //! (`KR_RECORD_PLUGIN_HOST_FRAMES=1`), and starts and adopts the real program with what this build
 //! writes.
@@ -18,7 +21,7 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Nonce256;
 use serde_json::Value;
 
-const RECORD: &str = include_str!("../../kr-protocol/retained/0.76/plugin-host-frames.json");
+const RECORD: &str = include_str!("../../kr-protocol/retained/0.77/plugin-host-frames.json");
 
 fn unhex(text: &str) -> Vec<u8> {
     assert_eq!(text.len() % 2, 0, "{text}");
@@ -39,7 +42,7 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
     let retained = &kr_protocol::retained::RETAINED[0];
     assert_eq!(
         retained.plugin_host.trim(),
-        HostProtocol::SECOND.name,
+        HostProtocol::THIS.name,
         "the level records the protocol its host speaks"
     );
     assert_eq!(
@@ -58,9 +61,9 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
     );
     launcher::check_rendezvous(&claim).expect("the claim is signed by the key it presents");
     assert!(
-        claim.endpoint.ends_with(HostProtocol::SECOND.endpoint),
+        claim.endpoint.ends_with(HostProtocol::THIS.endpoint),
         "the host serves on {}, not on {}",
-        HostProtocol::SECOND.endpoint,
+        HostProtocol::THIS.endpoint,
         claim.endpoint
     );
     let accepted_bytes = recorded(&record, "accepted");
@@ -74,7 +77,7 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
 
     // `Hello`, a `Hello` for another protocol, and `Verify`.
     let descriptor = HostDescriptor {
-        protocol: HostProtocol::SECOND.name.to_owned(),
+        protocol: HostProtocol::THIS.name.to_owned(),
         environment_id: claim.environment_id,
         reservation_id: claim.reservation_id,
         endpoint: claim.endpoint.clone(),
@@ -111,7 +114,7 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
     let [(hello, told), (other, refused), (verify, proved)] =
         <[_; 3]>::try_from(answers).expect("three exchanges");
     assert!(
-        matches!(&hello, RequestBody::Hello { protocol } if protocol == HostProtocol::SECOND.name)
+        matches!(&hello, RequestBody::Hello { protocol } if protocol == HostProtocol::THIS.name)
     );
     // The host's account of its descriptor names no reservation: the launcher's is published.
     let ResponseBody::Hello {
@@ -121,7 +124,7 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
     else {
         panic!("Hello was answered {told:?}");
     };
-    assert_eq!(protocol, HostProtocol::SECOND.name);
+    assert_eq!(protocol, HostProtocol::THIS.name);
     assert_eq!(told.reservation_id.get().as_bytes(), &[0; 16]);
     assert_eq!(
         HostDescriptor {
@@ -131,7 +134,7 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
         descriptor
     );
     assert!(
-        matches!(&other, RequestBody::Hello { protocol } if protocol != HostProtocol::SECOND.name)
+        matches!(&other, RequestBody::Hello { protocol } if protocol != HostProtocol::THIS.name)
     );
     assert!(matches!(&refused, ResponseBody::Refused { request, .. } if request == "hello"));
     assert!(matches!(&verify, RequestBody::Verify { nonce: asked } if *asked == nonce));
@@ -145,7 +148,7 @@ fn the_frames_of_the_plugin_host_of_the_release_before_read_here_and_encode_back
         .as_str()
         .expect("a descriptor file");
     let published: HostDescriptor = serde_json::from_str(file).expect("the descriptor reads");
-    assert_eq!(published.protocol, HostProtocol::SECOND.name);
+    assert_eq!(published.protocol, HostProtocol::THIS.name);
     assert_eq!(serde_json::to_string(&published).expect("encodes"), file);
 }
 
@@ -156,7 +159,7 @@ async fn the_arguments_a_launcher_starts_the_host_of_the_release_before_with_are
     let host = kr_ipc::testing::TempHost::create();
     let environment = host.environment();
     let reservation =
-        HostReservation::open(&environment, HostProtocol::SECOND).expect("a reservation");
+        HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
     let packages = host.root().join("packages");
     let given = reservation.arguments(&environment, &packages);
     let flags: Vec<&str> = given.iter().step_by(2).map(String::as_str).collect();
