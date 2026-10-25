@@ -392,7 +392,7 @@ impl Enrolment {
         if let Ok(signed) =
             serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&root)
         {
-            crate::trust::check_role_keys(&signed.signed)?;
+            crate::trust::check_role_keys(&signed.signed, crate::trust::Met::Enrolment)?;
         }
         if budgets.retained_generations.get() == 0 {
             return Err(CatalogueError::InvalidArgument {
