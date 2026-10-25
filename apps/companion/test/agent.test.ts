@@ -519,17 +519,12 @@ describe("a package's control asks the host for its action only when it can (KR-
     ).toContain('cannot tell what this action takes')
   })
 
-  it('asks nothing of the host for a control drawn under another instance, package or revision', () => {
-    const elsewhere = [
-      drawnUnder(instance('i-2', '10'), binding()),
-      drawnUnder({ ...live, plugin_id: 'other.package' }, binding()),
-      drawnUnder(live, binding({ binding_revision: '3' }))
-    ]
-    for (const drawn of elsewhere) {
-      expect(because(invocationOf(refresh, SESSION, live, binding(), drawn, false))).toContain(
-        'conversation moved'
-      )
-    }
-    expect(invocationOf(refresh, SESSION, live, binding(), here, false).kind).toBe('call')
+  it('asks nothing of the host for a control drawn under another package', () => {
+    // The page keys the other differences (another instance, a moved revision) through its view.
+    const drawn = drawnUnder({ ...live, plugin_id: 'other.package' }, binding())
+    expect(because(invocationOf(refresh, SESSION, live, binding(), drawn, null))).toContain(
+      'conversation moved'
+    )
+    expect(invocationOf(refresh, SESSION, live, binding(), here, null).kind).toBe('call')
   })
 })
