@@ -2041,8 +2041,6 @@ impl Controller {
 
     /// Removes what one ended worker retained, under the recovery ownership of its session.
     fn remove_one_closed(&self, session_id: SessionId) {
-        use crate::archive::{ClosedRefusal, OwnershipRefusal};
-
         let archive = self.archive();
         let now_ms = kr_ipc::now_ms();
         let refused = |reason: String| {
@@ -2053,11 +2051,8 @@ impl Controller {
             self.collectable(session_id).map(|collectable| !collectable)
         }) {
             Ok(ownership) => ownership,
-            // Another recovery holds the stores, or a worker may remain: this is not the pass for
-            // it, and nothing is owed by the removal that did not run.
-            Err(ClosedRefusal::Ownership(
-                OwnershipRefusal::Held { .. } | OwnershipRefusal::WorkerMayRemain { .. },
-            )) => return,
+            // Another recovery holds the stores, or a worker may remain: the removal did not run,
+            // and the report says why until a later pass has run it.
             Err(error) => {
                 refused(error.to_string());
                 return;
