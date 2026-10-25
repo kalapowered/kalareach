@@ -36,12 +36,15 @@ class DeliveryShownTest {
         )
 
     /** What was posted: the tag, the words and how. */
-    private class Posts(private val takesReplacements: Boolean = true) {
+    private class Posts(
+        private val takesReplacements: Boolean = true,
+        private val takesAlerts: Boolean = true
+    ) {
         val all = mutableListOf<Triple<String, String, Posting>>()
 
         fun show(plan: NotificationPlan, posting: Posting): Boolean {
             all += Triple(plan.tag, plan.body, posting)
-            return takesReplacements || posting != Posting.REPLACEMENT
+            return if (posting == Posting.REPLACEMENT) takesReplacements else takesAlerts
         }
     }
 
@@ -81,6 +84,21 @@ class DeliveryShownTest {
             )
 
         assertEquals(ALERT_GONE, plan.reason)
+    }
+
+    @Test
+    fun anAlertThatCannotBePostedIsNotFollowedByTheOpeningOfItsPreview() {
+        val posts = Posts(takesAlerts = false)
+
+        val plan =
+            showDelivery(
+                sealed,
+                decide = { throw AssertionError("the keys are not read for an alert nobody sees") },
+                show = posts::show
+            )
+
+        assertEquals(NOT_POSTED, plan.reason)
+        assertEquals(listOf(Triple("thread-1", sealed.alert, Posting.NEW)), posts.all)
     }
 
     @Test
