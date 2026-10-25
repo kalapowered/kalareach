@@ -4995,12 +4995,9 @@ fn kr_req_11_42_the_gemini_cli_record_stays_while_anything_else_stays_beside_it(
             "{name}: a removal that left something is not reported as complete: {settled:?}"
         );
 
-        // What stayed goes, the journal is read again by a new run, and the record goes with the
-        // directory the installation made.
+        // What stayed goes, and only that: the journal is read again by a new run, which takes
+        // the directories the installation made and the record with them.
         std::fs::remove_file(directory.join(beside)).expect("the file goes");
-        if beside == "hooks/hooks.json" {
-            std::fs::remove_dir(directory.join("hooks")).expect("the folder goes");
-        }
         let again = site
             .bridges()
             .reconcile(&gemini(), None)

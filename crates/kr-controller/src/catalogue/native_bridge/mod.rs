@@ -1734,7 +1734,16 @@ impl NativeBridges {
             ) else {
                 continue;
             };
-            let outcome = self.remove_directory(journal, &root, index)?;
+            // A directory the file taken last waits on stays recorded when something else holds
+            // it, so that it is taken once that is gone: the file goes when nothing is left beside
+            // it, and a directory this host made beside it is among what is left.
+            let waited_on = pending.iter().any(|removal| {
+                matches!(removal, Removal::File { path: file, .. }
+                if file.rsplit_once('/').is_some_and(|(held, _)| {
+                    path.strip_prefix(held).is_some_and(|rest| rest.starts_with('/'))
+                }))
+            });
+            let outcome = self.remove_directory(journal, &root, index, waited_on)?;
             self.settle_removal(journal, &root, index, outcome)?;
         }
         // And where its directory was not made by this host, after every directory that was.
@@ -1858,8 +1867,9 @@ impl NativeBridges {
                         Ok(names) if names.iter().all(|other| other == name) => {}
                         Ok(_) => {
                             return Ok(Outcome::Unfinished(
-                                "the directory holds something else beside it, and \
-                                 the application needs it for as long as that stays"
+                                "the directory holds something else beside it, and the \
+                                 application needs it for as long as that stays; the package is \
+                                 applied again once it is gone"
                                     .to_owned(),
                             ));
                         }
@@ -2040,7 +2050,16 @@ impl NativeBridges {
         self.save(journal)
     }
 
-    fn remove_directory(&self, journal: &Journal, root: &Dir, index: usize) -> Run<Outcome> {
+    /// Takes one directory this host made out, when it is the directory it made and nothing is in
+    /// it. With `for_retry`, a directory that something else holds stays recorded and is taken at
+    /// the next run, once that is gone, instead of being left for good.
+    fn remove_directory(
+        &self,
+        journal: &Journal,
+        root: &Dir,
+        index: usize,
+        for_retry: bool,
+    ) -> Run<Outcome> {
         let Change::Directory {
             path,
             publication: Publication::Published { identity },
@@ -2104,9 +2123,17 @@ impl NativeBridges {
                         if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
                             || error.kind() == std::io::ErrorKind::AlreadyExists =>
                     {
-                        Ok(Outcome::Kept(
-                            "it holds something this host did not put there".to_owned(),
-                        ))
+                        Ok(if for_retry {
+                            Outcome::Unfinished(
+                                "it holds something this host did not put there, and the \
+                                 application's record of its installation waits for it to go"
+                                    .to_owned(),
+                            )
+                        } else {
+                            Outcome::Kept(
+                                "it holds something this host did not put there".to_owned(),
+                            )
+                        })
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         self.flush(directory).map_err(halted)?;
