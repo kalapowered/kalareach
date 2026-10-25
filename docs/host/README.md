@@ -3036,15 +3036,19 @@ What the grant decides, for every request:
   daemon forwards with it. A grant with no history bound, once its own start is filled in where it
   names no cursor, reaches no retained output, and the daemon refuses its page by name. Otherwise
   the worker serves the output from the start of the first interval whose proven reading is at or
-  after the grant's first moment, and none before it. Cursors only grow, so everything from that cursor on was written no earlier than that
-  interval's first byte, whether or not an interval times it. An interval read on a clock the
+  after the grant's first moment, and none before it. Cursors only grow, so everything from that
+  cursor on was recorded no earlier than that interval's first byte, whether or not an interval
+  times it. An interval read on a clock the
   worker could not prove is not one to start from, as none is after the wall clock stepped
   forward. A page asked for from before that cursor begins at it, reports it as the oldest
   retained cursor, and says what it left out as a gap with no cause, because retention took none
-  of it; where retention took the range as well, the gap names its cause, as for any reader. A
-  grant that reaches no interval yet is served an empty page at the end of the output, and reads
-  on from there as output is written. A grant that reaches every moment is served what the owner
-  is. The page comes from the same retained window as the owner's and leaves by the same path, so
+  of it; where retention or a hole took some of what the grant reaches, the gap names its cause, as
+  for any reader. A grant that reaches no interval yet is served an empty page at the end of the
+  output, and reads on from there as intervals begin. Output is dated when the worker records it,
+  which can be later than when the application wrote it, and output that continues an interval
+  begun before the grant's start is served from the next interval, which begins within two seconds
+  and later as the index fills (see "When output was produced"). A grant that reaches every moment
+  is served what the owner is. The page comes from the same retained window as the owner's, so
   what privacy mode removes is gone from both. A closed session has no worker to cut its output,
   and a paired device is refused it, with that reason. The session's live screen and the stream
   that follows it are served when the grant includes them,
