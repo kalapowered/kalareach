@@ -1352,16 +1352,21 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
 /// archives with a deletion, `kr privacy delete` asks the service to delete one while privacy mode
 /// is on, and a fresh host with nothing but the kit restores what is left and not what was deleted.
 ///
-/// A set up host makes two generations. With privacy mode on, the older is deleted at a terminal
-/// and the newest through `--yes`; a reference the list does not hold and a command inside a session
-/// delete nothing, and another collection of the account is untouched. A fresh host, whose own
-/// privacy mode is off, restores the newest generation after the older was deleted (the control)
-/// and cannot restore once the newest is deleted too, and writes nothing. Turning privacy mode off
-/// makes the next backup, which the fresh host restores.
+/// A set up host makes two generations, with a session that closed on it in both, and `kr privacy
+/// on` reports the change complete once what that session retained is removed. With privacy mode on,
+/// the older generation is deleted at a terminal and the newest through `--yes`; a reference the
+/// list does not hold and a command inside a session delete nothing, and another collection of the
+/// account is untouched. A fresh host, whose own privacy mode is off, restores the newest generation
+/// after the older was deleted (the control) and cannot restore once the newest is deleted too, and
+/// writes nothing. Turning privacy mode off makes the next backup, which the fresh host restores.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_longer_restore() {
-    // The host's backups hold its configuration, which is all this case needs them to hold.
-    let rig = Rig::start().await;
+    // A session that closed on the host is in both generations, and privacy mode removes what it
+    // retained when it is turned on, which the command waits for and reports.
+    let rig = Rig::start_with(|host| {
+        closed_session(host, b"the output this session wrote\r\n", 9_000);
+    })
+    .await;
     let mut window = Window::run(&rig, &["backup", "setup"]);
     let kit = window.bring_up_the_kit();
     window.confirm(&kit);
