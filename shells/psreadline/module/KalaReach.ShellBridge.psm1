@@ -1159,6 +1159,13 @@ function Get-KrLineStatus {
     param([bool]$LastStatus)
     $line = $script:Line
     if (-not $line.Running) { return $null }
+    # A block the lookup handler substituted starts by taking its substitution. One still there when
+    # the line is over never ran: a handler of the person's set after this module's chose another
+    # command once it had called this module's.
+    if ($null -ne $script:Hooks.Substitution) {
+        $script:Hooks.Substitution = $null
+        $line.Called = $false
+    }
     $variables = $ExecutionContext.SessionState.PSVariable
     $code = $variables.GetValue('LASTEXITCODE')
     if ($line.Called -and $code -is [int]) { return [uint64]([int64]$code -band 4294967295L) }
