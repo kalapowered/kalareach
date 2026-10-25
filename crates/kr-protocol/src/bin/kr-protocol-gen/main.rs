@@ -14,7 +14,7 @@
 //! kr-protocol-gen --retain L --commit C           cut retained level L from the release at C
 //! kr-protocol-gen --release-commit L C            move level L's record to release C, the release before this one, if its schema is the kept one
 //! kr-protocol-gen --predecessor                   print the level, commit and tag of the release before this one, which has to be the newest retained level
-//! kr-protocol-gen --in-level [--without-the-cut]  fail unless this commit has the surface of every release at its level; a commit that moves the level runs the cut's check too, unless it is told it has been run
+//! kr-protocol-gen --in-level [--without-the-cut]  fail unless this commit has the surface and the public contract of every release at its level; a commit that moves the level runs the cut's check too, unless it is told it has been run
 //! kr-protocol-gen --public-contract               report what a client of an earlier release cannot read of this commit's schema, and fail on it once public 1.0 is frozen
 //! ```
 

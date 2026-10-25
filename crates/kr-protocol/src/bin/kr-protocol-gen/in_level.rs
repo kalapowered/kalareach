@@ -22,12 +22,14 @@
 //! * the whole protocol schema, every definition a root, which is what a client built from the
 //!   protocol package reads: a member or a variant added to an existing definition, and anything
 //!   removed or changed, is a difference. A definition that is new, a variant added to `Method`
-//!   (a host of the same level answers a method it does not list with a refusal, and a later
-//!   client reads the host's method list before it calls one that is new) and an optional member
-//!   added to an object the earlier release marked read-only metadata are not;
+//!   (a host of the same level answers a method it does not list with `PERMISSION_DENIED`, and a
+//!   client that meets that refusal for a method that is new asks the host a method its level has
+//!   before it takes the refusal for a lack of rights) and an optional member added to an object
+//!   the earlier release marked read-only metadata are not;
 //! * the plugin SDK schema, from the committed file of each release and of this commit, held to
 //!   the same rule. The file is generated, and `kr-plugin-sdk-gen --check` holds the committed
-//!   one equal to the generated one.
+//!   one equal to the generated one. A release of the level without the file, or a file that does
+//!   not read, fails the check.
 //!
 //! What it does not see: the `kr-plugin-host/3` frames, which have no schema; the types a
 //! daemon-served method names only in its description; rules that live in code; the hand-written
@@ -290,8 +292,8 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
     Err(format!(
         "{}\na level is one surface and one public contract: a change to either after the level's \
          first release moves the level in the train that makes it, with its cut \
-         (docs/releases/support-window.md); a difference that is harmless takes a cut or a reviewed \
-         change of the comparison",
+         (docs/releases/packages.md, \"A level is one surface\"); a difference that is harmless \
+         takes a cut or a reviewed change of the comparison",
         problems.join("\n")
     ))
 }
@@ -353,23 +355,19 @@ fn compare(
             found.push(line);
         }
     }
-    match file_at(repository, &release.commit, SDK_SCHEMA_PATH)
+    let sdk_text = file_at(repository, &release.commit, SDK_SCHEMA_PATH)
         .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag} cannot be read: {error}"))?
-    {
-        Some(text) => {
-            let sdk: Value = serde_json::from_str(&text)
-                .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag}: {error}"))?;
-            found.extend(
-                compare_for_a_level(&sdk, &head.sdk_schema)
-                    .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
-                    .into_iter()
-                    .map(|line| format!("the plugin SDK schema: {line}")),
-            );
-        }
-        None => notes.push(format!(
-            "{tag} has no {SDK_SCHEMA_PATH}: the plugin SDK schema is not compared with it"
-        )),
-    }
+        .ok_or_else(|| {
+            format!("{tag} has no {SDK_SCHEMA_PATH}, so the plugin SDK schema cannot be compared with it")
+        })?;
+    let sdk: Value = serde_json::from_str(&sdk_text)
+        .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag}: {error}"))?;
+    found.extend(
+        compare_for_a_level(&sdk, &head.sdk_schema)
+            .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
+            .into_iter()
+            .map(|line| format!("the plugin SDK schema: {line}")),
+    );
     let host = plugin_host_in(repository, &release.commit)?;
     if host != head.plugin_host {
         found.push(format!(

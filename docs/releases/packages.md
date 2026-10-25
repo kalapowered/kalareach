@@ -153,10 +153,12 @@ a host of its own level, and the Rust types refuse a member or a value they do n
 statements say what moves the level:
 
 1. A new method with its own parameter and result types, served by the daemon, keeps the level. A
-   host of the same level answers a method it does not list with `PERMISSION_DENIED`, so a client
-   reads the host's method list before it calls a method that is new in its level, and never shows
-   that refusal as a lack of rights. A new method that a worker serves is a row in the worker tables
-   and moves the level.
+   host of the same level answers a method it does not list with `PERMISSION_DENIED`. A client that
+   gets that refusal for a method that is new in its level therefore asks a method the host's level
+   has, under the same right, as `kr export` does for `history.times`. If that is answered, the
+   host is too old for the new method. Only if it is refused too does the client show the refusal
+   as a lack of rights. A new method that a worker serves is a row in the worker tables and moves
+   the level.
 2. A new member or value of an existing type moves the level, in a request as in an answer, and in a
    closed enumeration an answer can carry. The exception is an optional member added to an object
    that carries `x-kalareach-read-only-metadata`. A member, a variant or a definition that is
@@ -463,9 +465,9 @@ changed, an optional field that became required, and a new variant in a closed u
 any consumer that handles the previous variants exhaustively. While the version is below `1.0.0`
 that is a minor bump. A change that only adds an independent type keeps the version, and so does a
 new method that the daemon serves, with parameter and result types of its own: its variant in
-`Method` is the one new variant in a closed union that does not bump, because a client reads the
-host's method list before it calls a method that is new in its level. The commit in the tag and in
-each archive's name already tells two releases apart.
+`Method` is the one new variant in a closed union that does not bump, because a client tells a host
+that does not know the method from a grant that lacks the right (statement 1 of "A level is one
+surface"). The commit in the tag and in each archive's name already tells two releases apart.
 
 A new member of an existing type takes that bump too, an optional member included. The Rust types
 refuse a member they do not know, those of a session's local path among them, so a build without

@@ -397,6 +397,35 @@ fn a_member_added_to_a_type_fails_and_a_new_definition_and_a_new_method_pass() {
     check(&repo.directory, &repo.head(&with_method, &head), &releases)
         .expect("a method a daemon serves keeps the level");
 
+    // Only a new name passes. A name the earlier schema already had, a branch that says more than
+    // its name and a member added inside a branch are not new methods.
+    let mut again = now.clone();
+    again.schema["$defs"]["Method"] = methods(&["host.info", "session.read", "host.info"]);
+    let head = repo.commit(&again, "a name twice");
+    let error = check(&repo.directory, &repo.head(&again, &head), &releases)
+        .expect_err("a name the level already had is not a new method");
+    assert!(error.contains("Method#const:host.info@"), "{error}");
+
+    let mut wider = now.clone();
+    wider.schema["$defs"]["Method"] = methods(&["host.info", "session.read"]);
+    wider.schema["$defs"]["Method"]["oneOf"]
+        .as_array_mut()
+        .expect("a list")
+        .push(json!({ "const": "history.times", "type": "string", "pattern": "^x$" }));
+    let head = repo.commit(&wider, "a branch with more than its name");
+    let error = check(&repo.directory, &repo.head(&wider, &head), &releases)
+        .expect_err("a branch that says more than its name is not a new method");
+    assert!(error.contains("Method#const:history.times"), "{error}");
+
+    let mut inside = now.clone();
+    inside.schema["$defs"]["Method"] = methods(&["host.info", "session.read"]);
+    inside.schema["$defs"]["Method"]["oneOf"][0]["properties"] =
+        json!({ "added": { "type": "string" } });
+    let head = repo.commit(&inside, "a member inside a branch");
+    let error = check(&repo.directory, &repo.head(&inside, &head), &releases)
+        .expect_err("a member inside a branch is not a new method");
+    assert!(error.contains("Method#const:host.info.added"), "{error}");
+
     let mut without_method = now.clone();
     without_method.schema["$defs"]["Method"] = methods(&["host.info"]);
     let head = repo.commit(&without_method, "a method fewer");
@@ -473,7 +502,7 @@ fn an_optional_member_of_read_only_metadata_passes_and_a_required_one_fails() {
 }
 
 /// The plugin SDK schema is held to the level too: a member added to a definition fails, a changed
-/// description passes, and a release before the file is compared by the rest with the run saying so.
+/// description passes, and a release of the level without the file fails the check.
 #[test]
 fn the_plugin_sdk_schema_is_held_and_a_description_is_not() {
     let now = Tree::the_level();
@@ -495,25 +524,22 @@ fn the_plugin_sdk_schema_is_held_and_a_description_is_not() {
     };
     run(&level, &reworded).expect("a description is not part of the schema's meaning");
 
+    // A release of the level that committed no SDK schema cannot be compared, and the check says
+    // so: it is not read as a release with nothing in it.
     let repo = Repo::new("sdk-absent");
     let early = Tree {
         sdk: None,
         ..now.clone()
     };
-    let commit = repo.commit(&early, "a release before the SDK schema");
+    let commit = repo.commit(&early, "a release without the SDK schema");
     let tag = repo.release("0.76.0", &commit);
     let head = repo.commit(&now, "after");
     let releases = inventory(&repo.directory).expect("an inventory");
-    let outcome =
-        check(&repo.directory, &repo.head(&now, &head), &releases).expect("nothing else differs");
-    let Outcome::Held { notes, .. } = outcome else {
-        panic!("the level holds");
-    };
+    let error = check(&repo.directory, &repo.head(&now, &head), &releases)
+        .expect_err("the SDK schema of the release is missing");
     assert!(
-        notes
-            .iter()
-            .any(|note| note.contains(&tag) && note.contains("plugin SDK schema")),
-        "{notes:?}"
+        error.contains(&tag) && error.contains("plugin SDK schema"),
+        "{error}"
     );
 }
 
