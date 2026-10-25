@@ -2686,13 +2686,53 @@ fn change_name(change: &str) -> &str {
     change.split([',', ';']).next().unwrap_or(change).trim()
 }
 
+/// The identifiers of the change a triage row names: the words of its name that carry a digit and
+/// a hyphen or a dot inside them, such as `CVE-2026-69806`, `GHSA-r9hj-j2rw-4q3m`, `zsh-5.9.3` or
+/// `v7.4.21`. A name with none of them is its own identifier.
+fn change_identifiers(change: &str) -> Vec<String> {
+    let name = change_name(change);
+    let found: Vec<String> = name
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| {
+            word.chars().any(|c| c.is_ascii_digit()) && word.chars().any(|c| c == '-' || c == '.')
+        })
+        .map(str::to_owned)
+        .collect();
+    if found.is_empty() {
+        vec![name.to_owned()]
+    } else {
+        found
+    }
+}
+
+/// Whether `text` names `identifier` as a whole: not as part of a longer word or number, which is
+/// what the daily check reads a row for.
+fn mentions(text: &str, identifier: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(identifier).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let mut after = text[at + identifier.len()..].chars();
+        let next = after.next();
+        let behind_ok = before.is_none_or(|c| !(word(c) || c == '.' || c == '-'));
+        let ahead_ok = match next {
+            None => true,
+            Some(c) if word(c) || c == '-' => false,
+            Some('.') => !after.next().is_some_and(|d| d.is_ascii_digit()),
+            Some(_) => true,
+        };
+        behind_ok && ahead_ok
+    })
+}
+
 /// The rows that are still `scheduled` past their target release and are the newest assessment of
-/// their change, as lines to print.
+/// their change for a package, as lines to print.
 ///
-/// The newest row about a change is the assessment that stands, and the rows before it are the
-/// record of what was thought earlier, so a `scheduled` row that a later row about the same
-/// change and package replaces is history and not a missed deadline. A later row is one of the
-/// same day or after, further down the table.
+/// One rule picks the assessment that stands, here and in the daily check of the upstreams: rows
+/// are ordered by their date and, within one day, by their place in the table, and of the rows
+/// that name a package and mention an identifier of a change the last is the assessment, while the
+/// rows before it are the record of what was thought earlier. A row that names several packages
+/// stands for each of them apart, so a later row for one package leaves the others waiting.
 fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> Vec<String> {
     let mut late = Vec::new();
     for (index, row) in triage.iter().enumerate() {
@@ -2702,20 +2742,27 @@ fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> 
         if status != "scheduled" || as_date(target_release) >= now {
             continue;
         }
-        let replaced = triage[index + 1..].iter().any(|later| {
-            let [later_date, later_change, later_packages, ..] = later.as_slice() else {
-                return false;
-            };
-            as_date(later_date) >= as_date(date)
-                && change_name(later_change) == change_name(change)
-                && later_packages
-                    .split(", ")
-                    .any(|package| packages.split(", ").any(|own| own == package))
-        });
-        if !replaced {
+        let identifiers = change_identifiers(change);
+        let waiting: Vec<&str> = packages
+            .split(", ")
+            .filter(|package| {
+                !triage.iter().enumerate().any(|(other, later)| {
+                    let [later_date, later_change, later_packages, ..] = later.as_slice() else {
+                        return false;
+                    };
+                    (as_date(later_date), other) > (as_date(date), index)
+                        && later_packages.split(", ").any(|own| own == *package)
+                        && identifiers
+                            .iter()
+                            .any(|identifier| mentions(later_change, identifier))
+                })
+            })
+            .collect();
+        if !waiting.is_empty() {
             late.push(format!(
-                "{date}: {} (target {target_release})",
-                change_name(change)
+                "{date}: {} (target {target_release}) for {}",
+                change_name(change),
+                waiting.join(", ")
             ));
         }
     }
@@ -2723,11 +2770,14 @@ fn scheduled_past_their_target(triage: &[Vec<String>], now: (i64, u32, u32)) -> 
 }
 
 /// KR-REQ-07.88: a row that is still scheduled after its target stands as a missed deadline only
-/// when it is the newest assessment of its change.
+/// when it is the newest assessment of its change for a package.
 ///
-/// A replacement appended beneath a scheduled row makes that row history, and a row about another
-/// change, another package or an earlier day replaces nothing. The deadline is read from the
-/// table's own rows with a date as the caller's, so the case does not depend on the day it runs.
+/// The newest assessment is the last row, by date and then by place in the table, that names the
+/// package and mentions an identifier of the change, wherever it stands in the table and however
+/// it is worded. A replacement replaces a row for the packages it names alone, and a row about
+/// another change, another package or an earlier day replaces nothing. The deadline is read from
+/// the table's own rows with a date as the caller's, so the case does not depend on the day it
+/// runs.
 #[test]
 fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newest_for_its_change()
 {
@@ -2778,6 +2828,16 @@ fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newe
             ),
         ),
         (
+            "a longer version number",
+            row(
+                "2026-10-24",
+                "PowerShell v7.4.211; released 2026-10-13",
+                "psreadline",
+                "2026-10-27",
+                "not-affected",
+            ),
+        ),
+        (
             "another package",
             row(
                 "2026-10-24",
@@ -2805,6 +2865,74 @@ fn a_scheduled_row_past_its_target_is_a_missed_deadline_only_when_it_is_the_newe
             "a row about {name} replaced the scheduled one"
         );
     }
+
+    // One rule for "the newest row" here and in the daily check: wording and place in the table do
+    // not matter, the date and then the order do.
+    let worded_otherwise = row(
+        "2026-10-25",
+        "The 7.4 series' release (v7.4.21), assessed again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    );
+    assert!(
+        scheduled_past_their_target(&[scheduled.clone(), worded_otherwise.clone()], now).is_empty(),
+        "a row that mentions the identifier in other words replaces the scheduled one"
+    );
+    assert!(
+        scheduled_past_their_target(&[worded_otherwise, scheduled.clone()], now).is_empty(),
+        "a row of a later day replaces the scheduled one from above it in the table"
+    );
+    let same_day_above = row(
+        "2026-10-24",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    );
+    assert_eq!(
+        scheduled_past_their_target(&[same_day_above, scheduled.clone()], now).len(),
+        1,
+        "of two rows of one day the lower one stands, so a row above does not replace it"
+    );
+
+    // A row stands for each package it names apart.
+    let two_packages = row(
+        "2026-10-24",
+        "PowerShell v7.4.21, a release of the 7.4 series; released 2026-10-13",
+        "psreadline, zsh",
+        "2026-10-27",
+        "scheduled",
+    );
+    let for_psreadline = row(
+        "2026-10-25",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "psreadline",
+        "2026-10-27",
+        "not-affected",
+    );
+    let late = scheduled_past_their_target(&[two_packages.clone(), for_psreadline.clone()], now);
+    assert_eq!(
+        late.len(),
+        1,
+        "a later row for one package leaves the other waiting"
+    );
+    assert!(
+        late[0].ends_with("for zsh"),
+        "the line names the package still waiting: {late:?}"
+    );
+    let for_zsh = row(
+        "2026-10-25",
+        "PowerShell v7.4.21, read again; released 2026-10-13",
+        "zsh",
+        "2026-10-27",
+        "not-affected",
+    );
+    assert!(
+        scheduled_past_their_target(&[two_packages, for_psreadline, for_zsh], now).is_empty(),
+        "a row for each package replaces a row that names both"
+    );
+
     let mut table = vec![scheduled.clone()];
     table.push(row(
         "2026-10-25",

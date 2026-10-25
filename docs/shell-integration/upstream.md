@@ -72,9 +72,12 @@ directory has to answer.
 A change needs a row when it was first published on or after 2026-09-20, when its affected
 range includes what a package pins, or, for the advisories of PowerShell and PSReadLine, which pin
 no release, when it was revised on or after that day and its ranges now reach a version the module
-accepts. The newest row that names the package and the change by its
-identifier (a CVE, a GHSA, a RustSec identifier, a release tag, a patch name) is the assessment
-that stands, and the rows before it are the record of what was thought earlier. It covers the
+accepts. Rows are ordered by their date and, within a day, by their place in the table. Of the
+rows that name a package and the change by its identifier (a CVE, a GHSA, a RustSec identifier, a
+release tag, a patch name), the last is the assessment that stands for that package, and the rows
+before it are the record of what was thought earlier; a row that names several packages stands for
+each of them apart, and the qualification suite reads a `scheduled` row past its target by the same
+rule. The assessment that stands covers the
 change when it has a status defined below, is not `scheduled` past its target, quotes every
 affected range the source gives, as the source gives it, and is dated on or after the day the
 source last revised the change; a revision therefore needs a newer row. A GitHub advisory
