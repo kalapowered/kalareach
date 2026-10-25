@@ -1374,3 +1374,146 @@ async fn a_command_that_declares_another_environment_installs_nowhere() {
     .expect_err("this host runs a command in its own environment");
     assert!(refusal.contains("its own environment"), "{refusal}");
 }
+
+/// A capture node naming `session`, as `changeset.capture` takes it: the version is recorded for
+/// that session, and it is review work there.
+fn capture_node_for(session: Option<kr_protocol::ids::SessionId>) -> WorkflowNode {
+    use kr_protocol::changeset::{ChangesetCaptureParams, FileGrant};
+    use kr_protocol::ids::WorkspaceId;
+    use kr_protocol::project::{InclusionChoice, InclusionPolicy};
+
+    let params = ChangesetCaptureParams {
+        workspace_id: WorkspaceId::new(Uuid::from_bytes([30; 16])),
+        change_set_id: Nullable::null(),
+        label: "the workflow's reading".to_owned(),
+        policy: InclusionPolicy {
+            dirty_files: InclusionChoice::Include,
+            untracked_files: InclusionChoice::Exclude,
+            submodules: InclusionChoice::Exclude,
+            binary_files: InclusionChoice::Exclude,
+            generated_artefacts: InclusionChoice::Exclude,
+        },
+        grant: FileGrant::default(),
+        quiescence_declared: false,
+        required_consistency: Nullable::null(),
+        pin: false,
+        session_id: Nullable(session),
+        workflow_run_id: Nullable::null(),
+        note: String::new(),
+    };
+    WorkflowNode {
+        node_id: "capture".to_owned(),
+        action_kind: WorkflowActionKind::CaptureChangeset,
+        action_params: serde_json::to_string(&params).expect("typed parameters"),
+        declared_environment: Nullable::null(),
+    }
+}
+
+/// KR-REQ-19.04: a capture node records its version for the session it names, and a version
+/// recorded for a session is review work in it, so the workflow's grant has to select that
+/// session. A node that names none, and a grant that selects every session, are as they were.
+#[tokio::test]
+async fn a_capture_node_names_only_a_session_its_grant_selects() {
+    use kr_protocol::grant::SessionSelector;
+    use kr_protocol::ids::SessionId;
+
+    let grant_id = test_grant_id(40);
+    let selected = SessionId::new(Uuid::from_bytes([40; 16]));
+    let other = SessionId::new(Uuid::from_bytes([41; 16]));
+    let grant = |selector: SessionSelector| {
+        let mut grant = common::grant_of(grant_id, &[ActionRight::ChangesetCreate]);
+        grant.session_selector = selector;
+        grant
+    };
+    let one_session = SessionSelector::These {
+        session_ids: [selected].into_iter().collect(),
+    };
+
+    let refusal = install_refusal(
+        grant(one_session.clone()),
+        vec![capture_node_for(Some(other))],
+        40,
+    )
+    .expect_err("a capture for a session the grant does not select installs nowhere");
+    assert!(
+        refusal.contains(&other.to_string()),
+        "the refusal names the session: {refusal}"
+    );
+    install_refusal(
+        grant(one_session.clone()),
+        vec![capture_node_for(Some(selected))],
+        41,
+    )
+    .expect("a capture for the session the grant selects installs");
+    install_refusal(grant(one_session), vec![capture_node_for(None)], 42)
+        .expect("a capture for no session needs no session");
+    install_refusal(
+        grant(SessionSelector::Any),
+        vec![capture_node_for(Some(other))],
+        43,
+    )
+    .expect("a grant that selects every session admits any");
+    install_refusal(
+        grant(SessionSelector::None),
+        vec![capture_node_for(Some(selected))],
+        44,
+    )
+    .expect_err("a grant that selects no session admits none");
+}
+
+/// KR-REQ-19.04: a definition stored under a grant that admitted its capture node's session, and
+/// run after the grant was issued again for fewer sessions, is refused at that run with the session
+/// named, and leaves no run behind.
+#[tokio::test]
+async fn a_stored_capture_node_that_crosses_its_grant_is_refused_at_its_next_run() {
+    use kr_protocol::grant::SessionSelector;
+    use kr_protocol::ids::SessionId;
+
+    let grant_id = test_grant_id(45);
+    let selected = SessionId::new(Uuid::from_bytes([45; 16]));
+    let other = SessionId::new(Uuid::from_bytes([46; 16]));
+    let definition = create_workflow_definition(
+        test_wf_id(45),
+        1,
+        "capture for another session",
+        grant_id,
+        vec![capture_node_for(Some(other))],
+        vec![],
+    );
+    let table = common::holding(grant_id, &[ActionRight::ChangesetCreate]);
+    let service = service(Arc::new(MockActionRunner::new()), Arc::clone(&table));
+    service
+        .submit_install(&install_params(&definition), 1_000)
+        .expect("a grant that selects every session installs it");
+    service
+        .submit_enable(
+            &WorkflowEnableParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("the revision enables");
+
+    let mut narrowed = common::grant_of(grant_id, &[ActionRight::ChangesetCreate]);
+    narrowed.session_selector = SessionSelector::These {
+        session_ids: [selected].into_iter().collect(),
+    };
+    table.insert(narrowed);
+    let refusal = service
+        .submit_run(&run_params(&definition, "evt-1"), 2_000)
+        .await
+        .expect_err("the definition now crosses its grant");
+    assert!(
+        refusal.to_string().contains(&other.to_string()),
+        "the refusal names the session: {refusal}"
+    );
+    assert!(
+        service
+            .store()
+            .list_runs(Some(definition.workflow_id))
+            .expect("the journal")
+            .is_empty(),
+        "a refused admission leaves no run behind"
+    );
+}

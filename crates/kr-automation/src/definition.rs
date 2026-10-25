@@ -24,7 +24,7 @@ use kr_protocol::changeset::{
     SourceConsistency,
 };
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{EnvironmentId, GrantId, WorkflowId, WorkspaceId};
+use kr_protocol::ids::{EnvironmentId, GrantId, SessionId, WorkflowId, WorkspaceId};
 use kr_protocol::project::InclusionChoice;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::U64;
@@ -594,6 +594,22 @@ pub fn node_workspace(node: &WorkflowNode) -> Option<WorkspaceId> {
             serde_json::from_str::<DiffApplyParams>(&node.action_params)
                 .ok()
                 .and_then(|params| params.workspace_id.0)
+        }
+        _ => None,
+    }
+}
+
+/// Returns the session a capture node records its version for, when it names one.
+///
+/// A version recorded for a session is review work in that session, so the session is a resource
+/// the node's effect touches, and the grant has to select it.
+#[must_use]
+pub fn node_session(node: &WorkflowNode) -> Option<SessionId> {
+    match node.action_kind {
+        WorkflowActionKind::CaptureChangeset => {
+            serde_json::from_str::<ChangesetCaptureParams>(&node.action_params)
+                .ok()
+                .and_then(|params| params.session_id.0)
         }
         _ => None,
     }

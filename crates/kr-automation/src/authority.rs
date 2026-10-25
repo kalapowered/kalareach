@@ -155,7 +155,8 @@ pub fn check_scope(
 /// Returns [`AutomationError::PermissionDenied`] when the grant lacks a right the node's action
 /// kind needs, when the grant does not admit this environment, when it does not admit the
 /// environment a shell node declares, when a session node creates its session in another
-/// environment, or when a node touches a workspace outside the definition's declared scope.
+/// environment, when a capture node names a session the grant does not select, or when a node
+/// touches a workspace outside the definition's declared scope.
 pub fn check_node(
     grant: &Grant,
     definition: &WorkflowDefinition,
@@ -239,6 +240,18 @@ pub fn check_node(
             "node {} creates a session in environment {target}, and this host acts in \
              {environment_id}",
             node.node_id
+        )));
+    }
+    // A capture node records its version for the session it names, and a version recorded for a
+    // session is review work in it. A grant that does not select that session does not let a
+    // workflow put work in front of it.
+    if let Some(session_id) = crate::definition::node_session(node)
+        && !grant.session_selector.admits(session_id)
+    {
+        return Err(AutomationError::PermissionDenied(format!(
+            "node {} records its version for session {session_id}, and grant {} does not select \
+             that session",
+            node.node_id, grant.grant_id
         )));
     }
     // A node that reads or writes a workspace names the one it touches, and a definition scoped to
