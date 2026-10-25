@@ -566,10 +566,14 @@ fn set_list(path: &Path, sddl: &str) -> io::Result<()> {
 
 /// The access-control list of a sealed file or directory, as SDDL.
 fn sealed_list(directory: bool) -> String {
+    // A file is not denied the right to delete itself, and has no right to delete a name: it is
+    // removed by the right to delete a name in its directory, which an explicit denial on the file
+    // overrides, and a release whose files denied it could never be removed. The seal of its
+    // directory denies that right, and no entry grants the owner the right to delete the file.
     let nothing = if directory {
         NOTHING_MAY
     } else {
-        NOTHING_MAY & !0x40
+        NOTHING_MAY & !0x0000_0040 & !0x0001_0000
     };
     format!(
         "D:P(D;;0x{nothing:x};;;OW)(A;;0x{OWNER_MAY:x};;;OW)(A;;0x{OTHERS_MAY_READ:x};;;SY)(A;;0x{OTHERS_MAY_READ:x};;;BA)"
@@ -577,7 +581,8 @@ fn sealed_list(directory: bool) -> String {
 }
 
 /// Seals a file: read-only by attribute, and with an access-control list that gives its owner
-/// read access and nothing that writes, appends, deletes or changes its attributes.
+/// read access and nothing that writes, appends or changes its attributes. It is removed only
+/// where its directory lets a name be deleted, which a sealed directory does not.
 ///
 /// # Errors
 ///

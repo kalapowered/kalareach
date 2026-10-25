@@ -833,44 +833,6 @@ fn a_sealed_release_is_removed_whole() {
     assert!(left.is_empty(), "and neither has the trash: {left:?}");
 }
 
-#[cfg(windows)]
-#[test]
-fn probe_how_a_sealed_file_is_removed() {
-    let test = TestStore::create();
-    let directory = test.root.join("probe");
-    std::fs::create_dir_all(&directory).expect("a directory");
-    let report = |what: &str, result: std::io::Result<()>| eprintln!("PROBE {what}: {result:?}");
-    for (name, remedy) in [("a", 0), ("b", 1), ("c", 2)] {
-        let file = directory.join(name);
-        std::fs::write(&file, b"data").expect("a file");
-        kr_ipc::install::seal_file(&file).expect("sealed");
-        let _ = remedy;
-    }
-    // The directory is not sealed: its owner may delete a child.
-    report(
-        "remove_file on a sealed file",
-        std::fs::remove_file(directory.join("a")),
-    );
-    report(
-        "remove_dir_all on a directory of sealed files",
-        std::fs::remove_dir_all(&directory),
-    );
-    let left = std::fs::read_dir(&directory).map(|entries| entries.flatten().count());
-    eprintln!("PROBE left {left:?}");
-    // With the attribute cleared by hand, then the file removed.
-    let file = directory.join("b");
-    if file.exists() {
-        let mut permissions = std::fs::metadata(&file).expect("there").permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        report(
-            "clear the attribute",
-            std::fs::set_permissions(&file, permissions),
-        );
-        report("remove_file after", std::fs::remove_file(&file));
-    }
-}
-
 /// KR-REQ-26.06: a read of a file of a release is not refused by the question whether the release
 /// is held, which opens the manifest with no sharing for an instant: `kr host versions` asks it of
 /// every release while another command reads a manifest. A manifest is read two thousand times while
