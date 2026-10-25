@@ -2135,7 +2135,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`InstallError::Io`] when the directory cannot be read.
+    /// Returns [`InstallError::Io`] when the directory cannot be read, and the first refusal that no
+    /// running program caused, after everything else that could be deleted was.
     pub fn sweep_trash(&self, _held: &StoreLock) -> Result<()> {
         let trash = self.trash();
         let entries = match std::fs::read_dir(&trash) {
@@ -2143,21 +2144,17 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(InstallError::io("read", &trash, error)),
         };
+        let mut refused = None;
         for entry in entries.flatten() {
-            let path = entry.path();
             // Whatever is in the trash that is not a plain directory is taken away as a name: a
             // junction there would otherwise lead the removal into the directory it names.
-            let is_directory =
-                std::fs::symlink_metadata(&path).is_ok_and(|about| about.file_type().is_dir());
-            let _ = if is_directory {
-                remove_tree(&path)
-            } else {
-                std::fs::remove_dir(&path)
-                    .or_else(|_| std::fs::remove_file(&path))
-                    .map_err(|error| InstallError::io("remove", &path, error))
-            };
+            if let Err(InstallError::Io { source, .. }) = remove_tree(&entry.path())
+                && !windows::is_in_use(&source)
+            {
+                refused.get_or_insert(InstallError::io("remove", entry.path(), source));
+            }
         }
-        Ok(())
+        refused.map_or(Ok(()), Err)
     }
 }
 
@@ -2207,11 +2204,16 @@ fn sync_directory(directory: &Path) -> Result<()> {
 /// sealed.
 ///
 /// Only directories are changed. A file is deleted by name and never touched by its path, because a
-/// hard link to a file outside the release would carry the change there.
+/// hard link to a file outside the release would carry the change there. On Windows a file whose
+/// list the seal made is the one exception, since the seal denies its owner the right to change the
+/// attributes that deleting a read-only file asks for: it is given back to its owner first, and a
+/// link is taken away as a name whatever it leads to.
 ///
 /// # Errors
 ///
-/// Returns the failure to change a directory or to delete.
+/// Returns the failure to change a directory or to delete. On Windows an error that carries the
+/// system's code for a file in use (access denied or a sharing violation) says a program holds
+/// something of the tree, which is then left as it was; every other refusal comes without it.
 pub fn remove_sealed_tree(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     fn open_to_removal(directory: &Path) -> std::io::Result<()> {
@@ -2229,19 +2231,15 @@ pub fn remove_sealed_tree(directory: &Path) -> std::io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(windows)]
-    fn open_to_removal(directory: &Path) -> std::io::Result<()> {
-        windows::unseal_directory(directory)?;
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                open_to_removal(&entry.path())?;
-            }
-        }
-        Ok(())
-    }
 
-    open_to_removal(directory).and_then(|()| std::fs::remove_dir_all(directory))
+    #[cfg(unix)]
+    {
+        open_to_removal(directory).and_then(|()| std::fs::remove_dir_all(directory))
+    }
+    #[cfg(windows)]
+    {
+        windows::remove_tree(directory)
+    }
 }
 
 /// Deletes a release that was moved out of `versions/`.
