@@ -43,26 +43,51 @@ A publisher's name is held by one root. A plugin identifier is `publisher/name` 
 installation, an admission, a grant and a binding are all found by it, so two repositories under
 different roots that list one publisher would be two authorities for one name. A repository is
 refused a publisher that the root of another repository holds, with the publisher and that
-repository named: when it synchronises, before anything of its generation is kept, and when a
-package of it is installed, before anything is fetched. A root holds the publishers its repository's
-active generation lists and the publishers of what was installed from the repository, and what was
+repository named: when it synchronises, before anything of its generation is kept and again as the
+generation is activated, and when a package of it is installed, before anything is fetched and
+again as the installation is committed. A root holds the publishers its repository's active
+generation lists and the publishers of what was installed from the repository, and what was
 installed from a repository that has since been removed still holds its publisher, by the root in
-the checkpoint the repository left. "The same root" is the same set of keys the root names for its
-own role, so a mirror and a vendor repository beneath the official root share their publishers,
-and a renewed root keeps them; a sync accepts a holder under the root the repository was on or the
-root the load ended on, since the client verified the chain between them. The repository the seed
-enrols is never refused, so a shipped publisher's name is the build's whichever repository was
-enrolled first. Nothing about the binding is stored: it is read from the records above. It does
-not cover a delegation that lists no package, and a mirror that has not followed a root-key
-rotation counts as another root for an installation until it synchronises. A third party that
-already holds a shipped name keeps its generation, and what it installed, until its next sync is
-refused.
+the checkpoint the repository left. Nothing about the binding is stored: it is read from the
+records above.
+
+"The same root" is the same set of keys the root names for its own role, so a mirror and a vendor
+repository beneath the official root share their publishers, and a renewed root keeps them. A
+repository on a root that a holder's root signed over, the rotation a client follows, is under the
+holder's root: each sync of the repository that followed the rotation is accepted, not only the one
+that made it, while the holder has not followed yet. The host reads that from the signatures the
+repository's root carries, so it reaches one rotation. A holder two rotations behind is not
+recognised until it synchronises and follows, and a removed repository whose installation stays
+cannot, so it holds the name until what it installed is removed. A sync also accepts a holder under
+the root the repository was on, since the client verified the chain between them. For an
+installation a mirror that has not followed a rotation counts as another root until it
+synchronises.
+
+The limits of the rule:
+
+- A refused sync or installation changes nothing. The repository keeps its generation and what it
+  installed, and each sync and installation under that name is refused until the holder is removed
+  with what was installed from it.
+- A removed repository whose installation stays and whose checkpoint cannot be read holds its name
+  against every root, its own included.
+- Two repositories under different roots that both listed one name before the rule applied are
+  both refused.
+- The repository the seed enrols is never refused, so a shipped publisher's name is the build's
+  whichever repository was enrolled first. A host whose build seeded nothing has no such
+  repository, and the official one is held to the rule like any other: a repository that held a
+  shipped name before stops the official repository's syncs, and the revocations they carry, until
+  the owner removes it.
+- A delegation that lists no package holds no name.
 
 A root gives each of its four roles a key of its own. A root that names one key for two roles, or
-one key twice for a role, is refused with the roles named: when the owner is asked to adopt it,
-when the build is asked to trust the bundled generation's, and for the root a sync ends on, before
-that root is kept (a root a sync rotates to is not kept, and the repository stays on the root and
-the generation it was on). The check compares the keys as the client parsed them, within a family
+one key under two identifiers for a role, is refused with the roles named: when the owner is asked
+to adopt it, when the build is asked to trust the bundled generation's, and for the root a sync
+ends on, before that root is kept (a root a sync rotates to is not kept, and the repository stays
+on the root and the generation it was on). What a person can do depends on where the root is met.
+For a root offered for adoption, the repository's publisher gives a root with a key for each role
+and the owner enrols the repository with it. A bundled root is replaced by a later release of the
+product. A root a sync moves to or ends on is replaced by the publisher's next root, signed over
+it, which the host follows. The check compares the keys as the client parsed them, within a family
 of keys (Ed25519, RSA, ECDSA). It does not find one key written two ways, an Ed25519 key and its
 negation or its sum with a small-order point, or two RSA keys of one modulus; those are the key
 ceremony's. A root this host already holds is refused when a sync ends on it, not before the
