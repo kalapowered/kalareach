@@ -8032,43 +8032,71 @@ impl WorkerService {
         }
     }
 
-    /// Serves `history.page`: the session's retained output, to the local owner alone.
+    /// Serves `history.page`: the session's retained output, to the caller's history.
     ///
-    /// A page is a byte range and a grant's history scope is a moment in time, so nothing here can
-    /// narrow one to the other, and a host that cannot narrow content to a grant refuses it rather
-    /// than serving more than the grant allows. The daemon already refuses a paired device this
-    /// read; every caller but the local owner is refused here too, whichever socket it came in on,
-    /// a paired device in the daemon's own words.
+    /// The local owner reads all of it. A caller whose read came with the history scope of the grant
+    /// the daemon decided it under reads what that scope reaches, and a page is a byte range while a
+    /// scope is a moment in time, so the range is narrowed through the record of when the output was
+    /// produced ([`crate::output_times`]): a scope that begins at a moment is served from the start
+    /// of the first interval the record proves was written at or after it, and nothing before that.
+    /// Output the record does not time after that point is served, since cursors only grow; output
+    /// before it is never claimed, timed or not. A caller with no scope that is not the owner is
+    /// refused, whichever socket it came in on.
     fn history_page(
         &self,
         state: &ConnectionState,
         params: &ParamsValue,
         caller: &Caller,
     ) -> Result<ParamsValue> {
-        if !caller.is_local_owner() {
+        let Some(filter) = caller.history_filter(Method::HistoryPage.entry()) else {
             let refused = if caller.ingress == ActorIngress::PairedDevice {
                 "a paired device"
             } else {
                 "a caller acting under a grant"
             };
             return Err(WorkerError::PermissionDenied {
-                detail: format!("this host does not serve retained history to {refused}"),
+                detail: format!(
+                    "this host does not serve retained history to {refused} that sent no history \
+                     scope"
+                ),
             });
-        }
+        };
+        let Some(bound) = filter.first_moment(crate::history_filter::Surface::EventPage) else {
+            return Err(WorkerError::PermissionDenied {
+                detail: "this grant's history does not reach the session's retained output"
+                    .to_owned(),
+            });
+        };
         let params: HistoryPageParams = parse(params)?;
-        let session = self.runtime.session();
-        Self::check_session(&session, params.session_id)?;
         // A page that filled the control frame exactly would not fit once its own metadata was
         // encoded around it, so the request is clamped to what the frame can actually carry, and
         // to what the peer said it can receive.
-        let bound = state
+        let limit = state
             .peer_limits
             .max_control_frame_len
             .get()
             .saturating_sub(kr_protocol::limits::MAX_STREAM_HEADER_LEN as u64)
-            .min(MAX_REPLAY_PAGE_BYTES);
-        let page =
-            session.history_page(params.from_cursor.get(), params.max_bytes.get().min(bound))?;
+            .min(MAX_REPLAY_PAGE_BYTES)
+            .min(params.max_bytes.get());
+        let reach = if bound == 0 {
+            crate::history::Reach::Whole
+        } else {
+            // The record is read with the session let go: the read loop that takes the output in
+            // waits for that lock, and the record is a file. The end of the output is taken first,
+            // so that output written while the record is read is still ahead of the reader.
+            let (end, times) = {
+                let session = self.runtime.session();
+                Self::check_session(&session, params.session_id)?;
+                (session.output_cursor(), session.output_time_index())
+            };
+            match times.and_then(|times| times.first_cursor_from(bound)) {
+                Some(first) => crate::history::Reach::From(first),
+                None => crate::history::Reach::Nothing { end },
+            }
+        };
+        let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        let page = session.history_page_within(params.from_cursor.get(), limit, reach)?;
         encode(&page)
     }
 

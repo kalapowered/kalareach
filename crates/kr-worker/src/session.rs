@@ -3996,6 +3996,20 @@ impl Session {
         self.history.page(from_cursor, max_bytes)
     }
 
+    /// Reads one page of retained output for a reader that reaches `reach` of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the spool cannot be read.
+    pub fn history_page_within(
+        &self,
+        from_cursor: u64,
+        max_bytes: u64,
+        reach: crate::history::Reach,
+    ) -> Result<HistoryPageResult> {
+        self.history.page_within(from_cursor, max_bytes, reach)
+    }
+
     /// Returns why a cursor is no longer retained, when this host recorded a reason.
     ///
     /// The gap a page carries says what is gone; this says which of section 20's bounds took it,
