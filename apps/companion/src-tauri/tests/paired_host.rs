@@ -232,14 +232,14 @@ async fn a_paired_devices_questions_go_through_the_host() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_comes_back_is_reached_again() {
     let owner = DeviceKeys::generate().expect("keys");
-    // The host keeps its keys and its address across the restart, as a host does.
-    let port = {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a port");
-        socket.local_addr().expect("an address").port()
+    // The host binds a port the system gives it, and keeps its keys and that address across the
+    // restart, as a host does.
+    let settings = kr_controller::service::net::config::NetworkSettings {
+        endpoint: net_support::loopback(),
+        ..kr_controller::service::net::config::NetworkSettings::default()
     };
-    let mut settings = kr_controller::service::net::config::NetworkSettings::default();
-    settings.endpoint.bind_addr = Some(format!("127.0.0.1:{port}").parse().expect("an address"));
-    let host = Host::start_with_settings(&owner, settings.clone()).await;
+    let mut host = Host::start_with_settings(&owner, settings).await;
+    host.comes_back_at_its_address();
     let (companion, _data) = paired_with(&host, &owner, &[ActionRight::SessionView]).await;
     connection(&companion, true).await;
     companion
@@ -260,6 +260,7 @@ async fn a_host_that_comes_back_is_reached_again() {
         .expect_err("the host is gone");
     assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
 
+    let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
     let back = connection(&companion, true).await;
     assert_eq!(back["rights"], json!(["session.view"]));
