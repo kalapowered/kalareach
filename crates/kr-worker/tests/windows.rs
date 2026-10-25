@@ -1597,10 +1597,9 @@ async fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its
 /// The pseudo-console asks for key records with `CSI ?9001h`, and the worker records that. A
 /// record is then written to the console in the documented sequence with every field. The
 /// application reads one key with the console's own call and prints what it was given, then a
-/// marker that ends the line. Ctrl and Return is the key this is shown with: the console reports it
-/// as a line feed, and the legacy spelling of a line feed is a different key, so the application
-/// can tell the two paths apart. It is told Return, as a line feed, with the Control key held, as
-/// the record said.
+/// marker that ends the line. Shift and Return is the key this is shown with: its legacy spelling is
+/// a bare carriage return, which the console reads back as Return with no modifier, so an
+/// application that is told Return with Shift held was given the record and not the legacy bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_key_events() {
     use kr_ipc::client::LocalClient;
@@ -1684,7 +1683,7 @@ async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_k
         .to_typed()
         .expect("decodes");
 
-    // Ctrl and Return: virtual key 13, scan code 0x1c, the line feed the console makes of it.
+    // Shift and Return: virtual key 13, scan code 0x1c, the carriage return, Shift held.
     client
         .request(
             kr_protocol::method::Method::InputWrite,
@@ -1697,9 +1696,9 @@ async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_k
                     keys: vec![ConsoleKey {
                         virtual_key: 0x0d,
                         scan_code: 0x1c,
-                        unicode: 0x0a,
+                        unicode: 0x0d,
                         key_down: true,
-                        control_keys: 0x0008,
+                        control_keys: 0x0010,
                         repeat: 1,
                     }],
                 },
@@ -1711,7 +1710,7 @@ async fn key_records_written_to_a_real_pseudo_console_reach_the_application_as_k
     let seen = common::retained_carrying(runtime, b":kr-end", 1, PATIENCE).await;
     let shown = String::from_utf8_lossy(&seen);
     assert!(
-        shown.contains("kr-key:13:10:Control:kr-end"),
-        "the application was given Return, as a line feed, with Control held: {shown:?}"
+        shown.contains("kr-key:13:13:Shift:kr-end"),
+        "the application was given Return with Shift held: {shown:?}"
     );
 }

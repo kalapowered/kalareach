@@ -46,15 +46,15 @@
     {
       "id": "dead-key-has-no-character",
       "covers": "KR-REQ-08.53",
-      "why": "A key with no character and no name is nothing, not another key.",
+      "why": "A dead key is a record with no character, and no key it names is a key, so it spells nothing.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"
       },
       "records": [
         {
-          "virtual_key": 0,
-          "scan_code": 30,
+          "virtual_key": 222,
+          "scan_code": 40,
           "unicode": 0,
           "key_down": true,
           "control_keys": 0,
@@ -590,6 +590,26 @@
           "unicode": 13,
           "key_down": true,
           "control_keys": 0,
+          "repeat": 1
+        }
+      ],
+      "bytes": "0d"
+    },
+    {
+      "id": "shift-return-is-the-carriage-return",
+      "covers": "KR-REQ-08.53",
+      "why": "Legacy input has no spelling for Shift and Return, so it is the carriage return Return is.",
+      "keyboard": {
+        "application_cursor_keys": false,
+        "negotiated": "legacy"
+      },
+      "records": [
+        {
+          "virtual_key": 13,
+          "scan_code": 28,
+          "unicode": 13,
+          "key_down": true,
+          "control_keys": 16,
           "repeat": 1
         }
       ],
