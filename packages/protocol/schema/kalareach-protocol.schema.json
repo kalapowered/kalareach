@@ -20736,6 +20736,108 @@
         }
       ]
     },
+    "LaunchEditor": {
+      "description": "Whether the root editor is at a prompt a launch can be installed in.\n\n`verified` rests on the reader's last fence acknowledgement and on nothing the worker admitted\nsince: the buffer was empty with no operation pending at a primary prompt, the fence still\nstands, and no launch is outstanding or installed here. The reader still checks the real buffer\nwhen a launch arrives.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A launch quoting these values can be installed.",
+          "properties": {
+            "buffer_revision": {
+              "$ref": "#/$defs/EditorBufferRevision",
+              "description": "The buffer revision the reader acknowledged as empty, which a launch quotes."
+            },
+            "cwd_revision": {
+              "$ref": "#/$defs/CwdRevision",
+              "description": "The shell's working-directory revision. It shows where the shell is; a launch does not\nquote it."
+            },
+            "prompt_generation": {
+              "$ref": "#/$defs/PromptGeneration",
+              "description": "The prompt the fence was proved at, which a launch quotes."
+            },
+            "state": {
+              "const": "verified",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "prompt_generation",
+            "buffer_revision",
+            "cwd_revision"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker cannot vouch for the prompt.",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/LaunchUnverified",
+              "description": "The first reason that holds."
+            },
+            "state": {
+              "const": "unverified",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LaunchInput": {
+      "description": "How the asking connection stands to the session's input.",
+      "oneOf": [
+        {
+          "const": "held_here",
+          "description": "An attachment of the asking connection holds the input lease.",
+          "type": "string"
+        },
+        {
+          "const": "held_elsewhere",
+          "description": "Another connection holds it.",
+          "type": "string"
+        },
+        {
+          "const": "free",
+          "description": "Nobody holds it.",
+          "type": "string"
+        },
+        {
+          "const": "withheld",
+          "description": "The caller's grant does not reach the live screen, which shows who holds the input.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchOffer": {
+      "description": "One agent the host has a package for, and the command that starts it.\n\nWhether the executable is on the shell's path is the shell's to say when the command runs.\n\nRead-only metadata: a member added later is explicitly optional, and a reader whose schema\npredates it ignores it rather than refusing the answer.",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/LaunchCommand",
+          "description": "What a launch sends to start the agent: the command alone, with no flags."
+        },
+        "label": {
+          "description": "The package's display name.",
+          "type": "string"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The admitted package that gives the command."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "label",
+        "command"
+      ],
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
+    },
     "LaunchProbeReport": {
       "additionalProperties": false,
       "description": "What a package's launch probe read of its application, as `kr doctor` reports it.\n\nThe executable is this daemon's reading of it: the first its package's match rule names on the\ndaemon's own search path. The probe runs in the daemon's own environment and directory, so a\nlaunch whose environment differs (a `CODEX_HOME` of its own, say) can read another mode. This\nhost starts no launch that records a mode of its own.",
@@ -20917,6 +21019,111 @@
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "LaunchShell": {
+      "description": "The shell a session runs, where the host knows how to quote for it.",
+      "oneOf": [
+        {
+          "const": "sh",
+          "description": "A POSIX shell other than Bash and Zsh: `sh`, `dash` or `ash`.",
+          "type": "string"
+        },
+        {
+          "const": "zsh",
+          "description": "Zsh.",
+          "type": "string"
+        },
+        {
+          "const": "bash",
+          "description": "Bash.",
+          "type": "string"
+        },
+        {
+          "const": "fish",
+          "description": "Fish.",
+          "type": "string"
+        },
+        {
+          "const": "powershell",
+          "description": "PowerShell.",
+          "type": "string"
+        }
+      ]
+    },
+    "LaunchUnverified": {
+      "description": "Why the worker cannot vouch for the prompt, in the order it tests them.",
+      "oneOf": [
+        {
+          "const": "closing",
+          "description": "The session is closing.",
+          "type": "string"
+        },
+        {
+          "const": "not_a_shell",
+          "description": "The session's root is a command the host started, so there is no shell to type into.",
+          "type": "string"
+        },
+        {
+          "const": "stock_shell",
+          "description": "The session runs a stock shell, whose editor the host does not see. A person is shown\ninstructions instead.",
+          "type": "string"
+        },
+        {
+          "const": "profile_forbids",
+          "description": "The session's launch profile does not allow a fenced launch.",
+          "type": "string"
+        },
+        {
+          "const": "not_shown",
+          "description": "The caller's grant does not reach the live screen, so the editor is not told.",
+          "type": "string"
+        },
+        {
+          "const": "starting",
+          "description": "The root integration is not qualified yet: it has not connected, or the startup files still\nrun.",
+          "type": "string"
+        },
+        {
+          "const": "integration_lost",
+          "description": "The root integration was refused, or lost after it qualified.",
+          "type": "string"
+        },
+        {
+          "const": "not_at_prompt",
+          "description": "No root editor is registered: a command or an application holds the terminal, or the shell\nis between prompts.",
+          "type": "string"
+        },
+        {
+          "const": "not_primary_prompt",
+          "description": "The reader is a continuation line or the `read` builtin, not the primary prompt.",
+          "type": "string"
+        },
+        {
+          "const": "launch_in_progress",
+          "description": "A launch is reserved, one the worker revoked still waits for the reader, or one was\ninstalled at this prompt.",
+          "type": "string"
+        },
+        {
+          "const": "no_fence",
+          "description": "No fence stands: nobody holds the session's input, or a fence exchange is open or withheld.",
+          "type": "string"
+        },
+        {
+          "const": "buffer_not_empty",
+          "description": "The buffer the reader acknowledged held text.",
+          "type": "string"
+        },
+        {
+          "const": "reader_pending",
+          "description": "The reader acknowledged an operation in progress: a search, a numeric argument, a motion, a\nquoted insertion, a macro, a key sequence or a paste.",
+          "type": "string"
+        },
+        {
+          "const": "changed_since_fence",
+          "description": "Input, an interrupt, a refused launch or a reader report changed the worker's picture\nafter the fence was proved.",
+          "type": "string"
+        }
+      ]
     },
     "LiveBinding": {
       "additionalProperties": false,
@@ -22725,6 +22932,11 @@
         {
           "const": "shell.launch",
           "description": "Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT.",
+          "type": "string"
+        },
+        {
+          "const": "shell.launch.surface",
+          "description": "Whether the root editor is at an empty prompt a launch can be installed in, how the asking connection stands to the session's input, the shell's name, and the agents the host has a package for.",
           "type": "string"
         },
         {
@@ -37693,6 +37905,64 @@
       ],
       "type": "object"
     },
+    "ShellLaunchSurfaceParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `shell.launch.surface`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "ShellLaunchSurfaceResult": {
+      "description": "The result of `shell.launch.surface`: what a launch from this connection could do now.\n\nIt is advice, not a lease. A launch quotes the prompt generation and the buffer revision it\nnames, and the worker and the reader refuse a quote that has gone stale before anything is\ntyped.\n\nRead-only metadata: a member added later is explicitly optional, and a reader whose schema\npredates it ignores it rather than refusing the answer.",
+      "properties": {
+        "editor": {
+          "$ref": "#/$defs/LaunchEditor",
+          "description": "Whether the root editor is at an empty prompt a launch can be installed in."
+        },
+        "input": {
+          "$ref": "#/$defs/LaunchInput",
+          "description": "How the asking connection stands to the session's input."
+        },
+        "offers": {
+          "description": "What the host has an agent package for, by command.",
+          "items": {
+            "$ref": "#/$defs/LaunchOffer"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "shell": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchShell"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The shell the session runs, where the host knows how to quote for it. Null otherwise."
+        }
+      },
+      "required": [
+        "session_id",
+        "editor",
+        "input",
+        "shell",
+        "offers"
+      ],
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
+    },
     "ShellMode": {
       "description": "How the root shell is integrated.",
       "oneOf": [
@@ -44993,6 +45263,12 @@
     },
     "shell_launch_result": {
       "$ref": "#/$defs/ShellLaunchResult"
+    },
+    "shell_launch_surface_params": {
+      "$ref": "#/$defs/ShellLaunchSurfaceParams"
+    },
+    "shell_launch_surface_result": {
+      "$ref": "#/$defs/ShellLaunchSurfaceResult"
     },
     "signed_archive_manifest": {
       "$ref": "#/$defs/SignedArchiveManifest"

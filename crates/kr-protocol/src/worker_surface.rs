@@ -64,7 +64,10 @@ use crate::recovery::{
     EventsSubscribeParams, EventsSubscribeResult, HistoryGap, HistoryPageParams, HistoryPageResult,
     OutputEvent, ResyncRequired,
 };
-use crate::root::{EDITOR_BUSY_EVENT, EditorBusyEvent, ShellLaunchParams, ShellLaunchResult};
+use crate::root::{
+    EDITOR_BUSY_EVENT, EditorBusyEvent, ShellLaunchParams, ShellLaunchResult,
+    ShellLaunchSurfaceParams, ShellLaunchSurfaceResult,
+};
 use crate::session::{
     ClosureRecord, SESSION_CLOSED_EVENT, SessionCloseParams, SessionCloseResult, SessionReadParams,
     SessionReadResult,
@@ -185,6 +188,7 @@ fn table() -> Vec<ServedMethod> {
         ),
         method::<EventsSnapshotParams, EventsSnapshotResult>(Method::EventsSnapshot),
         method::<AgentInstancesParams, AgentInstancesResult>(Method::AgentInstances),
+        method::<ShellLaunchSurfaceParams, ShellLaunchSurfaceResult>(Method::ShellLaunchSurface),
         method::<HistoryPageParams, HistoryPageResult>(Method::HistoryPage),
         method::<EventsSubscribeParams, EventsSubscribeResult>(Method::EventsSubscribe),
         method::<ActionReadParams, ActionReadResult>(Method::ActionRead),

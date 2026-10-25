@@ -394,8 +394,8 @@ Mutation schemas are closed for the negotiated version. Read-only metadata may c
 optional fields a receiver does not know: a type opts in with the schema keyword
 `x-kalareach-read-only-metadata` and without `deny_unknown_fields`, and the check removes an
 undeclared field there before typed decoding and never delivers it. `HostInfoResult`,
-`EnvironmentListResult`, `EnvironmentSummary`, `HostPrivacyState` and `DefaultShellMode` are
-read-only metadata. A field a newer host adds
+`EnvironmentListResult`, `EnvironmentSummary`, `HostPrivacyState`, `DefaultShellMode`,
+`ShellLaunchSurfaceResult` and `LaunchOffer` are read-only metadata. A field a newer host adds
 to one of them is optional, absent when unset, and an older client ignores it. A test holds that no
 parameter schema, envelope, handshake message, signed object, event or write result reaches a
 read-only metadata type, so an ignored field is never one a signature or a digest covers.
@@ -743,12 +743,13 @@ reaching only its own.
 
 ## The root integration
 
-Six methods carry the trusted root shell's side of section 7, and `crates/kr-protocol/src/root.rs`
+Seven methods carry the trusted root shell's side of section 7, and `crates/kr-protocol/src/root.rs`
 holds the types they exchange. Five of them are private-IPC only: `root.editor.enter`,
 `root.editor.leave`, `root.editor.fence`, `root.eof.detach` and `root.command.accepted` list
 `local_ipc` alone, so a network caller is denied whatever grant it holds. `shell.launch` is
 reachable from a paired device, because a launch button is a client action, but it still installs
-through the reader rather than through the terminal.
+through the reader rather than through the terminal. `shell.launch.surface` is the read a client
+makes before it offers a launch: a paired device or a local caller makes it under `session.view`.
 
 | Method | Parameters | Result |
 | --- | --- | --- |
@@ -758,6 +759,34 @@ through the reader rather than through the terminal.
 | `root.eof.detach` | `RootEofDetachParams`: `fence_id`, `prompt_generation`, `input_epoch` | `RootEofDetachResult`: the attachment that was removed, the state and the discarded bytes |
 | `root.command.accepted` | `RootCommandAcceptedParams`: the fence, the prompt generation and the origin the reader can prove | `RootCommandAcceptedResult`: the origin the worker recorded, the `detach_token` this line's own execution presents to `kr detach` (a bearer capability, null where the host could not attribute the line) and the fence state after acceptance |
 | `shell.launch` | `ShellLaunchParams`: an argument vector or an already-quoted command, the expected prompt generation and the expected empty-buffer revision, which are the three section 7 gives the caller | `ShellLaunchResult`: the fence, the prompt generation and the buffer revision at acceptance |
+| `shell.launch.surface` | `ShellLaunchSurfaceParams`: the session | `ShellLaunchSurfaceResult`: whether the editor is verified at an empty prompt, how the asking connection stands to the session's input, the shell's name and the agents the host has a package for |
+
+`shell.launch.surface` is advice. A launch quotes the prompt generation and the buffer revision that
+the read returned, and the worker and the reader refuse a quote that has gone stale before anything
+is typed. `editor` is `verified` only when none of the reasons of `LaunchUnverified` holds. The
+worker tests them in the order they are declared: the session is closing; its root is a command
+rather than a shell; it runs a stock shell; its launch profile forbids a fenced launch; the caller's
+grant does not reach the live screen; the integration is still starting or was lost; no root editor
+is registered; the reader is not the primary prompt; a launch is reserved, outstanding or installed
+at this prompt; no fence stands; the buffer the reader acknowledged held text; the reader
+acknowledged an operation in progress; or input, an interrupt, a refused launch or a reader report
+changed the worker's picture after the fence was proved. `verified` carries the prompt generation,
+the acknowledged buffer revision and the working-directory revision; a launch does not quote the
+last. The reader checks the real buffer when the launch arrives, so a read can say `verified` while
+a key waits in the terminal's queue, and the launch is then refused with `DRAFT_CONFLICT`.
+
+`input` is `held_here` when an attachment of the asking connection holds the input lease,
+`held_elsewhere` when another connection holds it, `free` when nobody does, and `withheld` when the
+caller's grant does not reach the live screen, which shows who holds it. `shell` names the session's
+shell where the host knows how to quote for it (`sh`, `zsh`, `bash`, `fish`, `powershell`) and is
+null otherwise. `offers` has one entry for each distinct command among the packages the host has
+admitted, in the order of the command: the package, its display name and the `LaunchCommand` a
+launch sends, which is the command alone. A package gives the command its manifest declares as a
+command integration, whether or not the installation holds the capability that lets it run, and
+otherwise the file stem of its first match rule that names no directory. Nothing says the
+executable is installed: the shell reports that when the command runs. A worker states
+`shell.launch.surface/1` in its hello answer when it serves the read, and a caller asks only a
+worker that states it.
 
 `EditorFence` is the ownership proof the whole group rests on: the root process with the kernel's
 record of when it started, the prompt generation, the reader revision, the input-lease epoch and
