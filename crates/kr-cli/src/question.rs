@@ -1470,22 +1470,33 @@ fn first_line(text: &str) -> String {
 /// any question, so no answer of one is read in this build's shape. When no worker this `kr` reads
 /// holds the question and some were not read, the failure names them and the command that reads
 /// them.
+///
+/// The question is read by name, which always fits a frame. A worker that does not hold it refuses
+/// that read, and so does one that will not show its questions, and the refusal cannot tell them
+/// apart; the worker's pending questions can, because a worker that will not show its questions
+/// refuses that read too. The pending questions are not the whole history, which a long-lived
+/// session grows past what one frame holds, but they can pass it as well: such a worker could not
+/// be asked, and is reported as one.
 async fn locate(
     paths: &HostPaths,
     question_id: QuestionId,
     build_id: BuildId,
 ) -> Result<(WorkerDescriptor, Question, LocalClient)> {
     let mut unread = Vec::new();
-    // The first worker that could not say whether it holds the question, with its display number.
-    // A question that no worker lists is unknown only if every worker was asked: one that could
-    // not be asked may hold it.
-    let mut unasked: Option<(u64, CliError)> = None;
-    for descriptor in descriptors(paths, &Scope::Everything)? {
+    // The first worker that could not say whether it holds the question, with its display number
+    // when its descriptor was read. A question that no worker lists is unknown only if every
+    // worker was asked: one that could not be asked may hold it.
+    let mut unasked: Option<(Option<u64>, CliError)> = None;
+    let (found, unreadable) = every_descriptor(paths)?;
+    if let Some(error) = unreadable {
+        unasked.get_or_insert((None, error));
+    }
+    for descriptor in found {
         let display = descriptor.display_number.get();
         let mut client = match open_worker(&descriptor, build_id.clone()).await {
             Ok(client) => client,
             Err(error) => {
-                unasked.get_or_insert((display, error));
+                unasked.get_or_insert((Some(display), error));
                 continue;
             }
         };
@@ -1493,29 +1504,11 @@ async fn locate(
             unread.push(Unread { display, other });
             continue;
         }
-        // The worker's questions, not the one by name: a refusal of the named read cannot be told
-        // from a worker that lacks the question, and of the list it is a refusal to show them.
-        let outcome: Result<QuestionReadResult> = read(
-            &mut client,
-            &QuestionReadParams {
-                session_id: descriptor.session_id,
-                question_id: Nullable::null(),
-                include_resolved: true,
-            },
-        )
-        .await;
-        match outcome {
-            Ok(result) => {
-                if let Some(question) = result
-                    .questions
-                    .into_iter()
-                    .find(|question| question.question_id == question_id)
-                {
-                    return Ok((descriptor, question, client));
-                }
-            }
+        match holds(&mut client, &descriptor, question_id).await {
+            Ok(Some(question)) => return Ok((descriptor, question, client)),
+            Ok(None) => {}
             Err(error) => {
-                unasked.get_or_insert((display, error));
+                unasked.get_or_insert((Some(display), error));
             }
         }
     }
@@ -1536,7 +1529,10 @@ async fn locate(
             CliError::Refused(refusal) => Shown::protocol(refusal),
             other => other.said(),
         };
-        shown!(". Session {} could not be asked either: {}", display, why)
+        match display {
+            Some(display) => shown!(". Session {} could not be asked either: {}", display, why),
+            None => shown!(". A session could not be asked either: {}", why),
+        }
     });
     Err(CliError::Refused(kr_client::error::refusal(
         ErrorCode::UnsupportedSchema,
@@ -1549,30 +1545,100 @@ async fn locate(
     )))
 }
 
+/// Asks one worker for one question: the question when it holds it, none when it was asked and
+/// does not, and the failure when it could not be asked.
+async fn holds(
+    client: &mut LocalClient,
+    descriptor: &WorkerDescriptor,
+    question_id: QuestionId,
+) -> Result<Option<Question>> {
+    let named: Result<QuestionReadResult> = read(
+        client,
+        &QuestionReadParams {
+            session_id: descriptor.session_id,
+            question_id: Nullable::some(question_id),
+            include_resolved: true,
+        },
+    )
+    .await;
+    match named {
+        Ok(result) => Ok(result
+            .questions
+            .into_iter()
+            .find(|question| question.question_id == question_id)),
+        // A worker that does not hold the question refuses the read of it as permission denied.
+        // So does one that will not show its questions, as one does whose membership lease ended,
+        // so what the refusal means is read from its pending questions.
+        Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => {
+            let pending: QuestionReadResult = read(
+                client,
+                &QuestionReadParams {
+                    session_id: descriptor.session_id,
+                    question_id: Nullable::null(),
+                    include_resolved: false,
+                },
+            )
+            .await?;
+            Ok(pending
+                .questions
+                .into_iter()
+                .find(|question| question.question_id == question_id))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn descriptors(paths: &HostPaths, scope: &Scope) -> Result<Vec<WorkerDescriptor>> {
     match scope {
         Scope::Session(selector) => {
             let (_, descriptor) = find(paths, selector, None)?;
             Ok(vec![descriptor])
         }
-        Scope::Everything => {
-            let mut found = Vec::new();
-            for known in environments(paths)? {
-                collect(&known, &mut found);
-            }
-            found.sort_by_key(|descriptor| descriptor.display_number.get());
-            Ok(found)
-        }
+        Scope::Everything => Ok(every_descriptor(paths)?.0),
     }
 }
 
-fn collect(known: &KnownEnvironment, found: &mut Vec<WorkerDescriptor>) {
-    let Ok(entries) = kr_ipc::descriptor::read_all(&known.paths) else {
-        return;
+/// The descriptor of every session of every environment, in display order, and the first failure
+/// to read one: a directory that cannot be listed, or a file that is not a descriptor. A session
+/// whose descriptor cannot be read is one that cannot be asked, which a search for one question
+/// has to know, since the question may be there.
+fn every_descriptor(paths: &HostPaths) -> Result<(Vec<WorkerDescriptor>, Option<CliError>)> {
+    let mut found = Vec::new();
+    let mut unreadable = None;
+    for known in environments(paths)? {
+        collect(&known, &mut found, &mut unreadable);
+    }
+    found.sort_by_key(|descriptor| descriptor.display_number.get());
+    Ok((found, unreadable))
+}
+
+fn collect(
+    known: &KnownEnvironment,
+    found: &mut Vec<WorkerDescriptor>,
+    unreadable: &mut Option<CliError>,
+) {
+    let entries = match kr_ipc::descriptor::read_all(&known.paths) {
+        Ok(entries) => entries,
+        Err(error) => {
+            unreadable.get_or_insert(CliError::HostUnavailable(shown!(
+                "the sessions of environment {} cannot be listed: {}",
+                known.environment_id,
+                Shown::ipc(&error)
+            )));
+            return;
+        }
     };
     for entry in entries {
-        if let Ok(descriptor) = entry.descriptor {
-            found.push(descriptor);
+        match entry.descriptor {
+            Ok(descriptor) => found.push(descriptor),
+            // The reason is the descriptor reader's own text about a file it found, and is not
+            // repeated: which file, and that it could not be read, is what is established.
+            Err(_) => {
+                unreadable.get_or_insert(CliError::HostUnavailable(shown!(
+                    "the session descriptor {} cannot be read",
+                    Shown::stored(&entry.path, &[], &["kr"])
+                )));
+            }
         }
     }
 }

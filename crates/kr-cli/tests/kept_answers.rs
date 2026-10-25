@@ -1742,6 +1742,30 @@ async fn a_worker_that_cannot_be_reached_is_named_beside_one_of_an_earlier_build
     assert_eq!(host.answers_received(), 0);
 }
 
+/// KR-REQ-11.63: a session whose descriptor cannot be read cannot be asked, so a question no other
+/// session lists is not unknown: the worker behind the descriptor may hold it. The control is the
+/// same host without the unreadable descriptor, where every session was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_that_cannot_be_read_is_not_taken_for_a_session_without_the_question() {
+    let host = Host::start(Behaviour::ListsNoQuestions).await;
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(2), "{document}");
+
+    let unreadable = host
+        .environment
+        .descriptor_file(SessionId::new(kr_ipc::new_uuid()));
+    std::fs::write(&unreadable, b"not a descriptor").expect("a file that is not a descriptor");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600))
+        .expect("readable by its owner alone, as a descriptor is");
+    let (status, document) = answer_it(&host);
+    assert_eq!(status, Some(3), "{document}");
+    assert!(document.get("kept").is_none(), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("cannot be read"), "{message}");
+    assert!(!host.kept().exists());
+    assert_eq!(host.answers_received(), 0);
+}
+
 /// KR-REQ-11.63: a reply that is not a message is the worker's own answer, not a lost connection,
 /// so the answer is shown as refused and not kept, as the drafts library rules.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
