@@ -380,12 +380,12 @@ pub fn known() -> Vec<Known> {
             "ChangesetMaterializeParams",
             "415bb9a78b87717defa5d777ecec5da28cf9caae0710cb702a26394e96c458d9",
         ),
-        // The apply node's parameters are the type a stored apply node is decoded as. This line and
-        // its pair in `kept_without_a_holder` go when the store declares a frozen type of its own
-        // for the stored node, which keeps the type's present shape.
-        known_protocol::<changeset::DiffApplyParams>(
+        // The apply node's parameters are the type a stored apply node is decoded as, which is
+        // the store's own frozen shape and not the method's. This line and its pair in
+        // `kept_without_a_holder` go with that type when the store keeps the method's.
+        known_protocol::<kr_automation::definition::StoredApplyParams>(
             "workflows",
-            "DiffApplyParams",
+            "StoredApplyParams",
             "797959de9f2a9930651527808996128047e5f9ee0989a258675d6cab0af57430",
         ),
         known_protocol::<changeset::ChangesetCaptureParams>(
@@ -434,7 +434,7 @@ pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
         // The parameters of a stored workflow's node, which admission decodes at each admission.
         ("workflows", "ChangesetMaterializeParams"),
         // Goes with the apply node's line in `known`.
-        ("workflows", "DiffApplyParams"),
+        ("workflows", "StoredApplyParams"),
         ("workflows", "ChangesetCaptureParams"),
     ]
 }

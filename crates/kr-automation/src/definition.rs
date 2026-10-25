@@ -20,14 +20,16 @@ use kr_protocol::automation::{
     WorkflowEdge, WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
 };
 use kr_protocol::changeset::{
-    ChangesetCaptureParams, ChangesetMaterializeParams, DestinationClass, DiffApplyParams,
+    AffectedVersion, ChangesetCaptureParams, ChangesetMaterializeParams, DestinationClass,
     SourceConsistency,
 };
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{EnvironmentId, GrantId, SessionId, WorkflowId, WorkspaceId};
+use kr_protocol::ids::{
+    ChangeSetId, ChangeSetVersion, EnvironmentId, GrantId, SessionId, WorkflowId, WorkspaceId,
+};
 use kr_protocol::project::InclusionChoice;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::U64;
+use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::SessionCreateParams;
 
 use crate::error::{AutomationError, Result};
@@ -367,7 +369,9 @@ fn validate_typed_action_params(
     // for exactly what its method asks for, so its parameters are that method's own, and every
     // check that method makes on the request alone is made here too, so a node its method would
     // refuse whatever the host's state is refused when it is installed. What the method checks
-    // against the host's live state is checked when the node runs.
+    // against the host's live state is checked when the node runs. An apply node is the one
+    // exception: the store keeps the shape its parameters had before a versioned reference
+    // named the object it moves to, so the checks here are the ones that shape allows.
     match action_kind {
         WorkflowActionKind::ShellCommand => {
             let params: ShellCommandParams = typed_params(node_id, action_kind, &parsed)?;
@@ -417,7 +421,7 @@ fn validate_typed_action_params(
             typed_params::<ChangesetMaterializeParams>(node_id, action_kind, &parsed)?;
         }
         WorkflowActionKind::ApplyDiff => {
-            let params: DiffApplyParams = typed_params(node_id, action_kind, &parsed)?;
+            let params: StoredApplyParams = typed_params(node_id, action_kind, &parsed)?;
             apply_request_refusal(node_id, &params)?;
         }
         WorkflowActionKind::CaptureChangeset => {
@@ -448,17 +452,67 @@ fn session_request_refusal(node_id: &str, params: &SessionCreateParams) -> Resul
     Ok(())
 }
 
-/// Refuses an apply node whose parameters `diff.apply` refuses on the request alone.
+/// The parameters of an `apply_diff` node as the workflows store keeps them.
 ///
-/// These are every refusal on the method's path before its first reading of the host, and no
-/// other: the method reads the destination's workspace for every class; a versioned reference
-/// needs the reference, the value it is expected to hold and a name the method's reference rule
-/// admits; a direct apply to a shared working tree is chosen only after every limitation of that
-/// class has been shown; and a proposal or a direct apply reads each affected path through the
-/// transfer name rule and writes only paths the request describes. The limitations and the name
-/// rule are the method's own, called rather than restated; the reference rule is private to the
-/// method and restated here.
-fn apply_request_refusal(node_id: &str, params: &DiffApplyParams) -> Result<()> {
+/// An apply of a versioned reference names the object the reference moves to, and a stored node
+/// cannot: an apply node is never dispatched, and the node is read again at every admission, by
+/// this host and by an earlier release after a rollback, in the shape that release decodes. The
+/// store therefore keeps this type and not the method's own. A node that names an object to move
+/// to is refused when it is installed, and every node an earlier release stored is read as it was.
+///
+/// Delete this type and [`StoredReference`] and decode the method's own parameters once a
+/// released reader lets the workflows store keep the member and the store's version is raised for
+/// it. The rule that a move names its object then applies at install only, since a stored node of
+/// an earlier release carries none.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoredApplyParams {
+    /// The change set whose content is applied.
+    pub change_set_id: ChangeSetId,
+    /// The exact version of it.
+    pub version: ChangeSetVersion,
+    /// Where it goes.
+    pub destination: DestinationClass,
+    /// The workspace the destination names, for every class but a bare proposal.
+    pub workspace_id: Nullable<WorkspaceId>,
+    /// The reference and its expected old value, for a versioned Git reference.
+    pub expected_reference: Nullable<StoredReference>,
+    /// What the request expects each affected path to hold now.
+    pub affected: Vec<AffectedVersion>,
+    /// Which of the version's changed paths to apply. Empty means all of them.
+    pub paths: Vec<String>,
+    /// Run the preflight and stop, whatever it finds.
+    pub preflight_only: bool,
+    /// The limitations of the chosen destination, as the caller was shown them.
+    pub acknowledged_limitations: Vec<String>,
+}
+
+/// The reference a stored `apply_diff` node names, and the value it expects it at.
+///
+/// Removed with [`StoredApplyParams`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoredReference {
+    /// The full reference name, such as `refs/heads/main`.
+    pub name: String,
+    /// The value it is expected to hold, or nothing when it is expected not to exist.
+    pub expected_old_value: Nullable<String>,
+}
+
+/// Refuses an apply node whose parameters `diff.apply` refuses on the request alone, as far as a
+/// stored node can meet them.
+///
+/// These are the refusals on the method's path before its first reading of the host that need
+/// nothing a stored node lacks: the method reads the destination's workspace for every class; a
+/// versioned reference needs the reference, the value it is expected to hold and a name the
+/// method's reference rule admits; a direct apply to a shared working tree is chosen only after
+/// every limitation of that class has been shown; and a proposal or a direct apply reads each
+/// affected path through the transfer name rule and writes only paths the request describes. The
+/// limitations and the name rule are the method's own, called rather than restated; the reference
+/// rule is private to the method and restated here. What the method asks of the object a
+/// versioned reference moves to is not asked: a stored node carries none, and an apply node is
+/// never dispatched.
+fn apply_request_refusal(node_id: &str, params: &StoredApplyParams) -> Result<()> {
     let refused = |why: &str| {
         Err(AutomationError::InvalidArgument(format!(
             "node {node_id} applies a version diff.apply would refuse: {why}"
@@ -564,7 +618,8 @@ fn bounded(node_id: &str, field: &str, value: &str, max_bytes: usize) -> Result<
     Ok(())
 }
 
-/// Decodes one node's parameters into the exact wire type its action kind is dispatched with.
+/// Decodes one node's parameters into the type its action kind is dispatched with, or the type
+/// the store keeps for an apply node.
 fn typed_params<T: serde::de::DeserializeOwned>(
     node_id: &str,
     action_kind: WorkflowActionKind,
@@ -591,7 +646,7 @@ pub fn node_workspace(node: &WorkflowNode) -> Option<WorkspaceId> {
                 .map(|params| params.workspace_id)
         }
         WorkflowActionKind::ApplyDiff => {
-            serde_json::from_str::<DiffApplyParams>(&node.action_params)
+            serde_json::from_str::<StoredApplyParams>(&node.action_params)
                 .ok()
                 .and_then(|params| params.workspace_id.0)
         }
