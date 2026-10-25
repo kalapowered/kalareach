@@ -16,25 +16,27 @@
 //! null.
 //!
 //! It opens a real window, so it has its own main thread (`harness = false`) and runs on macOS,
-//! where the Mac lists run it. Windows and Linux run the same publisher without this check.
+//! where the Mac lists run it, and on Windows, in WebView2. Linux runs the same publisher without
+//! this check.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn main() {
     println!(
-        "host_events: the runtime check runs on macOS; the payload's unit test holds the form here"
+        "host_events: the runtime check runs on macOS and Windows; the payload's unit test holds \
+         the form here"
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn main() {
-    std::process::exit(macos::run());
+    std::process::exit(window::run());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod scripted_worker;
 
-#[cfg(target_os = "macos")]
-mod macos {
+#[cfg(any(target_os = "macos", windows))]
+mod window {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -67,8 +69,8 @@ mod macos {
         let runtime = Arc::new(tokio::runtime::Runtime::new().expect("a runtime for the worker"));
         let worker = runtime.block_on(async { ScriptedWorker::start(Challenge::Answered) });
         let mut worker = Some(worker);
-        // A test context: the library already embeds the application's Info.plist, and a second
-        // copy is a duplicate symbol. With no capability of its own, the context takes the
+        // A test context: on macOS the library already embeds the application's Info.plist, and a
+        // second copy is a duplicate symbol. With no capability of its own, the context takes the
         // application's, so the page is allowed what the interface is and nothing more.
         let app = tauri::Builder::default()
             // The application's own state, as the publisher finds it when its connection ends.
