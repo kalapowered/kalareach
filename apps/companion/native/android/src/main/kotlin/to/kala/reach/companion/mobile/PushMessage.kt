@@ -89,6 +89,12 @@ const val PREVIEW_KEY = "preview"
  */
 const val ALERT_GONE = "alert_gone"
 
+/**
+ * The reason a delivery ends with when its alert could not be posted at all (notifications are off
+ * for the application): there is no alert for a preview to replace, so none is opened.
+ */
+const val NOT_POSTED = "not_posted"
+
 /** How a notification is posted. */
 enum class Posting {
     /** The first post of a delivery: it may sound. */
@@ -121,7 +127,8 @@ enum class Posting {
  * `decide` is the decision about the preview. `show` posts a plan the way it is told, and says
  * whether it posted. `repeated` says an earlier try of this delivery may already have posted its
  * alert, so that this try's first post does not sound again. Returns the plan the delivery ended
- * with: [ALERT_GONE] is its reason when a preview opened and was not posted.
+ * with: [ALERT_GONE] is its reason when a preview opened and was not posted, and [NOT_POSTED] when
+ * the alert could not be posted and nothing was opened.
  */
 fun showDelivery(
     delivery: PushMessage.Delivery,
@@ -136,7 +143,9 @@ fun showDelivery(
         show(plan, first)
         return plan
     }
-    show(NotificationPlan(delivery.collapseId, delivery.alert, reason = "opening"), first)
+    if (!show(NotificationPlan(delivery.collapseId, delivery.alert, reason = "opening"), first)) {
+        return NotificationPlan(delivery.collapseId, delivery.alert, reason = NOT_POSTED)
+    }
     return PreviewKeyGate.deciding {
         val decision = decide()
         val plan = planNotification(delivery, decision)
