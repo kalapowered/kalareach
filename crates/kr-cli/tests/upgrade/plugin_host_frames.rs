@@ -31,7 +31,6 @@ use kr_plugin_service::protocol::{
 use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Nonce256;
 
-use super::plugin_hosts::Wire;
 use super::{Host, Setup, Updated, previous, start_agent, terminal_for};
 
 fn hex(bytes: &[u8]) -> String {
@@ -227,14 +226,14 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
     );
     terminal.ready().await;
     let program = start_agent(&prepared.host, &terminal, &agent).await;
-    prepared.host.plugin_holding_at(Wire::Three, 1).await;
+    prepared.host.plugin_holding(1).await;
     let published = std::fs::read(
         prepared
             .host
             .tree
             .environment()
             .runtime_dir()
-            .join(Wire::Three.descriptor_file()),
+            .join(HostProtocol::THIS.descriptor),
     )
     .expect("the descriptor the release before published");
     let read: HostDescriptor =
@@ -251,7 +250,7 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
         .host
         .close(&prepared.kr_before(), &prepared.display);
     prepared.host.worker_ended(&prepared.worker).await;
-    prepared.host.end_the_plugin_host_at(Wire::Three).await;
+    prepared.host.end_the_plugin_host().await;
 
     if std::env::var_os("KR_RECORD_PLUGIN_HOST_FRAMES").is_some() {
         let record = serde_json::json!({
