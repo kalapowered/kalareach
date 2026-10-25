@@ -1381,7 +1381,11 @@ impl AttentionModule {
         records: &[EventCursor],
     ) -> (Vec<Option<String>>, Ticket) {
         let indexed: Vec<(usize, EventCursor)> = records.iter().copied().enumerate().collect();
-        let (texts, ticket, _) = self.texts(reach, &indexed).await;
+        let Texts {
+            served: texts,
+            ticket,
+            ..
+        } = self.texts(reach, &indexed, &BTreeSet::new()).await;
         let mut ordered = vec![None; records.len()];
         for (index, text) in texts {
             if let Some(slot) = ordered.get_mut(index) {
@@ -1436,7 +1440,11 @@ impl AttentionModule {
                 .map_err(refusal)?;
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, ticket, _) = self.texts(reach, &page.texts).await;
+                let Texts {
+                    served: texts,
+                    ticket,
+                    ..
+                } = self.texts(reach, &page.texts, &BTreeSet::new()).await;
                 for (index, text) in texts {
                     if let Some(item) = result.items.get_mut(index) {
                         item.summary = Nullable(text);
@@ -1521,7 +1529,12 @@ impl AttentionModule {
                 self.after_page.wait();
                 let mut result = page.result;
                 let withheld = encode(&result)?;
-                let (texts, mut ticket, _) = self.texts(reach, &page.texts).await;
+                let Texts {
+                    served: texts,
+                    mut ticket,
+                    silent,
+                    ..
+                } = self.texts(reach, &page.texts, &BTreeSet::new()).await;
                 for (index, text) in texts {
                     if let Some(change) = result.changes.get_mut(index) {
                         change.summary = Nullable(text);
@@ -1531,8 +1544,9 @@ impl AttentionModule {
                 // text carries no summary: one is generated text, written from it. It is released
                 // only while the privacy state it was read under holds.
                 if let Some(source) = &source
-                    && let Some((summary, generated)) =
-                        self.summary(reach, caller, params.session_id, source).await
+                    && let Some((summary, generated)) = self
+                        .summary(reach, caller, params.session_id, source, &silent)
+                        .await
                 {
                     result.summary = Nullable::some(summary);
                     ticket.generated.push(generated);
@@ -1563,6 +1577,7 @@ impl AttentionModule {
         caller: &Caller,
         session_id: SessionId,
         source: &kr_attention::visit::SummarySource,
+        silent: &BTreeSet<SessionId>,
     ) -> Option<(ChangeSummary, Generated)> {
         let (Some(descriptions), Some(privacy)) = (
             self.descriptions.get().map(Arc::clone),
@@ -1594,7 +1609,7 @@ impl AttentionModule {
             }
         };
         if reading.wanted {
-            self.ask_for_summary(reach, &descriptions, session_id, source)
+            self.ask_for_summary(reach, &descriptions, session_id, source, silent)
                 .await;
         }
         reading.served.map(|record| {
@@ -1618,16 +1633,17 @@ impl AttentionModule {
     /// carried to the host is the generation that text was decided under: a host that finds
     /// privacy mode has moved since refuses the request. Nothing here is released to anybody.
     ///
-    /// Nothing is asked while the text of a closed session's change is held back for now (see
-    /// [`Self::texts`]): text that no owner will ever serve leaves the change without it, but text
-    /// that a later look can read is waited for. A live worker that does not answer in time is not
-    /// held back.
+    /// Nothing is asked while the text of a change is absent for now (see [`Self::texts`]): text
+    /// that no owner will ever serve leaves the change without it, but text that a later look can
+    /// read is waited for. `silent` names the sessions whose live worker did not answer the read
+    /// this belongs to, which are not asked again.
     async fn ask_for_summary(
         &self,
         reach: &dyn Reach,
         descriptions: &crate::describe::DescribeModule,
         session_id: SessionId,
         source: &kr_attention::visit::SummarySource,
+        silent: &BTreeSet<SessionId>,
     ) {
         let newest = newest_changes(source);
         let records: Vec<(usize, EventCursor)> = newest
@@ -1635,9 +1651,14 @@ impl AttentionModule {
             .enumerate()
             .filter_map(|(index, change)| change.text.record().map(|record| (index, record)))
             .collect();
-        let (texts, ticket, held_back) = self.texts(reach, &records).await;
-        // A summary written without text that is only held back for now would reach the head and
-        // be served as that interval's summary from then on. The next read asks again.
+        let Texts {
+            served: texts,
+            ticket,
+            held_back,
+            ..
+        } = self.texts(reach, &records, silent).await;
+        // A summary written without text that is only absent for now would reach the head and be
+        // served as that interval's summary from then on. The next read asks again.
         if held_back {
             return;
         }
@@ -1690,14 +1711,20 @@ impl AttentionModule {
     ///
     /// A live session's worker answers over its link and a closed session's journal is read; a
     /// session that is neither, or whose owner does not answer in time, serves none. So does a
-    /// closed session while privacy mode's cleanup of it is owed. Each request names at most as
-    /// many records as a text request carries.
+    /// closed session while privacy mode is on or its cleanup of the session is owed. Each request
+    /// names at most as many records as a text request carries. A worker `silent` in the read this
+    /// belongs to is not asked again.
     ///
-    /// The last of the three answers says whether the text of a closed session is held back for
-    /// now rather than absent: its journal cannot be brought forward yet, or privacy mode's cleanup
-    /// of it is owed or privacy mode is on. A session closed over a
-    /// worker this host could not account for, a journal that cannot be read, a session that serves
-    /// no text and a live worker that does not answer are not held back.
+    /// The result says whether any text is absent for now rather than for good, which is when a
+    /// summary written without it would stand for the interval from then on. Text is absent for now
+    /// when a closed session's journal cannot be brought forward yet; when privacy mode is on or its
+    /// cleanup of a closed session is owed; when a live worker gives no answer in time, its link
+    /// ends first, or it refuses in a way the next request may cure (its own journal could not be
+    /// read); when a link no longer speaks for its session; and when a session the store follows (a
+    /// worker it keeps a link for, or a closure it has begun) has no owner at this moment. It is
+    /// not absent for now when the session was closed over a worker this host could not account for,
+    /// when a journal cannot be read, when a worker refuses in a way that repeats, and when the store
+    /// follows no worker or closure of the session.
     ///
     /// What was read is looked at again once every owner has answered, under the same lock a
     /// closure is recorded under: a session found closed over a worker this host could not account
@@ -1711,7 +1738,8 @@ impl AttentionModule {
         &self,
         reach: &dyn Reach,
         records: &[(usize, EventCursor)],
-    ) -> (Vec<(usize, Option<String>)>, Ticket, bool) {
+        silent: &BTreeSet<SessionId>,
+    ) -> Texts {
         let mut by_session: BTreeMap<SessionId, Vec<(usize, EventCursor)>> = BTreeMap::new();
         for (index, record) in records {
             // What an approval asks is the application's to show: a broker transition has no text
@@ -1783,6 +1811,11 @@ impl AttentionModule {
                     recorded_generation: Nullable(recorded.map(U64::new)),
                 };
                 let answer = match &owner {
+                    // A worker already found silent in this read is not made to be waited for
+                    // again.
+                    TextOwner::Link(_) if silent.contains(&session_id) => {
+                        TextAnswer::Live(Live::Unanswered)
+                    }
                     TextOwner::Link(link) => {
                         let link = Arc::clone(link);
                         TextAnswer::Asked(tokio::spawn(async move {
@@ -1791,16 +1824,27 @@ impl AttentionModule {
                                 .ask(ControlFrame::AttentionText(request), request_id, TEXT_WAIT)
                                 .await
                             {
-                                Some(ControlFrame::AttentionTextAnswer(answer)) => Some(Leased {
-                                    generation: answer.privacy_generation.0.map(U64::get),
-                                    release_until: answer.release_until_boot_ms.get(),
-                                    texts: answer
-                                        .texts
-                                        .into_iter()
-                                        .map(|text| text.text.0)
-                                        .collect(),
-                                }),
-                                _ => None,
+                                Some(ControlFrame::AttentionTextAnswer(answer)) => {
+                                    Live::Text(Leased {
+                                        generation: answer.privacy_generation.0.map(U64::get),
+                                        release_until: answer.release_until_boot_ms.get(),
+                                        texts: answer
+                                            .texts
+                                            .into_iter()
+                                            .map(|text| text.text.0)
+                                            .collect(),
+                                    })
+                                }
+                                // The worker could not read its journal: the next request may.
+                                Some(ControlFrame::Response(Response {
+                                    outcome: Outcome::Error(error),
+                                    ..
+                                })) if error.code == ErrorCode::StorageUnavailable => {
+                                    Live::Unanswered
+                                }
+                                // Any other refusal repeats, and the text will not come.
+                                Some(_) => Live::Refused,
+                                None => Live::Unanswered,
                             }
                         }))
                     }
@@ -1818,17 +1862,20 @@ impl AttentionModule {
         }
         let mut answered = Vec::with_capacity(read.len());
         for (session_id, owner, wanted, answer) in read {
-            let (texts, lease) = match answer {
-                TextAnswer::Asked(asking) => match asking.await.ok().flatten() {
-                    Some(leased) => (
-                        Some(leased.texts),
-                        Some((leased.generation, leased.release_until)),
-                    ),
-                    None => (None, None),
+            let Settled {
+                texts,
+                lease,
+                unanswered,
+            } = match answer {
+                TextAnswer::Asked(asking) => asking.await.unwrap_or(Live::Unanswered).settle(),
+                TextAnswer::Live(live) => live.settle(),
+                TextAnswer::Read(texts) => Settled {
+                    texts,
+                    lease: None,
+                    unanswered: false,
                 },
-                TextAnswer::Read(texts) => (texts, None),
             };
-            answered.push((session_id, owner, wanted, texts, lease));
+            answered.push((session_id, owner, wanted, texts, lease, unanswered));
         }
         let finalised: BTreeSet<SessionId> = self
             .store()
@@ -1847,7 +1894,8 @@ impl AttentionModule {
         let mut served = Vec::new();
         let mut ticket = Ticket::default();
         let mut held_back = false;
-        for (session_id, owner, wanted, texts, lease) in answered {
+        let mut silent = BTreeSet::new();
+        for (session_id, owner, wanted, texts, lease, unanswered) in answered {
             let unaccounted = origins.unaccounted.contains(&session_id);
             let still = !unaccounted
                 && match &owner {
@@ -1874,7 +1922,25 @@ impl AttentionModule {
                     .generated
                     .push(Generated::read_under(state.clone(), *decided));
             }
-            held_back |= !unaccounted && journals_held_back.contains(&session_id);
+            if unanswered {
+                silent.insert(session_id);
+            }
+            // The text is absent for now where a later look may serve it: the journal is held
+            // back or privacy mode holds its text, the worker did not answer, the link no longer
+            // speaks for the session, or the store follows a worker or a closure of the session
+            // and none owns it at this moment.
+            // A session closed over an unaccounted worker is never served, and one the store
+            // follows nothing of has no owner to wait for.
+            let replaced = matches!(owner, TextOwner::Link(_)) && !still;
+            let between_owners = matches!(owner, TextOwner::Nobody)
+                && (origins.ended.contains(&session_id)
+                    || origins.watched.contains(&session_id)
+                    || origins.workers.contains_key(&session_id));
+            held_back |= !unaccounted
+                && (journals_held_back.contains(&session_id)
+                    || unanswered
+                    || replaced
+                    || between_owners);
             if let (Some(texts), Some((generation, release_until))) = (&texts, lease)
                 && texts.iter().any(Option::is_some)
             {
@@ -1886,7 +1952,12 @@ impl AttentionModule {
             }
             served.extend(serve(&wanted, texts));
         }
-        (served, ticket, held_back)
+        Texts {
+            served,
+            ticket,
+            held_back,
+            silent,
+        }
     }
 
     /// Returns the privacy generation this daemon has recorded for a session.
@@ -3429,9 +3500,67 @@ enum TextOwner {
 /// One text request's answer, as it is being read.
 enum TextAnswer {
     /// Asked of a live worker, on a task of its own.
-    Asked(tokio::task::JoinHandle<Option<Leased>>),
+    Asked(tokio::task::JoinHandle<Live>),
+    /// What a live worker's answer already is, without asking.
+    Live(Live),
     /// Read already, from a finished session's journal.
     Read(Option<Vec<Option<String>>>),
+}
+
+/// What a live worker answered to a request for text.
+enum Live {
+    /// Its text, with what the release of it is bound by.
+    Text(Leased),
+    /// A refusal that repeats: the text will not come from this worker.
+    Refused,
+    /// No answer in time, the link ending first, or a refusal the next request may cure: the text
+    /// may come.
+    Unanswered,
+}
+
+/// What a live worker's answer comes to for the text it is read for.
+struct Settled {
+    /// The texts it served.
+    texts: Option<Vec<Option<String>>>,
+    /// The generation and lease end of the answer, where it carried text.
+    lease: Option<(Option<u64>, u64)>,
+    /// Whether the worker left the request unanswered.
+    unanswered: bool,
+}
+
+impl Live {
+    fn settle(self) -> Settled {
+        match self {
+            Self::Text(leased) => Settled {
+                texts: Some(leased.texts),
+                lease: Some((leased.generation, leased.release_until)),
+                unanswered: false,
+            },
+            Self::Refused => Settled {
+                texts: None,
+                lease: None,
+                unanswered: false,
+            },
+            Self::Unanswered => Settled {
+                texts: None,
+                lease: None,
+                unanswered: true,
+            },
+        }
+    }
+}
+
+/// What reading the text of some records came to.
+struct Texts {
+    /// Each record's text, where its owner served one.
+    served: Vec<(usize, Option<String>)>,
+    /// What the release of the live answers is bound by.
+    ticket: Ticket,
+    /// Whether some text is absent for now rather than for good, so that a summary written
+    /// without it would stand for its interval from then on.
+    held_back: bool,
+    /// The sessions whose live worker gave no answer.
+    silent: BTreeSet<SessionId>,
 }
 
 /// A live worker's text answer: the texts, and what their release is bound by.
@@ -5234,6 +5363,136 @@ pub(crate) mod tests {
         );
     }
 
+    /// How the worker at the far end of a session's link treats the requests for text.
+    #[derive(Clone, Copy, Debug)]
+    enum Worker {
+        /// Answers each with the text of every record.
+        Answers,
+        /// Refuses each in a way the next request may cure: its own journal could not be read.
+        CannotReadItsJournal,
+        /// Refuses each in a way that repeats.
+        RefusesTheRequest,
+        /// Ends the link when the first request arrives, without answering it.
+        EndsTheLink,
+        /// Answers the first request, and is replaced as the session's worker while the second is
+        /// asked, which it answers too.
+        IsReplacedMeanwhile,
+    }
+
+    /// Whether a summary is asked for the changes of a session with a live link, whose worker
+    /// treats the requests for the text of its records as `worker` says. A read of what changed
+    /// asks for the text of the page first and of the summary's interval after it.
+    async fn summary_asked_of(worker: Worker) -> usize {
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let (_link, mut reader, mut writer) =
+            linked(&world.temp, 1, &world.module, world.session_id).await;
+        let module = Arc::clone(&world.module);
+        let session_id = world.session_id;
+        let playing = tokio::spawn(async move {
+            let mut asked = 0_usize;
+            while let Ok(ControlFrame::AttentionText(request)) =
+                reader.read_message::<ControlFrame>().await
+            {
+                asked += 1;
+                let frame = match worker {
+                    Worker::EndsTheLink => return,
+                    Worker::CannotReadItsJournal => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Error(ProtocolError::new(
+                            ErrorCode::StorageUnavailable,
+                            "the journal could not be read",
+                        )),
+                    }),
+                    Worker::RefusesTheRequest => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Error(ProtocolError::new(
+                            ErrorCode::InvalidArgument,
+                            "ask for fewer records",
+                        )),
+                    }),
+                    Worker::Answers | Worker::IsReplacedMeanwhile => {
+                        if matches!(worker, Worker::IsReplacedMeanwhile) && asked == 2 {
+                            // What closing the session does to its link, as the answer is given.
+                            let mut origins = module.origins();
+                            origins.links.remove(&session_id);
+                            origins.ended.insert(session_id);
+                        }
+                        ControlFrame::AttentionTextAnswer(Box::new(AttentionTextAnswer {
+                            request_id: request.request_id,
+                            privacy_generation: Nullable::some(U64::ZERO),
+                            release_until_boot_ms: lease_from_now(),
+                            texts: request
+                                .records
+                                .iter()
+                                .map(|record| AttentionRecordText {
+                                    source: record.source,
+                                    sequence: record.sequence,
+                                    text: Nullable::some(format!(
+                                        "record {}",
+                                        record.sequence.get()
+                                    )),
+                                })
+                                .collect(),
+                        }))
+                    }
+                };
+                if writer.write_message(&frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        world
+            .changed_through(&Stub { unaccounted: false }, &owner(), &Caller::Owner)
+            .await;
+        playing.abort();
+        world.asked().len()
+    }
+
+    /// KR-REQ-18.02: a summary is written from the text of the changes it covers, and one written
+    /// without text that is only absent for now would reach the head and be served for the interval
+    /// from then on. So none is asked for while a live worker gives no answer, its link ends first,
+    /// it cannot read its journal, or it is replaced as the answer is given; the next read asks
+    /// again. A worker that answers, and one that refuses in a way that repeats, do not hold it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_a_live_workers_text_is_missing_for_now() {
+        for (worker, asked) in [
+            (Worker::EndsTheLink, 0),
+            (Worker::CannotReadItsJournal, 0),
+            (Worker::IsReplacedMeanwhile, 0),
+            (Worker::Answers, 1),
+            (Worker::RefusesTheRequest, 1),
+        ] {
+            assert_eq!(
+                summary_asked_of(worker).await,
+                asked,
+                "a worker that {worker:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-18.02: a session whose closure the store has begun and whose journal it has not yet
+    /// read has no owner for its text for a moment, and a summary written then would stand. A
+    /// session the store follows nothing of has no owner to wait for, so it holds nothing back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_summary_is_not_asked_for_while_a_closing_session_has_no_owner_for_its_text() {
+        for (followed, asked) in [(true, 0), (false, 1)] {
+            let mut world = Summarised::start();
+            world.record_commands(&[1_000, 1_010], true);
+            if followed {
+                world.module.origins().ended.insert(world.session_id);
+            }
+            world
+                .changed_through(&Stub { unaccounted: false }, &owner(), &Caller::Owner)
+                .await;
+            assert_eq!(
+                world.asked().len(),
+                asked,
+                "a session the store follows: {followed}"
+            );
+        }
+    }
+
     /// The summary an answer to a read of what changed carries, when it carries one.
     fn summary_in(frame: &ControlFrame) -> Option<kr_protocol::attention::ChangeSummary> {
         let ControlFrame::Response(response) = frame else {
@@ -5702,7 +5961,11 @@ pub(crate) mod tests {
             .collect();
         let asking = {
             let module = Arc::clone(&module);
-            tokio::spawn(async move { module.texts(&Stub { unaccounted: false }, &records).await })
+            tokio::spawn(async move {
+                module
+                    .texts(&Stub { unaccounted: false }, &records, &BTreeSet::new())
+                    .await
+            })
         };
         let mut sizes = Vec::new();
         for _ in 0..2 {
@@ -5736,7 +5999,11 @@ pub(crate) mod tests {
         }
         sizes.sort_unstable();
         assert_eq!(sizes, vec![44, 256]);
-        let (mut served, ticket, _) = asking.await.expect("the texts are read");
+        let Texts {
+            served: mut served,
+            ticket,
+            ..
+        } = asking.await.expect("the texts are read");
         assert_eq!(
             ticket.entries.len(),
             2,
