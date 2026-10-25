@@ -26,7 +26,8 @@ HMAC. Every package build holds that code to published known answers, and
 | The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
 | The shell bridges' bootstrap proof | The shell packages' own `kr_bridge_crypto.c` (SHA-256 and HMAC-SHA-256, as above, [checked against published answers](#the-hash-the-shell-bridges-write-themselves)) for Bash, Fish and Zsh, and .NET's `HMACSHA256` and `SHA256` in the PowerShell bridge |
 | The release tool's keys and signatures | `aws-lc-rs` and `tough`'s signing, with `SystemRandom` for a development key |
-| Secret files on Android and previews on a phone | Android's `SecureRandom`, AES-256-GCM under an Android Keystore key, AndroidX encrypted preferences (AES-SIV and AES-GCM), Java `MessageDigest`; CryptoKit on iOS for hashes |
+| Secret files on Android and previews on a phone | Android's `SecureRandom`, AES-256-GCM under an Android Keystore key, Java `MessageDigest`; CryptoKit on iOS for hashes |
+| Certificates a test issues | the `rcgen` crate, which makes key pairs and signs certificates through `ring`; it is a dev-dependency of `kr-client`, `kr-controller`, `kr-transport` and the end-to-end harness, and no shipped code calls it |
 | Primitives inside the libraries above | `keyring`'s Linux store uses the `secret-service` crate with its own Diffie-Hellman exchange and AES-128-CBC; iroh brings `blake3`, `ed25519-dalek`, `curve25519-dalek` and RustCrypto `aes-gcm`, and, in its relay server (which the transport and controller tests enable), RustCrypto `sha1`; `libsodium-sys-stable`'s build script uses `minisign-verify`, with its own Ed25519 and BLAKE2b, to check the minisign signature of the libsodium archive at build time (the source archive on Linux and macOS, the prebuilt archive on Windows); `n0-mainline` and `tokio-websockets` bring `sha1_smol`; `noq-proto`, `rustls`, `x509-parser` and the other TLS crates bring `ring`; `rand` brings the `chacha20` and `rand_chacha` generators; `spake2` brings `curve25519-dalek` 4.1.3. No Rust source of the workspace calls any of them |
 | Digests in the TypeScript packages | the platform's WebCrypto, and Node's own crypto module for the hashes, HMAC, HKDF and Ed25519 signatures that the tests recompute |
 
@@ -75,8 +76,9 @@ hash, so the same 32 bytes declared under two purposes produce two identifiers.
 
 ## Secrets in memory
 
-`Secret<N>` and `SecretVec` zeroise on drop through `sodium_memzero`, which the compiler may not
-elide, and redact themselves in debug output. `Secret<N>` is deliberately not `Copy`: a copy that
+`Secret<N>` zeroises on drop through `sodium_memzero`, and `SecretVec` through the `zeroize`
+crate's `Vec::zeroize`, which clears the whole allocation. Neither write may be elided by the
+compiler, and both types redact themselves in debug output. `Secret<N>` is deliberately not `Copy`: a copy that
 moves leaves a duplicate behind, and a duplicate cannot be zeroised. Reading a secret goes through
 `expose()`, so every call site that touches key material is greppable.
 
@@ -101,7 +103,7 @@ either built from a domain and its elements or built from bytes another module p
 checked: the bytes must decode as a canonical array whose first element is the claimed domain. The
 three transcripts the specification writes as arrays reach a signature that way, and nothing else
 can. This table lists the domains that the cryptographic primitives sign or derive under. [The
-protocol reference](../protocol/README.md#domain-separation) lists every domain of the protocol,
+protocol reference](../protocol/README.md#digests-and-signing-input) lists every domain of the protocol,
 which is the longer list.
 
 | Domain | Covers |
@@ -586,7 +588,7 @@ worker accepts only while that command's line is running.
 
 `fixtures/crypto/` holds the documents below. The first three are regenerated with
 `cargo run -p kr-crypto --bin kr-crypto-vectors` and checked in continuous integration with
-`--check`, as are `relay.json` and `collection-keys.json`. `recovery-kit.json` is checked by `crates/kr-client/tests/
+`--check`, as are `relay.json`, `collection-keys.json` and `organisation.json`. `recovery-kit.json` is checked by `crates/kr-client/tests/
 recovery.rs::the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering
 it pins belongs to `kr-client` rather than to the vector generator:
 
@@ -596,6 +598,8 @@ it pins belongs to `kr-client` rather than to the vector generator:
 | `envelopes.json` | A sealed mailbox envelope with its authenticated plaintext and canonical bytes; a signed revocation request forwarded in an envelope, with the exact bytes its signature covers; a sealed manifest key wrap with its plaintext; the section 20 size buckets |
 | `kdf.json` | The RFC 5869 HKDF-SHA256 vector, an HMAC-SHA256 vector, the `KRRECOV1` subkeys with the recovery recipient's public key, and the context-bound bundle key |
 | `collection-keys.json` | A synchronised collection's first two key records, one member creating it and then adding a second at the same epoch, with the bytes each signature covers, each record's digest, and the second member's key wrap with its plaintext |
+| `relay.json` | Ed25519 signatures over the relay objects in `fixtures/relay`, by the two keys section 17 puts around a relay, each over `CBOR([domain, object])` |
+| `organisation.json` | Ed25519 signatures over an organisation's policy-signing chain, its head statement and two device-bound membership leases, with the negative cases a verifier must reject |
 | `recovery-kit.json` | The printable and QR recovery kit for the same test seed: its profile version, checksum, grouped base32 seed, locator, origins and the exact document bytes |
 
 Only domain-separated transcripts are signed. `fixtures/cbor/digests.json` also publishes a complete
@@ -660,20 +664,28 @@ examined them. The release's statement of that exception is in
 The bridge's SHA-256 and HMAC-SHA-256 are this project's own code, and no external cryptographic
 review has examined them. The checks above bound that, but they do not replace a review.
 
-The code clears its temporaries, and the bootstrap secret when an activation fails and once the
-handshake is accepted, with `kr_wipe`. An optimiser may drop a `memset` of a buffer that is not read
-again, so `kr_wipe` calls `memset_s` on Apple platforms, `explicit_bzero` on glibc 2.25 or later in
-its default feature set, and a loop through a volatile pointer on any other platform. No case can
-show the wipes of the temporaries inside the hash and the MAC, because reading them back means
-reading dead stack memory. The cases read only memory the caller owns: the hash state after the
-digest is taken, and the range a wipe is given, once with the platform's call and once with the
-loop. A Linux case reads the memory of a running Bash, Fish and Zsh after its first prompt and finds
-no copy of the secret in a writable mapping.
+The code clears, with `kr_wipe`, the buffers that hold key material or a hash's working data: the
+message schedule after each block, the hash state once the digest is taken, the key pads, the inner
+digest and the shortened key of the MAC, and the buffer the bootstrap secret was decoded into, when
+an activation fails and once the handshake is accepted. An optimiser may drop a `memset` of a buffer
+that is not read again, so `kr_wipe` calls `memset_s` on Apple platforms, `explicit_bzero` on glibc
+2.25 or later in its default feature set, and a loop through a volatile pointer on any other
+platform. It does not clear the compression function's working variables (the eight state words,
+`t1` and `t2`) or the base64url decoder's accumulator, which holds the last bits of the secret it
+read, and the compiler may leave copies of a value in registers or stack slots that no code of the
+bridge reaches. No case can show the wipes of the temporaries inside the hash and the MAC, because
+reading them back means reading dead stack memory. The cases read only memory the caller owns: the
+hash state after the digest is taken, and the range a wipe is given, once with the platform's call
+and once with the loop. A Linux case reads the memory of a running Bash, Fish and Zsh after its
+first prompt and looks for the secret's 32 decoded bytes in every writable mapping, and finds none;
+it does not look for the base64url text, which stays, as the next paragraph says.
 
 The wipe covers the buffer the secret was decoded into. The base64url text that carried it stays in
 the memory the process was started with after the variable is unset, and in the blocks the shell
 freed when it copied or dropped the variable, and the PowerShell bridge's runtime keeps managed
-copies of the text and of the key its HMAC object held; no code of the bridge can clear those.
+copies of the text and of the key its HMAC object held; no code of the bridge can clear those. The
+working variables and the decoder's accumulator named above are not among the copies that cannot be
+cleared: the bridge could clear them and does not.
 
 ## Release manifest
 
