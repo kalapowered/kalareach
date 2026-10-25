@@ -499,23 +499,23 @@ describe("a package's control asks the host for its action only when it can (KR-
     call.kind === 'cannot' ? call.because : null
 
   it('asks nothing of the host while the agent is unread, unrecognised or its input is unknown', () => {
-    expect(because(invocationOf(refresh, SESSION, null, binding(), here, false))).toContain(
-      'not read the agent'
+    expect(because(invocationOf(refresh, SESSION, null, binding(), here, null))).toContain(
+      'no agent it can call'
     )
-    expect(because(invocationOf(refresh, SESSION, live, null, here, false))).toContain(
-      'not read the agent'
+    expect(because(invocationOf(refresh, SESSION, live, null, here, null))).toContain(
+      'no agent it can call'
     )
-    expect(because(invocationOf(refresh, SESSION, live, binding(), null, false))).toContain(
+    expect(because(invocationOf(refresh, SESSION, live, binding(), null, null))).toContain(
       'before the agent was read'
     )
     const unrecognised = { ...live, plugin_id: null }
     expect(
       because(
-        invocationOf(refresh, SESSION, unrecognised, binding(), drawnUnder(unrecognised, binding()), false)
+        invocationOf(refresh, SESSION, unrecognised, binding(), drawnUnder(unrecognised, binding()), null)
       )
     ).toContain('No package recognised')
     expect(
-      because(invocationOf({ ...refresh, parameters: undefined }, SESSION, live, binding(), here, false))
+      because(invocationOf({ ...refresh, parameters: undefined }, SESSION, live, binding(), here, null))
     ).toContain('cannot tell what this action takes')
   })
 

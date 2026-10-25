@@ -692,6 +692,30 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
     await person.click(await screen.findByRole('button', { name: 'Apply the name' }))
     expect(await screen.findByText(/asks for input this view cannot take yet/)).toBeTruthy()
     expect(calls).toHaveLength(0)
+
+    // An entry that takes a file hands the call no file either.
+    act(() => {
+      controls.appendNode({
+        id: 'a-1',
+        revision: '1',
+        body: {
+          kind: 'attachment_entry',
+          label: 'Add a file',
+          contribute: {
+            id: 'contribute',
+            revision: '1',
+            label: 'Give a file',
+            accessible_description: 'Give a file',
+            action_id: 'file.give',
+            parameters: { parameters: [] }
+          }
+        }
+      } as unknown as DocumentNode)
+    })
+    await nextFrame()
+    await person.click(await screen.findByRole('button', { name: 'Give a file' }))
+    expect(await screen.findByText(/takes a file this view cannot hand over yet/)).toBeTruthy()
+    expect(calls).toHaveLength(0)
   })
   it('does not call an action for a control whose newer revision was kept over a late older one', async () => {
     const { port, controls } = fakeHost()
@@ -773,7 +797,14 @@ describe("a package's control invokes its action on the session's worker (KR-REQ
       controls.appendNode(controlsNode())
     })
     await nextFrame()
+    // The first read finds the history; the one that follows reads on from its last entry, and
+    // only then is the agent read.
     await answer(held, 0)
+    await made(held, 2)
+    await answer(held, 1)
+    await waitFor(() => {
+      expect(shown()).toEqual(expect.arrayContaining(HISTORY))
+    })
     const person = userEvent.setup()
     await person.click(await screen.findByRole('button', { name: 'Refresh' }))
     expect(await screen.findByText(/shown before the agent was read/)).toBeTruthy()

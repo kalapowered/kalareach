@@ -106,30 +106,34 @@ export function drawnUnder(
  * The call names the package that recognised the agent, the control's registered action, and the
  * instance at the binding revision the person saw. A control is called only under the conversation
  * it was drawn under: after the agent moved, the revision this view holds now is not the one the
- * control was drawn for, and sending it would hide the move from the host.
+ * control was drawn for, and sending it would hide the move from the host. A control drawn before
+ * this view had read the agent has no conversation to be called under until it is drawn again.
  *
  * Only a control that declares no parameters, on a surface that collects none, is called: this view
  * has no way yet to collect an argument, and sending an action what it needs would be the host's
  * refusal after a press the person had no way to complete. An action that answers a pending
  * request names the request, which a control does not, and the host refuses it for that.
  *
- * `collects` is true for a control that submits a form with fields, whose values the call does not
- * carry.
+ * `input` is the reason the surface around the control takes something the call does not carry, a
+ * form's fields for one, or null when it takes nothing.
  */
 export function invocationOf(
   control: Control,
   sessionId: string,
   instance: AgentInstanceSummary | null,
   binding: AgentBindingState | null,
-  drawn: DrawnUnder | null | undefined,
-  collects: boolean
+  drawn: DrawnUnder | null,
+  input: string | null
 ): Invocation {
   const now = drawnUnder(instance, binding)
   if (instance === null || binding === null || now === null) {
-    return { kind: 'cannot', because: 'This view has not read the agent yet.' }
+    return { kind: 'cannot', because: 'This view has no agent it can call.' }
   }
-  if (drawn === null || drawn === undefined) {
-    return { kind: 'cannot', because: 'This was shown before the agent was read.' }
+  if (drawn === null) {
+    return {
+      kind: 'cannot',
+      because: 'This was shown before the agent was read. It works when the package draws it again.'
+    }
   }
   if (
     drawn.instance !== now.instance ||
@@ -138,14 +142,14 @@ export function invocationOf(
   ) {
     return {
       kind: 'cannot',
-      because: 'The conversation moved since this was shown. It is sent again when it is drawn again.'
+      because: 'The conversation moved since this was shown. It works when the package draws it again.'
     }
   }
   if (instance.plugin_id === null) {
     return { kind: 'cannot', because: 'No package recognised this agent.' }
   }
-  if (collects) {
-    return { kind: 'cannot', because: 'This form asks for input this view cannot take yet.' }
+  if (input !== null) {
+    return { kind: 'cannot', because: input }
   }
   if (control.parameters === undefined) {
     return { kind: 'cannot', because: 'This view cannot tell what this action takes.' }
