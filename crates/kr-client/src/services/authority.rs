@@ -643,8 +643,9 @@ impl AuthorityFeedClient {
 /// until the host is finished with it. The change the announcement came with is committed either
 /// way, and the answer reports the announcement as declined.
 ///
-/// The service holds the same figure in its own contract. Neither side reads the other's, so a
-/// case on each side holds it to the hour; change one and the other's case fails.
+/// The service holds the same figure in its own contract. Neither side reads the other's, so each
+/// holds it to the hour with a case of its own: a change to one side fails there, and is made on
+/// the other side too.
 pub const ANNOUNCEMENT_LIFETIME_MS: u64 = 60 * 60 * 1000;
 
 /// How long an announcement sealed now lives: the service's bound less the freshness of a signed
@@ -652,7 +653,7 @@ pub const ANNOUNCEMENT_LIFETIME_MS: u64 = 60 * 60 * 1000;
 ///
 /// The service admits a request signed up to [`SERVICE_REQUEST_FRESHNESS_MS`] ahead of its own
 /// clock, and an announcement sealed on such a sender's clock would otherwise expire later than the
-/// service's bound and cost the sender the whole change, a revocation among them.
+/// service's bound and be declined, which leaves the host to read the feed at its next poll.
 pub const ANNOUNCEMENT_SEALED_LIFETIME_MS: u64 =
     ANNOUNCEMENT_LIFETIME_MS - SERVICE_REQUEST_FRESHNESS_MS;
 
