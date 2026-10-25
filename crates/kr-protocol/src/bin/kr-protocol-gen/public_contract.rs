@@ -82,13 +82,9 @@ fn accepted(old: &Value, new: &Value, difference: &Difference) -> bool {
     marked && !required
 }
 
-/// Compares the head's schema with one release's: each difference an earlier reader could not
-/// read, as a line.
-///
-/// # Errors
-///
-/// When a schema cannot be cut.
-pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
+/// Every difference between one release's schema and the head's, with every definition a root,
+/// that an earlier reader could not read.
+fn rejected(old: &Value, new: &Value) -> Result<Vec<Difference>, String> {
     let names = |schema: &Value| -> BTreeSet<String> {
         schema["$defs"]
             .as_object()
@@ -99,8 +95,43 @@ pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
     let before = cut_over(old, &roots).map_err(|error| error.to_string())?;
     let after = cut_over(new, &roots).map_err(|error| error.to_string())?;
     Ok(differences(&before, &after)
-        .iter()
+        .into_iter()
         .filter(|difference| !accepted(old, new, difference))
+        .collect())
+}
+
+/// Compares the head's schema with one release's: each difference an earlier reader could not
+/// read, as a line.
+///
+/// # Errors
+///
+/// When a schema cannot be cut.
+pub fn compare(old: &Value, new: &Value) -> Result<Vec<String>, String> {
+    Ok(rejected(old, new)?
+        .iter()
+        .map(ToString::to_string)
+        .collect())
+}
+
+/// Whether `difference` is a method that a host of the earlier release does not list: a variant
+/// added to `Method`.
+fn is_an_added_method(difference: &Difference) -> bool {
+    difference.kind == DifferenceKind::Added && difference.at.starts_with("Method#const:")
+}
+
+/// As [`compare`], for the check of a level: the differences that fail a commit that stays at the
+/// level. A method a daemon serves keeps the level, because a host of the same level answers a
+/// method it does not list with a refusal and a later client reads the host's method list before
+/// it calls one that is new, so a variant added to `Method` is not a difference here. It is one for
+/// `--public-contract`, which reports it.
+///
+/// # Errors
+///
+/// When a schema cannot be cut.
+pub fn compare_for_a_level(old: &Value, new: &Value) -> Result<Vec<String>, String> {
+    Ok(rejected(old, new)?
+        .iter()
+        .filter(|difference| !is_an_added_method(difference))
         .map(ToString::to_string)
         .collect())
 }
