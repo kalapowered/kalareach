@@ -262,7 +262,7 @@ export function tauriPort(): HostPort {
     composerSteer: (params, opening) => call('agent_turn_steer', { params, opening }),
     composerInterrupt: (params, opening) => call('agent_turn_cancel', { params, opening }),
     approvalRespond: (params, opening) => call('agent_approval_respond', { params, opening }),
-    pluginActionInvoke: () => noAgreedShape("invoking a package's action"),
+    pluginActionInvoke: (params, opening) => call('plugin_action_invoke', { params, opening }),
 
     deviceDrafts: () => call('device_drafts', {}),
     deviceDraftSave: (request) => read('device_draft_save', request),

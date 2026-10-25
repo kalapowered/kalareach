@@ -177,6 +177,8 @@ export interface Control {
   readonly label: string
   readonly accessible_description: string
   readonly action_id: string
+  /** What the action takes, as the package declares it. A document without it says nothing. */
+  readonly parameters?: { readonly parameters: readonly unknown[] }
   readonly icon?: string
   readonly priority?: string
   readonly disabled_reason?: { readonly text?: string } | string | null

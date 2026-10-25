@@ -18,8 +18,11 @@ import type {
   AgentSnapshotResult,
   AgentSubject,
   InstanceCapabilityRecord,
-  PendingResource
+  PendingResource,
+  PluginActionInvokeParams
 } from '@kalareach/protocol'
+
+import type { Control } from './controls'
 
 /** One entry of an instance's semantic history, as the conversation holds it. */
 export interface AgentEntry {
@@ -63,6 +66,55 @@ export function targetOf(
   binding: AgentBindingState
 ): AgentMutationTarget {
   return { subject: subjectOf(sessionId, instance), binding_revision: binding.binding_revision }
+}
+
+/** The arguments of an action that takes none: the empty object, as the host hashes it. */
+export const NO_ARGUMENTS = 'e30'
+
+/** What pressing a package's control asks of the host, or why this view cannot ask it. */
+export type Invocation =
+  | { readonly kind: 'call'; readonly params: PluginActionInvokeParams }
+  | { readonly kind: 'cannot'; readonly because: string }
+
+/**
+ * Builds the call a control makes, from what this view has read of the session's agent.
+ *
+ * The call names the package that recognised the agent, the control's registered action, and the
+ * instance at the binding revision the person saw. Only an action that declares no parameters is
+ * called: this view has no way yet to collect an argument, and sending an action the arguments
+ * it needs would be the host's refusal after a press the person had no way to complete. An action
+ * that answers a pending request names the request, which a control does not, and the host
+ * refuses it for that.
+ */
+export function invocationOf(
+  control: Control,
+  sessionId: string,
+  instance: AgentInstanceSummary | null,
+  binding: AgentBindingState | null
+): Invocation {
+  if (instance === null || binding === null) {
+    return { kind: 'cannot', because: 'This view has not read the agent yet.' }
+  }
+  if (instance.plugin_id === null) {
+    return { kind: 'cannot', because: 'No package recognised this agent.' }
+  }
+  if (control.parameters === undefined) {
+    return { kind: 'cannot', because: 'This view cannot tell what this action takes.' }
+  }
+  if (control.parameters.parameters.length > 0) {
+    return { kind: 'cannot', because: 'This action asks for input this view cannot take yet.' }
+  }
+  return {
+    kind: 'call',
+    params: {
+      target: targetOf(sessionId, instance.application_instance_id, binding),
+      plugin_id: instance.plugin_id,
+      action: control.action_id,
+      draft_id: null,
+      resource_id: null,
+      parameters: NO_ARGUMENTS
+    }
+  }
 }
 
 /** One entry of `instance`'s history, as the conversation holds it. */
