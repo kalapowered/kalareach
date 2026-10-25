@@ -8041,7 +8041,8 @@ impl WorkerService {
     /// of the first interval the record proves was written at or after it, and nothing before that.
     /// Output the record does not time after that point is served, since cursors only grow; output
     /// before it is never claimed, timed or not. A caller with no scope that is not the owner is
-    /// refused, whichever socket it came in on.
+    /// refused, whichever socket it came in on, and so is any caller but the owner once the
+    /// session is closed.
     fn history_page(
         &self,
         state: &ConnectionState,
@@ -8086,7 +8087,7 @@ impl WorkerService {
             // so that output written while the record is read is still ahead of the reader.
             let (end, times) = {
                 let session = self.runtime.session();
-                Self::check_session(&session, params.session_id)?;
+                Self::check_page_session(&session, params.session_id, caller)?;
                 (session.output_cursor(), session.output_time_index())
             };
             match times.and_then(|times| times.first_cursor_from(bound)) {
@@ -8095,9 +8096,24 @@ impl WorkerService {
             }
         };
         let session = self.runtime.session();
-        Self::check_session(&session, params.session_id)?;
+        Self::check_page_session(&session, params.session_id, caller)?;
         let page = session.history_page_within(params.from_cursor.get(), limit, reach)?;
         encode(&page)
+    }
+
+    /// Checks that a page of retained output is asked of the session this endpoint serves, and, for
+    /// a caller that is not the local owner, that the session is not closed.
+    ///
+    /// A worker goes on answering while the closure it recorded is delivered, and the daemon
+    /// serves a device nothing of a closed session, so a read forwarded in that interval is
+    /// refused here as it would be there. It is decided under the session's lock, so a page is
+    /// read from a session that is not closed or not at all.
+    fn check_page_session(session: &Session, named: SessionId, caller: &Caller) -> Result<()> {
+        Self::check_session(session, named)?;
+        if caller.is_local_owner() {
+            return Ok(());
+        }
+        session.require_live()
     }
 
     /// Serves `events.subscribe`: the screen, the resources the broker arbitrates, and everything
