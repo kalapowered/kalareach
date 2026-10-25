@@ -166,8 +166,8 @@ impl RecordReader {
     /// A run of keys becomes one [`ReadEvent::Keys`], and anything else keeps its own place between
     /// those runs, because a caller that could not tell whether a click came before or after a
     /// keystroke could not dispatch either of them honestly. The first half of a character outside
-    /// the basic plane that ends a read waits for the read that completes it, and goes out as it
-    /// was when something else comes first.
+    /// the basic plane that ends a run of keys waits for the keys that complete it, across a mouse
+    /// or resize record if one comes between, and goes out as it was with the next key.
     ///
     /// # Errors
     ///
@@ -179,10 +179,7 @@ impl RecordReader {
             match event {
                 ConsoleEvent::Key(record) => keys.push(record),
                 other => {
-                    // Something that is not a key comes between the halves of a character, so the
-                    // waiting half goes out in the place it was read.
-                    let mut ready = self.pairs.take(&keys);
-                    ready.extend(self.pairs.release());
+                    let ready = self.pairs.take(&keys);
                     keys.clear();
                     if !ready.is_empty() {
                         out.push(ReadEvent::Keys(ready));

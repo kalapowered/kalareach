@@ -332,7 +332,7 @@ fn paste_and_mouse_stay_the_separate_operations_they_are(/* KR-REQ-08.56 */) {
 /// KR-REQ-08.54, the part about the claim made for legacy VT input: it is described as having no
 /// Windows scan-code fidelity and is not said to carry console scan codes, while records are
 /// described as the console reported them, with no claim of a hardware scan code. Not shown here:
-/// the bytes the legacy input path sends for a record, which the console reader's cases show.
+/// the bytes the legacy input path sends for a record, which `tests/console_keys.rs` shows.
 #[test]
 fn legacy_input_is_accepted_without_claiming_a_fidelity_it_has_not_got() {
     // Microsoft's contract lets a terminal ignore mode 9001, so a client that sends no records is
