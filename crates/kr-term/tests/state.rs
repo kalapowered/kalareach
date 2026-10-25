@@ -36,6 +36,29 @@ fn engine() -> Engine {
     Engine::new(EngineConfig::default()).expect("engine")
 }
 
+// ------------------------------------------------------------------------ read splits
+
+/// KR-ACC-024: the screen does not depend on where reads end. Printing is followed by a read of the
+/// cell the cursor stands on, and that read must change nothing the screen holds: two spaces after
+/// an abandoned control sequence leave the same cells whether they arrive in one read or two.
+#[test]
+fn the_screen_is_the_same_wherever_the_reads_end() {
+    // `<`, IND, `ESC [` cancelled by a raw 0x81, two spaces and a lone ESC.
+    let input: &[u8] = b"<\x1bD\x1b[\x81  \x1b";
+    let mut whole = engine();
+    whole.feed(input, 0);
+    whole.close(0);
+    let mut split = engine();
+    for byte in input {
+        split.feed(&[*byte], 0);
+    }
+    split.close(0);
+    let whole = whole.snapshot(viewport(&whole), 0).0;
+    let split = split.snapshot(viewport(&split), 0).0;
+    assert_eq!(whole.rows, split.rows);
+    assert_eq!(whole.cursor, split.cursor);
+}
+
 // ---------------------------------------------------------------------- geometry
 
 #[test]
