@@ -363,7 +363,7 @@ command-lookup handler of its own, which it puts in front of the person's when i
 takes off when it goes, putting the person's back only if its own is still the one installed. The
 person's handler is called first, and what it answers stands. A handler the person sets later is
 theirs and stays where they put it: one that calls the handler it replaced still reaches this
-one, and one that does not leaves the commands to run as typed. The handler acts on a line that is one
+one, and one that does not leaves the commands to run as typed. A handler the person runs after the search finds a command is asked once about each command the line runs, whether the shell runs it as typed or through the launcher. The handler acts on a line that is one
 native command whose words are all plain constants, and only when the command PowerShell would run
 for that name is the program: an alias, a function, a cmdlet or a script that has the name is what
 runs, and nothing is asked. It changes a lookup only when the worker answers with a backend, so
