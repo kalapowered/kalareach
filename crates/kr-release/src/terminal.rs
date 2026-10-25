@@ -94,8 +94,10 @@ pub fn held(tree: &Path, checkout: &Path) -> Result<()> {
         let shown = path
             .strip_prefix(tree)
             .unwrap_or(&path)
-            .display()
-            .to_string();
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
         let carried = read(&path).map_err(|_| Refusal(format!("the tree carries no {shown}")))?;
         if carried != database {
             refuse!("{shown} is not the database this checkout compiles");
