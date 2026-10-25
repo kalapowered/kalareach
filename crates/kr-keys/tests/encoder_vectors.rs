@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use kr_client::encoder::{
+use kr_keys::{
     Arrow, Key, KeyEvent, KeyEventKind, KeyboardEncoding, Locks, Modifiers, key, release,
 };
 use serde_json::Value;

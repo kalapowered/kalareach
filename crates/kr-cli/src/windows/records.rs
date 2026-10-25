@@ -237,7 +237,7 @@ impl RecordReader {
 
     /// Turns key records into what a legacy VT client would have sent.
     ///
-    /// Everything goes through [`kr_client::encoder::key`], the one encoder every client in this
+    /// Everything goes through [`kr_keys::key`], the one encoder every client in this
     /// workspace uses, so a Windows console and a Unix terminal spell a key the same way. Only
     /// plain text - a character with no modifier the encoder would change it for - is written
     /// straight out, because that is what the encoder produces for it anyway and because a
@@ -497,12 +497,12 @@ fn plain_text(record: &KeyRecord) -> Option<u16> {
 /// Returns the legacy sequence for one key, or `None` for a record that is not a key an
 /// application receives and for one this encoding cannot spell.
 ///
-/// The spelling is [`kr_client::encoder::key`], the one encoder every client in this workspace
+/// The spelling is [`kr_keys::key`], the one encoder every client in this workspace
 /// uses, so nothing here invents a second one. A key the encoder refuses - a release, a key it has
 /// no name for, a function key beyond the twelve the legacy encoding spells - produces nothing
 /// rather than something that would mean a different key.
 fn encoded_key(record: &KeyRecord) -> Option<Vec<u8>> {
-    use kr_client::encoder::{Arrow, Key, KeyEvent, KeyboardEncoding, Modifiers, key};
+    use kr_keys::{Arrow, Key, KeyEvent, KeyboardEncoding, Modifiers, key};
 
     let named = match record.virtual_key {
         0x08 => Key::Backspace,

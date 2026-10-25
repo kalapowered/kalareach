@@ -1204,6 +1204,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the terminal input encoder",
+            &["test", "--locked", "-p", "kr-keys"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the loopback listener a sign-in comes back to",
             &["test", "--locked", "-p", "kr-loopback"],
         ),

@@ -208,7 +208,7 @@ jobs:
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
             -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
-            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf \
+            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-keys -p kr-loopback -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
             -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
             -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer \
@@ -647,6 +647,8 @@ jobs:
       #     suites and the collection key kept in the runner's credential store, `kr-plugin-sdk`'s
       #     forwarder placeholder, and `kr-shell-integration`'s `host::command`, `pwsh_windows` and
       #     `host::scripted::`;
+      #   - the terminal input encoder, all of `kr-keys`: its library and the hand-written vectors
+      #     it is held to;
       #   - the terminal a session opens in: `kr-shell-integration`'s
       #     `host::terminal::tests::native_windows::`, what is detected and what the console
       #     launcher runs;
@@ -1126,6 +1128,12 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-client --lib
 
+      # The input encoder every client spells a key with: its cases and the hand-written vectors it
+      # is held to run on this platform as they do on the others.
+      - name: Test the terminal input encoder
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-keys
+
       # The loopback listener a sign-in comes back to. Windows lets a socket that asks for address
       # reuse take over an address another program is listening on, so the listener takes the
       # address exclusively before it binds; these cases bind an address twice and see that the
@@ -1409,7 +1417,7 @@ jobs:
           -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-cli -p kr-client
           -p kr-conformance -p kr-controller -p kr-crypto -p kr-delivery -p kr-describe
           -p kr-describe-model -p kr-e2e-agents
-          -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf
+          -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-keys -p kr-loopback -p kr-pairing -p kr-perf
           -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk
           -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol
           -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer -p kr-transport
@@ -2503,7 +2511,7 @@ jobs:
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
             -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
-            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-loopback -p kr-pairing -p kr-perf \
+            -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-keys -p kr-loopback -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
             -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
             -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer \

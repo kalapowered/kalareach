@@ -21,7 +21,6 @@
 //! | [`chunks`] | Where one transfer's chunks travel: the attachment-chunk lane, which never shares the control connection |
 //! | [`transport`] | The shape both transports share, and the iroh connection |
 //! | [`tunnel`] | An HTTP `CONNECT` tunnel through the host's proxy, for a connection that is not HTTP itself |
-//! | [`encoder`] | The shared terminal input encoder: keys, modifiers, pointers and pastes |
 //! | [`viewport`] | The clipped window onto the canonical grid, and the presentation switch |
 //! | [`controls`] | What a client shows, and what it lets a person invoke |
 //! | [`drafts`] | Drafts this device owns, and the attachment that only presents one |
@@ -54,7 +53,6 @@ pub mod chunks;
 pub mod controls;
 pub mod cursors;
 pub mod drafts;
-pub mod encoder;
 pub mod error;
 pub mod ipc;
 pub mod mailbox_reader;

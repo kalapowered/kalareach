@@ -937,9 +937,6 @@ mod cases {
         };
         assert_unmarked("an upload's subject", &debug_renderings(&subject));
 
-        let key = crate::encoder::Key::Char('k');
-        renders_only(&key, "Char(..)");
-
         let access = crate::recovery::ServiceAccess::new(
             crate::recovery::RetrievalPolicy::Account,
             format!("https://{MARKER}:{MARKER}@reach.example/{MARKER}"),
@@ -1036,18 +1033,6 @@ mod cases {
             "body": { "kind": "markdown", "source": MARKER }
         })]);
         renders_only(&rendered[0], "Node{controls:0,..}");
-        renders_only(
-            &crate::encoder::KeyEvent {
-                key: crate::encoder::Key::Char('k'),
-                base: Some('k'),
-                modifiers: crate::encoder::Modifiers::default(),
-                locks: crate::encoder::Locks::default(),
-                kind: crate::encoder::KeyEventKind::Press,
-            },
-            "KeyEvent{key:Char(..),base:Some(\"..\"),modifiers:Modifiers{shift:false,\
-             alt:false,control:false,superkey:false},locks:Locks{caps_lock:false,\
-             num_lock:false},kind:Press}",
-        );
     }
 
     /// Nothing a reader here does is written to a log: every event raised while planted drafts are

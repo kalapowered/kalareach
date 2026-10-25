@@ -13,13 +13,13 @@
 //!
 //! It takes control of the program when the person asks, and writes the wheel turns, keys, text
 //! and pastes they make under the input lease, through [`Lease`]. Each key is spelled by the
-//! client's shared encoder in the encoding the screen it holds says the program reads (`keys`); a
+//! shared key encoder in the encoding the screen it holds says the program reads (`keys`); a
 //! screen that says the program reads a form the view does not produce ends control at once. A
 //! change of control is told to the page at once.
 
-use kr_client::encoder::{self, KeyEventKind, Modifiers};
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
+use kr_keys::{KeyEventKind, Modifiers};
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentSummary, AttachmentViewportParams,
     AttachmentViewportResult, SessionAttachParams, SessionAttachResult, SessionDetachParams,
@@ -904,7 +904,7 @@ impl View {
                         return None;
                     }
                 };
-                let bytes = encoder::paste(text.as_str(), keyboard.bracketed);
+                let bytes = kr_keys::paste(text.as_str(), keyboard.bracketed);
                 if bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
                     let _ = taken.send(Err(Refused::Unsent(keys::unsent(
                         "That paste",
@@ -943,14 +943,14 @@ impl View {
                     KeyEventKind::Repeat
                 };
                 typed.event(kind).and_then(|event| {
-                    let bytes = encoder::key(event, keyboard.encoding)?;
+                    let bytes = kr_keys::key(event, keyboard.encoding)?;
                     if kind == KeyEventKind::Press {
                         self.lease.pressed(
                             take,
                             typed.identity(),
                             Pressed {
                                 event,
-                                reported: encoder::release_reported(event, keyboard.encoding),
+                                reported: kr_keys::release_reported(event, keyboard.encoding),
                             },
                         );
                     }
@@ -958,7 +958,7 @@ impl View {
                 })
             }
             KeyAction::Release => match self.lease.released(take, &typed.identity()) {
-                Some(pressed) if pressed.reported => encoder::release(
+                Some(pressed) if pressed.reported => kr_keys::release(
                     pressed.event,
                     typed.modifiers,
                     typed.locks,

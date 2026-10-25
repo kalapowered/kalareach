@@ -569,22 +569,27 @@ pub enum Unsupported {
     UnknownKey,
 }
 
-impl crate::shown::Said for Unsupported {
-    fn said(&self) -> crate::shown::Shown {
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotExpressible { what } => crate::shown!(
-                "the negotiated encoding cannot express {}, and this encoder does not invent one",
-                *what
+            Self::NotExpressible { what } => write!(
+                formatter,
+                "the negotiated encoding cannot express {what}, and this encoder does not invent one"
             ),
-            Self::UnknownKey => {
-                crate::shown::Shown::said("this encoder has no spelling for that key")
-            }
+            Self::UnknownKey => formatter.write_str("this encoder has no spelling for that key"),
         }
     }
 }
 
-crate::display_as_said!(Unsupported);
-crate::debug_as_display!(Unsupported);
+impl std::fmt::Debug for Unsupported {
+    /// The name and the sentence it says, which holds fixed words only.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Unsupported")
+            .field(&self.to_string())
+            .finish()
+    }
+}
 
 impl std::error::Error for Unsupported {}
 
@@ -1394,7 +1399,7 @@ pub enum WheelDirection {
 /// One pointer event, at canonical cell coordinates.
 ///
 /// The coordinates are the canonical grid's, counted from zero. Mapping a display position onto
-/// them is [`crate::viewport::Viewport::map`]'s job and happens before this.
+/// them is the client viewport's job and happens before this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseEvent {
     /// What the pointer did.
@@ -2881,11 +2886,36 @@ mod tests {
             assert_eq!(format!("{:?}", Key::Keypad(text)), "Keypad(Text(..))");
         }
         assert_eq!(format!("{:?}", Key::Keypad(Keypad::Enter)), "Keypad(Enter)");
+        assert_eq!(format!("{:?}", Key::Char('k')), "Char(..)");
         assert_eq!(
             format!("{:?}", locked(on('k', 'K', Modifiers::shift()), CAPS)),
             "KeyEvent { key: Char(..), base: Some(\"..\"), modifiers: Modifiers { shift: true, \
              alt: false, control: false, superkey: false }, locks: Locks { caps_lock: true, \
              num_lock: false }, kind: Press }"
+        );
+    }
+
+    /// A refusal says this encoder's fixed words, in its `Display` and in its `Debug`, and holds no
+    /// key.
+    #[test]
+    fn a_refusal_says_fixed_words() {
+        for refusal in [
+            Unsupported::UnknownKey,
+            Unsupported::NotExpressible {
+                what: "a key release",
+            },
+        ] {
+            assert_eq!(
+                format!("{refusal:?}"),
+                format!("Unsupported({:?})", refusal.to_string())
+            );
+        }
+        assert!(
+            Unsupported::NotExpressible {
+                what: "a key release"
+            }
+            .to_string()
+            .contains("a key release")
         );
     }
 
