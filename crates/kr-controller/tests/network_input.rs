@@ -32,7 +32,7 @@ use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{
     ActionId, AttachmentId, InputLeaseEpoch, InputSequence, RequestId, SessionId,
 };
-use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Nullable};
@@ -237,7 +237,9 @@ impl Rig {
             attachment_id: self.attachment,
             epoch: self.epoch,
             sequence: InputSequence::new(self.sequence),
-            bytes: Bytes::new(bytes.to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(bytes.to_vec()),
+            },
         };
         self.sequence += 1;
         let began = Instant::now();

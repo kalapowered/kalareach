@@ -25,7 +25,7 @@ use kr_protocol::ids::{
     SessionId, StreamId,
 };
 use kr_protocol::input::{
-    InputAcquireParams, InputAcquireResult, InputWriteParams, InputWriteResult,
+    InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams, InputWriteResult,
 };
 use kr_protocol::method::Method;
 use kr_protocol::question::{
@@ -433,7 +433,9 @@ impl View {
             attachment_id: self.attachment_id,
             epoch,
             sequence: InputSequence::new(sequence),
-            bytes: Bytes::new(text.as_bytes().to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(text.as_bytes().to_vec()),
+            },
         };
         let written = bounded("input.write", remote.session().write_input(&params))
             .await?

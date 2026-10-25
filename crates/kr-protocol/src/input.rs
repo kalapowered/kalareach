@@ -78,13 +78,91 @@ pub struct InputWriteParams {
     pub session_id: SessionId,
     /// The attachment writing.
     pub attachment_id: AttachmentId,
-    /// The lease epoch the bytes belong to. A stale epoch is `LEASE_LOST` and never acquires
+    /// The lease epoch the input belongs to. A stale epoch is `LEASE_LOST` and never acquires
     /// implicitly.
     pub epoch: InputLeaseEpoch,
-    /// The position of these bytes in this connection's ordered input stream.
+    /// The position of this input in this connection's ordered input stream.
     pub sequence: InputSequence,
-    /// The raw bytes. They are not decoded, re-encoded or normalised.
-    pub bytes: Bytes,
+    /// What is written: raw bytes, or the console's key records.
+    pub input: InputContent,
+}
+
+/// What one `input.write` carries.
+///
+/// A write is one or the other, never both: bytes a client has already spelled, or key records the
+/// worker spells for the session's terminal. Both go through the same ordered stream, the same
+/// paste recogniser and the same bound on what one write may produce.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputContent {
+    /// Raw bytes. They are not decoded, re-encoded or normalised.
+    Bytes {
+        /// The bytes.
+        bytes: Bytes,
+    },
+    /// Key records from a console, in the order the console reported them. The worker spells them
+    /// as the session's terminal asked for, and refuses the write when it cannot.
+    ConsoleKeys {
+        /// The records.
+        keys: Vec<ConsoleKey>,
+    },
+}
+
+impl InputContent {
+    /// Returns the stable wire name of this variant.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Bytes { .. } => "bytes",
+            Self::ConsoleKeys { .. } => "console_keys",
+        }
+    }
+}
+
+impl std::fmt::Debug for InputContent {
+    /// Which variant it is and how much it holds, never what: a write carries what a person typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bytes { bytes } => formatter
+                .debug_struct("Bytes")
+                .field("len", &bytes.len())
+                .finish(),
+            Self::ConsoleKeys { keys } => formatter
+                .debug_struct("ConsoleKeys")
+                .field("count", &keys.len())
+                .finish(),
+        }
+    }
+}
+
+/// One key event the way a Windows console reports it.
+///
+/// The six numbers of a `KEY_EVENT_RECORD`, carried as the console read them. The worker, which
+/// knows what the session's backend asked for, decides what they are spelled as; a client never
+/// invents a scan code or a spelling here.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ConsoleKey {
+    /// The virtual-key code.
+    pub virtual_key: u16,
+    /// The scan code the keyboard sent, as the console reported it.
+    pub scan_code: u16,
+    /// One UTF-16 code unit. A character outside the basic plane arrives as two records, a high
+    /// surrogate then a low one.
+    pub unicode: u16,
+    /// True when the key went down, false when it came up.
+    pub key_down: bool,
+    /// The console's control-key state bits.
+    pub control_keys: u32,
+    /// How many times the key repeated in this one record.
+    pub repeat: u16,
+}
+
+impl std::fmt::Debug for ConsoleKey {
+    /// Says only that it is a key record: the numbers are what a person typed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConsoleKey { .. }")
+    }
 }
 
 /// The result of `input.write`.

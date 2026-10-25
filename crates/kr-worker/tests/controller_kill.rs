@@ -367,7 +367,9 @@ impl LocalTerminal {
                     attachment_id: self.attachment_id,
                     epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                    },
                 },
             )
             .await

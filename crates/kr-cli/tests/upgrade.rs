@@ -1943,6 +1943,186 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
     drop(owner);
 }
 
+/// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
+/// session of the release before through the new daemon. Its bytes are written in the shape that
+/// worker reads and reach the session's terminal; its console key records are refused by the
+/// daemon, by name, because that worker has no counterpart for them, and the session shows nothing
+/// of them. The refused write spends no sequence number: the next bytes write takes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_its_key_records_are_refused()
+ {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
+    use kr_protocol::input::{
+        ConsoleKey, InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
+    };
+    use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs};
+    use kr_protocol::session::Dimensions;
+
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let owner = door::Door::pair_the_first_owner(
+        &host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        host.tree.environment_id(),
+    )
+    .await;
+    let session_id = updated.session_id;
+    let target = || kr_protocol::envelope::ActionTarget {
+        environment_id: host.tree.environment_id(),
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    let attached: SessionAttachResult = owner
+        .session
+        .mutate(
+            Method::SessionAttach,
+            target(),
+            None,
+            &Empty {},
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the worker of the release before admits the device's attach")
+        .to_typed()
+        .expect("the worker answers with the attachment it made");
+    assert!(
+        attached
+            .attachment
+            .granted
+            .contains(&AttachmentCapability::Input),
+        "the attachment may type: {attached:?}"
+    );
+    let attachment_id = attached.attachment.attachment_id;
+    let lease: InputAcquireResult = owner
+        .session
+        .mutate(
+            Method::InputAcquire,
+            target(),
+            None,
+            &Empty {},
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the device takes the input lease")
+        .to_typed()
+        .expect("a lease");
+    let write = |sequence: u64, input: InputContent| InputWriteParams {
+        session_id,
+        attachment_id,
+        epoch: lease.lease.epoch,
+        sequence: InputSequence::new(sequence),
+        input,
+    };
+    // The shell computes each marker, so the line as typed does not hold it.
+    let typed = |line: &str| InputContent::Bytes {
+        bytes: Bytes::new(format!("{line}\n").into_bytes()),
+    };
+
+    owner
+        .session
+        .write_input(&write(0, typed("echo KEPT-$((6*7))-OUTPUT")))
+        .await
+        .expect("the worker of the release before takes the bytes of a paired device");
+
+    // Key records spelling a line the session must not show. The refusal is the daemon's: a
+    // worker of the release before would answer with an invalid argument.
+    let keys = "echo NOT-$((6*7))-TYPED\n"
+        .chars()
+        .map(|character| ConsoleKey {
+            virtual_key: 0,
+            scan_code: 0,
+            unicode: u16::try_from(u32::from(character)).expect("a basic plane character"),
+            key_down: true,
+            control_keys: 0,
+            repeat: 1,
+        })
+        .collect();
+    let refused = owner
+        .session
+        .write_input(&write(1, InputContent::ConsoleKeys { keys }))
+        .await
+        .expect_err("the daemon has no way to give key records to that worker");
+    assert_eq!(
+        refused.code(),
+        ErrorCode::UnsupportedCapability,
+        "{refused}"
+    );
+    owner
+        .session
+        .write_input(&write(1, typed("echo AFTER-$((6*7))-MARK")))
+        .await
+        .expect("the refused write spent no sequence number");
+
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    drop(owner);
+    let file = host.scratch("export").join("session.json");
+    let started = Instant::now();
+    loop {
+        let output = host.run(
+            &updated.kr_now(),
+            &[
+                "export",
+                &updated.session_id.to_string(),
+                "--output",
+                &file.display().to_string(),
+            ],
+        );
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the closed session was not exported in {:?}: {}",
+            started.elapsed(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let document: Value = serde_json::from_slice(&std::fs::read(&file).expect("the exported file"))
+        .expect("the export is one JSON document");
+    let shown = String::from_utf8_lossy(&exported_output(&document)).into_owned();
+    for marker in ["KEPT-42-OUTPUT", "AFTER-42-MARK"] {
+        assert!(
+            shown.contains(marker),
+            "the session shows {marker}: {}",
+            shown.escape_debug()
+        );
+    }
+    assert!(
+        !shown.contains("NOT-42-TYPED") && !shown.contains("NOT-$((6*7))-TYPED"),
+        "the session shows nothing of the refused key records: {}",
+        shown.escape_debug()
+    );
+}
+
 /// KR-REQ-26.06, KR-REQ-26.08, KR-REQ-20.23, KR-REQ-09.10: a host on the newest release of this
 /// build's own level is updated to this build, by that release's own `kr`, while a session's worker
 /// still runs the release. The worker is the process it was; a device paired with the new daemon has

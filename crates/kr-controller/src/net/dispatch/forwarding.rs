@@ -9,6 +9,7 @@ use kr_protocol::envelope::{
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::retained::CodecError;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
@@ -55,6 +56,26 @@ fn unreadable_retained_answer() -> ProtocolError {
         "this host holds what this action produced and does not show it to this device, because \
          the session's worker answered in a form this host cannot read",
     )
+}
+
+/// The refusal for an `input.write` that cannot be written for the level its session's worker is
+/// at.
+///
+/// A write the current type does not read is the caller's mistake, as it would be at a worker of
+/// this level. Key records have no counterpart at a retained level, which is a lack of the
+/// worker's and not of the write, so the code is the one that says a capability is missing and
+/// nothing reaches the worker.
+fn input_write_refusal(error: &CodecError) -> ProtocolError {
+    match error {
+        CodecError::NotInLevel { .. } => ProtocolError::new(
+            ErrorCode::UnsupportedCapability,
+            "this session's worker is of an earlier release and takes input as bytes only",
+        ),
+        _ => ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "the parameters of input.write are not the current ones",
+        ),
+    }
 }
 
 impl RemoteConnection {
@@ -199,6 +220,24 @@ impl RemoteConnection {
         let proxy = match proxy {
             Ok(proxy) => proxy,
             Err(error) => return failure(request.request_id, error),
+        };
+        // A write for a worker of a retained level is written in the shape that level reads, or
+        // refused here when that level has no counterpart for it. A worker of this level gets the
+        // request as it came, unread.
+        let rewritten;
+        let request = if entry.method == Method::InputWrite && !proxy.level().is_this() {
+            match proxy.level().encode_input_write(&request.params) {
+                Ok(params) => {
+                    rewritten = Request {
+                        params,
+                        ..request.clone()
+                    };
+                    &rewritten
+                }
+                Err(error) => return failure(request.request_id, input_write_refusal(&error)),
+            }
+        } else {
+            request
         };
         let envelope = self.envelope(asked.acting.grant.grant_id, validated);
         let authority = match self.authority_deadline(asked) {

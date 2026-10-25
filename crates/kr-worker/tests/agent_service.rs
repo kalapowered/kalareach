@@ -1902,7 +1902,9 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: kr_protocol::scalars::Bytes::new(b"hello".to_vec()),
+                input: kr_protocol::input::InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(b"hello".to_vec()),
+                },
             })
             .expect("encodes"),
         }))

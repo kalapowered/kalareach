@@ -48,7 +48,7 @@ use kr_protocol::ids::{
     ActionId, ActorId, AttachmentId, BuildId, DraftId, EnvironmentId, InputLeaseEpoch,
     InputSequence, SessionEpoch, SessionId,
 };
-use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams};
 use kr_protocol::insertion::{InsertionBegin, InsertionReport, ReportedOutcome};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -938,7 +938,9 @@ impl Terminal {
                     attachment_id: self.attachment_id,
                     epoch,
                     sequence: InputSequence::new(self.sequence),
-                    bytes: Bytes::new(bytes.to_vec()),
+                    input: InputContent::Bytes {
+                        bytes: Bytes::new(bytes.to_vec()),
+                    },
                 },
             )
             .await

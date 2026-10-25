@@ -1677,7 +1677,9 @@ async fn input_through_real_workers_while_a_session_prints() {
 
 #[cfg(unix)]
 async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String> {
-    use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+    use kr_protocol::input::{
+        InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
+    };
 
     // Nineteen idle sessions and thirty-two views, beside the session that is typed into. Section 27
     // states twenty live shells and thirty-two views for an idle host; typing into one of them while
@@ -1801,7 +1803,9 @@ async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(sequence),
-                bytes: kr_protocol::scalars::Bytes::new(b"s".to_vec()),
+                input: InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(b"s".to_vec()),
+                },
             },
         ),
     )
@@ -1826,7 +1830,9 @@ async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(sequence),
-                bytes: kr_protocol::scalars::Bytes::new(b"x".to_vec()),
+                input: InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(b"x".to_vec()),
+                },
             },
             sequence + 1,
             b'x',
@@ -1853,7 +1859,9 @@ async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String
                     attachment_id,
                     epoch,
                     sequence: kr_protocol::ids::InputSequence::new(sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(delimiter[..length].to_vec()),
+                    input: InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(delimiter[..length].to_vec()),
+                    },
                 },
                 sequence + 1,
                 b'^',

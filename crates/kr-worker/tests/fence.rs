@@ -5945,7 +5945,9 @@ async fn a_keystroke_that_expires_a_hold_reaches_the_terminal_in_order_while_the
                     attachment_id: holder,
                     epoch,
                     sequence: kr_protocol::ids::InputSequence::new(sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+                    },
                 },
             )
             .await

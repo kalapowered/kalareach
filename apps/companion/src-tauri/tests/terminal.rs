@@ -30,7 +30,7 @@ use kr_protocol::session::Dimensions;
 use scripted_worker::{
     CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, Stated, WATCHDOG,
     WorkerLease, delta, frame, frame_delta, keys_delta, mouse_delta, page as rows_page, reset, row,
-    screen, snapshot,
+    screen, snapshot, written,
 };
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -2297,7 +2297,7 @@ async fn a_wheel_turn_is_one_wheel_event_at_its_cell_under_the_epoch_and_next_nu
     assert_eq!(asked.epoch.get(), 5);
     assert_eq!(asked.sequence.get(), 0);
     assert_eq!(
-        asked.bytes.as_slice(),
+        written(&asked),
         b"\x1b[<65;8;2M",
         "the wheel turned down, at column 8 and row 2 counted from 1"
     );
@@ -2309,7 +2309,7 @@ async fn a_wheel_turn_is_one_wheel_event_at_its_cell_under_the_epoch_and_next_nu
     let asked: InputWriteParams = write.params();
     assert_eq!(asked.sequence.get(), 1);
     assert_eq!(
-        asked.bytes.as_slice(),
+        written(&asked),
         b"\x1b[<64;1;6M\x1b[<64;1;6M",
         "two turns up are two events"
     );
@@ -2349,10 +2349,7 @@ async fn the_modifiers_go_with_the_wheel() {
             .expect("the turn is taken");
         let write = link.expect(Method::InputWrite).await;
         let asked: InputWriteParams = write.params();
-        assert_eq!(
-            asked.bytes.as_slice(),
-            format!("\x1b[<{button};1;1M").as_bytes()
-        );
+        assert_eq!(written(&asked), format!("\x1b[<{button};1;1M").as_bytes());
         lease.answer(&mut link, &write).await;
     }
 }
@@ -2372,7 +2369,7 @@ async fn the_original_report_carries_the_wheel_as_far_as_its_range() {
     let write = link.expect(Method::InputWrite).await;
     let asked: InputWriteParams = write.params();
     assert_eq!(
-        asked.bytes.as_slice(),
+        written(&asked),
         &[0x1b, b'[', b'M', 65 + 32, 223 + 32, 1 + 32]
     );
     lease.answer(&mut link, &write).await;
@@ -2394,7 +2391,7 @@ async fn the_original_report_carries_the_wheel_as_far_as_its_range() {
     let asked: InputWriteParams = write.params();
     assert_eq!(asked.sequence.get(), 1, "nothing was written in between");
     assert_eq!(
-        asked.bytes.as_slice(),
+        written(&asked),
         &[0x1b, b'[', b'M', 64 + 32, 4 + 32, 2 + 32]
     );
 }
@@ -2449,7 +2446,7 @@ async fn nothing_reaches_a_program_that_does_not_read_the_wheel_from_this_view()
         .expect("the turn is taken");
     let write = link.expect(Method::InputWrite).await;
     assert_eq!(
-        write.params::<InputWriteParams>().bytes.as_slice(),
+        written(&write.params::<InputWriteParams>()),
         b"\x1b[<65;20;6M"
     );
 }
@@ -3102,7 +3099,7 @@ async fn inputs_that_are_not_the_views_shape_are_refused_before_anything_is_sent
         .expect("the most turns one input carries");
     let write = link.expect(Method::InputWrite).await;
     assert_eq!(
-        write.params::<InputWriteParams>().bytes.as_slice(),
+        written(&write.params::<InputWriteParams>()),
         b"\x1b[<65;1;1M".repeat(1024).as_slice()
     );
 }
@@ -3134,7 +3131,7 @@ async fn next_write(link: &mut Link, lease: &mut WorkerLease) -> (u64, Vec<u8>) 
     assert_eq!(write.kind, CallKind::Request, "input is a request");
     let asked: InputWriteParams = write.params();
     lease.answer(link, &write).await;
-    (asked.sequence.get(), asked.bytes.as_slice().to_vec())
+    (asked.sequence.get(), written(&asked).to_vec())
 }
 
 /// A view of a program that reads keys as `keys` says, whose control the page took as its request 1

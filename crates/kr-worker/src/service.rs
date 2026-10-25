@@ -43,7 +43,7 @@ use kr_protocol::ids::{
     SessionId, StreamId,
 };
 use kr_protocol::input::{
-    InputAcquireParams, InputInterruptParams, InputLeaseResult, InputReleaseParams,
+    InputAcquireParams, InputContent, InputInterruptParams, InputLeaseResult, InputReleaseParams,
     InputWriteParams, InputWriteResult, InterruptAction,
 };
 use kr_protocol::local::{
@@ -8684,9 +8684,14 @@ impl WorkerService {
         // section 27 puts at no more than the recogniser's deadline, began with the write.
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(facts, params.attachment_id)?;
+        let InputContent::Bytes { bytes } = &params.input else {
+            return Err(WorkerError::InvalidArgument(
+                "this worker does not take console key records".to_owned(),
+            ));
+        };
         // Raw input is its own stream with its own bound. Travelling inside a control frame does
         // not give a keystroke batch the control frame's allowance.
-        if params.bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
+        if bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
             return Err(WorkerError::InvalidArgument(format!(
                 "an input batch is at most {} bytes",
                 kr_protocol::limits::MAX_INPUT_FRAME_LEN
@@ -8725,7 +8730,7 @@ impl WorkerService {
                 params.attachment_id,
                 params.epoch.get(),
                 params.sequence.get(),
-                params.bytes.as_slice(),
+                bytes.as_slice(),
                 // The deadline travels with the bytes, on both clocks it is decided on. This check
                 // is the host's, taken now; the writer's is its own, taken when the terminal
                 // actually takes them.

@@ -10481,6 +10481,59 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ConsoleKey": {
+      "additionalProperties": false,
+      "description": "One key event the way a Windows console reports it.\n\nThe six numbers of a `KEY_EVENT_RECORD`, carried as the console read them. The worker, which\nknows what the session's backend asked for, decides what they are spelled as; a client never\ninvents a scan code or a spelling here.",
+      "properties": {
+        "control_keys": {
+          "description": "The console's control-key state bits.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "key_down": {
+          "description": "True when the key went down, false when it came up.",
+          "type": "boolean"
+        },
+        "repeat": {
+          "description": "How many times the key repeated in this one record.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scan_code": {
+          "description": "The scan code the keyboard sent, as the console reported it.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unicode": {
+          "description": "One UTF-16 code unit. A character outside the basic plane arrives as two records, a high\nsurrogate then a low one.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "virtual_key": {
+          "description": "The virtual-key code.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "virtual_key",
+        "scan_code",
+        "unicode",
+        "key_down",
+        "control_keys",
+        "repeat"
+      ],
+      "type": "object"
+    },
     "ContainerEnvironment": {
       "description": "Whether this execution context is inside a container or a Windows Subsystem for Linux\ndistribution.\n\nBoth have their own process namespace and their own idea of a display. Neither silently gains\ncontrol of the desktop of the machine hosting it, so a worker created in one reports it and its\ncapability records say why the parent desktop is not available.",
       "oneOf": [
@@ -19474,6 +19527,52 @@
       ],
       "type": "object"
     },
+    "InputContent": {
+      "description": "What one `input.write` carries.\n\nA write is one or the other, never both: bytes a client has already spelled, or key records the\nworker spells for the session's terminal. Both go through the same ordered stream, the same\npaste recogniser and the same bound on what one write may produce.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Raw bytes. They are not decoded, re-encoded or normalised.",
+          "properties": {
+            "bytes": {
+              "$ref": "#/$defs/Bytes",
+              "description": "The bytes."
+            },
+            "kind": {
+              "const": "bytes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Key records from a console, in the order the console reported them. The worker spells them\nas the session's terminal asked for, and refuses the write when it cannot.",
+          "properties": {
+            "keys": {
+              "description": "The records.",
+              "items": {
+                "$ref": "#/$defs/ConsoleKey"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "console_keys",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "keys"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "InputInterruptParams": {
       "additionalProperties": false,
       "description": "Parameters of `input.interrupt`.",
@@ -19602,17 +19701,17 @@
           "$ref": "#/$defs/AttachmentId",
           "description": "The attachment writing."
         },
-        "bytes": {
-          "$ref": "#/$defs/Bytes",
-          "description": "The raw bytes. They are not decoded, re-encoded or normalised."
-        },
         "epoch": {
           "$ref": "#/$defs/InputLeaseEpoch",
-          "description": "The lease epoch the bytes belong to. A stale epoch is `LEASE_LOST` and never acquires\nimplicitly."
+          "description": "The lease epoch the input belongs to. A stale epoch is `LEASE_LOST` and never acquires\nimplicitly."
+        },
+        "input": {
+          "$ref": "#/$defs/InputContent",
+          "description": "What is written: raw bytes, or the console's key records."
         },
         "sequence": {
           "$ref": "#/$defs/InputSequence",
-          "description": "The position of these bytes in this connection's ordered input stream."
+          "description": "The position of this input in this connection's ordered input stream."
         },
         "session_id": {
           "$ref": "#/$defs/SessionId",
@@ -19624,7 +19723,7 @@
         "attachment_id",
         "epoch",
         "sequence",
-        "bytes"
+        "input"
       ],
       "type": "object"
     },

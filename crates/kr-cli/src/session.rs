@@ -2075,7 +2075,9 @@ async fn send_input(
         attachment_id,
         epoch,
         sequence: kr_protocol::ids::InputSequence::new(sequence),
-        bytes: kr_protocol::scalars::Bytes::new(bytes),
+        input: kr_protocol::input::InputContent::Bytes {
+            bytes: kr_protocol::scalars::Bytes::new(bytes),
+        },
     };
     let Ok(params) = kr_protocol::envelope::ParamsValue::from_typed(&params) else {
         return false;

@@ -3222,9 +3222,11 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
                     attachment_id: attachment.attachment.attachment_id,
                     epoch: lease.lease.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(
-                        format!("kr-typed-{sequence}\n").into_bytes(),
-                    ),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(
+                            format!("kr-typed-{sequence}\n").into_bytes(),
+                        ),
+                    },
                 },
             )
             .await
@@ -3421,7 +3423,9 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
                 attachment_id: attachment.attachment.attachment_id,
                 epoch: lease.lease.epoch,
                 sequence: kr_protocol::ids::InputSequence::new(4),
-                bytes: kr_protocol::scalars::Bytes::new(b"kr-typed-4\n".to_vec()),
+                input: kr_protocol::input::InputContent::Bytes {
+                    bytes: kr_protocol::scalars::Bytes::new(b"kr-typed-4\n".to_vec()),
+                },
             },
         )
         .await
@@ -3484,7 +3488,9 @@ async fn every_character_typed_after_an_interrupt_reaches_the_application() {
                     attachment_id: attachment.attachment.attachment_id,
                     epoch: lease.lease.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(index as u64),
-                    bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                    },
                 },
             )
             .await

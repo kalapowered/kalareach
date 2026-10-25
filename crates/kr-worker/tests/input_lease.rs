@@ -24,7 +24,7 @@ use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, ConnectionId, ControllerGeneration, SessionEpoch, SessionId,
 };
-use kr_protocol::input::{InputAcquireParams, InputWriteParams, InputWriteResult};
+use kr_protocol::input::{InputAcquireParams, InputContent, InputWriteParams, InputWriteResult};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
@@ -1534,7 +1534,9 @@ async fn nothing_journals_a_keystroke_and_reaching_the_terminal_is_not_an_effect
                 attachment_id,
                 epoch: lease.lease.epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: Bytes::new(secret.to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(secret.to_vec()),
+                },
             },
         )
         .await
@@ -1770,7 +1772,9 @@ async fn write_over(
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(sequence),
-                bytes: Bytes::new(bytes.to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(bytes.to_vec()),
+                },
             },
         )
         .await
@@ -1828,7 +1832,9 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
                 attachment_id,
                 epoch: kr_protocol::ids::InputLeaseEpoch::new(0),
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: Bytes::new(b"x".to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"x".to_vec()),
+                },
             },
         )
         .await
@@ -1863,7 +1869,9 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: Bytes::new(b"kr-one.".to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"kr-one.".to_vec()),
+                },
             },
         )
         .await
@@ -1884,7 +1892,9 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(0),
-                bytes: Bytes::new(b"kr-again.".to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"kr-again.".to_vec()),
+                },
             },
         )
         .await
@@ -1902,7 +1912,9 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
                 attachment_id,
                 epoch: kr_protocol::ids::InputLeaseEpoch::new(epoch.get() + 7),
                 sequence: kr_protocol::ids::InputSequence::new(1),
-                bytes: Bytes::new(b"x".to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(b"x".to_vec()),
+                },
             },
         )
         .await
@@ -4019,7 +4031,9 @@ async fn write_in(
                 attachment_id,
                 epoch,
                 sequence: kr_protocol::ids::InputSequence::new(sequence),
-                bytes: Bytes::new(bytes.to_vec()),
+                input: InputContent::Bytes {
+                    bytes: Bytes::new(bytes.to_vec()),
+                },
             },
         )
         .await
@@ -4476,7 +4490,9 @@ fn key_frame(rig: &Rig, id: kr_protocol::ids::RequestId, bytes: &[u8]) -> Contro
             attachment_id: rig.attachment,
             epoch: rig.epoch,
             sequence: kr_protocol::ids::InputSequence::new(rig.sequence),
-            bytes: Bytes::new(bytes.to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(bytes.to_vec()),
+            },
         })
         .expect("encodes"),
     })
@@ -5085,7 +5101,9 @@ impl Proxied {
             attachment_id: self.attachment,
             epoch: self.epoch,
             sequence: kr_protocol::ids::InputSequence::new(self.sequence),
-            bytes: Bytes::new(bytes.to_vec()),
+            input: InputContent::Bytes {
+                bytes: Bytes::new(bytes.to_vec()),
+            },
         };
         self.sequence += 1;
         self.typed.extend_from_slice(bytes);

@@ -2172,7 +2172,9 @@ async fn a_devices_input_waiting_for_the_workers_writer_is_refused_once_a_feed_r
                     attachment_id: AttachmentId::new(Uuid::from_bytes([9; 16])),
                     epoch: InputLeaseEpoch::new(1),
                     sequence: InputSequence::new(id),
-                    bytes: Bytes::new(b"x".to_vec()),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: Bytes::new(b"x".to_vec()),
+                    },
                 },
             )
         };
@@ -2377,7 +2379,9 @@ async fn a_frame_the_worker_has_part_of_when_a_feed_refusal_rises_is_cut_and_the
                     attachment_id: AttachmentId::new(Uuid::from_bytes([9; 16])),
                     epoch: InputLeaseEpoch::new(1),
                     sequence: InputSequence::new(id),
-                    bytes: Bytes::new(vec![b'x'; size]),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: Bytes::new(vec![b'x'; size]),
+                    },
                 },
             )
         };
