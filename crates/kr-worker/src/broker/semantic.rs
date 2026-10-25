@@ -332,6 +332,8 @@ impl SemanticLog {
         let kept = text.floor_char_boundary(MAX_ENTRY_TEXT_BYTES);
         let omitted = text.len() - kept;
         text.truncate(kept);
+        // The prefix is all that is kept, so the allocation of a longer text is not.
+        text.shrink_to_fit();
         self.entries.push_back((
             cursor,
             AgentSnapshotEntry {

@@ -706,6 +706,9 @@ impl Gateway {
             .get(&connection)
             .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
         let body = read_frame(bytes)?;
+        // A member named twice at any depth is a frame two readers could read differently, and the
+        // answer's result member is nested.
+        read_channel_frame(bytes)?;
         if held.table.framing == NativeFraming::JsonLines
             && bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r'))
         {

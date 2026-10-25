@@ -864,6 +864,9 @@ struct Waiters {
     answered: std::collections::VecDeque<(UpstreamRequestId, LateVerdict)>,
     /// The operations given up on that wait for their answer to come.
     claimed: BTreeMap<UpstreamRequestId, tokio::sync::oneshot::Sender<LateVerdict>>,
+    /// True once the connection has ended: nothing the upstream says afterwards is read, so no
+    /// claim is taken.
+    ended: bool,
 }
 
 /// What claiming the answer to an operation that was given up on found.
@@ -995,6 +998,9 @@ impl Outstanding {
     /// when it comes. Each operation claims once.
     fn claim(&self, id: &UpstreamRequestId) -> LateClaim {
         let mut held = self.held();
+        if held.ended {
+            return LateClaim::Refused;
+        }
         if let Some(at) = held.answered.iter().position(|(seen, _)| seen == id)
             && let Some((_, verdict)) = held.answered.remove(at)
         {
@@ -1012,6 +1018,7 @@ impl Outstanding {
     /// upstream says afterwards is read.
     fn end_claims(&self) {
         let mut held = self.held();
+        held.ended = true;
         held.claimed.clear();
         held.answered.clear();
     }
@@ -4104,10 +4111,16 @@ mod tests {
         outstanding.end_claims();
         for mut receiver in receivers {
             assert!(
-                receiver.try_recv().is_err(),
-                "a connection that ended tells no claim anything"
+                matches!(
+                    receiver.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+                ),
+                "a connection that ended lets go of every claim"
             );
         }
-        assert!(matches!(outstanding.claim(&ids[1]), LateClaim::Waiting(_)));
+        assert!(
+            matches!(outstanding.claim(&ids[1]), LateClaim::Refused),
+            "and takes none afterwards"
+        );
     }
 }

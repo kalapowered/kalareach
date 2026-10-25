@@ -620,8 +620,8 @@ async fn kr_req_11_33_a_trust_withdrawn_while_the_component_encodes_leaves_the_a
 /// KR-REQ-11.21: bytes a component returns are data, and become an answer only if they are one. Each
 /// of these is refused by the core with nothing sent: an answer to another request, to the right
 /// one with its identifier as another JSON type, one that is a request, one that is an error, one
-/// that is both a result and an error, one that names a member twice and one that holds a line
-/// break. The request stays the opaque one it was, the terminal answers it, and the binding's
+/// that is both a result and an error, one that names a member twice, at the top or inside the
+/// result, and one that holds a line break. The request stays the opaque one it was, the terminal answers it, and the binding's
 /// report says only that the bytes were not an answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_and_nothing_is_sent()
@@ -639,6 +639,7 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
         "!answer-method",
         "!answer-error",
         "!answer-both",
+        "!answer-nested",
         "!answer-twice",
         "!answer-newline",
     ];
@@ -662,7 +663,7 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
         reason.contains(kr_worker::broker::encode::NotEncoded::NotAnAnswer.words()),
         "{reason}"
     );
-    assert!(reason.contains("7 answers were not written"), "{reason}");
+    assert!(reason.contains("8 answers were not written"), "{reason}");
 
     // The same request, answered by a component that returns a true answer, is sent.
     world.send(&request_noting(60, "!answer"));

@@ -1375,7 +1375,7 @@ fn kr_req_24_24_the_text_of_a_retained_entry_is_bounded_and_says_what_it_left_ou
         .register_instance(instance(), IntegrationMode::Gateway, None, None)
         .expect("the instance is registered");
     // Multi-byte text, so the cut has a character boundary to respect.
-    let said = "ab\u{e9}".repeat(400_000);
+    let said = format!("a{}", "\u{e9}".repeat(400_000));
     broker
         .observe(instance(), "message", &said, TimestampMs::new(1))
         .expect("observed");
@@ -1396,10 +1396,11 @@ fn kr_req_24_24_the_text_of_a_retained_entry_is_bounded_and_says_what_it_left_ou
         panic!("two entries were observed: {:?}", replay.entries.len());
     };
     let bound = kr_worker::broker::semantic::MAX_ENTRY_TEXT_BYTES;
-    assert!(
-        (bound - 3..=bound).contains(&long.text.len()),
-        "the retained text is {} bytes, cut at a character boundary within {bound}",
-        long.text.len()
+    // The first byte is one, and every character after it is two, so the bound falls inside one.
+    assert_eq!(
+        long.text.len(),
+        bound - 1,
+        "the retained text stops at the last whole character within {bound}"
     );
     assert!(
         said.starts_with(&long.text),
