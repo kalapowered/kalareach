@@ -448,14 +448,18 @@ impl From<OwnershipRefusal> for ControllerError {
 /// What [`ArchiveService::bring_forward`] left of a session's store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Forward {
-    /// Nothing was held back: the store is not there, is at the current version, is older than the
-    /// ladder or newer than this build, or its version could not be read, or a migration was
-    /// attempted. Whether the store can be read is for the reader to find.
+    /// Nothing was held back and nothing failed: the store is not there, is at the current
+    /// version, is older than the ladder or newer than this build, or its version could not be
+    /// read, or a migration was made. Whether the store can be read is for the reader to find.
     Settled,
     /// A migration is due and was not made, because a worker may still own the store, the
     /// daemon's evidence could not rule one out (its registry was busy or unreadable), or the
     /// recovery lock could not be taken. A later look may make it.
     HeldBack,
+    /// A migration was due and was made, and did not finish: the store is still of an earlier
+    /// schema. The cause is not told apart (a busy or full store may be cured by a later look, a
+    /// damaged one never is), so a reader that waits for it bounds how often it looks.
+    Failed,
 }
 
 /// What a daemon tells its archive about the workers of its sessions: whether one may still own a
@@ -728,8 +732,13 @@ impl ArchiveService {
         while_migrating::run(session_id);
         // `Journal::open` migrates and then holds the current schema. Dropping it immediately is
         // what keeps this a migration rather than a second reader.
-        drop(Journal::open(&path));
-        Forward::Settled
+        match Journal::open(&path) {
+            Ok(journal) => {
+                drop(journal);
+                Forward::Settled
+            }
+            Err(_) => Forward::Failed,
+        }
     }
 
     /// Removes the worker's published endpoint and descriptor, and returns whether anything went.

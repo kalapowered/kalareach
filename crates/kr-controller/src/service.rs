@@ -1335,6 +1335,10 @@ mod a_crash_whose_endpoint_cannot_be_removed;
 #[cfg(test)]
 mod a_migration_and_a_recovery_of_one_session;
 
+/// A closed session whose journal is of an earlier schema and whose migration fails.
+#[cfg(all(test, unix))]
+mod a_migration_that_fails;
+
 /// A closed session whose worker has not yet exited.
 #[cfg(test)]
 mod a_worker_that_is_on_its_way_out;

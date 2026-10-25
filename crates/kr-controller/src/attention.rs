@@ -136,8 +136,17 @@ fn held_back_wait(holds: u32) -> Duration {
 #[derive(Clone, Copy, Debug)]
 struct Held {
     holds: u32,
+    /// How many of the tries found the migration of the journal failing. A try that found the
+    /// journal held back for another reason does not count, and does not reset the count.
+    failures: u32,
     not_before_ms: u64,
 }
+
+/// How many tries that find a closed session's journal failing to migrate the store makes before it
+/// finishes the session with gaps, as it does for a journal it cannot read. With the waits that
+/// grow from [`CLOSURE_RETRY`] to [`CLOSURE_RETRY_MAX`] that is about twenty minutes. The count is
+/// kept in memory and starts again with the daemon.
+const FAILED_MIGRATION_TRIES: u32 = 10;
 
 /// How often the records of expired actions are let go of.
 const FORGET_EVERY_MS: u64 = 60 * 60 * 1_000;
@@ -323,6 +332,9 @@ pub enum ClosedJournal {
     /// The journal is of an earlier schema and cannot be brought forward yet, because a worker of
     /// the session may still own it or another recovery holds it. A later look may open it.
     HeldBack,
+    /// The journal is of an earlier schema, and bringing it forward was tried and failed. A later
+    /// look may succeed, and the store looks only [`FAILED_MIGRATION_TRIES`] times.
+    Failing,
     /// The journal is not there or cannot be read.
     Unreadable,
 }
@@ -333,7 +345,7 @@ impl ClosedJournal {
     pub fn open(self) -> Option<kr_worker::journal::Journal> {
         match self {
             Self::Open(journal) => Some(*journal),
-            Self::HeldBack | Self::Unreadable => None,
+            Self::HeldBack | Self::Failing | Self::Unreadable => None,
         }
     }
 }
@@ -1702,6 +1714,13 @@ impl AttentionModule {
                     ClosedJournal::HeldBack => {
                         journals_held_back.insert(session_id);
                     }
+                    // Only while the store is still trying it: a session finished with gaps
+                    // because its migration kept failing no longer holds a summary back.
+                    ClosedJournal::Failing => {
+                        if self.origins().closing.contains(&session_id) {
+                            journals_held_back.insert(session_id);
+                        }
+                    }
                     ClosedJournal::Open(_) => self.lift_the_wait(session_id),
                     ClosedJournal::Unreadable => {}
                 }
@@ -2698,7 +2717,9 @@ impl AttentionModule {
     /// Finishes a closed session as far as the store can now, and keeps it for the next pass when
     /// it cannot. A session whose journal is held back waits longer after each try that finds it
     /// so, up to [`CLOSURE_RETRY_MAX`]; while it waits its items are held back as they are while
-    /// its closure is under way.
+    /// its closure is under way. One whose journal fails to migrate waits the same way, and is
+    /// finished with gaps, as for a journal that cannot be read, when [`FAILED_MIGRATION_TRIES`]
+    /// tries have found it so.
     fn finish(&self, reach: &dyn Reach, session_id: SessionId, unaccounted: bool, now_ms: u64) {
         if self.finalised(session_id) {
             let mut origins = self.origins();
@@ -2728,6 +2749,7 @@ impl AttentionModule {
             let read = match reach.closed_journal(session_id) {
                 ClosedJournal::Open(journal) => self.read_to_the_end(session_id, &journal),
                 ClosedJournal::HeldBack => Err(Unfinished::HeldBack),
+                ClosedJournal::Failing => Err(Unfinished::Failing),
                 ClosedJournal::Unreadable => Err(Unfinished::Journal),
             };
             match read {
@@ -2736,29 +2758,43 @@ impl AttentionModule {
                     .gaps_without_end(session_id)
                     .and_then(|()| self.finalise(session_id)),
                 Err(Unfinished::Store(error)) => Err(error),
-                Err(Unfinished::HeldBack) => {
+                Err(waiting @ (Unfinished::HeldBack | Unfinished::Failing)) => {
+                    let failed = matches!(waiting, Unfinished::Failing);
+                    let failures = earlier
+                        .map_or(0, |held| held.failures)
+                        .saturating_add(u32::from(failed));
                     let mut origins = self.origins();
-                    if origins.lifted.remove(&session_id) {
-                        // A read opened the journal while this try was finding it held back: the
-                        // hold is over, and a wait put back now would outlast it. The session is
-                        // due at once, and the loop is woken for it.
-                        self.wake.notify_one();
+                    let lifted = origins.lifted.remove(&session_id);
+                    if !lifted && failures >= FAILED_MIGRATION_TRIES {
+                        // The migration failed on every try the store makes, so the journal is
+                        // taken for one that cannot be read.
+                        drop(origins);
+                        self.gaps_without_end(session_id)
+                            .and_then(|()| self.finalise(session_id))
                     } else {
-                        let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
-                        let wait =
-                            u64::try_from(held_back_wait(holds).as_millis()).unwrap_or(u64::MAX);
-                        origins.held_back.insert(
-                            session_id,
-                            Held {
-                                holds,
-                                not_before_ms: now_ms.saturating_add(wait),
-                            },
-                        );
+                        if lifted {
+                            // A read opened the journal while this try was finding it held back:
+                            // the hold is over, and a wait put back now would outlast it. The
+                            // session is due at once, and the loop is woken for it.
+                            self.wake.notify_one();
+                        } else {
+                            let holds = earlier.map_or(0, |held| held.holds).saturating_add(1);
+                            let wait = u64::try_from(held_back_wait(holds).as_millis())
+                                .unwrap_or(u64::MAX);
+                            origins.held_back.insert(
+                                session_id,
+                                Held {
+                                    holds,
+                                    failures,
+                                    not_before_ms: now_ms.saturating_add(wait),
+                                },
+                            );
+                        }
+                        Err(ProtocolError::new(
+                            ErrorCode::StorageUnavailable,
+                            "a closed session's journal cannot be brought forward yet",
+                        ))
                     }
-                    Err(ProtocolError::new(
-                        ErrorCode::StorageUnavailable,
-                        "a closed session's journal cannot be brought forward yet",
-                    ))
                 }
             }
         };
@@ -3385,6 +3421,9 @@ enum Unfinished {
     /// The journal is of an earlier schema and cannot be brought forward yet: the session is tried
     /// again after a wait that grows with each try.
     HeldBack,
+    /// The journal is of an earlier schema and bringing it forward failed: the session is tried
+    /// again in the same way, a bounded number of times.
+    Failing,
 }
 
 // ----- The link --------------------------------------------------------------------------------
@@ -4774,6 +4813,183 @@ pub(crate) mod tests {
         assert!(
             module.finalised(session_id),
             "and it is due at once, not after a wait"
+        );
+    }
+
+    /// How a scripted reach answers one look at a closed session's journal.
+    #[derive(Clone, Copy)]
+    enum Look {
+        /// A worker may still own it.
+        Held,
+        /// Its migration was made and failed.
+        Fails,
+    }
+
+    /// A reach whose closed journal answers each look as the script says, and then as its last
+    /// answer said, and which counts the looks.
+    struct Scripted {
+        script: std::sync::Mutex<std::collections::VecDeque<Look>>,
+        last: std::sync::Mutex<Look>,
+        looks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Scripted {
+        fn new(script: impl IntoIterator<Item = Look>) -> Self {
+            let script: std::collections::VecDeque<Look> = script.into_iter().collect();
+            let last = script.back().copied().unwrap_or(Look::Held);
+            Self {
+                script: std::sync::Mutex::new(script),
+                last: std::sync::Mutex::new(last),
+                looks: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn looks(&self) -> usize {
+            self.looks.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Reach for Scripted {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> ClosedJournal {
+            self.looks.fetch_add(1, Ordering::SeqCst);
+            let next = self
+                .script
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            let look = next.unwrap_or_else(|| {
+                *self
+                    .last
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            match look {
+                Look::Held => ClosedJournal::HeldBack,
+                Look::Fails => ClosedJournal::Failing,
+            }
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// Looks at `session_id` through `reach` each time it is due, on the clock `now` the case
+    /// keeps, until it is finished or `looks` have been made through `reach` in all.
+    async fn tried_until(
+        module: &AttentionModule,
+        reach: &Scripted,
+        session_id: SessionId,
+        now: &mut u64,
+        looks: usize,
+    ) {
+        while reach.looks() < looks && !module.finalised(session_id) {
+            *now += u64::try_from(module.closure_retry_wait(*now).as_millis()).unwrap_or(u64::MAX);
+            module.finish_again_at(reach, *now).await;
+        }
+    }
+
+    /// A journal whose migration keeps failing is tried again, the session staying closing and its
+    /// items held, and after the tries the store makes it is finished with gaps, as a journal that
+    /// cannot be read is. A try that finds it held back for another reason is not one of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journal_whose_migration_keeps_failing_is_tried_a_bounded_number_of_times() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let reach = Scripted::new([Look::Fails]);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut now = 100_000_u64;
+
+        module.session_closed_at(&reach, session_id, now).await;
+        tried_until(&module, &reach, session_id, &mut now, tries - 1).await;
+        assert_eq!(reach.looks(), tries - 1);
+        assert!(
+            !module.finalised(session_id) && module.origins().closing.contains(&session_id),
+            "a journal that failed to migrate is tried again, not finished with gaps"
+        );
+        tried_until(&module, &reach, session_id, &mut now, tries).await;
+        assert_eq!(reach.looks(), tries, "the last try the store makes");
+        assert!(
+            module.finalised(session_id) && !module.origins().closing.contains(&session_id),
+            "and a migration that failed every time is taken for a journal that cannot be read"
+        );
+
+        // Held back for a worker, again and again, and then failing: only the failures count.
+        let held_then_failing = Scripted::new(
+            std::iter::repeat_n(Look::Held, 3 * tries)
+                .chain(std::iter::repeat_n(Look::Fails, tries)),
+        );
+        let other = SessionId::new(kr_ipc::new_uuid());
+        module
+            .session_closed_at(&held_then_failing, other, now)
+            .await;
+        tried_until(&module, &held_then_failing, other, &mut now, 4 * tries - 1).await;
+        assert_eq!(held_then_failing.looks(), 4 * tries - 1);
+        assert!(
+            !module.finalised(other),
+            "holds for a worker do not use up the tries a failing migration has"
+        );
+        tried_until(&module, &held_then_failing, other, &mut now, 4 * tries).await;
+        assert!(module.finalised(other), "and the tenth failure ends it");
+    }
+
+    /// KR-REQ-18.02: a summary is not asked for while the store still tries a journal that fails to
+    /// migrate, and is once the session has been finished with gaps: the bound bounds the wait for
+    /// the text too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_migration_holds_a_summary_back_only_while_the_store_tries_it() {
+        let tries = usize::try_from(FAILED_MIGRATION_TRIES).expect("a small count");
+        let mut world = Summarised::start();
+        world.record_commands(&[1_000, 1_010], true);
+        let reach = Scripted::new([Look::Fails]);
+        let mut now = 100_000_u64;
+
+        world
+            .module
+            .session_closed_at(&reach, world.session_id, now)
+            .await;
+        world
+            .changed_through(&reach, &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked(),
+            Vec::new(),
+            "the store still tries the journal, so no summary is asked for"
+        );
+
+        tried_until(
+            &world.module,
+            &reach,
+            world.session_id,
+            &mut now,
+            usize::MAX,
+        )
+        .await;
+        assert!(world.module.finalised(world.session_id));
+        assert!(reach.looks() >= tries);
+        world
+            .changed_through(&reach, &owner(), &Caller::Owner)
+            .await;
+        assert_eq!(
+            world.asked().len(),
+            1,
+            "once the session is finished with gaps the text is not waited for"
         );
     }
 
