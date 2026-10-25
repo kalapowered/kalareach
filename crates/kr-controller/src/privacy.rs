@@ -1904,6 +1904,13 @@ impl crate::service::Controller {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the report could not be made.
     pub(crate) async fn privacy_status(&self) -> Result<kr_protocol::envelope::ParamsValue> {
+        let report = self.current_privacy_report().await?;
+        kr_protocol::envelope::ParamsValue::from_typed(&report)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Where privacy mode stands now, with the copies authorised viewers may hold.
+    async fn current_privacy_report(&self) -> Result<PrivacyReport> {
         let privacy = Arc::clone(&self.privacy);
         let now_ms = kr_ipc::now_ms();
         let report = tokio::task::spawn_blocking(move || privacy.status(now_ms))
@@ -1911,8 +1918,93 @@ impl crate::service::Controller {
             .map_err(|_| ControllerError::RegistryUnavailable {
                 detail: "privacy mode's report could not be made".to_owned(),
             })?;
-        kr_protocol::envelope::ParamsValue::from_typed(&self.with_viewer_copies(report))
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        Ok(self.with_viewer_copies(report))
+    }
+
+    /// Performs `privacy.retained.delete`: asks the service that holds one copy privacy mode lists
+    /// as having left this host to delete it, and answers where that stands.
+    ///
+    /// It is the person's own action, and privacy mode neither stops it nor is stopped by it. The
+    /// host does not trust the reference: it reads the list again and acts only when exactly one
+    /// copy carries it and that copy is listed as deletable, and the store decides the deletion
+    /// again in the write that records it. Every object of the generation is written down before a
+    /// request leaves, and the carrier then sends them, under a privacy fence too. The answer waits
+    /// for the first pass of the carrier that read the written rows, and says the deletion is
+    /// confirmed only when the service has confirmed every object; a pass that met a service that
+    /// did not answer leaves the rest asked, shown as such in the list, and sent again when the
+    /// person asks again, and by the carrier once privacy mode is off. The registration the call
+    /// was admitted under is checked in the write that records the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when the list holds no one copy under the
+    /// reference, [`ControllerError::PermissionDenied`] for a copy the host cannot ask the removal
+    /// of, [`ControllerError::NotConfigured`] when the host selects no storage service, and the
+    /// store's refusals.
+    pub(crate) async fn privacy_retained_delete(
+        self: &Arc<Self>,
+        mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let params: kr_protocol::privacy::PrivacyRetainedDeleteParams = mutation
+            .params
+            .to_typed()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let report = self.current_privacy_report().await?;
+        let mut named = report
+            .exported
+            .iter()
+            .filter(|copy| copy.reference == params.reference);
+        let (Some(copy), None) = (named.next(), named.next()) else {
+            return Err(ControllerError::InvalidArgument(
+                "privacy mode lists no one copy under that reference".to_owned(),
+            ));
+        };
+        let refused = |why: &str| ControllerError::PermissionDenied {
+            detail: format!("this host cannot ask for the removal of that copy: {why}"),
+        };
+        if !copy.deletable {
+            return Err(refused(&copy.kind));
+        }
+        let Some((archive, generation)) = backup_generation_of(&copy.reference) else {
+            return Err(refused("it is not a backup generation"));
+        };
+        let Some(runtime) = self.backup_runtime() else {
+            return Err(ControllerError::NotConfigured(format!(
+                "{} in this host's configuration document ({}) selects no storage service, so                  there is nothing to ask for a deletion",
+                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            )));
+        };
+        let controller = Arc::clone(self);
+        let now_ms = kr_ipc::now_ms();
+        tokio::task::spawn_blocking(move || {
+            controller.under_registration(&carried, || {
+                controller
+                    .backup()
+                    .ask_deletion(archive, generation, now_ms)
+            })
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the deletion stopped before it could say what it did".to_owned(),
+        })???;
+        // A service that is slow to answer, or one that asked to be left alone, leaves the rest
+        // asked and shown as such; the person is told so and the carrier goes on.
+        let _ = tokio::time::timeout(RETAINED_DELETE_WAIT, runtime.carry_now()).await;
+        let confirmed = self
+            .backup()
+            .objects(archive, generation)?
+            .iter()
+            .all(|object| object.released_at_ms.is_some());
+        let report = self.current_privacy_report().await?;
+        kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::privacy::PrivacyRetainedDeleteResult {
+                deleted: confirmed,
+                report,
+            },
+        )
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
     /// Adds to a report the copies that authorised viewers may hold.
@@ -1972,6 +2064,25 @@ impl crate::service::Controller {
             );
         report
     }
+}
+
+/// How long a person's deletion of a kept copy waits for the carrier's pass before it answers that
+/// the rest is asked and not yet confirmed.
+const RETAINED_DELETE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The archive and the backup generation a reference of the backup service's names:
+/// `<archive> generation <number>`.
+fn backup_generation_of(
+    reference: &str,
+) -> Option<(
+    kr_protocol::ids::ArchiveId,
+    kr_protocol::ids::BackupGeneration,
+)> {
+    let (archive, number) = reference.split_once(" generation ")?;
+    Some((
+        archive.parse().ok()?,
+        kr_protocol::ids::BackupGeneration::new(number.parse().ok()?),
+    ))
 }
 
 /// Records that `subsystem` owes `work`.

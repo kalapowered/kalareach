@@ -14,6 +14,24 @@ use super::{
     Reads, Result, TimestampMs, current_generation, inhibited_at, millis, params, sql,
 };
 
+/// The test, for a row of `generations`, that the host is deleting the whole generation: it
+/// records objects for it, and a deletion of each is written down. Such a generation is no backup
+/// the host has, whoever asked, so it counts for nothing in what the host keeps.
+macro_rules! being_deleted {
+    () => {
+        "(EXISTS (SELECT 1 FROM objects
+                   WHERE objects.archive_id = generations.archive_id
+                     AND objects.backup_generation = generations.backup_generation)
+          AND NOT EXISTS (SELECT 1 FROM objects
+                           WHERE objects.archive_id = generations.archive_id
+                             AND objects.backup_generation = generations.backup_generation
+                             AND NOT EXISTS (SELECT 1 FROM releases
+                                              WHERE releases.archive_id = objects.archive_id
+                                                AND releases.backup_generation = objects.backup_generation
+                                                AND releases.object_id = objects.object_id)))"
+    };
+}
+
 /// The fewest generations of an archive the host keeps published: the newest, and the one a
 /// restore may be reading when the next is published.
 pub const LEAST_KEPT: u64 = 2;
@@ -65,6 +83,129 @@ pub(super) fn standing_refusal(
                     .to_owned(),
             ));
         }
+    }
+    Ok(None)
+}
+
+/// Why the person may not ask the service to delete the objects of `generation` of `archive`, or
+/// nothing when they may.
+///
+/// Privacy mode is not a reason: the copies it lists as having left this host are exactly what the
+/// person's own action is for. The rest is the store's: the host has a setup and the archive is its
+/// own, the writer is still enrolled, the generation is in a state the `releases` rule admits, no
+/// attempt or upload of it is open, and an outcome this host could not establish is deleted only
+/// once a newer generation is published, since a late publication of it would otherwise name
+/// objects that are gone.
+pub(super) fn person_refusal(
+    reader: &impl Reads,
+    archive: &[u8],
+    generation: i64,
+) -> Result<Option<String>> {
+    let setup: i64 = reader
+        .read_one(sql!("SELECT COUNT(*) FROM host_backup"), [], |row| {
+            row.get(0)
+        })
+        .map_err(ControllerError::registry)?;
+    if setup == 0 {
+        return Ok(Some(
+            "this host has no setup, and deletes nothing at a service without one".to_owned(),
+        ));
+    }
+    if let Some(refusal) = standing_refusal(reader, archive, generation, true)? {
+        return Ok(Some(refusal));
+    }
+    let row: Option<(String, String)> = reader
+        .read_one(
+            sql!(
+                "SELECT production, remote FROM generations
+                  WHERE archive_id = ?1 AND backup_generation = ?2"
+            ),
+            params![archive, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some((production, remote)) = row else {
+        return Ok(Some(
+            "that backup generation is not one this host admitted".to_owned(),
+        ));
+    };
+    let over = matches!(production.as_str(), "complete" | "cancelled");
+    let admitted = match remote.as_str() {
+        "published" if over => true,
+        "unknown" if production == "cancelled" => {
+            let newer: i64 = reader
+                .read_one(
+                    sql!(
+                        "SELECT COUNT(*) FROM generations
+                          WHERE archive_id = ?1 AND backup_generation > ?2
+                            AND remote = 'published'"
+                    ),
+                    params![archive, generation],
+                    |row| row.get(0),
+                )
+                .map_err(ControllerError::registry)?;
+            if newer == 0 {
+                return Ok(Some(
+                    "no newer generation of that archive is published, so a publication of this \
+                     one may still land"
+                        .to_owned(),
+                ));
+            }
+            true
+        }
+        "objects" => {
+            return Ok(Some(
+                "a service holds ciphertext of that generation and no descriptor was published, \
+                 which this host's store has no record of asking the deletion of"
+                    .to_owned(),
+            ));
+        }
+        _ => false,
+    };
+    if !admitted {
+        return Ok(Some(
+            "only an object of a published generation whose production is over, or of one that \
+             ended with its outcome unknown, is deleted"
+                .to_owned(),
+        ));
+    }
+    let open: i64 = reader
+        .read_one(
+            sql!(
+                "SELECT (SELECT COUNT(*) FROM outbox
+                          WHERE archive_id = ?1 AND backup_generation = ?2
+                            AND status <> 'terminal')
+                      + (SELECT COUNT(*) FROM uploads
+                          WHERE archive_id = ?1 AND backup_generation = ?2)"
+            ),
+            params![archive, generation],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    if open > 0 {
+        return Ok(Some(
+            "an attempt or an upload of that generation is still open".to_owned(),
+        ));
+    }
+    let shared: i64 = reader
+        .read_one(
+            sql!(
+                "SELECT COUNT(*) FROM objects AS held
+                  WHERE held.archive_id = ?1 AND held.backup_generation = ?2
+                    AND EXISTS (SELECT 1 FROM objects AS other
+                                 WHERE other.archive_id = held.archive_id
+                                   AND other.object_id = held.object_id
+                                   AND other.backup_generation <> held.backup_generation)"
+            ),
+            params![archive, generation],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    if shared > 0 {
+        return Ok(Some(
+            "another backup generation this host records names an object of that one".to_owned(),
+        ));
     }
     Ok(None)
 }
@@ -180,12 +321,16 @@ impl BackupStore {
                 "an attempt or an upload of that generation is still open".to_owned(),
             ));
         }
+        // A newer generation whose every object is being deleted is not one the host keeps, so it
+        // does not stand between this one and the floor.
         let newer: i64 = transaction
             .read_one(
-                sql!(
+                sql!(concat!(
                     "SELECT COUNT(*) FROM generations
-                  WHERE archive_id = ?1 AND backup_generation > ?2 AND remote = 'published'"
-                ),
+                  WHERE archive_id = ?1 AND backup_generation > ?2 AND remote = 'published'
+                    AND NOT ",
+                    being_deleted!()
+                )),
                 params![archive, generation],
                 |row| row.get(0),
             )
@@ -235,5 +380,123 @@ impl BackupStore {
             )
             .map_err(ControllerError::registry)?;
         transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Why the person may not ask the service to delete a generation's objects, or nothing when they
+    /// may. Privacy mode is not a reason; see [`person_refusal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn deletion_refusal(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+    ) -> Result<Option<String>> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        person_refusal(&self.connection, &archive, generation)
+    }
+
+    /// Writes down, in one transaction, that this host will ask the service to delete every object
+    /// of a generation, because the person asked for exactly that, before any request leaves. It
+    /// returns how many of its objects the service has not yet confirmed deleted.
+    ///
+    /// It is the person's own action, so it applies none of retention's rules and neither of
+    /// privacy mode's: not the fence, and not the line privacy mode drew under a generation, whose
+    /// copies are what the action is for. It applies the store's own ([`person_refusal`]), so a
+    /// generation is refused whole, and every object is written down or none is. An object already
+    /// written down is left as it is: asking again after an unanswered request writes nothing new
+    /// and still finds the standing intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the setup, the writer, an open attempt, the
+    /// generation's state or another generation stands in the way, and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn ask_generation_deletion(
+        &mut self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        now_ms: TimestampMs,
+    ) -> Result<u64> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .writing()
+            .map_err(ControllerError::registry)?;
+        if let Some(refusal) = person_refusal(&transaction, &archive, generation)? {
+            return Err(ControllerError::Refused {
+                code: ErrorCode::PermissionDenied,
+                detail: refusal,
+            });
+        }
+        transaction
+            .run(
+                sql!(
+                    "INSERT INTO releases
+                     (archive_id, backup_generation, object_id, asked_at_ms, released_at_ms)
+                 SELECT archive_id, backup_generation, object_id, ?3, NULL FROM objects
+                  WHERE archive_id = ?1 AND backup_generation = ?2
+                    AND object_id NOT IN (SELECT object_id FROM releases
+                                           WHERE archive_id = ?1 AND backup_generation = ?2)"
+                ),
+                params![archive, generation, millis(now_ms)],
+            )
+            .map_err(ControllerError::registry)?;
+        let unconfirmed: i64 = transaction
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM releases
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND released_at_ms IS NULL"
+                ),
+                params![archive, generation],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(u64::try_from(unconfirmed).unwrap_or(0))
+    }
+
+    /// Decides again, before its request leaves, a deletion that is written down: the standing it
+    /// was asked under must still hold, as for a retention deletion asked for again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the standing no longer holds, and
+    /// [`ControllerError::InvalidArgument`] when no deletion of that object is written down.
+    pub fn confirm_asked_deletion(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        object_id: BackupObjectId,
+    ) -> Result<()> {
+        let archive = archive_id.get().as_bytes().to_vec();
+        let generation = i64::try_from(backup_generation.get()).unwrap_or(i64::MAX);
+        let object = object_id.get().as_bytes().to_vec();
+        if let Some(refusal) = person_refusal(&self.connection, &archive, generation)? {
+            return Err(ControllerError::Refused {
+                code: ErrorCode::PermissionDenied,
+                detail: refusal,
+            });
+        }
+        let asked: i64 = self
+            .connection
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM releases
+                  WHERE archive_id = ?1 AND backup_generation = ?2 AND object_id = ?3"
+                ),
+                params![archive, generation, object],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if asked == 0 {
+            return Err(ControllerError::InvalidArgument(
+                "no deletion of that object is written down".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

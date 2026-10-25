@@ -342,6 +342,9 @@ struct Shared {
     quiet: Arc<Quiet>,
     /// How many passes have finished, for whatever waits on one.
     passes: tokio::sync::watch::Sender<u64>,
+    /// How many passes have begun. The pass numbered `n` is the one that began when this reached
+    /// `n` and ended when `passes` did.
+    begun: tokio::sync::watch::Sender<u64>,
 }
 
 impl Shared {
@@ -743,6 +746,7 @@ impl BackupRuntime {
             observed: Mutex::default(),
             quiet: Arc::clone(&quiet),
             passes: tokio::sync::watch::channel(0).0,
+            begun: tokio::sync::watch::channel(0).0,
         });
         let uploader = Uploader::new(
             Arc::clone(&backup),
@@ -837,6 +841,18 @@ impl BackupRuntime {
     /// Tells the carrier to look again now.
     pub fn wake(&self) {
         self.shared.signals.work.notify_one();
+    }
+
+    /// Tells the carrier to look again now, and returns when the first pass that begins after this
+    /// call has ended. What was written down before the call is what that pass reads, so whatever
+    /// the call is made for has been tried once when it returns. A carrier held by a delay the
+    /// service asked for begins its next pass when the delay has passed, and this waits for it.
+    pub async fn carry_now(&self) {
+        let first = *self.shared.begun.borrow() + 1;
+        self.shared.signals.work.notify_one();
+        let mut ended = self.shared.passes.subscribe();
+        // The sender goes with the runtime, and a runtime that is gone carries nothing.
+        let _ = ended.wait_for(|ended| *ended >= first).await;
     }
 
     /// What `kr doctor` says of the storage service.
@@ -1048,6 +1064,7 @@ async fn drive(
         next = Some(shared.after(hold, &mut backoff));
     }
     loop {
+        shared.begun.send_modify(|begun| *begun += 1);
         let wait = match next.take() {
             Some(wait) => wait,
             // The epoch of the account binding is noted here, once for the iteration: a request

@@ -949,6 +949,17 @@ impl Controller {
                 }
                 let _: kr_protocol::privacy::PrivacySetParams = parse(&mutation.params)?;
             }
+            // The copies privacy mode lists belong to the environment, not to a session.
+            Method::PrivacyRetainedDelete => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "the copies privacy mode lists belong to this environment, not to one \
+                         session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::privacy::PrivacyRetainedDeleteParams = parse(&mutation.params)?;
+            }
             // The description settings and the fetch of the model's files belong to the
             // environment: the target names it and no session.
             _ if crate::describe::serves(method) => {

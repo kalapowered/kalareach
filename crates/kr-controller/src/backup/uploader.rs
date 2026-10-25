@@ -1938,13 +1938,19 @@ impl Uploader {
             let generation = match work {
                 Reclaim::Delete(generation, object) => {
                     return self
-                        .release(&generation, &object, None, now, turn)
+                        .release(&generation, &object, Basis::Unnamed, now, turn)
                         .await
                         .map(Some);
                 }
                 Reclaim::Retire(generation, object, kept) => {
                     return self
-                        .release(&generation, &object, Some(kept), now, turn)
+                        .release(&generation, &object, Basis::Retention(kept), now, turn)
+                        .await
+                        .map(Some);
+                }
+                Reclaim::Asked(generation, object) => {
+                    return self
+                        .release(&generation, &object, Basis::Person, now, turn)
                         .await
                         .map(Some);
                 }
@@ -1989,10 +1995,11 @@ impl Uploader {
         privacy: &PrivacyStatus,
         kept: Option<u64>,
     ) -> Result<Vec<Reclaim>> {
-        if privacy.inhibited_at().is_some() {
-            return Ok(Vec::new());
-        }
         let generations = self.disk.run(|backup| backup.generations())?;
+        let mut work = self.asked_by_a_person(&generations, privacy.inhibited_at().is_some())?;
+        if privacy.inhibited_at().is_some() {
+            return Ok(work);
+        }
         let uploads = self.disk.run(|backup| backup.store().uploads())?;
         let mut behind: Vec<(GenerationRecord, Vec<ObjectRecord>, bool)> = Vec::new();
         for record in &generations {
@@ -2006,7 +2013,6 @@ impl Uploader {
                 || objects.iter().any(|object| object.released_at_ms.is_some());
             behind.push((record.clone(), objects, unheld));
         }
-        let mut work = Vec::new();
         if let Some(kept) = kept {
             work.extend(self.retired(&generations, &uploads, outbox, privacy, kept)?);
         }
@@ -2053,6 +2059,61 @@ impl Uploader {
                     work.push(Reclaim::Delete(record.clone(), object.clone()));
                 }
             }
+        }
+        Ok(work)
+    }
+
+    /// The objects this host wrote down it would ask the service to delete and has had no answer
+    /// about, which are the person's to have sent.
+    ///
+    /// Without a fence every such object is sent, once the standing the store judges a deletion by
+    /// holds again: a request that was not answered, or that a restart cut short, is asked again
+    /// and not forgotten. Under a fence only the objects the person has just asked for are,
+    /// because the fence's rule stands for every deletion the host decides for itself: the copies
+    /// privacy mode listed go by the person's own action and no other.
+    fn asked_by_a_person(
+        &self,
+        generations: &[GenerationRecord],
+        fenced: bool,
+    ) -> Result<Vec<Reclaim>> {
+        let authorised = self.disk.run(|backup| backup.authorised_deletions());
+        let mut work = Vec::new();
+        for record in generations {
+            let objects = self
+                .disk
+                .run(|backup| backup.objects(record.archive_id, record.backup_generation))?;
+            let asked = objects
+                .into_iter()
+                .filter(|object| object.deletion_asked_at_ms.is_some())
+                .filter(|object| object.released_at_ms.is_none())
+                .filter(|object| {
+                    !fenced
+                        || authorised.contains(&(
+                            record.archive_id,
+                            record.backup_generation,
+                            object.object_id,
+                        ))
+                })
+                .collect::<Vec<_>>();
+            if asked.is_empty() {
+                continue;
+            }
+            // A generation the store would not delete from now is left as it stands: the list
+            // shows its deletion as asked and not confirmed, and the pass does not spend itself on
+            // a request that cannot leave.
+            let standing = self.disk.run(|backup| {
+                backup
+                    .store()
+                    .deletion_refusal(record.archive_id, record.backup_generation)
+            })?;
+            if standing.is_some() {
+                continue;
+            }
+            work.extend(
+                asked
+                    .into_iter()
+                    .map(|object| Reclaim::Asked(record.clone(), object)),
+            );
         }
         Ok(work)
     }
@@ -2109,23 +2170,28 @@ impl Uploader {
         &mut self,
         generation: &GenerationRecord,
         object: &ObjectRecord,
-        retiring: Option<u64>,
+        basis: Basis,
         now: TimestampMs,
         turn: &mut Turn,
     ) -> Result<Stepped> {
-        let asked = self.disk.run(|backup| match retiring {
-            Some(kept) => backup.store().note_retained_deletion_asked(
+        let asked = self.disk.run(|backup| match basis {
+            Basis::Retention(kept) => backup.store().note_retained_deletion_asked(
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,
                 kept,
                 now,
             ),
-            None => backup.store().note_deletion_asked(
+            Basis::Unnamed => backup.store().note_deletion_asked(
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,
                 now,
+            ),
+            Basis::Person => backup.store().confirm_asked_deletion(
+                generation.archive_id,
+                generation.backup_generation,
+                object.object_id,
             ),
         });
         if let Err(error) = asked {
@@ -2202,12 +2268,16 @@ impl Uploader {
             return Ok(Vec::new());
         };
         let archive_id = setup.record.archive_id;
+        // A generation the host is deleting whole is no backup it keeps, so it takes no place among
+        // the newest `kept`: after the person deletes the newest, the two before it stay.
+        let deleting = self.disk.run(|backup| backup.generations_being_deleted())?;
         let mut published: Vec<&GenerationRecord> = generations
             .iter()
             .filter(|record| {
                 record.archive_id == archive_id
                     && record.remote == Remote::Published
                     && record.production.is_over()
+                    && !deleting.contains(&generation_key(record))
             })
             .collect();
         published.sort_by_key(|record| std::cmp::Reverse(record.backup_generation));
@@ -2309,16 +2379,31 @@ impl Uploader {
 enum Reclaim {
     /// Ask the service whether it holds the generation.
     Ask(GenerationRecord),
+    /// Delete one object this host wrote down it would ask the service to delete, because the
+    /// person asked for exactly that.
+    Asked(GenerationRecord, ObjectRecord),
     /// Delete one object of a published generation that is older than the newest this host keeps.
     Retire(GenerationRecord, ObjectRecord, u64),
     /// Delete one object of a generation the service does not hold.
     Delete(GenerationRecord, ObjectRecord),
 }
 
+/// What a deletion is written down on, which decides the rules the store judges it by.
+#[derive(Clone, Copy)]
+enum Basis {
+    /// An object of a generation no publication can name any more.
+    Unnamed,
+    /// An object of a published generation older than the newest this host keeps.
+    Retention(u64),
+    /// An object the person asked to have deleted.
+    Person,
+}
+
 impl Reclaim {
     fn generation_key(&self) -> (ArchiveId, BackupGeneration) {
         match self {
             Self::Ask(generation)
+            | Self::Asked(generation, _)
             | Self::Delete(generation, _)
             | Self::Retire(generation, _, _) => generation_key(generation),
         }

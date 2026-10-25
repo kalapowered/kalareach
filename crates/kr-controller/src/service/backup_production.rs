@@ -372,11 +372,13 @@ impl Controller {
                     backup.holds_finished_ciphertext()?,
                     backup.privacy_status()?,
                     account.mark_at(&origin).map(|mark| mark.to_bytes()),
+                    backup.generations_being_deleted()?,
                 ))
             })
             .await
         };
-        let Ok(Ok((setup, generations, writers, finished, privacy, account))) = facts else {
+        let Ok(Ok((setup, generations, writers, finished, privacy, account, deleting))) = facts
+        else {
             return Some(failed(
                 production,
                 backoff,
@@ -441,7 +443,14 @@ impl Controller {
                     ProductionState::Producing | ProductionState::Complete
                 ) && generation.created_at_ms.get() <= now
             })
-            .max_by_key(|generation| generation.created_at_ms);
+            .max_by_key(|generation| generation.created_at_ms)
+            // The newest generation the host made, when the person has it deleted, is no backup
+            // the host has: the pass behaves as for a host with none, and makes one whatever has
+            // changed and however long ago the deleted one was made. An older generation does not
+            // stand in for it.
+            .filter(|generation| {
+                !deleting.contains(&(generation.archive_id, generation.backup_generation))
+            });
         if let Some(newest) = newest {
             let due = newest.created_at_ms.get().saturating_add(INTERVAL_MS);
             production.observed().next_due_ms = Some(due);

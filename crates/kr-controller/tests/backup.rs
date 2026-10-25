@@ -2062,8 +2062,12 @@ fn an_upload_finishing_after_privacy_mode_stops_does_not_enqueue_publication_and
             .exported()
             .expect("a list")
             .iter()
-            .any(|artifact| artifact.kind == "backup object ciphertext"),
-        "privacy mode shows what the service holds rather than deleting the evidence of it"
+            .any(
+                |artifact| artifact.kind.starts_with("backup object ciphertext")
+                    && !artifact.deletable
+            ),
+        "privacy mode shows what the service holds rather than deleting the evidence of it, and \
+         offers no deletion of ciphertext no archive was published from"
     );
 }
 
