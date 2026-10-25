@@ -36,8 +36,8 @@ widestring.workspace = true
 # identity is read from the kernel's process list and from the boot counter in the page the kernel
 # shares with every process: the last four declare that call and that page's layout. A store's
 # `current` junction is set through the file system's control codes, which `Win32_System_Ioctl`
-# declares.
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_SystemServices", "Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Ioctl"] }
+# declares, and the version of the system is the structure `Win32_System_SystemInformation` declares.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Memory", "Win32_System_SystemServices", "Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Ioctl", "Win32_System_SystemInformation"] }
 
 [features]
 # A disposable owner-only host tree for the other host crates' tests.
