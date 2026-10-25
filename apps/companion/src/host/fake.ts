@@ -29,7 +29,6 @@ import type {
   EnvironmentListResult,
   HostInfoResult,
   PresentationReason,
-  PrivacyReport,
   Receipt,
   SessionCreateParams,
   SessionCreateResult,
@@ -116,6 +115,7 @@ import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } 
 import { FakeDraftStore } from './fake-drafts'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
+import { ScriptedRetained, type FakeRetained } from './fake-retained'
 import { ScriptedSharing, type FakeSharing } from './fake-sharing'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
@@ -436,6 +436,8 @@ export interface FakeHostControls {
   readonly questions: FakeQuestions
   /** The grants the host holds, the attempts native code keeps, and what can happen to them. */
   readonly sharing: FakeSharing
+  /** What has left the host and this computer's sync, and the person's and the service's part in deleting it. */
+  readonly retained: FakeRetained
   /** The openings screens made of sessions, and what the host says of them. */
   readonly standings: FakeStandings
   /** The drafts this device keeps, which another window can write to. */
@@ -1125,6 +1127,12 @@ export function fakeHost(
       // A session the host does not have is refused as the host refuses it.
       records.agentOf(sessionId)
     }
+  )
+  // What has left the host: the generation privacy mode stands at is the one the report says.
+  const retained = new ScriptedRetained(
+    FAKE_NOW_MS,
+    () => 3,
+    () => connected && !pairedDevice
   )
   /** The raw terminal views the page has opened, oldest first. */
   const terminalViews: FakeTerminalView[] = []
@@ -2166,8 +2174,15 @@ export function fakeHost(
     privacyStatus: () =>
       reading('privacyStatus', () => {
         requireConnection()
-        return privacyReport()
+        return retained.report()
       }),
+    retainedSyncCopies: () => attempting(() => retained.syncCopies()),
+    retainedDeleteAsk: (reference) => retained.ask(reference),
+    retainedDeleteFinish: (token) => retained.finish(token),
+    retainedDeleteCancel: (token) => {
+      retained.cancel(token)
+      return Promise.resolve()
+    },
 
     // The command the page's port sends, read as native code reads it: its arguments decoded in
     // order, then the session identifier parsed and the size checked, or nothing opens.
@@ -3052,6 +3067,7 @@ export function fakeHost(
     records,
     questions,
     sharing,
+    retained,
     standings: {
       opens,
       leaves,
@@ -3920,44 +3936,6 @@ function createdSession(
     state: 'live',
     worker_profile: params.worker_profile
   } as unknown as SessionSummaryOf
-}
-
-/**
- * What privacy mode reports once it has been on for three generations: an archive and a
- * notification the host sent before then, a device that may hold a copy, and a subsystem that could
- * not be listed. The host offers no way to ask for the removal of any of them.
- */
-function privacyReport(): PrivacyReport {
-  return {
-    generation: '3',
-    enabled: true,
-    changed_at_ms: String(FAKE_NOW_MS - 86_400_000),
-    completion: { state: 'complete' },
-    sessions: [],
-    disabled: [],
-    kept: [],
-    exported: [
-      {
-        kind: 'backup archive',
-        reference: 'archive 4c1f0b5e generation 12',
-        left_at_ms: String(FAKE_NOW_MS - 172_800_000),
-        deletable: false
-      },
-      {
-        kind: 'notification',
-        reference: 'a turn summary, delivered through the push service',
-        left_at_ms: String(FAKE_NOW_MS - 90_000_000),
-        deletable: false
-      },
-      {
-        kind: "possible copy held by a viewer's device",
-        reference: 'device 0d5e1a7c-31aa-4f09-9c47-5f7a7d3f6a10',
-        left_at_ms: String(FAKE_NOW_MS - 260_000_000),
-        deletable: false
-      }
-    ],
-    unlisted: [{ subsystem: 'descriptions', reason: 'the description store could not be read' }]
-  }
 }
 
 /** A fake view, and the handle the page holds for it. */

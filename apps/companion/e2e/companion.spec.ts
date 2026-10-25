@@ -3454,15 +3454,63 @@ test.describe('a control that commits on a completed action', () => {
 })
 
 test.describe('what has left the host', () => {
-  test('each copy is listed with whether the host can ask for its removal', async ({ page }) => {
+  test('each copy is listed with whether it can be deleted', async ({ page }) => {
     await open(page)
     await page.getByRole('button', { name: 'Change sets' }).click()
     const retained = page.getByTestId('retained-artefacts')
     await expect(retained).toBeVisible()
-    await expect(retained.getByTestId('removal')).toHaveCount(3)
-    await expect(retained.getByRole('button')).toHaveCount(0)
+    await expect(retained.getByTestId('removal')).toHaveCount(4)
+    // Two copies can be deleted from here, and the other two say nobody here can remove them.
+    await expect(retained.getByRole('button')).toHaveCount(2)
     await expect(retained.getByTestId('unlisted')).toBeVisible()
-    await page.screenshot({ path: shot('privacy-24.29'), fullPage: true })
+    await page.screenshot({
+      path: shot(`privacy-24.29-${test.info().project.name}`),
+      fullPage: true
+    })
+  })
+
+  test('a deletion waits for the person and is shown at each step', async ({ page }) => {
+    await open(page)
+    await page.getByRole('button', { name: 'Change sets' }).click()
+    const retained = page.getByTestId('retained-artefacts')
+    const archive = retained.getByTestId('left-copy').filter({ hasText: 'archive 4c1f0b5e' })
+    await archive.getByRole('button', { name: /Delete backup archive/ }).click()
+
+    // The dialog is native code's. Until the person answers it the page can only wait, and nothing
+    // has been sent.
+    await expect(archive.getByTestId('removal')).toHaveText('Waiting for your answer in the dialog.')
+    await expect(archive.getByRole('button')).toBeDisabled()
+    expect(await page.evaluate(() => window.krTestHost?.retained.finished.length)).toBe(0)
+    await page.screenshot({
+      path: shot(`privacy-24.29-waiting-${test.info().project.name}`),
+      fullPage: true
+    })
+
+    // The service does not confirm: the copy stays listed and can be asked about again.
+    await page.evaluate(() => {
+      window.krTestHost?.retained.serviceDoesNotConfirm(true)
+      window.krTestHost?.retained.answerDialog(true)
+    })
+    await expect(archive.getByTestId('removal')).toContainText('the service has not confirmed it')
+    await expect(archive.getByRole('button')).toHaveText('Ask again…')
+    await page.screenshot({
+      path: shot(`privacy-24.29-unconfirmed-${test.info().project.name}`),
+      fullPage: true
+    })
+
+    await page.evaluate(() => {
+      window.krTestHost?.retained.serviceDoesNotConfirm(false)
+    })
+    await archive.getByRole('button').click()
+    await page.evaluate(() => {
+      window.krTestHost?.retained.answerDialog(true)
+    })
+    await expect(retained.getByTestId('left-copy').filter({ hasText: 'archive 4c1f0b5e' })).toHaveCount(0)
+    await expect(page.locator('.toast-text', { hasText: 'Deleted. The service confirmed it.' })).toBeVisible()
+    await page.screenshot({
+      path: shot(`privacy-24.29-deleted-${test.info().project.name}`),
+      fullPage: true
+    })
   })
 })
 

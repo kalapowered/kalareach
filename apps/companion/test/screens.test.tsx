@@ -1265,15 +1265,19 @@ describe('what has left the host', () => {
     expect(within(retained).getByText(/logical cleanup rather than a secure erase/)).toBeInTheDocument()
   })
 
-  it('offers no action on a copy the host has no way to ask for the removal of', async () => {
+  it('offers an action on a copy that can be deleted, and none on a copy the host has no way to ask for the removal of', async () => {
     start({ view: 'changesets' })
     const retained = await screen.findByTestId('retained-artefacts')
-    const removal = within(retained).getAllByTestId('removal')
-    expect(removal).toHaveLength(3)
-    for (const line of removal) {
-      expect(line).toHaveTextContent('This host has no way to ask for its removal.')
-    }
-    expect(within(retained).queryByRole('button')).toBeNull()
+    await waitFor(() => {
+      expect(within(retained).getAllByTestId('removal')).toHaveLength(4)
+    })
+    // The archive the host can ask the removal of and the copy this computer's own sync kept are
+    // the two with a button; the notification and the viewer's device have none.
+    expect(within(retained).getAllByRole('button')).toHaveLength(2)
+    const refused = within(retained)
+      .getAllByTestId('removal')
+      .filter((line) => line.textContent.includes('This host has no way to ask for its removal.'))
+    expect(refused).toHaveLength(2)
   })
 })
 

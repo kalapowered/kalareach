@@ -326,6 +326,11 @@ export function tauriPort(): HostPort {
 
     privacyStatus: () => read('privacy_status', {}),
 
+    retainedSyncCopies: () => call('retained_sync_copies', {}),
+    retainedDeleteAsk: (reference) => call('retained_delete_ask', { reference }),
+    retainedDeleteFinish: (token) => call('retained_delete_finish', { token }),
+    retainedDeleteCancel: (token) => call<undefined>('retained_delete_cancel', { token }),
+
     // Each view has a channel of its own, which native code publishes that view's states on and
     // nothing else: no protocol event and no other view's state ever reaches its listener.
     openTerminalView: async (sessionId, grid, listener, opening): Promise<TerminalView> => {

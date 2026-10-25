@@ -70,6 +70,7 @@ import type {
   PendingResource,
   PluginListParams,
   PluginListResult,
+  PrivacyExported,
   PrivacyReport,
   ProjectedHyperlink,
   Question,
@@ -1455,6 +1456,24 @@ export interface Attempts {
   readonly unreadable: number
 }
 
+/** What the page is told once the person has answered the dialog for deleting a copy. */
+export interface RetainedAsked {
+  /** Whether the person said yes. */
+  readonly confirmed: boolean
+  /** Finishes the deletion once, when they did. */
+  readonly token: string | null
+  /** How long the token lasts, in milliseconds. */
+  readonly lasts_ms: number
+}
+
+/** What the page is told once the deletion of a copy has been asked for. */
+export interface RetainedFinished {
+  /** True once the service confirmed it holds the copy no longer. */
+  readonly deleted: boolean
+  /** Where privacy mode stands, for a copy the host listed. */
+  readonly report: PrivacyReport | null
+}
+
 /** What the sheet is told once the host has put a hand-over to the owner devices. */
 export interface HandoverAsked {
   /** Names the hand-over in the commands that follow. */
@@ -1836,6 +1855,28 @@ export interface HostPort {
    * it sent and the devices that may hold a copy. They are listed and not erased.
    */
   privacyStatus(): Promise<PrivacyReport>
+
+  /**
+   * The copies the sync service kept of writes it refused this computer, listed as privacy mode
+   * lists what the host sent. They are read from this computer's own records, so they are listed
+   * whether or not a host is connected.
+   */
+  retainedSyncCopies(): Promise<readonly PrivacyExported[]>
+
+  /**
+   * Asks the person, in a dialog native code raises, whether to delete the copy listed under
+   * `reference`. The page cannot answer it. A yes returns the token that finishes the deletion
+   * once; a no returns none. Refuses a reference no one deletable copy is listed under, and a
+   * copy the host lists when this application is not connected to the host on this computer.
+   */
+  retainedDeleteAsk(reference: string): Promise<RetainedAsked>
+  /**
+   * Asks for the deletion of the copy the person said yes to, with the token that yes returned. The
+   * token works once, and not after a cancel or once it has run out.
+   */
+  retainedDeleteFinish(token: string): Promise<RetainedFinished>
+  /** Drops a confirmation that was not used. */
+  retainedDeleteCancel(token: string): Promise<void>
 
   /**
    * Opens a raw terminal view of one session, `grid` in size. Native code attaches it to the
