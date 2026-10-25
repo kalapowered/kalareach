@@ -1943,6 +1943,9 @@ async fn a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made
 
 /// KR-REQ-10.41: the local owner detaches another window's attachment on either socket, and a
 /// paired device does not, as each always did.
+///
+/// KR-REQ-07.52, the part about detaching: a detach removes only the attachment it names, and the
+/// session and its shell go on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_local_owner_detaches_another_windows_attachment_and_a_device_does_not() {
     let wired = wired("sleep 120").await;
@@ -1986,6 +1989,15 @@ async fn the_local_owner_detaches_another_windows_attachment_and_a_device_does_n
         .await
         .expect("the owner the daemon forwards detaches another window's attachment");
     assert!(!wired.attached(first));
+    assert!(
+        wired.attached(second),
+        "the other attachment stays when one is detached"
+    );
+    assert_eq!(
+        wired.runtime.state(),
+        kr_protocol::session::SessionState::Live,
+        "and so does the session"
+    );
 
     // And so does the owner in another of its own windows.
     let mut other_window = wired.window().await;
