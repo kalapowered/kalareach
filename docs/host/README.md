@@ -4938,7 +4938,14 @@ The line privacy mode draws under a generation, and the fence while it stands, a
 refuse. The store writes down a deletion of every object of the generation in one transaction before
 any request leaves, and the carrier then sends the requests, under a fence too. While a fence stands
 the carrier sends nothing else: a deletion the host decided on for itself before privacy mode came
-on waits until privacy mode is off.
+on waits until privacy mode is off, and is then asked again by the rule that wrote it down, as that
+rule stands. Retention's request for an object of a generation it was deleting object by object is
+sent only while retention would still delete that generation. A generation the person's own deletion
+has since made one of the newest the host keeps stays until a newer one is published, and one behind
+the line privacy mode drew stays until the person deletes it. The exception is the last object of a
+generation whose other objects retention had already deleted: it has a row for every object, as a
+person's request leaves it, so it is sent as the person's, and nothing a restore could read is left
+of that generation.
 
 The answer is `deleted` and the report. `deleted` is true once the service has confirmed every
 object, and false while some are asked and not confirmed. The call waits for the first pass of the

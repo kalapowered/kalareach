@@ -2277,12 +2277,23 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
                         .filter_map(|object| object.released_at_ms.map(TimestampMs::get))
                         .collect();
                     let wholly_deleted = !objects.is_empty() && deleted.len() == objects.len();
-                    let unconfirmed = objects
-                        .iter()
-                        .filter(|object| {
-                            object.deletion_asked_at_ms.is_some() && object.released_at_ms.is_none()
-                        })
-                        .count();
+                    // A deletion is asked and not confirmed only for a generation the host is
+                    // deleting whole, which is what the carrier sends. An object the host asked for
+                    // under its own rule, of a generation it is not deleting whole, is asked again
+                    // by that rule while it still holds, and until then the generation is listed as
+                    // it stands.
+                    let being_deleted = !objects.is_empty()
+                        && objects
+                            .iter()
+                            .all(|object| object.deletion_asked_at_ms.is_some());
+                    let unconfirmed = if being_deleted {
+                        objects
+                            .iter()
+                            .filter(|object| object.released_at_ms.is_none())
+                            .count()
+                    } else {
+                        0
+                    };
                     let refusal = store
                         .deletion_refusal(record.archive_id, record.backup_generation)
                         .map_err(|error| {

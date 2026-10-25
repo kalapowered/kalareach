@@ -2085,14 +2085,29 @@ impl Uploader {
         Ok(work)
     }
 
-    /// The objects this host wrote down it would ask the service to delete and has had no answer
-    /// about, which are the person's to have sent.
+    /// The objects of the generations the host is deleting whole that it wrote down it would ask
+    /// the service to delete and has had no answer about, which are the person's to have sent.
     ///
-    /// Without a fence every such object is sent, once the standing the store judges a deletion by
-    /// holds again: a request that was not answered, or that a restart cut short, is asked again
-    /// and not forgotten. Under a fence only the objects the person has just asked for are,
-    /// because the fence's rule stands for every deletion the host decides for itself: the copies
-    /// privacy mode listed go by the person's own action and no other.
+    /// The person's request writes down every object of a generation at once, and a deletion the
+    /// host decides for itself is written down one object a step, the next only after the one
+    /// before is answered. A generation with an object not written down is therefore one the
+    /// host's own rules are deleting, and the objects of it that were written down and not
+    /// answered are not the person's: they are asked again by the rule that wrote them down, as
+    /// that rule stands now ([`Self::retired`] and the generations no publication can name), so a
+    /// deletion of the person's since made does not send what it has made a kept generation.
+    ///
+    /// The one object the store cannot tell apart is the last: the host's own rule writes down
+    /// the last object of a generation, every other object of which it has already had deleted,
+    /// and then the generation has a row for every object, as the person's request leaves it.
+    /// That object is sent as the person's. The generation holds nothing a restore could read
+    /// by then, and a request that restart cut short would otherwise leave its last object at
+    /// the service for good.
+    ///
+    /// Without a fence every object of such a generation is sent, once the standing the store
+    /// judges a deletion by holds again: a request that was not answered, or that a restart cut
+    /// short, is asked again and not forgotten. Under a fence only the objects the person has just
+    /// asked for are, because the fence's rule stands for every deletion the host decides for
+    /// itself: the copies privacy mode listed go by the person's own action and no other.
     fn asked_by_a_person(
         &self,
         generations: &[GenerationRecord],
@@ -2104,9 +2119,15 @@ impl Uploader {
             let objects = self
                 .disk
                 .run(|backup| backup.objects(record.archive_id, record.backup_generation))?;
+            // The generation is being deleted whole (see `generations_being_deleted`).
+            if !objects
+                .iter()
+                .all(|object| object.deletion_asked_at_ms.is_some())
+            {
+                continue;
+            }
             let asked = objects
                 .into_iter()
-                .filter(|object| object.deletion_asked_at_ms.is_some())
                 .filter(|object| object.released_at_ms.is_none())
                 .filter(|object| {
                     !fenced

@@ -10082,7 +10082,9 @@ async fn a_generation_of_unknown_outcome_is_deleted_by_the_person_only_once_a_ne
 /// Under a privacy fence the carrier sends the deletions the person has just asked for and nothing
 /// else: a deletion this host decided on for itself and wrote down before privacy mode came on is
 /// not sent, because privacy mode's copies go by the person's action and no other. Once the fence is
-/// down the request that was written down is sent.
+/// down it is asked again by the rule that wrote it down, as that rule stands then: the person's
+/// deletion of generation 2 leaves generations 1 and 3 as the two the host keeps, and generation 1
+/// is behind the line privacy mode drew, which only the person's own deletion crosses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn under_a_fence_the_carrier_sends_the_deletions_the_person_asked_for_and_no_others() {
     let host = Host::open();
@@ -10134,8 +10136,10 @@ async fn under_a_fence_the_carrier_sends_the_deletions_the_person_asked_for_and_
     assert!(passes(&mut uploader, 70_000).await.is_empty());
     assert_eq!(deletions(&host), 2);
 
-    // The fence comes down, and the request that was written down is sent. Generation 3 is
-    // untouched.
+    // The fence comes down. The account keeps two generations, and with generation 2 being deleted
+    // the two are 1 and 3, so retention's request for generation 1 is not one it would make now and
+    // is not sent.
+    host.web.scripted().daily_snapshots = Some(2);
     host.service
         .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(98_100))
         .expect("the work is taken back");
@@ -10150,8 +10154,86 @@ async fn under_a_fence_the_carrier_sends_the_deletions_the_person_asked_for_and_
         )
         .expect("a release");
     passes(&mut uploader, 80_000).await;
-    assert!(host.web.stored_bytes(member_of(1, 0)).is_none());
+    assert!(
+        host.held_at_the_service(1),
+        "a generation retention would keep now is not deleted by its earlier request"
+    );
     assert!(host.held_at_the_service(3));
+    assert_eq!(deletions(&host), 2, "only the person's deletion was sent");
+
+    // The control: a newer generation does not send retention's request for generation 1, which
+    // is behind privacy mode's line, and the person's own deletion of it is sent.
+    host.admit(4, &[64]);
+    passes(&mut uploader, 90_000).await;
+    assert_eq!(host.generation(4).remote, Remote::Published);
+    assert!(host.held_at_the_service(1));
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(1),
+            TimestampMs::new(91_000),
+            &|write| write(),
+        )
+        .expect("the person asks");
+    passes(&mut uploader, 92_000).await;
+    assert!(host.deleted_at_the_service(1));
+    assert!(host.held_at_the_service(3));
+    assert!(host.held_at_the_service(4));
+}
+
+/// A deletion retention wrote down and the service did not answer is asked again by retention's
+/// rule as it stands then, and not by the person's. The person deletes generation 2, which leaves
+/// generations 1 and 3 as the two the host keeps, so the request for generation 1 is not sent; once
+/// a fourth generation is published it is one of the older ones again, and the request is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deletion_retention_wrote_down_is_asked_again_only_while_retention_would_make_it() {
+    let host = Host::open();
+    host.set_up();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    // Retention's deletion of generation 1's member, written down and not sent.
+    BackupStore::open(&host.state)
+        .expect("the store")
+        .note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(1),
+            member_of(1, 0),
+            2,
+            TimestampMs::new(50_000),
+        )
+        .expect("asked");
+    host.service
+        .ask_deletion(
+            archive_id(),
+            BackupGeneration::new(2),
+            TimestampMs::new(60_000),
+            &|write| write(),
+        )
+        .expect("the person asks");
+    host.web.scripted().daily_snapshots = Some(2);
+
+    passes(&mut uploader, 70_000).await;
+    assert!(host.deleted_at_the_service(2));
+    assert!(
+        host.held_at_the_service(1),
+        "a generation retention would keep now is not deleted by its earlier request"
+    );
+    assert_eq!(deletions(&host), 2, "only the person's deletion was sent");
+    assert!(
+        privacy(&host.service)
+            .exported()
+            .expect("a list")
+            .iter()
+            .all(|copy| !copy.kind.contains("deletion asked and not yet confirmed")),
+        "the list does not say a deletion is asked that the host will not send"
+    );
+
+    host.admit(4, &[64]);
+    passes(&mut uploader, 80_000).await;
+    assert_eq!(host.generation(4).remote, Remote::Published);
+    assert!(host.deleted_at_the_service(1));
+    assert!(host.held_at_the_service(3));
+    assert!(host.held_at_the_service(4));
 }
 
 /// While privacy mode is on, a deletion is confirmed before its request leaves only for an object
