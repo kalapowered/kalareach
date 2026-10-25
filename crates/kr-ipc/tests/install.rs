@@ -974,6 +974,57 @@ fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
     assert!(result.2, "and still sealed");
 }
 
+/// KR-REQ-26.06: a release that cannot be removed for a reason no program gave is reported and is
+/// not left in the trash as if a program held it: a directory of it refuses its owner the right to
+/// change its access list, which the removal asks for, so neither the removal of the release nor a
+/// sweep of the trash can finish, and each says so.
+#[cfg(windows)]
+#[test]
+fn a_release_that_cannot_be_removed_for_no_program_s_sake_is_reported() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let locked = test.store.release_directory(&one).join("locked");
+    std::fs::create_dir_all(&locked).expect("a directory");
+    seal_tree(&test.store.release_directory(&one));
+    // The owner's right to change the list is taken from the owner itself, as the list of a file
+    // that an account other than the owner's made would take it.
+    let denied = std::process::Command::new("icacls")
+        .arg(&locked)
+        .args(["/deny", "*S-1-3-4:(WDAC)"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("icacls runs");
+    assert!(denied.success(), "the right is denied");
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+
+    let answer = test.store.retire(&one, &update);
+    let kept = std::fs::read_dir(test.store.trash())
+        .expect("reads the trash")
+        .flatten()
+        .next()
+        .expect("what could not be removed is in the trash")
+        .path();
+    let swept = test.store.sweep_trash(&update);
+
+    // Put it right, so that the test leaves nothing behind: an empty directory goes by the right
+    // its parent gives.
+    std::fs::remove_dir(kept.join("locked")).expect("the directory goes with its parent's right");
+    kr_ipc::install::remove_sealed_tree(&kept).expect("the rest of the release goes");
+    assert!(
+        answer.is_err(),
+        "a refusal no program gave is not taken for a program that holds the release: {answer:?}"
+    );
+    assert!(
+        swept.is_err(),
+        "nor does a sweep take it for one: {swept:?}"
+    );
+}
+
 /// The variable that makes the late helper act, naming the directory it talks through.
 const LATE: &str = "KR_INSTALL_TEST_LATE";
 
