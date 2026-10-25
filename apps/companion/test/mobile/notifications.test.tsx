@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
-import type { HostRow } from '../../src/host/port'
+import type { HostPort, HostRow, PushView } from '../../src/host/port'
 import { MobileApp } from '../../src/mobile/MobileApp'
 
 afterEach(() => {
@@ -43,6 +43,45 @@ function start(): { controls: FakeHostControls } {
     </AppProvider>
   )
   return { controls }
+}
+
+/** A page whose answer to the Previews command is held until the test lets it go. */
+function startHoldingTheAnswerToPreviews(): {
+  controls: FakeHostControls
+  letItGo: () => Promise<void>
+} {
+  const { port, controls } = fakeHost()
+  controls.setPairing({ hosts: [STUDIO] })
+  let open!: () => void
+  const gate = new Promise<void>((resolve) => {
+    open = resolve
+  })
+  const answers: Promise<PushView>[] = []
+  const slow: HostPort = {
+    ...port,
+    pushPreviews: (reference, on) => {
+      const answer = port.pushPreviews(reference, on).then(async (view) => {
+        await gate
+        return view
+      })
+      answers.push(answer)
+      return answer
+    }
+  }
+  render(
+    <AppProvider port={slow}>
+      <MobileApp surface="ios" />
+    </AppProvider>
+  )
+  return {
+    controls,
+    letItGo: async () => {
+      await act(async () => {
+        open()
+        await Promise.all(answers)
+      })
+    }
+  }
 }
 
 async function openHosts(): Promise<HTMLElement> {
@@ -120,6 +159,44 @@ describe('the notifications of a paired host', () => {
       'aria-disabled',
       'true'
     )
+  })
+
+  it('keeps the view read last when the answer to an earlier command arrives after it', async () => {
+    const person = userEvent.setup()
+    const { controls, letItGo } = startHoldingTheAnswerToPreviews()
+    const row = await openHosts()
+    const on = {
+      available: true,
+      hosts: [
+        {
+          reference: 'studio-reference',
+          state: 'on' as const,
+          words: '',
+          settings: false,
+          previews: true
+        }
+      ]
+    }
+    act(() => {
+      controls.setPush(on)
+    })
+    const choice = await within(row).findByRole('switch', { name: 'Previews' })
+    // Previews are turned off, and the answer to that is on its way.
+    await person.click(choice)
+    expect(within(row).getByRole('switch', { name: 'Previews' })).toHaveAttribute('aria-checked', 'false')
+    // Native code reads a later view before the answer arrives: previews are on again.
+    act(() => {
+      controls.setPush(on)
+    })
+
+    await letItGo()
+
+    // The older answer says Off. The page keeps what was read after it, and the switch, which showed
+    // the choice until the answer came, now shows that.
+    await waitFor(() => {
+      expect(within(row).getByRole('switch', { name: 'Previews' })).toHaveAttribute('aria-checked', 'true')
+    })
+    expect(within(row).getByRole('switch', { name: 'Previews' })).not.toHaveAttribute('aria-disabled')
   })
 
   it('keeps the recorded choice where a step stopped, and offers it for change', async () => {

@@ -524,7 +524,10 @@ may be left with a credential the gateway no longer takes, and the row says that
 notify this phone until it takes a registration.
 
 The page asks five commands of the backend: `push_view`, `push_enable`, `push_previews`,
-`push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. `push.rs`
+`push_refresh` and `notification_route`, and is told of a change on the `kr://push` event. Every view
+the backend hands the page carries a revision, counted in the order the views are read. The page keeps
+the view with the highest revision it has seen, whether it came on the event or as the answer to a
+command, and drops an older one: an answer read before a change can arrive after it. `push.rs`
 sequences the steps for the host the person chose and holds the result in `push/push.json` under the
 data directory: per host, whether the person asked, the authorisation identifier this phone issued for
 it (so that asking again issues under the same one), the digest of the token the registration that

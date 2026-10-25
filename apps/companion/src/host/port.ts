@@ -707,6 +707,13 @@ export interface PushView {
   /** A phone has notifications to turn on. A computer has none, and the screen shows nothing of them. */
   readonly available: boolean
   readonly hosts: readonly PushHostView[]
+  /**
+   * The place of this view among the views native code has read, counted from one: a view read
+   * later has a higher number. Views reach the page by several routes (a change event, the answer
+   * to a command) and do not arrive in the order they were read, so the page keeps the view with
+   * the highest number it has seen and drops any older one.
+   */
+  readonly revision: number
 }
 
 /** Where this device reads a code from, besides the pasteboard. A computer reads from neither. */

@@ -2631,6 +2631,7 @@ fn unavailable_push_view() -> crate::push::PushView {
     crate::push::PushView {
         available: false,
         hosts: Vec::new(),
+        revision: 0,
     }
 }
 
