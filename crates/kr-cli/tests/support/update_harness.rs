@@ -231,6 +231,29 @@ const PROGRAM_NAMES: [&str; 7] = [
     "kr-plugin-host",
 ];
 
+/// The file a program of a release is, by its name: the name and the platform's suffix.
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The shell a session of this suite runs: the platform's own plain shell.
+fn default_shell() -> String {
+    if cfg!(windows) {
+        std::env::var_os("ProgramFiles")
+            .map_or_else(
+                || PathBuf::from(r"C:\Program Files"),
+                PathBuf::from,
+            )
+            .join("PowerShell")
+            .join("7")
+            .join("pwsh.exe")
+            .display()
+            .to_string()
+    } else {
+        "/bin/sh".to_owned()
+    }
+}
+
 /// The root of this checkout.
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -399,7 +422,7 @@ fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
         sources
             .into_iter()
             .map(|(name, source)| {
-                let copied = directory.join(name);
+                let copied = directory.join(exe(name));
                 kr_ipc::testing::place_program(&source, &copied);
                 let bytes = std::fs::read(&copied).expect("the program");
                 (
@@ -416,6 +439,15 @@ fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
 /// Gives `destination` a file of its own with `source`'s bytes: a clone where the filesystem makes
 /// one, a copy otherwise, by a process of its own so no descriptor of this one is open on a program
 /// another test may start.
+#[cfg(windows)]
+fn clone_file(source: &Path, destination: &Path) {
+    kr_ipc::testing::place_program(source, destination);
+}
+
+/// Gives `destination` a file of its own with `source`'s bytes: a clone where the filesystem makes
+/// one, a copy otherwise, by a process of its own so no descriptor of this one is open on a program
+/// another test may start.
+#[cfg(unix)]
 fn clone_file(source: &Path, destination: &Path) {
     let cloned = Command::new("/bin/cp")
         .arg(if cfg!(target_os = "macos") {
@@ -440,6 +472,8 @@ fn this_target() -> &'static str {
         ("x86_64", "macos") => "x86_64-apple-darwin",
         ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
         ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc",
+        ("aarch64", "windows") => "aarch64-pc-windows-msvc",
         other => panic!("no release target for {other:?}"),
     }
 }
@@ -612,7 +646,7 @@ impl Assembled {
         let mut files: Vec<ReleaseFile> = programs
             .iter()
             .map(|(name, _, digest, length)| ReleaseFile {
-                path: ReleasePath::new(format!("bin/{name}")).expect("a path"),
+                path: ReleasePath::new(format!("bin/{}", exe(name))).expect("a path"),
                 length: U64::new(*length),
                 sha256: *digest,
                 mode: FileMode::Executable,
@@ -645,6 +679,8 @@ impl Assembled {
                 os_floor: OsFloor {
                     system: if cfg!(target_os = "macos") {
                         FloorSystem::Macos
+                    } else if cfg!(windows) {
+                        FloorSystem::Windows
                     } else {
                         FloorSystem::Glibc
                     },
@@ -728,7 +764,7 @@ impl Assembled {
         self.manifest.files.retain(|file| {
             !names
                 .iter()
-                .any(|name| file.path.as_str() == format!("bin/{name}"))
+                .any(|name| file.path.as_str() == format!("bin/{}", exe(name)))
         });
         self
     }
@@ -748,7 +784,7 @@ impl Assembled {
     /// This release with the executable `name` in `bin/` written from `contents`, listed in the
     /// manifest by its digest: its own program in place of the workspace's, or one more.
     fn with_program(mut self, name: &str, contents: &[u8]) -> Self {
-        let path = ReleasePath::new(format!("bin/{name}")).expect("a path");
+        let path = ReleasePath::new(format!("bin/{}", exe(name))).expect("a path");
         self.manifest.files.retain(|file| file.path != path);
         self.manifest.files.push(ReleaseFile {
             path,
@@ -855,7 +891,7 @@ impl Assembled {
     /// and in the manifest, so every file check passes, and the manifest does not say it runs.
     fn with_data(mut self, name: &str) -> Self {
         for file in &mut self.manifest.files {
-            if file.path.as_str() == format!("bin/{name}") {
+            if file.path.as_str() == format!("bin/{}", exe(name)) {
                 file.mode = FileMode::Regular;
             }
         }
@@ -871,19 +907,22 @@ impl Assembled {
         std::fs::create_dir_all(directory.join("bin")).expect("the release's bin");
         for (name, copied, _, _) in self.programs {
             // A release assembled without a program lists none and carries none.
-            if self.manifest.file(&format!("bin/{name}")).is_some()
+            if self.manifest.file(&format!("bin/{}", exe(name))).is_some()
                 && !self.written.iter().any(|(known, _)| known == name)
             {
-                clone_file(copied, &directory.join("bin").join(name));
+                clone_file(copied, &directory.join("bin").join(exe(name)));
             }
         }
         for (name, contents) in &self.written {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            let file = directory.join("bin").join(name);
+            let file = directory.join("bin").join(exe(name));
             std::fs::write(&file, contents).expect("a program written for the release");
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
-                .expect("executable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                    .expect("executable");
+            }
         }
         let write = |path: &str, contents: &[u8]| {
             let file = directory.join(path);
@@ -938,7 +977,11 @@ impl Assembled {
                 .keep();
             let tree = directory.join(&top);
             self.write_signed(&tree, signer);
-            let packed = directory.join("release.tar.gz");
+            let packed = directory.join(if cfg!(windows) {
+                "release.zip"
+            } else {
+                "release.tar.gz"
+            });
             pack(&tree, &top, &packed);
             std::fs::remove_dir_all(&tree).expect("the tree goes");
             packed
@@ -947,7 +990,50 @@ impl Assembled {
     }
 }
 
+/// Packs `tree` as a `.zip` whose entries are the tree's files under `top`, as a Windows release's
+/// archive is packed: each file once, deflated, and no entry for a directory.
+#[cfg(windows)]
+fn pack(tree: &Path, top: &str, archive: &Path) {
+    use zip::write::SimpleFileOptions;
+
+    fn files_of(directory: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("a directory") {
+            let entry = entry.expect("an entry");
+            if entry.file_type().expect("a type").is_dir() {
+                files_of(&entry.path(), found);
+            } else {
+                found.push(entry.path());
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    files_of(tree, &mut files);
+    files.sort();
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(archive).expect("an archive"));
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for file in files {
+        let relative = file.strip_prefix(tree).expect("inside the tree");
+        let name = format!(
+            "{top}/{}",
+            relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        writer.start_file(name, options).expect("an entry");
+        std::io::copy(
+            &mut std::fs::File::open(&file).expect("a file"),
+            &mut writer,
+        )
+        .expect("a file is written");
+    }
+    writer.finish().expect("the archive is written");
+}
+
 /// Packs `tree` as an archive whose entries are under `top`, gzipped quickly.
+#[cfg(unix)]
 fn pack(tree: &Path, top: &str, archive: &Path) {
     let file = std::fs::File::create(archive).expect("an archive");
     let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
@@ -1156,6 +1242,8 @@ impl Drop for Host {
                 ));
             }
         }
+        #[cfg(windows)]
+        self.remove_the_standalone_start();
         // An installed release is read-only, and the tree goes whole: its directories are opened
         // to removal first.
         writable(self.store.root());
@@ -1164,11 +1252,16 @@ impl Drop for Host {
 
 /// Makes every directory under `root` writable by its owner, so the tree can be removed.
 fn writable(root: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(windows)]
+        let _ = kr_ipc::install::unseal_directory(&directory);
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
@@ -1290,6 +1383,16 @@ fn finish_within(mut child: std::process::Child, limit: Duration) -> Output {
 /// the programs it started, and, where the host says, the kernel's name for what each thread
 /// waits for, the sockets the program holds, and the other programs of the same host (those with
 /// the same runtime directory), whose threads show whether the host answered at all.
+#[cfg(windows)]
+fn what_the_program_waits_on(pid: u32) -> String {
+    format!("  {pid} (the program)\n")
+}
+
+/// Describes the program `pid`, which has not ended: the program with its arguments and its state,
+/// the programs it started, and, where the host says, the kernel's name for what each thread
+/// waits for, the sockets the program holds, and the other programs of the same host (those with
+/// the same runtime directory), whose threads show whether the host answered at all.
+#[cfg(unix)]
 fn what_the_program_waits_on(pid: u32) -> String {
     use std::fmt::Write as _;
 
@@ -1412,6 +1515,7 @@ fn what_the_program_waits_on(pid: u32) -> String {
 }
 
 /// Makes every directory under `root`, and `root`, read-only, as a release in the store is.
+#[cfg(unix)]
 fn seal_directories(root: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1649,10 +1753,19 @@ impl Host {
 
     fn command(&self, program: &Path, arguments: &[&str]) -> Command {
         let mut command = Command::new(program);
+        command.args(arguments);
+        // Nothing of this test's own environment reaches the product. Windows needs the system's
+        // variables to start a program at all, so what is taken away there is what would choose a
+        // place for the product: every variable it reads for that.
+        #[cfg(unix)]
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+        #[cfg(windows)]
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().to_ascii_uppercase().starts_with("KR_") {
+                command.env_remove(name);
+            }
+        }
         command
-            .args(arguments)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
             .env(
                 "KR_RUNTIME_DIR",
                 self.tree.paths().runtime_root().display().to_string(),
@@ -1780,13 +1893,92 @@ impl Host {
     }
 
     /// Starts `program` as this host's daemon and waits for it to answer.
+    #[cfg(unix)]
     async fn start_daemon(&mut self, program: &Path) {
         let root = self.tree.root().to_path_buf();
         self.start_daemon_in(program, &root).await;
     }
 
+    /// The environment's task, as this host's `current` release registers it with `kr host startup`:
+    /// the product's own step, run once, which is the only way a daemon is created on Windows.
+    #[cfg(windows)]
+    fn register_the_standalone_start(&self) {
+        let (output, said) = self.kr_json(&["host", "startup", "--set", "standalone", "--json"]);
+        assert!(
+            output.status.success(),
+            "kr host startup said {}: {said}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Starts this host's daemon as `kr new` does: the environment's task is asked, through a request
+    /// its starter takes, and the daemon it starts is of the release `current` names. Waits for it to
+    /// answer. The task is registered first when the host has none.
+    ///
+    /// `program` is the daemon the task is to start, which has to be the store's `current`.
+    #[cfg(windows)]
+    async fn start_daemon(&mut self, program: &Path) {
+        use kr_controller::supervision::windows as scheduled;
+
+        assert_eq!(
+            program,
+            self.store.stable(Program::Controller),
+            "the task starts the daemon through the store's current release"
+        );
+        self.register_the_standalone_start();
+        let environment = self.tree.environment();
+        let user = kr_ipc::starter::current_user_sid().expect("this account");
+        let definition = scheduled::TaskDefinition::for_setup(user, &environment, program);
+        let boot = kr_ipc::identity::boot_identity().expect("the boot");
+        let lapses = kr_ipc::clock::transferred_deadline(
+            kr_ipc::clock::boot_elapsed_ms(),
+            LIVENESS_DEADLINE,
+        )
+        .expect("a deadline");
+        kr_ipc::starter::leave_claim(
+            &environment,
+            &kr_ipc::starter::StartClaim {
+                request: kr_ipc::new_uuid(),
+                boot,
+                deadline_boot_ms: lapses,
+            },
+        )
+        .expect("a request is left for the starter");
+        scheduled::run(&definition).expect("the Task Scheduler runs the task");
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let started = Instant::now();
+        while connect_to_daemon(&endpoint).await.is_err() {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the daemon did not answer; its log says: {}",
+                std::fs::read_to_string(environment.state_dir().join("controller.log"))
+                    .unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Takes this host's task away, as a test that registered one must before it ends.
+    #[cfg(windows)]
+    fn remove_the_standalone_start(&self) {
+        let system = std::env::var_os("SystemRoot").map_or_else(
+            || PathBuf::from(r"C:\Windows"),
+            PathBuf::from,
+        );
+        let _ = Command::new(system.join("System32").join("schtasks.exe"))
+            .args(["/Delete", "/F", "/TN"])
+            .arg(kr_controller::supervision::windows::task_name(
+                self.tree.environment_id(),
+            ))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
     /// Starts `program` as this host's daemon, with `working_directory` as its own, and waits for
     /// it to answer.
+    #[cfg(unix)]
     async fn start_daemon_in(&mut self, program: &Path, working_directory: &Path) {
         let arguments = self.daemon_arguments();
         let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
@@ -1797,6 +1989,7 @@ impl Host {
 
     /// Starts this host's daemon with variables of its own: each of `set` given, and each of
     /// `unset` taken away from what [`Host::command`] gives every program.
+    #[cfg(unix)]
     async fn start_daemon_with(
         &mut self,
         program: &Path,
@@ -1816,6 +2009,7 @@ impl Host {
     }
 
     /// Starts `command` as this host's daemon, in the directory it names, and waits for it to answer.
+    #[cfg(unix)]
     async fn start_daemon_as(&mut self, mut command: Command) {
         let log = self
             .tree
@@ -1853,7 +2047,7 @@ impl Host {
 
     /// Creates a session with a release's `kr`, and returns its display number and identifier.
     fn new_session(&self, kr: &Path) -> (String, SessionId) {
-        self.new_session_as(kr, &["--shell", "/bin/sh"])
+        self.new_session_as(kr, &["--shell", &default_shell()])
     }
 
     fn new_session_as(&self, kr: &Path, shell: &[&str]) -> (String, SessionId) {
@@ -1891,6 +2085,7 @@ impl Host {
     ///
     /// The agent reads a pipe this test holds open, and ends when the test lets go of it, however
     /// the test ends. Returns the session's display number and identifier, and the agent.
+    #[cfg(unix)]
     fn new_session_with_an_agent(&self, kr: &Path, name: &str) -> (String, SessionId, Agent) {
         let directory = self.scratch(&format!("agent-{name}"));
         let pid_file = directory.join("pid");
