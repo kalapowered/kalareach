@@ -1007,6 +1007,8 @@ fn a_sealed_release_refuses_to_create_or_overwrite_a_file_as_its_owner() {
         "a sealed release is changed in none: {after:?}"
     );
     let mut permissions = std::fs::metadata(&program).expect("there").permissions();
+    // On Windows the attribute is all this clears, and a sealed file refuses even that.
+    #[allow(clippy::permissions_set_readonly_false)]
     permissions.set_readonly(false);
     assert!(
         std::fs::set_permissions(&program, permissions).is_err(),
