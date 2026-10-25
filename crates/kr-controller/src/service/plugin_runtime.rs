@@ -282,8 +282,8 @@ impl StoreReleases {
         {
             let _ = level;
             Err(format!(
-                "no plugin host of the release before runs, and none can be started: this host \
-                 keeps no release store (the worker runs {release})"
+                "no plugin host of the release before runs, and none can be started on Windows \
+                 (the worker runs {release})"
             ))
         }
     }

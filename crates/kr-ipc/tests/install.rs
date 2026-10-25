@@ -805,6 +805,126 @@ fn a_release_a_program_holds_cannot_be_renamed_or_deleted_by_anyone() {
     std::fs::rename(&directory, &elsewhere).expect("once nothing holds it, it moves");
 }
 
+/// KR-REQ-26.06: a read of a file of a release is not refused by the question whether the release
+/// is held, which opens the manifest with no sharing for an instant: `kr host versions` asks it of
+/// every release while another command reads a manifest. A manifest is read two thousand times while
+/// another thread asks without a pause, and every read is granted.
+#[cfg(windows)]
+#[test]
+fn a_read_of_a_manifest_is_not_refused_by_a_question_whether_its_release_is_held() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let asking = Arc::new(AtomicBool::new(true));
+    let asked = {
+        let store = Store::at(test.store.root());
+        let asking = Arc::clone(&asking);
+        let one = one.clone();
+        std::thread::spawn(move || {
+            let mut asked = 0_u64;
+            while asking.load(Ordering::Relaxed) {
+                store.held(&one).expect("asks");
+                asked += 1;
+            }
+            asked
+        })
+    };
+    let manifest = test.store.manifest(&one);
+    let mut refused = Vec::new();
+    for round in 0..2000 {
+        if let Err(error) = kr_ipc::install::read_regular_file(&manifest, 1 << 20) {
+            refused.push(format!("round {round}: {error}"));
+        }
+    }
+    asking.store(false, Ordering::Relaxed);
+    let asked = asked.join().expect("the asking thread ends");
+    assert!(asked > 0, "the question was asked");
+    assert!(
+        refused.is_empty(),
+        "a read is refused by a question: {refused:?}"
+    );
+}
+
+/// KR-REQ-26.06: what a removal left in the trash is deleted by a sweep, whatever it is: a release
+/// a program without a hold still ran from is deleted once that program has ended, and a junction
+/// left there is taken away as a name, with the directory it names and the access list of that
+/// directory as they were.
+#[cfg(windows)]
+#[test]
+fn a_sweep_of_the_trash_deletes_what_is_left_and_follows_no_junction() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    let system = PathBuf::from(std::env::var_os("SystemRoot").expect("a system directory"));
+    let waiting = test
+        .store
+        .release_directory(&one)
+        .join("bin")
+        .join("kr-plugin-host.exe");
+    std::fs::copy(system.join("System32").join("ping.exe"), &waiting).expect("a program");
+    let mut running = std::process::Command::new(&waiting)
+        .args(["-n", "300", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a program that holds nothing runs from the release");
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(
+        test.store.retire(&one, &update).expect("removes"),
+        "a release nothing holds is removed"
+    );
+    assert!(!test.store.release_directory(&one).exists());
+    let left = || {
+        std::fs::read_dir(test.store.trash())
+            .expect("reads the trash")
+            .flatten()
+            .count()
+    };
+    assert_eq!(
+        left(),
+        1,
+        "the running program keeps its release in the trash"
+    );
+
+    // A junction in the trash to a sealed directory elsewhere.
+    let outside = test.root.join("outside");
+    std::fs::create_dir_all(&outside).expect("a directory");
+    std::fs::write(outside.join("kept"), b"kept").expect("a file");
+    kr_ipc::install::seal_directory(&outside).expect("sealed");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(test.store.trash().join("a-junction"))
+        .arg(&outside)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("mklink runs");
+    assert!(made.success(), "a junction in the trash");
+
+    running.kill().expect("the program is ended");
+    running.wait().expect("and gone");
+    test.store.sweep_trash(&update).expect("sweeps");
+    let result = (
+        left(),
+        std::fs::read(outside.join("kept")).ok(),
+        std::fs::write(outside.join("added"), b"x").is_err(),
+    );
+    kr_ipc::install::unseal_directory(&outside).expect("given back");
+    assert_eq!(result.0, 0, "the trash is empty once the program has ended");
+    assert_eq!(
+        result.1.as_deref(),
+        Some(&b"kept"[..]),
+        "what the junction named is as it was"
+    );
+    assert!(result.2, "and still sealed");
+}
+
 /// The variable that makes the late helper act, naming the directory it talks through.
 const LATE: &str = "KR_INSTALL_TEST_LATE";
 
@@ -1146,15 +1266,14 @@ fn current_is_a_junction_that_names_a_release_of_this_store_only() {
 }
 
 /// KR-REQ-26.06: a store is kept on an NTFS volume, and one named on another file system is refused
-/// before anything is made there. The volume is a virtual disk formatted FAT32 that the native run
-/// attaches and names by the variable; without it there is no other file system to ask, and the case
-/// has nothing to assert.
+/// before anything is made there. The volume is a virtual disk formatted FAT32 that the run attaches
+/// and names by the variable; the case is run by hand against one.
 #[cfg(windows)]
 #[test]
+#[ignore = "needs a volume that is not NTFS: set KR_INSTALL_TEST_FAT_VOLUME to its root"]
 fn a_store_on_a_volume_that_is_not_ntfs_is_refused() {
-    let Some(volume) = std::env::var_os("KR_INSTALL_TEST_FAT_VOLUME") else {
-        return;
-    };
+    let volume = std::env::var_os("KR_INSTALL_TEST_FAT_VOLUME")
+        .expect("KR_INSTALL_TEST_FAT_VOLUME names the volume this case is run against");
     let store = Store::at(PathBuf::from(volume).join("host"));
     let refused = store.create_directories();
     assert!(
