@@ -1830,6 +1830,17 @@ function Publish-KalaReachQualification {
     if (-not $qualified.Ok) {
         throw "kalareach: $($qualified.Reason): $($qualified.Detail)"
     }
+    # This package builds no shell and holds no program: the shell a session starts is the host
+    # this qualification ran in, named by its absolute path in the record, and the package's own
+    # files (the module, the startup entry, the record) are inside the package. What a start adds
+    # to the host's environment is the launch block below. A host a package cannot name is refused
+    # before anything is written, so a refusal leaves nothing behind.
+    $qualifiedHost = Get-KrQualifiedHost
+    $unstartable = Test-KrHostCanBeStarted $qualifiedHost.executable
+    if ($null -ne $unstartable) {
+        throw "kalareach: $($unstartable.Reason): $($unstartable.Detail)"
+    }
+    $launchEnvironment = Get-KrLaunchEnvironment
     $identityInfo = Get-KrPackageIdentity
     $psrl = Get-KrPSReadLineVersion
 
@@ -1862,17 +1873,6 @@ function Publish-KalaReachQualification {
     New-Item -ItemType Directory -Force -Path (Join-Path $destination 'startup') | Out-Null
     Copy-Item -Path (Join-Path $script:ModuleRoot '*') -Destination $modules -Recurse -Force
     Copy-Item -Path $startupSource -Destination (Join-Path $destination 'startup') -Force
-
-    # This package builds no shell and holds no program: the shell a session starts is the host
-    # this qualification ran in, named by its absolute path in the record, and the package's own
-    # files (the module, the startup entry, the record) are inside the package. What a start adds
-    # to the host's environment is the launch block below.
-    $qualifiedHost = Get-KrQualifiedHost
-    $unstartable = Test-KrHostCanBeStarted $qualifiedHost.executable
-    if ($null -ne $unstartable) {
-        throw "kalareach: $($unstartable.Reason): $($unstartable.Detail)"
-    }
-    $launchEnvironment = Get-KrLaunchEnvironment
 
     $record = [ordered]@{
         identity      = $identity
