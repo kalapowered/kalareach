@@ -1117,11 +1117,12 @@ impl OutputHistory {
     /// output from a cursor on is served from there and never before it: the oldest retained
     /// cursor it is told is the later of the two, and a request that begins before its reach is
     /// answered with a gap from where it began to where its reach does. That gap carries the cause
-    /// this host recorded when retention had already taken the range, and none when the reader's
-    /// reach is what ends it, since nothing took it and what a reader may not see is not a fact
-    /// about the output. One that reaches none of the output that exists is told the output ends
-    /// where it does, and is served nothing; the output written after that is served when it is
-    /// asked for from there.
+    /// this host recorded only where the range it reports reaches into the reader's reach, as when
+    /// retention, a hole or a boundary this host cannot read took some of it, and none when the
+    /// reader's reach is what ends it, since nothing took the range before and what a reader may
+    /// not see is not a fact about the output. One that reaches none of the output that exists is
+    /// told the output ends where it does, and is served nothing; the output that follows is
+    /// served once a reach begins within it.
     ///
     /// # Errors
     ///
@@ -3262,7 +3263,8 @@ mod tests {
             assert!(page.bytes.as_slice().is_empty() && page.gap.0.is_none());
         }
 
-        // Output written after the reach was worked out is served from where it ended.
+        // Once a reach begins at the old end, as one does when a later interval starts there, the
+        // output written after it is served.
         history.append(b"cccc");
         let page = history.page_within(8, 64, Reach::From(8)).expect("a page");
         assert_eq!(page.bytes.as_slice(), b"cccc");
@@ -3301,6 +3303,38 @@ mod tests {
         let gap = page.gap.0.expect("a gap");
         assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, reach));
         assert_eq!(gap.cause, None, "nothing took what the reach leaves out");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_hole_inside_the_readers_reach_is_named_in_the_gap_that_runs_to_the_page() {
+        let directory = spool_directory("reach-hole");
+        let mut history =
+            OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        for _ in 0..8 {
+            history.append(&[b'z'; 8]);
+        }
+        // The file of the third segment goes from under the index, so nothing holds [16, 24).
+        std::fs::remove_file(directory.join(format!("{:020}.out", 16)))
+            .expect("takes the segment's file away");
+
+        // The reach begins inside the hole: the gap runs to the end of it, and the hole is named.
+        let page = history.page_within(0, 64, Reach::From(20)).expect("a page");
+        assert_eq!(page.from_cursor.get(), 24);
+        let gap = page.gap.0.expect("a gap");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 24));
+        assert!(
+            gap.cause.is_some(),
+            "the hole is part of what the reach covers"
+        );
+
+        // The reach begins after the hole: nothing the reader's reach covers was lost.
+        let page = history.page_within(0, 64, Reach::From(24)).expect("a page");
+        assert_eq!(page.from_cursor.get(), 24);
+        let gap = page.gap.0.expect("a gap");
+        assert_eq!((gap.from_cursor.get(), gap.to_cursor.get()), (0, 24));
+        assert_eq!(gap.cause, None);
         std::fs::remove_dir_all(&directory).ok();
     }
 

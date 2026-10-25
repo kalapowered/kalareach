@@ -472,8 +472,8 @@ async fn a_device_holding_a_share_is_served_the_output_written_after_the_share_w
 /// the mode on removes what the worker retained and keeps what arrives meanwhile: the owner reads an
 /// empty window, and so does the device, and the output produced under the mode is read by neither.
 /// When the mode is off again, both read what is produced after it and the device only what the
-/// owner reads. The device's page comes from the same retained window as the owner's and leaves
-/// through the same response path.
+/// owner reads. The device's page comes from the same retained window as the owner's; the owner
+/// reads it on the worker's own socket and the device through the daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn under_privacy_mode_a_paired_device_is_served_nothing_the_owner_is_not() {
     let rig = Rig::start().await;
