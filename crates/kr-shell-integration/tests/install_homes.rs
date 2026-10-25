@@ -716,12 +716,7 @@ fn install_and_remove(kr: &Kr, package: &Package, home: &Home, label: &str) {
         );
     }
 
-    let package_directory = package
-        .executable
-        .parent()
-        .and_then(Path::parent)
-        .expect("the package directory");
-    for (path, text) in text_files(&installed, package_directory) {
+    for (path, text) in text_files(&installed, package.directory()) {
         assert!(
             exec_of_kr(&text).is_none(),
             "{label}: {path} runs exec on kr: {:?}",

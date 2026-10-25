@@ -353,13 +353,10 @@ fn a_moved_package_whose_record_is_another_build_is_refused() {
     assert!(message.contains("PackageMismatch"), "refused as {message}");
 }
 
-/// The tree a package's executable is in: the package's own directory.
+/// The package's own directory, which holds its record, its modules and its startup entry.
 fn package_root(package: &Package) -> PathBuf {
     package
-        .executable
-        .parent()
-        .and_then(Path::parent)
-        .expect("the executable is in a bin directory")
+        .directory()
         .canonicalize()
         .expect("the package is there")
 }

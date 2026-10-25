@@ -3819,12 +3819,8 @@ pub fn a_mapping_that_goes_while_the_scan_reads_is_not_memory_left_unread() {
 /// Panics when the decoder returns anything but a byte array, or the clear leaves a byte.
 pub fn the_powershell_secret_is_decoded_into_one_byte_array_that_is_cleared() {
     let package = Package::built(ShellKind::PowerShell);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(Path::parent)
-        .expect("the package directory");
-    let module = directory
+    let module = package
+        .directory()
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
         .to_string();
@@ -4024,11 +4020,7 @@ const LINUX_LIBRARIES: [&str; 12] = [
 /// a library of the build machine.
 pub fn the_shell_links_no_library_of_the_machine_that_built_it(kind: ShellKind) {
     let package = Package::built(kind);
-    let directory = package
-        .executable
-        .parent()
-        .and_then(Path::parent)
-        .expect("the package directory");
+    let directory = package.directory();
     assert!(
         !linked_libraries(&package.executable).is_empty(),
         "no dependency was read from {}",
