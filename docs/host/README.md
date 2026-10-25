@@ -7340,8 +7340,8 @@ What the claim does not do:
   suspended until the binding is verified again.
 * A name and the identifier it resolves to are one conversation that the host cannot tell apart
   until the stream names the thread. Until then a second session can launch by the identifier and
-  be served. When a stream names the thread, the first session whose stream does keeps it, and the
-  other's selection is refused: its instance has no thread vouched for.
+  be served. The first execution to claim the identifier, by a launch or by a stream's selection,
+  keeps it, and the other's selection is refused: its instance has no thread vouched for.
 * The key is the word alone. Two applications that give one name to different conversations, a
   `fork` of a held conversation, two directories that use one name, and different data directories
   for one identifier are refused: the program runs as typed and loses the integration, nothing else.
@@ -7353,9 +7353,10 @@ What the claim does not do:
   later build that changes any of them takes both forms for as long as the workers of an earlier
   build can run.
 
-If a bridge or a stream reports that an instance selected a conversation another live instance of
-this session or another session holds, the host refuses the selection: the instance is left with no
-thread vouched for, and rich mutations stay suspended until the binding is verified again.
+If a bridge or a stream reports that an instance selected a conversation that another live
+instance of this session or another session holds, or that the server of an instance that has
+ended still runs against, the host refuses the selection: the instance is left with no thread
+vouched for, and rich mutations stay suspended until the binding is verified again.
 
 ### What a launch reads of its application's mode
 
