@@ -16,7 +16,7 @@
 //! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
 //! | KR-REQ-11.21 and KR-REQ-11.33 | the answer to an approval a component read is the bytes that component encoded, written to the upstream once; an approval the connector's table read is answered with the table's bytes, and no component is asked to encode it |
 //! | KR-REQ-11.33 | a native answer that comes while the component encodes wins, and the component's answer is not sent; the thread changing, the grant or the decoder's trust being withdrawn while it encodes each refuse the answer before the marker, and nothing is sent |
-//! | KR-REQ-11.21 and KR-ACC-016 | bytes that name another request, the right one as another JSON type, a method, an error in place of a result, a member twice or a line break are refused by the core and nothing is sent; a component that traps, declines or never returns makes no answer, the terminal answers, and the third fault disables the binding |
+//! | KR-REQ-11.21 and KR-ACC-016 | bytes that name another request, the right one as another JSON type, a method, an error in place of a result or beside one, a member twice or a line break are refused by the core and nothing is sent; a component that traps, declines or never returns makes no answer, the terminal answers, and the third fault disables the binding |
 
 #![cfg(unix)]
 
@@ -620,9 +620,9 @@ async fn kr_req_11_33_a_trust_withdrawn_while_the_component_encodes_leaves_the_a
 /// KR-REQ-11.21: bytes a component returns are data, and become an answer only if they are one. Each
 /// of these is refused by the core with nothing sent: an answer to another request, to the right
 /// one with its identifier as another JSON type, one that is a request, one that is an error, one
-/// that names a member twice and one that holds a line break. The request stays the opaque one it
-/// was, the terminal answers it, and the binding's report says only that the bytes were not an
-/// answer.
+/// that is both a result and an error, one that names a member twice and one that holds a line
+/// break. The request stays the opaque one it was, the terminal answers it, and the binding's
+/// report says only that the bytes were not an answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_and_nothing_is_sent()
 {
@@ -638,6 +638,7 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
         "!answer-retyped-id",
         "!answer-method",
         "!answer-error",
+        "!answer-both",
         "!answer-twice",
         "!answer-newline",
     ];
@@ -661,7 +662,7 @@ async fn kr_req_11_21_bytes_that_are_not_an_answer_to_the_request_are_refused_an
         reason.contains(kr_worker::broker::encode::NotEncoded::NotAnAnswer.words()),
         "{reason}"
     );
-    assert!(reason.contains("6 answers were not written"), "{reason}");
+    assert!(reason.contains("7 answers were not written"), "{reason}");
 
     // The same request, answered by a component that returns a true answer, is sent.
     world.send(&request_noting(60, "!answer"));

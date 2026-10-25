@@ -39,6 +39,7 @@
 //! | `!answer-retyped-id` | the same, with the identifier written as a string when it was a number |
 //! | `!answer-method` | the same, with a `method` member, which makes it a request |
 //! | `!answer-error` | an error member in place of the result |
+//! | `!answer-both` | an error member beside the result |
 //! | `!answer-twice` | the identifier member named twice |
 //! | `!answer-newline` | a line break between two members |
 //! | `!encode-decline` | declares a fault and returns nothing |
@@ -145,6 +146,10 @@ fn gateway_answer(bytes: &[u8], id: &str, decision: &str) -> EncodedResponse {
     };
     let text = if holds(bytes, b"!answer-method") {
         format!("{{\"id\":{naming},\"method\":\"session/prompt\",\"result\":{result}}}")
+    } else if holds(bytes, b"!answer-both") {
+        format!(
+            "{{\"id\":{naming},\"result\":{result},\"error\":{{\"code\":-1,\"message\":\"no\"}}}}"
+        )
     } else if holds(bytes, b"!answer-error") {
         format!("{{\"id\":{naming},\"error\":{{\"code\":-1,\"message\":\"no\"}}}}")
     } else if holds(bytes, b"!answer-twice") {
