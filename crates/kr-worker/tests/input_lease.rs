@@ -5379,6 +5379,13 @@ async fn key_records_reach_the_terminal_as_legacy_input_in_the_mode_the_applicat
     typing.bytes(b"kr-b.").await;
     assert_eq!(typing.received_between(b"kr-a.", b"kr-b.").await, b"\x1b[A");
 
+    // A key coming up on its own spells nothing, and the write is still accepted.
+    let released = InputContent::ConsoleKeys {
+        keys: vec![console_key(0x26, 0, false)],
+    };
+    let accepted = typing.write(released).await.expect("accepted");
+    assert_eq!(accepted.forwarded_bytes.get(), 0);
+
     // Application cursor keys, which an application sets with DEC mode 1: the same key is SS3 A.
     typing.negotiates(b"\x1b[?1h", b"kr-c.").await;
     typing.write(the_up_arrow()).await.expect("accepted");
