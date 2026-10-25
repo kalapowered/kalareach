@@ -166,8 +166,8 @@ impl RecordReader {
     /// A run of keys becomes one [`ReadEvent::Keys`], and anything else keeps its own place between
     /// those runs, because a caller that could not tell whether a click came before or after a
     /// keystroke could not dispatch either of them honestly. The first half of a character outside
-    /// the basic plane that ends a run of keys waits for the keys that complete it, across a mouse
-    /// or resize record if one comes between, and goes out as it was with the next key.
+    /// the basic plane that ends a run of keys waits for the keys that complete it, across a mouse,
+    /// resize, focus or menu record if one comes between, and goes out as it was with the next key.
     ///
     /// # Errors
     ///
