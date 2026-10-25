@@ -1,12 +1,11 @@
 //! Reaching the plugin host, with no component engine.
 //!
-//! The engine lives in `kr-plugin-host`, one process for each environment, and a
-//! process that serves a shell may not link it. This crate is what such a process may link to
-//! reach the host instead: the protocol the two ends speak, the descriptor a worker finds the host
-//! through, the client a worker uses, the launcher that starts the host and takes its identity
-//! proof, and the records a call carries. The host's own side of the conversation, which runs
-//! components, is `kr_plugin_runtime::service::host`. The plugin runtime links this crate, and
-//! never the reverse.
+//! The engine lives in `kr-plugin-host`, one process for each environment, and a process that
+//! serves a shell may not link it. This crate is what such a process may link to reach the host
+//! instead: the protocol the two ends speak, the descriptor a worker finds the host through, the
+//! client a worker uses, the launcher that starts the host and takes its identity proof, and the
+//! records a call carries. The host's own side of the conversation, which runs components, is
+//! `kr_plugin_runtime::service::host`. The plugin runtime links this crate, and never the reverse.
 //!
 //! # Why a crate without the engine
 //!
