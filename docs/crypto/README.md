@@ -24,7 +24,8 @@ HMAC. Every package build holds that code to published known answers, and
 | The media path of a voice call | DTLS-SRTP in the `stasel/WebRTC` framework on iOS and the `io.github.webrtc-sdk:android` library on Android ([media stack survey](../voice/media-stack-survey.md)) |
 | Secrets at rest | the operating system's credential store through the `keyring` crate on a desktop, and on a phone the Keychain on iOS and the Keystore on Android through the companion's platform services |
 | The voice confirmation's Ed25519 signature on a phone | CryptoKit on iOS and the Java security provider on Android |
-| The shell bridges' bootstrap proof | The shell packages' own `kr_bridge_crypto.c` (SHA-256 and HMAC-SHA-256, as above, [checked against published answers](#the-hash-the-shell-bridges-write-themselves)) for Bash, Fish and Zsh, and .NET's `HMACSHA256` and `SHA256` in the PowerShell bridge |
+| The shell bridges' bootstrap proof | The shell packages' own `kr_bridge_crypto.c` (SHA-256 and HMAC-SHA-256, as above, [checked against published answers](#the-hash-the-shell-bridges-write-themselves)) for Bash, Fish and Zsh, and .NET's `HMACSHA256` in the PowerShell bridge |
+| The PowerShell package's identity and file digests | .NET's `SHA256` over the package inputs, and `Get-FileHash` |
 | The release tool's keys and signatures | `aws-lc-rs` and `tough`'s signing, with `SystemRandom` for a development key |
 | Secret files on Android and previews on a phone | Android's `SecureRandom`, AES-256-GCM under an Android Keystore key, Java `MessageDigest`; CryptoKit on iOS for hashes |
 | Certificates a test issues | the `rcgen` crate, which makes key pairs and signs certificates through `ring`; it is a dev-dependency of `kr-client`, `kr-controller`, `kr-transport` and the end-to-end harness, and no shipped code calls it |
@@ -79,7 +80,8 @@ hash, so the same 32 bytes declared under two purposes produce two identifiers.
 `Secret<N>` zeroises on drop through `sodium_memzero`, and `SecretVec` through the `zeroize`
 crate's `Vec::zeroize`, which clears the whole allocation. Neither write may be elided by the
 compiler, and both types redact themselves in debug output. `Secret<N>` is deliberately not `Copy`: a copy that
-moves leaves a duplicate behind, and a duplicate cannot be zeroised. Reading a secret goes through
+moves leaves a duplicate behind, and a duplicate cannot be zeroised. A move of a `Secret<N>` is
+itself a bitwise copy whose old place nothing clears, and the crate cannot hook a move. Reading a secret goes through
 `expose()`, so every call site that touches key material is greppable.
 
 The notification extension receives only the notification-preview private key and paired sender
@@ -581,8 +583,8 @@ worker accepts only while that command's line is running.
 
 `fixtures/crypto/` holds the documents below. The first three are regenerated with
 `cargo run -p kr-crypto --bin kr-crypto-vectors` and checked in continuous integration with
-`--check`, as are `relay.json`, `collection-keys.json` and `organisation.json`. `recovery-kit.json` is checked by `crates/kr-client/tests/
-recovery.rs::the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering
+`--check`, as are `relay.json`, `collection-keys.json` and `organisation.json`. `recovery-kit.json` is checked by
+`crates/kr-client/tests/recovery.rs::the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering
 it pins belongs to `kr-client` rather than to the vector generator:
 
 | File | Contents |
@@ -663,8 +665,8 @@ digest and the shortened key of the MAC, and the buffer the bootstrap secret was
 an activation fails and once the handshake is accepted. An optimiser may drop a `memset` of a buffer
 that is not read again, so `kr_wipe` calls `memset_s` on Apple platforms, `explicit_bzero` on glibc
 2.25 or later in its default feature set, and a loop through a volatile pointer on any other
-platform. It does not clear the compression function's working variables (the eight state words,
-`t1` and `t2`) or the base64url decoder's accumulator, which holds the last bits of the secret it
+platform. It does not clear the compression function's working variables (the eight words `a` to
+`h`, `t1` and `t2`) or the base64url decoder's accumulator, which holds the last bits of the secret it
 read, and the compiler may leave copies of a value in registers or stack slots that no code of the
 bridge reaches. No case can show the wipes of the temporaries inside the hash and the MAC, because
 reading them back means reading dead stack memory. The cases read only memory the caller owns: the
