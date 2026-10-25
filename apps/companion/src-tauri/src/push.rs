@@ -486,7 +486,13 @@ pub struct PushDesk {
     /// one after another, each from the state the one before left, so a choice let go puts back
     /// what it found and never undoes a choice made after it began. Nothing else waits for it.
     choosing: tokio::sync::Mutex<()>,
-    changed: Box<dyn Fn() + Send + Sync>,
+    /// Tells the page where notifications stand, with the view as read when it is told.
+    changed: Box<dyn Fn(PushView) + Send + Sync>,
+    /// Held from the read of the view to the end of the call that hands it to the page, so that
+    /// pages are told in the order the views were read: a view read earlier is never handed over
+    /// after one read later, which would leave the page with a state the desk has left. Taken with
+    /// no other hold held.
+    telling: Mutex<()>,
     /// Whether the record on disk is one that could not be read and could not be moved aside, so
     /// that writing would replace it. Nothing is written then, and the page shows what the desk
     /// holds in memory until a start can read the record.
@@ -589,8 +595,8 @@ const fn this_platform() -> PushPlatform {
 }
 
 impl PushDesk {
-    /// Opens the desk over the record under `data`. `changed` is called when what the page is
-    /// shown changes.
+    /// Opens the desk over the record under `data`. `changed` is called, one call at a time and in
+    /// the order the views were read, with what the page is shown, when that changes.
     ///
     /// # Errors
     ///
@@ -601,7 +607,7 @@ impl PushDesk {
         native: Arc<dyn Native>,
         registrar: Arc<dyn Registrar>,
         wiring: Wiring,
-        changed: impl Fn() + Send + Sync + 'static,
+        changed: impl Fn(PushView) + Send + Sync + 'static,
     ) -> Result<Arc<Self>> {
         let origin =
             GatewayOrigin::new(kr_client::services::account::ACCOUNT_ORIGIN).map_err(|error| {
@@ -683,6 +689,7 @@ impl PushDesk {
             filed: tokio::sync::Mutex::new(None),
             choosing: tokio::sync::Mutex::new(()),
             changed: Box::new(changed),
+            telling: Mutex::new(()),
             write_blocked,
         });
         if lost || pruned {
@@ -749,6 +756,13 @@ impl PushDesk {
         }
     }
 
+    /// Tells the page where notifications stand. The view is read and handed over under one hold,
+    /// so two tellings from two tasks reach the page in the order their views were read.
+    fn tell_page(&self) {
+        let _one_at_a_time = lock(&self.telling);
+        (self.changed)(self.view());
+    }
+
     /// Turns notifications on for the host the page named, and starts the sequence.
     ///
     /// The host is the one the person chose, held from here to the end: a sequence that outlives a
@@ -809,7 +823,7 @@ impl PushDesk {
             // The run starts before the page is told: a host marked working has a run behind it
             // even when the page's callback fails.
             self.spawn_run(host, run, Reach::Asked, Job::Full);
-            (self.changed)();
+            self.tell_page();
         }
         Ok(self.view())
     }
@@ -884,7 +898,7 @@ impl PushDesk {
             let restored = self.file_keys_quietly().await.0.is_ok();
             // The page is told once, with the choice as it stands again: neither filing reported
             // while the choice was in the record, which the page would have kept.
-            (self.changed)();
+            self.tell_page();
             return Err(CommandError::local_failure(if undone && restored {
                 format!("{words} Your choice of previews was not made. Try again.")
             } else {
@@ -916,7 +930,7 @@ impl PushDesk {
         if let Some((run, job)) = claimed {
             self.spawn_run(host, run, Reach::Asked, job);
         }
-        (self.changed)();
+        self.tell_page();
         Ok(self.view())
     }
 
@@ -1022,7 +1036,7 @@ impl PushDesk {
             self.spawn_run(host, run, Reach::Visit, job);
         }
         if changed {
-            (self.changed)();
+            self.tell_page();
         }
         // What the receivers hold follows the record and the paired hosts, so a look mends a filing
         // that failed or a host that was unpaired meanwhile.
@@ -1054,7 +1068,7 @@ impl PushDesk {
                 self.keep(&state.record);
             }
         }
-        (self.changed)();
+        self.tell_page();
         // The host's key is not the receivers' to open its previews with any more.
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move { desk.file_keys_logged().await });
@@ -1194,7 +1208,7 @@ impl PushDesk {
             kept.registered = Some(registered);
             self.keep(&state.record);
         }
-        (self.changed)();
+        self.tell_page();
         Next::Done
     }
 
@@ -1220,7 +1234,7 @@ impl PushDesk {
             kept.updated_ms = now;
             self.keep(&state.record);
         }
-        (self.changed)();
+        self.tell_page();
     }
 
     /// Records where a host stands, without writing it.
@@ -1266,7 +1280,7 @@ impl PushDesk {
             Self::mark(&mut state, host, Phase::Working, words, false, now);
             self.keep(&state.record);
         }
-        (self.changed)();
+        self.tell_page();
         true
     }
 
@@ -1517,11 +1531,12 @@ impl PushDesk {
             match stop {
                 LineStop::Phone(words) => words.into(),
                 // The gateway issued before the host was asked, and an issue retires the credential
-                // the host holds: a host that refuses what follows holds one the gateway no longer
-                // takes, and cannot notify this phone until a registration is taken.
+                // the host holds: a host that refuses what follows, or whose answer is lost, may
+                // hold one the gateway no longer takes, and may not be able to notify this phone
+                // until a registration is taken.
                 LineStop::Host(words) if !full && issued => format!(
-                    "The host did not take this choice of previews, and it cannot notify this \
-                     phone until it takes a registration: {words}"
+                    "The host did not take this choice of previews, and it may not be able to \
+                     notify this phone until it takes a registration: {words}"
                 )
                 .into(),
                 LineStop::Host(words) if !full => {
@@ -1728,7 +1743,7 @@ impl PushDesk {
     async fn file_keys_logged(&self) {
         let (outcome, moved) = self.file_keys_quietly().await;
         if moved {
-            (self.changed)();
+            self.tell_page();
         }
         if let Err(words) = outcome {
             tracing::warn!(%words, "the preview keys could not be filed for the receivers");

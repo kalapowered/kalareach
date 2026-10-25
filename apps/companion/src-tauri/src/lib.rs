@@ -881,10 +881,8 @@ pub fn start_push<R: tauri::Runtime>(
         Arc::new(push::PluginNative(app.clone())),
         Arc::new(push::ConnectionRegistrar(device)),
         push::Wiring::product(),
-        move || {
-            if let Some(desk) = emitter.state::<AppState>().push() {
-                let _ = emitter.emit(push::PUSH_EVENT, desk.view());
-            }
+        move |view| {
+            let _ = emitter.emit(push::PUSH_EVENT, view);
         },
     )?;
     state.push_opened(desk);

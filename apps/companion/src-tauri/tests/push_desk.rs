@@ -86,8 +86,9 @@ struct ReceiverState {
     keys_released: bool,
     /// How many filings of the preview keys have been asked.
     keys_asked: usize,
-    /// Whether a filing of the preview keys fails.
+    /// Whether a filing of the preview keys fails, and how many have been refused so far.
     keys_fail: bool,
+    keys_refused: usize,
     /// How many of the next filings of the preview keys fail, and whether a filing that fails has
     /// first put the set it was handed where the receivers read it, as a store that fails part way
     /// does.
@@ -132,6 +133,7 @@ impl Receiver {
                 keys_released: false,
                 keys_asked: 0,
                 keys_fail: false,
+                keys_refused: 0,
                 keys_fail_next: 0,
                 keys_partly_applied: false,
                 token_held: BTreeSet::new(),
@@ -280,6 +282,7 @@ impl Native for Receiver {
             let mut state = self.state.lock().expect("the receiver");
             if state.keys_fail || state.keys_fail_next > 0 {
                 state.keys_fail_next = state.keys_fail_next.saturating_sub(1);
+                state.keys_refused += 1;
                 if state.keys_partly_applied {
                     state.keys_now = Some(keys.clone());
                 }
@@ -527,6 +530,8 @@ struct Desk {
     changes: Arc<AtomicUsize>,
     /// What the page would have been shown each time, in order.
     views: Arc<Mutex<Vec<PushView>>>,
+    /// Makes the page slow to take a view, once.
+    gate: Arc<PageGate>,
     /// Kept so the phone's records outlive the test.
     _phone: support::Phone,
 }
@@ -649,6 +654,7 @@ async fn desk_reaching(
         clock_ahead_ms: opened.clock_ahead_ms,
         changes: opened.changes,
         views: opened.views,
+        gate: opened.gate,
         _phone: phone,
     }
 }
@@ -663,6 +669,16 @@ struct Opened {
     changes: Arc<AtomicUsize>,
     /// What the page would have been shown each time, in order.
     views: Arc<Mutex<Vec<PushView>>>,
+    /// Makes the page slow to take a view, once.
+    gate: Arc<PageGate>,
+}
+
+/// A page that takes one view slowly: once armed, the next view it is told waits for the release.
+#[derive(Default)]
+struct PageGate {
+    armed: std::sync::atomic::AtomicBool,
+    parked: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl Opened {
@@ -701,8 +717,8 @@ fn open_with(
     let counted = Arc::clone(&changes);
     let views = Arc::new(Mutex::new(Vec::new()));
     let shown = Arc::clone(&views);
-    let desk_told = Arc::new(Mutex::new(None::<std::sync::Weak<PushDesk>>));
-    let to_tell = Arc::clone(&desk_told);
+    let gate = Arc::new(PageGate::default());
+    let told_gate = Arc::clone(&gate);
     let desk = PushDesk::open(
         data,
         Arc::clone(device),
@@ -712,7 +728,7 @@ fn open_with(
             http: Arc::new(move |_| Ok(Arc::clone(&http) as Arc<dyn ServiceHttp>)),
             clock: Arc::new(move || kr_ipc::now_ms().get() + ahead.load(Ordering::SeqCst)),
         },
-        move || {
+        move |view| {
             counted.fetch_add(1, Ordering::SeqCst);
             // Where a test asks the page's callback to fail in its own task, as a panic in the page
             // does. The desk's runs are tasks of their own, which the scope does not reach.
@@ -722,22 +738,25 @@ fn open_with(
                     .unwrap_or(false),
                 "the page's callback failed"
             );
-            // What the page would be shown now: read the way the page reads it, outside the desk's
-            // holds, which a call made under one would never return from.
-            let told = to_tell.lock().expect("the desk").clone();
-            if let Some(desk) = told.and_then(|desk| desk.upgrade()) {
-                shown.lock().expect("the views").push(desk.view());
+            // A page that is slow to take a view: the first call after the gate is armed waits here,
+            // with the view in hand, until the test lets it go.
+            if told_gate.armed.swap(false, Ordering::SeqCst) {
+                told_gate.parked.store(true, Ordering::SeqCst);
+                while !told_gate.released.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
+            shown.lock().expect("the views").push(view);
         },
     )
     .expect("the desk opens");
-    *desk_told.lock().expect("the desk") = Some(Arc::downgrade(&desk));
     Opened {
         desk,
         gateway,
         clock_ahead_ms,
         changes,
         views,
+        gate,
     }
 }
 
@@ -1745,6 +1764,34 @@ async fn a_host_that_cannot_be_reached_is_not_issued_an_authorisation() {
         .expect("the person asks again");
     phone.until(|states| states == [PushState::On]).await;
     assert_eq!(phone.gateway.issue_requests(), 1);
+}
+
+/// A choice of previews that cannot reach the host is refused before the gateway issues anything,
+/// so the host still holds the credential it had: the row says the host did not take the choice, and
+/// not that it may be unable to notify this phone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_that_cannot_reach_the_host_does_not_say_it_may_be_unable_to_notify() {
+    let (_host, phone, reference) = a_phone_with_notifications_on().await;
+    let issued = phone.gateway.issue_requests();
+    phone.registered.lock().expect("the script").connect_fails =
+        Some("the host did not answer in time".to_owned());
+
+    phone
+        .desk
+        .set_previews(&reference, false)
+        .await
+        .expect("off");
+    phone
+        .until(|states| states == [PushState::NeedsAttention])
+        .await;
+
+    let words = phone.view().hosts[0].words.clone();
+    assert!(
+        words.starts_with("The host did not take this choice of previews"),
+        "{words:?}"
+    );
+    assert!(!words.contains("may not be able to notify"), "{words:?}");
+    assert_eq!(phone.gateway.issue_requests(), issued, "nothing was issued");
 }
 
 /// The person forgets the host while the connection to it is made: it is connected to, and told
@@ -3063,8 +3110,8 @@ async fn a_choice_the_host_could_not_be_told_stays_recorded_and_try_again_sends_
     assert!(
         phone.view().hosts[0]
             .words
-            .contains("cannot notify this phone"),
-        "and that the credential it was issued first leaves it unable to notify: {:?}",
+            .contains("may not be able to notify this phone"),
+        "and that the credential it was issued first may leave it unable to notify: {:?}",
         phone.view().hosts[0].words
     );
     assert!(held_keys(&phone).expect("keys").senders.is_empty());
@@ -3574,14 +3621,10 @@ async fn a_choice_whose_key_cannot_be_filed_is_not_made() {
         refused.message
     );
     assert!(phone.view().hosts[0].previews, "the choice was let go");
-    assert!(
-        phone
-            .views
-            .lock()
-            .expect("the views")
-            .last()
-            .is_some_and(|last| last.hosts[0].previews),
-        "and was left with the choice that stands, not the one let go"
+    assert_eq!(
+        phone.views.lock().expect("the views").last(),
+        Some(&phone.view()),
+        "and the page was left with the view that stands, not the one the choice had made"
     );
     assert_eq!(
         phone.view().hosts[0].state,
@@ -3757,13 +3800,26 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
     );
 
     // Try again on a row that needs the person only for the keys files them and nothing else.
+    let refused = |phone: &Desk| {
+        phone
+            .receiver
+            .state
+            .lock()
+            .expect("the receiver")
+            .keys_refused
+    };
+    let before = refused(&phone);
     phone.desk.enable(&reference).expect("Try again");
     assert_eq!(
         phone.view().hosts[0].state,
         PushState::NeedsAttention,
         "no sequence was started for the host"
     );
-    eventually("Try again filed the keys", || asked(&phone) >= filings + 3).await;
+    eventually(
+        "Try again filed the keys, and the store refused them",
+        || refused(&phone) > before,
+    )
+    .await;
     assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
     assert_eq!(phone.gateway.issue_requests(), 1);
 
@@ -3942,4 +3998,70 @@ async fn a_choice_let_go_does_not_undo_a_choice_made_after_it_began() {
     })
     .await;
     phone.until(|states| states == [PushState::On]).await;
+}
+
+/// KR-REQ-16.11: the page is told in the order the views were read. A view read earlier that is slow
+/// to reach the page does not reach it after one read later: with two hosts forgotten together, the
+/// page's last view is the desk's own, and never the one a slow call read before the second host went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_read_earlier_never_reaches_the_page_after_one_read_later() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let phone = desk(&[&first, &second], &owner, Receiver::new(FIRST_TOKEN)).await;
+    let references = phone.references();
+    for reference in &references {
+        phone.desk.enable(reference).expect("the person asks");
+        phone
+            .until(|states| !states.contains(&PushState::Working))
+            .await;
+    }
+    phone
+        .until(|states| states == [PushState::On, PushState::On])
+        .await;
+    let hosts: Vec<_> = references
+        .iter()
+        .map(|reference| {
+            phone
+                .device
+                .host_by_reference(reference)
+                .expect("a host")
+                .host_device_id
+        })
+        .collect();
+    phone.gate.armed.store(true, Ordering::SeqCst);
+
+    // The person forgets the first host, and the page takes its view slowly.
+    let slow = std::thread::spawn({
+        let desk = Arc::clone(&phone.desk);
+        let host = hosts[0];
+        move || desk.forgotten(host)
+    });
+    eventually("the page is taking the first view", || {
+        phone.gate.parked.load(Ordering::SeqCst)
+    })
+    .await;
+    // The second host goes while that view is still on its way.
+    let quick = std::thread::spawn({
+        let desk = Arc::clone(&phone.desk);
+        let host = hosts[1];
+        move || desk.forgotten(host)
+    });
+    eventually("the second host was forgotten", || {
+        phone
+            .view()
+            .hosts
+            .iter()
+            .all(|host| host.state == PushState::Off)
+    })
+    .await;
+    phone.gate.released.store(true, Ordering::SeqCst);
+    slow.join().expect("the first call returned");
+    quick.join().expect("the second call returned");
+
+    assert_eq!(
+        phone.views.lock().expect("the views").last(),
+        Some(&phone.view()),
+        "the page was left with the view the desk has now"
+    );
 }
