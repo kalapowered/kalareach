@@ -416,14 +416,29 @@ struct Owing {
     owed: usize,
 }
 
+/// How long the whole arrangement of [`Owing`] may take, every attempt's start, its request and its
+/// shutdown included. It ends an arrangement that is stuck and decides nothing.
+const ARRANGEMENT_LIMIT: Duration = Duration::from_secs(180);
+
 /// Arranges [`Owing`]. A worker that is busy for a moment refuses the announcement, and the answer
 /// is then pending (section 9): nothing has been fenced, so nothing is owing, and a later
 /// announcement does not change the answer the daemon kept of the mutation. When it is pending the
-/// arrangement is made again on a new daemon, until an answer holds. One deadline bounds the
-/// attempts, and a failure says what each attempt answered.
+/// arrangement is made again on a new daemon and a new worker, after the daemon and the worker of
+/// the attempt have been stopped, until an answer holds. One limit bounds the attempts, and a
+/// failure says what each attempt answered.
 async fn a_revocation_that_left_names_owing() -> Owing {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let mut attempts = Vec::new();
+    let attempts = std::sync::Mutex::new(Vec::new());
+    tokio::time::timeout(ARRANGEMENT_LIMIT, arrange_until_an_answer_holds(&attempts))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no answer to a revocation held within {ARRANGEMENT_LIMIT:?}: {:#?}",
+                attempts.lock().expect("the attempts are listed")
+            )
+        })
+}
+
+async fn arrange_until_an_answer_holds(attempts: &std::sync::Mutex<Vec<String>>) -> Owing {
     loop {
         let started = tokio::time::Instant::now();
         let Adopted {
@@ -461,14 +476,13 @@ async fn a_revocation_that_left_names_owing() -> Owing {
             )
             .await
             .expect("the revocation is composed");
-        let first: kr_protocol::sharing::RevocationResult =
-            tokio::time::timeout(Duration::from_secs(60), client.repeat(&mutation))
-                .await
-                .expect("the revocation is answered")
-                .expect("the daemon answers")
-                .expect("the revocation is done")
-                .to_typed()
-                .expect("a revocation result");
+        let first: kr_protocol::sharing::RevocationResult = client
+            .repeat(&mutation)
+            .await
+            .expect("the daemon answers")
+            .expect("the revocation is done")
+            .to_typed()
+            .expect("a revocation result");
         let given = first
             .barrier
             .workers
@@ -489,20 +503,21 @@ async fn a_revocation_that_left_names_owing() -> Owing {
                 owed,
             };
         }
-        attempts.push(format!(
-            "{:?} after {:?}: {}",
-            given.state,
-            started.elapsed(),
-            given.detail
-        ));
+        attempts
+            .lock()
+            .expect("the attempts are listed")
+            .push(format!(
+                "{:?} after {:?}: {}",
+                given.state,
+                started.elapsed(),
+                given.detail
+            ));
         drop(client);
+        // The workers first, while the tree they serve is there to be written to.
+        for worker in workers {
+            worker.stop().await;
+        }
         host.stop().await;
-        drop(workers);
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no answer to a revocation held within a minute of {} attempts: {attempts:#?}",
-            attempts.len()
-        );
     }
 }
 

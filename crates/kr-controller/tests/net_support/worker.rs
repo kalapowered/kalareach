@@ -33,7 +33,7 @@ use kr_protocol::ids::{
 use kr_protocol::method::Method;
 use kr_protocol::question::{Question, QuestionCreateParams, QuestionKind};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
+use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
 use kr_worker::action::time::TimeSources;
 use kr_worker::broker::{
@@ -76,6 +76,7 @@ pub struct Worker {
     pub session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
     _runtime: Arc<SessionRuntime>,
+    serving: tokio::task::JoinHandle<()>,
 }
 
 impl Worker {
@@ -245,7 +246,12 @@ impl Worker {
             )
             .expect("a worker service"),
         );
-        tokio::spawn(Arc::clone(&service).serve(listener));
+        let serving = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                let _ = service.serve(listener).await;
+            }
+        });
         let mut registry =
             Registry::open(environment.registry_database(), environment_id).expect("the registry");
         registry
@@ -287,6 +293,7 @@ impl Worker {
             session_id,
             endpoint,
             _runtime: runtime,
+            serving,
         }
     }
 
@@ -299,6 +306,30 @@ impl Worker {
         )
         .await
         .expect("connects to the worker")
+    }
+
+    /// Ends the worker: it takes no more connections and its session closes, which ends the shell
+    /// it runs and the supervision of the session, and waits until the closure is recorded. For a
+    /// case that makes a worker again and must not leave the earlier ones running beside it.
+    ///
+    /// What the service started stays until the test's runtime ends, as it does for a worker that
+    /// is dropped: the host's maintenance ends at its next pass, the task that expires recoveries
+    /// never ends, and a connection task ends when the daemon closes its link. They only wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the closure is not recorded within a minute, so that a case does not go on to
+    /// remove the tree of a session that is still closing.
+    pub async fn stop(self) {
+        self.serving.abort();
+        let (_, gate) = self._runtime.close(ClosureReason::CloseRequested);
+        gate.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            self._runtime.wait_closed(),
+        )
+        .await
+        .expect("the worker's session closed");
     }
 
     /// The session's runtime, for a suite that stops the journal's next commit.
