@@ -139,6 +139,9 @@ rustix = { workspace = true, features = ["event", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+# The release archive of a Windows host: parsed before any signature is checked, so it is read
+# under the bounds of `update::archive`.
+zip.workspace = true
 # The path of a folder a restore holds open, read from the handle: the record is given its name from
 # the folder the handle holds and not from the text the person typed, which a junction can change.
 winx = "=0.36.4"

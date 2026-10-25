@@ -598,6 +598,28 @@ async fn find(
     }
 }
 
+/// Has this user's scheduled task for the environment start the control daemon, when none answers
+/// there, and waits for it to answer: what an update does for a daemon it stopped that this task
+/// started. The task is the environment's creator of a daemon on Windows, and `Service` in an
+/// update's record means it.
+///
+/// # Errors
+///
+/// Returns what [`open_or_start`] returns for a daemon that is there and answers badly, and for a
+/// task that is not this installation's or a daemon that did not answer.
+#[cfg(windows)]
+pub async fn start_by_service(
+    environment: &KnownEnvironment,
+    majors: &[u16],
+) -> Result<Option<Started>> {
+    let endpoint = environment.paths.controller_endpoint()?;
+    if let Found::Answering(_) = find(environment, &endpoint, BOUNDS, majors).await? {
+        return Ok(None);
+    }
+    let (_, started) = start_by_task(&environment.paths, &endpoint, BOUNDS, majors).await?;
+    Ok(started)
+}
+
 /// Has this user's service manager start the control daemon of an environment, when none answers
 /// there, and waits for it to answer: what an update does for a daemon it stopped that was started
 /// by the service.
@@ -1013,6 +1035,19 @@ async fn standalone(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
+    let (client, started) = start_by_task(environment, endpoint, bounds, &[]).await?;
+    Ok((ours(client)?, started))
+}
+
+/// [`standalone`], answered by a daemon that states any of `majors` besides this command's own:
+/// what an update waits for when the daemon it starts is of a release that lists another.
+#[cfg(windows)]
+async fn start_by_task(
+    environment: &EnvironmentPaths,
+    endpoint: &kr_ipc::paths::Endpoint,
+    bounds: Bounds,
+    majors: &[u16],
+) -> Result<(Listed, Option<Started>)> {
     let deadline = tokio::time::Instant::now() + bounds.start;
     let program = daemon_program()?;
     if !program.is_file() {
@@ -1042,13 +1077,13 @@ async fn standalone(
         start: ControllerStartup::Standalone,
         manager: None,
     };
-    let last = match answered_by(endpoint, deadline, &[], || {}).await {
+    let last = match answered_by(endpoint, deadline, majors, || {}).await {
         Ok(client) => {
             // A daemon answered, whichever start it came from. The request is withdrawn, so no
             // starter the Task Scheduler runs later acts on it; one that took it already is past
             // the reach of this.
             let _ = kr_ipc::starter::withdraw_claim(environment, asked.request);
-            return Ok((ours(client)?, Some(started)));
+            return Ok((client, Some(started)));
         }
         Err(last) => last,
     };
@@ -1556,6 +1591,21 @@ pub(crate) fn task_report(environment: &EnvironmentPaths, selected: bool) -> Opt
     windows::report(environment, selected)
 }
 
+/// Whether the environment's scheduled task is the one this installation registers, as an update
+/// asks before it stops a daemon that task is to start again: this command's own installation, the
+/// daemon through the store's `current`, with nothing about it changed.
+///
+/// # Errors
+///
+/// Returns what is wrong with the task, in this command's words, when it is missing, is not this
+/// environment's own, or differs from what this installation registers.
+#[cfg(windows)]
+pub(crate) fn task_is_this_installation_s(
+    environment: &EnvironmentPaths,
+) -> std::result::Result<(), Shown> {
+    windows::check(environment)
+}
+
 /// The standalone start on Windows: this user's scheduled task for the environment, which the
 /// setup step registers and `kr new` runs.
 #[cfg(windows)]
@@ -1564,7 +1614,7 @@ mod windows {
     use std::time::Duration;
 
     use kr_client::shown;
-    use kr_client::shown::Shown;
+    use kr_client::shown::{Said as _, Shown};
     use kr_controller::supervision;
     use kr_controller::supervision::windows::{
         Registration, Standing, TaskChange, TaskDefinition, TaskError,
@@ -1741,6 +1791,35 @@ mod windows {
                 task::error(&undone, environment_id),
                 choice
             )),
+        }
+    }
+
+    /// Whether the environment's task is this installation's own, as it registers it.
+    pub fn check(environment: &EnvironmentPaths) -> std::result::Result<(), Shown> {
+        let environment_id = environment.environment_id();
+        let name = task::name(environment_id);
+        let program = super::daemon_program().map_err(|error| error.said())?;
+        let definition = definition(environment, &program).map_err(|error| error.said())?;
+        match supervision::windows::standing(&definition) {
+            Ok(Standing::Owned(differences)) if differences.is_empty() => Ok(()),
+            Ok(Standing::Owned(differences)) => Err(shown!(
+                "the scheduled task {} is not the one this installation registers: {}; {} to \
+                 repair it",
+                name,
+                task::differences(&differences),
+                task::SETUP_ACTION
+            )),
+            Ok(Standing::Absent) => Err(shown!(
+                "the scheduled task {} is not registered; {}",
+                name,
+                task::SETUP_ACTION
+            )),
+            Ok(Standing::Foreign(foreign)) => Err(shown!(
+                "a task named {} is registered that is not this environment's own: {}",
+                name,
+                task::foreign(&foreign.reason)
+            )),
+            Err(error) => Err(task::error(&error, environment_id)),
         }
     }
 

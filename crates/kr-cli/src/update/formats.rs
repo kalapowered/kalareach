@@ -804,7 +804,7 @@ fn cbor(file: &Path, member: &str, absent: u32) -> Result<Option<u32>, Shown> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
