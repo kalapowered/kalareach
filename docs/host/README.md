@@ -1342,14 +1342,14 @@ the old enrolment installed stays with the old enrolment.
 Both method groups arrive through the ordinary path. A read is checked against current authority; a
 mutation carries an action window and is checked against the method registry and its envelope. That
 admission travels into the catalogue and is asked again where the change becomes durable: the
-catalogue's transaction, and every file it publishes or reclaims, runs while the daemon holds its
-table of admitted connections for reading, so a revocation or a withdrawn connection, which take
-the table for writing, is ordered wholly before the change or wholly after it, and a request
-whose deadline or authority ran out while it waited behind a sync or a download changes nothing.
-A request, a typed key and an output batch only read that table, so none of them waits for a
-commit. A connection that is registered or withdrawn while a commit runs waits for the commit, and
-a reader that arrives after it can wait behind it, because the lock may queue readers behind a
-waiting writer.
+catalogue's transaction, and every file it publishes or reclaims, runs while the daemon holds the
+change's registration standing, so a revocation or a withdrawn connection is ordered wholly before
+the change or wholly after it, and a request whose deadline or authority ran out while it waited
+behind a sync or a download changes nothing. The daemon's table of admitted connections is held
+only for the check, not for the commit: a request, a typed key, an output batch and a connection
+that is registered never wait for a commit. A withdrawal does. A connection that ends is withdrawn
+when the commit is over, on a thread of its own, and a revocation that lands during a commit waits
+for it while it holds the registry, so the requests that need the registry wait with it.
 
 The catalogue's work that grows with a catalogue (a mutation, a read, the seed, a change of the
 adapters an organisation allows, and the plan of an installation a person confirms) runs on a
@@ -5155,11 +5155,12 @@ thread, a lock or a transaction. The check is the one every service asks from in
 whether this host owes a fence it could not raise, then whether the connection's registration still
 stands under the revision the mutation was admitted at, then whether its accepted deadline has
 passed. The service asks it under its own lock at each place a mutation starts a new effect, and
-every commit that makes such an effect durable runs while the daemon's connection table is held
-against a change, from the check to the end of the commit. This way any withdrawal of the connection will either be
-committed before the check or after the commit of the mutation. If the check fails, nothing the
-action began becomes durable or visible, and the refusal is not kept as its answer: the same action
-sent again under an admission that stands is decided as a first admission. Finishing an effect that
+every commit that makes such an effect durable runs while the connection's registration is held
+standing against a withdrawal, from the check to the end of the commit. This way any withdrawal of
+the connection will either be committed before the check or after the commit of the mutation. If
+the check fails, nothing the action began becomes durable or visible, and the refusal is not kept
+as its answer: the same action sent again under an admission that stands is decided as a first
+admission. Finishing an effect that
 is already begun, such as completing a publication or a cancellation whose claim is committed, and
 the recovery at startup are not new effects, and the service does not ask again for them. A request
 whose envelope names a different session from the object its parameters name is refused, because the

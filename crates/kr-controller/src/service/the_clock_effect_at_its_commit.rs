@@ -233,8 +233,8 @@ async fn a_signer_revoked_while_the_establishment_waits_cannot_spend_its_answer(
 /// effect has committed: it reads the clock as established when it does.
 ///
 /// That the withdrawal waits is decided by the lock a withdrawal takes: the registrations are held
-/// while the effect commits, which is the one thing that says so without a delay. The thread's own
-/// reading afterwards shows the order the lock gave.
+/// against it while the effect commits, which is the one thing that says so without a delay. The
+/// thread's own reading afterwards shows the order the lock gave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
     let (temp, controller, ..) = distrusting().await;
@@ -265,8 +265,8 @@ async fn a_withdrawal_started_inside_the_commit_completes_after_it() {
         })
     };
     assert!(
-        controller.admitted.try_write().is_err(),
-        "the registrations are held against a change while the effect commits"
+        controller.commit_hold.try_write().is_err(),
+        "the registrations are held against a withdrawal while the effect commits"
     );
     assert!(
         !withdrawal.is_finished(),

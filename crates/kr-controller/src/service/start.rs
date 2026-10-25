@@ -1043,6 +1043,7 @@ impl Controller {
             pending: Mutex::new(BTreeMap::new()),
             reservations: Arc::default(),
             admitted: std::sync::RwLock::new(BTreeMap::new()),
+            commit_hold: std::sync::RwLock::new(()),
             identity,
             secret_store: setup.secret_store,
             generation,

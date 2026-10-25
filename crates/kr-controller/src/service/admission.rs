@@ -208,9 +208,9 @@ impl Controller {
     /// Returns the table of admitted connections to read.
     ///
     /// Every request, every output batch and every check of an admission reads the table, and
-    /// any number of them do at once. A registration that is added, withdrawn or tied to a write
-    /// boundary takes [`Self::admitted_write`], which waits for the readers that hold the table
-    /// and lets none begin behind it.
+    /// any number of them do at once. The table is held only for the length of a reading or a
+    /// change of it, never for the length of a commit that stands on a registration
+    /// ([`Self::under_registration`]), so nothing that reads it waits for one.
     ///
     /// A synchronous lock, deliberately: nothing is awaited while it is held, and the registry
     /// guard often is. A connection table behind an asynchronous lock would make every reader of
@@ -223,20 +223,49 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Returns the table of admitted connections to change: a registration made, withdrawn or
-    /// tied to a write boundary, or every registration moved to a new revision.
+    /// Returns the table of admitted connections to add to or to tie a write boundary to: a
+    /// registration made, or the latch of a boundary attached to one.
     ///
-    /// A change waits for the readers that hold the table, among them a change of a plugin
-    /// catalogue that holds its connection's registration standing for the length of a commit
-    /// ([`Self::under_registration`]), and a reader that arrives while it waits waits behind it.
-    /// So a withdrawal lands wholly before such a commit's check or wholly after its end. A
-    /// request that is decided while no registration changes does not wait for a commit.
+    /// Neither takes away what a commit stands on, so neither waits for a commit. A registration
+    /// removed, or moved to another revision, takes [`Self::admitted_withdraw`] instead.
     pub(super) fn admitted_write(
         &self,
     ) -> std::sync::RwLockWriteGuard<'_, BTreeMap<ConnectionId, AdmittedConnection>> {
         self.admitted
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns the table of admitted connections to withdraw from or to move to another revision,
+    /// once no commit stands on a registration.
+    ///
+    /// It waits for every commit that holds a registration standing ([`Self::under_registration`])
+    /// and lets no new one begin behind it, so a withdrawal lands wholly before such a commit's
+    /// check or wholly after its end. The wait is as long as the commit, and holds the thread it
+    /// is made on.
+    pub(super) fn admitted_withdraw(&self) -> Withdrawing<'_> {
+        let hold = self
+            .commit_hold
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Withdrawing {
+            table: self.admitted_write(),
+            _hold: hold,
+        }
+    }
+
+    /// As [`Self::admitted_withdraw`], where no commit stands on a registration now; `None` where
+    /// one does.
+    fn try_admitted_withdraw(&self) -> Option<Withdrawing<'_>> {
+        let hold = match self.commit_hold.try_write() {
+            Ok(hold) => hold,
+            Err(std::sync::TryLockError::Poisoned(held)) => held.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(Withdrawing {
+            table: self.admitted_write(),
+            _hold: hold,
+        })
     }
 
     /// Runs one service transaction under a carried admission.
@@ -384,14 +413,17 @@ impl Controller {
     /// or the deadline passed.
     ///
     /// [`Self::check_registration`] answers for the moment it is asked. A change that becomes
-    /// durable later asks here instead: the connection table stays held for reading from the check
-    /// to the end of `commit`, and revoking authority and withdrawing a connection both take it
-    /// for writing, so a withdrawal is ordered wholly before the check or wholly after the commit.
-    /// A request, a key and an output batch only read the table, so none of them waits for a
-    /// commit, however long it takes. `commit` is synchronous and awaits nothing, because the table
-    /// is a synchronous lock that every registration change waits on. It may be a store
-    /// transaction, including its sync to disk, and holds nothing else of this host's that a table
-    /// holder takes.
+    /// durable later asks here instead: the hold on commits is taken for reading from the check to
+    /// the end of `commit`, and revoking authority and withdrawing a connection both take it for
+    /// writing ([`Self::admitted_withdraw`]), so a withdrawal is ordered wholly before the check
+    /// or wholly after the commit. The connection table itself is held only for the check, so a
+    /// request, a key, an output batch and a connection that is registered never wait for a
+    /// commit, however long it takes. A withdrawal does wait for it: a connection's end waits on a
+    /// thread of its own ([`Self::deregister`]), and a revocation that lands meanwhile waits
+    /// holding the registry, which delays the requests that need it until the commit has ended.
+    /// `commit` is synchronous and awaits nothing, because the hold is a synchronous lock that
+    /// every withdrawal waits on. It may be a store transaction, including its sync to disk, and
+    /// holds nothing else of this host's that a withdrawal takes.
     ///
     /// # Errors
     ///
@@ -401,10 +433,13 @@ impl Controller {
         admission: &crate::authority::AdmittedMutation,
         commit: impl FnOnce() -> T,
     ) -> Result<T> {
-        let admitted = self.admitted_read();
-        self.check_registration_in(&admitted, admission)?;
+        let hold = self
+            .commit_hold
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_registration_in(&self.admitted_read(), admission)?;
         let committed = commit();
-        drop(admitted);
+        drop(hold);
         Ok(committed)
     }
 
@@ -537,8 +572,25 @@ impl Controller {
     }
 
     /// Withdraws one connection's registration.
-    pub(super) fn deregister(&self, connection_id: ConnectionId) {
-        self.admitted_write().remove(&connection_id);
+    ///
+    /// A withdrawal is ordered after every commit that stands on a registration. Where one is
+    /// running, the withdrawal waits for it on a thread of its own, so that no task's thread is
+    /// held for as long as the commit takes, and the registration goes once the commit has ended.
+    pub(super) fn deregister(self: &Arc<Self>, connection_id: ConnectionId) {
+        if let Some(mut table) = self.try_admitted_withdraw() {
+            table.remove(&connection_id);
+            return;
+        }
+        let controller = Arc::clone(self);
+        let withdraw = move || {
+            controller.admitted_withdraw().remove(&connection_id);
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(withdraw);
+            }
+            Err(_) => withdraw(),
+        }
     }
 
     /// Ties the latch of a connection's write boundary to its registration, so that the
@@ -1188,6 +1240,27 @@ impl From<LeaseDenied> for ControllerError {
         match denied {
             LeaseDenied::NotAcknowledged(error) | LeaseDenied::Stopped(error) => error,
         }
+    }
+}
+
+/// The connection table held to withdraw a registration from it or to move registrations to
+/// another revision, with the hold on commits that stand on a registration taken first.
+pub(super) struct Withdrawing<'a> {
+    table: std::sync::RwLockWriteGuard<'a, BTreeMap<ConnectionId, AdmittedConnection>>,
+    _hold: std::sync::RwLockWriteGuard<'a, ()>,
+}
+
+impl std::ops::Deref for Withdrawing<'_> {
+    type Target = BTreeMap<ConnectionId, AdmittedConnection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl std::ops::DerefMut for Withdrawing<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.table
     }
 }
 

@@ -9,9 +9,9 @@
 //!   authority, a mutation carries an action window and is checked against the method registry,
 //!   and neither has an admission path of its own.
 //! * The admission travels into the catalogue as an [`Authority`], and the catalogue asks it again
-//!   where the change becomes durable. [`DaemonAdmission`] answers by holding this daemon's
-//!   connection table for the length of the commit, so a withdrawal lands wholly before the change
-//!   or wholly after it.
+//!   where the change becomes durable. [`DaemonAdmission`] answers by holding the change's
+//!   registration standing for the length of the commit, so a withdrawal lands wholly before the
+//!   change or wholly after it, and nothing that only reads the daemon's connection table waits.
 //! * Adopting a trust root, granting a capability and an installation that widens what a package
 //!   may do are the owner's decisions, and section 10 says outright that an operating-system
 //!   identity is not that decision. Those methods carry the owner's confirmation of one exact
@@ -86,9 +86,9 @@ impl Admission for Owner {
 ///
 /// It is asked twice. [`Authority::check`] before the slow work, so a lapsed admission stops
 /// without downloading anything, and [`Authority::commit`] where the change becomes durable,
-/// holding this daemon's table of admitted connections for the length of the commit. Revoking
-/// authority and withdrawing a connection take the same table, so neither can be ordered between
-/// the check and the change.
+/// holding the change's registration standing for the length of the commit. Revoking authority and
+/// withdrawing a connection wait for the commit, so neither can be ordered between the check and
+/// the change.
 pub struct DaemonAdmission {
     controller: Arc<crate::service::Controller>,
     admitted: crate::authority::AdmittedMutation,

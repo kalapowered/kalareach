@@ -509,7 +509,7 @@ impl Controller {
                 deadline: accepted.map(|accepted| accepted.deadline),
             };
             // The admission travels into the catalogue and is asked again where the change
-            // becomes durable, holding this daemon's connection table for that commit.
+            // becomes durable, holding the change's registration standing for that commit.
             let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(
                 crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
             );

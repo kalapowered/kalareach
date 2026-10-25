@@ -353,6 +353,12 @@ pub struct Controller {
     /// same critical section as the caller's final record validation, and withdrawn when the
     /// authority it was made under is revoked or the connection ends.
     admitted: std::sync::RwLock<BTreeMap<ConnectionId, AdmittedConnection>>,
+    /// Held for reading by every commit that stands on a connection's registration, from the
+    /// check of it to the end of the commit, and for writing by every withdrawal or replacement of
+    /// a registration, which therefore lands wholly before the check or wholly after the commit.
+    /// The connection table is not held for the length of a commit, so what only reads it, and a
+    /// registration that is added, never waits for one.
+    commit_hold: std::sync::RwLock<()>,
     identity: ControllerIdentity,
     /// Which store this daemon keeps its keys in.
     secret_store: kr_crypto::store::StoreSelection,

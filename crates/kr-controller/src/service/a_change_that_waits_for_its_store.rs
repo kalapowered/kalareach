@@ -126,7 +126,12 @@ enum Lapse {
 
 impl Lapse {
     /// Lets the admission of the action that arrived on `connection_id` lapse.
-    fn happens(self, controller: &Controller, clock: &ManualClock, connection_id: ConnectionId) {
+    fn happens(
+        self,
+        controller: &Arc<Controller>,
+        clock: &ManualClock,
+        connection_id: ConnectionId,
+    ) {
         match self {
             Self::Deadline => clock.advance(STANDING + Duration::from_secs(1)),
             Self::Withdrawal => controller.deregister(connection_id),
