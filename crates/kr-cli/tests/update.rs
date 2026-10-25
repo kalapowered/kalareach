@@ -8926,11 +8926,7 @@ fn no_type_a_store_keeps_is_undeclared() {
         "a type a store keeps is neither declared nor known:\n{}",
         undeclared.join("\n")
     );
-    let mut answers: Vec<&str> = stored_formats::table::retained_answers()
-        .iter()
-        .map(|(_, answer)| *answer)
-        .collect();
-    answers.extend(stored_formats::table::kept_without_a_holder());
+    let answers = stored_formats::table::stored_elsewhere();
     let changed = stored_formats::known_that_changed(&table, &known, &answers)
         .expect("the known types are read");
     assert!(changed.is_empty(), "{}", changed.join("\n"));
@@ -8996,11 +8992,7 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
         .find(|line| line.name == "ShellKind")
         .expect("listed")
         .pinned = "0000";
-    let mut answers: Vec<&str> = stored_formats::table::retained_answers()
-        .iter()
-        .map(|(_, answer)| *answer)
-        .collect();
-    answers.extend(stored_formats::table::kept_without_a_holder());
+    let answers = stored_formats::table::stored_elsewhere();
     let found = stored_formats::known_that_changed(&table, &moved, &answers).expect("read");
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].starts_with("ShellKind "), "{found:?}");
@@ -9037,6 +9029,26 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     assert!(
         found.iter().any(|said| said.contains("PushRatePolicy")
             && said.contains("nothing the store keeps holds it")),
+        "{found:?}"
+    );
+
+    // A line is exempt for its own store: the code a refused changeset action keeps is exempt
+    // there, and the same type listed for another store that keeps nothing that holds it is not.
+    let mut elsewhere = stored_formats::table::known();
+    elsewhere.push(stored_formats::known_protocol::<
+        kr_protocol::error::ErrorCode,
+    >("privacy", "ErrorCode", "0000"));
+    let found = stored_formats::known_that_changed(&table, &elsewhere, &answers).expect("read");
+    assert!(
+        found.iter().any(|said| said.contains("ErrorCode")
+            && said.contains("store privacy")
+            && said.contains("nothing the store keeps holds it")),
+        "{found:?}"
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|said| said.contains("store changesets") && said.contains("nothing")),
         "{found:?}"
     );
 

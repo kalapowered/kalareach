@@ -1779,8 +1779,9 @@ pub fn records_unlisted(stores: &[Store], file: &str) -> Result<Vec<String>, Str
 
 /// Each known type whose pinned digest is not the digest it has now, each that its store declares
 /// (its line is to be deleted), each that no store keeps, and each that nothing its store keeps holds
-/// any more and that is not named in `stored_elsewhere`: the answers of the methods the registry
-/// keeps, and the known types that no source item holds, as a column of words or a root document.
+/// any more and that is not named in `stored_elsewhere`, by store and name: the answers of the methods
+/// the registry keeps, and the known types that no source item holds, as a column of words, a root
+/// document or a stored answer.
 ///
 /// # Errors
 ///
@@ -1788,7 +1789,7 @@ pub fn records_unlisted(stores: &[Store], file: &str) -> Result<Vec<String>, Str
 pub fn known_that_changed(
     stores: &[Store],
     known: &[Known],
-    stored_elsewhere: &[&str],
+    stored_elsewhere: &[(&str, &str)],
 ) -> Result<Vec<String>, String> {
     let workspace = resolve::Workspace::at(repository())?;
     let mut found = Vec::new();
@@ -1829,7 +1830,7 @@ pub fn known_that_changed(
             let Some(identity) = line.identity(&workspace)? else {
                 continue;
             };
-            if !held.contains(&identity) && !stored_elsewhere.contains(&line.name) {
+            if !held.contains(&identity) && !stored_elsewhere.contains(&(line.store, line.name)) {
                 found.push(format!(
                     "{} is listed as known for the store {} and nothing the store keeps holds it any more: delete the line",
                     line.name, line.store

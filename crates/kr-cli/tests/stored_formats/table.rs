@@ -60,8 +60,8 @@ fn entry(
 #[must_use]
 pub fn known() -> Vec<Known> {
     use kr_protocol::{
-        account, attention, automation, delivery, error, host_account, identity, pairing, push,
-        sharing, skill,
+        account, attention, automation, changeset, delivery, error, host_account, identity,
+        pairing, push, sharing, skill,
     };
 
     let source = |store, name, file, pinned| Known {
@@ -344,6 +344,55 @@ pub fn known() -> Vec<Known> {
             &[("crates/kr-transfer/src/store.rs", "SnapshotState")],
             "49e5f3b705b933016657462dba3bf9a0971954b08a67e97fd03f28385b0517af",
         ),
+        // The answers the changesets store keeps as the bytes a method answered, and the code a
+        // refused action keeps. Nothing the store declares holds them yet.
+        known_protocol::<changeset::ChangesetCaptureResult>(
+            "changesets",
+            "ChangesetCaptureResult",
+            "4829cddce683d8b76ad0c6b373fb0a6b68574c1ac0a128de0c7ffda3bbf640f0",
+        ),
+        known_protocol::<changeset::ChangesetMaterializeResult>(
+            "changesets",
+            "ChangesetMaterializeResult",
+            "4b6d8e3b2e0004978b8272ad1619231bf297d1bd2af2a1c820bbfc720a5c595d",
+        ),
+        known_protocol::<changeset::DiffApplyResult>(
+            "changesets",
+            "DiffApplyResult",
+            "abc53b830959780d6135382f1285f66ca4884f25549b1f3394f08e4cccce4087",
+        ),
+        known_protocol::<error::ErrorCode>(
+            "changesets",
+            "ErrorCode",
+            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+        ),
+        // The code a refused workflow action keeps in `action_records.error_code`, read back as the
+        // code it names.
+        known_protocol::<error::ErrorCode>(
+            "workflows",
+            "ErrorCode",
+            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+        ),
+        // The parameters of the nodes a stored workflow holds, which admission decodes at each
+        // admission. The store declares the rest of them.
+        known_protocol::<changeset::ChangesetMaterializeParams>(
+            "workflows",
+            "ChangesetMaterializeParams",
+            "415bb9a78b87717defa5d777ecec5da28cf9caae0710cb702a26394e96c458d9",
+        ),
+        // The apply node's parameters are the type a stored apply node is decoded as. This line and
+        // its pair in `kept_without_a_holder` go when the store declares a frozen type of its own
+        // for the stored node, which keeps the type's present shape.
+        known_protocol::<changeset::DiffApplyParams>(
+            "workflows",
+            "DiffApplyParams",
+            "797959de9f2a9930651527808996128047e5f9ee0989a258675d6cab0af57430",
+        ),
+        known_protocol::<changeset::ChangesetCaptureParams>(
+            "workflows",
+            "ChangesetCaptureParams",
+            "80ebb6910f711df25f77d570e901bc698b58a6a0ca21cbe8fcd96006f4e929d5",
+        ),
         // The environment's presence record.
         known_protocol::<identity::EnvironmentPresence>(
             "environments",
@@ -366,12 +415,39 @@ pub fn known() -> Vec<Known> {
     ]
 }
 
-/// The known types that no source item holds: a type a store keeps in a column of words, and the
-/// document that is the root of a stored value. A known line for one is not stale for want of a
-/// holder.
+/// The known types that no source item holds, by the store that keeps each and the type's name: a
+/// type a store keeps in a column of words, the document that is the root of a stored value, and
+/// the answers a store keeps for a retried call. A known line for one is not stale for want of a
+/// holder. A line is exempt for its own store only, so a type kept by two stores is not exempt for
+/// the one that stopped keeping it.
 #[must_use]
-pub fn kept_without_a_holder() -> Vec<&'static str> {
-    vec!["PairingConsumedReason"]
+pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("registry", "PairingConsumedReason"),
+        // The answers a stored action result holds, which `actions.result` keeps as the bytes the
+        // method answered, and the code a refused action keeps in `actions.error_code`.
+        ("changesets", "ChangesetCaptureResult"),
+        ("changesets", "ChangesetMaterializeResult"),
+        ("changesets", "DiffApplyResult"),
+        ("changesets", "ErrorCode"),
+        ("workflows", "ErrorCode"),
+        // The parameters of a stored workflow's node, which admission decodes at each admission.
+        ("workflows", "ChangesetMaterializeParams"),
+        // Goes with the apply node's line in `known`.
+        ("workflows", "DiffApplyParams"),
+        ("workflows", "ChangesetCaptureParams"),
+    ]
+}
+
+/// Every known type that no source item holds, with the store that keeps it: the answers the
+/// registry keeps for the methods that keep one, and [`kept_without_a_holder`].
+#[must_use]
+pub fn stored_elsewhere() -> Vec<(&'static str, &'static str)> {
+    retained_answers()
+        .iter()
+        .map(|(_, answer)| ("registry", *answer))
+        .chain(kept_without_a_holder())
+        .collect()
 }
 
 /// The type of the answer the registry keeps for each method that has it kept, by the type's name:
