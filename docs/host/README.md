@@ -1082,7 +1082,8 @@ so a recycled identifier reads as a different process. Neither carries a boot. O
 value counts clock ticks since boot, so a process of a later boot that repeats a recorded worker's
 identifier and tick reads as that worker for as long as it runs: a start that finds the sessions of
 an earlier boot leaves such a session open, and it closes later with the reason a worker found
-gone has, not as the host's restart. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
+gone has, unless the worker's own record of its processes names the earlier boot, which closes it as
+the host's restart when that process ends. A query the operating system refuses is reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
 A process query answers one of three things: the process and its start identity, gone, or cannot
@@ -4140,8 +4141,12 @@ fact that puts it in the session's tree (its parent, its session, its terminal, 
 session's job), so an identifier the kernel gave to a stranger after the process it listed ended is
 not recorded. A process stays in the record until the kernel says it has ended, so one that left
 the tree after it was seen is still stopped, unless it left for a control daemon's own scope.
-The record belongs to one boot: one from another boot, one from an earlier build that names no boot,
-and a missing one are not acted on, and the closure says why. A recorded process is stopped only
+The record belongs to one boot. One that names an earlier boot of the kind this host reads, with a
+value of the same length, says the worker went with that boot: nothing is stopped, since no process
+of one boot runs in another, nothing is listed as surviving, and the closure gives the host's restart
+as its reason, whatever this daemon remembers of the session. One that names a boot this host cannot
+compare with its own (another kind of identity or another length), one from an earlier build that
+names no boot, and a missing one are not acted on, and the closure says why. A recorded process is stopped only
 through the platform's hold on it: a process descriptor on Linux, the kernel's own version of the
 process on macOS (which the kernel checks again as it signals), an open handle on Windows. A
 platform that offers none of these does not signal the process by its number. On Unix the cleanup

@@ -1151,19 +1151,38 @@ async fn a_server_the_worker_recorded_is_asked_to_end_without_a_hang_up() {
 /// A record this pass may not act on stops nothing, and the closure says why. The processes are
 /// real and carry their true identities, so the only reason they are left alone is the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_record_from_another_boot_or_none_at_all_stops_nothing_and_says_why() {
-    for what in ["another boot", "a record that names no boot", "no record"] {
+async fn a_record_of_a_boot_that_cannot_be_compared_or_none_at_all_stops_nothing_and_says_why() {
+    for what in [
+        "another kind of boot",
+        "a boot of another length",
+        "a record that names no boot",
+        "no record",
+    ] {
         let (_temp, archive) = host();
         let session_id = session();
         let leftover = leftover();
         {
             let mut journal = journal_for(&archive, session_id);
             let mut record = owned_record(vec![leftover.identity.clone()]);
+            let now = kr_ipc::identity::boot_identity().expect("this boot");
             match what {
-                "another boot" => {
+                "another kind of boot" => {
                     record.boot = Some(kr_protocol::identity::BootIdentity {
-                        source: kr_protocol::identity::BootIdentitySource::BootTime,
+                        source: if now.source == kr_protocol::identity::BootIdentitySource::BootTime
+                        {
+                            kr_protocol::identity::BootIdentitySource::LinuxBootId
+                        } else {
+                            kr_protocol::identity::BootIdentitySource::BootTime
+                        },
                         value: kr_protocol::scalars::Bytes::new(b"not this boot".to_vec()),
+                    });
+                }
+                "a boot of another length" => {
+                    let mut value = now.value.as_slice().to_vec();
+                    value.push(0);
+                    record.boot = Some(kr_protocol::identity::BootIdentity {
+                        source: now.source,
+                        value: kr_protocol::scalars::Bytes::new(value),
                     });
                 }
                 "a record that names no boot" => record.boot = None,
@@ -1186,8 +1205,50 @@ async fn a_record_from_another_boot_or_none_at_all_stops_nothing_and_says_why() 
                 .any(|resource| resource.kind == "unestablished"),
             "{what}: the closure says why: {fenced:?}"
         );
+        assert!(
+            !fenced.earlier_boot,
+            "{what}: such a record does not say the worker went with an earlier boot"
+        );
         assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete, "{what}");
     }
+}
+
+/// A record that names an earlier boot of this boot's own kind says the worker went with that boot:
+/// nothing is stopped, since no process of one boot runs in another, and nothing is listed as
+/// surviving, since nothing outlives a boot. The pass says so, and the closure can give the host's
+/// restart as the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_of_an_earlier_boot_of_this_boots_kind_stops_nothing_and_lists_nothing() {
+    let (_temp, archive) = host();
+    let session_id = session();
+    let leftover = leftover();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        let mut record = owned_record(vec![leftover.identity.clone()]);
+        let now = kr_ipc::identity::boot_identity().expect("this boot");
+        let mut value = now.value.as_slice().to_vec();
+        value[0] ^= 0xff;
+        record.boot = Some(kr_protocol::identity::BootIdentity {
+            source: now.source,
+            value: kr_protocol::scalars::Bytes::new(value),
+        });
+        journal
+            .record_owned(session_id, &record)
+            .expect("records what the session owned");
+    }
+    let ownership = take(&archive, session_id);
+    let fenced = archive.fence_owned(&ownership, None).await;
+    assert!(leftover.running(), "nothing was stopped");
+    assert!(fenced.ended.is_empty(), "nothing is reported ended");
+    assert!(
+        fenced.surviving.is_empty(),
+        "a worker of an earlier boot owned nothing that outlived the boot: {fenced:?}"
+    );
+    assert!(
+        fenced.earlier_boot,
+        "and the pass says the worker went with its boot"
+    );
+    assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
 }
 
 /// A process the platform will not let this host stop is named in the closure, by identifier and
