@@ -45,6 +45,7 @@ import to.kala.reach.companion.mobile.CallOpenings
 import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
 import to.kala.reach.companion.mobile.CurrentTokenHolder
+import to.kala.reach.companion.mobile.KeyFilings
 import to.kala.reach.companion.mobile.NotificationRoute
 import to.kala.reach.companion.mobile.OwnerAuthenticators
 import to.kala.reach.companion.mobile.PreviewKeySet
@@ -132,6 +133,8 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     private val askingLock = Any()
     private var asking: Asking? = null
     private val deadlines = Handler(Looper.getMainLooper())
+
+    private val keyFilings = KeyFilings { PushStores.limited(noBackup, KeystoreSealer()) }
 
     private val secrets by lazy {
         SecretFiles(File(activity.noBackupFilesDir, "secrets"), KeystoreSealer())
@@ -395,11 +398,14 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("the preview keys are not keys")
             return
         }
-        try {
-            PushStores.limited(noBackup, KeystoreSealer()).replace(keys)
-            invoke.resolve(done())
-        } catch (failure: Exception) {
-            invoke.reject("the preview keys could not be filed")
+        // A change waits for the receivers that are deciding, which a command's own thread (the main
+        // thread) must not do.
+        keyFilings.file(keys) { failure ->
+            if (failure == null) {
+                invoke.resolve(done())
+            } else {
+                invoke.reject("the preview keys could not be filed")
+            }
         }
     }
 

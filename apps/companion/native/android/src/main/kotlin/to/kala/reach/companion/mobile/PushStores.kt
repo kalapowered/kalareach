@@ -162,3 +162,34 @@ class LimitedKeys(directory: File, sealer: Sealer) {
         const val ITEM = "preview-keys"
     }
 }
+
+/**
+ * Files sets of preview keys for the application, off the thread that asks and one at a time in the
+ * order they were asked.
+ *
+ * A change of the keys waits for the receivers that are deciding ([PreviewKeyGate]), and the
+ * command that asks for it arrives on the application's main thread, which must not be held while
+ * a receiver finishes. So the change is made on a thread of its own. The thread is one, so that a
+ * set asked for later is never filed before one asked for earlier, even when the earlier one is
+ * still waiting: the store ends up with the last set asked for.
+ */
+class KeyFilings(private val limited: () -> LimitedKeys) {
+    private val thread =
+        java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+            Thread(task, "kr-preview-keys").apply { isDaemon = true }
+        }
+
+    /** Files `keys` and then calls `done` with nothing, or with what stopped it. */
+    fun file(keys: PreviewKeySet, done: (failure: Exception?) -> Unit) {
+        thread.execute {
+            done(
+                try {
+                    limited().replace(keys)
+                    null
+                } catch (failure: Exception) {
+                    failure
+                }
+            )
+        }
+    }
+}

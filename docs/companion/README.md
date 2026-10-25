@@ -501,10 +501,13 @@ does. The switch reads as changed at once and waits while a step runs. Turning i
 key out of what the phone's receivers hold before the host is told, so a preview already on its way is
 not opened; turning it on files the key first. A receiver that is deciding at that moment is ordered
 against the change. On Android, the change of the keys waits until every receiver that is deciding has
-posted what it decided, and a receiver that starts later reads the keys as the person left them. On
-iOS, the extension reads the host's key again after it opens the preview and shows the preview only if
-that key is still there; a notification that passed this read before the key was removed was already
-on its way to the screen. The host is then told with `device.push.register`,
+posted what it decided, and a receiver that starts later reads the keys as the person left them; the
+wait is on a thread of the plugin's own, since the command arrives on the main thread. On iOS, the
+extension is another process and shares no lock with the application, so it reads the host's key again
+after it opens the preview and shows the preview only if that key is still there. The time between that
+read and the hand-over to the system is a few operations and does not grow with the time the open
+takes; a notification that passed the read before the key was removed was decided while previews were
+on. The host is then told with `device.push.register`,
 which carries the choice: a host seals nothing and names no recipient key in later notifications when
 it is off. Only that registration is repeated, under the authorisation identifier the phone already
 keeps and with no new token proposal. A host that cannot be told leaves the row needing the person,
