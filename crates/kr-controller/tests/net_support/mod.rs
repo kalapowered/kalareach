@@ -325,6 +325,11 @@ pub struct Waits {
     /// waits by a timer of its own that nothing releases, so that a suite reading the order of the
     /// carriers' waits meets only theirs.
     pub reader_shares_the_timer: bool,
+    /// A socket held on the address a daemon that was shut down had bound, from the moment it let
+    /// go of it until the next daemon, which names the same address, is about to bind it: no other
+    /// socket of the machine can be given the port in between, however long the next daemon takes
+    /// to start.
+    pub address_held: Arc<std::sync::Mutex<Option<std::net::UdpSocket>>>,
 }
 
 impl Host {
@@ -522,6 +527,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
+                ..Waits::default()
             },
         )
         .await;
@@ -569,6 +575,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: true,
+                ..Waits::default()
             },
         )
         .await;
@@ -648,6 +655,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
+                ..Waits::default()
             },
         )
         .await;
@@ -695,6 +703,21 @@ impl Host {
         host
     }
 
+    /// Has this daemon come back, when it restarts, at the address it is bound to now. A suite
+    /// that starts a daemon on a loopback address of any port, and pairs a device with it, calls
+    /// this once the daemon is up, so that the port is the one the system gave it and was never
+    /// chosen first and left for another socket to take.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the daemon is not bound to exactly one socket.
+    pub fn comes_back_at_its_address(&mut self) {
+        let [bound] = self.network.bound_sockets()[..] else {
+            panic!("the daemon is bound to one socket");
+        };
+        self.settings.endpoint.bind_addr = Some(bound);
+    }
+
     /// Stops this daemon and starts another on the same environment tree, the way a restart of
     /// the host does: every durable record stays, and nothing held in memory does.
     pub async fn restart(self) -> Self {
@@ -740,6 +763,31 @@ impl Host {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
+        // The address the daemon was bound to stays held until the next one is about to bind it.
+        // The daemon's own socket may close a moment after it is let go of, so the address is
+        // taken as soon as it is free.
+        if let Some(address) = settings
+            .endpoint
+            .bind_addr
+            .filter(|address| address.port() != 0)
+        {
+            let held = loop {
+                match std::net::UdpSocket::bind(address) {
+                    Ok(socket) => break Some(socket),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::AddrInUse
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(_) => break None,
+                }
+            };
+            *waits
+                .address_held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = held;
+        }
         Stopped {
             temp,
             room,
@@ -831,6 +879,15 @@ impl Host {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the client endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+        // The address held for this daemon since the one before it let go of it is let go of right
+        // before the network is registered, which binds the endpoint.
+        drop(
+            waits
+                .address_held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         // The endpoint configuration is this suite's own, so the network is registered here rather
         // than from the environment. The device keys live in memory and go with it.
         let network = net::register(
@@ -1114,6 +1171,7 @@ impl Stopped {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer,
+                ..Waits::default()
             },
         )
         .await;

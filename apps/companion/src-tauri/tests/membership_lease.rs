@@ -462,13 +462,12 @@ impl Rig {
     /// As [`Self::start`], for a member whose grant and leases carry `rights`, and with a host that
     /// serves `sessions` sessions.
     async fn start_with(rights: &[ActionRight], sessions: u64) -> Self {
-        let port = {
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("a port");
-            socket.local_addr().expect("an address").port()
+        // The host binds a port the system gives it, and keeps that address from here on, so no
+        // port is chosen first and left for another socket to take before the host binds it.
+        let settings = kr_controller::service::net::config::NetworkSettings {
+            endpoint: net_support::loopback(),
+            ..kr_controller::service::net::config::NetworkSettings::default()
         };
-        let mut settings = kr_controller::service::net::config::NetworkSettings::default();
-        settings.endpoint.bind_addr =
-            Some(format!("127.0.0.1:{port}").parse().expect("an address"));
         let mut fixture = Fixture::start_on(settings).await;
         let mut workers = Vec::new();
         if sessions > 0 {
@@ -495,6 +494,9 @@ impl Rig {
             fixture.host = host;
             workers = kept;
         }
+        // Nothing has met the host yet, so the address it has now is the one the device is paired
+        // with and the one it comes back at.
+        fixture.host.comes_back_at_its_address();
         let served = serve().await;
         account_system_knows(&served, ACCOUNT);
         let signing = Arc::new(Signing {
