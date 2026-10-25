@@ -700,3 +700,28 @@ async fn no_connection_is_opened_to_a_worker_whose_session_closed() {
         "the connection table holds nothing for a closed session"
     );
 }
+
+/// The attention store's pass over the change-set store takes a session as held while its worker is
+/// known and after its closure is recorded, which is when the worker has left the directory, and
+/// takes one the daemon has never heard of as not held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_is_held_by_its_worker_and_then_by_its_closure() {
+    let world = Served::recorded().await;
+    let held = world.controller.held_sessions();
+    assert!(held.holds(world.session_id).await, "its worker is known");
+    world
+        .controller
+        .retire(&closure_of(world.session_id))
+        .await
+        .expect("the closure is recorded");
+    assert!(
+        held.holds(world.session_id).await,
+        "its closure is recorded, and its worker has left the directory"
+    );
+    assert!(
+        !held
+            .holds(kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()))
+            .await,
+        "a session nobody has heard of is not held"
+    );
+}

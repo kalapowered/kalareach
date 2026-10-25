@@ -66,6 +66,12 @@ impl Controller {
         Arc::new(AttentionReach(self.me.clone()))
     }
 
+    /// Returns which sessions this daemon holds.
+    #[must_use]
+    pub fn held_sessions(&self) -> Arc<dyn crate::attention::HeldSessions> {
+        Arc::new(AttentionReach(self.me.clone()))
+    }
+
     /// Starts the attention store's reading of every session it has to read, and its own work.
     pub(super) async fn start_attention(self: &Arc<Self>) -> Result<()> {
         self.watch_open_sessions().await?;
@@ -73,6 +79,11 @@ impl Controller {
         // the store and the journal left off before the timers run.
         self.attention
             .consume_automation(Arc::clone(self.automation.journal()))
+            .await;
+        // The change-set store's versions are the other: review work for each, caught up with
+        // before anything is served.
+        self.attention
+            .consume_change_sets(Arc::clone(self.changesets.service()), self.held_sessions())
             .await;
         self.attention.maintain(self.attention_reach());
         Ok(())
@@ -216,5 +227,27 @@ impl crate::attention::Reach for AttentionReach {
         )
         .ok()
         .map(|history| history.oldest_retained_cursor())
+    }
+}
+
+impl crate::attention::HeldSessions for AttentionReach {
+    fn holds<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(controller) = self.0.upgrade() else {
+                return false;
+            };
+            // The directory first, then the closure: a closure is recorded before its worker leaves
+            // the directory, so a session that is closing is found by one of the two.
+            if controller.directory.lock().await.get(session_id).is_some() {
+                return true;
+            }
+            matches!(
+                controller.registry.lock().await.closure(session_id),
+                Ok(Some(_))
+            )
+        })
     }
 }

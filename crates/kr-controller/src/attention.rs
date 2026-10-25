@@ -93,6 +93,8 @@ use kr_worker::history_filter::{HistoryFilter, Surface, ViewerScope};
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 
+mod change_sets;
+
 /// What one answer of a method in this group is.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
@@ -314,6 +316,16 @@ pub trait Reach: Send + Sync {
     /// Returns the oldest output position a closed session's spool still retains, when it can be
     /// read.
     fn output_floor(&self, session_id: SessionId) -> Option<u64>;
+}
+
+/// Which sessions this host holds.
+pub trait HeldSessions: Send + Sync {
+    /// Answers whether this host holds the session: a worker is known for it, or its closure is
+    /// recorded.
+    fn holds<'a>(
+        &'a self,
+        session_id: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 }
 
 /// What a closed session's journal can be asked for.
@@ -719,6 +731,20 @@ pub struct AttentionModule {
     automation_failing: AtomicBool,
     /// The task that reads the workflow journal when it changes, ended with the module.
     automation_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// What the pass over the change-set store has settled.
+    change_sets: std::sync::Mutex<change_sets::ChangeSetPass>,
+    /// Set once the change-set store is being read, so it is read by one loop.
+    change_sets_started: std::sync::OnceLock<()>,
+    /// Woken when the change-set service records a version.
+    change_sets_wake: Arc<tokio::sync::Notify>,
+    /// Whether the last pass over the change-set store stopped short, so a failure that persists is
+    /// reported once rather than at every pass.
+    change_sets_failing: AtomicBool,
+    /// The task that reads the change-set store, ended with the module.
+    change_sets_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How many passes over the change-set store have finished.
+    #[cfg(any(test, feature = "testing"))]
+    change_sets_passes: tokio::sync::watch::Sender<u64>,
     /// How many passes over the workflow journal have finished, which a test reads to see that an
     /// idle journal costs none.
     #[cfg(test)]
@@ -753,6 +779,14 @@ impl Drop for AttentionModule {
     fn drop(&mut self) {
         let task = self
             .automation_task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+        }
+        let task = self
+            .change_sets_task
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -847,6 +881,13 @@ impl AttentionModule {
             descriptions: std::sync::OnceLock::new(),
             automation_failing: AtomicBool::new(false),
             automation_task: std::sync::Mutex::new(None),
+            change_sets: std::sync::Mutex::new(change_sets::ChangeSetPass::default()),
+            change_sets_started: std::sync::OnceLock::new(),
+            change_sets_wake: Arc::new(tokio::sync::Notify::new()),
+            change_sets_failing: AtomicBool::new(false),
+            change_sets_task: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            change_sets_passes: tokio::sync::watch::channel(0).0,
             #[cfg(test)]
             automation_passes: AtomicU64::new(0),
             #[cfg(feature = "testing")]
