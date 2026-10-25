@@ -4554,6 +4554,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winx",
  "zeroize",
+ "zip",
 ]
 
 [[package]]
