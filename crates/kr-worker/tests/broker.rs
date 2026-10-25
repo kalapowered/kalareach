@@ -1718,7 +1718,9 @@ fn no_arguments() -> Digest256 {
 /// A component package's channel with one relayed approval that the package's decoder
 /// interpreted as its component does, against the component's own projection schema, with the
 /// package's actions registered and a transport bound to carry an answer.
-fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResourceId) {
+fn component_decoded(
+    connector: &InstalledConnector,
+) -> (Broker, PendingResourceId, std::sync::Arc<RecordingUpstream>) {
     let package = connector.package().clone();
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
@@ -1760,11 +1762,9 @@ fn component_decoded(connector: &InstalledConnector) -> (Broker, PendingResource
             TimestampMs::new(3),
         )
         .expect("the component's interpretation is accepted");
-    broker.bind_connection_dispatch(
-        connection,
-        std::sync::Arc::new(RecordingUpstream::default()) as _,
-    );
-    (broker, relayed.resource_id)
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    broker.bind_connection_dispatch(connection, std::sync::Arc::clone(&upstream) as _);
+    (broker, relayed.resource_id, upstream)
 }
 
 /// KR-REQ-11.47: an action's effect class is the class it declares, and a label cannot change it.
@@ -1967,7 +1967,7 @@ fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_en
     for narrowing in ["approval.respond", "approval.decode"] {
         let root = package_store();
         let connector = claude_code(&root, true, &[]);
-        let (broker, relayed) = component_decoded(&connector);
+        let (broker, relayed, _) = component_decoded(&connector);
         let admitted = broker
             .admit_approval(
                 &caller("device-1"),
@@ -2024,6 +2024,38 @@ fn kr_req_11_47_an_answer_to_a_component_decoded_request_needs_its_decoder_to_en
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// KR-REQ-11.21: the answer to a request a bridge channel relayed is written by the host from the
+/// validated decision, whoever read the request. A component that read it is not asked to write
+/// the answer, and the host does not refuse the answer for want of a component's bytes.
+#[tokio::test]
+async fn kr_req_11_21_a_bridge_channels_answer_is_written_by_the_host_though_a_component_read_it() {
+    let root = package_store();
+    let connector = claude_code(&root, true, &[]);
+    let (broker, relayed, upstream) = component_decoded(&connector);
+    let (answered, _) = broker
+        .agent_approval_respond(
+            &caller("device-1"),
+            &respond(relayed, "allow"),
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("the host writes the channel's answer from the decision");
+    assert_eq!(answered.state, PendingState::Resolved);
+    let submitted = upstream.submitted();
+    let [request] = submitted.as_slice() else {
+        panic!("one answer was carried: {submitted:?}");
+    };
+    let UpstreamBody::Approval { response, .. } = &request.body else {
+        panic!("the answer is an approval: {:?}", request.body);
+    };
+    let frame = String::from_utf8_lossy(response.frame());
+    assert!(
+        frame.contains("abcde") && frame.contains("allow"),
+        "the channel's own verdict for the request: {frame}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// KR-REQ-11.47: a binding's actions are registered from its package's declarations and from
