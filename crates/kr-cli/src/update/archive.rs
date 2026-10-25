@@ -337,16 +337,13 @@ fn read_tail(
         }
         at += 46 + name + extra;
     }
-    // The entries tile the directory, and nothing in it or at its edge is an end record.
-    let edge: Vec<u8> = judged[directory.saturating_sub(3)..]
-        .iter()
-        .chain(&end[..3])
-        .copied()
-        .collect();
-    let named = |window: &[u8]| END_RECORDS.iter().any(|record| record == window);
+    // The entries tile the directory, and nothing in it is an end record: the parser looks for one
+    // by its signature and falls back to an earlier one when the last does not serve. The end
+    // record after it cannot make one with the directory's last bytes, which it begins with `P`.
     if at != directory
-        || judged.windows(4).any(named)
-        || edge.windows(4).take(directory.min(3)).any(named)
+        || judged
+            .windows(4)
+            .any(|window| END_RECORDS.iter().any(|record| record == window))
     {
         return Ok(Err(NOT_A_ZIP));
     }
@@ -436,5 +433,64 @@ impl Seek for Shown {
         };
         self.at = target;
         Ok(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A directory of one entry named `a` with `extra` after the name, and the end record after it.
+    fn archive_ending(extra: &[u8]) -> Vec<u8> {
+        let mut bytes = b"PK\x01\x02".to_vec();
+        bytes.extend_from_slice(&[0; 24]);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(extra.len()).expect("short").to_le_bytes());
+        bytes.extend_from_slice(&[0; 14]);
+        bytes.push(b'a');
+        bytes.extend_from_slice(extra);
+        let size = u32::try_from(bytes.len()).expect("small");
+        bytes.extend_from_slice(b"PK\x05\x06");
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    fn judged(bytes: &[u8]) -> bool {
+        let mut file = tempfile::tempfile().expect("a file");
+        file.write_all(bytes).expect("written");
+        read_tail(&mut file, &Limits::DEFAULT)
+            .expect("reads")
+            .is_ok()
+    }
+
+    /// KR-REQ-26.06: the parser falls back to an earlier end record when the last does not serve,
+    /// so a directory that holds the signature of an end record, of its 64-bit form or of that
+    /// form's locator, anywhere among its entries is refused before the parser sees it; the same
+    /// directory without it is judged whole.
+    #[test]
+    fn a_directory_that_holds_the_signature_of_an_end_record_is_refused() {
+        assert!(judged(&archive_ending(b"")), "the control is judged whole");
+        assert!(
+            judged(&archive_ending(b"PK\x05")),
+            "a part of a signature is not one"
+        );
+        for record in END_RECORDS {
+            assert!(
+                !judged(&archive_ending(&record)),
+                "{record:?} among the entries is refused"
+            );
+            let mut later = b"zz".to_vec();
+            later.extend_from_slice(&record);
+            assert!(
+                !judged(&archive_ending(&later)),
+                "{record:?} after other extra data is refused"
+            );
+        }
     }
 }
