@@ -118,6 +118,50 @@ final class SealedPreviewTests: XCTestCase {
         }
     }
 
+    /// The keys the golden names, until the host's key is taken away, as turning previews off does.
+    private final class SwitchableKeys: PreviewKeyReading {
+        private let lock = NSLock()
+        private let golden: Golden
+        private var holdsTheSender = true
+
+        init(_ golden: Golden) { self.golden = golden }
+
+        func turnPreviewsOff() {
+            lock.lock()
+            holdsTheSender = false
+            lock.unlock()
+        }
+
+        func recipientSeed(forRecipient recipientKeyID: Data) throws -> Data {
+            guard recipientKeyID == golden.recipientKeyID else { throw PreviewKeyUnavailable.notProvisioned }
+            return golden.recipientSeed
+        }
+
+        func senderKey(forSender senderKeyID: Data) throws -> Data {
+            lock.lock()
+            let holds = holdsTheSender
+            lock.unlock()
+            guard holds, senderKeyID == golden.senderKeyID else { throw PreviewKeyUnavailable.notProvisioned }
+            return golden.senderKey
+        }
+    }
+
+    /// The real opener, held at the start of its work until the test lets it go.
+    private final class HeldOpener: PreviewOpening {
+        let opening = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+
+        func open(preview: String, alert: String, seed: Data, senderKey: Data, nowMilliseconds: UInt64)
+            -> PreviewOpened
+        {
+            opening.signal()
+            _ = release.wait(timeout: .now() + 30)
+            return RustPreviewOpener().open(
+                preview: preview, alert: alert, seed: seed, senderKey: senderKey,
+                nowMilliseconds: nowMilliseconds)
+        }
+    }
+
     /// The bodies the system was handed, from whichever thread handed them.
     private final class HandedBack {
         private let lock = NSLock()
@@ -168,6 +212,35 @@ final class SealedPreviewTests: XCTestCase {
         wait(for: [returned], timeout: 30)
 
         XCTAssertEqual(handedBack.bodies, [sealed.alert], "the generic alert, once, and nothing after it")
+    }
+
+    func testPreviewsTurnedOffWhileThePreviewIsBeingOpenedLeaveTheGenericAlert() throws {
+        let sealed = try golden()
+        let earlier = NotificationService.parts
+        defer { NotificationService.parts = earlier }
+        let keys = SwitchableKeys(sealed)
+        let opener = HeldOpener()
+        NotificationService.parts = ExtensionParts(
+            keys: keys,
+            opener: opener,
+            nowMilliseconds: { sealed.nowMilliseconds })
+        let handedBack = HandedBack()
+        let returned = expectation(description: "didReceive returned")
+        let service = NotificationService()
+        let incoming = request(for: sealed)
+        DispatchQueue.global().async {
+            service.didReceive(incoming) { handedBack.add($0.body) }
+            returned.fulfill()
+        }
+
+        // The extension has read the host's key and is opening the preview with it.
+        XCTAssertEqual(opener.opening.wait(timeout: .now() + 30), .success, "the extension reached the opener")
+        // The person turns previews off, and the host's key goes, while the preview is still open.
+        keys.turnPreviewsOff()
+        opener.release.signal()
+        wait(for: [returned], timeout: 30)
+
+        XCTAssertEqual(handedBack.bodies, [sealed.alert], "the generic alert, since previews are off now")
     }
 
     func testANotificationServedWhileAnotherIsBeingOpenedIsCompletedWithItsOwnHandler() throws {

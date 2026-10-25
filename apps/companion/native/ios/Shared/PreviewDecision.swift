@@ -142,7 +142,20 @@ struct PreviewDecider {
         case let .text(text):
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             // An envelope that opens to nothing is not a preview. The alert the host chose stands.
-            return trimmed.isEmpty ? .generic(.emptyPreview) : .reveal(trimmed)
+            if trimmed.isEmpty { return .generic(.emptyPreview) }
+            // The person can turn previews off while the envelope is being opened, which takes the
+            // host's key out of the keychain. The key is read once more as the last step, so the
+            // preview is shown only on a decision made while previews were still allowed: the
+            // keychain orders that read against the removal, and a removal that comes after it is
+            // a notification already on its way out when previews were turned off.
+            do {
+                guard try keys.senderKey(forSender: envelope.routing.senderKeyID) == senderKey else {
+                    return .generic(.senderUnknown)
+                }
+            } catch {
+                return .generic(Self.reason(for: error, whenAbsent: .senderUnknown))
+            }
+            return .reveal(trimmed)
         }
     }
 
