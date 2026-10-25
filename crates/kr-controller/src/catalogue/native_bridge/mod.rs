@@ -1868,8 +1868,9 @@ impl NativeBridges {
                         Ok(_) => {
                             return Ok(Outcome::Unfinished(
                                 "the directory holds something else beside it, and the \
-                                 application needs it for as long as that stays; the package is \
-                                 applied again once it is gone"
+                                 application needs it for as long as that stays; it is taken \
+                                 out, and a package that is still wanted applied, once that is \
+                                 gone"
                                     .to_owned(),
                             ));
                         }
