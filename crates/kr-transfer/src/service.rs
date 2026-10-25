@@ -24,7 +24,8 @@ use kr_flush::NameKind;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    ActionId, ActorId, DraftId, DraftRevision, EnvironmentId, GrantId, SessionId, TransferId,
+    ActionId, ActorId, ApplicationInstanceId, DraftId, DraftRevision, EnvironmentId, GrantId,
+    SessionId, TransferId,
 };
 use kr_protocol::insertion::{
     BindingFacts, DraftFacts, InsertionBegin, InsertionClaim, InsertionReport,
@@ -2656,12 +2657,15 @@ impl TransferService {
     ///
     /// Returns [`TransferError::UnknownDraft`] when the draft is not this actor's,
     /// [`TransferError::NotAdmitted`] when the admission the prompt arrived under no longer stands
-    /// where the record is made, and what [`Store::record_prompt`] returns otherwise.
+    /// where the record is made, [`TransferError::DraftConflict`] when the draft was written for
+    /// another application than `application_instance_id`, the one the prompt is for, and what
+    /// [`Store::record_prompt`] returns otherwise.
     pub fn record_prompt(
         &self,
         actor: &ActorId,
         draft_id: DraftId,
         session_id: SessionId,
+        application_instance_id: ApplicationInstanceId,
         admission: &Admission,
     ) -> Result<usize> {
         let now = self.clock.now_ms();
@@ -2672,7 +2676,7 @@ impl TransferService {
         // both wait, so a deadline that passed or a registration that was withdrawn while the
         // prompt was queued is refused here and records nothing.
         admission.ask()?;
-        admission.commit(|| store.record_prompt(draft_id, session_id, now))
+        admission.commit(|| store.record_prompt(draft_id, session_id, application_instance_id, now))
     }
 
     /// Returns where the journal stands with the sessions whose agents may be sent a prompt that

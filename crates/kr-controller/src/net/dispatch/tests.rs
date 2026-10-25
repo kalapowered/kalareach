@@ -4091,7 +4091,12 @@ async fn record_directly(
         .transfer()
         .record_submission(
             actor,
-            draft_id,
+            crate::transfer::PromptedDraft {
+                draft_id,
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+            },
             session_id,
             crate::transfer::TransferAdmission::new(
                 std::sync::Arc::clone(&world.controller),

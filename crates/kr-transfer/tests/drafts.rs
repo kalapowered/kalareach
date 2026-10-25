@@ -180,6 +180,7 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
                 &harness.actor,
                 created.draft_id,
                 created.session_id.0.expect("a session"),
+                crate::support::an_application(),
                 &Admission::none()
             )
             .expect("records the submission"),
@@ -950,7 +951,13 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
     let other = sessionless(&harness);
     let prompt = harness
         .service
-        .record_prompt(&harness.actor, other.draft_id, session, &Admission::none())
+        .record_prompt(
+            &harness.actor,
+            other.draft_id,
+            session,
+            crate::support::an_application(),
+            &Admission::none(),
+        )
         .expect_err("a prompt for an ended session");
     assert_eq!(prompt.code(), ErrorCode::SessionClosed);
     let report = harness
@@ -1313,6 +1320,7 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
             &harness.actor,
             sent.draft_id,
             sent_session,
+            crate::support::an_application(),
             &Admission::none(),
         )
         .expect("sends the draft to the session");
