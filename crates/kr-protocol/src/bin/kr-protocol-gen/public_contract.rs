@@ -19,11 +19,10 @@
 //!
 //! Until public 1.0 freezes, which is the first client release (a host, command line, desktop or
 //! mobile build published for people to install), the public contract may change with a level move,
-//! and this reports and does not fail: the references are every release at the commit's level,
-//! the excluded ones included. From the freeze, `crates/kr-protocol/retained/PUBLIC_FREEZE` names the
-//! release the freeze was made at (`release=<tag>`), the references are that release and every
-//! release after it that shares a public major that is not retired with the commit, and a
-//! difference fails.
+//! and this reports and does not fail: the references are every release at the commit's level.
+//! From the freeze, `crates/kr-protocol/retained/PUBLIC_FREEZE` names the release the freeze was
+//! made at (`release=<tag>`), the references are that release and every release after it that
+//! shares a public major that is not retired with the commit, and a difference fails.
 //!
 //! It fails closed in both states when it cannot read what it compares: origin's tags, a release's
 //! schema, the record of the freeze.
@@ -34,7 +33,6 @@ use std::path::Path;
 use kr_protocol::retained::{Difference, DifferenceKind, differences};
 use serde_json::Value;
 
-use crate::excluded::Exclusions;
 use crate::in_level::{Head, SCHEMA_PATH, cut_over};
 use crate::releases::{
     Release, agree_with_origin, git_in, inventory, is_ancestor, package_version_at,
@@ -227,7 +225,6 @@ pub fn run(repository: &Path) -> Result<(), String> {
         .to_owned();
     let releases = inventory(repository)?;
     agree_with_origin(repository, &releases, &commit)?;
-    Exclusions::read(repository)?.validate(repository, &releases)?;
     let head = Head::of_this_build(repository, &commit)?;
     let frozen = freeze(repository, &commit, &releases)?;
     let report = report(repository, &head, &releases, frozen.as_ref())?;

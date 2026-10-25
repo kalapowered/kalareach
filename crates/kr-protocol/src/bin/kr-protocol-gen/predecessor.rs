@@ -10,23 +10,18 @@ use std::path::Path;
 
 use kr_protocol::update::CompatibilityLevel;
 
-use crate::excluded::Exclusions;
 use crate::releases::{Release, git_in, is_ancestor, package_version_at, release_of};
 
 /// The releases before the one at `commit`: those tagged in its history at the highest level below
-/// its own that are not excluded, oldest first, so the last is the release before. Releases of a
-/// lower level than that are the business of the release that retained them.
+/// its own, oldest first, so the last is the release before. Releases of a lower level than that
+/// are the business of the release that retained them.
 ///
 /// # Errors
 ///
 /// When no release below the commit's level is tagged, when the tags of that level do not lie on
 /// one line of history (so none is the newest), when two tags name one commit, or when a tag
 /// states another version than its commit's package.
-pub fn before(
-    repository: &Path,
-    commit: &str,
-    excluded: &Exclusions,
-) -> Result<Vec<Release>, String> {
+pub fn before(repository: &Path, commit: &str) -> Result<Vec<Release>, String> {
     let level = CompatibilityLevel::of(package_version_at(repository, commit)?);
     let tags = git_in(
         repository,
@@ -35,7 +30,7 @@ pub fn before(
     let mut below = Vec::new();
     for tag in tags.lines() {
         let release = release_of(repository, tag)?;
-        if release.level() < level && !excluded.contains(&release.tag) {
+        if release.level() < level {
             below.push(release);
         }
     }
@@ -194,7 +189,7 @@ mod tests {
 
         /// The release before `commit`, and the tags of its level up to it.
         fn before(&self, commit: &str) -> Result<(Release, Vec<String>), String> {
-            let mut releases = before(&self.directory, commit, &Exclusions::none())?;
+            let mut releases = before(&self.directory, commit)?;
             let tags = releases.iter().map(|release| release.tag.clone()).collect();
             Ok((releases.pop().expect("at least one"), tags))
         }
@@ -303,38 +298,6 @@ mod tests {
         let tag = history.release("0.75.0", &later);
         let next = history.commit("0.76.0", "next cut");
         assert_eq!(history.before(&next).expect("one line").0.tag, tag);
-    }
-
-    /// A release the record excludes is not the release before, and not one of the level's releases
-    /// the cut compares; the release before it is.
-    #[test]
-    fn an_excluded_release_is_skipped() {
-        let history = History::new("excluded");
-        let first = history.commit("0.74.0", "first");
-        let first_tag = history.release("0.74.0", &first);
-        let early = history.commit("0.74.0", "released before the level was whole");
-        let early_tag = history.release("0.74.0", &early);
-        let last = history.commit("0.74.0", "last");
-        let last_tag = history.release("0.74.0", &last);
-        let cut = history.commit("0.75.0", "cut");
-        let record = Exclusions::parse(&format!(
-            "tag={early_tag}\ncommit={early}\nlevel=0.74\nsurface={}\nwhy=a reason\n",
-            "0".repeat(64)
-        ))
-        .expect("a record");
-        let kept: Vec<String> = before(&history.directory, &cut, &record)
-            .expect("releases before")
-            .into_iter()
-            .map(|release| release.tag)
-            .collect();
-        assert_eq!(kept, [first_tag.clone(), last_tag.clone()]);
-        // Without the record the early release is one of the level's, and a release before the last.
-        let all: Vec<String> = before(&history.directory, &cut, &Exclusions::none())
-            .expect("releases before")
-            .into_iter()
-            .map(|release| release.tag)
-            .collect();
-        assert_eq!(all, [first_tag, early_tag, last_tag]);
     }
 
     /// The newest retained level has to be the level of the release before.

@@ -11,9 +11,8 @@
 //! The release before is whatever `retained/<level>/RELEASE` of the retained surface names. A
 //! commit that is not there, or a build of it that fails, fails the suite: nothing here skips.
 //! The cases of a release at this build's own level (`inside_the_level`) update from and roll back to
-//! the newest release of that level in this commit's history that the record of exclusions does not
-//! name. A commit whose history has no such release says so and ends them, and nothing else is
-//! skipped; a checkout with no release tags at all fails them. They print `inside the level:` and
+//! the newest release of that level in this commit's history. A commit whose history has no such
+//! release says so and ends them, and nothing else is skipped; a checkout with no release tags at all fails them. They print `inside the level:` and
 //! the release they chose, or that they have none, so run them with `--nocapture` to see it.
 //! The suite is behind the `upgrade-suite` feature, because building a second tree takes minutes
 //! and a network.
@@ -25,14 +24,11 @@ mod stored_formats;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
-// The release tags and the record of the releases a level's contract does not cover: the same
-// selection that `kr-protocol-gen` makes, so the suite updates from the release the check holds
-// this commit to.
-#[path = "../../kr-protocol/src/bin/kr-protocol-gen/excluded.rs"]
-mod excluded;
 // The one reader of Rust source the release tooling has, which the tags' roots are read with.
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/public_majors.rs"]
 mod public_majors;
+// The release tags: the same selection that `kr-protocol-gen` makes, so the suite updates from the
+// release the check holds this commit to.
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/releases.rs"]
 mod releases;
 // A device pairs with the installed host's daemon over the network. The pairing calls are the ones
@@ -171,19 +167,14 @@ fn retained_level() -> &'static kr_protocol::retained::RetainedLevel {
         .expect("a level is retained")
 }
 
-/// The commits of the trees the cases of a run build: the release before this one, the newest kept
-/// release of this build's own level, and the newest kept release of the retained level whose lock
-/// names no store for the policies applied for organisations. Each is kept when another is built.
+/// The commits of the trees the cases of a run build: the release before this one, and the newest
+/// kept release of this build's own level. Each is kept when another is built.
 fn trees_a_run_builds() -> Vec<String> {
     let level = retained_level();
     [
         Some(recorded(level.release, "commit")),
         newest_kept_release(CompatibilityLevel::of(PACKAGE_VERSION), |_| true)
             .map(|release| release.commit),
-        newest_kept_release(level.level, |release| {
-            !names_the_organisation_store(&release.commit)
-        })
-        .map(|release| release.commit),
     ]
     .into_iter()
     .flatten()
@@ -205,8 +196,8 @@ fn previous() -> &'static Previous {
     })
 }
 
-/// The newest release of `level` in this commit's history that the record of exclusions does not
-/// name and `accepted` takes, by the depth of its commit; none where this commit's history has none.
+/// The newest release of `level` in this commit's history that `accepted` takes, by the depth of its
+/// commit; none where this commit's history has none.
 ///
 /// The release tags are this checkout's, which the gates hold equal to origin's: a checkout with no
 /// release tag at all fails the suite, since an empty list is not the answer "no release at the
@@ -226,12 +217,8 @@ fn newest_kept_release(
         "this checkout has no release tags: fetch them (git fetch --force --prune origin \
          '+refs/tags/packages/v*:refs/tags/packages/v*'); the suite does not skip"
     );
-    let exclusions = excluded::Exclusions::read(&repository).expect("the record of exclusions");
-    exclusions
-        .validate(&repository, &all)
-        .expect("the record of exclusions holds");
     let mut newest: Option<(usize, releases::Release)> = None;
-    for release in excluded::kept(&all, level, &exclusions, &head) {
+    for release in releases::kept(&all, level, &head) {
         if !releases::is_ancestor(&repository, &release.commit, &head)
             .expect("the history of this commit")
             || !accepted(&release)
@@ -250,9 +237,8 @@ fn newest_kept_release(
     newest.map(|(_, release)| release)
 }
 
-/// The newest release of this build's own level in this commit's history that the record of
-/// exclusions does not name, built; none where this commit's history has none, which is the case
-/// of a commit that moves the level. The release chosen, or that there is none, is printed on
+/// The newest release of this build's own level in this commit's history, built; none where this
+/// commit's history has none, which is the case of a commit that moves the level. The release chosen, or that there is none, is printed on
 /// standard output, which a run shows with `--nocapture`.
 fn inside_the_level() -> Option<&'static Previous> {
     static INSIDE: OnceLock<Option<Previous>> = OnceLock::new();
@@ -332,72 +318,6 @@ impl Previous {
     }
 }
 
-/// Whether the stored-formats lock of the release at `commit` names the store a host keeps the
-/// policies applied for organisations in.
-fn names_the_organisation_store(commit: &str) -> bool {
-    let text = releases::file_at(&repository(), commit, "stored-formats.lock")
-        .expect("the release's lock can be read")
-        .unwrap_or_else(|| panic!("the release at {commit} has no stored-formats.lock"));
-    let lock: Value = serde_json::from_str(&text).expect("the release's lock is a document");
-    lock["stores"]
-        .as_array()
-        .expect("the lock lists stores")
-        .iter()
-        .any(|store| store["entry"]["store"] == "organisation-policy")
-}
-
-/// The newest release of the release before's level in this commit's history, that the record of
-/// exclusions does not name, whose lock names no store for the policies applied for organisations:
-/// a release that leaves the file they are kept in alone, so that a rollback to it lifts the adapter
-/// list a policy states. Built; none where this commit's history has none. The release chosen is
-/// printed on standard output, which a run shows with `--nocapture`.
-///
-/// A cut after which no kept release of the retained level lacks the store ends the cases that use
-/// it here, with the line above, and the refusal they show stays in the update check
-/// (`lifted_lists`), which then has no real release to be shown against: that cut replaces them
-/// with cases over a manifest assembled for the purpose.
-fn before_the_organisation_store() -> Option<&'static Previous> {
-    static BEFORE: OnceLock<Option<Previous>> = OnceLock::new();
-    BEFORE
-        .get_or_init(|| {
-            let level = previous().level;
-            let Some(release) = newest_kept_release(level, |release| {
-                !names_the_organisation_store(&release.commit)
-            }) else {
-                println!(
-                    "before the organisation store: no kept release of level {level} lacks the \
-                     store in the history of this commit, so no real release shows a rollback \
-                     that would lift an adapter list"
-                );
-                return None;
-            };
-            let name = release
-                .tag
-                .strip_prefix("packages/v")
-                .expect("a release tag");
-            println!(
-                "before the organisation store: the cases roll back to {} ({})",
-                release.tag, release.commit
-            );
-            Some(Previous::built(
-                release.commit.clone(),
-                self::release(name),
-                level,
-            ))
-        })
-        .as_ref()
-}
-
-/// As [`before_the_organisation_store`], for the case `case`, which says it did not run when there
-/// is no such release.
-fn before_the_organisation_store_for(case: &str) -> Option<&'static Previous> {
-    let found = before_the_organisation_store();
-    if found.is_none() {
-        println!("{case}: not run, because no kept release lacks the organisation store");
-    }
-    found
-}
-
 /// Copies one program to the internal disk and says what it is.
 fn placed(
     name: &'static str,
@@ -462,11 +382,10 @@ fn build_previous(commit: &str) -> PathBuf {
     let place = cache.join(commit);
     let tree = place.join("tree");
     let programs = place.join("target/debug");
-    // The trees the cases of a run select are kept between runs (the retained level's release, the
-    // newest of this build's own level and the newest of the retained level without the
-    // organisation store; see [`trees_a_run_builds`]); every other goes before anything is
-    // extracted, since a tree and its build are about 12 GB. A tree is read only while the cache
-    // lock is held.
+    // The trees the cases of a run select are kept between runs (the retained level's release and
+    // the newest of this build's own level; see [`trees_a_run_builds`]); every other goes before
+    // anything is extracted, since a tree and its build are about 12 GB. A tree is read only while
+    // the cache lock is held.
     let kept = trees_a_run_builds();
     for entry in std::fs::read_dir(&cache).expect("the cache") {
         let path = entry.expect("an entry").path();
@@ -605,6 +524,10 @@ struct Setup {
     /// started from, as a release of that major does: the variable that makes a program state a
     /// later major reaches the programs a command starts, and this keeps it from this daemon.
     states_its_own_major: bool,
+    /// The first release's manifest names no store for the policies applied for organisations, as
+    /// the manifest of a release from before that store does not: a rollback to it is decided by
+    /// the update check on that manifest, with the release's own programs behind it.
+    without_the_organisation_store: bool,
 }
 
 /// The named pipes the contact server of a session runs on.
@@ -673,8 +596,14 @@ impl Updated {
             plugin,
             agent,
             states_its_own_major,
+            without_the_organisation_store,
         } = setup;
         let mut one = before.assembled(1);
+        if without_the_organisation_store {
+            one.manifest
+                .stores
+                .retain(|store| store.store != "organisation-policy");
+        }
         if states_its_own_major {
             one = one.whose_daemon_states(None);
         }
@@ -1624,26 +1553,22 @@ async fn enrolled_with_a_policy(
     (organisation.organisation_id, store)
 }
 
-/// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-18.06: a release from before the host kept the applied
-/// policies in a store of their own does not name that store, so it would admit every adapter. A
-/// rollback to it while an organisation's policy states an adapter list is refused, naming the
+/// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-18.06: a release whose manifest names no store for the
+/// policies applied for organisations would admit every adapter, so the update check refuses a
+/// rollback to it while an organisation's policy states an adapter list. The refusal names the
 /// organisation, with nothing switched and the daemon serving again. The way through is the
 /// withdrawal from the organisation, which needs no confirmation; after it the rollback goes on.
 ///
-/// A package manager has put these releases here: its name is in a file beside the record, which a
-/// release from before that file does not know, and the rollback leaves it where it was.
+/// A package manager has put these releases here: its name is in a file beside the record, and the
+/// rollback leaves it where it was.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_until_the_host_leaves_it()
  {
-    let Some(before) = before_the_organisation_store_for(
-        "a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_until_the_host_leaves_it",
-    ) else {
-        return;
-    };
     let updated = Updated::start_on(
-        before,
+        previous(),
         Setup {
             network: true,
+            without_the_organisation_store: true,
             ..Setup::default()
         },
     )
@@ -1718,21 +1643,15 @@ async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_unt
 }
 
 /// KR-REQ-26.10, KR-REQ-26.08: a policy that states no adapter list lifts nothing, so a rollback to
-/// a release from before the store goes on while the host keeps the policy. That release reads the
-/// registry, which holds the enrolment as it always did, and the file beside it stays on disk, which
-/// that release ignores: it applies no organisation policy and shows none.
+/// a release whose manifest names no store for the policies goes on while the host keeps the
+/// policy, and the file the policy is kept in stays on disk.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_leaves_an_applied_policy_that_states_no_list_in_its_store_and_a_release_from_before_it_ignores_it()
- {
-    let Some(before) = before_the_organisation_store_for(
-        "a_rollback_leaves_an_applied_policy_that_states_no_list_in_its_store_and_a_release_from_before_it_ignores_it",
-    ) else {
-        return;
-    };
+async fn a_rollback_goes_on_while_an_applied_policy_states_no_list_and_leaves_its_store() {
     let updated = Updated::start_on(
-        before,
+        previous(),
         Setup {
             network: true,
+            without_the_organisation_store: true,
             ..Setup::default()
         },
     )
@@ -1752,25 +1671,7 @@ async fn a_rollback_leaves_an_applied_policy_that_states_no_list_in_its_store_an
         format!("kr-controller/{}", updated.one.name()),
         "the daemon is the release before's again"
     );
-    assert!(store.is_file(), "the release before leaves the store alone");
-
-    // The release's daemon holds the enrolment and applies no policy: its own `kr` shows the
-    // organisation with no applied policy.
-    let output = host.run(&updated.kr_before(), &["--json", "organisation", "list"]);
-    assert!(
-        output.status.success(),
-        "the release before's kr lists the organisations: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let said: Value = serde_json::from_slice(&output.stdout).expect("a document");
-    let enrolments = said["enrolments"].as_array().expect("a list of enrolments");
-    assert_eq!(enrolments.len(), 1, "{said}");
-    assert!(
-        enrolments[0]["organisation_policy_revision"].is_null()
-            && enrolments[0]["adapter_allowlist"].is_null()
-            && said["effective_adapter_allowlist"].is_null(),
-        "a release from before the store shows no applied policy: {said}"
-    );
+    assert!(store.is_file(), "the rollback leaves the store alone");
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;

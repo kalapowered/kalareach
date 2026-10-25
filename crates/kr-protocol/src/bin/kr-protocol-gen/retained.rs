@@ -13,18 +13,17 @@
 //! `RetainedLevel::with_public_majors`, and `--check` fails until it is.
 //! `--release-commit` is for when the release a level was cut from is not the commit its record
 //! names: it compares the schema, the table of public majors and the plugin host protocol of every
-//! release of the level that `retained/EXCLUDED` does not name, from the release tags and not from
-//! the history of this checkout, with the kept ones, refuses on a difference, and only then edits
-//! the record. The commit has to be the release before this one, the newest release that is not
-//! excluded and is tagged in this checkout's history at the highest level below its own, and
-//! `--predecessor` prints that release and fails unless its level is the newest retained.
+//! release of the level, from the release tags and not from the history of this checkout, with the
+//! kept ones, refuses on a difference, and only then edits the record. The commit has to be the
+//! release before this one, the newest release tagged in this checkout's history at the highest
+//! level below its own, and `--predecessor` prints that release and fails unless its level is the
+//! newest retained.
 
 use std::path::{Path, PathBuf};
 
 use kr_protocol::hello::PACKAGE_VERSION;
 use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface};
 
-use crate::excluded::{self, Exclusions};
 use crate::{in_level, predecessor, public_majors, releases};
 
 /// The directory the retained levels are kept in.
@@ -175,32 +174,6 @@ pub fn kept_release_differences(
     Ok(found)
 }
 
-/// What is wrong with the record of excluded releases without asking git: it is malformed, or it
-/// names a level that this build neither is at nor retains, which is the 0.78 cut's to remove.
-pub fn exclusion_problems() -> Vec<String> {
-    let exclusions = match Exclusions::read(&repository()) {
-        Ok(exclusions) => exclusions,
-        Err(error) => return vec![error],
-    };
-    exclusions
-        .entries()
-        .iter()
-        .filter(|entry| {
-            entry.level != kr_protocol::update::THIS_LEVEL
-                && !RETAINED_WORKER_LEVELS.contains(&entry.level)
-        })
-        .map(|entry| {
-            format!(
-                "{} excludes {}, whose level {} is neither this build's nor a retained one: remove the \
-                 record and its readers",
-                excluded::RECORD,
-                entry.tag,
-                entry.level
-            )
-        })
-        .collect()
-}
-
 /// Cuts a new retained level from the release at `commit`.
 pub fn retain(level: &str, commit: &str) -> Result<(), String> {
     let target = retained_dir().join(level);
@@ -308,13 +281,6 @@ pub fn plugin_host_in(repository: &Path, commit: &str) -> Result<String, String>
     ))
 }
 
-/// The releases the record excludes, read and held to this checkout's tags.
-fn checked_exclusions() -> Result<Exclusions, String> {
-    let exclusions = Exclusions::read(&repository())?;
-    exclusions.validate(&repository(), &releases::inventory(&repository())?)?;
-    Ok(exclusions)
-}
-
 /// The level, full commit and tag of the release before this one, as one line of text. It fails
 /// unless that release's level is the newest this build retains, and unless this build is the one
 /// the checkout's `HEAD` makes, since the tags are read from `HEAD`'s history.
@@ -326,8 +292,7 @@ pub fn release_before() -> Result<String, String> {
              clean checkout of the commit to release"
         ));
     }
-    let exclusions = checked_exclusions()?;
-    let history = predecessor::before(&repository(), "HEAD", &exclusions)?;
+    let history = predecessor::before(&repository(), "HEAD")?;
     let release = history
         .last()
         .ok_or("no release is tagged before this one")?;
@@ -341,8 +306,7 @@ pub fn release_before() -> Result<String, String> {
 }
 
 /// Moves a level's record to the release before this one, after comparing the schema, the table of
-/// public majors and the plugin host protocol of every release of the level that is not excluded
-/// with the kept ones. `commit` has to be the release before this one: the newest tagged in this
+/// public majors and the plugin host protocol of every release of the level with the kept ones. `commit` has to be the release before this one: the newest tagged in this
 /// checkout's history at the highest level below its own, which is the level's last release. The
 /// sources the rules, limits and probes read are compared by the `retained_surface` test run with
 /// `KR_RELEASE_TREE` set to that release's tree.
@@ -357,8 +321,7 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     if full != commit {
         return Err(format!("give the full commit: {commit} is {full}"));
     }
-    let exclusions = checked_exclusions()?;
-    let history = predecessor::before(&repository(), "HEAD", &exclusions)?;
+    let history = predecessor::before(&repository(), "HEAD")?;
     let before = history
         .last()
         .ok_or("no release is tagged before this one")?;
@@ -383,12 +346,7 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     // the tags say which they are whether or not this checkout's history reaches them. The cut
     // covers the kept surface's roots and the ones the release declares, and a root one of them
     // lacks is a difference.
-    let peers = excluded::kept(
-        &releases::inventory(&repository())?,
-        retained.level,
-        &exclusions,
-        "",
-    );
+    let peers = releases::kept(&releases::inventory(&repository())?, retained.level, "");
     for release in &peers {
         let found = kept_release_differences(
             &repository(),

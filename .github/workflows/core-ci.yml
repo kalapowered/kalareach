@@ -138,9 +138,9 @@ jobs:
         with:
           name: linux
 
-      # A level is one surface: this commit has the surface of every release at its level that the
-      # record of exclusions does not name, taken from origin's complete list of release tags, which
-      # have to be this checkout's. A commit that moves the level runs the cut's own check here too.
+      # A level is one surface: this commit has the surface of every release at its level, taken
+      # from origin's complete list of release tags, which have to be this checkout's. A commit
+      # that moves the level runs the cut's own check here too.
       # The generator is built first, so that no tag can land between fetching the tags and
       # comparing them with origin's while it compiles; each check then fetches first, and a tag only
       # this checkout has is removed, so the comparison is with origin as it is now. All before
