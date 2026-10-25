@@ -193,3 +193,53 @@ async fn a_connection_admitted_before_the_feed_removed_the_host_is_refused_by_th
     );
     assert_eq!(asked(&controller, &local).await, [true, true]);
 }
+
+/// KR-REQ-24.15: a refusal the feed raises while a commit stands on a connection's registration
+/// rises after the commit, as a withdrawal does: the commit's check read no refusal, so the commit
+/// is the whole of what the connection did under the standing it had, and a commit that begins
+/// after the raise reads it. The commit holds the registration and not the connection table, so
+/// the case holds a commit and lets the raise try to rise inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_refusal_raised_while_a_commit_stands_on_a_registration_rises_after_it() {
+    let (_temp, controller) = daemon().await;
+    let (remote, _) = registered(&controller);
+    let (entered, waiting) = std::sync::mpsc::channel::<()>();
+    let (raising, begun) = std::sync::mpsc::channel::<()>();
+    let committing = {
+        let controller = Arc::clone(&controller);
+        tokio::task::spawn_blocking(move || {
+            controller.under_registration(&remote, || {
+                entered.send(()).expect("the case is waiting");
+                begun.recv().expect("the raise has begun");
+                // A raise that does not wait for this commit rises while it is given the chance.
+                for _ in 0..10_000 {
+                    if controller.feed_refusal.word() != 0 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                controller.feed_refusal.word()
+            })
+        })
+    };
+    tokio::task::spawn_blocking(move || waiting.recv().expect("the commit is held"))
+        .await
+        .expect("the wait ended");
+    let raise = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move {
+            raising.send(()).expect("the commit is waiting");
+            controller.raise_the_unverified_withdrawal_refusal().await;
+        })
+    };
+    let word = committing
+        .await
+        .expect("the commit ends")
+        .expect("the commit's check read no refusal");
+    assert_eq!(word, 0, "the refusal rose inside the commit");
+    raise.await.expect("the raise ends");
+    assert!(
+        controller.check_registration(&remote).is_err(),
+        "a check that begins after the raise reads it"
+    );
+}

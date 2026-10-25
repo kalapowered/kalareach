@@ -1154,9 +1154,11 @@ impl Controller {
     /// flag and the word that mirrors it change together, under the policy's lock, and the epoch
     /// moves after. Says whether it changed anything.
     ///
-    /// A raise first takes the registry's guard and then the connection table, the order a
-    /// withdrawal takes them in (registry, policy, table), so a write that holds either from its
-    /// check to its commit is wholly before the raise or wholly after it. A write that releases
+    /// A raise first takes the registry's guard and then the hold on commits that stand on a
+    /// registration and the connection table ([`Self::admitted_withdraw`]), the order a
+    /// withdrawal takes them in (registry, policy, hold, table), so a write that holds either from
+    /// its check to its commit is wholly before the raise or wholly after it. It waits for a
+    /// commit that is running, holding the registry and the policy's lock meanwhile. A write that releases
     /// them before its commit is not ordered by this: a write to the pairing records that read the
     /// word before it rose commits after it, and the wait of [`Self::move_a_feed_refusal`] is what
     /// orders those. A lift needs no order. Nothing is taken when the word already says what is
@@ -1185,7 +1187,7 @@ impl Controller {
             if flag(&policy) == raised {
                 return false;
             }
-            let _table = raised.then(|| self.admitted_write());
+            let _held = raised.then(|| self.admitted_withdraw());
             set(&mut policy, raised);
             if raised {
                 self.feed_refusal.raise(bit);

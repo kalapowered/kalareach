@@ -1348,7 +1348,7 @@ the change or wholly after it, and a request whose deadline or authority ran out
 behind a sync or a download changes nothing. The daemon's table of admitted connections is held
 only for the check, not for the commit: a request, a typed key, an output batch and a connection
 that is registered never wait for a commit. A withdrawal does. A connection that ends is withdrawn
-when the commit is over, on a thread of its own, and a revocation that lands during a commit waits
+when the commit is over, on a thread of its own, and a revocation, or a refusal the authority feed raises, that lands during a commit waits
 for it while it holds the registry, so the requests that need the registry wait with it.
 
 The catalogue's work that grows with a catalogue (a mutation, a read, the seed, a change of the
