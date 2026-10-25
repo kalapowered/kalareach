@@ -897,7 +897,11 @@ fn kr_req_12_05_a_conversation_stays_held_until_the_server_that_runs_against_it_
         kr_ipc::identity::process_state(&server) == kr_ipc::identity::ProcessState::Ended
     });
     eventually("the conversation is free", || {
-        claimed.take("thread-9").is_ok()
+        match claimed.take("thread-9") {
+            Ok(_) => true,
+            Err(kr_worker::broker::host_claims::ClaimRefusal::Held) => false,
+            Err(unusable) => panic!("the claim cannot be asked about: {unusable:?}"),
+        }
     });
     let answer = second
         .establish(&["codex", "resume", "thread-9"])

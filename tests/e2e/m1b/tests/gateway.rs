@@ -779,12 +779,17 @@ impl Person {
     ///
     /// A row of the screen is what a person would read, whichever bytes painted it, so a row left
     /// by an earlier line is told from one the next line made only when the earlier ones are gone.
+    /// What an earlier line leaves is what the stand-in as a program says, as a terminal and as
+    /// typed, and what the launcher says: the clear has happened when none of them is on the
+    /// screen, and not before the shell has acted on the key.
     fn clears_the_screen(&self) {
         self.window.type_text(b"\x0c");
         let started = Instant::now();
         loop {
             let rows = self.window.screen();
-            if !rows.iter().any(|row| row.contains(RAN_AS_TYPED)) {
+            if !rows.iter().any(|row| {
+                row.contains(RAN_AS_TYPED) || row.contains("TUI:") || row.contains("kr-hook:")
+            }) {
                 return;
             }
             assert!(
@@ -1200,9 +1205,18 @@ fn kr_req_12_07_a_codex_typed_in_a_managed_root_shell_is_served_by_a_gateway_and
 /// is taken and let go of, as a worker's launch takes it; its directory, file name and lock are what
 /// workers of different builds agree on.
 fn wait_until_the_claim_is_free(host: &Host<'_>, word: &str) {
+    use kr_worker::broker::host_claims::ClaimRefusal;
+
     let claims = kr_worker::broker::host_claims::HostClaims::new(host.roots());
     let started = Instant::now();
-    while claims.take(word).is_err() {
+    loop {
+        match claims.take(word) {
+            Ok(_) => return,
+            Err(ClaimRefusal::Held) => {}
+            Err(ClaimRefusal::Unavailable(why)) => {
+                panic!("the claim on {word} cannot be asked about: {why}")
+            }
+        }
         assert!(
             started.elapsed() < LIVENESS,
             "the claim on {word} was not let go of"
@@ -1281,10 +1295,17 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
     wait_until_the_claim_is_free(&host, "thread-10");
 
     // It asks for the first session's conversation, and the launcher says the backend refused it.
-    // Nothing was started for it.
+    // Nothing was started for it, and the conversation is held by a worker at that moment.
     let _ = second.types_until_the_launch_is_refused(
         "codex resume thread-9",
         "the second session's line for the first session's conversation",
+    );
+    assert!(
+        matches!(
+            kr_worker::broker::host_claims::HostClaims::new(host.roots()).take("thread-9"),
+            Err(kr_worker::broker::host_claims::ClaimRefusal::Held)
+        ),
+        "the first session's worker holds the claim on the conversation that was refused"
     );
     assert_eq!(
         gateway_sockets(host.roots().runtime_root()),
@@ -1307,6 +1328,22 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
         "the first session's instance is untouched: {still:?}"
     );
 
+    // Control: the second session's worker serves another conversation right after the refusal, so
+    // the refusal was of this conversation and not of a worker that could not serve.
+    let _ = second.types_until_it_shows(
+        "codex resume thread-10",
+        "TUI: turn/completed",
+        "the second session is served another conversation after the refusal",
+    );
+    let again = server_besides(
+        &ctx,
+        "the second session's second server",
+        &[&server, &other],
+    );
+    second.window.type_text(b"\x03");
+    assert!(ended_within(&again, LIVENESS), "the second server ends");
+    wait_until_the_claim_is_free(&host, "thread-10");
+
     // The first session's program ends and its server with it: the conversation is free once the
     // retirement has ended what the server started.
     first.window.type_text(b"\x03");
@@ -1323,7 +1360,11 @@ fn kr_req_12_05_a_second_session_is_not_served_a_conversation_the_first_runs_aga
         "TUI: turn/completed",
         "the second session's line is served once the first session's execution has ended",
     );
-    let served = server_besides(&ctx, "the second session's server", &[&server, &other]);
+    let served = server_besides(
+        &ctx,
+        "the second session's server",
+        &[&server, &other, &again],
+    );
     assert!(
         kr_e2e_m1b::run::running(&served),
         "behind a gateway of its own"

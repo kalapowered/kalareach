@@ -2614,13 +2614,14 @@ fn kr_req_12_05_the_retirement_of_an_earlier_server_frees_only_the_conversations
 
 /// KR-REQ-12.05: an instance that ends while its server is still being started keeps its
 /// conversations, whether the server is then recorded (and its retirement frees them) or never
-/// started (and giving it up does), and no server is started for an instance that has ended.
+/// started (and giving the start up, as a start that fails or is cancelled with its admission
+/// does by being dropped, frees them), and no server is started for an instance that has ended.
 #[test]
 fn kr_req_12_05_an_instance_that_ends_while_its_server_starts_keeps_its_conversation_held() {
     let (_directory, first, second) = two_sessions();
     let server = process_identity(77, 1_000);
     launched_on(&first, "recorded", instance(2)).expect("launched");
-    first
+    let starting = first
         .server_starting(instance(2))
         .expect("a server is to be started");
     assert!(first.end(instance(2)));
@@ -2628,6 +2629,7 @@ fn kr_req_12_05_an_instance_that_ends_while_its_server_starts_keeps_its_conversa
         launched_on(&second, "recorded", instance(3)),
         Err(BrokerError::ConversationHeldElsewhere)
     ));
+    starting.recorded();
     first
         .set_instance_backend(instance(2), server.clone())
         .expect_err("the instance has ended, and the server is the caller's to retire");
@@ -2639,7 +2641,7 @@ fn kr_req_12_05_an_instance_that_ends_while_its_server_starts_keeps_its_conversa
     launched_on(&second, "recorded", instance(3)).expect("free once the server is retired");
 
     launched_on(&first, "unstarted", instance(4)).expect("launched");
-    first
+    let starting = first
         .server_starting(instance(4))
         .expect("a server is to be started");
     assert!(first.end(instance(4)));
@@ -2647,7 +2649,7 @@ fn kr_req_12_05_an_instance_that_ends_while_its_server_starts_keeps_its_conversa
         launched_on(&second, "unstarted", instance(5)),
         Err(BrokerError::ConversationHeldElsewhere)
     ));
-    first.server_not_started(instance(4));
+    drop(starting);
     launched_on(&second, "unstarted", instance(5)).expect("free once the start is given up");
 
     first
